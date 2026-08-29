@@ -9,8 +9,8 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 
-	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/change"
+	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
 )

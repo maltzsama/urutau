@@ -50,5 +50,5 @@ func keyString(key []any) string {
 			parts[i] = fmt.Sprintf("%v", v)
 		}
 	}
-	return strings.Join(parts, "[1f")
+	return strings.Join(parts, "\x1f")
 }

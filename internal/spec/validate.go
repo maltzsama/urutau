@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	ErrNilFilterNode = errors.New("filter node is empty")
+	ErrNilFilterNode       = errors.New("filter node is empty")
 	ErrAmbiguousFilterNode = errors.New("filter node carries more than one of all/any/not/where")
 )
 
