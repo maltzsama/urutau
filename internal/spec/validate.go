@@ -104,13 +104,17 @@ func validateFilter(f *Filter, path string, problems *[]string) {
 	}
 
 	count := 0
-	for i := range f.All {
+	if len(f.All) > 0 {
 		count++
-		validateFilter(&f.All[i], path+".all["+fmt.Sprint(i)+"]", problems)
+		for i := range f.All {
+			validateFilter(&f.All[i], path+".all["+fmt.Sprint(i)+"]", problems)
+		}
 	}
-	for i := range f.Any {
+	if len(f.Any) > 0 {
 		count++
-		validateFilter(&f.Any[i], path+".any["+fmt.Sprint(i)+"]", problems)
+		for i := range f.Any {
+			validateFilter(&f.Any[i], path+".any["+fmt.Sprint(i)+"]", problems)
+		}
 	}
 	if f.Not != nil {
 		count++
@@ -122,10 +126,10 @@ func validateFilter(f *Filter, path string, problems *[]string) {
 	}
 
 	if count == 0 {
-		*problems = append(*problems, fmt.Sprintf("%s: %w", path, ErrNilFilterNode))
+		*problems = append(*problems, fmt.Sprintf("%s: %v", path, ErrNilFilterNode))
 	}
 	if count > 1 {
-		*problems = append(*problems, fmt.Sprintf("%s: %w", path, ErrAmbiguousFilterNode))
+		*problems = append(*problems, fmt.Sprintf("%s: %v", path, ErrAmbiguousFilterNode))
 	}
 }
 
