@@ -20,10 +20,11 @@ All code, comments, and documentation in this repository are **English**.
 | `cmd/coordinator` | coordinator binary (reader, router, supervisor) |
 | `cmd/worker` | worker binary (Iceberg writer) |
 | `internal/spec` | resolvedSpec + single server-side validation |
+| `internal/change` | row change event, per-key collapse, batch |
 | `internal/position` | position contract (GTID/LSN, `Compare`/`Contains`) |
 | `internal/source` | sources: MySQL (`go-mysql`), Postgres (`pgx`) |
 | `internal/coordinator` | reader/router loops, flight budget, supervisor |
-| `internal/worker` | batcher, per-PK collapse, serial committer |
+| `internal/worker` | per-table batcher + serialized committer |
 | `internal/sink` | Iceberg writes (upsert/equality delete) |
 | `internal/transport` | gRPC control + Arrow Flight; generated in `internal/transport/pb` |
 | `internal/eventlog` | per-run-id JSONL in S3 |
@@ -54,14 +55,20 @@ make e2e-test   # compose up --wait, then URUTAU_E2E=1 go test ./test/e2e
 make e2e-down   # tear the stack down
 ```
 
-It exercises append, equality delete, and the `cdc.position` snapshot/table
-properties. Key finding so far: in `iceberg-go` v0.6.0 an append and an
-equality delete staged in one transaction produce **two** snapshots — the
-delete gets the higher sequence number and applies to the freshly appended
-file too. A correct upsert is therefore delete-then-append (separate
-commits), never append-then-delete in a single commit.
+It exercises append, equality delete, the `cdc.position` snapshot/table
+properties, and the collapsed worker end to end (inline YAML → batcher →
+collapse → delete-then-append commits, verified through Trino). Key finding
+so far: in `iceberg-go` v0.6.0 an append and an equality delete staged in
+one transaction produce **two** snapshots — the delete gets the higher
+sequence number and applies to the freshly appended file too. A correct
+upsert is therefore delete-then-append (separate commits), never
+append-then-delete in a single commit.
 
 ## Status
 
-Skeleton + spike. Next step: the worker writer
-for one table with upsert, end to end.
+Done: the Iceberg write path is proven by reading it
+back with Trino, and the collapsed worker (inline YAML spec, per-key
+collapse, delete-then-append committer with serialized retry) runs end to
+end. Next: the MySQL binlog reader (`go-mysql`) feeding
+the collapsed process, plus position resume. The v0.1.0 target is the
+experimental cut: stream-only replication, local mode.
