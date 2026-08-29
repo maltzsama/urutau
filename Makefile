@@ -18,7 +18,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test
 
 all: lint test build
 
@@ -49,3 +49,14 @@ clean:
 
 docker:
 	docker build -f build/Dockerfile -t urutau:dev .
+
+E2E_COMPOSE := test/e2e/docker-compose.yml
+
+e2e-up:
+	docker compose -f $(E2E_COMPOSE) up -d --wait
+
+e2e-down:
+	docker compose -f $(E2E_COMPOSE) down
+
+e2e-test: e2e-up
+	URUTAU_E2E=1 $(GO) test -count=1 -v ./test/e2e

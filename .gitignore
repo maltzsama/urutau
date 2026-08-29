@@ -365,3 +365,6 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+### Urutau ###
+/bin/

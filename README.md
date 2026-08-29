@@ -43,8 +43,25 @@ make proto       # buf lint + generate (generated code is committed)
 Go ≥ 1.26. No `protoc` needed — generation uses `buf` with the
 `protoc-gen-go`/`protoc-gen-go-grpc` plugins pinned as `go tool`.
 
+## E2E spike
+
+The spike proves the Iceberg write path by reading it back with
+Trino (trusting the read, not the commit return). Stack: MinIO (S3) +
+Polaris (REST catalog) + Trino (Iceberg REST catalog).
+
+```sh
+make e2e-test   # compose up --wait, then URUTAU_E2E=1 go test ./test/e2e
+make e2e-down   # tear the stack down
+```
+
+It exercises append, equality delete, and the `cdc.position` snapshot/table
+properties. Key finding so far: in `iceberg-go` v0.6.0 an append and an
+equality delete staged in one transaction produce **two** snapshots — the
+delete gets the higher sequence number and applies to the freshly appended
+file too. A correct upsert is therefore delete-then-append (separate
+commits), never append-then-delete in a single commit.
+
 ## Status
 
-Skeleton. Next step: the `iceberg-go` spike: append +
-equality delete + read back in Trino and watch the old version actually
-disappear.
+Skeleton + spike. Next step: the worker writer
+for one table with upsert, end to end.

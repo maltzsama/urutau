@@ -1,0 +1,99 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  bucket-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/warehouse &&
+        echo bucket ready
+
+  polaris:
+    image: apache/polaris:latest
+    ports:
+      - "8181:8181"
+      - "8182:8182"
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,s3cr3t
+      polaris.realm-context.realms: POLARIS
+      quarkus.otel.sdk.disabled: "true"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  polaris-setup:
+    image: alpine/curl:8.11.1
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      CLIENT_ID: root
+      CLIENT_SECRET: s3cr3t
+      CATALOG_NAME: quickstart_catalog
+      REALM: POLARIS
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        TOKEN=$$(curl -sf -X POST http://polaris:8181/api/catalog/v1/oauth/tokens \
+          -H 'Content-Type: application/x-www-form-urlencoded' \
+          -d "grant_type=client_credentials&client_id=$${CLIENT_ID}&client_secret=$${CLIENT_SECRET}&scope=PRINCIPAL_ROLE:ALL" \
+          | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+        test -n "$$TOKEN"
+        if [ "$$(curl -s -o /dev/null -w '%{http_code}' http://polaris:8181/api/management/v1/catalogs/$$CATALOG_NAME -H "Authorization: Bearer $$TOKEN" -H "Polaris-Realm: $$REALM")" != "200" ]; then
+          curl -sf -X POST http://polaris:8181/api/management/v1/catalogs \
+            -H "Authorization: Bearer $$TOKEN" -H "Polaris-Realm: $$REALM" \
+            -H 'Content-Type: application/json' \
+            -d '{"catalog":{"name":"'$$CATALOG_NAME'","type":"INTERNAL","readOnly":false,"properties":{"default-base-location":"s3://warehouse"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://warehouse"],"endpoint":"http://localhost:9000","endpointInternal":"http://minio:9000","pathStyleAccess":true,"region":"us-west-2"}}}' \
+            >/dev/null
+        fi
+        curl -sf -X PUT "http://polaris:8181/api/management/v1/catalogs/$$CATALOG_NAME/catalog-roles/catalog_admin/grants" \
+          -H "Authorization: Bearer $$TOKEN" -H "Polaris-Realm: $$REALM" \
+          -H 'Content-Type: application/json' \
+          -d '{"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}' \
+          >/dev/null || true
+        echo catalog created
+
+  trino:
+    image: trinodb/trino:470
+    ports:
+      - "8080:8080"
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
