@@ -1,0 +1,11 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - BASIC
+  except:
+    - SERVICE_SUFFIX
+breaking:
+  use:
+    - FILE
