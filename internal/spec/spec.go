@@ -4,9 +4,8 @@
 // change.
 package spec
 
-import "errors"
-
-var ErrNotImplemented = errors.New("spec: validation not implemented yet")
+// WriteMode selects how a table is written: upsert reflects state through
+// the primary key; append emits every change as a new row.
 
 type WriteMode string
 
@@ -50,8 +49,4 @@ type Table struct {
 	Worker            string    `json:"worker,omitempty"`
 	CreateIfNotExists bool      `json:"createIfNotExists,omitempty"`
 	FilterImmutable   bool      `json:"filterImmutable,omitempty"`
-}
-
-func (s *Spec) Validate() error {
-	return ErrNotImplemented
 }
