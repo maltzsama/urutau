@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             (unknown)
-// source: urutau/v1/urutau.proto
+// source: urutau/v1/control.proto
 
 package pb
 
@@ -149,5 +149,5 @@ var UrutauControl_ServiceDesc = grpc.ServiceDesc{
 			ClientStreams: true,
 		},
 	},
-	Metadata: "urutau/v1/urutau.proto",
+	Metadata: "urutau/v1/control.proto",
 }
