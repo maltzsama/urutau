@@ -23,6 +23,9 @@ func TestWorkerEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// Isolated from other e2e tests sharing the stack: drop the target table.
+	dropIcebergTable(t, ctx)
+
 	yamlSpec := `
 pipeline: e2e
 source:

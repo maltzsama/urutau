@@ -1,0 +1,241 @@
+// Package source.mysql implements the MySQL replication source on top of
+// go-mysql/canal: a single binlog reader that decodes row events into
+// change.Change, positions them at their transaction GTID, and exposes the
+// synced and master positions for the DBLog watermark logic.
+package mysql
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"regexp"
+	"sync"
+	"time"
+
+	"github.com/go-mysql-org/go-mysql/canal"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/schema"
+
+	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/position"
+)
+
+// TableRef maps one source table to its target and primary key.
+type TableRef struct {
+	Source     string // "db.table"
+	Target     string // "raw.orders"
+	PrimaryKey []string
+}
+
+// Config dials one MySQL instance. One replication connection per source —
+// the invariant the whole design stands on.
+type Config struct {
+	Addr      string // host:port
+	User      string
+	Password  string
+	ServerID  uint32
+	Heartbeat time.Duration
+	Tables    []TableRef
+	Logger    *slog.Logger
+}
+
+// Reader wraps a canal instance and decodes its row events.
+type Reader struct {
+	cfg     Config
+	canal   *canal.Canal
+	out     chan<- change.Change
+	bySrc   map[string]TableRef // "db.table" → ref (PK + target)
+	mu      sync.Mutex
+	curSet  *position.GTID // accumulated GTID set through the current transaction
+	curGTID string         // curSet.String() — the position rows of this txn carry
+
+	canal.DummyEventHandler // unimplemented hooks are no-ops
+}
+
+// New builds the reader but does not start it.
+func New(ctx context.Context, cfg Config, out chan<- change.Change) (*Reader, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	incl := make([]string, 0, len(cfg.Tables))
+	bySrc := make(map[string]TableRef, len(cfg.Tables))
+	for _, t := range cfg.Tables {
+		incl = append(incl, fmt.Sprintf(`^%s$`, regexp.QuoteMeta(t.Source)))
+		bySrc[t.Source] = t
+	}
+
+	c, err := canal.NewCanal(&canal.Config{
+		Addr:              cfg.Addr,
+		User:              cfg.User,
+		Password:          cfg.Password,
+		ServerID:          cfg.ServerID,
+		Flavor:            "mysql",
+		HeartbeatPeriod:   cfg.Heartbeat,
+		ReadTimeout:       60 * time.Second,
+		IncludeTableRegex: incl,
+		ParseTime:         false,
+		Logger:            cfg.Logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mysql: new canal: %w", err)
+	}
+
+	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc}
+	c.SetEventHandler(r)
+	return r, nil
+}
+
+// StartFromGTID begins streaming from the given GTID set, blocking until
+// the stream ends or the context is cancelled. Call in a goroutine.
+func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error {
+	r.cfg.Logger.Info("reader start", "from", start.String())
+	r.mu.Lock()
+	r.curSet = start
+	r.mu.Unlock()
+	if err := r.canal.StartFromGTID(start.Raw()); err != nil {
+		return fmt.Errorf("mysql: start from gtid %s: %w", start, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.canal.Run() }()
+
+	select {
+	case <-ctx.Done():
+		r.canal.Close()
+		return ctx.Err()
+	case err := <-done:
+		return fmt.Errorf("mysql: stream ended: %w", err)
+	}
+}
+
+// Synced reports the reader's current synced GTID set.
+func (r *Reader) Synced() *position.GTID {
+	set := r.canal.SyncedGTIDSet()
+	if g, err := position.ParseGTID(set.String()); err == nil {
+		return g
+	}
+	return position.MustGTID("")
+}
+
+// Master reports the master's current executed GTID set (the caught-up
+// target for the DBLog window).
+func (r *Reader) Master() (*position.GTID, error) {
+	set, err := r.canal.GetMasterGTIDSet()
+	if err != nil {
+		return nil, fmt.Errorf("mysql: master gtid: %w", err)
+	}
+	return position.MustGTID(set.String()), nil
+}
+
+// Close stops the reader and its replication connection.
+func (r *Reader) Close() { r.canal.Close() }
+
+// ── canal.EventHandler ──────────────────────────────────────────────
+
+func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {
+	next, err := e.GTIDNext()
+	if err != nil {
+		return fmt.Errorf("mysql: gtid next: %w", err)
+	}
+	g, err := position.ParseGTID(next.String())
+	if err != nil {
+		return fmt.Errorf("mysql: gtid next parse: %w", err)
+	}
+	r.mu.Lock()
+	if r.curSet == nil {
+		r.curSet = position.MustGTID("")
+	}
+	// A resume position is a CUMULATIVE set: "everything up to and including
+	// this transaction". Merging the single next GTID into the running set
+	// yields "uuid:1-N", which is the safe point to resume from.
+	r.curSet.Add(g)
+	r.curGTID = r.curSet.String()
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *Reader) OnRow(e *canal.RowsEvent) error {
+	ref, ok := r.bySrc[e.Table.Schema+"."+e.Table.Name]
+	if !ok {
+		return nil // excluded by regex; double-check only
+	}
+
+	r.mu.Lock()
+	pos := r.curGTID
+	r.mu.Unlock()
+
+	if dbg := r.cfg.Logger; dbg != nil && os.Getenv("URUTAU_DEBUG_READER") != "" {
+		dbg.Info("row", "table", ref.Source, "action", e.Action, "pos", pos, "nrows", len(e.Rows))
+	}
+
+	switch e.Action {
+	case canal.InsertAction:
+		for _, row := range e.Rows {
+			r.out <- r.decode(ref, e.Table, change.OpInsert, row, nil, pos)
+		}
+	case canal.DeleteAction:
+		for _, row := range e.Rows {
+			r.out <- r.decode(ref, e.Table, change.OpDelete, row, nil, pos)
+		}
+	case canal.UpdateAction:
+		// Rows come as [before, after] pairs.
+		for i := 0; i+1 < len(e.Rows); i += 2 {
+			r.out <- r.decode(ref, e.Table, change.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
+		}
+	}
+	return nil
+}
+
+// decode maps one row (in table column order) to a change. key is built from
+// the spec primary key columns, in spec order.
+func (r *Reader) decode(ref TableRef, tbl *schema.Table, op change.Op, after, before []any, pos string) change.Change {
+	c := change.Change{
+		Op:       op,
+		Table:    ref.Target,
+		Position: pos,
+	}
+
+	key := make([]any, 0, len(ref.PrimaryKey))
+	for _, pk := range ref.PrimaryKey {
+		if idx := tbl.FindColumn(pk); idx >= 0 {
+			key = append(key, after[idx])
+		} else {
+			key = append(key, nil)
+		}
+	}
+	c.Key = key
+
+	if op == change.OpDelete {
+		if before != nil {
+			c.Before = rowToMap(tbl, before)
+		}
+		return c
+	}
+	c.After = rowToMap(tbl, after)
+	if before != nil {
+		c.Before = rowToMap(tbl, before)
+	}
+	return c
+}
+
+// rowToMap maps a row (in table column order) to column-name → value.
+// The binlog yields []byte for string columns; normalize them to string so
+// the writer's scalar type switch accepts them.
+func rowToMap(tbl *schema.Table, row []any) map[string]any {
+	out := make(map[string]any, len(tbl.Columns))
+	for i, col := range tbl.Columns {
+		if i >= len(row) {
+			continue
+		}
+		out[col.Name] = normalize(row[i])
+	}
+	return out
+}
+
+func normalize(v any) any {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return v
+}

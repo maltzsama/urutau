@@ -56,19 +56,19 @@ make e2e-down   # tear the stack down
 ```
 
 It exercises append, equality delete, the `cdc.position` snapshot/table
-properties, and the collapsed worker end to end (inline YAML → batcher →
-collapse → delete-then-append commits, verified through Trino). Key finding
-so far: in `iceberg-go` v0.6.0 an append and an equality delete staged in
-one transaction produce **two** snapshots — the delete gets the higher
-sequence number and applies to the freshly appended file too. A correct
-upsert is therefore delete-then-append (separate commits), never
-append-then-delete in a single commit.
+properties, the collapsed worker end to end (inline YAML → batcher →
+collapse → delete-then-append commits), and the full MySQL pipeline:
+binlog → DBLog snapshot → stream → Iceberg, with resume after downtime.
+All verified through Trino. Key finding: in `iceberg-go` v0.6.0 an append
+and an equality delete staged in one transaction produce **two** snapshots
+— the delete gets the higher sequence number and applies to the freshly
+appended file too. A correct upsert is therefore delete-then-append
+(separate commits), never append-then-delete in a single commit.
 
 ## Status
 
-Done: the Iceberg write path is proven by reading it
-back with Trino, and the collapsed worker (inline YAML spec, per-key
-collapse, delete-then-append committer with serialized retry) runs end to
-end. Next: the MySQL binlog reader (`go-mysql`) feeding
-the collapsed process, plus position resume. The v0.1.0 target is the
-experimental cut: stream-only replication, local mode.
+The MySQL source is in: one binlog reader per source (canal), DBLog
+snapshot with the caught-up proof (never a timer), per-key collapse and
+serialized commits in the worker, and resume from the cumulative GTID set
+committed atomically with the data. Next: Postgres source, or the
+multi-worker split.

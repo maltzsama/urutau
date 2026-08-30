@@ -38,6 +38,11 @@ func Collapse(changes []Change) Collapsed {
 	return out
 }
 
+// KeyString renders a primary key tuple into a unique map key. Strings are
+// prefixed so a string "1" never collides with the integer 1; elements are
+// joined with a unit separator so adjacent values cannot merge.
+func KeyString(key []any) string { return keyString(key) }
+
 // keyString renders a primary key tuple into a unique map key. Strings are
 // prefixed so a string "1" never collides with the integer 1; elements are
 // joined with a unit separator so adjacent values cannot merge.
