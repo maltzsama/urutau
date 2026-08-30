@@ -63,9 +63,8 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("mysql: chunker bounds: %w", err)
 		}
-		var key []any
-		key, err = scanRow(rows)
-		rows.Close()
+		key, err := scanRow(rows)
+		_ = rows.Close()
 		if err == sql.ErrNoRows {
 			break
 		}
@@ -121,7 +120,7 @@ func (c *Chunker) Scan(ctx context.Context, ch Chunk, fn func(row map[string]any
 	if err != nil {
 		return fmt.Errorf("mysql: chunk scan: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	colsMeta, err := rows.Columns()
 	if err != nil {
@@ -138,7 +137,7 @@ func (c *Chunker) Scan(ctx context.Context, ch Chunk, fn func(row map[string]any
 		}
 		m := make(map[string]any, len(colsMeta))
 		for i, name := range colsMeta {
-			m[name] = vals[i]
+			m[name] = normalize(vals[i])
 		}
 		if err := fn(m); err != nil {
 			return err
@@ -152,18 +151,18 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			return nil, err
-		}
-		return vals, nil
+	if !rows.Next() {
+		return nil, sql.ErrNoRows
 	}
-	return nil, sql.ErrNoRows
+	vals := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return nil, err
+	}
+	return vals, nil
 }
 
 func placeholders(n int) string {

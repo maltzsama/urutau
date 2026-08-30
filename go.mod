@@ -6,6 +6,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.7.0
 	github.com/apache/iceberg-go v0.6.0
 	github.com/go-mysql-org/go-mysql v1.16.0
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/spf13/cobra v1.10.2
 	github.com/trinodb/trino-go-client v0.333.0
 	google.golang.org/grpc v1.83.2

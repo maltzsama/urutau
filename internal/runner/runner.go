@@ -57,7 +57,7 @@ func Run(ctx context.Context, s *spec.Spec, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("runner: open query db: %w", err)
 	}
-	defer qdb.Close()
+	defer func() { _ = qdb.Close() }()
 
 	// Resolve source tables and their Iceberg schemas.
 	refs, schemas, err := resolveTables(ctx, qdb, s)
@@ -93,6 +93,10 @@ func Run(ctx context.Context, s *spec.Spec, cfg Config) error {
 	for target, wr := range writers {
 		w.Register(target, wr)
 	}
+	w.OnCommit(func(b change.Batch, rows int) {
+		log.Info("commit", "table", b.Table, "rows", rows,
+			"upserts", len(b.Upserts), "deletes", len(b.Deletes), "position", b.Position)
+	})
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
 

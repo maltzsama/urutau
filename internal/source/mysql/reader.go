@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
 	"sync"
 	"time"
@@ -47,7 +48,8 @@ type Reader struct {
 	out     chan<- change.Change
 	bySrc   map[string]TableRef // "db.table" → ref (PK + target)
 	mu      sync.Mutex
-	curGTID string // GTID of the transaction being decoded
+	curSet  *position.GTID // accumulated GTID set through the current transaction
+	curGTID string         // curSet.String() — the position rows of this txn carry
 
 	canal.DummyEventHandler // unimplemented hooks are no-ops
 }
@@ -69,6 +71,7 @@ func New(ctx context.Context, cfg Config, out chan<- change.Change) (*Reader, er
 		User:              cfg.User,
 		Password:          cfg.Password,
 		ServerID:          cfg.ServerID,
+		Flavor:            "mysql",
 		HeartbeatPeriod:   cfg.Heartbeat,
 		ReadTimeout:       60 * time.Second,
 		IncludeTableRegex: incl,
@@ -87,6 +90,10 @@ func New(ctx context.Context, cfg Config, out chan<- change.Change) (*Reader, er
 // StartFromGTID begins streaming from the given GTID set, blocking until
 // the stream ends or the context is cancelled. Call in a goroutine.
 func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error {
+	r.cfg.Logger.Info("reader start", "from", start.String())
+	r.mu.Lock()
+	r.curSet = start
+	r.mu.Unlock()
 	if err := r.canal.StartFromGTID(start.Raw()); err != nil {
 		return fmt.Errorf("mysql: start from gtid %s: %w", start, err)
 	}
@@ -127,12 +134,23 @@ func (r *Reader) Close() { r.canal.Close() }
 // ── canal.EventHandler ──────────────────────────────────────────────
 
 func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {
-	set, err := e.GTIDNext()
+	next, err := e.GTIDNext()
 	if err != nil {
 		return fmt.Errorf("mysql: gtid next: %w", err)
 	}
+	g, err := position.ParseGTID(next.String())
+	if err != nil {
+		return fmt.Errorf("mysql: gtid next parse: %w", err)
+	}
 	r.mu.Lock()
-	r.curGTID = set.String()
+	if r.curSet == nil {
+		r.curSet = position.MustGTID("")
+	}
+	// A resume position is a CUMULATIVE set: "everything up to and including
+	// this transaction". Merging the single next GTID into the running set
+	// yields "uuid:1-N", which is the safe point to resume from.
+	r.curSet.Add(g)
+	r.curGTID = r.curSet.String()
 	r.mu.Unlock()
 	return nil
 }
@@ -146,6 +164,10 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	r.mu.Lock()
 	pos := r.curGTID
 	r.mu.Unlock()
+
+	if dbg := r.cfg.Logger; dbg != nil && os.Getenv("URUTAU_DEBUG_READER") != "" {
+		dbg.Info("row", "table", ref.Source, "action", e.Action, "pos", pos, "nrows", len(e.Rows))
+	}
 
 	switch e.Action {
 	case canal.InsertAction:
@@ -198,12 +220,22 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op change.Op, after, be
 }
 
 // rowToMap maps a row (in table column order) to column-name → value.
+// The binlog yields []byte for string columns; normalize them to string so
+// the writer's scalar type switch accepts them.
 func rowToMap(tbl *schema.Table, row []any) map[string]any {
 	out := make(map[string]any, len(tbl.Columns))
 	for i, col := range tbl.Columns {
-		if i < len(row) {
-			out[col.Name] = row[i]
+		if i >= len(row) {
+			continue
 		}
+		out[col.Name] = normalize(row[i])
 	}
 	return out
+}
+
+func normalize(v any) any {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return v
 }

@@ -38,14 +38,14 @@ func runCmd() *cobra.Command {
 		windowTimeout time.Duration
 	)
 	cmd := &cobra.Command{
-		Use:   "run --local",
-		Short: "Run the collapsed pipeline from a YAML spec",
+		Use:   "run",
+		Short: "Run the pipeline from a YAML spec",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f, err := os.Open(file)
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			s, err := spec.LoadYAML(f)
 			if err != nil {
 				return err
@@ -65,6 +65,7 @@ func runCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "pipeline.yaml", "pipeline spec (inline YAML)")
+	cmd.Flags().Bool("local", true, "run in collapsed (single process) mode")
 	cmd.Flags().Uint32Var(&serverID, "server-id", 1101, "MySQL server id for this replicator")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 10000, "DBLog snapshot chunk size (rows per chunk)")
 	cmd.Flags().DurationVar(&windowTimeout, "window-timeout", 5*time.Minute, "DBLog window timeout (pathology detector)")

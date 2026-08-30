@@ -36,7 +36,7 @@ func TestWindowSnapshotSingleBatch(t *testing.T) {
 	// live UPDATE of id=1 inside the window: must discard the stale v=a row.
 	ingest <- change.Change{
 		Op: change.OpUpdate, Table: "raw.orders", Key: []any{int64(1)},
-		After:  map[string]any{"id": int64(1), "v": "b"},
+		After:    map[string]any{"id": int64(1), "v": "b"},
 		Position: "p1",
 		Window:   &change.Window{ChunkID: 7, InWindow: true},
 	}
