@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+package urutau.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1;pb";
+
+// Control plane: handshake, acks, and chunks. Carries NO data.
+service UrutauControl {
+  rpc Session(stream WorkerMessage) returns (stream CoordinatorMessage);
+  // Urgent signals on the SAME ClientConn — never queued behind data.
+  rpc Control(stream WorkerMessage) returns (stream ControlMessage);
+}
+
+message WorkerMessage {
+  oneof msg {
+    Hello       hello        = 1;
+    Ack         ack          = 2;
+    ChunkReady  chunk_ready  = 3;
+    ChunkFailed chunk_failed = 4;
+    WorkerError error        = 5;
+  }
+}
+
+message CoordinatorMessage {
+  oneof msg {
+    Assignment   assign = 1;
+    ChunkRequest chunk  = 2;
+  }
+}
+
+message ControlMessage {
+  oneof msg {
+    Pause    pause    = 1;
+    Shutdown shutdown = 2;
+  }
+}
+
+// ── Handshake ────────────────────────────────────────────────────────────
+enum WorkerPhase {
+  WORKER_PHASE_UNSPECIFIED  = 0;
+  WORKER_PHASE_STARTING     = 1;
+  WORKER_PHASE_SNAPSHOTTING = 2;  // → coordinator re-issues pending chunks
+  WORKER_PHASE_STREAMING    = 3;  // → coordinator opens an interval reader
+}
+
+message Hello {
+  string      worker_name  = 1;
+  string      pod_uid      = 2;   // detects zombies
+  uint64      epoch        = 3;   // bumped on every reset
+  WorkerPhase phase        = 4;   // decides the recovery path
+  string      image_digest = 5;   // detects image skew
+
+  // target_table → committed position, read from the Iceberg table property.
+  map<string, string> committed = 6;
+  // Chunk ids already completed, per source table. Lets the coordinator
+  // re-issue only what is pending after a mid-snapshot restart.
+  map<string, ChunkIds> completed_chunks = 7;
+}
+
+message ChunkIds {
+  repeated uint32 ids = 1;
+}
+
+// ── Assignment ───────────────────────────────────────────────────────────
+enum WriteMode {
+  WRITE_MODE_UNSPECIFIED = 0;
+  WRITE_MODE_UPSERT      = 1;
+  WRITE_MODE_APPEND      = 2;
+}
+
+message TableAssignment {
+  string    source_table         = 1;  // "shop.orders"
+  string    target_table         = 2;  // "lakehouse.orders"
+  WriteMode write_mode           = 3;
+  repeated string primary_key    = 4;  // equality-delete key; required on upsert
+  repeated string partition_by   = 5;  // native Iceberg transforms
+  bool      include_before       = 6;  // derived: true only with a mutable-column filter
+  bool      create_if_not_exists = 7;
+}
+
+message BatchConfig {
+  int64                    max_bytes    = 1;
+  google.protobuf.Duration max_interval = 2;
+}
+
+message Assignment {
+  string      worker_name = 1;
+  uint64      epoch       = 2;
+  string      run_id      = 3;
+  bytes       ticket      = 4;  // Flight DoGet ticket
+  repeated TableAssignment tables = 5;
+  BatchConfig batching    = 6;  // already resolved, including worker override
+  string      resume_from = 7;  // min() position this worker resumes from
+}
+
+// ── Acks ─────────────────────────────────────────────────────────────────
+message Ack {
+  uint64 batch_id = 1;
+  uint64 epoch    = 2;  // stale-epoch acks are rejected
+  string table    = 3;  // target table
+  string position = 4;  // position AFTER the Iceberg commit
+  uint64 rows     = 5;
+  uint64 deletes  = 6;  // equality deletes written — feeds collapse_ratio
+  google.protobuf.Duration commit_duration = 7;
+}
+
+// ── DBLog chunks ─────────────────────────────────────────────────────────
+message ChunkRequest {
+  string table          = 1;  // source table
+  uint32 chunk_id       = 2;
+  bytes  low            = 3;  // lower PK bound (lexicographic tuple)
+  bytes  high           = 4;  // upper PK bound
+  bool   inclusive_high = 5;  // true only on the last chunk
+}
+
+message ChunkReady {
+  string table             = 1;  // disambiguates parallel chunks
+  uint32 chunk_id          = 2;
+  uint64 rows              = 3;
+  uint64 dropped_by_window = 4;  // proves DBLog is working
+}
+
+message ChunkFailed {
+  string     table    = 1;
+  uint32     chunk_id = 2;
+  ErrorClass class    = 3;
+  string     detail   = 4;
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
+enum ErrorClass {
+  ERROR_CLASS_UNSPECIFIED  = 0;
+  ERROR_CLASS_TRANSIENT    = 1;  // retry with backoff
+  ERROR_CLASS_WORKER_FATAL = 2;  // kill the worker → reset
+  ERROR_CLASS_JOB_FATAL    = 3;  // terminal
+  ERROR_CLASS_NEEDS_HUMAN  = 4;  // pause, wait for intervention
+}
+
+message WorkerError {
+  ErrorClass class  = 1;
+  string     code   = 2;  // stable machine-readable id, e.g. "commit_exhausted"
+  string     detail = 3;
+  string     table  = 4;  // optional
+}
+
+// ── Control signals ──────────────────────────────────────────────────────
+message Pause {
+  string reason = 1;
+  string table  = 2;  // schema mismatch pauses ONE table, not the whole worker
+}
+
+message Shutdown {
+  google.protobuf.Duration grace = 1;
+  // true  → flush + commit + ack in-flight, exit 0 (graceful)
+  // false → abort in-flight transactions, exit 1
+  bool drain = 2;
+}
+
+// ── Data plane ───────────────────────────────────────────────────────────
+// The FlightData body is raw Arrow IPC; BatchMeta travels in
+// FlightData.app_metadata.
+message BatchMeta {
+  string    table    = 1;  // target table
+  string    low_pos  = 2;
+  string    high_pos = 3;
+  uint64    batch_id = 4;
+  uint64    epoch    = 5;  // same guard as Ack
+  WindowTag window   = 6;
+}
+
+message WindowTag {
+  bool   in_window = 1;
+  bool   closes    = 2;
+  uint32 chunk_id  = 3;
+}
