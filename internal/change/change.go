@@ -38,6 +38,19 @@ type Change struct {
 	Before   map[string]any
 	Position string
 	CommitTS time.Time
+	// Window tags the change as part of a DBLog snapshot window. Nil for
+	// plain stream events.
+	Window *Window
+}
+
+// Window carries DBLog snapshot-window signaling on a change. The runner
+// tags live events that fall inside [low, high] with InWindow so the
+// batcher discards the superseded snapshot row, and emits a Closes marker
+// (with no row payload) once the reader has provably caught up past high.
+type Window struct {
+	ChunkID  uint32
+	InWindow bool
+	Closes   bool
 }
 
 // Collapsed is the reduced state of a batch after per-key collapse: the last
