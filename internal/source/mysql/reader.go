@@ -51,7 +51,29 @@ type Reader struct {
 	curSet  *position.GTID // accumulated GTID set through the current transaction
 	curGTID string         // curSet.String() — the position rows of this txn carry
 
+	winMu    sync.Mutex
+	winChunk uint32 // chunkID of the open DBLog window, when winOpen
+	winOpen  bool
+
 	canal.DummyEventHandler // unimplemented hooks are no-ops
+}
+
+// MarkWindow opens the DBLog window for chunkID: every row event decoded
+// from now on is tagged InWindow for that chunk, until ClearWindow. The tag
+// is applied synchronously at decode — no event can escape the window by
+// racing a channel pull.
+func (r *Reader) MarkWindow(chunkID uint32) {
+	r.winMu.Lock()
+	r.winOpen = true
+	r.winChunk = chunkID
+	r.winMu.Unlock()
+}
+
+// ClearWindow closes the DBLog window opened by MarkWindow.
+func (r *Reader) ClearWindow() {
+	r.winMu.Lock()
+	r.winOpen = false
+	r.winMu.Unlock()
 }
 
 // New builds the reader but does not start it.
@@ -94,18 +116,22 @@ func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error 
 	r.mu.Lock()
 	r.curSet = start
 	r.mu.Unlock()
-	if err := r.canal.StartFromGTID(start.Raw()); err != nil {
-		return fmt.Errorf("mysql: start from gtid %s: %w", start, err)
-	}
+
+	// canal.StartFromGTID runs the stream to completion — it must be the
+	// ONLY sync loop. A second canal.Run() would kill the first
+	// connection ("kill last connection" / "Sync was closed").
 	done := make(chan error, 1)
-	go func() { done <- r.canal.Run() }()
+	go func() { done <- r.canal.StartFromGTID(start.Raw()) }()
 
 	select {
 	case <-ctx.Done():
 		r.canal.Close()
 		return ctx.Err()
 	case err := <-done:
-		return fmt.Errorf("mysql: stream ended: %w", err)
+		if err != nil {
+			return fmt.Errorf("mysql: stream ended: %w", err)
+		}
+		return nil
 	}
 }
 
@@ -142,17 +168,22 @@ func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) e
 	if err != nil {
 		return fmt.Errorf("mysql: gtid next parse: %w", err)
 	}
+	r.mergeGTID(g)
+	return nil
+}
+
+// mergeGTID folds one transaction GTID into the cumulative resume set. A
+// resume position is a CUMULATIVE set — "everything up to and including this
+// transaction" ("uuid:1-N") — not the single transaction GTID: starting from
+// a lone {N} makes the master replay everything except N.
+func (r *Reader) mergeGTID(g *position.GTID) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.curSet == nil {
 		r.curSet = position.MustGTID("")
 	}
-	// A resume position is a CUMULATIVE set: "everything up to and including
-	// this transaction". Merging the single next GTID into the running set
-	// yields "uuid:1-N", which is the safe point to resume from.
 	r.curSet.Add(g)
 	r.curGTID = r.curSet.String()
-	r.mu.Unlock()
-	return nil
 }
 
 func (r *Reader) OnRow(e *canal.RowsEvent) error {
@@ -163,25 +194,38 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 
 	r.mu.Lock()
 	pos := r.curGTID
+	r.winMu.Lock()
+	var win *change.Window
+	if r.winOpen {
+		win = &change.Window{ChunkID: r.winChunk, InWindow: true}
+	}
+	r.winMu.Unlock()
 	r.mu.Unlock()
 
 	if dbg := r.cfg.Logger; dbg != nil && os.Getenv("URUTAU_DEBUG_READER") != "" {
-		dbg.Info("row", "table", ref.Source, "action", e.Action, "pos", pos, "nrows", len(e.Rows))
+		dbg.Info("row", "table", ref.Source, "action", e.Action, "pos", pos,
+			"nrows", len(e.Rows), "win", win)
 	}
 
 	switch e.Action {
 	case canal.InsertAction:
 		for _, row := range e.Rows {
-			r.out <- r.decode(ref, e.Table, change.OpInsert, row, nil, pos)
+			c := r.decode(ref, e.Table, change.OpInsert, row, nil, pos)
+			c.Window = win
+			r.out <- c
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			r.out <- r.decode(ref, e.Table, change.OpDelete, row, nil, pos)
+			c := r.decode(ref, e.Table, change.OpDelete, row, nil, pos)
+			c.Window = win
+			r.out <- c
 		}
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
-			r.out <- r.decode(ref, e.Table, change.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
+			c := r.decode(ref, e.Table, change.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
+			c.Window = win
+			r.out <- c
 		}
 	}
 	return nil

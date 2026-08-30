@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/sink/iceberg"
 )
 
 // Config tunes batch accumulation.
@@ -40,16 +41,16 @@ type tablePipeline struct {
 	committer Committer
 	ch        chan change.Change
 
-	// DBLog snapshot window, per design: the chunk SELECT rows land here
-	// (AddWindowRows) and live events tagged InWindow remove their key; the
-	// Closes marker flushes what remains. Guarded by winMu because the
-	// runner (snapshot orchestrator) populates it while the batcher goroutine
-	// consumes events.
-	winMu         sync.Mutex
-	windowOpen    bool
-	windowChunkID uint32
-	chunkWindow   map[string]change.Change
-	dropped       int64
+	// DBLog snapshot windows, per design: each chunk's SELECT rows land in
+	// their own window (AddWindowRows); live events tagged InWindow remove
+	// their key from that chunk's window; the chunk's Closes marker flushes
+	// what remains. Windows are keyed by chunkID because the orchestrator
+	// may populate chunk N+1 while the batcher is still draining chunk N's
+	// buffered release. Guarded by winMu: the runner (snapshot orchestrator)
+	// populates windows while the batcher goroutine consumes events.
+	winMu   sync.Mutex
+	windows map[uint32]map[string]change.Change
+	dropped int64
 }
 
 // New builds a worker; register tables before Run.
@@ -64,15 +65,29 @@ func New(cfg Config) *Worker {
 func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
 
 // Register wires a committer to a target table.
-func (w *Worker) Register(target string, c Committer) {
-	w.tables[target] = &tablePipeline{target: target, committer: c, ch: make(chan change.Change, 1024)}
+func (w *Worker) Register(target string, c *iceberg.TableWriter) {
+	w.tables[target] = newTablePipeline(target, c)
 }
 
-// AddWindowRows feeds the chunk SELECT result of a DBLog snapshot window
-// into the table's batcher. The rows are held until the window closes: a
-// live event tagged InWindow discards its key (the live version wins), and
-// the Closes marker emits whatever is left. The runner calls this between
-// the chunk SELECT and releasing the buffered events of [low, high].
+// RegisterCommitter wires a committer to a target table (for tests).
+func (w *Worker) RegisterCommitter(target string, c Committer) {
+	w.tables[target] = newTablePipeline(target, c)
+}
+
+func newTablePipeline(target string, c Committer) *tablePipeline {
+	return &tablePipeline{
+		target:    target,
+		committer: c,
+		ch:        make(chan change.Change, 1024),
+		windows:   map[uint32]map[string]change.Change{},
+	}
+}
+
+// AddWindowRows feeds one chunk's SELECT result of a DBLog snapshot window
+// into the table's batcher. The rows are held in that chunk's window until
+// its Closes marker: a live event tagged InWindow discards its key (the live
+// version wins). Chunks are independent — a previous chunk may still be
+// draining while a new one opens.
 func (w *Worker) AddWindowRows(target string, chunkID uint32, rows []change.Change) error {
 	p, ok := w.tables[target]
 	if !ok {
@@ -80,16 +95,13 @@ func (w *Worker) AddWindowRows(target string, chunkID uint32, rows []change.Chan
 	}
 	p.winMu.Lock()
 	defer p.winMu.Unlock()
-	if p.windowOpen && p.windowChunkID != chunkID {
-		return fmt.Errorf("worker: table %s: window for chunk %d already open", target, p.windowChunkID)
-	}
-	if !p.windowOpen {
-		p.windowOpen = true
-		p.windowChunkID = chunkID
-		p.chunkWindow = make(map[string]change.Change, len(rows))
+	win, ok := p.windows[chunkID]
+	if !ok {
+		win = make(map[string]change.Change, len(rows))
+		p.windows[chunkID] = win
 	}
 	for _, r := range rows {
-		p.chunkWindow[change.KeyString(r.Key)] = r
+		win[change.KeyString(r.Key)] = r
 	}
 	return nil
 }
@@ -191,24 +203,26 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 			}
 			// DBLog window application, design §3.4: an InWindow event is
 			// itself a real change — it removes its snapshot row from the
-			// window (the live version wins) and is then appended normally.
-			// The Closes marker flushes what remains as inserts and is not a
-			// row.
+			// chunk's window (the live version wins) and is then appended
+			// normally. The chunk's Closes marker flushes what remains as
+			// inserts; markers for unknown chunks are stale and dropped.
 			if c.Window != nil {
 				p.winMu.Lock()
-				if c.Window.InWindow && p.windowOpen && c.Window.ChunkID == p.windowChunkID {
-					if _, hit := p.chunkWindow[change.KeyString(c.Key)]; hit {
-						delete(p.chunkWindow, change.KeyString(c.Key))
+				win := p.windows[c.Window.ChunkID]
+				if c.Window.InWindow && win != nil {
+					if _, hit := win[change.KeyString(c.Key)]; hit {
+						delete(win, change.KeyString(c.Key))
 						p.dropped++
 					}
 				}
-				if c.Window.Closes && p.windowOpen && c.Window.ChunkID == p.windowChunkID {
-					for _, row := range p.chunkWindow {
-						row.Position = c.Position
-						buf = append(buf, row)
+				if c.Window.Closes {
+					if win != nil {
+						for _, row := range win {
+							row.Position = c.Position
+							buf = append(buf, row)
+						}
+						delete(p.windows, c.Window.ChunkID)
 					}
-					p.chunkWindow = nil
-					p.windowOpen = false
 					p.winMu.Unlock()
 					continue // the Closes marker is not a data row
 				}

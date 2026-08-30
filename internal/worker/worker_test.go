@@ -39,7 +39,7 @@ func runWorker(t *testing.T, cfg Config, targets []string, committers map[string
 	t.Helper()
 	w := New(cfg)
 	for _, target := range targets {
-		w.Register(target, committers[target])
+		w.RegisterCommitter(target, committers[target])
 	}
 	ingest := make(chan change.Change, len(changes)+1)
 	for _, c := range changes {
@@ -99,7 +99,7 @@ func TestFlushByMaxRows(t *testing.T) {
 func TestFlushByInterval(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: 30 * time.Millisecond})
-	w.Register("t", fc)
+	w.RegisterCommitter("t", fc)
 
 	ingest := make(chan change.Change, 2)
 	done := make(chan error, 1)

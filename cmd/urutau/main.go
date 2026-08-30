@@ -53,7 +53,7 @@ func runCmd() *cobra.Command {
 			if err := s.Validate(); err != nil {
 				return err
 			}
-			return runner.Run(cmd.Context(), s, runner.Config{
+			r, err := runner.NewRunner(cmd.Context(), s, runner.Config{
 				ServerID:      serverID,
 				Heartbeat:     5 * time.Second,
 				ChunkSize:     chunkSize,
@@ -62,6 +62,10 @@ func runCmd() *cobra.Command {
 				MaxRows:       1000,
 				MaxInterval:   5 * time.Second,
 			})
+			if err != nil {
+				return err
+			}
+			return r.Run(cmd.Context())
 		},
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "pipeline.yaml", "pipeline spec (inline YAML)")
