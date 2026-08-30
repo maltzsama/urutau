@@ -29,9 +29,13 @@ type Source struct {
 }
 
 type Sink struct {
-	URI       string   `json:"uri"`
-	Namespace string   `json:"namespace"`
-	Defaults  Defaults `json:"defaults"`
+	URI          string   `json:"uri"`
+	Namespace    string   `json:"namespace"`
+	Warehouse    string   `json:"warehouse,omitempty"`
+	ClientID     string   `json:"clientId,omitempty"`
+	ClientSecret string   `json:"clientSecret,omitempty"`
+	Scope        string   `json:"scope,omitempty"`
+	Defaults     Defaults `json:"defaults"`
 }
 
 type Defaults struct {
