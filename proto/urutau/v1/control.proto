@@ -78,6 +78,7 @@ message TableAssignment {
   repeated string partition_by   = 5;  // native Iceberg transforms
   bool      include_before       = 6;  // derived: true only with a mutable-column filter
   bool      create_if_not_exists = 7;
+  string    schema_json          = 8;  // Iceberg schema (JSON) — the coordinator owns introspection
 }
 
 message BatchConfig {
@@ -174,4 +175,5 @@ message WindowTag {
   bool   in_window = 1;
   bool   closes    = 2;
   uint32 chunk_id  = 3;
+  bool   snapshot  = 4;  // true → rows feed AddWindowRows, not the ingest path
 }

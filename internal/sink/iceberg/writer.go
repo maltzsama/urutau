@@ -274,8 +274,10 @@ func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, er
 }
 
 // appendColumn appends values into a builder, tolerating a small, explicit
-// set of scalar types (int64, string, float64, bool). Anything else is an
-// error — silent coercion is how type bugs are born.
+// set of scalar types. Numeric coercion is schema-directed, not silent: the
+// Iceberg column type is authoritative, and JSON-based wire formats cannot
+// distinguish whole floats from ints, so int64 may arrive for a double
+// column and vice versa.
 func appendColumn(builder array.Builder, name string, values []any) error {
 	switch b := builder.(type) {
 	case *array.Int64Builder:
@@ -288,6 +290,11 @@ func appendColumn(builder array.Builder, name string, values []any) error {
 			case int:
 				b.Append(int64(t))
 			case int32:
+				b.Append(int64(t))
+			case float64:
+				if t != float64(int64(t)) {
+					return fmt.Errorf("iceberg: column %q: cannot append %v as int64", name, v)
+				}
 				b.Append(int64(t))
 			default:
 				return fmt.Errorf("iceberg: column %q: cannot append %T as int64", name, v)
@@ -312,6 +319,12 @@ func appendColumn(builder array.Builder, name string, values []any) error {
 			case float64:
 				b.Append(t)
 			case float32:
+				b.Append(float64(t))
+			case int64:
+				b.Append(float64(t))
+			case int:
+				b.Append(float64(t))
+			case int32:
 				b.Append(float64(t))
 			default:
 				return fmt.Errorf("iceberg: column %q: cannot append %T as double", name, v)
