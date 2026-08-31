@@ -20,6 +20,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/internal/spec"
 )
 
 // TableRef maps one source table to its target and primary key.
@@ -27,6 +28,7 @@ type TableRef struct {
 	Source     string // "db.table"
 	Target     string // "raw.orders"
 	PrimaryKey []string
+	Filter     *spec.Filter // optional row filter; nil replicates everything
 }
 
 // Config dials one MySQL instance. One replication connection per source —
@@ -212,23 +214,95 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 		for _, row := range e.Rows {
 			c := r.decode(ref, e.Table, change.OpInsert, row, nil, pos)
 			c.Window = win
-			r.out <- c
+			if c2 := applyFilter(ref, e.Table, change.OpInsert, row, nil, c); c2 != nil {
+				r.out <- *c2
+			}
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, change.OpDelete, row, nil, pos)
+			// For deletes the removed row rides in the event's row slot;
+			// decode carries it as the before image so filter membership
+			// can be evaluated.
+			c := r.decode(ref, e.Table, change.OpDelete, row, row, pos)
 			c.Window = win
-			r.out <- c
+			if c2 := applyFilter(ref, e.Table, change.OpDelete, row, row, c); c2 != nil {
+				r.out <- *c2
+			}
 		}
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
-			c := r.decode(ref, e.Table, change.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
+			before, after := e.Rows[i], e.Rows[i+1]
+			c := r.decode(ref, e.Table, change.OpUpdate, after, before, pos)
 			c.Window = win
-			r.out <- c
+			if c2 := applyFilter(ref, e.Table, change.OpUpdate, after, before, c); c2 != nil {
+				r.out <- *c2
+			}
 		}
 	}
 	return nil
+}
+
+// applyFilter implements the membership transition matrix for a filtered
+// table: a row leaving the filter becomes a delete; a row entering becomes
+// an insert; a row outside on both sides is dropped. Inserts and deletes
+// outside the filter are dropped too. Updates require before images
+// (row_image FULL); a delete without a before image is kept — deleting a
+// key that is not a member is a no-op at the sink.
+func applyFilter(ref TableRef, tbl *schema.Table, op change.Op, after, before []any, c change.Change) *change.Change {
+	if ref.Filter == nil {
+		return &c
+	}
+
+	switch op {
+	case change.OpInsert:
+		if ref.Filter.Matches(c.After) {
+			return &c
+		}
+		return nil
+	case change.OpDelete:
+		if c.Before == nil || ref.Filter.Matches(c.Before) {
+			return &c
+		}
+		return nil
+	case change.OpUpdate:
+		inBefore := c.Before != nil && ref.Filter.Matches(c.Before)
+		inAfter := ref.Filter.Matches(c.After)
+		switch {
+		case inBefore && inAfter:
+			return &c
+		case inBefore && !inAfter:
+			// The row left the filter: reflect the removal.
+			return &change.Change{
+				Op:       change.OpDelete,
+				Table:    c.Table,
+				Key:      keyFromRow(tbl, ref.PrimaryKey, before),
+				Before:   c.Before,
+				Position: c.Position,
+				Window:   c.Window,
+			}
+		case !inBefore && inAfter:
+			// The row entered the filter: emit as an insert.
+			c.Op = change.OpInsert
+			return &c
+		default:
+			return nil
+		}
+	}
+	return &c
+}
+
+// keyFromRow builds the PK key from a raw row (table column order).
+func keyFromRow(tbl *schema.Table, pk []string, row []any) []any {
+	key := make([]any, 0, len(pk))
+	for _, col := range pk {
+		if idx := tbl.FindColumn(col); idx >= 0 && idx < len(row) {
+			key = append(key, normalize(row[idx]))
+		} else {
+			key = append(key, nil)
+		}
+	}
+	return key
 }
 
 // decode maps one row (in table column order) to a change. key is built from

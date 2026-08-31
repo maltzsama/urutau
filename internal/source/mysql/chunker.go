@@ -26,6 +26,18 @@ type Chunker struct {
 	table     string
 	pk        []string
 	chunkSize int
+
+	filterSQL  string // optional pushed-down row filter (parameterized)
+	filterArgs []any
+}
+
+// WithFilter pushes a row filter (a rendered, parameterized WHERE fragment)
+// into every chunk SELECT, so the snapshot only carries rows inside the
+// filter. Composed with the chunk bounds by AND.
+func (c *Chunker) WithFilter(where string, args []any) *Chunker {
+	c.filterSQL = where
+	c.filterArgs = args
+	return c
 }
 
 // NewChunker builds a chunker for one source table.
@@ -93,29 +105,14 @@ func Chunks(bounds [][]any) []Chunk {
 	return out
 }
 
-// Scan executes the chunk SELECT (with the row-filter WHERE pushed — none
-// yet in this milestone) and calls fn for every row, keyed by column name.
+// Scan executes the chunk SELECT (chunk bounds AND the pushed-down row
+// filter, if any) and calls fn for every row, keyed by column name.
 func (c *Chunker) Scan(ctx context.Context, ch Chunk, fn func(row map[string]any) error) error {
-	// Row-constructor comparison keeps composite PKs lexicographic.
-	cond := make([]string, 0, 2)
-	args := make([]any, 0, 2*len(c.pk))
-	cols := "`" + strings.Join(c.pk, "`, `") + "`"
-
-	if ch.Low != nil {
-		cond = append(cond, fmt.Sprintf("(%s) >= (%s)", cols, placeholders(len(c.pk))))
-		args = append(args, ch.Low...)
-	}
-	if ch.High != nil {
-		cond = append(cond, fmt.Sprintf("(%s) < (%s)", cols, placeholders(len(c.pk))))
-		args = append(args, ch.High...)
-	}
-	where := ""
-	if len(cond) > 0 {
-		where = " WHERE " + strings.Join(cond, " AND ")
-	}
+	where, args := chunkWhere(ch, c.pk, c.filterSQL, c.filterArgs)
 
 	// With no row filter the SELECT must still read the whole row; select *
 	// keeps it simple and correct for the spike.
+	cols := "`" + strings.Join(c.pk, "`, `") + "`"
 	query := fmt.Sprintf("SELECT * FROM `%s`.`%s`%s ORDER BY %s",
 		c.schema, c.table, where, cols)
 
@@ -147,6 +144,32 @@ func (c *Chunker) Scan(ctx context.Context, ch Chunk, fn func(row map[string]any
 		}
 	}
 	return rows.Err()
+}
+
+// chunkWhere composes the chunk bounds (half-open PK range; row-constructor
+// comparison keeps composite PKs lexicographic) with an optional pushed-down
+// filter fragment. Bound args come first, filter args last.
+func chunkWhere(ch Chunk, pk []string, filterSQL string, filterArgs []any) (string, []any) {
+	cond := make([]string, 0, 2)
+	cols := "`" + strings.Join(pk, "`, `") + "`"
+	args := make([]any, 0, 2*len(pk)+len(filterArgs))
+
+	if ch.Low != nil {
+		cond = append(cond, fmt.Sprintf("(%s) >= (%s)", cols, placeholders(len(pk))))
+		args = append(args, ch.Low...)
+	}
+	if ch.High != nil {
+		cond = append(cond, fmt.Sprintf("(%s) < (%s)", cols, placeholders(len(pk))))
+		args = append(args, ch.High...)
+	}
+	if filterSQL != "" {
+		cond = append(cond, filterSQL)
+		args = append(args, filterArgs...)
+	}
+	if len(cond) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(cond, " AND "), args
 }
 
 func scanRow(rows *sql.Rows) ([]any, error) {
