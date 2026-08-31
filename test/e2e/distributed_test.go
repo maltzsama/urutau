@@ -32,6 +32,8 @@ func TestDistributedPipeline(t *testing.T) {
 	_ = lis.Close()
 
 	s := loadPipeline(t)
+	// Name the worker group so the Hello ("w1") matches the registry.
+	s.Tables[0].Worker = "w1"
 	db := mysqlConn(t)
 	resetBinlog(t, db)
 	dropIcebergTable(t, ctx)

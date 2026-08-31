@@ -1,8 +1,10 @@
 // Package coordinator drives the source side of the split pipeline: it owns
 // the replication reader and the DBLog snapshot, serves the control plane
 // (Session/Assignment) and the Arrow Flight data plane, and streams change
-// batches to connected workers. One worker is validated in this milestone;
-// the session registry already scales beyond it.
+// batches to the connected workers. Tables map to worker groups
+// (spec.Tables[].Worker; a table without a group owns its own worker), each
+// group gets its own Flight queue, and one batch always routes to exactly
+// one worker.
 package coordinator
 
 import (
@@ -15,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -36,9 +39,6 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
-// dataTicket is the Flight ticket the (single) worker's DoGet consumes.
-var dataTicket = []byte("urutau-data")
-
 // Config tunes the coordinator for one pipeline.
 type Config struct {
 	Spec       *spec.Spec
@@ -50,12 +50,16 @@ type Config struct {
 	ServerID      uint32
 	Heartbeat     time.Duration
 
-	// WaitWorker bounds how long the coordinator waits for the first
+	// WaitWorker bounds how long the coordinator waits for every expected
 	// worker session before failing the boot.
 	WaitWorker time.Duration
 
 	Logger *slog.Logger
 }
+
+// workerQueueCap bounds one worker's in-flight batches — the structural
+// backpressure hop of design §1.1 (workerCh cap 64).
+const workerQueueCap = 64
 
 // queuedBatch is one encoded batch waiting for the Flight stream.
 type queuedBatch struct {
@@ -73,17 +77,36 @@ type Coordinator struct {
 	refs  []dblog.TableRef
 	cat   *rest.Catalog
 
-	queue chan queuedBatch
+	// Worker registry: groups resolved at boot from the spec, one queue and
+	// one ticket each; route maps every target table to its owning worker.
+	route    map[string]*workerState
+	workers  map[string]*workerState
+	byTicket map[string]*workerState
 
-	session    *workerSession // single-worker milestone
-	sessionSet chan struct{}
+	ready       chan struct{} // one send per attached session
+	sessionErrs chan error    // first exit wins
+	mu          sync.Mutex    // guards session attach/detach
 }
 
-// workerSession is one connected worker's control surface.
-type workerSession struct {
-	name string
-	out  chan *pb.CoordinatorMessage
-	done chan error
+// workerState is one worker group's slice of the pipeline: its tables, its
+// Flight queue, and — once it connects — its control surface.
+type workerState struct {
+	name   string
+	refs   []dblog.TableRef
+	queue  chan queuedBatch
+	ticket []byte
+
+	out      chan *pb.CoordinatorMessage // attached by Session
+	attached bool
+}
+
+// workerName resolves the worker group of one spec table: the explicit
+// worker= grouping, or the table's own pod (1:1 default).
+func workerName(t spec.Table) string {
+	if t.Worker != "" {
+		return t.Worker
+	}
+	return t.Target
 }
 
 // Run boots the pipeline and blocks until ctx is cancelled or a terminal
@@ -93,10 +116,13 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Logger = slog.Default()
 	}
 	c := &Coordinator{
-		cfg:        cfg,
-		log:        cfg.Logger,
-		queue:      make(chan queuedBatch, 1024),
-		sessionSet: make(chan struct{}),
+		cfg:         cfg,
+		log:         cfg.Logger,
+		route:       map[string]*workerState{},
+		workers:     map[string]*workerState{},
+		byTicket:    map[string]*workerState{},
+		ready:       make(chan struct{}, 1024),
+		sessionErrs: make(chan error, 1024),
 	}
 	return c.run(ctx)
 }
@@ -133,6 +159,26 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 	c.refs = refs
 
+	// Resolve worker groups: explicit worker= or the table's own pod.
+	for i, t := range c.cfg.Spec.Tables {
+		name := workerName(t)
+		w, ok := c.workers[name]
+		if !ok {
+			w = &workerState{
+				name:   name,
+				queue:  make(chan queuedBatch, workerQueueCap),
+				ticket: []byte("urutau/" + name),
+			}
+			c.workers[name] = w
+			c.byTicket[string(w.ticket)] = w
+		}
+		w.refs = append(w.refs, refs[i])
+		c.route[t.Target] = w
+	}
+	for _, w := range c.workers {
+		c.log.Info("coordinator worker group", "worker", w.name, "tables", len(w.refs))
+	}
+
 	// Catalog + tables: the coordinator owns DDL.
 	cat, err := foziceberg.NewCatalog(ctx, catalogConfig(c.cfg.Spec))
 	if err != nil {
@@ -168,25 +214,20 @@ func (c *Coordinator) run(ctx context.Context) error {
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
-	// Wait for the first worker session.
+	// Wait for every expected worker session.
 	wait := c.cfg.WaitWorker
 	if wait <= 0 {
 		wait = 2 * time.Minute
 	}
-	select {
-	case <-c.sessionSet:
-	case <-time.After(wait):
-		return fmt.Errorf("coordinator: no worker session within %s", wait)
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Assignment: tables with their resolved Iceberg schema.
-	assign, err := c.assignment(schemas)
-	if err != nil {
+	if err := c.waitWorkers(ctx, wait); err != nil {
 		return err
 	}
-	c.session.out <- assign
+
+	// Assignment: each worker gets its tables with the resolved schemas and
+	// its own Flight ticket.
+	if err := c.sendAssignments(ctx, schemas); err != nil {
+		return err
+	}
 
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.
@@ -235,9 +276,39 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return ctx.Err()
 	case err := <-streamErr:
 		return fmt.Errorf("coordinator: stream: %w", err)
-	case err := <-c.session.done:
+	case err := <-c.sessionErrs:
 		return fmt.Errorf("coordinator: worker session: %w", err)
 	}
+}
+
+// waitWorkers blocks until every expected group has a session attached.
+func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error {
+	for range c.workers {
+		select {
+		case <-c.ready:
+		case <-time.After(wait):
+			return fmt.Errorf("coordinator: not all workers connected within %s", wait)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// sendAssignments delivers each worker its table slice over its session.
+func (c *Coordinator) sendAssignments(ctx context.Context, schemas map[string]*iceberg.Schema) error {
+	for _, w := range c.workers {
+		msg, err := c.assignmentFor(w, schemas)
+		if err != nil {
+			return err
+		}
+		select {
+		case w.out <- msg:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // pump encodes reader events into the data queue.
@@ -271,14 +342,20 @@ func batchMeta(ch change.Change) *pb.BatchMeta {
 	return m
 }
 
-// enqueueBatch encodes rows and queues them for the Flight stream.
+// enqueueBatch encodes rows and queues them on the owning worker's Flight
+// stream. Blocking on a full queue is the backpressure: it stalls the pump,
+// which stalls the reader.
 func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, meta *pb.BatchMeta) error {
+	w, ok := c.route[meta.Table]
+	if !ok {
+		return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
+	}
 	rec, metaBytes, err := transport.EncodeBatch(rows, meta)
 	if err != nil {
 		return err
 	}
 	select {
-	case c.queue <- queuedBatch{rec: rec, meta: metaBytes}:
+	case w.queue <- queuedBatch{rec: rec, meta: metaBytes}:
 		return nil
 	case <-ctx.Done():
 		rec.Release()
@@ -312,15 +389,16 @@ func (w *wireRelay) AddWindowRows(target string, chunkID uint32, rows []change.C
 	})
 }
 
-// assignment builds the worker's table assignment.
-func (c *Coordinator) assignment(schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
+// assignmentFor builds one worker's table assignment with its own ticket.
+func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
 	assign := &pb.Assignment{
-		Ticket: dataTicket,
+		WorkerName: w.name,
+		Ticket:     w.ticket,
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
 	}
-	for _, ref := range c.refs {
+	for _, ref := range w.refs {
 		schemaJSON, err := json.Marshal(schemas[ref.Source])
 		if err != nil {
 			return nil, fmt.Errorf("coordinator: schema %s: %w", ref.Source, err)
@@ -376,14 +454,12 @@ type controlServer struct {
 	c *Coordinator
 }
 
-// Session accepts one worker: the first Hello claims the single slot; the
-// server then streams assignments and collects acks until the worker goes.
-func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
-	sess := &workerSession{
-		out:  make(chan *pb.CoordinatorMessage, 16),
-		done: make(chan error, 1),
-	}
-
+// Session accepts one worker: the Hello names the group it claims (unknown
+// names and second connects are rejected; epoch validation arrives with
+// supervision). The server then streams assignments and collects acks until
+// the worker goes.
+func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr error) {
+	c := s.c
 	msg, err := stream.Recv()
 	if err != nil {
 		return err
@@ -392,18 +468,41 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
 	if hello == nil {
 		return errors.New("coordinator: first worker message must be Hello")
 	}
-	sess.name = hello.WorkerName
-	// Publish the session BEFORE claiming the slot: the sessionSet send
-	// happens-before run's receive, so run may read c.session the moment it
-	// wakes — writing the field after the send is a data race.
-	s.c.session = sess
+
+	c.mu.Lock()
+	w, known := c.workers[hello.WorkerName]
+	if known && w.attached {
+		c.mu.Unlock()
+		return fmt.Errorf("coordinator: worker %q already connected", hello.WorkerName)
+	}
+	sess := &workerSession{
+		out:  make(chan *pb.CoordinatorMessage, 16),
+		done: make(chan error, 1),
+	}
+	// Publish the session BEFORE signaling ready: the ready send
+	// happens-before run's receive, so run may use w.out the moment it
+	// wakes — attaching after the signal is a data race.
+	if known {
+		w.out, w.attached = sess.out, true
+	}
+	c.mu.Unlock()
+	if !known {
+		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+	}
+
+	defer func() {
+		c.mu.Lock()
+		w.attached, w.out = false, nil
+		c.mu.Unlock()
+		c.sessionErrs <- retErr
+	}()
 
 	select {
-	case s.c.sessionSet <- struct{}{}:
+	case c.ready <- struct{}{}:
 	case <-stream.Context().Done():
 		return stream.Context().Err()
 	}
-	s.c.log.Info("worker session", "worker", sess.name)
+	c.log.Info("worker session", "worker", hello.WorkerName)
 
 	// Recv loop: acks and worker errors.
 	go func() {
@@ -415,10 +514,10 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
 			}
 			switch m := msg.Msg.(type) {
 			case *pb.WorkerMessage_Ack:
-				s.c.log.Info("worker ack", "worker", sess.name, "table", m.Ack.Table,
+				c.log.Info("worker ack", "worker", hello.WorkerName, "table", m.Ack.Table,
 					"rows", m.Ack.Rows, "position", m.Ack.Position)
 			case *pb.WorkerMessage_ChunkReady:
-				s.c.log.Info("chunk ready", "table", m.ChunkReady.Table, "chunk", m.ChunkReady.ChunkId)
+				c.log.Info("chunk ready", "table", m.ChunkReady.Table, "chunk", m.ChunkReady.ChunkId)
 			case *pb.WorkerMessage_Error:
 				sess.done <- errors.New("coordinator: worker error: " + m.Error.Detail)
 				return
@@ -433,10 +532,19 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
 			if err := stream.Send(m); err != nil {
 				return err
 			}
+		case err := <-sess.done:
+			return err
 		case <-stream.Context().Done():
 			return stream.Context().Err()
 		}
 	}
+}
+
+// workerSession is one connected worker's session-local surface; the group's
+// durable state lives in workerState.
+type workerSession struct {
+	out  chan *pb.CoordinatorMessage
+	done chan error
 }
 
 // Control is the urgent-signal plane; nothing sends on it in this milestone.
@@ -452,16 +560,18 @@ type flightServer struct {
 	c *Coordinator
 }
 
-// DoGet streams the queued batches. Each FlightData carries one complete
-// IPC stream in DataBody (schema + one record) and a BatchMeta proto in
+// DoGet streams the worker's queued batches; the ticket (from its
+// Assignment) selects which queue. Each FlightData carries one complete IPC
+// stream in DataBody (schema + one record) and a BatchMeta proto in
 // AppMetadata — self-consistent with the worker's reader.
 func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoGetServer) error {
-	if !bytes.Equal(req.Ticket, dataTicket) {
-		return errors.New("coordinator: unknown flight ticket")
+	w, ok := s.c.byTicket[string(req.Ticket)]
+	if !ok {
+		return fmt.Errorf("coordinator: unknown flight ticket %q", string(req.Ticket))
 	}
 	for {
 		select {
-		case qb := <-s.c.queue:
+		case qb := <-w.queue:
 			var buf bytes.Buffer
 			w := ipc.NewWriter(&buf, ipc.WithSchema(transport.ChangeSchema))
 			if err := w.Write(qb.rec); err != nil {
