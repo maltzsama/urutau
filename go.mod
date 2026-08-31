@@ -11,6 +11,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.101.0
 	github.com/go-mysql-org/go-mysql v1.16.0
 	github.com/go-sql-driver/mysql v1.9.3
+	github.com/jackc/pglogrepl v0.0.0-20260824121319-4ae5c490f7ce
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/spf13/cobra v1.10.2
 	github.com/trinodb/trino-go-client v0.333.0
 	google.golang.org/grpc v1.83.2
@@ -87,6 +89,10 @@ require (
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/jackc/pgio v1.0.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
 	github.com/jcmturner/gofork v1.7.6 // indirect

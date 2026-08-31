@@ -28,6 +28,9 @@ func (s *Spec) Validate() error {
 	default:
 		problems = append(problems, fmt.Sprintf("source.kind: unsupported %q", s.Source.Kind))
 	}
+	if s.Source.Kind == "postgres" && s.Source.SlotName == "" {
+		problems = append(problems, "source.slotName: required for postgres (logical replication slot)")
+	}
 	if s.Source.URI == "" {
 		problems = append(problems, "source.uri: required")
 	}

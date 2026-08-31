@@ -23,6 +23,29 @@ services:
     volumes:
       - ./mysql/init:/docker-entrypoint-initdb.d:ro
 
+  # Logical-decoding source for the Postgres pipeline (wal_level=logical is
+  # the only knob pgoutput needs; slot and publication are created by the
+  # runner itself).
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5433:5432"
+    # wal_sender_timeout=5s tightens the keepalive cadence (default 60s
+    # sends one every ~30s) so the idle-source caught-up proof closes fast.
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=5", "-c", "max_wal_senders=5", "-c", "wal_sender_timeout=5s"]
+    environment:
+      POSTGRES_USER: repl
+      POSTGRES_PASSWORD: replpass
+      POSTGRES_DB: shop
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repl -d shop"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+
   rustfs:
     image: rustfs/rustfs:latest
     ports:

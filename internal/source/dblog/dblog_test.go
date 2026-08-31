@@ -1,4 +1,4 @@
-package mysql
+package dblog
 
 import (
 	"context"
@@ -57,7 +57,7 @@ type fakeRelay struct {
 	relPos map[uint32]string
 }
 
-func (r *fakeRelay) Release(table string, id uint32, at *position.GTID) {
+func (r *fakeRelay) Release(table string, id uint32, at position.Position) {
 	r.ops = append(r.ops, fmt.Sprintf("release:%d", id))
 	r.relPos[id] = at.String()
 }
@@ -67,25 +67,31 @@ func (r *fakeRelay) AddWindowRows(target string, id uint32, rows []change.Change
 	return nil
 }
 
-// fakeReader converges to master after convergeAfter Synced() calls.
+// fakeReader converges to master after convergeAfter Synced() calls. The
+// positions are interface values, so the same fake exercises GTID sets and
+// LSNs alike — the orchestrator must not care.
 type fakeReader struct {
-	master        *position.GTID
+	master        position.Position
+	early         position.Position
 	calls         int
 	convergeAfter int
 	marks, clears int
 }
 
-func (r *fakeReader) Synced() *position.GTID {
+func (r *fakeReader) Synced() position.Position {
 	r.calls++
 	if r.calls > r.convergeAfter {
 		return r.master
 	}
-	return gt("1-1")
+	if r.early != nil {
+		return r.early
+	}
+	return nil
 }
 
-func (r *fakeReader) Master() (*position.GTID, error) { return r.master, nil }
-func (r *fakeReader) MarkWindow(chunkID uint32)       { r.marks++ }
-func (r *fakeReader) ClearWindow()                    { r.clears++ }
+func (r *fakeReader) Master() (position.Position, error) { return r.master, nil }
+func (r *fakeReader) MarkWindow(chunkID uint32)          { r.marks++ }
+func (r *fakeReader) ClearWindow()                       { r.clears++ }
 
 // rowsFor builds a deterministic source: ids 1..n with v = "v<id>".
 func rowsFor(n int) *fakeSource {
@@ -102,7 +108,7 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 	// position, later chunks read an already-caught-up low.
 	src := rowsFor(6)
 	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
-	reader := &fakeReader{master: gt("1-9"), convergeAfter: 3}
+	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
 		SnapshotConfig{CaughtUpPoll: time.Millisecond})
@@ -161,9 +167,36 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 	}
 }
 
+// TestSnapshotTableWithLSNPositions runs the same happy path with LSN
+// positions — the proof that the orchestrator is source-agnostic.
+func TestSnapshotTableWithLSNPositions(t *testing.T) {
+	src := rowsFor(4)
+	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	reader := &fakeReader{master: position.MustLSN("0/20"), early: position.MustLSN("0/10"), convergeAfter: 3}
+
+	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
+		SnapshotConfig{CaughtUpPoll: time.Millisecond})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(relay.ops) != 4 {
+		t.Fatalf("ops = %v, want two full chunk cycles", relay.ops)
+	}
+	if relay.relPos[0] != "0/20" || relay.relPos[1] != "0/20" {
+		t.Fatalf("releases at %v, want caught-up 0/20", relay.relPos)
+	}
+	// Chunk 0 rows carry the early watermark; chunk 1 rows the converged one.
+	if relay.rows[0][0].Position != "0/10" {
+		t.Errorf("chunk 0 position = %q, want 0/10", relay.rows[0][0].Position)
+	}
+	if relay.rows[1][0].Position != "0/20" {
+		t.Errorf("chunk 1 position = %q, want 0/20", relay.rows[1][0].Position)
+	}
+}
+
 func TestSnapshotTableEmptySource(t *testing.T) {
 	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
-	reader := &fakeReader{master: gt("1-1")}
+	reader := &fakeReader{master: gt("1-1"), early: gt("1-1")}
 
 	err := SnapshotTable(context.Background(), &fakeSource{}, reader, relay, "raw.orders", SnapshotConfig{})
 	if err != nil {
@@ -178,7 +211,7 @@ func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 	src := rowsFor(4)
 	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
 	// The reader never converges: synced stays behind master forever.
-	reader := &fakeReader{master: gt("1-9"), convergeAfter: 1 << 30}
+	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 1 << 30}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
 		SnapshotConfig{WindowTimeout: 50 * time.Millisecond, CaughtUpPoll: 5 * time.Millisecond})
@@ -205,7 +238,7 @@ func TestSnapshotTableLagConvergesBeforeRelease(t *testing.T) {
 	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
 	// Four Synced calls per chunk cycle (low, high, poll×k, at) — converge
 	// only on the 4th, proving Release waits for the caught-up proof.
-	reader := &fakeReader{master: gt("1-5"), convergeAfter: 3}
+	reader := &fakeReader{master: gt("1-5"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
 		SnapshotConfig{CaughtUpPoll: time.Millisecond})

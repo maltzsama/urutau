@@ -67,10 +67,11 @@ appended file too. A correct upsert is therefore delete-then-append
 
 ## Status
 
-The MySQL source is in: one binlog reader per source (canal), DBLog
+The MySQL and Postgres sources are in: one replication reader per source
+(canal for MySQL binlog, pgoutput logical decoding for Postgres), DBLog
 snapshot with the caught-up proof (never a timer), per-key collapse and
-serialized commits in the worker, and resume from the cumulative GTID set
-committed atomically with the data. Every run can also record a JSONL
-audit trail in S3 (`internal/eventlog`, `run --eventlog s3://bucket/prefix`):
-lifecycle and commit events, one object per run. Next: Postgres source, or
-the multi-worker split.
+serialized commits in the worker, and resume from the committed position
+(GTID set / LSN) written atomically with the data. Every run can also
+record a JSONL audit trail in S3 (`internal/eventlog`,
+`run --eventlog s3://bucket/prefix`): lifecycle and commit events, one
+object per run. Next: the multi-worker split.

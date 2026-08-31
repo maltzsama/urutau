@@ -112,27 +112,3 @@ func (g *GTID) Add(other *GTID) {
 	// Update merges the string representation of other into g.
 	_ = g.set.Update(other.set.String())
 }
-
-// Min returns the position all others start from: the set that is contained
-// by every candidate, if such a set exists, otherwise the one with the
-// smallest max interval. Under a single source every committed position
-// extends the previous one, so the contained set is well defined.
-func Min(positions []Position) Position {
-	if len(positions) == 0 {
-		return nil
-	}
-	best := positions[0].(*GTID)
-	for _, p := range positions[1:] {
-		c := p.(*GTID)
-		if best.Contains(c) {
-			best = c
-		} else if c.Contains(best) {
-			// c is strictly smaller; keep best.
-		} else {
-			if c.Compare(best) < 0 {
-				best = c
-			}
-		}
-	}
-	return best
-}

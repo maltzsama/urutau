@@ -1,4 +1,9 @@
-package mysql
+// Package dblog holds the source-agnostic DBLog snapshot orchestrator:
+// chunking by primary key, low/high watermarks, and the caught-up proof
+// that closes each window — never a timer. Sources implement the three
+// interfaces (ChunkSource, SourceReader, Relay) on top of their own
+// replication protocol; the proof logic lives here, once.
+package dblog
 
 import (
 	"context"
@@ -9,6 +14,35 @@ import (
 	"github.com/maltzsama/urutau/internal/position"
 )
 
+// TableRef maps one source table to its target and primary key.
+type TableRef struct {
+	Source     string // "db.table"
+	Target     string // "raw.orders"
+	PrimaryKey []string
+}
+
+// Chunk is a half-open primary-key range [Low, High). The last chunk of a
+// table is emitted with the marker in the orchestrator; Low/High are tuples
+// in PK column order.
+type Chunk struct {
+	Low  []any
+	High []any
+}
+
+// Chunks materializes the half-open ranges from the bounds. Each chunk is
+// [bounds[i], bounds[i+1]); the last is [bounds[n-1], nil) (open high).
+func Chunks(bounds [][]any) []Chunk {
+	if len(bounds) == 0 {
+		return nil
+	}
+	out := make([]Chunk, 0, len(bounds))
+	for i := 0; i < len(bounds)-1; i++ {
+		out = append(out, Chunk{Low: bounds[i], High: bounds[i+1]})
+	}
+	out = append(out, Chunk{Low: bounds[len(bounds)-1], High: nil})
+	return out
+}
+
 // Relay is the boundary the DBLog orchestrator pushes through: it feeds the
 // chunk rows into the worker's window and releases the chunk's Closes marker
 // (which flushes what the window still holds). The collapsed runner
@@ -17,13 +51,13 @@ type Relay interface {
 	// Release sends the Closes marker for the chunk at the given position.
 	// Must be called after caught-up; the marker's position is the safe
 	// resume point.
-	Release(table string, chunkID uint32, at *position.GTID)
+	Release(table string, chunkID uint32, at position.Position)
 	// AddWindowRows feeds the chunk SELECT result into the worker's window.
 	AddWindowRows(target string, chunkID uint32, rows []change.Change) error
 }
 
 // ChunkSource is the chunk SELECT surface the orchestrator consumes. The
-// SQL-backed Chunker implements it; unit tests drive SnapshotTable with a
+// SQL-backed chunkers implement it; unit tests drive SnapshotTable with a
 // fake.
 type ChunkSource interface {
 	// PK returns the primary key columns, in key order.
@@ -38,8 +72,8 @@ type ChunkSource interface {
 // the watermarks, and the window mark that tags events InWindow at decode
 // time — so no event can escape the window by racing a channel pull.
 type SourceReader interface {
-	Synced() *position.GTID
-	Master() (*position.GTID, error)
+	Synced() position.Position
+	Master() (position.Position, error)
 	MarkWindow(chunkID uint32)
 	ClearWindow()
 }
@@ -104,7 +138,7 @@ func SnapshotTable(
 
 // scanChunk runs the chunk SELECT and wraps each row as an insert carrying
 // the low watermark position. Keys come from the source PK columns.
-func scanChunk(ctx context.Context, src ChunkSource, ch Chunk, target string, low *position.GTID) ([]change.Change, error) {
+func scanChunk(ctx context.Context, src ChunkSource, ch Chunk, target string, low position.Position) ([]change.Change, error) {
 	pk := src.PK()
 	var rows []change.Change
 	err := src.Scan(ctx, ch, func(row map[string]any) error {
@@ -124,10 +158,10 @@ func scanChunk(ctx context.Context, src ChunkSource, ch Chunk, target string, lo
 	return rows, err
 }
 
-// waitCaughtUp polls the master position until the reader's synced set
+// waitCaughtUp polls the master position until the reader's synced position
 // contains it — the proof that everything up to high (and the current master
 // state) has been read.
-func waitCaughtUp(ctx context.Context, reader SourceReader, high *position.GTID, cfg SnapshotConfig) error {
+func waitCaughtUp(ctx context.Context, reader SourceReader, high position.Position, cfg SnapshotConfig) error {
 	poll := cfg.CaughtUpPoll
 	if poll <= 0 {
 		poll = time.Second
