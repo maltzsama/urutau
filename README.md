@@ -47,7 +47,7 @@ Go ≥ 1.26. No `protoc` needed — generation uses `buf` with the
 ## E2E spike
 
 The spike proves the Iceberg write path by reading it back with
-Trino (trusting the read, not the commit return). Stack: MinIO (S3) +
+Trino (trusting the read, not the commit return). Stack: RustFS (S3) +
 Polaris (REST catalog) + Trino (Iceberg REST catalog).
 
 ```sh
@@ -70,5 +70,7 @@ appended file too. A correct upsert is therefore delete-then-append
 The MySQL source is in: one binlog reader per source (canal), DBLog
 snapshot with the caught-up proof (never a timer), per-key collapse and
 serialized commits in the worker, and resume from the cumulative GTID set
-committed atomically with the data. Next: Postgres source, or the
-multi-worker split.
+committed atomically with the data. Every run can also record a JSONL
+audit trail in S3 (`internal/eventlog`, `run --eventlog s3://bucket/prefix`):
+lifecycle and commit events, one object per run. Next: Postgres source, or
+the multi-worker split.

@@ -6,6 +6,7 @@ package runner
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -18,6 +19,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/position"
 	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/source/mysql"
@@ -34,7 +36,10 @@ type Config struct {
 	CaughtUpPoll  time.Duration
 	MaxRows       int
 	MaxInterval   time.Duration
-	Logger        *slog.Logger
+	// Eventlog, when set, records a per-run JSONL audit trail in S3
+	// (lifecycle + commit events). Nil disables the trail.
+	Eventlog *eventlog.Config
+	Logger   *slog.Logger
 }
 
 // Run executes the collapsed pipeline for a validated spec until ctx is
@@ -240,9 +245,21 @@ func resumeOrNone(p *position.GTID) string {
 type Runner struct {
 	w                                *worker.Worker
 	log                              *slog.Logger
+	ev                               *eventlog.Run
 	rdr                              *mysql.Reader
 	closeQuery                       func()
 	streamErr, workerErr, routerDone <-chan error
+}
+
+// emit posts one lifecycle event to the audit trail, best-effort by
+// contract: a lost event is logged and the pipeline carries on.
+func (r *Runner) emit(kind string, fields map[string]any) {
+	if r.ev == nil {
+		return
+	}
+	if err := r.ev.Emit(context.Background(), kind, fields); err != nil {
+		r.log.Warn("eventlog: emit failed", "kind", kind, "err", err)
+	}
 }
 
 // NewRunner sets up the collapsed pipeline (catalog, writers, worker,
@@ -250,11 +267,31 @@ type Runner struct {
 // position. It returns once snapshots are done and the stream is live; Run
 // then blocks until cancellation or a terminal error. Resources are owned
 // by the Runner and released when Run returns.
-func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
+func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	log := cfg.Logger
+
+	// Audit trail first: job_started marks the boot, and a startup failure
+	// still seals the trail with job_stopped.
+	var ev *eventlog.Run
+	if cfg.Eventlog != nil {
+		e, eerr := eventlog.New(ctx, *cfg.Eventlog)
+		if eerr != nil {
+			return nil, eerr
+		}
+		ev = e
+		_ = ev.Emit(ctx, eventlog.KindJobStarted, map[string]any{
+			"pipeline": s.Pipeline, "source": s.Source.Kind, "tables": len(s.Tables),
+		})
+		defer func() {
+			if r == nil {
+				_ = ev.Emit(ctx, eventlog.KindJobStopped, map[string]any{"reason": "startup_failed"})
+				ev.Close()
+			}
+		}()
+	}
 
 	conn, err := parseMySQLURI(s.Source.URI)
 	if err != nil {
@@ -302,14 +339,17 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 	for target, wr := range writers {
 		w.Register(target, wr)
 	}
+	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() }}
 	w.OnCommit(func(b change.Batch, rows int) {
 		log.Info("commit", "table", b.Table, "rows", rows,
 			"upserts", len(b.Upserts), "deletes", len(b.Deletes), "position", b.Position)
+		r.emit(eventlog.KindCommit, map[string]any{
+			"table": b.Table, "rows": rows,
+			"upserts": len(b.Upserts), "deletes": len(b.Deletes), "position": b.Position,
+		})
 	})
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
-
-	r := &Runner{w: w, log: log, closeQuery: func() { _ = qdb.Close() }}
 
 	resume, needsSnapshot, err := resumeFrom(ctx, cat, s, refs)
 	if err != nil {
@@ -317,6 +357,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 		return nil, err
 	}
 	log.Info("resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
+	r.emit(eventlog.KindResume, map[string]any{
+		"from": resumeOrNone(resume), "snapshot_tables": len(needsSnapshot),
+	})
 
 	// Reader (one replication connection) → relay → ingest.
 	out := make(chan change.Change, 1024)
@@ -354,6 +397,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 	// Snapshot phase: DBLog for tables with no committed position.
 	for _, ref := range needsSnapshot {
 		log.Info("snapshot", "table", ref.Source)
+		r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
 		chunker, err := mysql.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
 		if err != nil {
 			rdr.Close()
@@ -369,6 +413,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 			return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
 		}
 		log.Info("snapshot done", "table", ref.Source)
+		r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
 	}
 
 	r.streamErr = streamErr
@@ -379,12 +424,24 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 }
 
 // Run blocks until ctx is cancelled or a terminal error surfaces, then
-// releases the pipeline resources.
+// releases the pipeline resources and seals the audit trail.
 func (r *Runner) Run(ctx context.Context) error {
-	defer func() {
-		r.rdr.Close()
-		r.closeQuery()
-	}()
+	err := r.run(ctx)
+	if r.ev != nil {
+		reason := "error"
+		if errors.Is(err, context.Canceled) {
+			reason = "cancelled"
+		}
+		_ = r.ev.Emit(context.Background(), eventlog.KindJobStopped,
+			map[string]any{"reason": reason})
+		r.ev.Close()
+	}
+	r.rdr.Close()
+	r.closeQuery()
+	return err
+}
+
+func (r *Runner) run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():

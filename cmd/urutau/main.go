@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/runner"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/version"
@@ -36,6 +37,7 @@ func runCmd() *cobra.Command {
 		serverID      uint32
 		chunkSize     int
 		windowTimeout time.Duration
+		eventlogURI   string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -53,7 +55,7 @@ func runCmd() *cobra.Command {
 			if err := s.Validate(); err != nil {
 				return err
 			}
-			r, err := runner.NewRunner(cmd.Context(), s, runner.Config{
+			rc := runner.Config{
 				ServerID:      serverID,
 				Heartbeat:     5 * time.Second,
 				ChunkSize:     chunkSize,
@@ -61,7 +63,13 @@ func runCmd() *cobra.Command {
 				CaughtUpPoll:  time.Second,
 				MaxRows:       1000,
 				MaxInterval:   5 * time.Second,
-			})
+			}
+			if eventlogURI != "" {
+				// Credentials and endpoint come from the standard AWS env
+				// (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3).
+				rc.Eventlog = &eventlog.Config{URI: eventlogURI}
+			}
+			r, err := runner.NewRunner(cmd.Context(), s, rc)
 			if err != nil {
 				return err
 			}
@@ -73,6 +81,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().Uint32Var(&serverID, "server-id", 1101, "MySQL server id for this replicator")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 10000, "DBLog snapshot chunk size (rows per chunk)")
 	cmd.Flags().DurationVar(&windowTimeout, "window-timeout", 5*time.Minute, "DBLog window timeout (pathology detector)")
+	cmd.Flags().StringVar(&eventlogURI, "eventlog", "", "S3 URI for the run's JSONL audit trail (s3://bucket/prefix); AWS env supplies credentials/endpoint")
 	return cmd
 }
 

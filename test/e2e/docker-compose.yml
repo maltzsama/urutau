@@ -23,32 +23,38 @@ services:
     volumes:
       - ./mysql/init:/docker-entrypoint-initdb.d:ro
 
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+  rustfs:
+    image: rustfs/rustfs:latest
     ports:
       - "9000:9000"
       - "9001:9001"
-    command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-      start_period: 10s
+      RUSTFS_ACCESS_KEY: urutau
+      RUSTFS_SECRET_KEY: urutau_dev_secret
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_REGION: us-east-1
 
+  # RustFS does not create buckets itself, and Polaris fails to register
+  # the catalog while the path is missing — same bootstrap as the homelab.
   bucket-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: amazon/aws-cli:latest
     depends_on:
-      minio:
-        condition: service_healthy
+      - rustfs
+    environment:
+      AWS_ACCESS_KEY_ID: urutau
+      AWS_SECRET_ACCESS_KEY: urutau_dev_secret
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >
-        mc alias set local http://minio:9000 minioadmin minioadmin &&
-        mc mb --ignore-existing local/warehouse &&
+      - |
+        set -e
+        until aws --endpoint-url http://rustfs:9000 s3 ls >/dev/null 2>&1; do
+          echo waiting for rustfs...; sleep 2
+        done
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://warehouse || true
         echo bucket ready
 
   polaris:
@@ -60,9 +66,9 @@ services:
       bucket-init:
         condition: service_completed_successfully
     environment:
-      AWS_REGION: us-west-2
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: urutau
+      AWS_SECRET_ACCESS_KEY: urutau_dev_secret
       POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,s3cr3t
       polaris.realm-context.realms: POLARIS
       quarkus.otel.sdk.disabled: "true"
@@ -96,7 +102,7 @@ services:
           curl -sf -X POST http://polaris:8181/api/management/v1/catalogs \
             -H "Authorization: Bearer $$TOKEN" -H "Polaris-Realm: $$REALM" \
             -H 'Content-Type: application/json' \
-            -d '{"catalog":{"name":"'$$CATALOG_NAME'","type":"INTERNAL","readOnly":false,"properties":{"default-base-location":"s3://warehouse"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://warehouse"],"endpoint":"http://localhost:9000","endpointInternal":"http://minio:9000","pathStyleAccess":true,"region":"us-west-2"}}}' \
+            -d '{"catalog":{"name":"'$$CATALOG_NAME'","type":"INTERNAL","readOnly":false,"properties":{"default-base-location":"s3://warehouse"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://warehouse"],"endpoint":"http://localhost:9000","endpointInternal":"http://rustfs:9000","pathStyleAccess":true,"region":"us-east-1"}}}' \
             >/dev/null
         fi
         curl -sf -X PUT "http://polaris:8181/api/management/v1/catalogs/$$CATALOG_NAME/catalog-roles/catalog_admin/grants" \
