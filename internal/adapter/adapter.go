@@ -1,0 +1,288 @@
+// Package adapter bundles the per-source pieces the pipeline drivers need:
+// query access, introspection, chunking, the replication reader, and the
+// position codec. The collapsed runner and the coordinator consume the same
+// Source; new sources plug in here, everything downstream is shared.
+package adapter
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/apache/iceberg-go"
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/source/mysql"
+	"github.com/maltzsama/urutau/internal/source/postgres"
+	"github.com/maltzsama/urutau/internal/spec"
+)
+
+// Runtime carries the replication knobs a driver passes through to the
+// source reader.
+type Runtime struct {
+	ServerID  uint32
+	Heartbeat time.Duration
+	Logger    *slog.Logger
+}
+
+// StreamSource is the replication reader surface a driver drives: the DBLog
+// watermark surface plus start/stop of the stream.
+type StreamSource interface {
+	dblog.SourceReader
+	// Start begins streaming at the given position, blocking until the
+	// stream ends or ctx is cancelled. Call in a goroutine.
+	Start(ctx context.Context, at position.Position) error
+	Close()
+}
+
+// Source is the per-source surface of the pipeline: everything that differs
+// between MySQL and Postgres lives behind it.
+type Source interface {
+	// OpenQuery opens the SQL connection for chunk SELECTs, schema
+	// introspection, and position queries.
+	OpenQuery(ctx context.Context) (*sql.DB, error)
+	// Introspect resolves one spec table into its ref and Iceberg schema.
+	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (dblog.TableRef, *iceberg.Schema, error)
+	// NewChunker builds the chunk SELECT source for one table.
+	NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error)
+	// NewReader builds the replication reader over the pipeline's tables.
+	NewReader(ctx context.Context, db *sql.DB, refs []dblog.TableRef, out chan<- change.Change) (StreamSource, error)
+	// InitialPosition is the stream start for a first boot (no resume).
+	InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error)
+	// ParsePosition decodes a stored cdc.position string.
+	ParsePosition(s string) (position.Position, error)
+}
+
+// For resolves the source adapter for a spec's source kind.
+func For(s *spec.Spec, rt Runtime) (Source, error) {
+	switch s.Source.Kind {
+	case "mysql":
+		return mysqlSource{spec: s, rt: rt}, nil
+	case "postgres":
+		return postgresSource{spec: s, rt: rt}, nil
+	default:
+		return nil, fmt.Errorf("adapter: unsupported source kind %q", s.Source.Kind)
+	}
+}
+
+// ── MySQL ────────────────────────────────────────────────────────────
+
+type mysqlSource struct {
+	spec *spec.Spec
+	rt   Runtime
+}
+
+func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
+	conn, err := parseMySQLURI(a.spec.Source.URI)
+	if err != nil {
+		return nil, err
+	}
+	return sql.Open("mysql", conn.queryDSN())
+}
+
+func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (dblog.TableRef, *iceberg.Schema, error) {
+	schemaName, tableName, ok := strings.Cut(t.Source, ".")
+	if !ok {
+		return dblog.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
+	}
+	st, err := mysql.QueryTable(ctx, db, schemaName, tableName)
+	if err != nil {
+		return dblog.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
+	}
+	pk := t.PrimaryKey
+	if len(pk) == 0 && len(st.PKColumns) > 0 {
+		for _, idx := range st.PKColumns {
+			pk = append(pk, st.Columns[idx].Name)
+		}
+	}
+	is, err := mysql.IcebergSchema(st)
+	if err != nil {
+		return dblog.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	return dblog.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
+}
+
+func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error) {
+	return mysql.NewChunker(db, source, pk, chunkSize)
+}
+
+func (a mysqlSource) NewReader(ctx context.Context, db *sql.DB, refs []dblog.TableRef, out chan<- change.Change) (StreamSource, error) {
+	conn, err := parseMySQLURI(a.spec.Source.URI)
+	if err != nil {
+		return nil, err
+	}
+	rdr, err := mysql.New(ctx, mysql.Config{
+		Addr:      conn.addr(),
+		User:      conn.user,
+		Password:  conn.password,
+		ServerID:  a.rt.ServerID,
+		Heartbeat: a.rt.Heartbeat,
+		Tables:    refs,
+		Logger:    a.rt.Logger,
+	}, out)
+	if err != nil {
+		return nil, err
+	}
+	return mysqlStream{Reader: rdr}, nil
+}
+
+// InitialPosition returns the master's executed GTID set — the same query
+// canal's GetMasterGTIDSet issues, without spinning a replication handle.
+func (a mysqlSource) InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error) {
+	var gtid string
+	if err := db.QueryRowContext(ctx, `SELECT @@GLOBAL.gtid_executed`).Scan(&gtid); err != nil {
+		return nil, fmt.Errorf("mysql: gtid_executed: %w", err)
+	}
+	return position.ParseGTID(gtid)
+}
+
+// ParsePosition decodes a stored cdc.position as a GTID set.
+func (a mysqlSource) ParsePosition(s string) (position.Position, error) {
+	return position.ParseGTID(s)
+}
+
+// mysqlStream adapts the concrete canal reader to the StreamSource
+// interface (its watermark surface already matches).
+type mysqlStream struct {
+	*mysql.Reader
+}
+
+// Start begins the stream at the given GTID set.
+func (s mysqlStream) Start(ctx context.Context, at position.Position) error {
+	g, ok := at.(*position.GTID)
+	if !ok {
+		return fmt.Errorf("mysql: start position must be a GTID set, got %T", at)
+	}
+	return s.StartFromGTID(ctx, g)
+}
+
+// ── PostgreSQL ───────────────────────────────────────────────────────
+
+type postgresSource struct {
+	spec *spec.Spec
+	rt   Runtime
+}
+
+func (a postgresSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
+	return sql.Open("pgx", a.spec.Source.URI)
+}
+
+func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (dblog.TableRef, *iceberg.Schema, error) {
+	schemaName, tableName, ok := strings.Cut(t.Source, ".")
+	if !ok {
+		return dblog.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
+	}
+	st, err := postgres.QueryTable(ctx, db, schemaName, tableName)
+	if err != nil {
+		return dblog.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
+	}
+	pk := t.PrimaryKey
+	if len(pk) == 0 && len(st.PKColumns) > 0 {
+		for _, idx := range st.PKColumns {
+			pk = append(pk, st.Columns[idx].Name)
+		}
+	}
+	is, err := postgres.IcebergSchema(st)
+	if err != nil {
+		return dblog.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	return dblog.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
+}
+
+func (a postgresSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error) {
+	return postgres.NewChunker(db, source, pk, chunkSize)
+}
+
+func (a postgresSource) NewReader(ctx context.Context, db *sql.DB, refs []dblog.TableRef, out chan<- change.Change) (StreamSource, error) {
+	slot := a.spec.Source.SlotName
+	if slot == "" {
+		return nil, fmt.Errorf("adapter: postgres source requires slotName")
+	}
+	rdr, err := postgres.New(ctx, postgres.Config{
+		URI:      a.spec.Source.URI,
+		DB:       db,
+		SlotName: slot,
+		Tables:   refs,
+		Logger:   a.rt.Logger,
+	}, out)
+	if err != nil {
+		return nil, err
+	}
+	return pgStream{Reader: rdr}, nil
+}
+
+// InitialPosition returns the slot's confirmed LSN: a first boot starts
+// streaming from the slot's consistency point — everything after it flows
+// through the stream, everything before it belongs to the snapshot.
+func (a postgresSource) InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error) {
+	return postgres.ConfirmedLSN(ctx, db, a.spec.Source.SlotName)
+}
+
+// ParsePosition decodes a stored cdc.position as an LSN.
+func (a postgresSource) ParsePosition(s string) (position.Position, error) {
+	return position.ParseLSN(s)
+}
+
+// pgStream adapts the concrete pgoutput reader to the StreamSource
+// interface.
+type pgStream struct {
+	*postgres.Reader
+}
+
+// Start begins the stream at the given LSN.
+func (s pgStream) Start(ctx context.Context, at position.Position) error {
+	l, ok := at.(*position.LSN)
+	if !ok {
+		return fmt.Errorf("postgres: start position must be an LSN, got %T", at)
+	}
+	return s.StartFromLSN(ctx, l)
+}
+
+// ── MySQL URI parsing ────────────────────────────────────────────────
+
+// mysqlConn is the parsed MySQL source URI.
+type mysqlConn struct {
+	user, password, host, port, db string
+}
+
+func parseMySQLURI(uri string) (*mysqlConn, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("adapter: source uri: %w", err)
+	}
+	if u.Scheme != "mysql" {
+		return nil, fmt.Errorf("adapter: source uri scheme %q, want mysql", u.Scheme)
+	}
+	c := &mysqlConn{user: u.User.Username()}
+	if p, ok := u.User.Password(); ok {
+		c.password = p
+	}
+	c.host = u.Hostname()
+	if c.host == "" {
+		return nil, fmt.Errorf("adapter: source uri %q lacks host", uri)
+	}
+	if p := u.Port(); p != "" {
+		c.port = p
+	} else {
+		c.port = "3306"
+	}
+	c.db = strings.TrimPrefix(u.Path, "/")
+	if c.db == "" {
+		return nil, fmt.Errorf("adapter: source uri %q lacks /db", uri)
+	}
+	return c, nil
+}
+
+func (c *mysqlConn) addr() string { return c.host + ":" + c.port }
+
+func (c *mysqlConn) queryDSN() string {
+	return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true", c.user, c.password, c.addr(), c.db)
+}
