@@ -47,6 +47,9 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int) (*Chunker, error) 
 	}, nil
 }
 
+// PK returns the primary key columns the chunker splits by.
+func (c *Chunker) PK() []string { return c.pk }
+
 // Bounds returns the ordered list of chunk boundary keys: key[0] is the
 // lowest PK, followed by every chunkSize-th key, then nil (the open high
 // bound of the last chunk).

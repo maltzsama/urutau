@@ -9,34 +9,43 @@ import (
 	"github.com/maltzsama/urutau/internal/position"
 )
 
-// Relay is the boundary the DBLog orchestrator pushes through: it buffers a
-// table's live events during a chunk SELECT, feeds the chunk rows into the
-// worker's window, and releases tagged events + the Closes marker into the
-// ingest channel. The collapsed runner implements it with its routing loop;
-// unit tests use a fake.
+// Relay is the boundary the DBLog orchestrator pushes through: it feeds the
+// chunk rows into the worker's window and releases the chunk's Closes marker
+// (which flushes what the window still holds). The collapsed runner
+// implements it over its ingest channel; unit tests use a fake.
 type Relay interface {
-	// Buffer suspends the relay of one table: subsequent events for it are
-	// accumulated (not dispatched) until Release.
-	Buffer(table string)
-	// Release sends every buffered event tagged InWindow, then the Closes
-	// marker for the chunk at the given position. Must be called after
-	// caught-up; the marker's position is the safe resume point.
+	// Release sends the Closes marker for the chunk at the given position.
+	// Must be called after caught-up; the marker's position is the safe
+	// resume point.
 	Release(table string, chunkID uint32, at *position.GTID)
-	// Ingest returns the channel the orchestrator writes into.
-	Ingest() chan<- change.Change
 	// AddWindowRows feeds the chunk SELECT result into the worker's window.
 	AddWindowRows(target string, chunkID uint32, rows []change.Change) error
 }
 
-// SourceReader is the minimal reader surface the orchestrator needs.
+// ChunkSource is the chunk SELECT surface the orchestrator consumes. The
+// SQL-backed Chunker implements it; unit tests drive SnapshotTable with a
+// fake.
+type ChunkSource interface {
+	// PK returns the primary key columns, in key order.
+	PK() []string
+	// Bounds returns the ordered chunk boundary keys.
+	Bounds(ctx context.Context) ([][]any, error)
+	// Scan reads one chunk, calling fn per row keyed by column name.
+	Scan(ctx context.Context, ch Chunk, fn func(row map[string]any) error) error
+}
+
+// SourceReader is the reader surface the orchestrator needs: positions for
+// the watermarks, and the window mark that tags events InWindow at decode
+// time — so no event can escape the window by racing a channel pull.
 type SourceReader interface {
 	Synced() *position.GTID
 	Master() (*position.GTID, error)
+	MarkWindow(chunkID uint32)
+	ClearWindow()
 }
 
 // SnapshotConfig tunes the DBLog snapshot phase.
 type SnapshotConfig struct {
-	ChunkSize     int
 	WindowTimeout time.Duration
 	CaughtUpPoll  time.Duration
 }
@@ -48,7 +57,7 @@ type SnapshotConfig struct {
 // WindowTimeout is a pathology surfaced as an error.
 func SnapshotTable(
 	ctx context.Context,
-	chunker *Chunker,
+	chunker ChunkSource,
 	reader SourceReader,
 	relay Relay,
 	target string,
@@ -66,34 +75,41 @@ func SnapshotTable(
 			return err
 		}
 
-		relay.Buffer(target)
+		// Open the window first: events decoded from now on carry the
+		// InWindow tag for this chunk, applied synchronously at decode.
+		reader.MarkWindow(chunkID)
 		low := reader.Synced()
 
 		rows, err := scanChunk(ctx, chunker, ch, target, low)
 		if err != nil {
+			reader.ClearWindow()
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 		}
 		if err := relay.AddWindowRows(target, chunkID, rows); err != nil {
+			reader.ClearWindow()
 			return err
 		}
 
 		high := reader.Synced()
 		if err := waitCaughtUp(ctx, reader, high, cfg); err != nil {
+			reader.ClearWindow()
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 		}
 		at := reader.Synced()
+		reader.ClearWindow()
 		relay.Release(target, chunkID, at)
 	}
 	return nil
 }
 
 // scanChunk runs the chunk SELECT and wraps each row as an insert carrying
-// the low watermark position. Keys come from the chunker PK columns.
-func scanChunk(ctx context.Context, chunker *Chunker, ch Chunk, target string, low *position.GTID) ([]change.Change, error) {
+// the low watermark position. Keys come from the source PK columns.
+func scanChunk(ctx context.Context, src ChunkSource, ch Chunk, target string, low *position.GTID) ([]change.Change, error) {
+	pk := src.PK()
 	var rows []change.Change
-	err := chunker.Scan(ctx, ch, func(row map[string]any) error {
-		key := make([]any, 0, len(chunker.pk))
-		for _, col := range chunker.pk {
+	err := src.Scan(ctx, ch, func(row map[string]any) error {
+		key := make([]any, 0, len(pk))
+		for _, col := range pk {
 			key = append(key, row[col])
 		}
 		rows = append(rows, change.Change{
