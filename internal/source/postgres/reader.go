@@ -74,6 +74,11 @@ type Reader struct {
 	winMu    sync.Mutex
 	winChunk uint32
 	winOpen  bool
+
+	// loopCancel stops the replication loop; loopDone tells Close it has
+	// fully left pgx.
+	loopCancel context.CancelFunc
+	loopDone   chan struct{}
 }
 
 // New introspects the tables, performs the server-side setup (replica
@@ -169,6 +174,19 @@ func (r *Reader) Master() (position.Position, error) {
 // stream ends or ctx is cancelled. Call in a goroutine. An LSN of 0/0
 // starts at the slot's confirmed point.
 func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
+	// The loop runs on its own cancelable ctx: Close stops it and waits
+	// for loopDone, so the conn is never closed mid-call from two
+	// goroutines.
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	r.mu.Lock()
+	r.loopCancel, r.loopDone = cancel, done
+	r.mu.Unlock()
+	defer func() {
+		cancel()
+		close(done)
+	}()
+
 	start := at
 	if start == nil {
 		start = position.MustLSN("0/0")
@@ -252,8 +270,24 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 	}
 }
 
-// Close stops the reader and its replication connection.
+// Close stops the reader and its replication connection. It cancels the
+// replication loop first and waits for it to exit pgx, so the conn close
+// never races an in-flight receive.
 func (r *Reader) Close() {
+	r.mu.Lock()
+	cancel, done := r.loopCancel, r.loopDone
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-r.loopDone:
+		case <-time.After(5 * time.Second):
+			// The loop is stuck outside pgx (e.g. a full out channel);
+			// closing the conn below is safe from it.
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = r.conn.Close(ctx)
