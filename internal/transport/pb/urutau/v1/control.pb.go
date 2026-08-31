@@ -623,6 +623,7 @@ type TableAssignment struct {
 	PartitionBy       []string               `protobuf:"bytes,5,rep,name=partition_by,json=partitionBy,proto3" json:"partition_by,omitempty"`        // native Iceberg transforms
 	IncludeBefore     bool                   `protobuf:"varint,6,opt,name=include_before,json=includeBefore,proto3" json:"include_before,omitempty"` // derived: true only with a mutable-column filter
 	CreateIfNotExists bool                   `protobuf:"varint,7,opt,name=create_if_not_exists,json=createIfNotExists,proto3" json:"create_if_not_exists,omitempty"`
+	SchemaJson        string                 `protobuf:"bytes,8,opt,name=schema_json,json=schemaJson,proto3" json:"schema_json,omitempty"` // Iceberg schema (JSON) — the coordinator owns introspection
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -704,6 +705,13 @@ func (x *TableAssignment) GetCreateIfNotExists() bool {
 		return x.CreateIfNotExists
 	}
 	return false
+}
+
+func (x *TableAssignment) GetSchemaJson() string {
+	if x != nil {
+		return x.SchemaJson
+	}
+	return ""
 }
 
 type BatchConfig struct {
@@ -1423,6 +1431,7 @@ type WindowTag struct {
 	InWindow      bool                   `protobuf:"varint,1,opt,name=in_window,json=inWindow,proto3" json:"in_window,omitempty"`
 	Closes        bool                   `protobuf:"varint,2,opt,name=closes,proto3" json:"closes,omitempty"`
 	ChunkId       uint32                 `protobuf:"varint,3,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
+	Snapshot      bool                   `protobuf:"varint,4,opt,name=snapshot,proto3" json:"snapshot,omitempty"` // true → rows feed AddWindowRows, not the ingest path
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1478,6 +1487,13 @@ func (x *WindowTag) GetChunkId() uint32 {
 	return 0
 }
 
+func (x *WindowTag) GetSnapshot() bool {
+	if x != nil {
+		return x.Snapshot
+	}
+	return false
+}
+
 var File_urutau_v1_control_proto protoreflect.FileDescriptor
 
 const file_urutau_v1_control_proto_rawDesc = "" +
@@ -1515,7 +1531,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12)\n" +
 	"\x05value\x18\x02 \x01(\v2\x13.urutau.v1.ChunkIdsR\x05value:\x028\x01\"\x1c\n" +
 	"\bChunkIds\x12\x10\n" +
-	"\x03ids\x18\x01 \x03(\rR\x03ids\"\xa8\x02\n" +
+	"\x03ids\x18\x01 \x03(\rR\x03ids\"\xc9\x02\n" +
 	"\x0fTableAssignment\x12!\n" +
 	"\fsource_table\x18\x01 \x01(\tR\vsourceTable\x12!\n" +
 	"\ftarget_table\x18\x02 \x01(\tR\vtargetTable\x123\n" +
@@ -1525,7 +1541,9 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"primaryKey\x12!\n" +
 	"\fpartition_by\x18\x05 \x03(\tR\vpartitionBy\x12%\n" +
 	"\x0einclude_before\x18\x06 \x01(\bR\rincludeBefore\x12/\n" +
-	"\x14create_if_not_exists\x18\a \x01(\bR\x11createIfNotExists\"h\n" +
+	"\x14create_if_not_exists\x18\a \x01(\bR\x11createIfNotExists\x12\x1f\n" +
+	"\vschema_json\x18\b \x01(\tR\n" +
+	"schemaJson\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
 	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xfb\x01\n" +
@@ -1582,11 +1600,12 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\bhigh_pos\x18\x03 \x01(\tR\ahighPos\x12\x19\n" +
 	"\bbatch_id\x18\x04 \x01(\x04R\abatchId\x12\x14\n" +
 	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\x12,\n" +
-	"\x06window\x18\x06 \x01(\v2\x14.urutau.v1.WindowTagR\x06window\"[\n" +
+	"\x06window\x18\x06 \x01(\v2\x14.urutau.v1.WindowTagR\x06window\"w\n" +
 	"\tWindowTag\x12\x1b\n" +
 	"\tin_window\x18\x01 \x01(\bR\binWindow\x12\x16\n" +
 	"\x06closes\x18\x02 \x01(\bR\x06closes\x12\x19\n" +
-	"\bchunk_id\x18\x03 \x01(\rR\achunkId*\x81\x01\n" +
+	"\bchunk_id\x18\x03 \x01(\rR\achunkId\x12\x1a\n" +
+	"\bsnapshot\x18\x04 \x01(\bR\bsnapshot*\x81\x01\n" +
 	"\vWorkerPhase\x12\x1c\n" +
 	"\x18WORKER_PHASE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15WORKER_PHASE_STARTING\x10\x01\x12\x1d\n" +
