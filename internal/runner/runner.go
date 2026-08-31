@@ -183,7 +183,7 @@ func resolveTables(ctx context.Context, qdb *sql.DB, s *spec.Spec) ([]mysql.Tabl
 		if err != nil {
 			return nil, nil, fmt.Errorf("runner: schema %s: %w", t.Source, err)
 		}
-		refs = append(refs, mysql.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk})
+		refs = append(refs, mysql.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk, Filter: t.Filter})
 		schemas[t.Source] = is
 	}
 	return refs, schemas, nil
@@ -359,6 +359,15 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 			rdr.Close()
 			_ = qdb.Close()
 			return nil, err
+		}
+		if ref.Filter != nil {
+			fsql, fargs, ferr := ref.Filter.SQL()
+			if ferr != nil {
+				rdr.Close()
+				_ = qdb.Close()
+				return nil, fmt.Errorf("runner: filter %s: %w", ref.Source, ferr)
+			}
+			chunker = chunker.WithFilter(fsql, fargs)
 		}
 		if err := mysql.SnapshotTable(ctx, chunker, rdr, router, ref.Target, mysql.SnapshotConfig{
 			WindowTimeout: cfg.WindowTimeout,
