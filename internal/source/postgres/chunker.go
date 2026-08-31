@@ -1,4 +1,4 @@
-package mysql
+package postgres
 
 import (
 	"context"
@@ -10,10 +10,10 @@ import (
 )
 
 // Chunker splits a table by its primary key, using the chunk-skipping
-// bounds trick: pick every chunkSize-th key with LIMIT 1 OFFSET n, then read
-// the slice between consecutive bounds. Reading ORDER BY pk LIMIT 1 OFFSET n
-// is O(n) per bounds query, but avoids scanning gaps and stays correct under
-// concurrent inserts (bounds are only seeds for the half-open range).
+// bounds trick shared with the MySQL source: pick every chunkSize-th key
+// with LIMIT 1 OFFSET n, then read the slice between consecutive bounds.
+// Bounds are only seeds for the half-open range, so the split stays
+// correct under concurrent inserts.
 type Chunker struct {
 	db        *sql.DB
 	schema    string
@@ -26,17 +26,16 @@ type Chunker struct {
 func NewChunker(db *sql.DB, source, pk string, chunkSize int) (*Chunker, error) {
 	schema, table, ok := strings.Cut(source, ".")
 	if !ok {
-		return nil, fmt.Errorf("mysql: chunker: source %q must be db.table", source)
+		return nil, fmt.Errorf("postgres: chunker: source %q must be schema.table", source)
 	}
 	if chunkSize <= 0 {
-		return nil, fmt.Errorf("mysql: chunker: chunkSize must be positive")
+		return nil, fmt.Errorf("postgres: chunker: chunkSize must be positive")
 	}
-	pks := strings.Split(pk, ",")
 	return &Chunker{
 		db:        db,
 		schema:    schema,
 		table:     table,
-		pk:        pks,
+		pk:        strings.Split(pk, ","),
 		chunkSize: chunkSize,
 	}, nil
 }
@@ -48,17 +47,17 @@ func (c *Chunker) PK() []string { return c.pk }
 // lowest PK, followed by every chunkSize-th key, then nil (the open high
 // bound of the last chunk).
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
-	cols := strings.Join(c.pk, ", ")
+	cols := quotedList(c.pk)
 	query := fmt.Sprintf(
-		"SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
-		cols, c.schema, c.table, cols,
+		"SELECT %s FROM %s.%s ORDER BY %s LIMIT 1 OFFSET $1",
+		cols, quoteIdent(c.schema), quoteIdent(c.table), cols,
 	)
 
 	var bounds [][]any
 	for offset := 0; ; offset += c.chunkSize {
 		rows, err := c.db.QueryContext(ctx, query, offset)
 		if err != nil {
-			return nil, fmt.Errorf("mysql: chunker bounds: %w", err)
+			return nil, fmt.Errorf("postgres: chunker bounds: %w", err)
 		}
 		key, err := scanRow(rows)
 		_ = rows.Close()
@@ -73,20 +72,24 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	return bounds, nil
 }
 
-// Scan executes the chunk SELECT (with the row-filter WHERE pushed — none
-// yet in this milestone) and calls fn for every row, keyed by column name.
+// Scan executes the chunk SELECT and calls fn for every row, keyed by
+// column name. Values decode through the same scalar mapping the pgoutput
+// reader uses, so snapshot rows and stream rows land in Iceberg identically.
 func (c *Chunker) Scan(ctx context.Context, ch dblog.Chunk, fn func(row map[string]any) error) error {
-	// Row-constructor comparison keeps composite PKs lexicographic.
+	// Row-constructor comparison keeps composite PKs lexicographic; the
+	// placeholder index runs across clauses ($1..$k, then $k+1..).
 	cond := make([]string, 0, 2)
 	args := make([]any, 0, 2*len(c.pk))
-	cols := "`" + strings.Join(c.pk, "`, `") + "`"
+	cols := quotedList(c.pk)
+	argIdx := 1
 
 	if ch.Low != nil {
-		cond = append(cond, fmt.Sprintf("(%s) >= (%s)", cols, placeholders(len(c.pk))))
+		cond = append(cond, fmt.Sprintf("(%s) >= (%s)", cols, placeholders(argIdx, len(c.pk))))
 		args = append(args, ch.Low...)
+		argIdx += len(c.pk)
 	}
 	if ch.High != nil {
-		cond = append(cond, fmt.Sprintf("(%s) < (%s)", cols, placeholders(len(c.pk))))
+		cond = append(cond, fmt.Sprintf("(%s) < (%s)", cols, placeholders(argIdx, len(c.pk))))
 		args = append(args, ch.High...)
 	}
 	where := ""
@@ -94,14 +97,14 @@ func (c *Chunker) Scan(ctx context.Context, ch dblog.Chunk, fn func(row map[stri
 		where = " WHERE " + strings.Join(cond, " AND ")
 	}
 
-	// With no row filter the SELECT must still read the whole row; select *
-	// keeps it simple and correct for the spike.
-	query := fmt.Sprintf("SELECT * FROM `%s`.`%s`%s ORDER BY %s",
-		c.schema, c.table, where, cols)
+	// Without a row filter the SELECT reads the whole row; select * keeps
+	// it simple and correct.
+	query := fmt.Sprintf("SELECT * FROM %s.%s%s ORDER BY %s",
+		quoteIdent(c.schema), quoteIdent(c.table), where, cols)
 
 	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("mysql: chunk scan: %w", err)
+		return fmt.Errorf("postgres: chunk scan: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -116,7 +119,7 @@ func (c *Chunker) Scan(ctx context.Context, ch dblog.Chunk, fn func(row map[stri
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return fmt.Errorf("mysql: chunk scan row: %w", err)
+			return fmt.Errorf("postgres: chunk scan row: %w", err)
 		}
 		m := make(map[string]any, len(colsMeta))
 		for i, name := range colsMeta {
@@ -148,6 +151,35 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	return vals, nil
 }
 
-func placeholders(n int) string {
-	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
+// placeholders renders $from..$from+n-1.
+func placeholders(from, n int) string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("$%d", from+i)
+	}
+	return strings.Join(out, ", ")
+}
+
+// quoteIdent quotes one identifier, doubling embedded quotes.
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func quotedList(cols []string) string {
+	out := make([]string, len(cols))
+	for i, c := range cols {
+		out[i] = quoteIdent(strings.TrimSpace(c))
+	}
+	return strings.Join(out, ", ")
+}
+
+// normalize maps driver values into the scalar subset shared with the
+// stream decoder.
+func normalize(v any) any {
+	switch t := v.(type) {
+	case []byte:
+		return string(t)
+	default:
+		return v
+	}
 }

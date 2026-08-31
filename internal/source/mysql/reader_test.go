@@ -11,6 +11,8 @@ import (
 	"github.com/maltzsama/urutau/internal/position"
 )
 
+const readerTestUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+
 func ordersTable() *schema.Table {
 	return &schema.Table{
 		Schema: "shop",
@@ -155,11 +157,12 @@ func TestOnRowUpdatePairsAndUnregisteredTable(t *testing.T) {
 
 func TestOnGTIDAccumulatesCumulativeSet(t *testing.T) {
 	r := newTestReader(nil)
-	r.mergeGTID(position.MustGTID(testUUID + ":1-2"))
-	for i := uint64(3); i <= 5; i++ {
-		r.mergeGTID(position.MustGTID(fmt.Sprintf("%s:%d", testUUID, i)))
+	r.mergeGTID(position.MustGTID(readerTestUUID + ":1-2"))
+	for i := 3; i <= 5; i++ {
+		r.mergeGTID(position.MustGTID(fmt.Sprintf("%s:%d", readerTestUUID, i)))
 	}
-	want := position.MustGTID(testUUID + ":1-5").String()
+
+	want := position.MustGTID(readerTestUUID + ":1-5").String()
 	if r.curGTID != want {
 		t.Fatalf("curGTID = %q, want cumulative %q", r.curGTID, want)
 	}

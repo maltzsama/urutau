@@ -20,14 +20,12 @@ import (
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/internal/source/dblog"
 )
 
-// TableRef maps one source table to its target and primary key.
-type TableRef struct {
-	Source     string // "db.table"
-	Target     string // "raw.orders"
-	PrimaryKey []string
-}
+// TableRef is the source-agnostic table mapping (kept here as an alias for
+// the package's public surface).
+type TableRef = dblog.TableRef
 
 // Config dials one MySQL instance. One replication connection per source —
 // the invariant the whole design stands on.
@@ -136,7 +134,7 @@ func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error 
 }
 
 // Synced reports the reader's current synced GTID set.
-func (r *Reader) Synced() *position.GTID {
+func (r *Reader) Synced() position.Position {
 	set := r.canal.SyncedGTIDSet()
 	if g, err := position.ParseGTID(set.String()); err == nil {
 		return g
@@ -146,7 +144,7 @@ func (r *Reader) Synced() *position.GTID {
 
 // Master reports the master's current executed GTID set (the caught-up
 // target for the DBLog window).
-func (r *Reader) Master() (*position.GTID, error) {
+func (r *Reader) Master() (position.Position, error) {
 	set, err := r.canal.GetMasterGTIDSet()
 	if err != nil {
 		return nil, fmt.Errorf("mysql: master gtid: %w", err)
