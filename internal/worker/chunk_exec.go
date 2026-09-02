@@ -114,9 +114,10 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return err
 	}
 	return x.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_ChunkReady{ChunkReady: &pb.ChunkReady{
-		Table:   req.Table,
-		ChunkId: req.ChunkId,
-		Rows:    uint64(len(rows)),
+		Table:           req.Table,
+		ChunkId:         req.ChunkId,
+		Rows:            uint64(len(rows)),
+		DroppedByWindow: uint64(x.w.DroppedByWindow(ta.TargetTable)),
 	}}})
 }
 

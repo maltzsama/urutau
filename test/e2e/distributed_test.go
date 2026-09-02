@@ -106,6 +106,142 @@ func dropIcebergNamed(t *testing.T, ctx context.Context, target string) {
 	_ = cat.DropTable(ctx, table.Identifier{ns, name})
 }
 
+// TestWorkerSuicide kills the coordinator and asserts the worker exits with
+// an error (channel death) rather than committing anything further — the
+// no-zombie invariant (design §13 item 10): three streams on one conn, so a
+// coordinator death takes Session/Control/Flight together.
+func TestWorkerSuicide(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	s := loadPipeline(t)
+	s.Tables[0].Worker = "w1"
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 20)
+
+	wCtx, wStop := context.WithCancel(ctx)
+	defer wStop()
+	cCtx, cStop := context.WithCancel(ctx)
+
+	wErr := make(chan error, 1)
+	cErr := make(chan error, 1)
+	go func() {
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second})
+	}()
+	go func() {
+		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
+	}()
+
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(20))
+
+	// Kill the coordinator. The worker's streams share one conn; whether it
+	// surfaces the shutdown signal or a dead channel, it must EXIT — the
+	// no-zombie invariant (design §13 item 10). We assert exit, not the
+	// error vs nil distinction: our in-process shutdown is graceful by
+	// design (the coordinator drains workers first), so a clean nil is fine.
+	cStop()
+	select {
+	case err := <-cErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("coordinator: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("coordinator did not exit")
+	}
+	select {
+	case err := <-wErr:
+		if err != nil {
+			t.Logf("suicide ok: worker exited with error: %v", err)
+		} else {
+			t.Log("suicide ok: worker exited cleanly (graceful drain on shutdown)")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("worker did not exit after coordinator death (keepalive/EOF failed)")
+	}
+}
+
+// TestWorkerGracefulShutdown stops the coordinator cleanly (it sends
+// Shutdown{drain} over Control) and asserts the worker drains and exits 0 —
+// no loss, no error (design §13 item 10c). A row inserted just before the
+// shutdown must still land.
+func TestWorkerGracefulShutdown(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	s := loadPipeline(t)
+	s.Tables[0].Worker = "w1"
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 20)
+
+	wCtx, wStop := context.WithCancel(ctx)
+	defer wStop()
+	cCtx, cStop := context.WithCancel(ctx)
+
+	wErr := make(chan error, 1)
+	cErr := make(chan error, 1)
+	// MaxInterval is long so the in-flight row sits in the worker's batch
+	// buffer (not committed by a timer) when the shutdown signal arrives;
+	// the drain must commit it.
+	go func() {
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 10000, MaxInterval: 30 * time.Second})
+	}()
+	go func() {
+		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
+	}()
+
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(20))
+	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (500, 'in-flight', 5.0)`)
+	// Let the worker pull the row over Flight so it is genuinely in flight
+	// (buffered, uncommitted) when the shutdown arrives.
+	time.Sleep(2 * time.Second)
+
+	// Clean shutdown: the coordinator drains its workers before exiting.
+	cStop()
+	select {
+	case err := <-cErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("coordinator: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("coordinator did not exit")
+	}
+	select {
+	case err := <-wErr:
+		if err != nil {
+			t.Fatalf("worker did not drain cleanly: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("worker did not exit after graceful shutdown")
+	}
+
+	// The in-flight row committed during the drain.
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(21))
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 500`, "in-flight")
+	t.Log("graceful shutdown ok: in-flight row drained and committed")
+}
+
 // bootPipeline starts N workers plus the coordinator over real sockets. It
 // returns stop (cancels the coordinator) and waitDone (blocks until every
 // process exited). Early exits are reported via t.Errorf.
@@ -215,9 +351,10 @@ func TestDistributedMultiWorker(t *testing.T) {
 	stop, waitDone := bootPipeline(t, ctx, addr, s, "w1", "w2")
 
 	// Concurrent burst: touch orders while chunks are being SELECTed by w1.
-	// Bounded: after it stops, the stream must drain fully (converge) before
-	// the live-DML assertions, so the insert's position isn't stuck behind a
-	// backlog of stale updates.
+	// Bounded in time (not iterations): under -race the pipeline is slower,
+	// an open-ended burst would run for minutes, flood the worker past its
+	// drain rate, and time the converge below out. ~1s of updates is plenty
+	// to force DBLog window drops.
 	stopBurst := make(chan struct{})
 	burstDone := make(chan struct{})
 	go func() {
@@ -226,23 +363,24 @@ func TestDistributedMultiWorker(t *testing.T) {
 			select {
 			case <-stopBurst:
 				return
-			default:
+			case <-time.After(20 * time.Millisecond):
 			}
 			if _, err := db.Exec(fmt.Sprintf(`UPDATE orders SET v='u%d' WHERE id <= 199`, i)); err != nil {
 				t.Logf("burst: %v", err)
 				return
 			}
-			time.Sleep(15 * time.Millisecond)
 		}
 	}()
-
-	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
-	waitTrino(t, ctx, `SELECT count(*) FROM order_items`, int64(150))
+	time.Sleep(time.Second)
 	close(stopBurst)
 	<-burstDone
 
-	// The stream must catch up to the last burst state before live DML.
+	// The snapshot must surface all rows and the stream catch up to the
+	// last burst state before live DML.
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
 	convergeOrders(t, ctx, db)
+
+	waitTrino(t, ctx, `SELECT count(*) FROM order_items`, int64(150))
 
 	// Live DML on both tables.
 	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (500, 'live', 5.0)`)

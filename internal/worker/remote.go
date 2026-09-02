@@ -353,7 +353,9 @@ func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.
 
 // dialOpts carries keepalive that converts a frozen coordinator into a
 // dead channel in ~15s. MinTime on the server must be ≤ Time here, or the
-// server GOAWAYs the client for pinging too much.
+// server GOAWAYs the client for pinging too much. The max message size must
+// cover a full snapshot window chunk (default 4Mi is too small for real
+// batches).
 func dialOpts() []grpc.DialOption {
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -362,6 +364,10 @@ func dialOpts() []grpc.DialOption {
 			Timeout:             5 * time.Second,
 			PermitWithoutStream: false,
 		}),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(128<<20),
+			grpc.MaxCallSendMsgSize(128<<20),
+		),
 	}
 }
 

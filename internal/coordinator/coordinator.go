@@ -296,6 +296,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 			MinTime:             10 * time.Second,
 			PermitWithoutStream: false,
 		}),
+		// Flight batches can be a full snapshot chunk; 128Mi covers the
+		// default batching ceiling.
+		grpc.MaxRecvMsgSize(128<<20),
+		grpc.MaxSendMsgSize(128<<20),
 	)
 	pb.RegisterUrutauControlServer(grpcServer, &controlServer{c: c})
 	flight.RegisterFlightServiceServer(grpcServer, &flightServer{c: c})
@@ -368,14 +372,21 @@ func (c *Coordinator) run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		c.gracefulShutdown()
-		c.emit(eventlog.KindJobStopped, map[string]any{"reason": "shutdown"})
+		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "shutdown"})
 		return ctx.Err()
 	case err := <-streamErr:
-		c.emit(eventlog.KindJobStopped, map[string]any{"reason": "stream"})
+		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "stream"})
 		return fmt.Errorf("coordinator: stream: %w", err)
 	case err := <-c.sessionErrs:
-		c.emit(eventlog.KindJobStopped, map[string]any{"reason": "session"})
+		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "session"})
 		return fmt.Errorf("coordinator: worker session: %w", err)
+	}
+}
+
+// emitLog writes an event and logs any failure (best-effort trail).
+func (c *Coordinator) emitLog(kind string, fields map[string]any) {
+	if err := c.emit(kind, fields); err != nil {
+		c.log.Warn("coordinator: eventlog emit", "kind", kind, "err", err)
 	}
 }
 
@@ -456,20 +467,26 @@ func (c *Coordinator) gateHold(ch change.Change) bool {
 	return true
 }
 
-// openWindow pauses the pump for one table and tags the current chunk.
+// openWindow pauses the pump for one table, tagging the current chunk. The
+// gate stays open for the WHOLE snapshot of the table (design §3.1: the
+// coordinator pauses relaying while it works the table); flushWindow drains
+// per chunk without closing it, and closeWindow seals it at the end. A gate
+// that opened and closed per chunk would let gap events (positioned AFTER
+// the gate's backlog) flow straight through, then release older backlog
+// after them — a reordering that resurrects old values.
 func (c *Coordinator) openWindow(target string, chunkID uint32) {
 	c.gateMu.Lock()
-	c.gateOn, c.gateTgt, c.gateChk, c.gateBuf = true, target, chunkID, nil
+	c.gateOn, c.gateTgt, c.gateChk = true, target, chunkID
 	c.gateMu.Unlock()
 }
 
-// flushWindow releases the gated events InWindow-tagged, then returns the
-// position the pump has caught up to (the caller sends the Closes marker
-// after its own caught-up proof).
-func (c *Coordinator) flushWindow(ctx context.Context) error {
+// flushWindow drains the gated events collected since the last drain,
+// InWindow-tagged for the given chunk, then returns (gate stays open).
+func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 	c.gateMu.Lock()
-	buf, tgt, chk := c.gateBuf, c.gateTgt, c.gateChk
-	c.gateOn, c.gateBuf = false, nil
+	buf, tgt := c.gateBuf, c.gateTgt
+	c.gateBuf = nil
+	c.gateChk = chunkID
 	c.gateMu.Unlock()
 
 	if len(buf) == 0 {
@@ -479,9 +496,24 @@ func (c *Coordinator) flushWindow(ctx context.Context) error {
 	// chunk's window (the live version won) and applies the change.
 	meta := &pb.BatchMeta{
 		Table:  tgt,
-		Window: &pb.WindowTag{InWindow: true, ChunkId: chk},
+		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
 	}
 	return c.enqueueBatch(ctx, buf, meta)
+}
+
+// closeWindow releases any remaining gated events (post-last-chunk) and
+// closes the gate. The trailing events are ordinary live changes: no window
+// tag.
+func (c *Coordinator) closeWindow(ctx context.Context) error {
+	c.gateMu.Lock()
+	buf, tgt := c.gateBuf, c.gateTgt
+	c.gateOn, c.gateBuf, c.gateChk = false, nil, 0
+	c.gateMu.Unlock()
+
+	if len(buf) == 0 {
+		return nil
+	}
+	return c.enqueueBatch(ctx, buf, &pb.BatchMeta{Table: tgt})
 }
 
 // waitChunkReady blocks until the worker reports the chunk SELECT done.
@@ -521,7 +553,9 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr dblog.SourceReader,
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c.openWindow(ref.Target, chunkID)
+		if i == 0 {
+			c.openWindow(ref.Target, chunkID)
+		}
 
 		lowB, err := json.Marshal(ch.Low)
 		if err != nil {
@@ -545,6 +579,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr dblog.SourceReader,
 		if err := c.waitChunkReady(ctx, ref.Source, chunkID); err != nil {
 			return err
 		}
+		c.log.Info("chunk ready", "table", ref.Source, "chunk", chunkID)
 
 		// The worker has the chunk rows in its window; prove the reader is
 		// caught up before releasing anything that touches this window.
@@ -554,9 +589,10 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr dblog.SourceReader,
 		}
 		at := rdr.Synced()
 
-		// Release the gated live events (InWindow-tagged) ahead of the
-		// Closes marker — FIFO ordering keeps them before it.
-		if err := c.flushWindow(ctx); err != nil {
+		// Release this chunk's gated live events (InWindow-tagged) ahead of
+		// the Closes marker — FIFO keeps them before it. The gate stays
+		// open: the next chunk's backlog must not race ahead of these.
+		if err := c.flushWindow(ctx, chunkID); err != nil {
 			return err
 		}
 		if err := c.enqueueBatch(ctx, nil, &pb.BatchMeta{
@@ -567,7 +603,8 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr dblog.SourceReader,
 			return err
 		}
 	}
-	return nil
+	// Seal the gate and release anything collected after the last chunk.
+	return c.closeWindow(ctx)
 }
 
 // batchMeta derives the wire window tag from one change.

@@ -201,20 +201,26 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 			if !ok {
 				return flush()
 			}
-			// DBLog window application, design §3.4: an InWindow event is
-			// itself a real change — it removes its snapshot row from the
+			// DBLog window application, design §3.4: an InWindow event is itself a
+			// real change — it removes its snapshot row from the owning
 			// chunk's window (the live version wins) and is then appended
-			// normally. The chunk's Closes marker flushes what remains as
-			// inserts; markers for unknown chunks are stale and dropped.
+			// normally. The coordinator tags gated live events with the
+			// chunk that was draining when they were released, which need
+			// not be the chunk that contains the row, so the delete scans
+			// every open window. The chunk's Closes marker flushes what
+			// remains as inserts; markers for unknown chunks are stale.
 			if c.Window != nil {
 				p.winMu.Lock()
-				win := p.windows[c.Window.ChunkID]
-				if c.Window.InWindow && win != nil {
-					if _, hit := win[change.KeyString(c.Key)]; hit {
-						delete(win, change.KeyString(c.Key))
-						p.dropped++
+				if c.Window.InWindow {
+					k := change.KeyString(c.Key)
+					for _, win := range p.windows {
+						if _, hit := win[k]; hit {
+							delete(win, k)
+							p.dropped++
+						}
 					}
 				}
+				win := p.windows[c.Window.ChunkID]
 				if c.Window.Closes {
 					if win != nil {
 						for _, row := range win {
