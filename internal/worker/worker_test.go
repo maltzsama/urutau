@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/sink"
 )
 
 type fakeCommitter struct {
@@ -15,6 +16,8 @@ type fakeCommitter struct {
 	batches []change.Batch
 	failAt  map[int]bool // fail the Nth flush (0-based)
 }
+
+func (f *fakeCommitter) Close() error { return nil }
 
 func (f *fakeCommitter) Commit(_ context.Context, b change.Batch) error {
 	f.mu.Lock()
@@ -35,7 +38,7 @@ func chg(table string, op change.Op, id int64, v, pos string) change.Change {
 	return c
 }
 
-func runWorker(t *testing.T, cfg Config, targets []string, committers map[string]Committer, changes []change.Change) error {
+func runWorker(t *testing.T, cfg Config, targets []string, committers map[string]sink.TableWriter, changes []change.Change) error {
 	t.Helper()
 	w := New(cfg)
 	for _, target := range targets {
@@ -52,7 +55,7 @@ func runWorker(t *testing.T, cfg Config, targets []string, committers map[string
 func TestFlushOnCloseCollapses(t *testing.T) {
 	fc := &fakeCommitter{}
 	err := runWorker(t, Config{MaxRows: 100, MaxInterval: time.Hour}, []string{"raw.orders"},
-		map[string]Committer{"raw.orders": fc}, []change.Change{
+		map[string]sink.TableWriter{"raw.orders": fc}, []change.Change{
 			chg("raw.orders", change.OpInsert, 1, "a", "p1"),
 			chg("raw.orders", change.OpUpdate, 1, "b", "p2"),
 			chg("raw.orders", change.OpInsert, 2, "x", "p3"),
@@ -80,7 +83,7 @@ func TestFlushOnCloseCollapses(t *testing.T) {
 func TestFlushByMaxRows(t *testing.T) {
 	fc := &fakeCommitter{}
 	err := runWorker(t, Config{MaxRows: 2, MaxInterval: time.Hour}, []string{"t"},
-		map[string]Committer{"t": fc}, []change.Change{
+		map[string]sink.TableWriter{"t": fc}, []change.Change{
 			chg("t", change.OpInsert, 1, "a", "p1"),
 			chg("t", change.OpInsert, 2, "b", "p2"),
 			chg("t", change.OpInsert, 3, "c", "p3"),
@@ -121,7 +124,7 @@ func TestFlushByInterval(t *testing.T) {
 func TestCommitFailureIsTerminalAndNeverSkips(t *testing.T) {
 	fc := &fakeCommitter{failAt: map[int]bool{0: true}}
 	err := runWorker(t, Config{MaxRows: 1, MaxInterval: time.Hour}, []string{"t"},
-		map[string]Committer{"t": fc}, []change.Change{
+		map[string]sink.TableWriter{"t": fc}, []change.Change{
 			chg("t", change.OpInsert, 1, "a", "p1"), // batch 0: fails
 			chg("t", change.OpInsert, 2, "b", "p2"), // batch 1: must NOT be committed after failure
 		})
@@ -140,7 +143,7 @@ func TestTablesCommitIndependently(t *testing.T) {
 	items := &fakeCommitter{}
 	err := runWorker(t, Config{MaxRows: 100, MaxInterval: time.Hour},
 		[]string{"raw.orders", "raw.order_items"},
-		map[string]Committer{"raw.orders": orders, "raw.order_items": items},
+		map[string]sink.TableWriter{"raw.orders": orders, "raw.order_items": items},
 		[]change.Change{
 			chg("raw.orders", change.OpInsert, 1, "a", "p1"),
 			chg("raw.order_items", change.OpInsert, 1, "x", "p2"),
@@ -182,7 +185,7 @@ func TestCommitsAreSerializedPerTable(t *testing.T) {
 		changes = append(changes, chg("t", change.OpInsert, int64(i), "v", "p"))
 	}
 	if err := runWorker(t, Config{MaxRows: 5, MaxInterval: time.Hour}, []string{"t"},
-		map[string]Committer{"t": slow}, changes); err != nil {
+		map[string]sink.TableWriter{"t": slow}, changes); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if overlapped {
@@ -191,5 +194,7 @@ func TestCommitsAreSerializedPerTable(t *testing.T) {
 }
 
 type CommitterFunc func(context.Context, change.Batch) error
+
+func (f CommitterFunc) Close() error { return nil }
 
 func (f CommitterFunc) Commit(ctx context.Context, b change.Batch) error { return f(ctx, b) }

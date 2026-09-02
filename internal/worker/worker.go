@@ -9,7 +9,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/observability"
-	"github.com/maltzsama/urutau/internal/sink/iceberg"
+	"github.com/maltzsama/urutau/internal/sink"
 )
 
 // Config tunes batch accumulation.
@@ -21,13 +21,6 @@ type Config struct {
 	MaxInterval time.Duration
 	// MetricsAddr serves /metrics (Prometheus); empty disables it.
 	MetricsAddr string
-}
-
-// Committer applies one collapsed batch of a single table. Implementations
-// must be safe to call from the table's dedicated goroutine only — the
-// serialization invariant is the caller's design.
-type Committer interface {
-	Commit(ctx context.Context, b change.Batch) error
 }
 
 // OnCommit observes successful commits (bookkeeping, tests).
@@ -42,7 +35,7 @@ type Worker struct {
 
 type tablePipeline struct {
 	target    string
-	committer Committer
+	committer sink.TableWriter
 	ch        chan change.Change
 
 	// DBLog snapshot windows, per design: each chunk's SELECT rows land in
@@ -73,17 +66,20 @@ func New(cfg Config) *Worker {
 // OnCommit installs the commit observer.
 func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
 
-// Register wires a committer to a target table.
-func (w *Worker) Register(target string, c *iceberg.TableWriter) {
+// Register wires a per-table writer to a target table. The writer is any
+// sink.TableWriter implementation — the worker knows nothing about the sink
+// (CR-012).
+func (w *Worker) Register(target string, c sink.TableWriter) {
 	w.tables[target] = newTablePipeline(target, c)
 }
 
-// RegisterCommitter wires a committer to a target table (for tests).
-func (w *Worker) RegisterCommitter(target string, c Committer) {
+// RegisterCommitter wires a writer to a target table (test helper; same
+// contract as Register).
+func (w *Worker) RegisterCommitter(target string, c sink.TableWriter) {
 	w.tables[target] = newTablePipeline(target, c)
 }
 
-func newTablePipeline(target string, c Committer) *tablePipeline {
+func newTablePipeline(target string, c sink.TableWriter) *tablePipeline {
 	return &tablePipeline{
 		target:    target,
 		committer: c,

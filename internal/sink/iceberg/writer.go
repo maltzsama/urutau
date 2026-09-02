@@ -89,10 +89,16 @@ func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifi
 	}, nil
 }
 
+// Close releases writer resources. The Iceberg writer holds none per-call
+// (it reloads metadata on every commit), so this is a no-op — present to
+// satisfy sink.TableWriter.
+func (w *TableWriter) Close() error { return nil }
+
 // Commit applies the batch: snapshot one equality-deletes every key in it
 // (upserts delete their older versions, deletes are the last word), snapshot
 // two appends the surviving rows. Only then is the position considered
-// advanced.
+// advanced. Implements sink.TableWriter; INVARIANT 2 (position last) is
+// honoured by writing the position only on the final commit of the batch.
 func (w *TableWriter) Commit(ctx context.Context, b change.Batch) error {
 	keys := append(collectKeys(b.Upserts), collectKeys(b.Deletes)...)
 	if len(keys) > 0 {
