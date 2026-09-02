@@ -113,6 +113,11 @@ type workerState struct {
 
 	out      chan *pb.CoordinatorMessage // attached by Session
 	attached bool
+	epoch    uint64 // last accepted epoch (guards stale Hellos)
+
+	// committed: target table → position the worker reported after its last
+	// commit. Refreshed on every ready Hello (design §5.6.1).
+	committed map[string]string
 }
 
 // workerName resolves the worker group of one spec table: the explicit
@@ -411,6 +416,26 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, me
 	}
 }
 
+// onHello processes a worker's ready Hello: it carries the phase and the
+// committed positions the worker read from Iceberg. A Hello with a stale
+// epoch is a zombie from a superseded generation — reject it (design §5.5).
+func (c *Coordinator) onHello(worker string, h *pb.Hello) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w, ok := c.workers[worker]
+	if !ok {
+		c.log.Warn("coordinator: Hello for unknown worker", "worker", worker)
+		return
+	}
+	if h.Epoch != w.epoch {
+		c.log.Warn("coordinator: stale Hello epoch", "worker", worker, "have", w.epoch, "got", h.Epoch)
+		return
+	}
+	w.committed = h.Committed
+	c.log.Info("worker hello", "worker", worker, "phase", h.Phase.String(),
+		"committed", len(h.Committed))
+}
+
 // onAck advances the worker's position index: every head batch the commit
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
@@ -582,6 +607,8 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			switch m := msg.Msg.(type) {
 			case *pb.WorkerMessage_Ack:
 				c.onAck(hello.WorkerName, m.Ack)
+			case *pb.WorkerMessage_Hello:
+				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_ChunkReady:
 				c.log.Info("chunk ready", "table", m.ChunkReady.Table, "chunk", m.ChunkReady.ChunkId)
 			case *pb.WorkerMessage_Error:
