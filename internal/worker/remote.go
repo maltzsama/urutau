@@ -37,6 +37,11 @@ type RemoteConfig struct {
 	MaxRows     int
 	MaxInterval time.Duration
 	Logger      *slog.Logger
+
+	// FaultStopAck (test-only): commits normally but withholds the ack, so
+	// the coordinator's supervisor sees a stale worker — the crashloop
+	// proof.
+	FaultStopAck bool
 }
 
 // sessionSender serializes Session sends: grpc client streams are not
@@ -195,6 +200,9 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
 
 	w.OnCommit(func(b change.Batch, rows int) {
+		if cfg.FaultStopAck {
+			return
+		}
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
 			Table:    b.Table,
 			Epoch:    assign.Epoch,

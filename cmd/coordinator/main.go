@@ -30,6 +30,9 @@ func main() {
 		eventlogURI     string
 		checkpointURI   string
 		checkpointSec   int
+		ackTimeout      time.Duration
+		maxResets       int
+		resetWindow     time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -60,6 +63,9 @@ func main() {
 				FlowPerWorkerMin: flowPerWorkerMi << 20,
 				Eventlog:         eventlogConfig(eventlogURI),
 				Checkpoint:       checkpointConfig(checkpointURI, checkpointSec),
+				AckTimeout:       ackTimeout,
+				MaxResets:        maxResets,
+				ResetWindow:      resetWindow,
 			})
 		},
 	}
@@ -74,6 +80,9 @@ func main() {
 	cmd.Flags().StringVar(&eventlogURI, "eventlog", "", "s3://<bucket>/<prefix> audit trail store (optional)")
 	cmd.Flags().StringVar(&checkpointURI, "checkpoint", "", "s3://<bucket>/<prefix> async position manifests (optional)")
 	cmd.Flags().IntVar(&checkpointSec, "checkpoint-interval", 10, "checkpoint write interval (seconds)")
+	cmd.Flags().DurationVar(&ackTimeout, "ack-timeout", 30*time.Second, "worker considered stale without an ack for this long")
+	cmd.Flags().IntVar(&maxResets, "max-resets", 5, "resets within the window before the job terminates")
+	cmd.Flags().DurationVar(&resetWindow, "reset-window", 15*time.Minute, "sliding window for the reset count")
 
 	root.AddCommand(cmd)
 	if err := root.Execute(); err != nil {

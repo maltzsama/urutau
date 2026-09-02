@@ -70,6 +70,13 @@ type Config struct {
 	// worker session before failing the boot.
 	WaitWorker time.Duration
 
+	// Supervision: a worker that stops acking past AckTimeout is reset
+	// (epoch++ and session cancel). Resets within ResetWindow beyond
+	// MaxResets terminate the job. Defaults 30s / 5 / 15m.
+	AckTimeout  time.Duration
+	MaxResets   int
+	ResetWindow time.Duration
+
 	Logger *slog.Logger
 }
 
@@ -128,7 +135,9 @@ type Coordinator struct {
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
 
-	cp *checkpoint
+	cp         *checkpoint
+	supervisor *supervisor
+	terminate  chan error
 }
 
 // workerState is one worker group's slice of the pipeline: its tables, its
@@ -143,6 +152,7 @@ type workerState struct {
 	control  pb.UrutauControl_ControlServer
 	attached bool
 	epoch    uint64 // last accepted epoch (guards stale Hellos)
+	cancel   context.CancelFunc
 
 	// committed: target table → position the worker reported after its last
 	// commit. Refreshed on every ready Hello (design §5.6.1).
@@ -183,6 +193,8 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
+	c.supervisor = newSupervisor(c)
+	c.terminate = make(chan error, 1)
 	return c.run(ctx)
 }
 
@@ -383,6 +395,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 	}
 
+	// Supervision after the snapshot phase: acks only flow once the stream
+	// is live, so a long snapshot must not look like a stale worker.
+	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
+
 	// Block until the world ends.
 	select {
 	case <-ctx.Done():
@@ -395,6 +411,19 @@ func (c *Coordinator) run(ctx context.Context) error {
 	case err := <-c.sessionErrs:
 		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "session"})
 		return fmt.Errorf("coordinator: worker session: %w", err)
+	case err := <-c.terminate:
+		c.gracefulShutdown()
+		c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": "crashloop"})
+		return err
+	}
+}
+
+// supervisionConfig maps the Config knobs to the supervisor defaults.
+func supervisionConfig(cfg Config) SupervisorConfig {
+	return SupervisorConfig{
+		AckTimeout:  cfg.AckTimeout,
+		MaxResets:   cfg.MaxResets,
+		ResetWindow: cfg.ResetWindow,
 	}
 }
 
@@ -700,6 +729,7 @@ func (c *Coordinator) onHello(worker string, h *pb.Hello) {
 // onAck advances the worker's position index: every head batch the commit
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
+	c.supervisor.noteAck(worker, time.Now())
 	pos, err := c.adapt.ParsePosition(ack.Position)
 	if err != nil {
 		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
@@ -813,6 +843,9 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		c.mu.Unlock()
 		return fmt.Errorf("coordinator: worker %q already connected", hello.WorkerName)
 	}
+	// The supervisor cancels this ctx to force a reset; the worker sees the
+	// stream die and suicides.
+	sessCtx, sessCancel := context.WithCancel(stream.Context())
 	sess := &workerSession{
 		out:  make(chan *pb.CoordinatorMessage, 16),
 		done: make(chan error, 1),
@@ -822,17 +855,26 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	// wakes — attaching after the signal is a data race.
 	if known {
 		w.out, w.attached = sess.out, true
+		w.cancel = sessCancel
+		c.supervisor.noteAttach(hello.WorkerName)
 	}
 	c.mu.Unlock()
 	if !known {
+		sessCancel()
 		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
 	}
 
 	defer func() {
 		c.mu.Lock()
-		w.attached, w.out = false, nil
+		w.attached, w.out, w.cancel = false, nil, nil
 		c.mu.Unlock()
-		c.sessionErrs <- retErr
+		sessCancel()
+		// A supervisor reset is not a worker failure, and neither is the
+		// death of a worker mid-reset (it suicides on channel loss); the
+		// supervisor owns the outcome (crashloop or recovery).
+		if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(hello.WorkerName) {
+			c.sessionErrs <- retErr
+		}
 	}()
 
 	select {
@@ -875,9 +917,15 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			return err
 		case <-stream.Context().Done():
 			return stream.Context().Err()
+		case <-sessCtx.Done():
+			return errSessionReset
 		}
 	}
 }
+
+// errSessionReset marks a session cancelled by the supervisor; not a worker
+// failure, so it must not kill the run via sessionErrs.
+var errSessionReset = errors.New("session reset")
 
 // workerSession is one connected worker's session-local surface; the group's
 // durable state lives in workerState.
@@ -912,7 +960,11 @@ func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr e
 		c.mu.Lock()
 		w.control = nil
 		c.mu.Unlock()
-		c.sessionErrs <- retErr
+		// A worker mid-reset suicides and closes this stream too; only a
+		// non-reset death is a real session failure.
+		if !c.supervisor.isPending(hello.WorkerName) {
+			c.sessionErrs <- retErr
+		}
 	}()
 	// The worker never writes again; its death is the stream ending.
 	<-stream.Context().Done()

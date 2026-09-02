@@ -472,3 +472,57 @@ func equalItems(src, ice [][]any) bool {
 	}
 	return true
 }
+
+// TestCrashloopKillsJob proves the terminal supervision invariant (design
+// §13 item 11): a worker that commits but stops acking is reset by the
+// supervisor; once resets exceed the window the coordinator terminates
+// rather than limp along with a zombie.
+func TestCrashloopKillsJob(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	s := loadPipeline(t)
+	s.Tables[0].Worker = "w1"
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 10)
+
+	wCtx, wStop := context.WithCancel(ctx)
+	defer wStop()
+	cCtx, cStop := context.WithCancel(ctx)
+
+	cErr := make(chan error, 1)
+	wErr := make(chan error, 1)
+	go func() {
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: true})
+	}()
+	// Aggressive supervision: stale after 5s, only 2 resets allowed, 1m window.
+	go func() {
+		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 5 * time.Second, MaxResets: 2, ResetWindow: time.Minute})
+	}()
+
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(10))
+
+	// The supervisor must terminate the job with a crashloop error.
+	select {
+	case err := <-cErr:
+		if err == nil || !strings.Contains(err.Error(), "crashloop") {
+			t.Fatalf("coordinator returned %v, want crashloop", err)
+		}
+		t.Logf("crashloop ok: %v", err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("coordinator did not terminate on crashloop")
+	}
+	cStop()
+	<-wErr
+}
