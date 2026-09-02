@@ -776,6 +776,8 @@ type Assignment struct {
 	Batching      *BatchConfig           `protobuf:"bytes,6,opt,name=batching,proto3" json:"batching,omitempty"`                       // already resolved, including worker override
 	ResumeFrom    string                 `protobuf:"bytes,7,opt,name=resume_from,json=resumeFrom,proto3" json:"resume_from,omitempty"` // min() position this worker resumes from
 	SourceKind    string                 `protobuf:"bytes,8,opt,name=source_kind,json=sourceKind,proto3" json:"source_kind,omitempty"` // "mysql" | "postgres" — how to parse positions
+	SourceDsn     string                 `protobuf:"bytes,9,opt,name=source_dsn,json=sourceDsn,proto3" json:"source_dsn,omitempty"`    // query connection for snapshot chunk SELECTs
+	ChunkSize     uint32                 `protobuf:"varint,10,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`  // DBLog chunk granularity for chunk SELECTs
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -864,6 +866,20 @@ func (x *Assignment) GetSourceKind() string {
 		return x.SourceKind
 	}
 	return ""
+}
+
+func (x *Assignment) GetSourceDsn() string {
+	if x != nil {
+		return x.SourceDsn
+	}
+	return ""
+}
+
+func (x *Assignment) GetChunkSize() uint32 {
+	if x != nil {
+		return x.ChunkSize
+	}
+	return 0
 }
 
 // ── Acks ─────────────────────────────────────────────────────────────────
@@ -1554,7 +1570,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"schemaJson\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
-	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\x9c\x02\n" +
+	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xda\x02\n" +
 	"\n" +
 	"Assignment\x12\x1f\n" +
 	"\vworker_name\x18\x01 \x01(\tR\n" +
@@ -1567,7 +1583,12 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\vresume_from\x18\a \x01(\tR\n" +
 	"resumeFrom\x12\x1f\n" +
 	"\vsource_kind\x18\b \x01(\tR\n" +
-	"sourceKind\"\xda\x01\n" +
+	"sourceKind\x12\x1d\n" +
+	"\n" +
+	"source_dsn\x18\t \x01(\tR\tsourceDsn\x12\x1d\n" +
+	"\n" +
+	"chunk_size\x18\n" +
+	" \x01(\rR\tchunkSize\"\xda\x01\n" +
 	"\x03Ack\x12\x19\n" +
 	"\bbatch_id\x18\x01 \x01(\x04R\abatchId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x04R\x05epoch\x12\x14\n" +

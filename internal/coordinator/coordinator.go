@@ -109,6 +109,20 @@ type Coordinator struct {
 	sessionErrs chan error    // first exit wins
 	batchSeq    atomic.Uint64 // monotonic BatchMeta.batch_id
 	mu          sync.Mutex    // guards session attach/detach
+
+	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
+	// on the worker, live events of that table are held here instead of
+	// being shipped — a live event racing ahead of the chunk's rows would
+	// miss the window delete and duplicate the row. On ChunkReady the held
+	// events are released InWindow-tagged, then the Closes marker.
+	gateMu  sync.Mutex
+	gateOn  bool
+	gateTgt string
+	gateChk uint32
+	gateBuf []change.Change
+
+	// chunkReady routes worker ChunkReady replies to the snapshot loop.
+	chunkReady chan *pb.ChunkReady
 }
 
 // workerState is one worker group's slice of the pipeline: its tables, its
@@ -153,6 +167,7 @@ func Run(ctx context.Context, cfg Config) error {
 		index:       map[string]*positionIndex{},
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
+		chunkReady:  make(chan *pb.ChunkReady, 1024),
 	}
 	if cfg.FlowTotalBytes <= 0 {
 		cfg.FlowTotalBytes = 512 << 20
@@ -340,7 +355,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := dblog.SnapshotTable(ctx, chunker, rdr, &wireRelay{c: c}, ref.Target, snapCfg); err != nil {
+		if err := c.snapshotTable(ctx, rdr, chunker, ref, snapCfg); err != nil {
 			return fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
 		}
 		c.log.Info("coordinator snapshot done", "table", ref.Source)
@@ -406,13 +421,19 @@ func (c *Coordinator) sendAssignments(ctx context.Context, schemas map[string]*i
 	return nil
 }
 
-// pump encodes reader events into the data queue.
+// pump encodes reader events into the data queue. While a DBLog window is
+// open (gateOn), events of the gated table are buffered instead — released
+// InWindow-tagged by flushWindow after the worker confirms ChunkReady. Other
+// tables flow freely.
 func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
 	for {
 		select {
 		case ch, ok := <-out:
 			if !ok {
 				return
+			}
+			if c.gateHold(ch) {
+				continue
 			}
 			if err := c.enqueueBatch(ctx, []change.Change{ch}, batchMeta(ch)); err != nil {
 				c.log.Warn("coordinator: enqueue failed", "err", err)
@@ -422,6 +443,131 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
 			return
 		}
 	}
+}
+
+// gateHold buffers an event when a window is open for its table.
+func (c *Coordinator) gateHold(ch change.Change) bool {
+	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
+	if !c.gateOn || ch.Table != c.gateTgt {
+		return false
+	}
+	c.gateBuf = append(c.gateBuf, ch)
+	return true
+}
+
+// openWindow pauses the pump for one table and tags the current chunk.
+func (c *Coordinator) openWindow(target string, chunkID uint32) {
+	c.gateMu.Lock()
+	c.gateOn, c.gateTgt, c.gateChk, c.gateBuf = true, target, chunkID, nil
+	c.gateMu.Unlock()
+}
+
+// flushWindow releases the gated events InWindow-tagged, then returns the
+// position the pump has caught up to (the caller sends the Closes marker
+// after its own caught-up proof).
+func (c *Coordinator) flushWindow(ctx context.Context) error {
+	c.gateMu.Lock()
+	buf, tgt, chk := c.gateBuf, c.gateTgt, c.gateChk
+	c.gateOn, c.gateBuf = false, nil
+	c.gateMu.Unlock()
+
+	if len(buf) == 0 {
+		return nil
+	}
+	// One batch, InWindow-tagged: the worker deletes each key from the
+	// chunk's window (the live version won) and applies the change.
+	meta := &pb.BatchMeta{
+		Table:  tgt,
+		Window: &pb.WindowTag{InWindow: true, ChunkId: chk},
+	}
+	return c.enqueueBatch(ctx, buf, meta)
+}
+
+// waitChunkReady blocks until the worker reports the chunk SELECT done.
+func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32) error {
+	for {
+		select {
+		case cr := <-c.chunkReady:
+			if cr.Table == table && cr.ChunkId == chunkID {
+				return nil
+			}
+			c.log.Warn("coordinator: unexpected ChunkReady", "table", cr.Table, "chunk", cr.ChunkId)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// snapshotTable runs the DBLog snapshot for one table with the chunk SELECT
+// executed by the worker (design §3.1): for each chunk the coordinator pauses
+// the pump (openWindow), sends ChunkRequest bounds, waits ChunkReady, proves
+// caught-up, then releases the gated live events InWindow-tagged and the
+// Closes marker. The worker holds the chunk rows in its window; the window
+// is what InWindow events drain and the Closes marker flushes.
+func (c *Coordinator) snapshotTable(ctx context.Context, rdr dblog.SourceReader, chunker dblog.ChunkSource, ref dblog.TableRef, cfg dblog.SnapshotConfig) error {
+	bounds, err := chunker.Bounds(ctx)
+	if err != nil {
+		return err
+	}
+	chunks := dblog.Chunks(bounds)
+	w, ok := c.route[ref.Target]
+	if !ok {
+		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
+	}
+
+	for i, ch := range chunks {
+		chunkID := uint32(i)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c.openWindow(ref.Target, chunkID)
+
+		lowB, err := json.Marshal(ch.Low)
+		if err != nil {
+			return fmt.Errorf("coordinator: chunk %d low bounds: %w", chunkID, err)
+		}
+		var highB []byte
+		if ch.High != nil {
+			highB, err = json.Marshal(ch.High)
+			if err != nil {
+				return fmt.Errorf("coordinator: chunk %d high bounds: %w", chunkID, err)
+			}
+		}
+		req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Low: lowB, High: highB}
+
+		select {
+		case w.out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		if err := c.waitChunkReady(ctx, ref.Source, chunkID); err != nil {
+			return err
+		}
+
+		// The worker has the chunk rows in its window; prove the reader is
+		// caught up before releasing anything that touches this window.
+		high := rdr.Synced()
+		if err := dblog.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
+			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+		}
+		at := rdr.Synced()
+
+		// Release the gated live events (InWindow-tagged) ahead of the
+		// Closes marker — FIFO ordering keeps them before it.
+		if err := c.flushWindow(ctx); err != nil {
+			return err
+		}
+		if err := c.enqueueBatch(ctx, nil, &pb.BatchMeta{
+			Table:  ref.Target,
+			LowPos: at.String(),
+			Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // batchMeta derives the wire window tag from one change.
@@ -524,32 +670,6 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	}
 }
 
-// wireRelay routes the DBLog orchestrator's calls over the data queue.
-type wireRelay struct {
-	c *Coordinator
-}
-
-func (w *wireRelay) Release(table string, chunkID uint32, at position.Position) {
-	// The Closes marker travels as an empty batch; its position rides in
-	// LowPos. FIFO ordering guarantees every window row and every InWindow
-	// event is already ahead of it.
-	meta := &pb.BatchMeta{
-		Table:  table,
-		LowPos: at.String(),
-		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
-	}
-	if err := w.c.enqueueBatch(w.c.runCtx, nil, meta); err != nil {
-		w.c.log.Warn("coordinator: release enqueue failed", "err", err)
-	}
-}
-
-func (w *wireRelay) AddWindowRows(target string, chunkID uint32, rows []change.Change) error {
-	return w.c.enqueueBatch(w.c.runCtx, rows, &pb.BatchMeta{
-		Table:  target,
-		Window: &pb.WindowTag{Snapshot: true, ChunkId: chunkID},
-	})
-}
-
 // assignmentFor builds one worker's table assignment with its own ticket.
 func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
 	assign := &pb.Assignment{
@@ -558,6 +678,8 @@ func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.
 		RunId:      c.runID,
 		Ticket:     w.ticket,
 		SourceKind: c.cfg.Spec.Source.Kind,
+		SourceDsn:  c.cfg.Spec.Source.URI,
+		ChunkSize:  uint32(c.cfg.ChunkSize),
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
@@ -682,7 +804,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			case *pb.WorkerMessage_Hello:
 				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_ChunkReady:
-				c.log.Info("chunk ready", "table", m.ChunkReady.Table, "chunk", m.ChunkReady.ChunkId)
+				c.chunkReady <- m.ChunkReady
 			case *pb.WorkerMessage_Error:
 				sess.done <- errors.New("coordinator: worker error: " + m.Error.Detail)
 				return

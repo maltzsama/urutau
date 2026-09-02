@@ -95,6 +95,8 @@ message Assignment {
   BatchConfig batching    = 6;  // already resolved, including worker override
   string      resume_from = 7;  // min() position this worker resumes from
   string      source_kind = 8;  // "mysql" | "postgres" — how to parse positions
+  string      source_dsn  = 9;  // query connection for snapshot chunk SELECTs
+  uint32      chunk_size  = 10; // DBLog chunk granularity for chunk SELECTs
 }
 
 // ── Acks ─────────────────────────────────────────────────────────────────

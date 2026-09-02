@@ -73,6 +73,24 @@ func For(s *spec.Spec, rt Runtime) (Source, error) {
 	}
 }
 
+// OpenQueryDB opens a query connection for a source kind and URI — the same
+// surface the per-source OpenQuery uses, exposed for remote workers that run
+// snapshot chunk SELECTs themselves (design §11.1).
+func OpenQueryDB(kind, uri string) (*sql.DB, error) {
+	switch kind {
+	case "mysql":
+		conn, err := parseMySQLURI(uri)
+		if err != nil {
+			return nil, err
+		}
+		return sql.Open("mysql", conn.queryDSN())
+	case "postgres":
+		return sql.Open("pgx", uri)
+	default:
+		return nil, fmt.Errorf("adapter: OpenQueryDB: unknown source kind %q", kind)
+	}
+}
+
 // ── MySQL ────────────────────────────────────────────────────────────
 
 type mysqlSource struct {

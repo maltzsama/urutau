@@ -192,6 +192,8 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	ingest := make(chan change.Change, 1024)
 	go func() { runErr <- w.Run(pipeCtx, ingest) }()
 
+	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
+
 	w.OnCommit(func(b change.Batch, rows int) {
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
 			Table:    b.Table,
@@ -229,6 +231,21 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		log:       cfg.Logger,
 	}
 
+	// Chunk work is serialized: the coordinator sends one ChunkRequest at a
+	// time and waits for ChunkReady, so a single worker slot is enough and
+	// ordering between chunks is preserved.
+	chunkWork := make(chan *pb.ChunkRequest, 4)
+	chunkErr := make(chan error, 1)
+	go func() {
+		for req := range chunkWork {
+			if err := chunks.run(sessCtx, req); err != nil {
+				chunkErr <- err
+				cancelAll(fmt.Errorf("worker: chunk: %w", err))
+				return
+			}
+		}
+	}()
+
 	// Surveillance is by READING each stream (§5.3.1): the first one to
 	// die cancels the shared context, which takes the other two with it.
 	loops := []struct {
@@ -236,8 +253,14 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		step func() error
 	}{
 		{"session", func() error {
-			_, err := session.Recv()
-			return err
+			m, err := session.Recv()
+			if err != nil {
+				return err
+			}
+			if cr := m.GetChunk(); cr != nil {
+				chunkWork <- cr
+			}
+			return nil
 		}},
 		{"control", func() error {
 			m, err := control.Recv()
@@ -257,11 +280,14 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return recv.apply(fd)
 		}},
 	}
+	var loopWG sync.WaitGroup
 	for _, l := range loops {
+		loopWG.Add(1)
 		go func(l struct {
 			name string
 			step func() error
 		}) {
+			defer loopWG.Done()
 			for {
 				if err := l.step(); err != nil {
 					if errors.Is(err, io.EOF) {
@@ -278,6 +304,10 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	}
 
 	<-sessCtx.Done()
+	// Every read loop has seen the cancellation (or will within a Recv
+	// round-trip); wait for them so no loop can still send into ingest when
+	// we close it below.
+	loopWG.Wait()
 	return workerShutdown(context.Cause(sessCtx), pipeCancel, pipeCtx, runErr, ingest, cfg.Logger)
 }
 
