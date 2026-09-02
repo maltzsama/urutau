@@ -37,6 +37,7 @@ import (
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Config tunes the coordinator for one pipeline.
@@ -112,6 +113,7 @@ type workerState struct {
 	ticket []byte
 
 	out      chan *pb.CoordinatorMessage // attached by Session
+	control  pb.UrutauControl_ControlServer
 	attached bool
 	epoch    uint64 // last accepted epoch (guards stale Hellos)
 
@@ -240,7 +242,18 @@ func (c *Coordinator) run(ctx context.Context) error {
 	defer func() { _ = lis.Close() }()
 	c.log.Info("coordinator listening", "addr", lis.Addr().String())
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		// Keepalive agreement with the worker: MinTime ≤ client Time, else
+		// the server GOAWAYs a healthy worker for pinging too much.
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    10 * time.Second,
+			Timeout: 5 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	)
 	pb.RegisterUrutauControlServer(grpcServer, &controlServer{c: c})
 	flight.RegisterFlightServiceServer(grpcServer, &flightServer{c: c})
 	go func() { _ = grpcServer.Serve(lis) }()
@@ -305,6 +318,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Block until the world ends.
 	select {
 	case <-ctx.Done():
+		c.gracefulShutdown()
 		return ctx.Err()
 	case err := <-streamErr:
 		return fmt.Errorf("coordinator: stream: %w", err)
@@ -640,10 +654,60 @@ type workerSession struct {
 	done chan error
 }
 
-// Control is the urgent-signal plane; nothing sends on it in this milestone.
-func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) error {
+// Control is the urgent-signal plane on the same ClientConn as Session and
+// DoGet. The first frame must be a Hello naming the worker so urgent
+// signals route to the right stream. No data rides here.
+func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr error) {
+	c := s.c
+	msg, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	hello := msg.GetHello()
+	if hello == nil {
+		return errors.New("coordinator: Control first message must be Hello")
+	}
+	c.mu.Lock()
+	w, known := c.workers[hello.WorkerName]
+	if known {
+		w.control = stream
+	}
+	c.mu.Unlock()
+	if !known {
+		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+	}
+	defer func() {
+		c.mu.Lock()
+		w.control = nil
+		c.mu.Unlock()
+		c.sessionErrs <- retErr
+	}()
+	// The worker never writes again; its death is the stream ending.
 	<-stream.Context().Done()
 	return stream.Context().Err()
+}
+
+// gracefulShutdown tells every connected worker to drain: flush + commit +
+// ack what is in flight, then exit 0 (design §5.3.2). Called on shutdown
+// and before terminal exits.
+func (c *Coordinator) gracefulShutdown() {
+	for _, w := range c.workers {
+		c.mu.Lock()
+		ctrl := w.control
+		c.mu.Unlock()
+		if ctrl == nil {
+			continue
+		}
+		msg := &pb.ControlMessage{Msg: &pb.ControlMessage_Shutdown{
+			Shutdown: &pb.Shutdown{
+				Grace: durationpb.New(30 * time.Second),
+				Drain: true,
+			},
+		}}
+		if err := ctrl.Send(msg); err != nil {
+			c.log.Warn("coordinator: shutdown send", "worker", w.name, "err", err)
+		}
+	}
 }
 
 // ── Flight data plane ────────────────────────────────────────────────

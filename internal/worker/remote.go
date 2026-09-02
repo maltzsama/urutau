@@ -17,9 +17,8 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/position"
@@ -87,13 +86,20 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		cfg.MaxInterval = 2 * time.Second
 	}
 
-	conn, err := grpc.NewClient(cfg.Coordinator, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// One ClientConn, one parent context, three coupled streams: Session,
+	// Control and Flight all die together — the split-brain correction of
+	// design §5.3. dialOpts carries the keepalive that turns a silently
+	// frozen coordinator into an error in ~15s.
+	conn, err := grpc.NewClient(cfg.Coordinator, dialOpts()...)
 	if err != nil {
 		return fmt.Errorf("worker: dial: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	session, err := sessionWithRetry(ctx, conn, cfg.Logger)
+	sessCtx, cancelAll := context.WithCancelCause(ctx)
+	defer cancelAll(nil)
+
+	session, err := sessionWithRetry(sessCtx, conn, cfg.Logger)
 	if err != nil {
 		return fmt.Errorf("worker: session: %w", err)
 	}
@@ -177,9 +183,14 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	}
 	cfg.Logger.Info("worker ready", "phase", phase.String(), "committed", len(committed))
 
+	// Pipelines drain on their own ctx: a graceful shutdown signal cancels
+	// the streams (sessCtx) but leaves the flush able to commit in-flight
+	// rows (design §5.3.2). Only an anomalous channel death aborts it.
+	pipeCtx, pipeCancel := context.WithCancel(ctx)
+	defer pipeCancel()
 	runErr := make(chan error, 1)
 	ingest := make(chan change.Change, 1024)
-	go func() { runErr <- w.Run(ctx, ingest) }()
+	go func() { runErr <- w.Run(pipeCtx, ingest) }()
 
 	w.OnCommit(func(b change.Batch, rows int) {
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
@@ -190,16 +201,22 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}}})
 	})
 
-	// Flight data plane: pull batches until the coordinator closes the
-	// stream (snapshot done, shutdown, or the world ending).
-	flightConn, err := flight.NewClientWithMiddleware(cfg.Coordinator, nil, nil,
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Control plane (same ClientConn, urgent signals) — the Hello identifies
+	// this stream to the server.
+	control, err := pb.NewUrutauControlClient(conn).Control(sessCtx)
 	if err != nil {
-		return fmt.Errorf("worker: flight dial: %w", err)
+		return fmt.Errorf("worker: control: %w", err)
 	}
-	defer func() { _ = flightConn.Close() }()
+	if err := control.Send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Hello{Hello: &pb.Hello{
+		WorkerName: cfg.Name,
+		Epoch:      assign.Epoch,
+	}}}); err != nil {
+		return fmt.Errorf("worker: control hello: %w", err)
+	}
 
-	dataStream, err := flightConn.DoGet(ctx, &flight.Ticket{Ticket: assign.Ticket})
+	// Data plane: Arrow Flight over the SAME ClientConn, so a dropped
+	// connection tears down every stream at once.
+	fl, err := flight.NewFlightServiceClient(conn).DoGet(sessCtx, &flight.Ticket{Ticket: assign.Ticket})
 	if err != nil {
 		return fmt.Errorf("worker: doget: %w", err)
 	}
@@ -211,25 +228,111 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		parsePos:  parsePos,
 		log:       cfg.Logger,
 	}
-	for {
-		fd, err := dataStream.Recv()
-		// gRPC wraps ctx cancellation in a status error, so match the code
-		// too: a shutdown is not a failure.
-		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) ||
-			status.Code(err) == codes.Canceled {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("worker: flight recv: %w", err)
-		}
-		if err := recv.apply(fd); err != nil {
+
+	// Surveillance is by READING each stream (§5.3.1): the first one to
+	// die cancels the shared context, which takes the other two with it.
+	loops := []struct {
+		name string
+		step func() error
+	}{
+		{"session", func() error {
+			_, err := session.Recv()
 			return err
-		}
+		}},
+		{"control", func() error {
+			m, err := control.Recv()
+			if err != nil {
+				return err
+			}
+			if m.GetShutdown() != nil {
+				return errShutdown
+			}
+			return nil
+		}},
+		{"flight", func() error {
+			fd, err := fl.Recv()
+			if err != nil {
+				return err
+			}
+			return recv.apply(fd)
+		}},
+	}
+	for _, l := range loops {
+		go func(l struct {
+			name string
+			step func() error
+		}) {
+			for {
+				if err := l.step(); err != nil {
+					if errors.Is(err, io.EOF) {
+						cancelAll(fmt.Errorf("%w", errGracefulEOF))
+					} else if errors.Is(err, errShutdown) {
+						cancelAll(errShutdown)
+					} else {
+						cancelAll(fmt.Errorf("worker: stream %s: %w", l.name, err))
+					}
+					return
+				}
+			}
+		}(l)
 	}
 
-	// Stream over: close ingest so the pipelines flush their remainder.
+	<-sessCtx.Done()
+	return workerShutdown(context.Cause(sessCtx), pipeCancel, pipeCtx, runErr, ingest, cfg.Logger)
+}
+
+// Sentinel causes distinguishing graceful shutdown from channel death.
+var (
+	errGracefulEOF = errors.New("worker: coordinator closed the stream cleanly")
+	errShutdown    = errors.New("worker: shutdown signal received")
+)
+
+// workerShutdown drains and exits cleanly when the coordinator intended to
+// shut down (graceful EOF, shutdown signal, or the parent ctx cancelling);
+// on an anomalous channel death it aborts in-flight transactions instead —
+// a commit that completes after the channel is lost is indistinguishable
+// from a zombie's (design §5.5).
+func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.Context,
+	runErr <-chan error, ingest chan<- change.Change, log *slog.Logger) error {
+
+	graceful := errors.Is(cause, errGracefulEOF) || errors.Is(cause, errShutdown) ||
+		errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded)
+
 	close(ingest)
-	return <-runErr
+	if !graceful {
+		pipeCancel()
+		log.Error("worker: channel lost, aborting in-flight transactions", "cause", cause)
+		select {
+		case <-runErr:
+		case <-time.After(5 * time.Second):
+		}
+		return fmt.Errorf("worker: channel lost: %w", cause)
+	}
+
+	// Graceful: drain whatever is buffered; pipeCtx is still alive unless
+	// the parent ctx itself was cancelled.
+	log.Info("worker: draining", "cause", cause)
+	select {
+	case err := <-runErr:
+		return err
+	case <-time.After(30 * time.Second):
+		pipeCancel()
+		return fmt.Errorf("worker: drain timeout: %w", cause)
+	}
+}
+
+// dialOpts carries keepalive that converts a frozen coordinator into a
+// dead channel in ~15s. MinTime on the server must be ≤ Time here, or the
+// server GOAWAYs the client for pinging too much.
+func dialOpts() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second,
+			Timeout:             5 * time.Second,
+			PermitWithoutStream: false,
+		}),
+	}
 }
 
 // batchReceiver routes decoded Flight batches into the worker core, skipping
