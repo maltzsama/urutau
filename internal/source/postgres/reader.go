@@ -61,8 +61,8 @@ type Reader struct {
 	conn    *pgx.Conn
 	out     chan<- change.Change
 	bySrc   map[string]snapshot.TableRef // "schema.table" → ref (PK + target)
-	states  map[string]*TableState    // "schema.table" → introspected state
-	relByID map[uint32]relEntry       // relation id → state, from Relation messages
+	states  map[string]*TableState       // "schema.table" → introspected state
+	relByID map[uint32]relEntry          // relation id → state, from Relation messages
 
 	// Transaction buffer: rows stream inside a transaction before its
 	// commit LSN is known, so they accumulate and flush at Commit.

@@ -15,7 +15,7 @@ import (
 // Config is what every source needs, in neutral terms. Driver-specific
 // knobs (server_id, slot name, heartbeat) live in Options.
 type Config struct {
-	URI     string            // "mysql://user:pass@host:3306/db"
+	URI     string // "mysql://user:pass@host:3306/db"
 	Tables  []core.TableRef
 	Options map[string]string // driver-specific, validated by the driver
 }

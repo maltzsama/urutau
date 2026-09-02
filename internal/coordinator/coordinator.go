@@ -30,12 +30,11 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/apache/iceberg-go/table"
-	"github.com/maltzsama/urutau/internal/adapter"
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/position"
-	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -101,7 +100,7 @@ type Coordinator struct {
 	cfg Config
 	log *slog.Logger
 
-	adapt   adapter.Source
+	reg     *drivers.Registry
 	qdb     *sql.DB
 	refs    []snapshot.TableRef
 	cat     *rest.Catalog
@@ -230,7 +229,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
-	adapt, err := adapter.For(c.cfg.Spec, adapter.Runtime{
+	reg, err := drivers.New(c.cfg.Spec, drivers.Runtime{
 		ServerID:  c.cfg.ServerID,
 		Heartbeat: c.cfg.Heartbeat,
 		Logger:    c.log,
@@ -238,9 +237,9 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.adapt = adapt
+	c.reg = reg
 
-	qdb, err := adapt.OpenQuery(ctx)
+	qdb, err := reg.OpenQuery(ctx)
 	if err != nil {
 		return fmt.Errorf("coordinator: open query db: %w", err)
 	}
@@ -250,7 +249,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, is, err := adapt.Introspect(ctx, qdb, t)
+		ref, is, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
 			return err
 		}
@@ -297,21 +296,21 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 
 	// Catalog + tables: the coordinator owns DDL.
-	cat, err := icebergsink.NewCatalog(ctx, catalogConfig(c.cfg.Spec))
+	cat, err := drivers.NewCatalog(ctx, c.cfg.Spec)
 	if err != nil {
 		return fmt.Errorf("coordinator: catalog: %w", err)
 	}
 	c.cat = cat
-	if err := icebergsink.EnsureNamespace(ctx, cat, table.Identifier{c.cfg.Spec.Sink.Namespace}); err != nil {
+	if err := drivers.EnsureNamespace(ctx, cat, table.Identifier{c.cfg.Spec.Sink.Namespace}); err != nil {
 		return err
 	}
 	for _, ref := range refs {
-		if err := icebergsink.EnsureTable(ctx, cat, targetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source]); err != nil {
+		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source]); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
 
-	resume, needsSnapshot, err := c.resumeFrom(ctx, adapt, refs)
+	resume, needsSnapshot, err := c.resumeFrom(ctx, reg, refs)
 	if err != nil {
 		return err
 	}
@@ -358,7 +357,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.
 	out := make(chan change.Change, 1024)
-	rdr, err := adapt.NewReader(ctx, qdb, refs, out)
+	rdr, err := reg.NewReader(ctx, qdb, refs, out)
 	if err != nil {
 		return err
 	}
@@ -366,7 +365,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	start := resume
 	if start == nil {
-		m, err := adapt.InitialPosition(ctx, qdb)
+		m, err := reg.InitialPosition(ctx, qdb)
 		if err != nil {
 			return fmt.Errorf("coordinator: initial position: %w", err)
 		}
@@ -389,7 +388,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 			c.log.Warn("coordinator: eventlog emit", "err", err)
 		}
-		chunker, err := adapt.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
+		chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 		if err != nil {
 			return err
 		}
@@ -715,7 +714,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, me
 	}
 	var high position.Position
 	if posStr != "" {
-		high, err = c.adapt.ParsePosition(posStr)
+		high, err = c.reg.ParsePosition(posStr)
 		if err != nil {
 			c.budget.release(w.name, n)
 			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
@@ -755,7 +754,7 @@ func (c *Coordinator) onHello(worker string, h *pb.Hello) {
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.noteAck(worker, time.Now())
-	pos, err := c.adapt.ParsePosition(ack.Position)
+	pos, err := c.reg.ParsePosition(ack.Position)
 	if err != nil {
 		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
 		return
@@ -814,16 +813,16 @@ func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
 // is the resume point, tables without one need the snapshot.
-func (c *Coordinator) resumeFrom(ctx context.Context, adapt adapter.Source, refs []snapshot.TableRef) (position.Position, []snapshot.TableRef, error) {
+func (c *Coordinator) resumeFrom(ctx context.Context, reg *drivers.Registry, refs []snapshot.TableRef) (position.Position, []snapshot.TableRef, error) {
 	var positions []position.Position
 	var needsSnapshot []snapshot.TableRef
 	for _, ref := range refs {
-		pos, err := icebergsink.CommittedPosition(ctx, c.cat, targetIdent(c.cfg.Spec, ref.Target))
+		pos, err := drivers.CommittedPosition(ctx, c.cat, drivers.TargetIdent(c.cfg.Spec, ref.Target))
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
 		}
 		if pos != "" {
-			p, err := adapt.ParsePosition(pos)
+			p, err := reg.ParsePosition(pos)
 			if err != nil {
 				return nil, nil, fmt.Errorf("coordinator: %s cdc.position %q: %w", ref.Target, pos, err)
 			}
@@ -1068,24 +1067,7 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 	}
 }
 
-// ── Catalog helpers (mirror the runner's) ────────────────────────────
-
-func catalogConfig(s *spec.Spec) icebergsink.Config {
-	return icebergsink.Config{
-		URI:          s.Sink.URI,
-		Warehouse:    s.Sink.Warehouse,
-		ClientID:     s.Sink.ClientID,
-		ClientSecret: s.Sink.ClientSecret,
-		Scope:        s.Sink.Scope,
-	}
-}
-
-func targetIdent(s *spec.Spec, target string) table.Identifier {
-	if ns, name, ok := strings.Cut(target, "."); ok {
-		return table.Identifier{ns, name}
-	}
-	return table.Identifier{s.Sink.Namespace, target}
-}
+// ── Positions ─────────────────────────────────────────────────────────
 
 func resumeOrNone(p position.Position) string {
 	if p == nil {

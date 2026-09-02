@@ -9,7 +9,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"strings"
 	"time"
 
@@ -81,11 +80,11 @@ func For(s *spec.Spec, rt Runtime) (Source, error) {
 func OpenQueryDB(kind, uri string) (*sql.DB, error) {
 	switch kind {
 	case "mysql":
-		conn, err := parseMySQLURI(uri)
+		conn, err := mysql.ParseURI(uri)
 		if err != nil {
 			return nil, err
 		}
-		return sql.Open("mysql", conn.queryDSN())
+		return sql.Open("mysql", conn.QueryDSN())
 	case "postgres":
 		return sql.Open("pgx", uri)
 	default:
@@ -101,11 +100,11 @@ type mysqlSource struct {
 }
 
 func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
-	conn, err := parseMySQLURI(a.spec.Source.URI)
+	conn, err := mysql.ParseURI(a.spec.Source.URI)
 	if err != nil {
 		return nil, err
 	}
-	return sql.Open("mysql", conn.queryDSN())
+	return sql.Open("mysql", conn.QueryDSN())
 }
 
 func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
@@ -139,14 +138,14 @@ func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (s
 }
 
 func (a mysqlSource) NewReader(ctx context.Context, db *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (StreamSource, error) {
-	conn, err := parseMySQLURI(a.spec.Source.URI)
+	conn, err := mysql.ParseURI(a.spec.Source.URI)
 	if err != nil {
 		return nil, err
 	}
 	rdr, err := mysql.New(ctx, mysql.Config{
-		Addr:      conn.addr(),
-		User:      conn.user,
-		Password:  conn.password,
+		Addr:      conn.Addr(),
+		User:      conn.User,
+		Password:  conn.Password,
 		ServerID:  a.rt.ServerID,
 		Heartbeat: a.rt.Heartbeat,
 		Tables:    refs,
@@ -272,45 +271,4 @@ func (s pgStream) Start(ctx context.Context, at position.Position) error {
 		return fmt.Errorf("postgres: start position must be an LSN, got %T", at)
 	}
 	return s.StartFromLSN(ctx, l)
-}
-
-// ── MySQL URI parsing ────────────────────────────────────────────────
-
-// mysqlConn is the parsed MySQL source URI.
-type mysqlConn struct {
-	user, password, host, port, db string
-}
-
-func parseMySQLURI(uri string) (*mysqlConn, error) {
-	u, err := url.Parse(uri)
-	if err != nil {
-		return nil, fmt.Errorf("adapter: source uri: %w", err)
-	}
-	if u.Scheme != "mysql" {
-		return nil, fmt.Errorf("adapter: source uri scheme %q, want mysql", u.Scheme)
-	}
-	c := &mysqlConn{user: u.User.Username()}
-	if p, ok := u.User.Password(); ok {
-		c.password = p
-	}
-	c.host = u.Hostname()
-	if c.host == "" {
-		return nil, fmt.Errorf("adapter: source uri %q lacks host", uri)
-	}
-	if p := u.Port(); p != "" {
-		c.port = p
-	} else {
-		c.port = "3306"
-	}
-	c.db = strings.TrimPrefix(u.Path, "/")
-	if c.db == "" {
-		return nil, fmt.Errorf("adapter: source uri %q lacks /db", uri)
-	}
-	return c, nil
-}
-
-func (c *mysqlConn) addr() string { return c.host + ":" + c.port }
-
-func (c *mysqlConn) queryDSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true", c.user, c.password, c.addr(), c.db)
 }
