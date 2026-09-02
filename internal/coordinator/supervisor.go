@@ -172,6 +172,9 @@ func (c *Coordinator) resetWorker(w *workerState) {
 	c.mu.Unlock()
 	c.supervisor.pendingSet(w.name)
 	c.log.Warn("coordinator: reset worker", "worker", w.name, "epoch", w.epoch)
+	if c.metrics != nil {
+		c.metrics.WorkerResets.WithLabelValues(w.name, "ack_timeout").Inc()
+	}
 	c.emitLog(eventlog.KindWorkerReset, map[string]any{
 		"worker": w.name,
 		"epoch":  w.epoch,

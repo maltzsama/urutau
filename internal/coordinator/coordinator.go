@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,7 @@ import (
 	"github.com/maltzsama/urutau/internal/adapter"
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/position"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/source/dblog"
@@ -76,6 +78,10 @@ type Config struct {
 	AckTimeout  time.Duration
 	MaxResets   int
 	ResetWindow time.Duration
+
+	// MetricsAddr serves /metrics (Prometheus) and /statusz (live state).
+	// Empty disables the endpoint.
+	MetricsAddr string
 
 	Logger *slog.Logger
 }
@@ -139,6 +145,7 @@ type Coordinator struct {
 	cp         *checkpoint
 	supervisor *supervisor
 	terminate  chan error
+	metrics    *observability.Metrics
 }
 
 // workerState is one worker group's slice of the pipeline: its tables, its
@@ -196,6 +203,10 @@ func Run(ctx context.Context, cfg Config) error {
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
 	c.supervisor = newSupervisor(c)
 	c.terminate = make(chan error, 1)
+	if cfg.MetricsAddr != "" {
+		c.metrics = observability.New()
+		go func() { _ = c.metrics.Serve(cfg.MetricsAddr, c.statusz) }()
+	}
 	return c.run(ctx)
 }
 
@@ -430,6 +441,37 @@ func (c *Coordinator) emitLog(kind string, fields map[string]any) {
 	}
 }
 
+// statusz renders the live coordinator state for /statusz (design §13.4).
+func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
+	type workerStatus struct {
+		Phase     string            `json:"phase"`
+		Epoch     uint64            `json:"epoch"`
+		Attached  bool              `json:"attached"`
+		Inflight  int64             `json:"inflight_bytes"`
+		Committed map[string]string `json:"committed,omitempty"`
+	}
+	st := map[string]any{
+		"run_id": c.runID,
+	}
+	ws := map[string]*workerStatus{}
+	for name, w := range c.workers {
+		c.mu.Lock()
+		ws[name] = &workerStatus{
+			Phase:     "attached",
+			Epoch:     w.epoch,
+			Attached:  w.attached,
+			Inflight:  c.budget.inFlight(name),
+			Committed: w.committed,
+		}
+		c.mu.Unlock()
+	}
+	st["workers"] = ws
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(st); err != nil {
+		c.log.Warn("statusz encode", "err", err)
+	}
+}
+
 // emit writes one event to the audit trail when configured; best-effort by
 // contract (a lost trail must never fail the pipeline).
 func (c *Coordinator) emit(kind string, fields map[string]any) error {
@@ -466,6 +508,9 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
 		case ch, ok := <-out:
 			if !ok {
 				return
+			}
+			if c.metrics != nil {
+				c.metrics.EventsDecoded.Inc()
 			}
 			if c.gateHold(ch) {
 				continue
@@ -718,6 +763,10 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	freed := c.index[worker].truncate(ack.Table, pos)
 	if freed > 0 {
 		c.budget.release(worker, freed)
+	}
+	if c.metrics != nil {
+		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
+		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()
 	}
 	c.log.Info("worker ack", "worker", worker, "table", ack.Table,
 		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.inFlight(worker))

@@ -28,6 +28,7 @@ func main() {
 		namespace    string
 		maxRows      int
 		maxInterval  time.Duration
+		metricsAddr  string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -46,6 +47,7 @@ func main() {
 				},
 				MaxRows:     maxRows,
 				MaxInterval: maxInterval,
+				MetricsAddr: metricsAddr,
 			})
 		},
 	}
@@ -59,6 +61,7 @@ func main() {
 	cmd.Flags().StringVar(&namespace, "namespace", "raw", "fallback namespace for bare targets")
 	cmd.Flags().IntVar(&maxRows, "max-rows", 1000, "flush the batch once this many rows are buffered")
 	cmd.Flags().DurationVar(&maxInterval, "max-interval", 2*time.Second, "flush cadence")
+	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics on this address (optional)")
 
 	root.AddCommand(cmd)
 	if err := root.Execute(); err != nil {

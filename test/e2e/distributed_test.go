@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -527,6 +529,96 @@ func TestCrashloopKillsJob(t *testing.T) {
 	}
 	cStop()
 	<-wErr
+}
+
+// TestObservabilityEndpoints serves /metrics and /statusz and asserts both
+// respond (design §13.1/§13.4).
+func TestObservabilityEndpoints(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	metricsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve metrics port: %v", err)
+	}
+	metricsAddr := metricsLis.Addr().String()
+	_ = metricsLis.Close()
+	workerMetricsLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve worker metrics port: %v", err)
+	}
+	workerMetricsAddr := workerMetricsLis.Addr().String()
+	_ = workerMetricsLis.Close()
+
+	s := loadPipeline(t)
+	s.Tables[0].Worker = "w1"
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 5)
+
+	wCtx, wStop := context.WithCancel(ctx)
+	defer wStop()
+	cCtx, cStop := context.WithCancel(ctx)
+	go func() {
+		_ = worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
+	}()
+	go func() {
+		_ = coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, MetricsAddr: metricsAddr, AckTimeout: 2 * time.Minute})
+	}()
+
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(5))
+
+	httpGet := func(path string) (string, error) {
+		resp, err := http.Get("http://" + metricsAddr + path)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			return string(b), fmt.Errorf("%s status %d", path, resp.StatusCode)
+		}
+		return string(b), nil
+	}
+
+	metricsBody, err := httpGet("/metrics")
+	if err != nil {
+		t.Fatalf("metrics: %v", err)
+	}
+	if !strings.Contains(metricsBody, "urutau_coordinator_commits_total") {
+		t.Fatalf("coordinator metrics missing urutau series:\n%s", metricsBody)
+	}
+
+	workerMetrics, err := http.Get("http://" + workerMetricsAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("worker metrics: %v", err)
+	}
+	wb, _ := io.ReadAll(workerMetrics.Body)
+	_ = workerMetrics.Body.Close()
+	if !strings.Contains(string(wb), "urutau_worker_rows_written_total") {
+		t.Fatalf("worker metrics missing urutau series:\n%s", wb)
+	}
+
+	statusBody, err := httpGet("/statusz")
+	if err != nil {
+		t.Fatalf("statusz: %v", err)
+	}
+	if !strings.Contains(statusBody, `"run_id"`) || !strings.Contains(statusBody, `"w1"`) {
+		t.Fatalf("statusz missing state:\n%s", statusBody)
+	}
+	t.Log("observability ok: /metrics and /statusz served")
+
+	cStop()
 }
 
 // TestWorkerRecoveryAfterReset proves the resurrection path: a worker that

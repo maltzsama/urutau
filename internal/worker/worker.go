@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/sink/iceberg"
 )
 
@@ -18,6 +19,8 @@ type Config struct {
 	MaxRows int
 	// MaxInterval flushes whatever is buffered on this cadence.
 	MaxInterval time.Duration
+	// MetricsAddr serves /metrics (Prometheus); empty disables it.
+	MetricsAddr string
 }
 
 // Committer applies one collapsed batch of a single table. Implementations
@@ -34,6 +37,7 @@ type Worker struct {
 	cfg      Config
 	onCommit OnCommit
 	tables   map[string]*tablePipeline
+	metrics  *observability.Metrics
 }
 
 type tablePipeline struct {
@@ -55,10 +59,15 @@ type tablePipeline struct {
 
 // New builds a worker; register tables before Run.
 func New(cfg Config) *Worker {
-	return &Worker{
+	w := &Worker{
 		cfg:    cfg,
 		tables: make(map[string]*tablePipeline),
 	}
+	if cfg.MetricsAddr != "" {
+		w.metrics = observability.New()
+		go func() { _ = w.metrics.Serve(cfg.MetricsAddr, nil) }()
+	}
+	return w
 }
 
 // OnCommit installs the commit observer.
@@ -186,8 +195,17 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 		}
 		rows := len(buf)
 		buf = buf[:0]
+		start := time.Now()
 		if err := p.committer.Commit(ctx, b); err != nil {
+			if w.metrics != nil {
+				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
+			}
 			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
+		}
+		if w.metrics != nil {
+			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
+			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(len(b.Upserts)))
+			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(len(b.Deletes)))
 		}
 		if w.onCommit != nil {
 			w.onCommit(b, rows)

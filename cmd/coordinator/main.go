@@ -33,6 +33,7 @@ func main() {
 		ackTimeout      time.Duration
 		maxResets       int
 		resetWindow     time.Duration
+		metricsAddr     string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -66,6 +67,7 @@ func main() {
 				AckTimeout:       ackTimeout,
 				MaxResets:        maxResets,
 				ResetWindow:      resetWindow,
+				MetricsAddr:      metricsAddr,
 			})
 		},
 	}
@@ -83,6 +85,7 @@ func main() {
 	cmd.Flags().DurationVar(&ackTimeout, "ack-timeout", 30*time.Second, "worker considered stale without an ack for this long")
 	cmd.Flags().IntVar(&maxResets, "max-resets", 5, "resets within the window before the job terminates")
 	cmd.Flags().DurationVar(&resetWindow, "reset-window", 15*time.Minute, "sliding window for the reset count")
+	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics and /statusz on this address (optional)")
 
 	root.AddCommand(cmd)
 	if err := root.Execute(); err != nil {

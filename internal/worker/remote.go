@@ -37,6 +37,8 @@ type RemoteConfig struct {
 	MaxRows     int
 	MaxInterval time.Duration
 	Logger      *slog.Logger
+	// MetricsAddr serves /metrics (Prometheus); empty disables it.
+	MetricsAddr string
 
 	// FaultStopAck (test-only): commits normally but withholds the ack, so
 	// the coordinator's supervisor sees a stale worker — the crashloop
@@ -137,7 +139,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
-	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
+	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
 	for _, ta := range assign.Tables {
 		schema := &iceberg.Schema{}
 		if err := json.Unmarshal([]byte(ta.SchemaJson), schema); err != nil {
