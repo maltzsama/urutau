@@ -16,13 +16,14 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/position"
-	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
@@ -135,7 +136,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 
 	// Catalog + writers from the assignment: the coordinator owns DDL and
 	// introspection, but the writes are this worker's.
-	cat, err := icebergsink.NewCatalog(ctx, cfg.Sink)
+	cat, err := drivers.NewCatalogFromConfig(ctx, cfg.Sink)
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
@@ -147,11 +148,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		ident := targetIdent(cfg.Namespace, ta.TargetTable)
 		if ta.CreateIfNotExists {
-			if err := icebergsink.EnsureTable(ctx, cat, ident, schema); err != nil {
+			if err := drivers.EnsureTable(ctx, cat, ident, schema); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}
-		writer, err := icebergsink.NewTableWriter(ctx, cat, ident, ta.PrimaryKey)
+		writer, err := drivers.NewTableWriter(ctx, cat, ident, ta.PrimaryKey)
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
@@ -166,7 +167,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	committed := make(map[string]position.Position, len(assign.Tables))
 	phase := pb.WorkerPhase_WORKER_PHASE_SNAPSHOTTING
 	for _, ta := range assign.Tables {
-		pos, err := icebergsink.CommittedPosition(ctx, cat, targetIdent(cfg.Namespace, ta.TargetTable))
+		pos, err := drivers.CommittedPosition(ctx, cat, targetIdent(cfg.Namespace, ta.TargetTable))
 		if err != nil {
 			return fmt.Errorf("worker: committed %s: %w", ta.TargetTable, err)
 		}

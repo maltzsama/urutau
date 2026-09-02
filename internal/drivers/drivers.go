@@ -103,6 +103,12 @@ func NewCatalog(ctx context.Context, s *spec.Spec) (*rest.Catalog, error) {
 	return icebergsink.NewCatalog(ctx, icebergsink.CatalogConfig(s))
 }
 
+// NewCatalogFromConfig opens the Iceberg REST catalog from a raw sink config
+// (used by remote workers, which hold the config directly).
+func NewCatalogFromConfig(ctx context.Context, cfg icebergsink.Config) (*rest.Catalog, error) {
+	return icebergsink.NewCatalog(ctx, cfg)
+}
+
 // EnsureNamespace creates the sink namespace if absent.
 func EnsureNamespace(ctx context.Context, cat *rest.Catalog, ident table.Identifier) error {
 	return icebergsink.EnsureNamespace(ctx, cat, ident)
