@@ -66,7 +66,7 @@ func TestFlowBudgetCancelUnblocks(t *testing.T) {
 }
 
 func TestPositionIndexTruncatesByHead(t *testing.T) {
-	p := newPositionIndex("w")
+	p := newPositionIndex("w", "run-0")
 	lo, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-10")
 	hi, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-20")
 	hi2, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-30")
@@ -96,7 +96,7 @@ func TestPositionIndexTruncatesByHead(t *testing.T) {
 }
 
 func TestPositionIndexPositionlessPopsOnAnyAck(t *testing.T) {
-	p := newPositionIndex("w")
+	p := newPositionIndex("w", "run-1")
 	pos, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-5")
 
 	p.add(inflightBatch{table: "raw.orders", high: nil, bytes: 7}) // snapshot rows
@@ -104,5 +104,25 @@ func TestPositionIndexPositionlessPopsOnAnyAck(t *testing.T) {
 
 	if freed := p.truncate("raw.orders", pos); freed != 10 {
 		t.Fatalf("freed %d, want 10 (positionless pops once its table acked)", freed)
+	}
+}
+
+func TestPositionIndexManifest(t *testing.T) {
+	p := newPositionIndex("w", "run-abc")
+	pos, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-34")
+	p.add(inflightBatch{id: 7, table: "raw.orders", high: pos, bytes: 10})
+	p.add(inflightBatch{id: 8, table: "raw.items", high: nil, bytes: 5})
+	p.truncate("raw.orders", pos)
+
+	m := p.Manifest()
+	if m.RunID != "run-abc" {
+		t.Fatalf("run_id = %q, want run-abc", m.RunID)
+	}
+	if m.Acked["raw.orders"] != pos.String() {
+		t.Fatalf("acked = %v, want %s", m.Acked, pos.String())
+	}
+	// Batch 7 popped on ack; batch 8 (unconfirmed items) still in flight.
+	if m.FirstBatchID != 8 || m.LastBatchID != 8 {
+		t.Fatalf("batch ids = %d..%d, want 8..8", m.FirstBatchID, m.LastBatchID)
 	}
 }

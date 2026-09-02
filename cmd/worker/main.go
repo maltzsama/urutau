@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/worker"
 )
 
@@ -37,7 +37,7 @@ func main() {
 				Coordinator: coordinator,
 				Name:        name,
 				Namespace:   namespace,
-				Sink: foziceberg.Config{
+				Sink: icebergsink.Config{
 					URI:          catalogURI,
 					Warehouse:    warehouse,
 					ClientID:     clientID,

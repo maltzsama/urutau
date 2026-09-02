@@ -20,7 +20,7 @@ import (
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/position"
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/source/dblog"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
@@ -129,11 +129,11 @@ func resumeFrom(ctx context.Context, cat *rest.Catalog, adapt adapter.Source, s 
 	var positions []position.Position
 	var needsSnapshot []dblog.TableRef
 	for _, ref := range refs {
-		tbl, err := cat.LoadTable(ctx, targetIdent(s, ref.Target))
+		pos, err := icebergsink.CommittedPosition(ctx, cat, targetIdent(s, ref.Target))
 		if err != nil {
-			return nil, nil, fmt.Errorf("runner: load %s: %w", ref.Target, err)
+			return nil, nil, fmt.Errorf("runner: %s: %w", ref.Target, err)
 		}
-		if pos := tbl.Properties()["cdc.position"]; pos != "" {
+		if pos != "" {
 			p, err := adapt.ParsePosition(pos)
 			if err != nil {
 				return nil, nil, fmt.Errorf("runner: %s cdc.position %q: %w", ref.Target, pos, err)
@@ -149,8 +149,8 @@ func resumeFrom(ctx context.Context, cat *rest.Catalog, adapt adapter.Source, s 
 	return position.Min(positions), needsSnapshot, nil
 }
 
-func catalogConfig(s *spec.Spec) foziceberg.Config {
-	return foziceberg.Config{
+func catalogConfig(s *spec.Spec) icebergsink.Config {
+	return icebergsink.Config{
 		URI:          s.Sink.URI,
 		Warehouse:    s.Sink.Warehouse,
 		ClientID:     s.Sink.ClientID,
@@ -268,21 +268,21 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	}
 
 	// Catalog + writers, ensuring tables exist.
-	cat, err := foziceberg.NewCatalog(ctx, catalogConfig(s))
+	cat, err := icebergsink.NewCatalog(ctx, catalogConfig(s))
 	if err != nil {
 		return nil, fmt.Errorf("runner: catalog: %w", err)
 	}
-	if err := foziceberg.EnsureNamespace(ctx, cat, table.Identifier{s.Sink.Namespace}); err != nil {
+	if err := icebergsink.EnsureNamespace(ctx, cat, table.Identifier{s.Sink.Namespace}); err != nil {
 		return nil, err
 	}
 
-	writers := make(map[string]*foziceberg.TableWriter, len(refs))
+	writers := make(map[string]*icebergsink.TableWriter, len(refs))
 	for _, ref := range refs {
 		ident := targetIdent(s, ref.Target)
-		if err := foziceberg.EnsureTable(ctx, cat, ident, schemas[ref.Source]); err != nil {
+		if err := icebergsink.EnsureTable(ctx, cat, ident, schemas[ref.Source]); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
-		wr, err := foziceberg.NewTableWriter(ctx, cat, ident, ref.PrimaryKey)
+		wr, err := icebergsink.NewTableWriter(ctx, cat, ident, ref.PrimaryKey)
 		if err != nil {
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
 		}

@@ -12,7 +12,7 @@ import (
 
 	"github.com/apache/iceberg-go/table"
 	"github.com/maltzsama/urutau/internal/coordinator"
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
 )
@@ -85,10 +85,10 @@ func TestDistributedPipeline(t *testing.T) {
 	}
 }
 
-func sinkConfig() foziceberg.Config {
-	return foziceberg.Config{
-		URI:          env("FOZ_E2E_CATALOG", "http://localhost:8181/api/catalog"),
-		Warehouse:    env("FOZ_E2E_WAREHOUSE", "quickstart_catalog"),
+func sinkConfig() icebergsink.Config {
+	return icebergsink.Config{
+		URI:          env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog"),
+		Warehouse:    env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog"),
 		ClientID:     "root",
 		ClientSecret: "s3cr3t",
 		Scope:        "PRINCIPAL_ROLE:ALL",
@@ -98,7 +98,7 @@ func sinkConfig() foziceberg.Config {
 // dropIcebergNamed drops a target table from the catalog.
 func dropIcebergNamed(t *testing.T, ctx context.Context, target string) {
 	t.Helper()
-	cat, err := foziceberg.NewCatalog(ctx, sinkConfig())
+	cat, err := icebergsink.NewCatalog(ctx, sinkConfig())
 	if err != nil {
 		t.Fatalf("catalog: %v", err)
 	}

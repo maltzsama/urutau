@@ -32,9 +32,9 @@ func TestEventlogTrail(t *testing.T) {
 	trailCfg := eventlog.Config{
 		URI:       "s3://warehouse/e2e-events/" + fmt.Sprintf("%d", time.Now().UnixNano()),
 		Region:    "us-east-1",
-		Endpoint:  env("FOZ_E2E_S3_ENDPOINT", "http://localhost:9000"),
-		AccessKey: env("FOZ_E2E_S3_KEY", "urutau"),
-		SecretKey: env("FOZ_E2E_S3_SECRET", "urutau_dev_secret"),
+		Endpoint:  env("URUTAU_E2E_S3_ENDPOINT", "http://localhost:9000"),
+		AccessKey: env("URUTAU_E2E_S3_KEY", "urutau"),
+		SecretKey: env("URUTAU_E2E_S3_SECRET", "urutau_dev_secret"),
 	}
 
 	db := mysqlConn(t)

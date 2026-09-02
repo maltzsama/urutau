@@ -28,6 +28,8 @@ func main() {
 		flowTotalBytes  int64
 		flowPerWorkerMi int64
 		eventlogURI     string
+		checkpointURI   string
+		checkpointSec   int
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -57,6 +59,7 @@ func main() {
 				FlowTotalBytes:   flowTotalBytes,
 				FlowPerWorkerMin: flowPerWorkerMi << 20,
 				Eventlog:         eventlogConfig(eventlogURI),
+				Checkpoint:       checkpointConfig(checkpointURI, checkpointSec),
 			})
 		},
 	}
@@ -69,6 +72,8 @@ func main() {
 	cmd.Flags().Int64Var(&flowTotalBytes, "flow-total-bytes", 512<<20, "process-wide ceiling on unacked batch bytes in flight")
 	cmd.Flags().Int64Var(&flowPerWorkerMi, "flow-per-worker-min-mi", 16, "per-worker minimum share of the flow budget (MiB)")
 	cmd.Flags().StringVar(&eventlogURI, "eventlog", "", "s3://<bucket>/<prefix> audit trail store (optional)")
+	cmd.Flags().StringVar(&checkpointURI, "checkpoint", "", "s3://<bucket>/<prefix> async position manifests (optional)")
+	cmd.Flags().IntVar(&checkpointSec, "checkpoint-interval", 10, "checkpoint write interval (seconds)")
 
 	root.AddCommand(cmd)
 	if err := root.Execute(); err != nil {
@@ -77,6 +82,16 @@ func main() {
 }
 
 // eventlogConfig builds the audit-trail config from the flag; nil when unset.
+func checkpointConfig(uri string, intervalSec int) *coordinator.CheckpointConfig {
+	if uri == "" {
+		return nil
+	}
+	return &coordinator.CheckpointConfig{
+		URI:      uri,
+		Interval: time.Duration(intervalSec) * time.Second,
+	}
+}
+
 func eventlogConfig(uri string) *eventlog.Config {
 	if uri == "" {
 		return nil

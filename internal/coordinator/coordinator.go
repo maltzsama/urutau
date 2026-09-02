@@ -33,7 +33,7 @@ import (
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/position"
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/source/dblog"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -61,6 +61,10 @@ type Config struct {
 	// Eventlog is optional: when set, the coordinator writes its per-run
 	// audit trail (job_started, snapshots, commits, terminal) to S3.
 	Eventlog *eventlog.Config
+
+	// Checkpoint is optional: async position manifests to S3 (design §6).
+	// Convenience only — the Iceberg table property is the source of truth.
+	Checkpoint *CheckpointConfig
 
 	// WaitWorker bounds how long the coordinator waits for every expected
 	// worker session before failing the boot.
@@ -123,6 +127,8 @@ type Coordinator struct {
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
+
+	cp *checkpoint
 }
 
 // workerState is one worker group's slice of the pipeline: its tables, its
@@ -241,7 +247,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			}
 			c.workers[name] = w
 			c.byTicket[string(w.ticket)] = w
-			c.index[name] = newPositionIndex(name)
+			c.index[name] = newPositionIndex(name, c.runID)
 		}
 		w.refs = append(w.refs, refs[i])
 		c.route[t.Target] = w
@@ -255,18 +261,27 @@ func (c *Coordinator) run(ctx context.Context) error {
 			c.log.Warn("coordinator: eventlog emit", "err", err)
 		}
 	}
+	if cfg := c.cfg.Checkpoint; cfg != nil {
+		cp, err := newCheckpoint(ctx, *cfg)
+		if err != nil {
+			return fmt.Errorf("coordinator: checkpoint: %w", err)
+		}
+		c.cp = cp
+		go cp.run(ctx, c.runID, c.index, c.log)
+		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
+	}
 
 	// Catalog + tables: the coordinator owns DDL.
-	cat, err := foziceberg.NewCatalog(ctx, catalogConfig(c.cfg.Spec))
+	cat, err := icebergsink.NewCatalog(ctx, catalogConfig(c.cfg.Spec))
 	if err != nil {
 		return fmt.Errorf("coordinator: catalog: %w", err)
 	}
 	c.cat = cat
-	if err := foziceberg.EnsureNamespace(ctx, cat, table.Identifier{c.cfg.Spec.Sink.Namespace}); err != nil {
+	if err := icebergsink.EnsureNamespace(ctx, cat, table.Identifier{c.cfg.Spec.Sink.Namespace}); err != nil {
 		return err
 	}
 	for _, ref := range refs {
-		if err := foziceberg.EnsureTable(ctx, cat, targetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source]); err != nil {
+		if err := icebergsink.EnsureTable(ctx, cat, targetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source]); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
@@ -654,7 +669,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, me
 	}
 	select {
 	case w.queue <- queuedBatch{body: body, meta: metaBytes}:
-		c.index[w.name].add(inflightBatch{table: meta.Table, high: high, bytes: n})
+		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n})
 		return nil
 	case <-ctx.Done():
 		c.budget.release(w.name, n)
@@ -744,11 +759,11 @@ func (c *Coordinator) resumeFrom(ctx context.Context, adapt adapter.Source, refs
 	var positions []position.Position
 	var needsSnapshot []dblog.TableRef
 	for _, ref := range refs {
-		tbl, err := c.cat.LoadTable(ctx, targetIdent(c.cfg.Spec, ref.Target))
+		pos, err := icebergsink.CommittedPosition(ctx, c.cat, targetIdent(c.cfg.Spec, ref.Target))
 		if err != nil {
-			return nil, nil, fmt.Errorf("coordinator: load %s: %w", ref.Target, err)
+			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
 		}
-		if pos := tbl.Properties()["cdc.position"]; pos != "" {
+		if pos != "" {
 			p, err := adapt.ParsePosition(pos)
 			if err != nil {
 				return nil, nil, fmt.Errorf("coordinator: %s cdc.position %q: %w", ref.Target, pos, err)
@@ -961,8 +976,8 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 
 // ── Catalog helpers (mirror the runner's) ────────────────────────────
 
-func catalogConfig(s *spec.Spec) foziceberg.Config {
-	return foziceberg.Config{
+func catalogConfig(s *spec.Spec) icebergsink.Config {
+	return icebergsink.Config{
 		URI:          s.Sink.URI,
 		Warehouse:    s.Sink.Warehouse,
 		ClientID:     s.Sink.ClientID,

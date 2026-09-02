@@ -12,7 +12,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/maltzsama/urutau/internal/runner"
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/spec"
 )
 
@@ -115,9 +115,9 @@ source:
   kind: mysql
   uri: mysql://repl:replpass@127.0.0.1:3306/shop
 sink:
-  uri: ` + env("FOZ_E2E_CATALOG", "http://localhost:8181/api/catalog") + `
+  uri: ` + env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog") + `
   namespace: raw
-  warehouse: ` + env("FOZ_E2E_WAREHOUSE", "quickstart_catalog") + `
+  warehouse: ` + env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog") + `
   clientId: root
   clientSecret: s3cr3t
   scope: PRINCIPAL_ROLE:ALL
@@ -155,14 +155,14 @@ func mysqlConn(t *testing.T) *sql.DB {
 // from a fresh snapshot (no committed position to resume from).
 func dropIcebergTable(t *testing.T, ctx context.Context) {
 	t.Helper()
-	cfg := foziceberg.Config{
-		URI:          env("FOZ_E2E_CATALOG", "http://localhost:8181/api/catalog"),
-		Warehouse:    env("FOZ_E2E_WAREHOUSE", "quickstart_catalog"),
+	cfg := icebergsink.Config{
+		URI:          env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog"),
+		Warehouse:    env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog"),
 		ClientID:     "root",
 		ClientSecret: "s3cr3t",
 		Scope:        "PRINCIPAL_ROLE:ALL",
 	}
-	cat, err := foziceberg.NewCatalog(ctx, cfg)
+	cat, err := icebergsink.NewCatalog(ctx, cfg)
 	if err != nil {
 		t.Fatalf("catalog: %v", err)
 	}
@@ -244,7 +244,7 @@ func assertCount(t *testing.T, ctx context.Context, query string, want int64) {
 // trinoQuery runs a query and returns rows, propagating any error (unlike
 // trinoRows which fails the test).
 func trinoQuery(ctx context.Context, query string) ([][]any, error) {
-	dsn := "http://user@" + env("FOZ_E2E_TRINO", "127.0.0.1:8080") + "?catalog=iceberg&schema=raw"
+	dsn := "http://user@" + env("URUTAU_E2E_TRINO", "127.0.0.1:8080") + "?catalog=iceberg&schema=raw"
 	db, err := sql.Open("trino", dsn)
 	if err != nil {
 		return nil, err

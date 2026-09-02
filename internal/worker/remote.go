@@ -22,7 +22,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/position"
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
@@ -30,10 +30,10 @@ import (
 // RemoteConfig wires one distributed worker: where the coordinator lives,
 // which sink this worker owns, and how it batches.
 type RemoteConfig struct {
-	Coordinator string            // host:port of the coordinator
-	Name        string            // worker name (Hello)
-	Sink        foziceberg.Config // catalog access — workers own their writes
-	Namespace   string            // fallback namespace for bare targets
+	Coordinator string             // host:port of the coordinator
+	Name        string             // worker name (Hello)
+	Sink        icebergsink.Config // catalog access — workers own their writes
+	Namespace   string             // fallback namespace for bare targets
 	MaxRows     int
 	MaxInterval time.Duration
 	Logger      *slog.Logger
@@ -128,7 +128,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 
 	// Catalog + writers from the assignment: the coordinator owns DDL and
 	// introspection, but the writes are this worker's.
-	cat, err := foziceberg.NewCatalog(ctx, cfg.Sink)
+	cat, err := icebergsink.NewCatalog(ctx, cfg.Sink)
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
@@ -140,11 +140,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		ident := targetIdent(cfg.Namespace, ta.TargetTable)
 		if ta.CreateIfNotExists {
-			if err := foziceberg.EnsureTable(ctx, cat, ident, schema); err != nil {
+			if err := icebergsink.EnsureTable(ctx, cat, ident, schema); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}
-		writer, err := foziceberg.NewTableWriter(ctx, cat, ident, ta.PrimaryKey)
+		writer, err := icebergsink.NewTableWriter(ctx, cat, ident, ta.PrimaryKey)
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
@@ -159,7 +159,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	committed := make(map[string]position.Position, len(assign.Tables))
 	phase := pb.WorkerPhase_WORKER_PHASE_SNAPSHOTTING
 	for _, ta := range assign.Tables {
-		pos, err := foziceberg.CommittedPosition(ctx, cat, targetIdent(cfg.Namespace, ta.TargetTable))
+		pos, err := icebergsink.CommittedPosition(ctx, cat, targetIdent(cfg.Namespace, ta.TargetTable))
 		if err != nil {
 			return fmt.Errorf("worker: committed %s: %w", ta.TargetTable, err)
 		}

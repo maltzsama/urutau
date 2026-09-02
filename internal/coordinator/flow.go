@@ -92,6 +92,7 @@ func (b *flowBudget) inFlight(worker string) int64 {
 // inflightBatch is one batch's flight-window metadata — position only; the
 // data itself is never retained (design §5.4.2).
 type inflightBatch struct {
+	id    uint64
 	table string
 	high  position.Position // nil for position-less snapshot rows
 	bytes int64
@@ -102,20 +103,50 @@ type inflightBatch struct {
 // batches leave in order, and a batch of an unconfirmed table blocks the
 // removal of the ones behind it — conservative and correct.
 type positionIndex struct {
-	worker string
-	mu     sync.Mutex
-	head   []inflightBatch
-	acked  map[string]position.Position
+	mu    sync.Mutex
+	head  []inflightBatch
+	acked map[string]position.Position
+	runID string
 }
 
-func newPositionIndex(worker string) *positionIndex {
-	return &positionIndex{worker: worker, acked: map[string]position.Position{}}
+func newPositionIndex(worker, runID string) *positionIndex {
+	return &positionIndex{acked: map[string]position.Position{}, runID: runID}
 }
 
 func (p *positionIndex) add(b inflightBatch) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.head = append(p.head, b)
+}
+
+// Manifest snapshots the acked positions and the in-flight batch-id range
+// for the async S3 checkpoint (design §6) — a small file; the data is never
+// persisted.
+func (p *positionIndex) Manifest() PositionManifest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m := PositionManifest{
+		Acked: make(map[string]string, len(p.acked)),
+		RunID: p.runID,
+	}
+	for t, pos := range p.acked {
+		m.Acked[t] = pos.String()
+	}
+	if len(p.head) > 0 {
+		m.FirstBatchID = p.head[0].id
+		m.LastBatchID = p.head[len(p.head)-1].id
+	}
+	return m
+}
+
+// PositionManifest is the on-disk checkpoint: per-table acked positions and
+// the in-flight batch id range. Written asynchronously; losing it never
+// blocks recovery (the Iceberg table property is the source of truth).
+type PositionManifest struct {
+	Acked        map[string]string `json:"acked"`
+	RunID        string            `json:"run_id"`
+	FirstBatchID uint64            `json:"first_batch_id"`
+	LastBatchID  uint64            `json:"last_batch_id"`
 }
 
 // truncate records an Ack and pops every head batch the commit covers: a
