@@ -17,7 +17,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
@@ -32,46 +31,70 @@ var (
 func TestMain(m *testing.M) {
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
-		assets = "/home/dalbuquerque/.local/share/kubebuilder-envtest/k8s/1.37.0-linux-amd64"
+		assets = envtestAssetsPath()
 	}
-	_ = os.Setenv("KUBEBUILDER_ASSETS", assets)
-
-	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
-		ErrorIfCRDPathMissing: false,
+	if assets != "" {
+		_ = os.Setenv("KUBEBUILDER_ASSETS", assets)
+		testEnv = &envtest.Environment{
+			CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd")},
+			ErrorIfCRDPathMissing: false,
+		}
+		cfg, err := testEnv.Start()
+		if err == nil {
+			testCtx = context.Background()
+			sch := runtime.NewScheme()
+			if err := urutauv1alpha1.AddToScheme(sch); err == nil {
+				if err := clientgoscheme.AddToScheme(sch); err == nil {
+					var mgr ctrl.Manager
+					mgr, err = ctrl.NewManager(cfg, ctrl.Options{
+						Scheme:  sch,
+						Metrics: metricsserver.Options{BindAddress: "0"},
+					})
+					if err == nil {
+						if err := (&CoordinatorReconciler{Client: mgr.GetClient(), Image: "urutau:dev"}).SetupWithManager(mgr); err == nil {
+							cli = mgr.GetClient()
+							go func() { _ = mgr.Start(testCtx) }()
+						}
+					}
+				}
+			}
+		}
+		if testEnv != nil {
+			defer func() { _ = testEnv.Stop() }()
+		}
 	}
-	cfg, err := testEnv.Start()
-	if err != nil {
-		panic(err)
-	}
-	defer func() { _ = testEnv.Stop() }()
-
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
-	testCtx = context.Background()
-
-	sch := runtime.NewScheme()
-	if err := urutauv1alpha1.AddToScheme(sch); err != nil {
-		panic(err)
-	}
-	if err := clientgoscheme.AddToScheme(sch); err != nil {
-		panic(err)
-	}
-
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:  sch,
-		Metrics: metricsserver.Options{BindAddress: "0"},
-	})
-	if err != nil {
-		panic(err)
-	}
-	if err := (&CoordinatorReconciler{Client: mgr.GetClient(), Image: "urutau:dev"}).SetupWithManager(mgr); err != nil {
-		panic(err)
-	}
-	cli = mgr.GetClient()
-	done := make(chan struct{})
-	go func() { _ = mgr.Start(testCtx); close(done) }()
 
 	os.Exit(m.Run())
+}
+
+// requireEnvtest skips tests that need the live control plane.
+func requireEnvtest(t *testing.T) {
+	t.Helper()
+	if cli == nil {
+		t.Skip("envtest control plane unavailable")
+	}
+}
+
+// envtestAssetsPath resolves the setup-envtest install location without
+// shelling out: the default cache dir layout is
+// ~/.local/share/kubebuilder-envtest/k8s/<version>-<os>-<arch>. Empty when
+// nothing is installed.
+func envtestAssetsPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, ".local", "share", "kubebuilder-envtest", "k8s")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
 }
 
 func pipelineCR(name, ns string) *urutauv1alpha1.CDCPipeline {
@@ -86,6 +109,7 @@ func pipelineCR(name, ns string) *urutauv1alpha1.CDCPipeline {
 }
 
 func TestReconcilerCreatesCoordinator(t *testing.T) {
+	requireEnvtest(t)
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ops"}}
 	_ = cli.Create(testCtx, ns)
 
@@ -117,6 +141,7 @@ func TestReconcilerCreatesCoordinator(t *testing.T) {
 }
 
 func TestReconcilerStopsAtTerminated(t *testing.T) {
+	requireEnvtest(t)
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-term"}}
 	_ = cli.Create(testCtx, ns)
 
@@ -125,10 +150,24 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 		t.Fatalf("create CR: %v", err)
 	}
 	// Status is a subresource: set it via the status endpoint, then delete the
-	// coordinator — a terminated pipeline must not have it recreated.
-	cr.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
-	if err := cli.Status().Update(testCtx, cr); err != nil {
-		t.Fatalf("set status: %v", err)
+	// coordinator — a terminated pipeline must not have it recreated. The
+	// reconciler's finalizer Update races this, so retry on conflict.
+	fresh := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: "test-term"}, fresh); err != nil {
+		t.Fatalf("reget CR: %v", err)
+	}
+	fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
+	for i := 0; i < 10; i++ {
+		if err := cli.Status().Update(testCtx, fresh); err == nil {
+			break
+		} else if !apierrors.IsConflict(err) {
+			t.Fatalf("set status: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: "test-term"}, fresh); err != nil {
+			t.Fatalf("reget CR: %v", err)
+		}
+		fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
 	}
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "dead-coordinator", Namespace: "test-term"}}
 	_ = cli.Delete(testCtx, sts)

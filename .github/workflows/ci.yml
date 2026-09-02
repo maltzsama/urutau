@@ -21,6 +21,11 @@ jobs:
       - name: Bootstrap tools
         run: make bootstrap
 
+      - name: Install envtest assets
+        run: |
+          make envtest-setup
+          echo "KUBEBUILDER_ASSETS=$(./bin/setup-envtest use -p path)" >> "$GITHUB_ENV"
+
       - name: Regenerate proto (check freshness)
         run: |
           make proto
