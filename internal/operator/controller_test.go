@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -110,10 +111,11 @@ func pipelineCR(name, ns string) *urutauv1alpha1.CDCPipeline {
 
 func TestReconcilerCreatesCoordinator(t *testing.T) {
 	requireEnvtest(t)
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-ops"}}
+	nsName := "test-ops-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
 	_ = cli.Create(testCtx, ns)
 
-	cr := pipelineCR("orders", "test-ops")
+	cr := pipelineCR("orders", nsName)
 	if err := cli.Create(testCtx, cr); err != nil {
 		t.Fatalf("create CR: %v", err)
 	}
@@ -122,7 +124,7 @@ func TestReconcilerCreatesCoordinator(t *testing.T) {
 	sts := &appsv1.StatefulSet{}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		err := cli.Get(testCtx, types.NamespacedName{Name: "orders-coordinator", Namespace: "test-ops"}, sts)
+		err := cli.Get(testCtx, types.NamespacedName{Name: "orders-coordinator", Namespace: nsName}, sts)
 		if err == nil {
 			break
 		}
@@ -142,19 +144,27 @@ func TestReconcilerCreatesCoordinator(t *testing.T) {
 
 func TestReconcilerStopsAtTerminated(t *testing.T) {
 	requireEnvtest(t)
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "test-term"}}
+	nsName := "test-term-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
 	_ = cli.Create(testCtx, ns)
 
-	cr := pipelineCR("dead", "test-term")
+	cr := pipelineCR("dead", nsName)
 	if err := cli.Create(testCtx, cr); err != nil {
 		t.Fatalf("create CR: %v", err)
 	}
-	// Status is a subresource: set it via the status endpoint, then delete the
-	// coordinator — a terminated pipeline must not have it recreated. The
-	// reconciler's finalizer Update races this, so retry on conflict.
+	// The manager's cached client propagates asynchronously; wait for it.
+	// Status is a subresource: set it via the status endpoint, then delete
+	// the coordinator — a terminated pipeline must not have it recreated.
 	fresh := &urutauv1alpha1.CDCPipeline{}
-	if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: "test-term"}, fresh); err != nil {
-		t.Fatalf("reget CR: %v", err)
+	for i := 0; i < 20; i++ {
+		err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh)
+		if err == nil {
+			break
+		}
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("reget CR: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
 	for i := 0; i < 10; i++ {
@@ -164,17 +174,17 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 			t.Fatalf("set status: %v", err)
 		}
 		time.Sleep(200 * time.Millisecond)
-		if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: "test-term"}, fresh); err != nil {
+		if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh); err != nil {
 			t.Fatalf("reget CR: %v", err)
 		}
 		fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
 	}
-	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "dead-coordinator", Namespace: "test-term"}}
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "dead-coordinator", Namespace: nsName}}
 	_ = cli.Delete(testCtx, sts)
 
 	// No coordinator workload may reappear for a terminated pipeline.
 	time.Sleep(3 * time.Second)
-	err := cli.Get(testCtx, types.NamespacedName{Name: "dead-coordinator", Namespace: "test-term"}, sts)
+	err := cli.Get(testCtx, types.NamespacedName{Name: "dead-coordinator", Namespace: nsName}, sts)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("terminated pipeline got a coordinator: %v", err)
 	}
@@ -183,7 +193,7 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 
 func TestWebhookRejectsEmptyTables(t *testing.T) {
 	v := &pipelineValidator{}
-	cr := pipelineCR("empty", "test-ops")
+	cr := pipelineCR("empty", "test-ops-unique")
 	cr.Spec.Definition.Tables = nil
 	if _, err := v.ValidateCreate(testCtx, cr); err == nil {
 		t.Fatal("webhook accepted a pipeline without tables")
