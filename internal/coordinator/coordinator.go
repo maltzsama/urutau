@@ -31,6 +31,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/maltzsama/urutau/internal/adapter"
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/position"
 	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/source/dblog"
@@ -56,6 +57,10 @@ type Config struct {
 	// that keeps a slow worker from starving. Defaults 512Mi / 16Mi.
 	FlowTotalBytes   int64
 	FlowPerWorkerMin int64
+
+	// Eventlog is optional: when set, the coordinator writes its per-run
+	// audit trail (job_started, snapshots, commits, terminal) to S3.
+	Eventlog *eventlog.Config
 
 	// WaitWorker bounds how long the coordinator waits for every expected
 	// worker session before failing the boot.
@@ -97,6 +102,8 @@ type Coordinator struct {
 	runCtx context.Context
 
 	runID string // run-id of this boot (assignment + eventlog, §5.6.1)
+
+	ev *eventlog.Run
 
 	ready       chan struct{} // one send per attached session
 	sessionErrs chan error    // first exit wins
@@ -161,6 +168,21 @@ func Run(ctx context.Context, cfg Config) error {
 func (c *Coordinator) run(ctx context.Context) error {
 	c.runCtx = ctx
 
+	if cfg := c.cfg.Eventlog; cfg != nil {
+		ev, err := eventlog.New(ctx, *cfg)
+		if err != nil {
+			return fmt.Errorf("coordinator: eventlog: %w", err)
+		}
+		c.ev = ev
+		defer ev.Close()
+		if err := c.emit(eventlog.KindJobStarted, map[string]any{
+			"pipeline": c.cfg.Spec.Pipeline,
+			"source":   c.cfg.Spec.Source.Kind,
+		}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
+	}
+
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
 	adapt, err := adapter.For(c.cfg.Spec, adapter.Runtime{
@@ -211,6 +233,12 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 	for _, w := range c.workers {
 		c.log.Info("coordinator worker group", "worker", w.name, "tables", len(w.refs))
+		if err := c.emit(eventlog.KindWorkerCreated, map[string]any{
+			"worker": w.name,
+			"tables": tableNames(w.refs),
+		}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
 	}
 
 	// Catalog + tables: the coordinator owns DDL.
@@ -305,6 +333,9 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 	for _, ref := range needsSnapshot {
 		c.log.Info("coordinator snapshot", "table", ref.Source)
+		if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
 		chunker, err := adapt.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 		if err != nil {
 			return err
@@ -313,18 +344,36 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
 		}
 		c.log.Info("coordinator snapshot done", "table", ref.Source)
+		if err := c.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
 	}
 
 	// Block until the world ends.
 	select {
 	case <-ctx.Done():
 		c.gracefulShutdown()
+		c.emit(eventlog.KindJobStopped, map[string]any{"reason": "shutdown"})
 		return ctx.Err()
 	case err := <-streamErr:
+		c.emit(eventlog.KindJobStopped, map[string]any{"reason": "stream"})
 		return fmt.Errorf("coordinator: stream: %w", err)
 	case err := <-c.sessionErrs:
+		c.emit(eventlog.KindJobStopped, map[string]any{"reason": "session"})
 		return fmt.Errorf("coordinator: worker session: %w", err)
 	}
+}
+
+// emit writes one event to the audit trail when configured; best-effort by
+// contract (a lost trail must never fail the pipeline).
+func (c *Coordinator) emit(kind string, fields map[string]any) error {
+	if c.ev == nil {
+		return nil
+	}
+	if err := c.ev.Emit(context.Background(), kind, fields); err != nil {
+		return err
+	}
+	return nil
 }
 
 // waitWorkers blocks until every expected group has a session attached.
@@ -464,6 +513,15 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	}
 	c.log.Info("worker ack", "worker", worker, "table", ack.Table,
 		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.inFlight(worker))
+	if err := c.emit(eventlog.KindCommit, map[string]any{
+		"worker":   worker,
+		"table":    ack.Table,
+		"rows":     ack.Rows,
+		"deletes":  ack.Deletes,
+		"position": ack.Position,
+	}); err != nil {
+		c.log.Warn("coordinator: eventlog emit", "err", err)
+	}
 }
 
 // wireRelay routes the DBLog orchestrator's calls over the data queue.
@@ -775,4 +833,13 @@ func randSuffix(n int) string {
 		return "000000"
 	}
 	return hex.EncodeToString(b)[:n]
+}
+
+// tableNames renders a group's source tables for the audit trail.
+func tableNames(refs []dblog.TableRef) []string {
+	out := make([]string, len(refs))
+	for i, r := range refs {
+		out[i] = r.Source
+	}
+	return out
 }

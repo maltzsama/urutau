@@ -49,6 +49,7 @@ const (
 	KindSnapshotDone    = "snapshot_done"
 	KindCommit          = "commit"
 	KindJobStopped      = "job_stopped"
+	KindWorkerCreated   = "worker_created"
 )
 
 // Run accumulates one run's events and uploads the trail object as it

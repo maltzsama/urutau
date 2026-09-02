@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/maltzsama/urutau/internal/coordinator"
+	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/spec"
 )
 
@@ -26,6 +27,7 @@ func main() {
 		waitWorker      time.Duration
 		flowTotalBytes  int64
 		flowPerWorkerMi int64
+		eventlogURI     string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -54,6 +56,7 @@ func main() {
 				WaitWorker:       waitWorker,
 				FlowTotalBytes:   flowTotalBytes,
 				FlowPerWorkerMin: flowPerWorkerMi << 20,
+				Eventlog:         eventlogConfig(eventlogURI),
 			})
 		},
 	}
@@ -65,9 +68,18 @@ func main() {
 	cmd.Flags().DurationVar(&waitWorker, "wait-worker", 2*time.Minute, "how long to wait for every expected worker session")
 	cmd.Flags().Int64Var(&flowTotalBytes, "flow-total-bytes", 512<<20, "process-wide ceiling on unacked batch bytes in flight")
 	cmd.Flags().Int64Var(&flowPerWorkerMi, "flow-per-worker-min-mi", 16, "per-worker minimum share of the flow budget (MiB)")
+	cmd.Flags().StringVar(&eventlogURI, "eventlog", "", "s3://<bucket>/<prefix> audit trail store (optional)")
 
 	root.AddCommand(cmd)
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// eventlogConfig builds the audit-trail config from the flag; nil when unset.
+func eventlogConfig(uri string) *eventlog.Config {
+	if uri == "" {
+		return nil
+	}
+	return &eventlog.Config{URI: uri}
 }
