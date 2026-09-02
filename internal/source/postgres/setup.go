@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/maltzsama/urutau/internal/position"
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // slotNameRe matches the server's slot-name rules: lowercase letters,
@@ -29,7 +29,7 @@ func publicationFor(slotName string) string { return slotName + "_pub" }
 // The slot is the consistency anchor: created before the snapshot starts,
 // it guarantees no transaction between slot creation and the stream start
 // is ever lost.
-func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []dblog.TableRef) error {
+func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []snapshot.TableRef) error {
 	if !slotNameRe.MatchString(slotName) {
 		return fmt.Errorf("postgres: slot name %q must match %s", slotName, slotNameRe)
 	}
@@ -87,7 +87,7 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []dblo
 
 // syncPublication aligns an existing publication's table set with the
 // pipeline: adds missing members, drops extra ones.
-func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []dblog.TableRef) error {
+func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []snapshot.TableRef) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT schemaname, tablename FROM pg_catalog.pg_publication_tables WHERE pubname = $1`, pub)
 	if err != nil {

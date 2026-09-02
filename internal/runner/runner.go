@@ -16,12 +16,13 @@ import (
 	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
 
-	"github.com/maltzsama/urutau/internal/adapter"
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/position"
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/sink"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
 )
@@ -39,6 +40,9 @@ type Config struct {
 	// (lifecycle + commit events). Nil disables the trail.
 	Eventlog *eventlog.Config
 	Logger   *slog.Logger
+	// Drivers, when set, is the source/sink driver assembly to use; nil
+	// resolves the default registry from the spec (local mode).
+	Drivers *drivers.Registry
 }
 
 // Run executes the collapsed pipeline for a validated spec until ctx is
@@ -125,16 +129,16 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 
 // ── Positions and catalog ────────────────────────────────────────────
 
-func resumeFrom(ctx context.Context, cat *rest.Catalog, adapt adapter.Source, s *spec.Spec, refs []dblog.TableRef) (position.Position, []dblog.TableRef, error) {
+func resumeFrom(ctx context.Context, reg *drivers.Registry, cat *rest.Catalog, s *spec.Spec, refs []core.TableRef) (position.Position, []core.TableRef, error) {
 	var positions []position.Position
-	var needsSnapshot []dblog.TableRef
+	var needsSnapshot []core.TableRef
 	for _, ref := range refs {
-		tbl, err := cat.LoadTable(ctx, targetIdent(s, ref.Target))
+		pos, err := drivers.CommittedPosition(ctx, cat, drivers.TargetIdent(s, ref.Target))
 		if err != nil {
-			return nil, nil, fmt.Errorf("runner: load %s: %w", ref.Target, err)
+			return nil, nil, fmt.Errorf("runner: %s: %w", ref.Target, err)
 		}
-		if pos := tbl.Properties()["cdc.position"]; pos != "" {
-			p, err := adapt.ParsePosition(pos)
+		if pos != "" {
+			p, err := reg.ParsePosition(pos)
 			if err != nil {
 				return nil, nil, fmt.Errorf("runner: %s cdc.position %q: %w", ref.Target, pos, err)
 			}
@@ -149,31 +153,14 @@ func resumeFrom(ctx context.Context, cat *rest.Catalog, adapt adapter.Source, s 
 	return position.Min(positions), needsSnapshot, nil
 }
 
-func catalogConfig(s *spec.Spec) foziceberg.Config {
-	return foziceberg.Config{
-		URI:          s.Sink.URI,
-		Warehouse:    s.Sink.Warehouse,
-		ClientID:     s.Sink.ClientID,
-		ClientSecret: s.Sink.ClientSecret,
-		Scope:        s.Sink.Scope,
-	}
-}
-
-func targetIdent(s *spec.Spec, target string) table.Identifier {
-	if ns, name, ok := strings.Cut(target, "."); ok {
-		return table.Identifier{ns, name}
-	}
-	return table.Identifier{s.Sink.Namespace, target}
-}
-
-// introspectAll resolves each spec table through the adapter, so the
+// introspectAll resolves each spec table through the registry, so the
 // pipeline knows the PK (equality key) and the target shape before writing
 // anything.
-func introspectAll(ctx context.Context, adapt adapter.Source, qdb *sql.DB, s *spec.Spec) ([]dblog.TableRef, map[string]*iceberg.Schema, error) {
-	refs := make([]dblog.TableRef, 0, len(s.Tables))
+func introspectAll(ctx context.Context, reg *drivers.Registry, qdb *sql.DB, s *spec.Spec) ([]core.TableRef, map[string]*iceberg.Schema, error) {
+	refs := make([]core.TableRef, 0, len(s.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(s.Tables))
 	for _, t := range s.Tables {
-		ref, is, err := adapt.Introspect(ctx, qdb, t)
+		ref, is, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -198,7 +185,7 @@ type Runner struct {
 	w                                *worker.Worker
 	log                              *slog.Logger
 	ev                               *eventlog.Run
-	rdr                              adapter.StreamSource
+	rdr                              drivers.StreamSource
 	closeQuery                       func()
 	streamErr, workerErr, routerDone <-chan error
 }
@@ -245,44 +232,47 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}()
 	}
 
-	adapt, err := adapter.For(s, adapter.Runtime{
-		ServerID:  cfg.ServerID,
-		Heartbeat: cfg.Heartbeat,
-		Logger:    log,
-	})
-	if err != nil {
-		return nil, err
+	reg := cfg.Drivers
+	if reg == nil {
+		reg, err = drivers.New(s, drivers.Runtime{
+			ServerID:  cfg.ServerID,
+			Heartbeat: cfg.Heartbeat,
+			Logger:    log,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// One query connection for chunk SELECTs, schema introspection, and the
 	// position queries (caught-up proof, slot state).
-	qdb, err := adapt.OpenQuery(ctx)
+	qdb, err := reg.OpenQuery(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("runner: open query db: %w", err)
 	}
 
 	// Resolve source tables and their Iceberg schemas.
-	refs, schemas, err := introspectAll(ctx, adapt, qdb, s)
+	refs, schemas, err := introspectAll(ctx, reg, qdb, s)
 	if err != nil {
 		return nil, err
 	}
 
 	// Catalog + writers, ensuring tables exist.
-	cat, err := foziceberg.NewCatalog(ctx, catalogConfig(s))
+	cat, err := drivers.NewCatalog(ctx, s)
 	if err != nil {
 		return nil, fmt.Errorf("runner: catalog: %w", err)
 	}
-	if err := foziceberg.EnsureNamespace(ctx, cat, table.Identifier{s.Sink.Namespace}); err != nil {
+	if err := drivers.EnsureNamespace(ctx, cat, table.Identifier{s.Sink.Namespace}); err != nil {
 		return nil, err
 	}
 
-	writers := make(map[string]*foziceberg.TableWriter, len(refs))
+	writers := make(map[string]sink.TableWriter, len(refs))
 	for _, ref := range refs {
-		ident := targetIdent(s, ref.Target)
-		if err := foziceberg.EnsureTable(ctx, cat, ident, schemas[ref.Source]); err != nil {
+		ident := drivers.TargetIdent(s, ref.Target)
+		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source]); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
-		wr, err := foziceberg.NewTableWriter(ctx, cat, ident, ref.PrimaryKey)
+		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey)
 		if err != nil {
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
 		}
@@ -307,7 +297,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
 
-	resume, needsSnapshot, err := resumeFrom(ctx, cat, adapt, s, refs)
+	resume, needsSnapshot, err := resumeFrom(ctx, reg, cat, s, refs)
 	if err != nil {
 		_ = qdb.Close()
 		return nil, err
@@ -321,7 +311,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	// constructor also performs the source's server-side setup (Postgres
 	// slot and publication).
 	out := make(chan change.Change, 1024)
-	rdr, err := adapt.NewReader(ctx, qdb, refs, out)
+	rdr, err := reg.NewReader(ctx, qdb, refs, out)
 	if err != nil {
 		_ = qdb.Close()
 		return nil, err
@@ -334,7 +324,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 
 	start := resume
 	if start == nil {
-		if m, err := adapt.InitialPosition(ctx, qdb); err != nil {
+		if m, err := reg.InitialPosition(ctx, qdb); err != nil {
 			return nil, fmt.Errorf("runner: initial position: %w", err)
 		} else {
 			start = m
@@ -348,13 +338,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	for _, ref := range needsSnapshot {
 		log.Info("snapshot", "table", ref.Source)
 		r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
-		chunker, err := adapt.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
+		chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
 		if err != nil {
 			rdr.Close()
 			_ = qdb.Close()
 			return nil, err
 		}
-		if err := dblog.SnapshotTable(ctx, chunker, rdr, router, ref.Target, dblog.SnapshotConfig{
+		if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
 			WindowTimeout: cfg.WindowTimeout,
 			CaughtUpPoll:  cfg.CaughtUpPoll,
 		}); err != nil {

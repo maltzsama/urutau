@@ -1,4 +1,4 @@
-package dblog
+package snapshot
 
 import (
 	"context"

@@ -113,12 +113,12 @@ func postgresPipelineYAML() string {
 pipeline: e2e-postgres
 source:
   kind: postgres
-  uri: ` + env("FOZ_E2E_PG_URI", "postgres://repl:replpass@127.0.0.1:5433/shop?sslmode=disable") + `
+  uri: ` + env("URUTAU_E2E_PG_URI", "postgres://repl:replpass@127.0.0.1:5433/shop?sslmode=disable") + `
   slotName: urutau_e2e
 sink:
-  uri: ` + env("FOZ_E2E_CATALOG", "http://localhost:8181/api/catalog") + `
+  uri: ` + env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog") + `
   namespace: raw
-  warehouse: ` + env("FOZ_E2E_WAREHOUSE", "quickstart_catalog") + `
+  warehouse: ` + env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog") + `
   clientId: root
   clientSecret: s3cr3t
   scope: PRINCIPAL_ROLE:ALL
@@ -132,7 +132,7 @@ tables:
 
 func pgConn(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("pgx", env("FOZ_E2E_PG_URI", "postgres://repl:replpass@127.0.0.1:5433/shop?sslmode=disable"))
+	db, err := sql.Open("pgx", env("URUTAU_E2E_PG_URI", "postgres://repl:replpass@127.0.0.1:5433/shop?sslmode=disable"))
 	if err != nil {
 		t.Fatalf("open postgres: %v", err)
 	}

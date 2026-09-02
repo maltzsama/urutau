@@ -8,7 +8,8 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/sink/iceberg"
+	"github.com/maltzsama/urutau/internal/observability"
+	"github.com/maltzsama/urutau/internal/sink"
 )
 
 // Config tunes batch accumulation.
@@ -18,13 +19,8 @@ type Config struct {
 	MaxRows int
 	// MaxInterval flushes whatever is buffered on this cadence.
 	MaxInterval time.Duration
-}
-
-// Committer applies one collapsed batch of a single table. Implementations
-// must be safe to call from the table's dedicated goroutine only — the
-// serialization invariant is the caller's design.
-type Committer interface {
-	Commit(ctx context.Context, b change.Batch) error
+	// MetricsAddr serves /metrics (Prometheus); empty disables it.
+	MetricsAddr string
 }
 
 // OnCommit observes successful commits (bookkeeping, tests).
@@ -34,11 +30,12 @@ type Worker struct {
 	cfg      Config
 	onCommit OnCommit
 	tables   map[string]*tablePipeline
+	metrics  *observability.Metrics
 }
 
 type tablePipeline struct {
 	target    string
-	committer Committer
+	committer sink.TableWriter
 	ch        chan change.Change
 
 	// DBLog snapshot windows, per design: each chunk's SELECT rows land in
@@ -55,26 +52,34 @@ type tablePipeline struct {
 
 // New builds a worker; register tables before Run.
 func New(cfg Config) *Worker {
-	return &Worker{
+	w := &Worker{
 		cfg:    cfg,
 		tables: make(map[string]*tablePipeline),
 	}
+	if cfg.MetricsAddr != "" {
+		w.metrics = observability.New()
+		go func() { _ = w.metrics.Serve(cfg.MetricsAddr, nil) }()
+	}
+	return w
 }
 
 // OnCommit installs the commit observer.
 func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
 
-// Register wires a committer to a target table.
-func (w *Worker) Register(target string, c *iceberg.TableWriter) {
+// Register wires a per-table writer to a target table. The writer is any
+// sink.TableWriter implementation — the worker knows nothing about the sink
+// (CR-012).
+func (w *Worker) Register(target string, c sink.TableWriter) {
 	w.tables[target] = newTablePipeline(target, c)
 }
 
-// RegisterCommitter wires a committer to a target table (for tests).
-func (w *Worker) RegisterCommitter(target string, c Committer) {
+// RegisterCommitter wires a writer to a target table (test helper; same
+// contract as Register).
+func (w *Worker) RegisterCommitter(target string, c sink.TableWriter) {
 	w.tables[target] = newTablePipeline(target, c)
 }
 
-func newTablePipeline(target string, c Committer) *tablePipeline {
+func newTablePipeline(target string, c sink.TableWriter) *tablePipeline {
 	return &tablePipeline{
 		target:    target,
 		committer: c,
@@ -186,8 +191,17 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 		}
 		rows := len(buf)
 		buf = buf[:0]
+		start := time.Now()
 		if err := p.committer.Commit(ctx, b); err != nil {
+			if w.metrics != nil {
+				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
+			}
 			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
+		}
+		if w.metrics != nil {
+			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
+			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(len(b.Upserts)))
+			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(len(b.Deletes)))
 		}
 		if w.onCommit != nil {
 			w.onCommit(b, rows)
@@ -201,20 +215,26 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 			if !ok {
 				return flush()
 			}
-			// DBLog window application, design §3.4: an InWindow event is
-			// itself a real change — it removes its snapshot row from the
+			// DBLog window application, design §3.4: an InWindow event is itself a
+			// real change — it removes its snapshot row from the owning
 			// chunk's window (the live version wins) and is then appended
-			// normally. The chunk's Closes marker flushes what remains as
-			// inserts; markers for unknown chunks are stale and dropped.
+			// normally. The coordinator tags gated live events with the
+			// chunk that was draining when they were released, which need
+			// not be the chunk that contains the row, so the delete scans
+			// every open window. The chunk's Closes marker flushes what
+			// remains as inserts; markers for unknown chunks are stale.
 			if c.Window != nil {
 				p.winMu.Lock()
-				win := p.windows[c.Window.ChunkID]
-				if c.Window.InWindow && win != nil {
-					if _, hit := win[change.KeyString(c.Key)]; hit {
-						delete(win, change.KeyString(c.Key))
-						p.dropped++
+				if c.Window.InWindow {
+					k := change.KeyString(c.Key)
+					for _, win := range p.windows {
+						if _, hit := win[k]; hit {
+							delete(win, k)
+							p.dropped++
+						}
 					}
 				}
+				win := p.windows[c.Window.ChunkID]
 				if c.Window.Closes {
 					if win != nil {
 						for _, row := range win {

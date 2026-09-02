@@ -7,11 +7,13 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/protobuf/proto"
 
@@ -28,10 +30,12 @@ var ChangeSchema = arrow.NewSchema([]arrow.Field{
 	{Name: "position", Type: arrow.BinaryTypes.String, Nullable: false},
 }, nil)
 
-// EncodeBatch renders rows as an Arrow record; meta marshals into the
-// FlightData app_metadata.
-func EncodeBatch(rows []change.Change, meta *pb.BatchMeta) (arrow.RecordBatch, []byte, error) {
-	metaBytes, err := proto.Marshal(meta)
+// EncodeBatch renders rows as one complete Arrow IPC stream (schema +
+// record) and marshals meta for the FlightData app_metadata. The serialized
+// body is produced here so the coordinator can account for its bytes in the
+// flow budget before the batch enters a worker queue.
+func EncodeBatch(rows []change.Change, meta *pb.BatchMeta) (body, metaBytes []byte, err error) {
+	metaBytes, err = proto.Marshal(meta)
 	if err != nil {
 		return nil, nil, fmt.Errorf("transport: marshal batch meta: %w", err)
 	}
@@ -50,7 +54,18 @@ func EncodeBatch(rows []change.Change, meta *pb.BatchMeta) (arrow.RecordBatch, [
 		appendJSON(bld.Field(3), rows[i].After)
 		bld.Field(4).(*array.StringBuilder).Append(rows[i].Position)
 	}
-	return bld.NewRecordBatch(), metaBytes, nil
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+
+	var buf bytes.Buffer
+	w := ipc.NewWriter(&buf, ipc.WithSchema(ChangeSchema))
+	if err := w.Write(rec); err != nil {
+		return nil, nil, fmt.Errorf("transport: ipc write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, nil, fmt.Errorf("transport: ipc close: %w", err)
+	}
+	return buf.Bytes(), metaBytes, nil
 }
 
 // DecodeBatch reads a record + app_metadata back into rows and meta.

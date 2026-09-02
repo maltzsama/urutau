@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // Chunker splits a table by its primary key, using the chunk-skipping
@@ -75,7 +75,7 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 
 // Scan executes the chunk SELECT (with the row-filter WHERE pushed — none
 // yet in this milestone) and calls fn for every row, keyed by column name.
-func (c *Chunker) Scan(ctx context.Context, ch dblog.Chunk, fn func(row map[string]any) error) error {
+func (c *Chunker) Scan(ctx context.Context, ch snapshot.Chunk, fn func(row map[string]any) error) error {
 	// Row-constructor comparison keeps composite PKs lexicographic.
 	cond := make([]string, 0, 2)
 	args := make([]any, 0, 2*len(c.pk))

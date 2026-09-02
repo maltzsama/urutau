@@ -1,8 +1,11 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 
 	"github.com/maltzsama/urutau/internal/change"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -35,9 +38,19 @@ func TestCodecRoundTrip(t *testing.T) {
 		Window: &pb.WindowTag{ChunkId: 3, Snapshot: true},
 	}
 
-	rec, metaBytes, err := EncodeBatch(rows, meta)
+	body, metaBytes, err := EncodeBatch(rows, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
+	}
+
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
 	}
 	defer rec.Release()
 

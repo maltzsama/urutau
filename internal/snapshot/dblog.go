@@ -3,7 +3,7 @@
 // that closes each window — never a timer. Sources implement the three
 // interfaces (ChunkSource, SourceReader, Relay) on top of their own
 // replication protocol; the proof logic lives here, once.
-package dblog
+package snapshot
 
 import (
 	"context"
@@ -11,15 +11,14 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/position"
 )
 
-// TableRef maps one source table to its target and primary key.
-type TableRef struct {
-	Source     string // "db.table"
-	Target     string // "raw.orders"
-	PrimaryKey []string
-}
+// TableRef maps one source table to its target and primary key. It is an
+// alias of the canonical core.TableRef — the pipeline-wide table identity
+// (CR-012).
+type TableRef = core.TableRef
 
 // Chunk is a half-open primary-key range [Low, High). The last chunk of a
 // table is emitted with the marker in the orchestrator; Low/High are tuples
@@ -125,7 +124,7 @@ func SnapshotTable(
 		}
 
 		high := reader.Synced()
-		if err := waitCaughtUp(ctx, reader, high, cfg); err != nil {
+		if err := WaitCaughtUp(ctx, reader, high, cfg); err != nil {
 			reader.ClearWindow()
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 		}
@@ -158,10 +157,11 @@ func scanChunk(ctx context.Context, src ChunkSource, ch Chunk, target string, lo
 	return rows, err
 }
 
-// waitCaughtUp polls the master position until the reader's synced position
+// WaitCaughtUp polls the master position until the reader's synced position
 // contains it — the proof that everything up to high (and the current master
-// state) has been read.
-func waitCaughtUp(ctx context.Context, reader SourceReader, high position.Position, cfg SnapshotConfig) error {
+// state) has been read. Exported so the distributed coordinator's snapshot
+// flow (worker-side SELECT) reuses the same proof.
+func WaitCaughtUp(ctx context.Context, reader SourceReader, high position.Position, cfg SnapshotConfig) error {
 	poll := cfg.CaughtUpPoll
 	if poll <= 0 {
 		poll = time.Second

@@ -17,7 +17,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/position"
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // statusInterval is how often the reader reports its applied LSN back to
@@ -42,7 +42,7 @@ type Config struct {
 	URI      string
 	DB       *sql.DB
 	SlotName string
-	Tables   []dblog.TableRef
+	Tables   []snapshot.TableRef
 	Logger   *slog.Logger
 }
 
@@ -50,7 +50,7 @@ type Config struct {
 // pipeline's target mapping.
 type relEntry struct {
 	state *TableState
-	ref   dblog.TableRef
+	ref   snapshot.TableRef
 }
 
 // Reader wraps one logical-decoding connection and decodes pgoutput row
@@ -60,9 +60,9 @@ type Reader struct {
 	db      *sql.DB
 	conn    *pgx.Conn
 	out     chan<- change.Change
-	bySrc   map[string]dblog.TableRef // "schema.table" → ref (PK + target)
-	states  map[string]*TableState    // "schema.table" → introspected state
-	relByID map[uint32]relEntry       // relation id → state, from Relation messages
+	bySrc   map[string]snapshot.TableRef // "schema.table" → ref (PK + target)
+	states  map[string]*TableState       // "schema.table" → introspected state
+	relByID map[uint32]relEntry          // relation id → state, from Relation messages
 
 	// Transaction buffer: rows stream inside a transaction before its
 	// commit LSN is known, so they accumulate and flush at Commit.
@@ -95,7 +95,7 @@ func New(ctx context.Context, cfg Config, out chan<- change.Change) (*Reader, er
 		return nil, err
 	}
 
-	bySrc := make(map[string]dblog.TableRef, len(cfg.Tables))
+	bySrc := make(map[string]snapshot.TableRef, len(cfg.Tables))
 	states := make(map[string]*TableState, len(cfg.Tables))
 	for _, ref := range cfg.Tables {
 		schema, table, ok := splitSource(ref.Source)
@@ -343,7 +343,7 @@ func (r *Reader) handleRelation(payload []byte) error {
 	return r.bindRelation(msg.RelationID, src, ref)
 }
 
-func (r *Reader) bindRelation(relID uint32, src string, ref dblog.TableRef) error {
+func (r *Reader) bindRelation(relID uint32, src string, ref snapshot.TableRef) error {
 	st, ok := r.states[src]
 	if !ok {
 		return fmt.Errorf("postgres: relation %s: no introspected state", src)
@@ -498,7 +498,7 @@ func (r *Reader) currentWindow() *change.Window {
 }
 
 // keyFrom builds the key tuple from the PK columns, in spec order.
-func keyFrom(st *TableState, ref dblog.TableRef, row map[string]any) []any {
+func keyFrom(st *TableState, ref snapshot.TableRef, row map[string]any) []any {
 	key := make([]any, 0, len(ref.PrimaryKey))
 	for _, pk := range ref.PrimaryKey {
 		if v, ok := row[pk]; ok {

@@ -12,33 +12,79 @@ parallel — no Kafka in the data path, recoverable from total catastrophe.
 
 All code, comments, and documentation in this repository are **English**.
 
+## Architecture
+
+Sources and sinks are decoupled behind **contracts** (CR-012): a canonical
+type system (`internal/core`) crosses the source↔sink boundary, so N sources
+× M sinks cost N+M type mappings instead of N×M. The DBLog snapshot
+orchestrator is source-agnostic (`internal/snapshot`); concrete drivers are
+registered in `internal/drivers`, which is the only place that knows the
+implementations.
+
+```mermaid
+flowchart TB
+    CORE["core — canonical types"]
+    SRC["source — contract"]
+    SNK["sink — contract"]
+    SNAP["snapshot — generic DBLog"]
+    WRK["worker"]
+    STD["spec / position / change"]
+
+    subgraph impls ["implementations — never import each other"]
+        MYSQL["source/mysql"]
+        ICE["sink/iceberg"]
+    end
+
+    DRV["drivers — registration, assembled in cmd/"]
+    RUN["runner / coordinator — consume interfaces only"]
+
+    CORE --- SRC & SNK & SNAP & WRK & STD
+    SRC --> MYSQL
+    SNK --> ICE
+    MYSQL & ICE --> DRV
+    DRV --> RUN
+```
+
+The dependency walls are enforced by a test (`internal/architecture`) that
+checks direct imports via `go list` — a leak fails CI, not a future driver.
+
 ## Map
 
 | Path | Role |
 | --- | --- |
-| `cmd/urutau` | CLI (`plan`, `run --local`, `status`, `resume`, …) |
-| `cmd/coordinator` | coordinator binary (reader, router, supervisor) |
-| `cmd/worker` | worker binary (Iceberg writer) |
+| `cmd/urutau` | CLI (`run --local`, …) |
+| `cmd/coordinator` | coordinator binary (reader, router, supervisor, Flight) |
+| `cmd/worker` | worker binary (Iceberg writer, Flight consumer) |
+| `cmd/operator` | Kubernetes operator (CRD reconciler + webhook) |
+| `internal/core` | canonical type system (`Kind`, `Schema`, `TableRef`, `Row`) |
+| `internal/source` | source contracts (`Source`, `Introspector`, `Chunker`, `Driver`) |
+| `internal/sink` | sink contracts (`Sink`, `TableWriter` with commit invariants) |
+| `internal/snapshot` | generic DBLog orchestrator (chunk + caught-up proof) |
+| `internal/source/mysql` | MySQL source (`go-mysql`/canal, GTID) |
+| `internal/source/postgres` | Postgres source (`pgx`, pgoutput, LSN slot) |
+| `internal/sink/iceberg` | Iceberg writes (upsert/equality delete, `FromCanonical`) |
+| `internal/drivers` | driver registry — the only place that knows implementations |
+| `internal/coordinator` | reader/router loops, flow budget, supervisor, control plane |
+| `internal/worker` | per-table batcher + serialized committer (sink-agnostic) |
 | `internal/spec` | resolvedSpec + single server-side validation |
 | `internal/change` | row change event, per-key collapse, batch |
 | `internal/position` | position contract (GTID/LSN, `Compare`/`Contains`) |
-| `internal/source` | sources: MySQL (`go-mysql`), Postgres (`pgx`) |
-| `internal/coordinator` | reader/router loops, flight budget, supervisor |
-| `internal/worker` | per-table batcher + serialized committer |
-| `internal/sink` | Iceberg writes (upsert/equality delete) |
 | `internal/transport` | gRPC control + Arrow Flight; generated in `internal/transport/pb` |
-| `internal/eventlog` | per-run-id JSONL in S3 |
-| `api/v1alpha1` | CDCPipeline CR types (pending) |
+| `internal/eventlog` | per-run-id JSONL audit trail in S3 |
+| `internal/observability` | lean Prometheus metrics + live `/statusz` |
+| `api/v1alpha1` | CDCPipeline CR types |
+| `config/` | CRD + RBAC manifests |
 | `proto/` | coordinator↔worker wire contract |
 
 ## Development
 
 ```sh
-make bootstrap   # buf + golangci-lint pinned into ./bin
-make build       # bin/urutau, bin/urutau-coordinator, bin/urutau-worker
-make test        # go test -race ./...
-make lint        # golangci-lint
-make proto       # buf lint + generate (generated code is committed)
+make bootstrap        # buf, golangci-lint, setup-envtest pinned into ./bin
+make envtest-setup    # install the operator envtest control plane
+make build            # bin/urutau, bin/urutau-coordinator, bin/urutau-worker, bin/urutau-operator
+make test             # go test -race ./... (operator envtest skipped without assets)
+make lint             # golangci-lint
+make proto            # buf lint + generate (generated code is committed)
 ```
 
 Go ≥ 1.26. No `protoc` needed — generation uses `buf` with the
@@ -63,15 +109,37 @@ All verified through Trino. Key finding: in `iceberg-go` v0.6.0 an append
 and an equality delete staged in one transaction produce **two** snapshots
 — the delete gets the higher sequence number and applies to the freshly
 appended file too. A correct upsert is therefore delete-then-append
-(separate commits), never append-then-delete in a single commit.
+(separate commits), never append-then-delete in a single commit. This is
+captured as an invariant on the `sink.TableWriter` contract, inherited by
+every future sink.
 
 ## Status
 
-The MySQL and Postgres sources are in: one replication reader per source
-(canal for MySQL binlog, pgoutput logical decoding for Postgres), DBLog
-snapshot with the caught-up proof (never a timer), per-key collapse and
-serialized commits in the worker, and resume from the committed position
-(GTID set / LSN) written atomically with the data. Every run can also
-record a JSONL audit trail in S3 (`internal/eventlog`,
-`run --eventlog s3://bucket/prefix`): lifecycle and commit events, one
-object per run. Next: the multi-worker split.
+- **Sources:** MySQL (`go-mysql`/canal, GTID, heartbeat) and Postgres
+  (`pgx`, pgoutput, LSN slot) — one replication reader per source, mapped
+  to the canonical type system.
+- **DBLog snapshot:** generic in `internal/snapshot` — chunk by PK,
+  low/high watermarks, and the caught-up proof that closes each window
+  (never a timer; `windowTimeout` is a pathology detector).
+- **Worker:** per-key collapse, strictly serialized commits per table, and
+  DBLog window application — over the `sink.TableWriter` contract, so it is
+  sink-agnostic.
+- **Distributed split:** coordinator (control plane + Flight data plane,
+  flow budget, supervisor) and workers (Flight consumer, chunk SELECTs run
+  on the worker). Lifecycle-coupled streams — one ClientConn, keepalive,
+  graceful drain — so a dead channel is never a silent zombie.
+- **Resume:** committed position (GTID/LSN) written atomically with the
+  data; walk-back over snapshot summaries survives compaction; async
+  position manifests to S3 as convenience (the Iceberg property is the
+  source of truth).
+- **Supervision:** a worker that stops acking is reset (epoch bump, session
+  cancel); resets within the window beyond the cap terminate the job —
+  crashloops stay dead, recoverable by a fresh process with a higher epoch.
+- **Eventlog:** optional per-run JSONL audit trail in S3 (`run --eventlog
+  s3://bucket/prefix`), lifecycle + commit events.
+- **Observability:** lean Prometheus `/metrics` on both binaries and a live
+  `/statusz` on the coordinator (`--metrics-addr`).
+- **Operator:** CDCPipeline CRD, coordinator StatefulSet reconciler that
+  respects `status.terminated`, validating webhook, and an envtest suite.
+  The operator accepts inline `definition.tables` for now; the Python
+  planner (own repo) will render the full resolved spec.

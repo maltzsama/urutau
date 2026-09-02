@@ -1,43 +1,46 @@
 // Package coordinator drives the source side of the split pipeline: it owns
 // the replication reader and the DBLog snapshot, serves the control plane
 // (Session/Assignment) and the Arrow Flight data plane, and streams change
-// batches to connected workers. One worker is validated in this milestone;
-// the session registry already scales beyond it.
+// batches to the connected workers. Tables map to worker groups
+// (spec.Tables[].Worker; a table without a group owns its own worker), each
+// group gets its own Flight queue, and one batch always routes to exactly
+// one worker.
 package coordinator
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog/rest"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/apache/iceberg-go/table"
-	"github.com/maltzsama/urutau/internal/adapter"
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/drivers"
+	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/position"
-	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"google.golang.org/grpc/keepalive"
 )
-
-// dataTicket is the Flight ticket the (single) worker's DoGet consumes.
-var dataTicket = []byte("urutau-data")
 
 // Config tunes the coordinator for one pipeline.
 type Config struct {
@@ -50,17 +53,46 @@ type Config struct {
 	ServerID      uint32
 	Heartbeat     time.Duration
 
-	// WaitWorker bounds how long the coordinator waits for the first
+	// FlowTotalBytes is the process-wide ceiling on serialized batch bytes
+	// in flight (queued or sent, unacked). FlowPerWorkerMin is the floor
+	// that keeps a slow worker from starving. Defaults 512Mi / 16Mi.
+	FlowTotalBytes   int64
+	FlowPerWorkerMin int64
+
+	// Eventlog is optional: when set, the coordinator writes its per-run
+	// audit trail (job_started, snapshots, commits, terminal) to S3.
+	Eventlog *eventlog.Config
+
+	// Checkpoint is optional: async position manifests to S3 (design §6).
+	// Convenience only — the Iceberg table property is the source of truth.
+	Checkpoint *CheckpointConfig
+
+	// WaitWorker bounds how long the coordinator waits for every expected
 	// worker session before failing the boot.
 	WaitWorker time.Duration
+
+	// Supervision: a worker that stops acking past AckTimeout is reset
+	// (epoch++ and session cancel). Resets within ResetWindow beyond
+	// MaxResets terminate the job. Defaults 30s / 5 / 15m.
+	AckTimeout  time.Duration
+	MaxResets   int
+	ResetWindow time.Duration
+
+	// MetricsAddr serves /metrics (Prometheus) and /statusz (live state).
+	// Empty disables the endpoint.
+	MetricsAddr string
 
 	Logger *slog.Logger
 }
 
-// queuedBatch is one encoded batch waiting for the Flight stream.
+// workerQueueCap bounds one worker's in-flight batches — the structural
+// backpressure hop of design §1.1 (workerCh cap 64).
+const workerQueueCap = 64
+
+// queuedBatch is one serialized batch waiting for the Flight stream.
 type queuedBatch struct {
-	rec  arrow.RecordBatch
-	meta []byte
+	body []byte // complete Arrow IPC stream
+	meta []byte // BatchMeta proto
 }
 
 // Coordinator runs the source pipeline and serves workers.
@@ -68,22 +100,79 @@ type Coordinator struct {
 	cfg Config
 	log *slog.Logger
 
-	adapt adapter.Source
-	qdb   *sql.DB
-	refs  []dblog.TableRef
-	cat   *rest.Catalog
+	reg     *drivers.Registry
+	qdb     *sql.DB
+	refs    []snapshot.TableRef
+	cat     *rest.Catalog
+	schemas map[string]*iceberg.Schema
 
-	queue chan queuedBatch
+	// Worker registry: groups resolved at boot from the spec, one queue and
+	// one ticket each; route maps every target table to its owning worker.
+	route    map[string]*workerState
+	workers  map[string]*workerState
+	byTicket map[string]*workerState
+	budget   *flowBudget
+	index    map[string]*positionIndex
 
-	session    *workerSession // single-worker milestone
-	sessionSet chan struct{}
+	// runCtx outlives the helper goroutines that need cancellation (the
+	// wireRelay) but are called outside run's select.
+	runCtx context.Context
+
+	runID string // run-id of this boot (assignment + eventlog, §5.6.1)
+
+	ev *eventlog.Run
+
+	ready       chan struct{} // one send per attached session
+	sessionErrs chan error    // first exit wins
+	batchSeq    atomic.Uint64 // monotonic BatchMeta.batch_id
+	mu          sync.Mutex    // guards session attach/detach
+
+	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
+	// on the worker, live events of that table are held here instead of
+	// being shipped — a live event racing ahead of the chunk's rows would
+	// miss the window delete and duplicate the row. On ChunkReady the held
+	// events are released InWindow-tagged, then the Closes marker.
+	gateMu  sync.Mutex
+	gateOn  bool
+	gateTgt string
+	gateChk uint32
+	gateBuf []change.Change
+
+	// chunkReady routes worker ChunkReady replies to the snapshot loop.
+	chunkReady chan *pb.ChunkReady
+
+	cp         *checkpoint
+	supervisor *supervisor
+	terminate  chan error
+	metrics    *observability.Metrics
 }
 
-// workerSession is one connected worker's control surface.
-type workerSession struct {
-	name string
-	out  chan *pb.CoordinatorMessage
-	done chan error
+// workerState is one worker group's slice of the pipeline: its tables, its
+// Flight queue, and — once it connects — its control surface.
+type workerState struct {
+	name   string
+	refs   []snapshot.TableRef
+	queue  chan queuedBatch
+	ticket []byte
+
+	out      chan *pb.CoordinatorMessage // attached by Session
+	control  pb.UrutauControl_ControlServer
+	attached bool
+	epoch    uint64 // last accepted epoch (guards stale Hellos)
+	cancel   context.CancelFunc
+
+	// committed: target table → position the worker reported after its last
+	// commit. Refreshed on every ready Hello (design §5.6.1).
+	committed map[string]string
+}
+
+// workerName resolves the worker group of one spec table: the explicit
+// worker= grouping, or the table's own pod (1:1 default).
+func workerName(t spec.Table) string {
+	if t.Worker != "" {
+		return t.Worker
+	}
+	return t.Target
 }
 
 // Run boots the pipeline and blocks until ctx is cancelled or a terminal
@@ -93,18 +182,54 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Logger = slog.Default()
 	}
 	c := &Coordinator{
-		cfg:        cfg,
-		log:        cfg.Logger,
-		queue:      make(chan queuedBatch, 1024),
-		sessionSet: make(chan struct{}),
+		cfg:         cfg,
+		log:         cfg.Logger,
+		route:       map[string]*workerState{},
+		workers:     map[string]*workerState{},
+		byTicket:    map[string]*workerState{},
+		index:       map[string]*positionIndex{},
+		ready:       make(chan struct{}, 1024),
+		sessionErrs: make(chan error, 1024),
+		chunkReady:  make(chan *pb.ChunkReady, 1024),
+	}
+	if cfg.FlowTotalBytes <= 0 {
+		cfg.FlowTotalBytes = 512 << 20
+	}
+	if cfg.FlowPerWorkerMin <= 0 {
+		cfg.FlowPerWorkerMin = 16 << 20
+	}
+	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
+	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
+	c.supervisor = newSupervisor(c)
+	c.terminate = make(chan error, 1)
+	if cfg.MetricsAddr != "" {
+		c.metrics = observability.New()
+		go func() { _ = c.metrics.Serve(cfg.MetricsAddr, c.statusz) }()
 	}
 	return c.run(ctx)
 }
 
 func (c *Coordinator) run(ctx context.Context) error {
+	c.runCtx = ctx
+
+	if cfg := c.cfg.Eventlog; cfg != nil {
+		ev, err := eventlog.New(ctx, *cfg)
+		if err != nil {
+			return fmt.Errorf("coordinator: eventlog: %w", err)
+		}
+		c.ev = ev
+		defer ev.Close()
+		if err := c.emit(eventlog.KindJobStarted, map[string]any{
+			"pipeline": c.cfg.Spec.Pipeline,
+			"source":   c.cfg.Spec.Source.Kind,
+		}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
+	}
+
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
-	adapt, err := adapter.For(c.cfg.Spec, adapter.Runtime{
+	reg, err := drivers.New(c.cfg.Spec, drivers.Runtime{
 		ServerID:  c.cfg.ServerID,
 		Heartbeat: c.cfg.Heartbeat,
 		Logger:    c.log,
@@ -112,19 +237,19 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.adapt = adapt
+	c.reg = reg
 
-	qdb, err := adapt.OpenQuery(ctx)
+	qdb, err := reg.OpenQuery(ctx)
 	if err != nil {
 		return fmt.Errorf("coordinator: open query db: %w", err)
 	}
 	defer func() { _ = qdb.Close() }()
 	c.qdb = qdb
 
-	refs := make([]dblog.TableRef, 0, len(c.cfg.Spec.Tables))
+	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, is, err := adapt.Introspect(ctx, qdb, t)
+		ref, is, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
 			return err
 		}
@@ -132,23 +257,60 @@ func (c *Coordinator) run(ctx context.Context) error {
 		schemas[t.Source] = is
 	}
 	c.refs = refs
+	c.schemas = schemas
+
+	// Resolve worker groups: explicit worker= or the table's own pod.
+	for i, t := range c.cfg.Spec.Tables {
+		name := workerName(t)
+		w, ok := c.workers[name]
+		if !ok {
+			w = &workerState{
+				name:   name,
+				queue:  make(chan queuedBatch, workerQueueCap),
+				ticket: []byte("urutau/" + name),
+			}
+			c.workers[name] = w
+			c.byTicket[string(w.ticket)] = w
+			c.index[name] = newPositionIndex(name, c.runID)
+		}
+		w.refs = append(w.refs, refs[i])
+		c.route[t.Target] = w
+	}
+	for _, w := range c.workers {
+		c.log.Info("coordinator worker group", "worker", w.name, "tables", len(w.refs))
+		if err := c.emit(eventlog.KindWorkerCreated, map[string]any{
+			"worker": w.name,
+			"tables": tableNames(w.refs),
+		}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
+	}
+	if cfg := c.cfg.Checkpoint; cfg != nil {
+		cp, err := newCheckpoint(ctx, *cfg)
+		if err != nil {
+			return fmt.Errorf("coordinator: checkpoint: %w", err)
+		}
+		c.cp = cp
+		go cp.run(ctx, c.runID, c.index, c.log)
+		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
+	}
 
 	// Catalog + tables: the coordinator owns DDL.
-	cat, err := foziceberg.NewCatalog(ctx, catalogConfig(c.cfg.Spec))
+	cat, err := drivers.NewCatalog(ctx, c.cfg.Spec)
 	if err != nil {
 		return fmt.Errorf("coordinator: catalog: %w", err)
 	}
 	c.cat = cat
-	if err := foziceberg.EnsureNamespace(ctx, cat, table.Identifier{c.cfg.Spec.Sink.Namespace}); err != nil {
+	if err := drivers.EnsureNamespace(ctx, cat, table.Identifier{c.cfg.Spec.Sink.Namespace}); err != nil {
 		return err
 	}
 	for _, ref := range refs {
-		if err := foziceberg.EnsureTable(ctx, cat, targetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source]); err != nil {
+		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source]); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
 
-	resume, needsSnapshot, err := c.resumeFrom(ctx, adapt, refs)
+	resume, needsSnapshot, err := c.resumeFrom(ctx, reg, refs)
 	if err != nil {
 		return err
 	}
@@ -162,36 +324,40 @@ func (c *Coordinator) run(ctx context.Context) error {
 	defer func() { _ = lis.Close() }()
 	c.log.Info("coordinator listening", "addr", lis.Addr().String())
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		// Keepalive agreement with the worker: MinTime ≤ client Time, else
+		// the server GOAWAYs a healthy worker for pinging too much.
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    10 * time.Second,
+			Timeout: 5 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
+		// Flight batches can be a full snapshot chunk; 128Mi covers the
+		// default batching ceiling.
+		grpc.MaxRecvMsgSize(128<<20),
+		grpc.MaxSendMsgSize(128<<20),
+	)
 	pb.RegisterUrutauControlServer(grpcServer, &controlServer{c: c})
 	flight.RegisterFlightServiceServer(grpcServer, &flightServer{c: c})
 	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
-	// Wait for the first worker session.
+	// Wait for every expected worker session.
 	wait := c.cfg.WaitWorker
 	if wait <= 0 {
 		wait = 2 * time.Minute
 	}
-	select {
-	case <-c.sessionSet:
-	case <-time.After(wait):
-		return fmt.Errorf("coordinator: no worker session within %s", wait)
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Assignment: tables with their resolved Iceberg schema.
-	assign, err := c.assignment(schemas)
-	if err != nil {
+	if err := c.waitWorkers(ctx, wait); err != nil {
 		return err
 	}
-	c.session.out <- assign
 
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.
 	out := make(chan change.Change, 1024)
-	rdr, err := adapt.NewReader(ctx, qdb, refs, out)
+	rdr, err := reg.NewReader(ctx, qdb, refs, out)
 	if err != nil {
 		return err
 	}
@@ -199,7 +365,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	start := resume
 	if start == nil {
-		m, err := adapt.InitialPosition(ctx, qdb)
+		m, err := reg.InitialPosition(ctx, qdb)
 		if err != nil {
 			return fmt.Errorf("coordinator: initial position: %w", err)
 		}
@@ -213,40 +379,140 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// in-process flushReq drain disappears.
 	go c.pump(ctx, out)
 
-	snapCfg := dblog.SnapshotConfig{
+	snapCfg := snapshot.SnapshotConfig{
 		WindowTimeout: c.cfg.WindowTimeout,
 		CaughtUpPoll:  c.cfg.CaughtUpPoll,
 	}
 	for _, ref := range needsSnapshot {
 		c.log.Info("coordinator snapshot", "table", ref.Source)
-		chunker, err := adapt.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
+		if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
+		chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 		if err != nil {
 			return err
 		}
-		if err := dblog.SnapshotTable(ctx, chunker, rdr, &wireRelay{c: c}, ref.Target, snapCfg); err != nil {
+		if err := c.snapshotTable(ctx, rdr, chunker, ref, snapCfg); err != nil {
 			return fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
 		}
 		c.log.Info("coordinator snapshot done", "table", ref.Source)
+		if err := c.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source}); err != nil {
+			c.log.Warn("coordinator: eventlog emit", "err", err)
+		}
 	}
+
+	// Supervision after the snapshot phase: acks only flow once the stream
+	// is live, so a long snapshot must not look like a stale worker.
+	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
 
 	// Block until the world ends.
 	select {
 	case <-ctx.Done():
+		c.gracefulShutdown()
+		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "shutdown"})
 		return ctx.Err()
 	case err := <-streamErr:
+		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "stream"})
 		return fmt.Errorf("coordinator: stream: %w", err)
-	case err := <-c.session.done:
+	case err := <-c.sessionErrs:
+		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "session"})
 		return fmt.Errorf("coordinator: worker session: %w", err)
+	case err := <-c.terminate:
+		c.gracefulShutdown()
+		c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": "crashloop"})
+		return err
 	}
 }
 
-// pump encodes reader events into the data queue.
+// supervisionConfig maps the Config knobs to the supervisor defaults.
+func supervisionConfig(cfg Config) SupervisorConfig {
+	return SupervisorConfig{
+		AckTimeout:  cfg.AckTimeout,
+		MaxResets:   cfg.MaxResets,
+		ResetWindow: cfg.ResetWindow,
+	}
+}
+
+// emitLog writes an event and logs any failure (best-effort trail).
+func (c *Coordinator) emitLog(kind string, fields map[string]any) {
+	if err := c.emit(kind, fields); err != nil {
+		c.log.Warn("coordinator: eventlog emit", "kind", kind, "err", err)
+	}
+}
+
+// statusz renders the live coordinator state for /statusz (design §13.4).
+func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
+	type workerStatus struct {
+		Phase     string            `json:"phase"`
+		Epoch     uint64            `json:"epoch"`
+		Attached  bool              `json:"attached"`
+		Inflight  int64             `json:"inflight_bytes"`
+		Committed map[string]string `json:"committed,omitempty"`
+	}
+	st := map[string]any{
+		"run_id": c.runID,
+	}
+	ws := map[string]*workerStatus{}
+	for name, w := range c.workers {
+		c.mu.Lock()
+		ws[name] = &workerStatus{
+			Phase:     "attached",
+			Epoch:     w.epoch,
+			Attached:  w.attached,
+			Inflight:  c.budget.inFlight(name),
+			Committed: w.committed,
+		}
+		c.mu.Unlock()
+	}
+	st["workers"] = ws
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(st); err != nil {
+		c.log.Warn("statusz encode", "err", err)
+	}
+}
+
+// emit writes one event to the audit trail when configured; best-effort by
+// contract (a lost trail must never fail the pipeline).
+func (c *Coordinator) emit(kind string, fields map[string]any) error {
+	if c.ev == nil {
+		return nil
+	}
+	if err := c.ev.Emit(context.Background(), kind, fields); err != nil {
+		return err
+	}
+	return nil
+}
+
+// waitWorkers blocks until every expected group has a session attached.
+func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error {
+	for range c.workers {
+		select {
+		case <-c.ready:
+		case <-time.After(wait):
+			return fmt.Errorf("coordinator: not all workers connected within %s", wait)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// pump encodes reader events into the data queue. While a DBLog window is
+// open (gateOn), events of the gated table are buffered instead — released
+// InWindow-tagged by flushWindow after the worker confirms ChunkReady. Other
+// tables flow freely.
 func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
 	for {
 		select {
 		case ch, ok := <-out:
 			if !ok {
 				return
+			}
+			if c.metrics != nil {
+				c.metrics.EventsDecoded.Inc()
+			}
+			if c.gateHold(ch) {
+				continue
 			}
 			if err := c.enqueueBatch(ctx, []change.Change{ch}, batchMeta(ch)); err != nil {
 				c.log.Warn("coordinator: enqueue failed", "err", err)
@@ -256,6 +522,157 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
 			return
 		}
 	}
+}
+
+// gateHold buffers an event when a window is open for its table.
+func (c *Coordinator) gateHold(ch change.Change) bool {
+	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
+	if !c.gateOn || ch.Table != c.gateTgt {
+		return false
+	}
+	c.gateBuf = append(c.gateBuf, ch)
+	return true
+}
+
+// openWindow pauses the pump for one table, tagging the current chunk. The
+// gate stays open for the WHOLE snapshot of the table (design §3.1: the
+// coordinator pauses relaying while it works the table); flushWindow drains
+// per chunk without closing it, and closeWindow seals it at the end. A gate
+// that opened and closed per chunk would let gap events (positioned AFTER
+// the gate's backlog) flow straight through, then release older backlog
+// after them — a reordering that resurrects old values.
+func (c *Coordinator) openWindow(target string, chunkID uint32) {
+	c.gateMu.Lock()
+	c.gateOn, c.gateTgt, c.gateChk = true, target, chunkID
+	c.gateMu.Unlock()
+}
+
+// flushWindow drains the gated events collected since the last drain,
+// InWindow-tagged for the given chunk, then returns (gate stays open).
+func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
+	c.gateMu.Lock()
+	buf, tgt := c.gateBuf, c.gateTgt
+	c.gateBuf = nil
+	c.gateChk = chunkID
+	c.gateMu.Unlock()
+
+	if len(buf) == 0 {
+		return nil
+	}
+	// One batch, InWindow-tagged: the worker deletes each key from the
+	// chunk's window (the live version won) and applies the change.
+	meta := &pb.BatchMeta{
+		Table:  tgt,
+		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
+	}
+	return c.enqueueBatch(ctx, buf, meta)
+}
+
+// closeWindow releases any remaining gated events (post-last-chunk) and
+// closes the gate. The trailing events are ordinary live changes: no window
+// tag.
+func (c *Coordinator) closeWindow(ctx context.Context) error {
+	c.gateMu.Lock()
+	buf, tgt := c.gateBuf, c.gateTgt
+	c.gateOn, c.gateBuf, c.gateChk = false, nil, 0
+	c.gateMu.Unlock()
+
+	if len(buf) == 0 {
+		return nil
+	}
+	return c.enqueueBatch(ctx, buf, &pb.BatchMeta{Table: tgt})
+}
+
+// waitChunkReady blocks until the worker reports the chunk SELECT done.
+func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32) error {
+	for {
+		select {
+		case cr := <-c.chunkReady:
+			if cr.Table == table && cr.ChunkId == chunkID {
+				return nil
+			}
+			c.log.Warn("coordinator: unexpected ChunkReady", "table", cr.Table, "chunk", cr.ChunkId)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// snapshotTable runs the DBLog snapshot for one table with the chunk SELECT
+// executed by the worker (design §3.1): for each chunk the coordinator pauses
+// the pump (openWindow), sends ChunkRequest bounds, waits ChunkReady, proves
+// caught-up, then releases the gated live events InWindow-tagged and the
+// Closes marker. The worker holds the chunk rows in its window; the window
+// is what InWindow events drain and the Closes marker flushes.
+func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceReader, chunker snapshot.ChunkSource, ref snapshot.TableRef, cfg snapshot.SnapshotConfig) error {
+	bounds, err := chunker.Bounds(ctx)
+	if err != nil {
+		return err
+	}
+	chunks := snapshot.Chunks(bounds)
+	w, ok := c.route[ref.Target]
+	if !ok {
+		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
+	}
+
+	for i, ch := range chunks {
+		chunkID := uint32(i)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if i == 0 {
+			c.openWindow(ref.Target, chunkID)
+		}
+
+		lowB, err := json.Marshal(ch.Low)
+		if err != nil {
+			return fmt.Errorf("coordinator: chunk %d low bounds: %w", chunkID, err)
+		}
+		var highB []byte
+		if ch.High != nil {
+			highB, err = json.Marshal(ch.High)
+			if err != nil {
+				return fmt.Errorf("coordinator: chunk %d high bounds: %w", chunkID, err)
+			}
+		}
+		req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Low: lowB, High: highB}
+
+		select {
+		case w.out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		if err := c.waitChunkReady(ctx, ref.Source, chunkID); err != nil {
+			return err
+		}
+		c.log.Info("chunk ready", "table", ref.Source, "chunk", chunkID)
+
+		// The worker has the chunk rows in its window; prove the reader is
+		// caught up before releasing anything that touches this window.
+		high := rdr.Synced()
+		if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
+			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+		}
+		at := rdr.Synced()
+
+		// Release this chunk's gated live events (InWindow-tagged) ahead of
+		// the Closes marker — FIFO keeps them before it. The gate stays
+		// open: the next chunk's backlog must not race ahead of these.
+		if err := c.flushWindow(ctx, chunkID); err != nil {
+			return err
+		}
+		if err := c.enqueueBatch(ctx, nil, &pb.BatchMeta{
+			Table:  ref.Target,
+			LowPos: at.String(),
+			Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
+		}); err != nil {
+			return err
+		}
+	}
+	// Seal the gate and release anything collected after the last chunk.
+	return c.closeWindow(ctx)
 }
 
 // batchMeta derives the wire window tag from one change.
@@ -271,56 +688,113 @@ func batchMeta(ch change.Change) *pb.BatchMeta {
 	return m
 }
 
-// enqueueBatch encodes rows and queues them for the Flight stream.
+// enqueueBatch encodes rows, charges the worker's share of the global flow
+// budget, and queues the serialized batch on its Flight stream. A full
+// budget blocks here — the backpressure that stalls the pump and, through
+// it, the reader. The charge is released when the worker's Ack covers the
+// batch's position (onAck).
 func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, meta *pb.BatchMeta) error {
-	rec, metaBytes, err := transport.EncodeBatch(rows, meta)
+	w, ok := c.route[meta.Table]
+	if !ok {
+		return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
+	}
+	meta.BatchId = c.batchSeq.Add(1)
+	body, metaBytes, err := transport.EncodeBatch(rows, meta)
 	if err != nil {
 		return err
 	}
+	n := int64(len(body) + len(metaBytes))
+	if err := c.budget.acquire(ctx, w.name, n); err != nil {
+		return err
+	}
+	// Marker batches (window closes) carry their position in LowPos.
+	posStr := meta.HighPos
+	if posStr == "" {
+		posStr = meta.LowPos
+	}
+	var high position.Position
+	if posStr != "" {
+		high, err = c.reg.ParsePosition(posStr)
+		if err != nil {
+			c.budget.release(w.name, n)
+			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
+		}
+	}
 	select {
-	case c.queue <- queuedBatch{rec: rec, meta: metaBytes}:
+	case w.queue <- queuedBatch{body: body, meta: metaBytes}:
+		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n})
 		return nil
 	case <-ctx.Done():
-		rec.Release()
+		c.budget.release(w.name, n)
 		return ctx.Err()
 	}
 }
 
-// wireRelay routes the DBLog orchestrator's calls over the data queue.
-type wireRelay struct {
-	c *Coordinator
-}
-
-func (w *wireRelay) Release(table string, chunkID uint32, at position.Position) {
-	// The Closes marker travels as an empty batch; its position rides in
-	// LowPos. FIFO ordering guarantees every window row and every InWindow
-	// event is already ahead of it.
-	meta := &pb.BatchMeta{
-		Table:  table,
-		LowPos: at.String(),
-		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
+// onHello processes a worker's ready Hello: it carries the phase and the
+// committed positions the worker read from Iceberg. A Hello with a stale
+// epoch is a zombie from a superseded generation — reject it (design §5.5).
+func (c *Coordinator) onHello(worker string, h *pb.Hello) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w, ok := c.workers[worker]
+	if !ok {
+		c.log.Warn("coordinator: Hello for unknown worker", "worker", worker)
+		return
 	}
-	if err := w.c.enqueueBatch(context.Background(), nil, meta); err != nil {
-		w.c.log.Warn("coordinator: release enqueue failed", "err", err)
+	if h.Epoch != w.epoch {
+		c.log.Warn("coordinator: stale Hello epoch", "worker", worker, "have", w.epoch, "got", h.Epoch)
+		return
+	}
+	w.committed = h.Committed
+	c.log.Info("worker hello", "worker", worker, "phase", h.Phase.String(),
+		"committed", len(h.Committed))
+}
+
+// onAck advances the worker's position index: every head batch the commit
+// covers leaves the flight window and returns its bytes to the budget.
+func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
+	c.supervisor.noteAck(worker, time.Now())
+	pos, err := c.reg.ParsePosition(ack.Position)
+	if err != nil {
+		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
+		return
+	}
+	freed := c.index[worker].truncate(ack.Table, pos)
+	if freed > 0 {
+		c.budget.release(worker, freed)
+	}
+	if c.metrics != nil {
+		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
+		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()
+	}
+	c.log.Info("worker ack", "worker", worker, "table", ack.Table,
+		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.inFlight(worker))
+	if err := c.emit(eventlog.KindCommit, map[string]any{
+		"worker":   worker,
+		"table":    ack.Table,
+		"rows":     ack.Rows,
+		"deletes":  ack.Deletes,
+		"position": ack.Position,
+	}); err != nil {
+		c.log.Warn("coordinator: eventlog emit", "err", err)
 	}
 }
 
-func (w *wireRelay) AddWindowRows(target string, chunkID uint32, rows []change.Change) error {
-	return w.c.enqueueBatch(context.Background(), rows, &pb.BatchMeta{
-		Table:  target,
-		Window: &pb.WindowTag{Snapshot: true, ChunkId: chunkID},
-	})
-}
-
-// assignment builds the worker's table assignment.
-func (c *Coordinator) assignment(schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
+// assignmentFor builds one worker's table assignment with its own ticket.
+func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
 	assign := &pb.Assignment{
-		Ticket: dataTicket,
+		WorkerName: w.name,
+		Epoch:      uint64(1),
+		RunId:      c.runID,
+		Ticket:     w.ticket,
+		SourceKind: c.cfg.Spec.Source.Kind,
+		SourceDsn:  c.cfg.Spec.Source.URI,
+		ChunkSize:  uint32(c.cfg.ChunkSize),
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
 	}
-	for _, ref := range c.refs {
+	for _, ref := range w.refs {
 		schemaJSON, err := json.Marshal(schemas[ref.Source])
 		if err != nil {
 			return nil, fmt.Errorf("coordinator: schema %s: %w", ref.Source, err)
@@ -339,16 +813,16 @@ func (c *Coordinator) assignment(schemas map[string]*iceberg.Schema) (*pb.Coordi
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
 // is the resume point, tables without one need the snapshot.
-func (c *Coordinator) resumeFrom(ctx context.Context, adapt adapter.Source, refs []dblog.TableRef) (position.Position, []dblog.TableRef, error) {
+func (c *Coordinator) resumeFrom(ctx context.Context, reg *drivers.Registry, refs []snapshot.TableRef) (position.Position, []snapshot.TableRef, error) {
 	var positions []position.Position
-	var needsSnapshot []dblog.TableRef
+	var needsSnapshot []snapshot.TableRef
 	for _, ref := range refs {
-		tbl, err := c.cat.LoadTable(ctx, targetIdent(c.cfg.Spec, ref.Target))
+		pos, err := drivers.CommittedPosition(ctx, c.cat, drivers.TargetIdent(c.cfg.Spec, ref.Target))
 		if err != nil {
-			return nil, nil, fmt.Errorf("coordinator: load %s: %w", ref.Target, err)
+			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
 		}
-		if pos := tbl.Properties()["cdc.position"]; pos != "" {
-			p, err := adapt.ParsePosition(pos)
+		if pos != "" {
+			p, err := reg.ParsePosition(pos)
 			if err != nil {
 				return nil, nil, fmt.Errorf("coordinator: %s cdc.position %q: %w", ref.Target, pos, err)
 			}
@@ -376,14 +850,12 @@ type controlServer struct {
 	c *Coordinator
 }
 
-// Session accepts one worker: the first Hello claims the single slot; the
-// server then streams assignments and collects acks until the worker goes.
-func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
-	sess := &workerSession{
-		out:  make(chan *pb.CoordinatorMessage, 16),
-		done: make(chan error, 1),
-	}
-
+// Session accepts one worker: the Hello names the group it claims (unknown
+// names and second connects are rejected; epoch validation arrives with
+// supervision). The server then streams assignments and collects acks until
+// the worker goes.
+func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr error) {
+	c := s.c
 	msg, err := stream.Recv()
 	if err != nil {
 		return err
@@ -392,18 +864,66 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
 	if hello == nil {
 		return errors.New("coordinator: first worker message must be Hello")
 	}
-	sess.name = hello.WorkerName
-	// Publish the session BEFORE claiming the slot: the sessionSet send
-	// happens-before run's receive, so run may read c.session the moment it
-	// wakes — writing the field after the send is a data race.
-	s.c.session = sess
+
+	c.mu.Lock()
+	w, known := c.workers[hello.WorkerName]
+	if known && w.attached {
+		c.mu.Unlock()
+		return fmt.Errorf("coordinator: worker %q already connected", hello.WorkerName)
+	}
+	// The supervisor cancels this ctx to force a reset; the worker sees the
+	// stream die and suicides.
+	sessCtx, sessCancel := context.WithCancel(stream.Context())
+	sess := &workerSession{
+		out:  make(chan *pb.CoordinatorMessage, 16),
+		done: make(chan error, 1),
+	}
+	// Publish the session BEFORE signaling ready: the ready send
+	// happens-before run's receive, so run may use w.out the moment it
+	// wakes — attaching after the signal is a data race.
+	if known {
+		w.out, w.attached = sess.out, true
+		w.cancel = sessCancel
+		c.supervisor.noteAttach(hello.WorkerName)
+	}
+	c.mu.Unlock()
+	if !known {
+		sessCancel()
+		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+	}
+
+	defer func() {
+		c.mu.Lock()
+		w.attached, w.out, w.cancel = false, nil, nil
+		c.mu.Unlock()
+		sessCancel()
+		// A supervisor reset is not a worker failure, and neither is the
+		// death of a worker mid-reset (it suicides on channel loss); the
+		// supervisor owns the outcome (crashloop or recovery).
+		if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(hello.WorkerName) {
+			c.sessionErrs <- retErr
+		}
+	}()
 
 	select {
-	case s.c.sessionSet <- struct{}{}:
+	case c.ready <- struct{}{}:
 	case <-stream.Context().Done():
 		return stream.Context().Err()
 	}
-	s.c.log.Info("worker session", "worker", sess.name)
+	c.log.Info("worker session", "worker", hello.WorkerName)
+
+	// Assignment on every attach (including after a reset): the worker
+	// waits for it before opening Flight, and a resurrected worker needs a
+	// fresh one.
+	if msg, err := c.assignmentFor(w, c.schemas); err != nil {
+		return err
+	} else {
+		select {
+		case sess.out <- msg:
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
 
 	// Recv loop: acks and worker errors.
 	go func() {
@@ -415,10 +935,11 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
 			}
 			switch m := msg.Msg.(type) {
 			case *pb.WorkerMessage_Ack:
-				s.c.log.Info("worker ack", "worker", sess.name, "table", m.Ack.Table,
-					"rows", m.Ack.Rows, "position", m.Ack.Position)
+				c.onAck(hello.WorkerName, m.Ack)
+			case *pb.WorkerMessage_Hello:
+				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_ChunkReady:
-				s.c.log.Info("chunk ready", "table", m.ChunkReady.Table, "chunk", m.ChunkReady.ChunkId)
+				c.chunkReady <- m.ChunkReady
 			case *pb.WorkerMessage_Error:
 				sess.done <- errors.New("coordinator: worker error: " + m.Error.Detail)
 				return
@@ -433,16 +954,85 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) error {
 			if err := stream.Send(m); err != nil {
 				return err
 			}
+		case err := <-sess.done:
+			return err
 		case <-stream.Context().Done():
 			return stream.Context().Err()
+		case <-sessCtx.Done():
+			return errSessionReset
 		}
 	}
 }
 
-// Control is the urgent-signal plane; nothing sends on it in this milestone.
-func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) error {
+// errSessionReset marks a session cancelled by the supervisor; not a worker
+// failure, so it must not kill the run via sessionErrs.
+var errSessionReset = errors.New("session reset")
+
+// workerSession is one connected worker's session-local surface; the group's
+// durable state lives in workerState.
+type workerSession struct {
+	out  chan *pb.CoordinatorMessage
+	done chan error
+}
+
+// Control is the urgent-signal plane on the same ClientConn as Session and
+// DoGet. The first frame must be a Hello naming the worker so urgent
+// signals route to the right stream. No data rides here.
+func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr error) {
+	c := s.c
+	msg, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	hello := msg.GetHello()
+	if hello == nil {
+		return errors.New("coordinator: Control first message must be Hello")
+	}
+	c.mu.Lock()
+	w, known := c.workers[hello.WorkerName]
+	if known {
+		w.control = stream
+	}
+	c.mu.Unlock()
+	if !known {
+		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+	}
+	defer func() {
+		c.mu.Lock()
+		w.control = nil
+		c.mu.Unlock()
+		// A worker mid-reset suicides and closes this stream too; only a
+		// non-reset death is a real session failure.
+		if !c.supervisor.isPending(hello.WorkerName) {
+			c.sessionErrs <- retErr
+		}
+	}()
+	// The worker never writes again; its death is the stream ending.
 	<-stream.Context().Done()
 	return stream.Context().Err()
+}
+
+// gracefulShutdown tells every connected worker to drain: flush + commit +
+// ack what is in flight, then exit 0 (design §5.3.2). Called on shutdown
+// and before terminal exits.
+func (c *Coordinator) gracefulShutdown() {
+	for _, w := range c.workers {
+		c.mu.Lock()
+		ctrl := w.control
+		c.mu.Unlock()
+		if ctrl == nil {
+			continue
+		}
+		msg := &pb.ControlMessage{Msg: &pb.ControlMessage_Shutdown{
+			Shutdown: &pb.Shutdown{
+				Grace: durationpb.New(30 * time.Second),
+				Drain: true,
+			},
+		}}
+		if err := ctrl.Send(msg); err != nil {
+			c.log.Warn("coordinator: shutdown send", "worker", w.name, "err", err)
+		}
+	}
 }
 
 // ── Flight data plane ────────────────────────────────────────────────
@@ -452,31 +1042,21 @@ type flightServer struct {
 	c *Coordinator
 }
 
-// DoGet streams the queued batches. Each FlightData carries one complete
-// IPC stream in DataBody (schema + one record) and a BatchMeta proto in
-// AppMetadata — self-consistent with the worker's reader.
+// DoGet streams the worker's queued batches; the ticket (from its
+// Assignment) selects which queue. Each FlightData carries one complete IPC
+// stream in DataBody and a BatchMeta proto in AppMetadata — both produced
+// at enqueue time, so the server only moves bytes.
 func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoGetServer) error {
-	if !bytes.Equal(req.Ticket, dataTicket) {
-		return errors.New("coordinator: unknown flight ticket")
+	w, ok := s.c.byTicket[string(req.Ticket)]
+	if !ok {
+		return fmt.Errorf("coordinator: unknown flight ticket %q", string(req.Ticket))
 	}
 	for {
 		select {
-		case qb := <-s.c.queue:
-			var buf bytes.Buffer
-			w := ipc.NewWriter(&buf, ipc.WithSchema(transport.ChangeSchema))
-			if err := w.Write(qb.rec); err != nil {
-				qb.rec.Release()
-				_ = w.Close()
-				return err
-			}
-			if err := w.Close(); err != nil {
-				qb.rec.Release()
-				return err
-			}
-			qb.rec.Release()
+		case qb := <-w.queue:
 			if err := stream.Send(&flight.FlightData{
 				DataHeader:  []byte("urutau-batch"),
-				DataBody:    buf.Bytes(),
+				DataBody:    qb.body,
 				AppMetadata: qb.meta,
 			}); err != nil {
 				return err
@@ -487,28 +1067,29 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 	}
 }
 
-// ── Catalog helpers (mirror the runner's) ────────────────────────────
-
-func catalogConfig(s *spec.Spec) foziceberg.Config {
-	return foziceberg.Config{
-		URI:          s.Sink.URI,
-		Warehouse:    s.Sink.Warehouse,
-		ClientID:     s.Sink.ClientID,
-		ClientSecret: s.Sink.ClientSecret,
-		Scope:        s.Sink.Scope,
-	}
-}
-
-func targetIdent(s *spec.Spec, target string) table.Identifier {
-	if ns, name, ok := strings.Cut(target, "."); ok {
-		return table.Identifier{ns, name}
-	}
-	return table.Identifier{s.Sink.Namespace, target}
-}
+// ── Positions ─────────────────────────────────────────────────────────
 
 func resumeOrNone(p position.Position) string {
 	if p == nil {
 		return "none"
 	}
 	return p.String()
+}
+
+// randSuffix returns n hex chars of crypto randomness (run-id suffix).
+func randSuffix(n int) string {
+	b := make([]byte, n/2+1)
+	if _, err := rand.Read(b); err != nil {
+		return "000000"
+	}
+	return hex.EncodeToString(b)[:n]
+}
+
+// tableNames renders a group's source tables for the audit trail.
+func tableNames(refs []snapshot.TableRef) []string {
+	out := make([]string, len(refs))
+	for i, r := range refs {
+		out[i] = r.Source
+	}
+	return out
 }

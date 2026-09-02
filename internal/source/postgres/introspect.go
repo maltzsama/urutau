@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/apache/iceberg-go"
+	"github.com/maltzsama/urutau/internal/core"
 )
 
 // Column is one introspected source column.
@@ -114,46 +114,48 @@ func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
 	return out, rows.Err()
 }
 
-// IcebergSchema derives an Iceberg schema from the introspected table,
-// mapping the scalar subset the writer supports (int64, float64, string,
-// bool). Anything outside the subset is a hard error — silent coercion is
-// how type bugs are born.
-func IcebergSchema(tbl *TableState) (*iceberg.Schema, error) {
-	fields := make([]iceberg.NestedField, 0, len(tbl.Columns))
-	for id, col := range tbl.Columns {
-		itype, err := mapType(col)
+// CanonicalSchema derives the canonical core.Schema from the introspected
+// table, mapping the scalar subset the pipeline supports (int64, float64,
+// string, bool). Anything outside the subset is a hard error — silent
+// coercion is how type bugs are born. The source knows nothing about any
+// sink (CR-012).
+func CanonicalSchema(tbl *TableState) (core.Schema, error) {
+	cols := make([]core.Column, 0, len(tbl.Columns))
+	for _, col := range tbl.Columns {
+		ct, err := mapColumnType(col)
 		if err != nil {
-			return nil, fmt.Errorf("postgres: %s.%s column %q: %w", tbl.Schema, tbl.Name, col.Name, err)
+			return core.Schema{}, fmt.Errorf("postgres: %s.%s column %q: %w", tbl.Schema, tbl.Name, col.Name, err)
 		}
-		fields = append(fields, iceberg.NestedField{
-			ID:       id + 1, // Iceberg field ids start at 1
-			Name:     col.Name,
-			Type:     itype,
-			Required: false,
-		})
+		cols = append(cols, core.Column{Name: col.Name, Type: ct})
 	}
-	return iceberg.NewSchema(0, fields...), nil
+	var pk []string
+	for _, idx := range tbl.PKColumns {
+		if idx >= 0 && idx < len(tbl.Columns) {
+			pk = append(pk, tbl.Columns[idx].Name)
+		}
+	}
+	return core.Schema{Columns: cols, PrimaryKey: pk}, nil
 }
 
-// mapType maps a PostgreSQL type to an Iceberg type, restricted to the
-// scalar subset the writer implements. Temporal types stay as text in this
-// milestone — the source text representation round-trips losslessly and
-// the MySQL source (canal with ParseTime=false) behaves the same way.
-func mapType(col Column) (iceberg.Type, error) {
+// mapColumnType maps a PostgreSQL type to a canonical type, restricted to
+// the scalar subset the pipeline implements. Temporal types stay as strings
+// in this milestone — the source text representation round-trips losslessly
+// and the MySQL source behaves the same way.
+func mapColumnType(col Column) (core.ColumnType, error) {
 	switch strings.ToLower(col.DataType) {
 	case "smallint", "integer", "bigint":
-		return iceberg.PrimitiveTypes.Int64, nil
+		return core.ColumnType{Kind: core.KindInt64}, nil
 	case "real", "double precision", "numeric", "money":
-		return iceberg.PrimitiveTypes.Float64, nil
+		return core.ColumnType{Kind: core.KindFloat64}, nil
 	case "boolean":
-		return iceberg.PrimitiveTypes.Bool, nil
+		return core.ColumnType{Kind: core.KindBool}, nil
 	case "character varying", "character", "text", "citext",
 		"date", "timestamp without time zone", "timestamp with time zone",
 		"time without time zone", "time with time zone",
 		"uuid", "json", "jsonb", "xml",
 		"inet", "cidr", "macaddr", "macaddr8", "interval", "bytea":
-		return iceberg.PrimitiveTypes.String, nil
+		return core.ColumnType{Kind: core.KindString}, nil
 	default:
-		return nil, fmt.Errorf("unsupported postgres type %q", col.DataType)
+		return core.ColumnType{}, fmt.Errorf("unsupported postgres type %q", col.DataType)
 	}
 }

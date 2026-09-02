@@ -89,10 +89,16 @@ func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifi
 	}, nil
 }
 
+// Close releases writer resources. The Iceberg writer holds none per-call
+// (it reloads metadata on every commit), so this is a no-op — present to
+// satisfy sink.TableWriter.
+func (w *TableWriter) Close() error { return nil }
+
 // Commit applies the batch: snapshot one equality-deletes every key in it
 // (upserts delete their older versions, deletes are the last word), snapshot
 // two appends the surviving rows. Only then is the position considered
-// advanced.
+// advanced. Implements sink.TableWriter; INVARIANT 2 (position last) is
+// honoured by writing the position only on the final commit of the batch.
 func (w *TableWriter) Commit(ctx context.Context, b change.Batch) error {
 	keys := append(collectKeys(b.Upserts), collectKeys(b.Deletes)...)
 	if len(keys) > 0 {
@@ -193,6 +199,45 @@ func (w *TableWriter) commitAppend(ctx context.Context, upserts []change.Change,
 		return nil
 	}
 	return fmt.Errorf("%w: append commit on %v: %v", ErrCommitExhausted, w.ident, lastErr)
+}
+
+// CommittedPosition reads the committed cdc.position of a table. The fast
+// path is the table property written atomically with every commit; when a
+// third-party maintenance job replaced the current snapshot (compaction
+// produces a replace without the property), the walk-back over snapshot
+// summaries is the fallback — defense, not coupling (design §2.2). Empty
+// string means the table has never committed (snapshot needed).
+func CommittedPosition(ctx context.Context, cat *rest.Catalog, ident table.Identifier) (string, error) {
+	tbl, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		return "", fmt.Errorf("iceberg: load %v: %w", ident, err)
+	}
+	return committedPosition(tbl), nil
+}
+
+// committedPosition implements the property-first, walk-back fallback over
+// a loaded table's metadata. Split out for unit testing without a live
+// catalog.
+func committedPosition(tbl *table.Table) string {
+	return walkBackPosition(tbl.Properties(), tbl.Metadata().Snapshots())
+}
+
+// walkBackPosition finds cdc.position in the table properties, else walks
+// the snapshot summaries newest-first (Snapshots() is newest-first). Pure,
+// for tests.
+func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
+	if pos := props["cdc.position"]; pos != "" {
+		return pos
+	}
+	for i := range snaps {
+		if snaps[i].Summary == nil {
+			continue
+		}
+		if pos := snaps[i].Summary.Properties["cdc.position"]; pos != "" {
+			return pos
+		}
+	}
+	return ""
 }
 
 // EnsureTable creates the table when it does not exist. Schema derivation
