@@ -156,6 +156,16 @@ func (s *supervisor) recordReset(worker string, now time.Time, window time.Durat
 // resetWorker bumps the epoch, cancels the worker's session, and waits for
 // the next Hello (the worker suicides on channel loss and reconnects, or a
 // new process takes over). Stale-epoch Hellos are rejected by onHello.
+//
+// Recovery of the resurrected worker rides on the resume path already in
+// place: the coordinator resumes from the global min() and the worker skips
+// every batch at or before its own committed position (failure-analysis case
+// 4). The design's dedicated second-connection interval reader (§5.6.2) is
+// intentionally not built here — go-mysql cannot run two replication
+// connections to the same source concurrently (a second canal.Run() kills
+// the first), and the correctness the interval reader exists for is already
+// delivered by the skip; the interval reader would only save the other
+// workers from re-skipping the window, a pure efficiency gain.
 func (c *Coordinator) resetWorker(w *workerState) {
 	c.mu.Lock()
 	w.epoch++

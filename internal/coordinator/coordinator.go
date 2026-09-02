@@ -95,10 +95,11 @@ type Coordinator struct {
 	cfg Config
 	log *slog.Logger
 
-	adapt adapter.Source
-	qdb   *sql.DB
-	refs  []dblog.TableRef
-	cat   *rest.Catalog
+	adapt   adapter.Source
+	qdb     *sql.DB
+	refs    []dblog.TableRef
+	cat     *rest.Catalog
+	schemas map[string]*iceberg.Schema
 
 	// Worker registry: groups resolved at boot from the spec, one queue and
 	// one ticket each; route maps every target table to its owning worker.
@@ -246,6 +247,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		schemas[t.Source] = is
 	}
 	c.refs = refs
+	c.schemas = schemas
 
 	// Resolve worker groups: explicit worker= or the table's own pod.
 	for i, t := range c.cfg.Spec.Tables {
@@ -339,12 +341,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 		wait = 2 * time.Minute
 	}
 	if err := c.waitWorkers(ctx, wait); err != nil {
-		return err
-	}
-
-	// Assignment: each worker gets its tables with the resolved schemas and
-	// its own Flight ticket.
-	if err := c.sendAssignments(ctx, schemas); err != nil {
 		return err
 	}
 
@@ -453,22 +449,6 @@ func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error
 		case <-c.ready:
 		case <-time.After(wait):
 			return fmt.Errorf("coordinator: not all workers connected within %s", wait)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return nil
-}
-
-// sendAssignments delivers each worker its table slice over its session.
-func (c *Coordinator) sendAssignments(ctx context.Context, schemas map[string]*iceberg.Schema) error {
-	for _, w := range c.workers {
-		msg, err := c.assignmentFor(w, schemas)
-		if err != nil {
-			return err
-		}
-		select {
-		case w.out <- msg:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -883,6 +863,19 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		return stream.Context().Err()
 	}
 	c.log.Info("worker session", "worker", hello.WorkerName)
+
+	// Assignment on every attach (including after a reset): the worker
+	// waits for it before opening Flight, and a resurrected worker needs a
+	// fresh one.
+	if msg, err := c.assignmentFor(w, c.schemas); err != nil {
+		return err
+	} else {
+		select {
+		case sess.out <- msg:
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
 
 	// Recv loop: acks and worker errors.
 	go func() {

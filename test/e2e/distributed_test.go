@@ -208,7 +208,9 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 10000, MaxInterval: 30 * time.Second})
 	}()
 	go func() {
-		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
+		// AckTimeout generous: this test exercises the drain, not
+		// supervision — a slow Iceberg commit must not look like a crash.
+		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 2 * time.Minute})
 	}()
 
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(20))
@@ -525,4 +527,72 @@ func TestCrashloopKillsJob(t *testing.T) {
 	}
 	cStop()
 	<-wErr
+}
+
+// TestWorkerRecoveryAfterReset proves the resurrection path: a worker that
+// dies (its session is cancelled by the supervisor) is replaced by a fresh
+// process that reconnects with a higher epoch; the coordinator accepts the
+// new Hello, the worker resumes from its committed position, and the data
+// keeps flowing — no crashloop, no re-snapshot.
+func TestWorkerRecoveryAfterReset(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	s := loadPipeline(t)
+	s.Tables[0].Worker = "w1"
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 20)
+
+	cCtx, cStop := context.WithCancel(ctx)
+	cErr := make(chan error, 1)
+	go func() {
+		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 10 * time.Second, MaxResets: 10, ResetWindow: time.Minute})
+	}()
+
+	// First worker: commits but stops acking after the snapshot, so the
+	// supervisor resets it (session cancelled → it suicides).
+	startWorker := func(fault bool) <-chan error {
+		wCtx, wStop := context.WithCancel(ctx)
+		t.Cleanup(wStop)
+		wErr := make(chan error, 1)
+		go func() {
+			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: fault})
+		}()
+		return wErr
+	}
+	firstErr := startWorker(true)
+
+	// Snapshot lands, then the supervisor resets the silent worker.
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(20))
+	select {
+	case err := <-firstErr:
+		if err == nil {
+			t.Fatal("first worker exited cleanly despite the fault")
+		}
+		t.Logf("first worker suicides after reset: %v", err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("first worker did not suicide after reset")
+	}
+
+	// A fresh, healthy worker reconnects with the next epoch and resumes.
+	secondErr := startWorker(false)
+	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (500, 'resumed', 5.0)`)
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(21))
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 500`, "resumed")
+
+	t.Log("recovery ok: new-epoch worker resumed without re-snapshot")
+	cStop()
+	<-secondErr
+	<-cErr
 }
