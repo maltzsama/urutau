@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Fundo Vermelho -->
+  <circle cx="256" cy="256" r="256" fill="#8B0000" />
+
+  <!-- Estrutura Principal (Sino/Capacete) -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    
+    <!-- Aro externo -->
+    <circle cx="256" cy="240" r="130" />
+
+    <!-- Alça superior -->
+    <path d="M 226 105 L 226 85 A 10 10 0 0 1 236 75 L 276 75 A 10 10 0 0 1 286 85 L 286 105" />
+
+    <!-- Suportes laterais (orelhas) -->
+    <rect x="85" y="180" width="40" height="65" rx="10" />
+    <rect x="387" y="180" width="40" height="65" rx="10" />
+
+    <!-- Base inferior -->
+    <path d="M 126 340 L 386 340 A 10 10 0 0 1 395 355 L 405 390 A 50 50 0 0 1 355 430 L 157 430 A 50 50 0 0 1 107 390 L 117 355 A 10 10 0 0 1 126 340" />
+
+    <!-- Anel central do visor (o "vidro") -->
+    <circle cx="256" cy="240" r="85" />
+
+    <!-- 🔹 CRUZ INTERNA DE FUNDO (os 4 braços, sem o X por cima) 🔹 -->
+    <path d="M 256 155 L 256 185" /> <!-- Braço superior -->
+    <path d="M 256 295 L 256 325" /> <!-- Braço inferior -->
+    <path d="M 171 240 L 201 240" /> <!-- Braço esquerdo -->
+    <path d="M 311 240 L 341 240" /> <!-- Braço direito -->
+    
+    <!-- Conexões diagonais da cruz (opcional, para ficar igual ao original sem o X) -->
+    <path d="M 195 180 L 215 200" />
+    <path d="M 297 280 L 317 300" />
+    <path d="M 215 280 L 195 300" />
+    <path d="M 317 180 L 297 200" />
+
+  </g>
+</svg>

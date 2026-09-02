@@ -8,7 +8,6 @@
 package coordinator
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -18,11 +17,10 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog/rest"
 	"google.golang.org/grpc"
@@ -50,6 +48,12 @@ type Config struct {
 	ServerID      uint32
 	Heartbeat     time.Duration
 
+	// FlowTotalBytes is the process-wide ceiling on serialized batch bytes
+	// in flight (queued or sent, unacked). FlowPerWorkerMin is the floor
+	// that keeps a slow worker from starving. Defaults 512Mi / 16Mi.
+	FlowTotalBytes   int64
+	FlowPerWorkerMin int64
+
 	// WaitWorker bounds how long the coordinator waits for every expected
 	// worker session before failing the boot.
 	WaitWorker time.Duration
@@ -61,10 +65,10 @@ type Config struct {
 // backpressure hop of design §1.1 (workerCh cap 64).
 const workerQueueCap = 64
 
-// queuedBatch is one encoded batch waiting for the Flight stream.
+// queuedBatch is one serialized batch waiting for the Flight stream.
 type queuedBatch struct {
-	rec  arrow.RecordBatch
-	meta []byte
+	body []byte // complete Arrow IPC stream
+	meta []byte // BatchMeta proto
 }
 
 // Coordinator runs the source pipeline and serves workers.
@@ -82,9 +86,16 @@ type Coordinator struct {
 	route    map[string]*workerState
 	workers  map[string]*workerState
 	byTicket map[string]*workerState
+	budget   *flowBudget
+	index    map[string]*positionIndex
+
+	// runCtx outlives the helper goroutines that need cancellation (the
+	// wireRelay) but are called outside run's select.
+	runCtx context.Context
 
 	ready       chan struct{} // one send per attached session
 	sessionErrs chan error    // first exit wins
+	batchSeq    atomic.Uint64 // monotonic BatchMeta.batch_id
 	mu          sync.Mutex    // guards session attach/detach
 }
 
@@ -121,13 +132,23 @@ func Run(ctx context.Context, cfg Config) error {
 		route:       map[string]*workerState{},
 		workers:     map[string]*workerState{},
 		byTicket:    map[string]*workerState{},
+		index:       map[string]*positionIndex{},
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
 	}
+	if cfg.FlowTotalBytes <= 0 {
+		cfg.FlowTotalBytes = 512 << 20
+	}
+	if cfg.FlowPerWorkerMin <= 0 {
+		cfg.FlowPerWorkerMin = 16 << 20
+	}
+	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	return c.run(ctx)
 }
 
 func (c *Coordinator) run(ctx context.Context) error {
+	c.runCtx = ctx
+
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
 	adapt, err := adapter.For(c.cfg.Spec, adapter.Runtime{
@@ -171,6 +192,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			}
 			c.workers[name] = w
 			c.byTicket[string(w.ticket)] = w
+			c.index[name] = newPositionIndex(name)
 		}
 		w.refs = append(w.refs, refs[i])
 		c.route[t.Target] = w
@@ -342,25 +364,62 @@ func batchMeta(ch change.Change) *pb.BatchMeta {
 	return m
 }
 
-// enqueueBatch encodes rows and queues them on the owning worker's Flight
-// stream. Blocking on a full queue is the backpressure: it stalls the pump,
-// which stalls the reader.
+// enqueueBatch encodes rows, charges the worker's share of the global flow
+// budget, and queues the serialized batch on its Flight stream. A full
+// budget blocks here — the backpressure that stalls the pump and, through
+// it, the reader. The charge is released when the worker's Ack covers the
+// batch's position (onAck).
 func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, meta *pb.BatchMeta) error {
 	w, ok := c.route[meta.Table]
 	if !ok {
 		return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
 	}
-	rec, metaBytes, err := transport.EncodeBatch(rows, meta)
+	meta.BatchId = c.batchSeq.Add(1)
+	body, metaBytes, err := transport.EncodeBatch(rows, meta)
 	if err != nil {
 		return err
 	}
+	n := int64(len(body) + len(metaBytes))
+	if err := c.budget.acquire(ctx, w.name, n); err != nil {
+		return err
+	}
+	// Marker batches (window closes) carry their position in LowPos.
+	posStr := meta.HighPos
+	if posStr == "" {
+		posStr = meta.LowPos
+	}
+	var high position.Position
+	if posStr != "" {
+		high, err = c.adapt.ParsePosition(posStr)
+		if err != nil {
+			c.budget.release(w.name, n)
+			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
+		}
+	}
 	select {
-	case w.queue <- queuedBatch{rec: rec, meta: metaBytes}:
+	case w.queue <- queuedBatch{body: body, meta: metaBytes}:
+		c.index[w.name].add(inflightBatch{table: meta.Table, high: high, bytes: n})
 		return nil
 	case <-ctx.Done():
-		rec.Release()
+		c.budget.release(w.name, n)
 		return ctx.Err()
 	}
+}
+
+// onAck advances the worker's position index: every head batch the commit
+// covers leaves the flight window and returns its bytes to the budget.
+func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
+	pos, err := c.adapt.ParsePosition(ack.Position)
+	if err != nil {
+		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
+		return
+	}
+	freed := c.index[worker].truncate(ack.Table, pos)
+	if freed > 0 {
+		c.budget.release(worker, freed)
+	}
+	c.log.Info("worker ack", "worker", worker, "table", ack.Table,
+		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.inFlight(worker))
 }
 
 // wireRelay routes the DBLog orchestrator's calls over the data queue.
@@ -377,13 +436,13 @@ func (w *wireRelay) Release(table string, chunkID uint32, at position.Position) 
 		LowPos: at.String(),
 		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
 	}
-	if err := w.c.enqueueBatch(context.Background(), nil, meta); err != nil {
+	if err := w.c.enqueueBatch(w.c.runCtx, nil, meta); err != nil {
 		w.c.log.Warn("coordinator: release enqueue failed", "err", err)
 	}
 }
 
 func (w *wireRelay) AddWindowRows(target string, chunkID uint32, rows []change.Change) error {
-	return w.c.enqueueBatch(context.Background(), rows, &pb.BatchMeta{
+	return w.c.enqueueBatch(w.c.runCtx, rows, &pb.BatchMeta{
 		Table:  target,
 		Window: &pb.WindowTag{Snapshot: true, ChunkId: chunkID},
 	})
@@ -514,8 +573,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			}
 			switch m := msg.Msg.(type) {
 			case *pb.WorkerMessage_Ack:
-				c.log.Info("worker ack", "worker", hello.WorkerName, "table", m.Ack.Table,
-					"rows", m.Ack.Rows, "position", m.Ack.Position)
+				c.onAck(hello.WorkerName, m.Ack)
 			case *pb.WorkerMessage_ChunkReady:
 				c.log.Info("chunk ready", "table", m.ChunkReady.Table, "chunk", m.ChunkReady.ChunkId)
 			case *pb.WorkerMessage_Error:
@@ -562,8 +620,8 @@ type flightServer struct {
 
 // DoGet streams the worker's queued batches; the ticket (from its
 // Assignment) selects which queue. Each FlightData carries one complete IPC
-// stream in DataBody (schema + one record) and a BatchMeta proto in
-// AppMetadata — self-consistent with the worker's reader.
+// stream in DataBody and a BatchMeta proto in AppMetadata — both produced
+// at enqueue time, so the server only moves bytes.
 func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoGetServer) error {
 	w, ok := s.c.byTicket[string(req.Ticket)]
 	if !ok {
@@ -572,21 +630,9 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 	for {
 		select {
 		case qb := <-w.queue:
-			var buf bytes.Buffer
-			w := ipc.NewWriter(&buf, ipc.WithSchema(transport.ChangeSchema))
-			if err := w.Write(qb.rec); err != nil {
-				qb.rec.Release()
-				_ = w.Close()
-				return err
-			}
-			if err := w.Close(); err != nil {
-				qb.rec.Release()
-				return err
-			}
-			qb.rec.Release()
 			if err := stream.Send(&flight.FlightData{
 				DataHeader:  []byte("urutau-batch"),
-				DataBody:    buf.Bytes(),
+				DataBody:    qb.body,
 				AppMetadata: qb.meta,
 			}); err != nil {
 				return err
