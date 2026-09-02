@@ -11,15 +11,14 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/position"
 )
 
-// TableRef maps one source table to its target and primary key.
-type TableRef struct {
-	Source     string // "db.table"
-	Target     string // "raw.orders"
-	PrimaryKey []string
-}
+// TableRef maps one source table to its target and primary key. It is an
+// alias of the canonical core.TableRef — the pipeline-wide table identity
+// (CR-012).
+type TableRef = core.TableRef
 
 // Chunk is a half-open primary-key range [Low, High). The last chunk of a
 // table is emitted with the marker in the orchestrator; Low/High are tuples
