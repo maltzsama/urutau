@@ -3,7 +3,7 @@
 // that closes each window — never a timer. Sources implement the three
 // interfaces (ChunkSource, SourceReader, Relay) on top of their own
 // replication protocol; the proof logic lives here, once.
-package dblog
+package snapshot
 
 import (
 	"context"

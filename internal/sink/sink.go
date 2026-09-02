@@ -19,7 +19,7 @@ var ErrNoPosition = errors.New("sink: no committed position")
 
 // Config is what every sink needs, in neutral terms.
 type Config struct {
-	URI       string            // "iceberg+rest://host/catalog"
+	URI       string // "iceberg+rest://host/catalog"
 	Namespace string
 	Options   map[string]string // warehouse, credentials, file size, codec
 }

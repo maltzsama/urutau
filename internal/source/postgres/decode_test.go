@@ -5,7 +5,7 @@ import (
 
 	pglogrepl "github.com/jackc/pglogrepl"
 
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // orderState is the introspected shape of shop.orders used by the golden
@@ -125,7 +125,7 @@ func TestKeyFromSpecOrder(t *testing.T) {
 	st := &TableState{Schema: "shop", Name: "orders", Columns: []Column{
 		{Name: "a"}, {Name: "b"}, {Name: "id"},
 	}, PKColumns: []int{2, 0}}
-	ref := dblog.TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id", "a"}}
+	ref := snapshot.TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id", "a"}}
 
 	key := keyFrom(st, ref, map[string]any{"id": int64(9), "a": "x", "b": "y"})
 	if len(key) != 2 || key[0] != int64(9) || key[1] != "x" {

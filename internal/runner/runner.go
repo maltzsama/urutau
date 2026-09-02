@@ -21,7 +21,7 @@ import (
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/position"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
 )
@@ -125,9 +125,9 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 
 // ── Positions and catalog ────────────────────────────────────────────
 
-func resumeFrom(ctx context.Context, cat *rest.Catalog, adapt adapter.Source, s *spec.Spec, refs []dblog.TableRef) (position.Position, []dblog.TableRef, error) {
+func resumeFrom(ctx context.Context, cat *rest.Catalog, adapt adapter.Source, s *spec.Spec, refs []snapshot.TableRef) (position.Position, []snapshot.TableRef, error) {
 	var positions []position.Position
-	var needsSnapshot []dblog.TableRef
+	var needsSnapshot []snapshot.TableRef
 	for _, ref := range refs {
 		pos, err := icebergsink.CommittedPosition(ctx, cat, targetIdent(s, ref.Target))
 		if err != nil {
@@ -169,8 +169,8 @@ func targetIdent(s *spec.Spec, target string) table.Identifier {
 // introspectAll resolves each spec table through the adapter, so the
 // pipeline knows the PK (equality key) and the target shape before writing
 // anything.
-func introspectAll(ctx context.Context, adapt adapter.Source, qdb *sql.DB, s *spec.Spec) ([]dblog.TableRef, map[string]*iceberg.Schema, error) {
-	refs := make([]dblog.TableRef, 0, len(s.Tables))
+func introspectAll(ctx context.Context, adapt adapter.Source, qdb *sql.DB, s *spec.Spec) ([]snapshot.TableRef, map[string]*iceberg.Schema, error) {
+	refs := make([]snapshot.TableRef, 0, len(s.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(s.Tables))
 	for _, t := range s.Tables {
 		ref, is, err := adapt.Introspect(ctx, qdb, t)
@@ -354,7 +354,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			_ = qdb.Close()
 			return nil, err
 		}
-		if err := dblog.SnapshotTable(ctx, chunker, rdr, router, ref.Target, dblog.SnapshotConfig{
+		if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
 			WindowTimeout: cfg.WindowTimeout,
 			CaughtUpPoll:  cfg.CaughtUpPoll,
 		}); err != nil {

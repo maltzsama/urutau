@@ -21,7 +21,7 @@ import (
 	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/position"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/source/mysql"
 	"github.com/maltzsama/urutau/internal/source/postgres"
 	"github.com/maltzsama/urutau/internal/spec"
@@ -38,7 +38,7 @@ type Runtime struct {
 // StreamSource is the replication reader surface a driver drives: the DBLog
 // watermark surface plus start/stop of the stream.
 type StreamSource interface {
-	dblog.SourceReader
+	snapshot.SourceReader
 	// Start begins streaming at the given position, blocking until the
 	// stream ends or ctx is cancelled. Call in a goroutine.
 	Start(ctx context.Context, at position.Position) error
@@ -54,9 +54,9 @@ type Source interface {
 	// Introspect resolves one spec table into its ref and Iceberg schema.
 	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error)
 	// NewChunker builds the chunk SELECT source for one table.
-	NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error)
+	NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error)
 	// NewReader builds the replication reader over the pipeline's tables.
-	NewReader(ctx context.Context, db *sql.DB, refs []dblog.TableRef, out chan<- change.Change) (StreamSource, error)
+	NewReader(ctx context.Context, db *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (StreamSource, error)
 	// InitialPosition is the stream start for a first boot (no resume).
 	InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error)
 	// ParsePosition decodes a stored cdc.position string.
@@ -111,11 +111,11 @@ func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
-		return dblog.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
+		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
 	}
 	st, err := mysql.QueryTable(ctx, db, schemaName, tableName)
 	if err != nil {
-		return dblog.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
+		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
 	}
 	pk := t.PrimaryKey
 	if len(pk) == 0 && len(st.PKColumns) > 0 {
@@ -134,11 +134,11 @@ func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
 }
 
-func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error) {
+func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {
 	return mysql.NewChunker(db, source, pk, chunkSize)
 }
 
-func (a mysqlSource) NewReader(ctx context.Context, db *sql.DB, refs []dblog.TableRef, out chan<- change.Change) (StreamSource, error) {
+func (a mysqlSource) NewReader(ctx context.Context, db *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (StreamSource, error) {
 	conn, err := parseMySQLURI(a.spec.Source.URI)
 	if err != nil {
 		return nil, err
@@ -202,11 +202,11 @@ func (a postgresSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
-		return dblog.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
+		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
 	}
 	st, err := postgres.QueryTable(ctx, db, schemaName, tableName)
 	if err != nil {
-		return dblog.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
+		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
 	}
 	pk := t.PrimaryKey
 	if len(pk) == 0 && len(st.PKColumns) > 0 {
@@ -225,11 +225,11 @@ func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
 }
 
-func (a postgresSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error) {
+func (a postgresSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {
 	return postgres.NewChunker(db, source, pk, chunkSize)
 }
 
-func (a postgresSource) NewReader(ctx context.Context, db *sql.DB, refs []dblog.TableRef, out chan<- change.Change) (StreamSource, error) {
+func (a postgresSource) NewReader(ctx context.Context, db *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (StreamSource, error) {
 	slot := a.spec.Source.SlotName
 	if slot == "" {
 		return nil, fmt.Errorf("adapter: postgres source requires slotName")

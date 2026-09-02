@@ -19,13 +19,13 @@ import (
 	"github.com/go-mysql-org/go-mysql/schema"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/position"
-	"github.com/maltzsama/urutau/internal/source/dblog"
 )
 
 // TableRef is the source-agnostic table mapping (kept here as an alias for
 // the package's public surface).
-type TableRef = dblog.TableRef
+type TableRef = core.TableRef
 
 // Config dials one MySQL instance. One replication connection per source —
 // the invariant the whole design stands on.

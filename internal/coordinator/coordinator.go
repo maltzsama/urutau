@@ -36,7 +36,7 @@ import (
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/position"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/source/dblog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -103,7 +103,7 @@ type Coordinator struct {
 
 	adapt   adapter.Source
 	qdb     *sql.DB
-	refs    []dblog.TableRef
+	refs    []snapshot.TableRef
 	cat     *rest.Catalog
 	schemas map[string]*iceberg.Schema
 
@@ -152,7 +152,7 @@ type Coordinator struct {
 // Flight queue, and — once it connects — its control surface.
 type workerState struct {
 	name   string
-	refs   []dblog.TableRef
+	refs   []snapshot.TableRef
 	queue  chan queuedBatch
 	ticket []byte
 
@@ -247,7 +247,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	defer func() { _ = qdb.Close() }()
 	c.qdb = qdb
 
-	refs := make([]dblog.TableRef, 0, len(c.cfg.Spec.Tables))
+	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
 		ref, is, err := adapt.Introspect(ctx, qdb, t)
@@ -380,7 +380,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// in-process flushReq drain disappears.
 	go c.pump(ctx, out)
 
-	snapCfg := dblog.SnapshotConfig{
+	snapCfg := snapshot.SnapshotConfig{
 		WindowTimeout: c.cfg.WindowTimeout,
 		CaughtUpPoll:  c.cfg.CaughtUpPoll,
 	}
@@ -606,12 +606,12 @@ func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID 
 // caught-up, then releases the gated live events InWindow-tagged and the
 // Closes marker. The worker holds the chunk rows in its window; the window
 // is what InWindow events drain and the Closes marker flushes.
-func (c *Coordinator) snapshotTable(ctx context.Context, rdr dblog.SourceReader, chunker dblog.ChunkSource, ref dblog.TableRef, cfg dblog.SnapshotConfig) error {
+func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceReader, chunker snapshot.ChunkSource, ref snapshot.TableRef, cfg snapshot.SnapshotConfig) error {
 	bounds, err := chunker.Bounds(ctx)
 	if err != nil {
 		return err
 	}
-	chunks := dblog.Chunks(bounds)
+	chunks := snapshot.Chunks(bounds)
 	w, ok := c.route[ref.Target]
 	if !ok {
 		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
@@ -653,7 +653,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr dblog.SourceReader,
 		// The worker has the chunk rows in its window; prove the reader is
 		// caught up before releasing anything that touches this window.
 		high := rdr.Synced()
-		if err := dblog.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
+		if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 		}
 		at := rdr.Synced()
@@ -814,9 +814,9 @@ func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
 // is the resume point, tables without one need the snapshot.
-func (c *Coordinator) resumeFrom(ctx context.Context, adapt adapter.Source, refs []dblog.TableRef) (position.Position, []dblog.TableRef, error) {
+func (c *Coordinator) resumeFrom(ctx context.Context, adapt adapter.Source, refs []snapshot.TableRef) (position.Position, []snapshot.TableRef, error) {
 	var positions []position.Position
-	var needsSnapshot []dblog.TableRef
+	var needsSnapshot []snapshot.TableRef
 	for _, ref := range refs {
 		pos, err := icebergsink.CommittedPosition(ctx, c.cat, targetIdent(c.cfg.Spec, ref.Target))
 		if err != nil {
@@ -1104,7 +1104,7 @@ func randSuffix(n int) string {
 }
 
 // tableNames renders a group's source tables for the audit trail.
-func tableNames(refs []dblog.TableRef) []string {
+func tableNames(refs []snapshot.TableRef) []string {
 	out := make([]string, len(refs))
 	for i, r := range refs {
 		out[i] = r.Source
