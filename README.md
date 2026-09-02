@@ -21,20 +21,28 @@ orchestrator is source-agnostic (`internal/snapshot`); concrete drivers are
 registered in `internal/drivers`, which is the only place that knows the
 implementations.
 
-```
-                 core                  (canonical types; imports nothing internal)
-                   ▲
-     ┌──────┬──────┼──────┬──────────┐
- source   sink  snapshot  worker  spec/position/change
-(contract)(contract)(DBLog)
-     ▲      ▲
-     │      │
- source/mysql  sink/iceberg            (implementations; never import each other)
-     ▲      ▲
-     └──┬───┘
-    drivers     (registration, assembled in cmd/)
-       ▲
- runner / coordinator                  (consume interfaces only)
+```mermaid
+flowchart TB
+    CORE["core — canonical types"]
+    SRC["source — contract"]
+    SNK["sink — contract"]
+    SNAP["snapshot — generic DBLog"]
+    WRK["worker"]
+    STD["spec / position / change"]
+
+    subgraph impls ["implementations — never import each other"]
+        MYSQL["source/mysql"]
+        ICE["sink/iceberg"]
+    end
+
+    DRV["drivers — registration, assembled in cmd/"]
+    RUN["runner / coordinator — consume interfaces only"]
+
+    CORE --- SRC & SNK & SNAP & WRK & STD
+    SRC --> MYSQL
+    SNK --> ICE
+    MYSQL & ICE --> DRV
+    DRV --> RUN
 ```
 
 The dependency walls are enforced by a test (`internal/architecture`) that
