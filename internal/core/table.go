@@ -16,15 +16,15 @@ const (
 	KindInt64
 	KindFloat32
 	KindFloat64
-	KindDecimal      // uses Precision, Scale
+	KindDecimal // uses Precision, Scale
 	KindString
 	KindBinary
-	KindDate         // days since epoch
-	KindTime         // micros since midnight
-	KindTimestamp    // naive wall clock, NO timezone (MySQL DATETIME)
-	KindTimestampTZ  // UTC instant (MySQL TIMESTAMP)
+	KindDate        // days since epoch
+	KindTime        // micros since midnight
+	KindTimestamp   // naive wall clock, NO timezone (MySQL DATETIME)
+	KindTimestampTZ // UTC instant (MySQL TIMESTAMP)
 	KindUUID
-	KindJSON         // semantically JSON; physically a string in most sinks
+	KindJSON // semantically JSON; physically a string in most sinks
 )
 
 // String renders the kind name for errors and diagnostics.

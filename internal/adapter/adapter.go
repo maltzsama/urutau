@@ -18,7 +18,9 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/position"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/source/dblog"
 	"github.com/maltzsama/urutau/internal/source/mysql"
 	"github.com/maltzsama/urutau/internal/source/postgres"
@@ -50,7 +52,7 @@ type Source interface {
 	// introspection, and position queries.
 	OpenQuery(ctx context.Context) (*sql.DB, error)
 	// Introspect resolves one spec table into its ref and Iceberg schema.
-	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (dblog.TableRef, *iceberg.Schema, error)
+	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error)
 	// NewChunker builds the chunk SELECT source for one table.
 	NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error)
 	// NewReader builds the replication reader over the pipeline's tables.
@@ -106,7 +108,7 @@ func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 	return sql.Open("mysql", conn.queryDSN())
 }
 
-func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (dblog.TableRef, *iceberg.Schema, error) {
+func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
 		return dblog.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
@@ -121,11 +123,15 @@ func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (
 			pk = append(pk, st.Columns[idx].Name)
 		}
 	}
-	is, err := mysql.IcebergSchema(st)
+	cs, err := mysql.CanonicalSchema(st)
 	if err != nil {
-		return dblog.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
 	}
-	return dblog.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
+	is, err := icebergsink.FromCanonical(cs)
+	if err != nil {
+		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
 }
 
 func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error) {
@@ -193,7 +199,7 @@ func (a postgresSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 	return sql.Open("pgx", a.spec.Source.URI)
 }
 
-func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (dblog.TableRef, *iceberg.Schema, error) {
+func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
 		return dblog.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
@@ -208,11 +214,15 @@ func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table
 			pk = append(pk, st.Columns[idx].Name)
 		}
 	}
-	is, err := postgres.IcebergSchema(st)
+	cs, err := postgres.CanonicalSchema(st)
 	if err != nil {
-		return dblog.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
 	}
-	return dblog.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
+	is, err := icebergsink.FromCanonical(cs)
+	if err != nil {
+		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
 }
 
 func (a postgresSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (dblog.ChunkSource, error) {
