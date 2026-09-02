@@ -9,7 +9,9 @@ package coordinator
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,6 +95,8 @@ type Coordinator struct {
 	// wireRelay) but are called outside run's select.
 	runCtx context.Context
 
+	runID string // run-id of this boot (assignment + eventlog, §5.6.1)
+
 	ready       chan struct{} // one send per attached session
 	sessionErrs chan error    // first exit wins
 	batchSeq    atomic.Uint64 // monotonic BatchMeta.batch_id
@@ -143,6 +147,7 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.FlowPerWorkerMin = 16 << 20
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
+	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
 	return c.run(ctx)
 }
 
@@ -452,7 +457,10 @@ func (w *wireRelay) AddWindowRows(target string, chunkID uint32, rows []change.C
 func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
 	assign := &pb.Assignment{
 		WorkerName: w.name,
+		Epoch:      uint64(1),
+		RunId:      c.runID,
 		Ticket:     w.ticket,
+		SourceKind: c.cfg.Spec.Source.Kind,
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
@@ -667,4 +675,13 @@ func resumeOrNone(p position.Position) string {
 		return "none"
 	}
 	return p.String()
+}
+
+// randSuffix returns n hex chars of crypto randomness (run-id suffix).
+func randSuffix(n int) string {
+	b := make([]byte, n/2+1)
+	if _, err := rand.Read(b); err != nil {
+		return "000000"
+	}
+	return hex.EncodeToString(b)[:n]
 }

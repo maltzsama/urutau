@@ -94,6 +94,7 @@ message Assignment {
   repeated TableAssignment tables = 5;
   BatchConfig batching    = 6;  // already resolved, including worker override
   string      resume_from = 7;  // min() position this worker resumes from
+  string      source_kind = 8;  // "mysql" | "postgres" — how to parse positions
 }
 
 // ── Acks ─────────────────────────────────────────────────────────────────

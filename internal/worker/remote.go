@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/position"
 	foziceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -144,6 +145,38 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		w.Register(ta.TargetTable, writer)
 	}
 
+	// Report phase + committed positions (design §5.6.1): STREAMING if any
+	// of our tables has a commit, SNAPSHOTTING otherwise. The committed map
+	// also drives the local skip of batches the Iceberg table already
+	// covers — the resume idempotence boundary (failure-analysis case 4).
+	parsePos := parsePosition(assign.SourceKind)
+	committed := make(map[string]position.Position, len(assign.Tables))
+	phase := pb.WorkerPhase_WORKER_PHASE_SNAPSHOTTING
+	for _, ta := range assign.Tables {
+		pos, err := foziceberg.CommittedPosition(ctx, cat, targetIdent(cfg.Namespace, ta.TargetTable))
+		if err != nil {
+			return fmt.Errorf("worker: committed %s: %w", ta.TargetTable, err)
+		}
+		if pos == "" {
+			continue
+		}
+		p, err := parsePos(pos)
+		if err != nil {
+			return fmt.Errorf("worker: committed %s %q: %w", ta.TargetTable, pos, err)
+		}
+		committed[ta.TargetTable] = p
+		phase = pb.WorkerPhase_WORKER_PHASE_STREAMING
+	}
+	if err := sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Hello{Hello: &pb.Hello{
+		WorkerName: cfg.Name,
+		Epoch:      assign.Epoch,
+		Phase:      phase,
+		Committed:  committedStrings(committed),
+	}}}); err != nil {
+		return fmt.Errorf("worker: ready hello: %w", err)
+	}
+	cfg.Logger.Info("worker ready", "phase", phase.String(), "committed", len(committed))
+
 	runErr := make(chan error, 1)
 	ingest := make(chan change.Change, 1024)
 	go func() { runErr <- w.Run(ctx, ingest) }()
@@ -171,6 +204,13 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		return fmt.Errorf("worker: doget: %w", err)
 	}
 
+	recv := &batchReceiver{
+		w:         w,
+		ingest:    ingest,
+		committed: committed,
+		parsePos:  parsePos,
+		log:       cfg.Logger,
+	}
 	for {
 		fd, err := dataStream.Recv()
 		// gRPC wraps ctx cancellation in a status error, so match the code
@@ -182,7 +222,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		if err != nil {
 			return fmt.Errorf("worker: flight recv: %w", err)
 		}
-		if err := applyFlightData(w, ingest, fd); err != nil {
+		if err := recv.apply(fd); err != nil {
 			return err
 		}
 	}
@@ -192,9 +232,35 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	return <-runErr
 }
 
-// applyFlightData routes one decoded batch: snapshot rows build windows,
-// closes markers release them, live rows feed ingest.
-func applyFlightData(w *Worker, ingest chan<- change.Change, fd *flight.FlightData) error {
+// batchReceiver routes decoded Flight batches into the worker core, skipping
+// any batch the Iceberg table already covers (resume idempotence, failure-
+// analysis case 4): a batch whose high position is at or before the
+// committed position was already applied by an earlier run.
+type batchReceiver struct {
+	w         *Worker
+	ingest    chan<- change.Change
+	committed map[string]position.Position // target table → committed
+	parsePos  func(string) (position.Position, error)
+	log       *slog.Logger
+}
+
+// covered reports whether a positioned batch was already committed. Batches
+// without a position (snapshot window rows) are never skipped.
+func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
+	cp, ok := r.committed[meta.Table]
+	if !ok || meta.HighPos == "" {
+		return false
+	}
+	high, err := r.parsePos(meta.HighPos)
+	if err != nil {
+		return false
+	}
+	return high.Compare(cp) <= 0
+}
+
+// apply routes one decoded batch: snapshot rows build windows, closes
+// markers release them, live rows feed ingest.
+func (r *batchReceiver) apply(fd *flight.FlightData) error {
 	reader, err := ipc.NewReader(bytes.NewReader(fd.DataBody))
 	if err != nil {
 		return fmt.Errorf("worker: ipc reader: %w", err)
@@ -213,13 +279,17 @@ func applyFlightData(w *Worker, ingest chan<- change.Change, fd *flight.FlightDa
 	if err != nil {
 		return err
 	}
+	if r.covered(meta) {
+		r.log.Info("worker skip covered batch", "table", meta.Table, "high", meta.HighPos)
+		return nil
+	}
 	switch {
 	case meta.Window != nil && meta.Window.Snapshot:
-		if err := w.AddWindowRows(meta.Table, meta.Window.ChunkId, rows); err != nil {
+		if err := r.w.AddWindowRows(meta.Table, meta.Window.ChunkId, rows); err != nil {
 			return err
 		}
 	case meta.Window != nil && meta.Window.Closes:
-		ingest <- change.Change{
+		r.ingest <- change.Change{
 			Table:    meta.Table,
 			Position: meta.LowPos,
 			Window:   &change.Window{Closes: true, ChunkID: meta.Window.ChunkId},
@@ -231,7 +301,7 @@ func applyFlightData(w *Worker, ingest chan<- change.Change, fd *flight.FlightDa
 		}
 		for i := range rows {
 			rows[i].Window = win
-			ingest <- rows[i]
+			r.ingest <- rows[i]
 		}
 	}
 	return nil
@@ -242,4 +312,21 @@ func targetIdent(namespace, target string) table.Identifier {
 		return table.Identifier{ns, name}
 	}
 	return table.Identifier{namespace, target}
+}
+
+// parsePosition returns the parser for the assignment's source kind.
+func parsePosition(kind string) func(string) (position.Position, error) {
+	if kind == "postgres" {
+		return func(s string) (position.Position, error) { return position.ParseLSN(s) }
+	}
+	return func(s string) (position.Position, error) { return position.ParseGTID(s) }
+}
+
+// committedStrings renders the committed map for the wire Hello.
+func committedStrings(m map[string]position.Position) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v.String()
+	}
+	return out
 }

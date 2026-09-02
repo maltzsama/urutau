@@ -195,6 +195,17 @@ func (w *TableWriter) commitAppend(ctx context.Context, upserts []change.Change,
 	return fmt.Errorf("%w: append commit on %v: %v", ErrCommitExhausted, w.ident, lastErr)
 }
 
+// CommittedPosition reads the committed cdc.position of a table — the
+// table property written atomically with every commit. Empty string means
+// the table has never committed (snapshot needed).
+func CommittedPosition(ctx context.Context, cat *rest.Catalog, ident table.Identifier) (string, error) {
+	tbl, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		return "", fmt.Errorf("iceberg: load %v: %w", ident, err)
+	}
+	return tbl.Properties()["cdc.position"], nil
+}
+
 // EnsureTable creates the table when it does not exist. Schema derivation
 // from source types arrives with the source plugin; callers pass the schema
 // explicitly for now.
