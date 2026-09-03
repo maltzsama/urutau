@@ -59,7 +59,17 @@ func ParseCastTarget(s string) (CastTarget, error) {
 		return CastTarget{}, fmt.Errorf("core: empty cast target")
 	}
 
-	// string(hex) / string(base64)
+	// decimal(p,s)
+	if base, args, ok := strings.Cut(trimmed, "("); ok && strings.HasSuffix(args, ")") && base == "decimal" {
+		args = strings.TrimSuffix(args, ")")
+		p, s, err := parseDecimalArgs(args)
+		if err != nil {
+			return CastTarget{}, err
+		}
+		return CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: p, Scale: s}}, nil
+	}
+
+	// string(hex) / string(base64) / timestamptz(assume_utc)
 	if base, args, ok := strings.Cut(trimmed, "("); ok && strings.HasSuffix(args, ")") {
 		args = strings.TrimSuffix(args, ")")
 		switch {
@@ -70,16 +80,6 @@ func ParseCastTarget(s string) (CastTarget, error) {
 		default:
 			return CastTarget{}, fmt.Errorf("core: unknown cast target %q", s)
 		}
-	}
-
-	// decimal(p,s)
-	if base, args, ok := strings.Cut(trimmed, "("); ok && strings.HasSuffix(args, ")") && base == "decimal" {
-		args = strings.TrimSuffix(args, ")")
-		p, s, err := parseDecimalArgs(args)
-		if err != nil {
-			return CastTarget{}, err
-		}
-		return CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: p, Scale: s}}, nil
 	}
 
 	switch trimmed {
