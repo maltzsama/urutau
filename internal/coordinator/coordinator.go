@@ -249,7 +249,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, is, err := reg.Introspect(ctx, qdb, t)
+		ref, _, is, _, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
 			return err
 		}

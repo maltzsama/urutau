@@ -447,8 +447,9 @@ func (r *Reader) handleDelete(payload []byte) error {
 // only stamped at Commit, when the LSN is known.
 func (r *Reader) enqueue(entry relEntry, op change.Op, after, before map[string]any) {
 	c := change.Change{
-		Op:    op,
-		Table: entry.ref.Target,
+		Op:       op,
+		Table:    entry.ref.Target,
+		IngestTS: time.Now(),
 	}
 	switch op {
 	case change.OpDelete:

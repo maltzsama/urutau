@@ -45,7 +45,7 @@ func TestFromCanonicalRoundTrip(t *testing.T) {
 // sink does not support is an error, not a string fallback.
 func TestUnmappableIsHardError(t *testing.T) {
 	cs := core.Schema{
-		Columns: []core.Column{{Name: "x", Type: core.ColumnType{Kind: core.KindDecimal, Precision: 20, Scale: 2}}},
+		Columns: []core.Column{{Name: "x", Type: core.ColumnType{Kind: core.KindUnknown}}},
 	}
 	if _, err := FromCanonical(cs); err == nil {
 		t.Fatal("unsupported canonical kind did not error")

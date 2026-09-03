@@ -297,6 +297,7 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op change.Op, after, be
 		Op:       op,
 		Table:    ref.Target,
 		Position: pos,
+		IngestTS: time.Now(),
 	}
 
 	key := make([]any, 0, len(ref.PrimaryKey))

@@ -178,6 +178,8 @@ func scanChunk(ctx context.Context, src ChunkSource, ch Chunk, target string, lo
 			Key:      key,
 			After:    row,
 			Position: low.String(),
+			Snapshot: true,
+			IngestTS: time.Now(),
 		})
 		return nil
 	})

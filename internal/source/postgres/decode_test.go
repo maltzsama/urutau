@@ -57,8 +57,8 @@ func TestTupleToMapScalars(t *testing.T) {
 	if row["v"] != "hello world" {
 		t.Errorf("v = %v, want string", row["v"])
 	}
-	if row["amount"] != 1.99 {
-		t.Errorf("amount = %v (%T), want float64(1.99)", row["amount"], row["amount"])
+	if row["amount"] != "1.99" {
+		t.Errorf("amount = %v (%T), want string \"1.99\"", row["amount"], row["amount"])
 	}
 	if row["active"] != true {
 		t.Errorf("active = %v, want true", row["active"])
@@ -78,8 +78,8 @@ func TestTupleToMapNullsAndMoney(t *testing.T) {
 	if v, ok := row["v"]; !ok || v != nil {
 		t.Errorf("v = %v (%T), want nil, present", v, v)
 	}
-	if row["amount"] != 1234.50 {
-		t.Errorf("amount = %v, want 1234.50", row["amount"])
+	if row["amount"] != "1234.50" {
+		t.Errorf("amount = %v (%T), want string \"1234.50\"", row["amount"], row["amount"])
 	}
 	if row["active"] != false {
 		t.Errorf("active = %v, want false", row["active"])

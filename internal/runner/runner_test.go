@@ -50,7 +50,7 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	at := position.MustGTID(runnerTestUUID + ":1-9")
 	committer := &gateCommitter{}
 	w := worker.New(worker.Config{MaxRows: 100, MaxInterval: time.Hour})
-	w.RegisterCommitter("raw.orders", committer)
+	w.RegisterCommitter("raw.orders", committer, change.UpsertMode)
 
 	ingest := make(chan change.Change, 64)
 	done := make(chan error, 1)

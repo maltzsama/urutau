@@ -77,17 +77,42 @@ func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
 }
 
 // mapTypeByName maps a MySQL data_type string to the canal schema.Type
-// constants, so IcebergSchema can reuse the same mapping for both the canal
-// path and the information_schema path.
+// constants, so the canonical mapping reuses the same classification as the
+// canal runtime path (schema.Table.AddColumn).
 func mapTypeByName(dataType string) int {
-	switch strings.ToLower(dataType) {
-	case "bigint", "int", "smallint", "tinyint", "mediumint", "year":
-		return schema.TYPE_NUMBER
-	case "double", "float", "decimal", "numeric", "real":
+	t := strings.ToLower(dataType)
+	switch {
+	case strings.HasPrefix(t, "float"), strings.HasPrefix(t, "double"):
 		return schema.TYPE_FLOAT
-	case "char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum", "set", "json":
-		return schema.TYPE_STRING
+	case strings.HasPrefix(t, "decimal"), t == "numeric", t == "real":
+		return schema.TYPE_DECIMAL
+	case strings.HasPrefix(t, "enum"):
+		return schema.TYPE_ENUM
+	case strings.HasPrefix(t, "set"):
+		return schema.TYPE_SET
+	case strings.HasPrefix(t, "binary"), strings.HasPrefix(t, "varbinary"):
+		return schema.TYPE_BINARY
+	case strings.HasPrefix(t, "datetime"):
+		return schema.TYPE_DATETIME
+	case strings.HasPrefix(t, "timestamp"):
+		return schema.TYPE_TIMESTAMP
+	case strings.HasPrefix(t, "time"):
+		return schema.TYPE_TIME
+	case t == "date":
+		return schema.TYPE_DATE
+	case strings.HasPrefix(t, "bit"):
+		return schema.TYPE_BIT
+	case strings.HasPrefix(t, "json"):
+		return schema.TYPE_JSON
+	case strings.HasPrefix(t, "mediumint"):
+		return schema.TYPE_MEDIUM_INT
+	case strings.HasPrefix(t, "int"), strings.HasPrefix(t, "smallint"),
+		strings.HasPrefix(t, "tinyint"), strings.HasPrefix(t, "bigint"),
+		strings.HasPrefix(t, "year"):
+		return schema.TYPE_NUMBER
 	default:
-		return 0 // schema.TYPE_NUMBER = iota + 1, so 0 marks unknown
+		// char, varchar, text, blob and everything else — the canal maps
+		// the residual to TYPE_STRING.
+		return schema.TYPE_STRING
 	}
 }

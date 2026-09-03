@@ -17,7 +17,7 @@ import (
 func TestWindowSnapshotSingleBatch(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	w.RegisterCommitter("raw.orders", fc)
+	w.RegisterCommitter("raw.orders", fc, change.UpsertMode)
 
 	// chunk rows: id=1 v=a (stale), id=2 v=x (stable), id=3 v=y (stable)
 	snap := []change.Change{
@@ -74,7 +74,7 @@ func TestWindowSnapshotSingleBatch(t *testing.T) {
 func TestWindowLiveDeleteWins(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	w.RegisterCommitter("t", fc)
+	w.RegisterCommitter("t", fc, change.UpsertMode)
 
 	_ = w.AddWindowRows("t", 1, []change.Change{
 		{Op: change.OpInsert, Table: "t", Key: []any{int64(9)}, After: map[string]any{"id": int64(9), "v": "s"}, Position: "p0"},
@@ -113,7 +113,7 @@ func TestWindowLiveDeleteWins(t *testing.T) {
 func TestWindowNoEventsClosesEmitsAll(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	w.RegisterCommitter("t", fc)
+	w.RegisterCommitter("t", fc, change.UpsertMode)
 
 	_ = w.AddWindowRows("t", 1, []change.Change{
 		{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: "p0"},

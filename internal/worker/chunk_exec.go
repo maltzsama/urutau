@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/maltzsama/urutau/internal/adapter"
 	"github.com/maltzsama/urutau/internal/change"
@@ -99,10 +100,12 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 			key = append(key, row[col])
 		}
 		rows = append(rows, change.Change{
-			Op:    change.OpInsert,
-			Table: ta.TargetTable,
-			Key:   key,
-			After: row,
+			Op:       change.OpInsert,
+			Table:    ta.TargetTable,
+			Key:      key,
+			After:    row,
+			Snapshot: true,
+			IngestTS: time.Now(),
 		})
 		return nil
 	})

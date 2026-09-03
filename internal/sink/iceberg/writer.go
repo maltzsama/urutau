@@ -2,8 +2,10 @@ package iceberg
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -15,6 +17,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 )
 
 // ErrCommitExhausted marks a terminal commit failure: retries against the
@@ -36,19 +39,24 @@ var ErrCommitExhausted = errors.New("iceberg: commit retries exhausted")
 // caller (the worker dedicates one committer goroutine per table, which is
 // the design's serialization invariant).
 type TableWriter struct {
-	cat        *rest.Catalog
-	ident      table.Identifier
-	eqIDs      []int
-	dataSchema *arrow.Schema
-	delSchema  *arrow.Schema
-	delCols    []string
-	maxTries   int
-	backoff    time.Duration
+	cat         *rest.Catalog
+	ident       table.Identifier
+	eqIDs       []int
+	dataSchema  *arrow.Schema
+	delSchema   *arrow.Schema
+	delCols     []string
+	maxTries    int
+	backoff     time.Duration
+	cast        core.CastPolicy
+	metaByName  map[string]core.MetadataColumn
+	sourceTable string
 }
 
 // NewTableWriter loads the table, resolves the equality-delete key (the
 // primary key) and precomputes the arrow schemas for data and delete rows.
-func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifier, primaryKey []string) (*TableWriter, error) {
+// The cast policy is applied to source column values during projection; the
+// metadata columns are projected from the change header.
+func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifier, primaryKey []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string) (*TableWriter, error) {
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return nil, fmt.Errorf("iceberg: load %v: %w", ident, err)
@@ -77,15 +85,23 @@ func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifi
 		return nil, fmt.Errorf("iceberg: delete schema: %w", err)
 	}
 
+	metaByName := make(map[string]core.MetadataColumn, len(meta))
+	for _, m := range meta {
+		metaByName[m.As] = m
+	}
+
 	return &TableWriter{
-		cat:        cat,
-		ident:      ident,
-		eqIDs:      eqIDs,
-		dataSchema: dataSchema,
-		delSchema:  delSchema,
-		delCols:    primaryKey,
-		maxTries:   5,
-		backoff:    200 * time.Millisecond,
+		cat:         cat,
+		ident:       ident,
+		eqIDs:       eqIDs,
+		dataSchema:  dataSchema,
+		delSchema:   delSchema,
+		delCols:     primaryKey,
+		maxTries:    5,
+		backoff:     200 * time.Millisecond,
+		cast:        cast,
+		metaByName:  metaByName,
+		sourceTable: sourceTable,
 	}, nil
 }
 
@@ -99,11 +115,14 @@ func (w *TableWriter) Close() error { return nil }
 // two appends the surviving rows. Only then is the position considered
 // advanced. Implements sink.TableWriter; INVARIANT 2 (position last) is
 // honoured by writing the position only on the final commit of the batch.
+// In append mode the equality delete is skipped: every change becomes a row.
 func (w *TableWriter) Commit(ctx context.Context, b change.Batch) error {
-	keys := append(collectKeys(b.Upserts), collectKeys(b.Deletes)...)
-	if len(keys) > 0 {
-		if err := w.commitDeletes(ctx, keys, b.Position); err != nil {
-			return err
+	if b.Mode == change.UpsertMode {
+		keys := append(collectKeys(b.Upserts), collectKeys(b.Deletes)...)
+		if len(keys) > 0 {
+			if err := w.commitDeletes(ctx, keys, b.Position); err != nil {
+				return err
+			}
 		}
 	}
 	if len(b.Upserts) > 0 {
@@ -304,12 +323,11 @@ func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, er
 	for i, field := range w.dataSchema.Fields() {
 		values := make([]any, len(upserts))
 		for j, c := range upserts {
-			v, ok := c.After[field.Name]
-			if !ok {
-				values[j] = nil
-				continue
+			proj, err := w.project(c)
+			if err != nil {
+				return nil, err
 			}
-			values[j] = v
+			values[j] = proj[field.Name]
 		}
 		if err := appendColumn(b.Field(i), field.Name, values); err != nil {
 			return nil, err
@@ -318,11 +336,71 @@ func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, er
 	return b.NewRecordBatch(), nil
 }
 
+// project resolves a change's source columns (applying casts) and metadata
+// columns into a flat map matching the dataSchema field names.
+func (w *TableWriter) project(c change.Change) (map[string]any, error) {
+	out := make(map[string]any, len(w.dataSchema.Fields()))
+	for _, f := range w.dataSchema.Fields() {
+		if m, ok := w.metaByName[f.Name]; ok {
+			v, err := metaValue(m.From, c, w.sourceTable)
+			if err != nil {
+				return nil, fmt.Errorf("iceberg: metadata %q: %w", f.Name, err)
+			}
+			out[f.Name] = v
+			continue
+		}
+		v, ok := c.After[f.Name]
+		if !ok {
+			out[f.Name] = nil
+			continue
+		}
+		if ct, ok := w.cast.Target(f.Name); ok {
+			cv, err := ct.Convert(v)
+			if err != nil {
+				return nil, fmt.Errorf("iceberg: column %q: %w", f.Name, err)
+			}
+			v = cv
+		}
+		out[f.Name] = v
+	}
+	return out, nil
+}
+
+// metaValue resolves one metadata key to its concrete value for a change.
+func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, error) {
+	switch key {
+	case core.MetaOp:
+		return c.Op.String(), nil
+	case core.MetaCommitTS:
+		if c.CommitTS.IsZero() {
+			return nil, nil
+		}
+		return c.CommitTS, nil
+	case core.MetaIngestTS:
+		return c.IngestTS, nil
+	case core.MetaPosition:
+		if c.Position == "" {
+			return nil, nil
+		}
+		return c.Position, nil
+	case core.MetaSourceTable:
+		return sourceTable, nil
+	case core.MetaPhase:
+		if c.Snapshot {
+			return "snapshot", nil
+		}
+		return "stream", nil
+	default:
+		return nil, fmt.Errorf("unknown metadata key %q", key)
+	}
+}
+
 // appendColumn appends values into a builder, tolerating a small, explicit
 // set of scalar types. Numeric coercion is schema-directed, not silent: the
 // Iceberg column type is authoritative, and JSON-based wire formats cannot
 // distinguish whole floats from ints, so int64 may arrive for a double
-// column and vice versa.
+// column and vice versa. Temporal, decimal, uuid and json values arrive as
+// their canonical text and are parsed at the column boundary.
 func appendColumn(builder array.Builder, name string, values []any) error {
 	switch b := builder.(type) {
 	case *array.Int64Builder:
@@ -343,6 +421,41 @@ func appendColumn(builder array.Builder, name string, values []any) error {
 				b.Append(int64(t))
 			default:
 				return fmt.Errorf("iceberg: column %q: cannot append %T as int64", name, v)
+			}
+		}
+	case *array.Int32Builder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case int32:
+				b.Append(t)
+			case int:
+				b.Append(int32(t))
+			case int64:
+				b.Append(int32(t))
+			case float64:
+				if t != float64(int64(t)) {
+					return fmt.Errorf("iceberg: column %q: cannot append %v as int32", name, v)
+				}
+				b.Append(int32(t))
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as int32", name, v)
+			}
+		}
+	case *array.Float32Builder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case float32:
+				b.Append(t)
+			case float64:
+				b.Append(float32(t))
+			case int64:
+				b.Append(float32(t))
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as float32", name, v)
 			}
 		}
 	case *array.StringBuilder:
@@ -386,8 +499,148 @@ func appendColumn(builder array.Builder, name string, values []any) error {
 				return fmt.Errorf("iceberg: column %q: cannot append %T as boolean", name, v)
 			}
 		}
+	case *array.Decimal128Builder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case string:
+				if err := b.AppendValueFromString(t); err != nil {
+					return fmt.Errorf("iceberg: column %q: %w", name, err)
+				}
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as decimal", name, v)
+			}
+		}
+	case *array.Date32Builder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case string:
+				days, err := dateToDays(t)
+				if err != nil {
+					return fmt.Errorf("iceberg: column %q: %w", name, err)
+				}
+				b.Append(arrow.Date32(days))
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as date", name, v)
+			}
+		}
+	case *array.Time64Builder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case string:
+				micros, err := timeToMicros(t)
+				if err != nil {
+					return fmt.Errorf("iceberg: column %q: %w", name, err)
+				}
+				b.Append(arrow.Time64(micros))
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as time", name, v)
+			}
+		}
+	case *array.TimestampBuilder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case time.Time:
+				b.AppendTime(t)
+			case string:
+				tm, err := parseTimestampText(t)
+				if err != nil {
+					return fmt.Errorf("iceberg: column %q: %w", name, err)
+				}
+				b.AppendTime(tm)
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as timestamp", name, v)
+			}
+		}
+	case *array.FixedSizeBinaryBuilder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case string:
+				raw, err := uuidToBytes(t)
+				if err != nil {
+					return fmt.Errorf("iceberg: column %q: %w", name, err)
+				}
+				b.Append(raw)
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as uuid", name, v)
+			}
+		}
+	case *array.BinaryBuilder:
+		for _, v := range values {
+			switch t := v.(type) {
+			case nil:
+				b.AppendNull()
+			case []byte:
+				b.Append(t)
+			default:
+				return fmt.Errorf("iceberg: column %q: cannot append %T as binary", name, v)
+			}
+		}
 	default:
 		return fmt.Errorf("iceberg: column %q: unsupported builder %T", name, builder)
 	}
 	return nil
+}
+
+// ── canonical text → arrow value parsing ─────────────────────────────
+
+// dateToDays parses a "2006-01-02" date into days since the epoch.
+func dateToDays(s string) (int32, error) {
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return 0, fmt.Errorf("date %q: %w", s, err)
+	}
+	return int32(t.Unix() / 86400), nil
+}
+
+var timeLayouts = []string{"15:04:05.999999999", "15:04:05.999999", "15:04:05"}
+
+// timeToMicros parses a time-of-day text into microseconds since midnight.
+func timeToMicros(s string) (int64, error) {
+	for _, layout := range timeLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return int64(t.Hour())*3600_000_000 + int64(t.Minute())*60_000_000 +
+				int64(t.Second())*1_000_000 + int64(t.Nanosecond())/1000, nil
+		}
+	}
+	return 0, fmt.Errorf("time %q: not a valid time of day", s)
+}
+
+var tsLayouts = []string{
+	"2006-01-02 15:04:05.999999999",
+	"2006-01-02 15:04:05.999999",
+	"2006-01-02 15:04:05",
+}
+
+// parseTimestampText parses a naive or RFC3339 timestamp. Naive values are
+// anchored at UTC so the wall clock survives round-tripping.
+func parseTimestampText(s string) (time.Time, error) {
+	for _, layout := range tsLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("timestamp %q: not a valid timestamp", s)
+}
+
+// uuidToBytes parses a hyphenated uuid text into its 16 raw bytes.
+func uuidToBytes(s string) ([]byte, error) {
+	compact := strings.ReplaceAll(strings.ToLower(s), "-", "")
+	raw, err := hex.DecodeString(compact)
+	if err != nil || len(raw) != 16 {
+		return nil, fmt.Errorf("uuid %q: not a valid uuid", s)
+	}
+	return raw, nil
 }

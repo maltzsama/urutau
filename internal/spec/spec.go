@@ -4,6 +4,10 @@
 // change.
 package spec
 
+import (
+	"github.com/maltzsama/urutau/internal/core"
+)
+
 // WriteMode selects how a table is written: upsert reflects state through
 // the primary key; append emits every change as a new row.
 
@@ -44,13 +48,20 @@ type Defaults struct {
 }
 
 type Table struct {
-	Source            string    `json:"source"`
-	Target            string    `json:"target"`
-	PrimaryKey        []string  `json:"primaryKey,omitempty"`
-	PartitionBy       []string  `json:"partitionBy,omitempty"`
-	Filter            *Filter   `json:"filter,omitempty"`
-	WriteMode         WriteMode `json:"writeMode,omitempty"`
-	Worker            string    `json:"worker,omitempty"`
-	CreateIfNotExists bool      `json:"createIfNotExists,omitempty"`
-	FilterImmutable   bool      `json:"filterImmutable,omitempty"`
+	Source            string                `json:"source"`
+	Target            string                `json:"target"`
+	PrimaryKey        []string              `json:"primaryKey,omitempty"`
+	PartitionBy       []string              `json:"partitionBy,omitempty"`
+	Filter            *Filter               `json:"filter,omitempty"`
+	WriteMode         WriteMode             `json:"writeMode,omitempty"`
+	Worker            string                `json:"worker,omitempty"`
+	CreateIfNotExists bool                  `json:"createIfNotExists,omitempty"`
+	FilterImmutable   bool                  `json:"filterImmutable,omitempty"`
+	// Metadata lands pipeline metadata columns (op, commit_ts, position, …)
+	// in the target table. The destination name is explicit via As.
+	Metadata []core.MetadataColumn `json:"metadata,omitempty"`
+	// Cast overrides one source column's canonical type. Key is the source
+	// column name; value is the textual canonical target (e.g. "string",
+	// "decimal(20,4)", "timestamptz(assume_utc)").
+	Cast map[string]string `json:"cast,omitempty"`
 }

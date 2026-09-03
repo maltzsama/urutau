@@ -269,20 +269,26 @@ func resumeFrom(ctx context.Context, reg *drivers.Registry, cat *rest.Catalog, s
 }
 
 // introspectAll resolves each spec table through the registry, so the
-// pipeline knows the PK (equality key) and the target shape before writing
-// anything.
-func introspectAll(ctx context.Context, reg *drivers.Registry, qdb *sql.DB, s *spec.Spec) ([]core.TableRef, map[string]*iceberg.Schema, error) {
+// pipeline knows the PK (equality key) and the resolved target shape before
+// writing anything. The canonical schema carries the declared cast and
+// metadata columns; the Iceberg schema is derived from it.
+func introspectAll(ctx context.Context, reg *drivers.Registry, qdb *sql.DB, s *spec.Spec, logger *slog.Logger) ([]core.TableRef, map[string]*iceberg.Schema, map[string]core.Schema, error) {
 	refs := make([]core.TableRef, 0, len(s.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(s.Tables))
+	canonical := make(map[string]core.Schema, len(s.Tables))
 	for _, t := range s.Tables {
-		ref, is, err := reg.Introspect(ctx, qdb, t)
+		ref, cs, is, warns, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
+		}
+		for _, w := range warns {
+			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
 		}
 		refs = append(refs, ref)
 		schemas[t.Source] = is
+		canonical[t.Source] = cs
 	}
-	return refs, schemas, nil
+	return refs, schemas, canonical, nil
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
@@ -367,7 +373,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	}
 
 	// Resolve source tables and their Iceberg schemas.
-	refs, schemas, err := introspectAll(ctx, reg, qdb, s)
+	refs, schemas, _, err := introspectAll(ctx, reg, qdb, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -381,13 +387,23 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		return nil, err
 	}
 
+	// Lookup spec tables by source and target for plan parameters.
+	specBySource := make(map[string]spec.Table, len(s.Tables))
+	specByTarget := make(map[string]spec.Table, len(s.Tables))
+	for _, t := range s.Tables {
+		specBySource[t.Source] = t
+		specByTarget[t.Target] = t
+	}
+
 	writers := make(map[string]sink.TableWriter, len(refs))
 	for _, ref := range refs {
 		ident := drivers.TargetIdent(s, ref.Target)
 		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source]); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
-		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey)
+		t := specBySource[ref.Source]
+		cast, _ := core.ParseCastPolicy(t.Cast)
+		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey, cast, t.Metadata, t.Source)
 		if err != nil {
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
 		}
@@ -398,7 +414,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	ingest := make(chan change.Change, 1024)
 	w := worker.New(worker.Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
 	for target, wr := range writers {
-		w.Register(target, wr)
+		mode := change.UpsertMode
+		if specByTarget[target].WriteMode == spec.WriteModeAppend {
+			mode = change.AppendMode
+		}
+		w.Register(target, wr, mode)
 	}
 	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() }}
 	w.OnCommit(func(b change.Batch, rows int) {

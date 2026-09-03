@@ -64,10 +64,11 @@ func OpenQueryDB(kind, uri string) (*sql.DB, error) {
 	return adapter.OpenQueryDB(kind, uri)
 }
 
-// Introspect resolves one spec table into its ref and Iceberg schema.
-func (r *Registry) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
-	ref, is, err := r.adapt.Introspect(ctx, db, t)
-	return core.TableRef(ref), is, err
+// Introspect resolves one spec table into its ref, the resolved canonical
+// schema (cast + metadata applied), the final Iceberg schema, and the
+// advisory warnings.
+func (r *Registry) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error) {
+	return r.adapt.Introspect(ctx, db, t)
 }
 
 // ParsePosition decodes a stored cdc.position string.
@@ -119,9 +120,11 @@ func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier,
 	return icebergsink.EnsureTable(ctx, cat, ident, schema)
 }
 
-// NewTableWriter opens the per-table Iceberg writer.
-func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifier, pk []string) (*icebergsink.TableWriter, error) {
-	return icebergsink.NewTableWriter(ctx, cat, ident, pk)
+// NewTableWriter opens the per-table Iceberg writer with its cast and
+// metadata plan. Casts are applied to source column values; metadata columns
+// are projected from the change header.
+func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifier, pk []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string) (*icebergsink.TableWriter, error) {
+	return icebergsink.NewTableWriter(ctx, cat, ident, pk, cast, meta, sourceTable)
 }
 
 // CommittedPosition reads the committed cdc.position (with walk-back).

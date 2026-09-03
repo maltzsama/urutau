@@ -50,8 +50,11 @@ type Source interface {
 	// OpenQuery opens the SQL connection for chunk SELECTs, schema
 	// introspection, and position queries.
 	OpenQuery(ctx context.Context) (*sql.DB, error)
-	// Introspect resolves one spec table into its ref and Iceberg schema.
-	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error)
+	// Introspect resolves one spec table into its ref, the canonical schema
+	// with the declared cast and metadata columns applied, and the final
+	// Iceberg schema built from it. The warnings carry the advisory cast
+	// outcomes.
+	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error)
 	// NewChunker builds the chunk SELECT source for one table.
 	NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error)
 	// NewReader builds the replication reader over the pipeline's tables.
@@ -107,14 +110,14 @@ func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 	return sql.Open("mysql", conn.QueryDSN())
 }
 
-func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
+func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
-		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
+		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
 	}
 	st, err := mysql.QueryTable(ctx, db, schemaName, tableName)
 	if err != nil {
-		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
+		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
 	}
 	pk := t.PrimaryKey
 	if len(pk) == 0 && len(st.PKColumns) > 0 {
@@ -124,13 +127,21 @@ func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (
 	}
 	cs, err := mysql.CanonicalSchema(st)
 	if err != nil {
-		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
 	}
-	is, err := icebergsink.FromCanonical(cs)
+	cast, err := core.ParseCastPolicy(t.Cast)
 	if err != nil {
-		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
 	}
-	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
+	resolved, warns, err := core.ResolveSchema(cs, cast, t.Metadata)
+	if err != nil {
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	is, err := icebergsink.FromCanonical(resolved)
+	if err != nil {
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, is, warns, nil
 }
 
 func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {
@@ -198,14 +209,14 @@ func (a postgresSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 	return sql.Open("pgx", a.spec.Source.URI)
 }
 
-func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, *iceberg.Schema, error) {
+func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
-		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
+		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: source %q must be db.table", t.Source)
 	}
 	st, err := postgres.QueryTable(ctx, db, schemaName, tableName)
 	if err != nil {
-		return snapshot.TableRef{}, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
+		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: introspect %s: %w", t.Source, err)
 	}
 	pk := t.PrimaryKey
 	if len(pk) == 0 && len(st.PKColumns) > 0 {
@@ -215,13 +226,21 @@ func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table
 	}
 	cs, err := postgres.CanonicalSchema(st)
 	if err != nil {
-		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
 	}
-	is, err := icebergsink.FromCanonical(cs)
+	cast, err := core.ParseCastPolicy(t.Cast)
 	if err != nil {
-		return core.TableRef{}, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
 	}
-	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, is, nil
+	resolved, warns, err := core.ResolveSchema(cs, cast, t.Metadata)
+	if err != nil {
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	is, err := icebergsink.FromCanonical(resolved)
+	if err != nil {
+		return core.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("adapter: schema %s: %w", t.Source, err)
+	}
+	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, is, warns, nil
 }
 
 func (a postgresSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {

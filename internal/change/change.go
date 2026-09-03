@@ -38,6 +38,12 @@ type Change struct {
 	Before   map[string]any
 	Position string
 	CommitTS time.Time
+	// IngestTS is when the pipeline processed the event. The difference
+	// between CommitTS and IngestTS is the per-row replication lag.
+	IngestTS time.Time
+	// Snapshot marks rows read by a DBLog chunk SELECT (true) versus live
+	// stream events (false). It drives the "phase" metadata column.
+	Snapshot bool
 	// Window tags the change as part of a DBLog snapshot window. Nil for
 	// plain stream events.
 	Window *Window
@@ -81,6 +87,17 @@ func (c Collapsed) Keys() [][]any {
 	return keys
 }
 
+// WriteMode controls how the worker and writer handle a batch.
+type WriteMode uint8
+
+const (
+	// UpsertMode collapses batches per-key and applies equality deletes.
+	UpsertMode WriteMode = iota
+	// AppendMode passes every change through without collapse. Deletes are
+	// emitted as upserts with op='delete' so the row carries the operation.
+	AppendMode
+)
+
 // Batch is the unit handed to a committer: the collapsed changes of one
 // table plus the source position reached when the batch closed.
 type Batch struct {
@@ -88,4 +105,5 @@ type Batch struct {
 	Upserts  []Change
 	Deletes  []Change
 	Position string
+	Mode     WriteMode
 }

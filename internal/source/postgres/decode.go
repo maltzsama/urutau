@@ -81,11 +81,13 @@ func decodeScalar(dataType string, data []byte) (any, error) {
 			return nil, err
 		}
 		return v, nil
-	case "numeric", "money":
-		// Money renders as "$1,234.56"; strip the decorations. Numeric
-		// NaN parses as float NaN via ParseFloat.
-		clean := strings.NewReplacer("$", "", ",", "", " ", "").Replace(s)
-		v, err := strconv.ParseFloat(clean, 64)
+	case "numeric":
+		// Decimal lands as its text form (the canonical value for
+		// KindDecimal); the sink parses it at the column boundary.
+		return cleanNumeric(s), nil
+	case "money":
+		// Money renders as "$1,234.56"; strip the decorations.
+		v, err := strconv.ParseFloat(cleanNumeric(s), 64)
 		if err != nil {
 			return nil, err
 		}
@@ -105,4 +107,9 @@ func decodeScalar(dataType string, data []byte) (any, error) {
 		// to String.
 		return s, nil
 	}
+}
+
+// cleanNumeric strips the money decorations from a numeric text.
+func cleanNumeric(s string) string {
+	return strings.NewReplacer("$", "", ",", "", " ", "").Replace(s)
 }
