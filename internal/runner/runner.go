@@ -469,26 +469,30 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	streamErr := make(chan error, 1)
 	go func() { streamErr <- rdr.Start(ctx, start) }()
 
-	// Snapshot phase: DBLog for tables with no committed position.
-	for _, ref := range needsSnapshot {
-		log.Info("snapshot", "table", ref.Source)
-		r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
-		chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
-		if err != nil {
-			rdr.Close()
-			_ = qdb.Close()
-			return nil, err
+	// Snapshot phase: DBLog for tables with no committed position. Skip
+	// when the source does not support snapshot (e.g. Kafka).
+	caps := reg.Caps()
+	if caps.Snapshot {
+		for _, ref := range needsSnapshot {
+			log.Info("snapshot", "table", ref.Source)
+			r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
+			chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
+			if err != nil {
+				rdr.Close()
+				_ = qdb.Close()
+				return nil, err
+			}
+			if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
+				WindowTimeout: cfg.WindowTimeout,
+				CaughtUpPoll:  cfg.CaughtUpPoll,
+			}); err != nil {
+				rdr.Close()
+				_ = qdb.Close()
+				return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
+			}
+			log.Info("snapshot done", "table", ref.Source)
+			r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
 		}
-		if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
-			WindowTimeout: cfg.WindowTimeout,
-			CaughtUpPoll:  cfg.CaughtUpPoll,
-		}); err != nil {
-			rdr.Close()
-			_ = qdb.Close()
-			return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
-		}
-		log.Info("snapshot done", "table", ref.Source)
-		r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
 	}
 
 	r.streamErr = streamErr
