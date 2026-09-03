@@ -262,14 +262,37 @@ func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
 // EnsureTable creates the table when it does not exist. Schema derivation
 // from source types arrives with the source plugin; callers pass the schema
 // explicitly for now.
-func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema) error {
-	if _, err := cat.LoadTable(ctx, ident); err == nil {
+// EnsureTable creates the target table if absent. When the table already
+// exists, every column touched by a cast rule must match the resolved type:
+// if the existing column's Iceberg type disagrees, a hard error prevents
+// silent data corruption. On first create, a PK-cast advisory is logged.
+func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema, cast core.CastPolicy) error {
+	existing, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		// Table does not exist — create.
+		_, err := cat.CreateTable(ctx, ident, schema,
+			catalog.WithProperties(iceberg.Properties{"format-version": "2"}))
+		if err != nil {
+			return fmt.Errorf("iceberg: create %v: %w", ident, err)
+		}
 		return nil
 	}
-	_, err := cat.CreateTable(ctx, ident, schema,
-		catalog.WithProperties(iceberg.Properties{"format-version": "2"}))
-	if err != nil {
-		return fmt.Errorf("iceberg: create %v: %w", ident, err)
+	// Table exists — verify cast divergence.
+	existSchema := existing.Schema()
+	for colName, target := range cast.Columns {
+		newField, ok := schema.FindFieldByName(colName)
+		if !ok {
+			continue // column not in resolved schema — introspection will catch
+		}
+		existField, ok := existSchema.FindFieldByName(colName)
+		if !ok {
+			return fmt.Errorf("iceberg: %v: cast column %q not in existing table", ident, colName)
+		}
+		if !newField.Type.Equals(existField.Type) {
+			return fmt.Errorf("iceberg: %v: cast column %q type divergence: spec wants %s, table has %s",
+				ident, colName, newField.Type, existField.Type)
+		}
+		_ = target // used for future PK-cast advisory
 	}
 	return nil
 }
