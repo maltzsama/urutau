@@ -68,12 +68,18 @@ type Reader struct {
 	// commit LSN is known, so they accumulate and flush at Commit.
 	txn []*change.Change
 
+	// curLSN is the current transaction's final (commit) LSN, from the Begin
+	// message. The DBLog window uses it to tag only transactions committed
+	// after the low watermark. Loop-goroutine only, like txn.
+	curLSN position.LSN
+
 	mu     sync.Mutex
 	synced *position.LSN // end LSN of the last committed transaction
 
 	winMu    sync.Mutex
 	winChunk uint32
 	winOpen  bool
+	winLow   *position.LSN // source watermark (pg_current_wal_lsn) at OpenWindow
 
 	// loopCancel stops the replication loop; loopDone tells Close it has
 	// fully left pgx.
@@ -134,21 +140,37 @@ func New(ctx context.Context, cfg Config, out chan<- change.Change) (*Reader, er
 	}, nil
 }
 
-// MarkWindow opens the DBLog window for chunkID: every row event decoded
-// from now on is tagged InWindow for that chunk, until ClearWindow. The
-// tag is applied synchronously at decode — no event can escape the window
-// by racing a channel pull.
-func (r *Reader) MarkWindow(chunkID uint32) {
+// OpenWindow opens the DBLog window for chunkID. The reader captures its
+// source watermark — the server's current WAL position — and, from now on,
+// tags decoded events whose commit LSN is strictly past that watermark
+// InWindow for the chunk, until ClearWindow. Transactions at or before the
+// watermark are already reflected in the chunk SELECT (or an earlier chunk)
+// and must not be tagged. The tag is applied synchronously at decode — no
+// event can escape the window by racing a channel pull. The watermark is an
+// LSN (64-bit, monotonic), never the 32-bit transaction xid — the pgoutput
+// Begin message only carries the raw xid, which wraps every ~4 billion
+// transactions; the LSN does not.
+func (r *Reader) OpenWindow(ctx context.Context, chunkID uint32) {
+	var low *position.LSN
+	if m, err := r.Master(ctx); err == nil {
+		if lsn, ok := m.(*position.LSN); ok {
+			low = lsn
+		}
+	} else {
+		r.cfg.Logger.Warn("postgres: window open without lsn watermark", "err", err)
+	}
 	r.winMu.Lock()
 	r.winOpen = true
 	r.winChunk = chunkID
+	r.winLow = low
 	r.winMu.Unlock()
 }
 
-// ClearWindow closes the DBLog window opened by MarkWindow.
+// ClearWindow closes the DBLog window opened by OpenWindow.
 func (r *Reader) ClearWindow() {
 	r.winMu.Lock()
 	r.winOpen = false
+	r.winLow = nil
 	r.winMu.Unlock()
 }
 
@@ -161,9 +183,9 @@ func (r *Reader) Synced() position.Position {
 
 // Master reports the server's current WAL write position (the caught-up
 // target for the DBLog window).
-func (r *Reader) Master() (position.Position, error) {
+func (r *Reader) Master(ctx context.Context) (position.Position, error) {
 	var raw string
-	if err := r.db.QueryRowContext(context.Background(),
+	if err := r.db.QueryRowContext(ctx,
 		`SELECT pg_current_wal_lsn()::text`).Scan(&raw); err != nil {
 		return nil, fmt.Errorf("postgres: current wal lsn: %w", err)
 	}
@@ -303,7 +325,12 @@ func (r *Reader) handleXLogData(ctx context.Context, xld pglogrepl.XLogData) err
 	body := payload[1:]
 	switch payload[0] {
 	case msgBegin:
+		begin := &pglogrepl.BeginMessage{}
+		if err := begin.Decode(body); err != nil {
+			return fmt.Errorf("postgres: begin: %w", err)
+		}
 		r.txn = r.txn[:0]
+		r.curLSN = position.LSN(begin.FinalLSN)
 	case msgRelation:
 		if err := r.handleRelation(body); err != nil {
 			return err
@@ -492,6 +519,15 @@ func (r *Reader) currentWindow() *change.Window {
 	r.winMu.Lock()
 	defer r.winMu.Unlock()
 	if !r.winOpen {
+		return nil
+	}
+	// Only transactions committed past the low watermark's LSN are
+	// InWindow: an older transaction is already reflected in the chunk
+	// SELECT (or an earlier chunk), so tagging it would resurrect a stale
+	// value. A missing watermark falls back to tagging everything —
+	// over-tagging is safe. The comparison is on the 64-bit commit LSN
+	// (from the Begin message), not the 32-bit xid that wraps.
+	if r.winLow != nil && r.curLSN <= *r.winLow {
 		return nil
 	}
 	return &change.Window{ChunkID: r.winChunk, InWindow: true}

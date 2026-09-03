@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -62,15 +63,32 @@ func Run(ctx context.Context, s *spec.Spec, cfg Config) error {
 // relay pumps reader events into the worker's ingest channel and releases
 // the DBLog chunk markers. Window tagging happens in the reader at decode
 // time; the marker's Release first drains the pump, so every event decoded
-// inside the window is already enqueued ahead of it.
+// inside the window is already enqueued ahead of it. The gate mirrors the
+// coordinator's pump gate: while a chunk SELECT is in flight the table's
+// live events are buffered and released InWindow-tagged only after
+// AddWindowRows populates the worker window — the ordering the window proof
+// needs (a live event must never deduplicate against an empty window).
 type relay struct {
 	ingest   chan<- change.Change
 	window   *worker.Worker
 	flushReq chan chan struct{}
+
+	gateMu       sync.Mutex
+	gateOn       bool
+	gateTgt      string
+	gateChk      uint32
+	gateBuf      []change.Change
+	flushGate    bool
+	gateFlushReq chan chan struct{}
 }
 
 func newRelay(ingest chan<- change.Change, window *worker.Worker) *relay {
-	return &relay{ingest: ingest, window: window, flushReq: make(chan chan struct{}, 1)}
+	return &relay{
+		ingest:       ingest,
+		window:       window,
+		flushReq:     make(chan chan struct{}, 1),
+		gateFlushReq: make(chan chan struct{}, 1),
+	}
 }
 
 func (r *relay) Release(table string, chunkID uint32, at position.Position) {
@@ -88,13 +106,98 @@ func (r *relay) AddWindowRows(target string, chunkID uint32, rows []change.Chang
 	return r.window.AddWindowRows(target, chunkID, rows)
 }
 
+// GateOn starts buffering the table's live events for a chunk SELECT in
+// flight. Called by the orchestrator before the SELECT.
+func (r *relay) GateOn(table string, chunkID uint32) {
+	r.gateMu.Lock()
+	r.gateOn = true
+	r.gateTgt = table
+	r.gateChk = chunkID
+	r.gateMu.Unlock()
+}
+
+// GateFlush releases the buffered events InWindow-tagged for the chunk. It
+// is SYNCHRONOUS: it waits for the pump to drain the gate buffer into ingest
+// before returning, so a gated event can never be overtaken by the Closes
+// marker that Release sends afterwards. This makes the window deduplication
+// (and the droppedByWindow evidence) deterministic.
+func (r *relay) GateFlush() {
+	r.gateMu.Lock()
+	r.flushGate = true
+	r.gateMu.Unlock()
+	req := make(chan struct{})
+	r.gateFlushReq <- req
+	<-req
+}
+
+// gate buffers an event when the gate is on for its table.
+func (r *relay) gate(c change.Change) bool {
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	if !r.gateOn || c.Table != r.gateTgt {
+		return false
+	}
+	r.gateBuf = append(r.gateBuf, c)
+	return true
+}
+
+// drainGate writes the pending gate buffer to ingest, InWindow-tagged, and
+// turns the gate off. Returns true if a flush was performed. The reader's own
+// window decision is preserved: an event it explicitly left untagged (at or
+// before its source watermark) stays untagged; only events decoded in the
+// GateOn↔OpenWindow gap (reader never saw them) are tagged here.
+func (r *relay) drainGate(ctx context.Context) (bool, error) {
+	r.gateMu.Lock()
+	if !r.flushGate {
+		r.gateMu.Unlock()
+		return false, nil
+	}
+	buf := r.gateBuf
+	chunkID := r.gateChk
+	r.gateBuf = nil
+	r.gateOn = false
+	r.flushGate = false
+	r.gateMu.Unlock()
+
+	for _, c := range buf {
+		if c.Window == nil {
+			c.Window = &change.Window{ChunkID: chunkID, InWindow: true}
+		} else {
+			c.Window.ChunkID = chunkID
+		}
+		select {
+		case r.ingest <- c:
+		case <-ctx.Done():
+			return true, ctx.Err()
+		}
+	}
+	return true, nil
+}
+
 // run routes reader events into the worker's ingest channel.
 func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 	for {
+		// The gate buffer is drained before any select: the pump is the
+		// only writer to ingest, so a gated table's older events can never
+		// be overtaken by its later ones.
+		if flushed, err := r.drainGate(ctx); err != nil {
+			return err
+		} else if flushed {
+			continue
+		}
 		select {
 		case c, ok := <-out:
 			if !ok {
+				// A gate flush may be pending (GateFlush raced this select):
+				// flush it before exiting so buffered events are never
+				// dropped.
+				if _, err := r.drainGate(ctx); err != nil {
+					return err
+				}
 				return nil
+			}
+			if r.gate(c) {
+				continue
 			}
 			select {
 			case r.ingest <- c:
@@ -110,6 +213,9 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 					if !ok {
 						break drain
 					}
+					if r.gate(c) {
+						continue
+					}
 					select {
 					case r.ingest <- c:
 					case <-ctx.Done():
@@ -119,6 +225,15 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 				default:
 					break drain
 				}
+			}
+			close(req)
+		case req := <-r.gateFlushReq:
+			// Flush the gate buffer before acking: GateFlush blocks until
+			// the gated events are in ingest, so Release's Closes marker
+			// (sent after) can never overtake them.
+			if _, err := r.drainGate(ctx); err != nil {
+				close(req)
+				return err
 			}
 			close(req)
 		case <-ctx.Done():

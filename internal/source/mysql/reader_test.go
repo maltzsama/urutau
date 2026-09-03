@@ -167,3 +167,73 @@ func TestOnGTIDAccumulatesCumulativeSet(t *testing.T) {
 		t.Fatalf("curGTID = %q, want cumulative %q", r.curGTID, want)
 	}
 }
+
+// TestOnRowWindowTagsOnlyPastLowWatermark drives the DBLog window predicate:
+// only transactions strictly past the low watermark (the master's executed
+// GTID set captured at OpenWindow) are tagged InWindow. A transaction at or
+// before the watermark is already reflected in the chunk SELECT and must not
+// be tagged, or the snapshot row would be discarded for a stale value.
+func TestOnRowWindowTagsOnlyPastLowWatermark(t *testing.T) {
+	out := make(chan change.Change, 8)
+	r := newTestReader(out)
+	r.curGTID = "u:1-9"
+	low := position.MustGTID(readerTestUUID + ":1-5")
+	r.winMu.Lock()
+	r.winOpen = true
+	r.winChunk = 0
+	r.winLow = low
+	r.winMu.Unlock()
+
+	tbl := ordersTable()
+	e := &canal.RowsEvent{
+		Table:  tbl,
+		Action: canal.InsertAction,
+		Rows:   [][]any{{int64(1), []byte("a"), 1.0}},
+	}
+
+	// A transaction PAST the low watermark is tagged InWindow.
+	r.curTxn = position.MustGTID(readerTestUUID + ":1-7")
+	if err := r.OnRow(e); err != nil {
+		t.Fatalf("OnRow: %v", err)
+	}
+	c := <-out
+	if c.Window == nil || !c.Window.InWindow || c.Window.ChunkID != 0 {
+		t.Fatalf("past-low event must be InWindow: %+v", c.Window)
+	}
+
+	// A transaction AT the low watermark is NOT tagged (its effect is
+	// already in the SELECT).
+	r.curTxn = position.MustGTID(readerTestUUID + ":1-5")
+	if err := r.OnRow(e); err != nil {
+		t.Fatalf("OnRow: %v", err)
+	}
+	c = <-out
+	if c.Window != nil {
+		t.Fatalf("at-low event must NOT be InWindow: %+v", c.Window)
+	}
+
+	// A missing watermark (master capture failed) falls back to tagging
+	// everything — over-tagging is safe.
+	r.winMu.Lock()
+	r.winLow = nil
+	r.winMu.Unlock()
+	r.curTxn = position.MustGTID(readerTestUUID + ":1-1")
+	if err := r.OnRow(e); err != nil {
+		t.Fatalf("OnRow: %v", err)
+	}
+	c = <-out
+	if c.Window == nil || !c.Window.InWindow {
+		t.Fatalf("missing watermark must fall back to tagging: %+v", c.Window)
+	}
+
+	// Window closed: nothing is tagged.
+	r.ClearWindow()
+	r.curTxn = position.MustGTID(readerTestUUID + ":1-8")
+	if err := r.OnRow(e); err != nil {
+		t.Fatalf("OnRow: %v", err)
+	}
+	c = <-out
+	if c.Window != nil {
+		t.Fatalf("closed window must not tag: %+v", c.Window)
+	}
+}
