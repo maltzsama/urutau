@@ -398,11 +398,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	writers := make(map[string]sink.TableWriter, len(refs))
 	for _, ref := range refs {
 		ident := drivers.TargetIdent(s, ref.Target)
-		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source]); err != nil {
-			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
-		}
 		t := specBySource[ref.Source]
 		cast, _ := core.ParseCastPolicy(t.Cast)
+		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source], cast); err != nil {
+			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
+		}
 		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey, cast, t.Metadata, t.Source)
 		if err != nil {
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
