@@ -44,9 +44,21 @@ type StreamSource interface {
 	Close()
 }
 
+// Capabilities declares what a source supports: snapshot via DBLog, chunk
+// SELECT introspection, and/or replication streaming. Sources that do not
+// support a capability cause the runner to skip the corresponding phase.
+type Capabilities struct {
+	Snapshot   bool
+	ChunkQuery bool
+	Stream     bool
+}
+
 // Source is the per-source surface of the pipeline: everything that differs
 // between MySQL and Postgres lives behind it.
 type Source interface {
+	// Caps returns the source's capabilities. The runner uses this to
+	// decide which pipeline phases to run.
+	Caps() Capabilities
 	// OpenQuery opens the SQL connection for chunk SELECTs, schema
 	// introspection, and position queries.
 	OpenQuery(ctx context.Context) (*sql.DB, error)
@@ -100,6 +112,10 @@ func OpenQueryDB(kind, uri string) (*sql.DB, error) {
 type mysqlSource struct {
 	spec *spec.Spec
 	rt   Runtime
+}
+
+func (a mysqlSource) Caps() Capabilities {
+	return Capabilities{Snapshot: true, ChunkQuery: true, Stream: true}
 }
 
 func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
@@ -203,6 +219,10 @@ func (s mysqlStream) Start(ctx context.Context, at position.Position) error {
 type postgresSource struct {
 	spec *spec.Spec
 	rt   Runtime
+}
+
+func (a postgresSource) Caps() Capabilities {
+	return Capabilities{Snapshot: true, ChunkQuery: true, Stream: true}
 }
 
 func (a postgresSource) OpenQuery(ctx context.Context) (*sql.DB, error) {

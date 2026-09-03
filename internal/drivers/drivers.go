@@ -54,6 +54,9 @@ func New(s *spec.Spec, rt Runtime) (*Registry, error) {
 // Source exposes the source adapter surface.
 func (r *Registry) Source() adapter.Source { return r.adapt }
 
+// Caps returns the source's capabilities.
+func (r *Registry) Caps() adapter.Capabilities { return r.adapt.Caps() }
+
 // OpenQuery opens the source query connection.
 func (r *Registry) OpenQuery(ctx context.Context) (*sql.DB, error) {
 	return r.adapt.OpenQuery(ctx)
