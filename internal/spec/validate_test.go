@@ -3,6 +3,8 @@ package spec
 import (
 	"strings"
 	"testing"
+
+	"github.com/maltzsama/urutau/internal/core"
 )
 
 func validSpec() *Spec {
@@ -115,5 +117,96 @@ func TestValidateFilterGrammar(t *testing.T) {
 				t.Fatalf("want problem %q, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestValidateMetadataClosedCatalog(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: "op", As: "operation"},
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("valid metadata must validate: %v", err)
+	}
+}
+
+func TestValidateMetadataUnknownKey(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: "unknown_key", As: "x"},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "unknown key") {
+		t.Fatalf("want unknown metadata key error, got %v", err)
+	}
+}
+
+func TestValidateMetadataDuplicateAs(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: "op", As: "x"},
+		{From: "phase", As: "x"},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("want duplicated as error, got %v", err)
+	}
+}
+
+func TestValidateMetadataAsCollisionWithPK(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].PrimaryKey = []string{"id"}
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: "op", As: "id"},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "primary key") {
+		t.Fatalf("want PK collision error, got %v", err)
+	}
+}
+
+func TestValidateMetadataAsRegex(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: "op", As: "invalid name!"},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "not a valid") {
+		t.Fatalf("want identifier regex error, got %v", err)
+	}
+}
+
+func TestValidateCastValid(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Cast = map[string]string{
+		"amount": "float64",
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("valid cast must validate: %v", err)
+	}
+}
+
+func TestValidateCastInvalidTarget(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Cast = map[string]string{
+		"amount": "invalid_type",
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "cast") {
+		t.Fatalf("want cast error, got %v", err)
+	}
+}
+
+func TestValidateWarningsOpInUpsert(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].WriteMode = WriteModeUpsert
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: "op", As: "op"},
+	}
+	warns := s.Warnings()
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "op") && strings.Contains(w, "upsert") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected op-in-upsert advisory warning, got %v", warns)
 	}
 }
