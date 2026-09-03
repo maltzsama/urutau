@@ -8,9 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/apache/iceberg-go"
 	_ "github.com/go-sql-driver/mysql"
@@ -21,37 +19,22 @@ import (
 	"github.com/maltzsama/urutau/internal/position"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/internal/source/kafka"
 	"github.com/maltzsama/urutau/internal/source/mysql"
 	"github.com/maltzsama/urutau/internal/source/postgres"
+	srctypes "github.com/maltzsama/urutau/internal/source/types"
 	"github.com/maltzsama/urutau/internal/spec"
 )
 
 // Runtime carries the replication knobs a driver passes through to the
 // source reader.
-type Runtime struct {
-	ServerID  uint32
-	Heartbeat time.Duration
-	Logger    *slog.Logger
-}
+type Runtime = srctypes.Runtime
 
-// StreamSource is the replication reader surface a driver drives: the DBLog
-// watermark surface plus start/stop of the stream.
-type StreamSource interface {
-	snapshot.SourceReader
-	// Start begins streaming at the given position, blocking until the
-	// stream ends or ctx is cancelled. Call in a goroutine.
-	Start(ctx context.Context, at position.Position) error
-	Close()
-}
+// Capabilities declares what a source supports.
+type Capabilities = srctypes.Capabilities
 
-// Capabilities declares what a source supports: snapshot via DBLog, chunk
-// SELECT introspection, and/or replication streaming. Sources that do not
-// support a capability cause the runner to skip the corresponding phase.
-type Capabilities struct {
-	Snapshot   bool
-	ChunkQuery bool
-	Stream     bool
-}
+// StreamSource is the replication reader surface a driver drives.
+type StreamSource = srctypes.StreamSource
 
 // Source is the per-source surface of the pipeline: everything that differs
 // between MySQL and Postgres lives behind it.
@@ -84,6 +67,8 @@ func For(s *spec.Spec, rt Runtime) (Source, error) {
 		return mysqlSource{spec: s, rt: rt}, nil
 	case "postgres":
 		return postgresSource{spec: s, rt: rt}, nil
+	case "kafka":
+		return kafka.Source{Spec: s, Rt: rt}, nil
 	default:
 		return nil, fmt.Errorf("adapter: unsupported source kind %q", s.Source.Kind)
 	}

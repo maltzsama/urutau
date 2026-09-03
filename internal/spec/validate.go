@@ -28,8 +28,12 @@ func (s *Spec) Validate() error {
 
 	switch s.Source.Kind {
 	case "mysql", "postgres":
+	case "kafka":
+		if s.Source.SnapshotMode != "" && s.Source.SnapshotMode != "none" {
+			problems = append(problems, "source.snapshotMode: must be \"none\" for kafka")
+		}
 	case "":
-		problems = append(problems, "source.kind: required (mysql | postgres)")
+		problems = append(problems, "source.kind: required (mysql | postgres | kafka)")
 	default:
 		problems = append(problems, fmt.Sprintf("source.kind: unsupported %q", s.Source.Kind))
 	}

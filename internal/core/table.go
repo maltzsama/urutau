@@ -127,6 +127,17 @@ type TableRef struct {
 	PrimaryKey []string // equality key; empty means "derive from source"
 }
 
+// ParseColumnType parses a textual canonical type string into a
+// ColumnType. The syntax is the same as ParseCastTarget: "string",
+// "int64", "decimal(20,4)", etc.
+func ParseColumnType(s string) (ColumnType, error) {
+	ct, err := ParseCastTarget(s)
+	if err != nil {
+		return ColumnType{}, err
+	}
+	return ct.Type, nil
+}
+
 // Row is a decoded source row: column name → value, using only the Go types
 // that ColumnType.Kind implies.
 type Row map[string]any
