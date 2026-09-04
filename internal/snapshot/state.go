@@ -213,17 +213,28 @@ func ParseISO8601(s string) (time.Time, error) {
 // encodeBoundCell tags a bound value with its kind for JSON storage. The
 // tags exist because JSON numbers decode as float64 and a bounds round
 // trip must return the exact types the chunker produced — these values
-// are bound back into SQL comparisons on resume.
+// are bound back into SQL comparisons on resume. Integer variants (int,
+// int32, uint64) and raw []byte cells are folded into their canonical
+// tagged forms; an unhandled type returns false and the caller drops the
+// bounds rather than persist something unround-trippable.
 func encodeBoundCell(v any) (any, bool) {
 	switch t := v.(type) {
 	case nil:
 		return nil, true
+	case int:
+		return map[string]any{"i": strconv.FormatInt(int64(t), 10)}, true
+	case int32:
+		return map[string]any{"i": strconv.FormatInt(int64(t), 10)}, true
 	case int64:
 		return map[string]any{"i": strconv.FormatInt(t, 10)}, true
+	case uint64:
+		return map[string]any{"u": strconv.FormatUint(t, 10)}, true
 	case float64:
 		return map[string]any{"f": t}, true
 	case string:
 		return map[string]any{"s": t}, true
+	case []byte:
+		return map[string]any{"s": string(t)}, true
 	case bool:
 		return map[string]any{"b": t}, true
 	case time.Time:
@@ -244,6 +255,13 @@ func decodeBoundCell(v any) (any, bool) {
 	}
 	if s, ok := m["i"].(string); ok {
 		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return nil, false
+		}
+		return n, true
+	}
+	if s, ok := m["u"].(string); ok {
+		n, err := strconv.ParseUint(s, 10, 64)
 		if err != nil {
 			return nil, false
 		}

@@ -72,3 +72,38 @@ func TestEncodeSnapshotProgressUnsupportedType(t *testing.T) {
 		t.Fatalf("read with absent bounds: %v", err)
 	}
 }
+
+// Bounds with driver-native integer variants and []byte cells must survive
+// the round trip: chunkers return raw driver types, and a dropped bound
+// would silently recalculate on resume.
+func TestBoundsRoundTripNativeTypes(t *testing.T) {
+	in := &SnapshotProgress{
+		State: StateInProgress,
+		Bounds: [][]any{
+			{int32(1), uint64(2), []byte("abc"), int(7)},
+			{int32(9), uint64(10), []byte("xyz"), int(70)},
+		},
+		Pending: []uint32{0},
+	}
+	props := EncodeSnapshotProgress(in)
+	got, err := ReadSnapshotProgress(props)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got.Bounds) != 2 {
+		t.Fatalf("bounds = %d rows, want 2 (none dropped)", len(got.Bounds))
+	}
+	row := got.Bounds[0]
+	if row[0] != int64(1) { // int32 folds to the canonical int64
+		t.Fatalf("bounds[0][0] = %v (%T), want int64 1", row[0], row[0])
+	}
+	if row[1] != uint64(2) {
+		t.Fatalf("bounds[0][1] = %v (%T), want uint64 2", row[1], row[1])
+	}
+	if row[2] != "abc" { // []byte folds to string
+		t.Fatalf("bounds[0][2] = %v (%T), want abc", row[2], row[2])
+	}
+	if row[3] != int64(7) {
+		t.Fatalf("bounds[0][3] = %v (%T), want int64 7", row[3], row[3])
+	}
+}
