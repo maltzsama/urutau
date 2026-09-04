@@ -119,9 +119,10 @@ func EnsureNamespace(ctx context.Context, cat *rest.Catalog, ident table.Identif
 }
 
 // EnsureTable creates the target table if absent; on existing tables it
-// verifies cast column types have not diverged.
-func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema, cast core.CastPolicy) error {
-	return icebergsink.EnsureTable(ctx, cat, ident, schema, cast)
+// verifies cast column types have not diverged. The partition spec is
+// applied on create and verified for divergence on existing tables.
+func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
+	return icebergsink.EnsureTable(ctx, cat, ident, schema, partitionBy, cast)
 }
 
 // NewTableWriter opens the per-table Iceberg writer with its cast and

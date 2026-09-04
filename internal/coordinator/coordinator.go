@@ -306,7 +306,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	for _, ref := range refs {
-		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source], core.CastPolicy{}); err != nil {
+		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source], nil, core.CastPolicy{}); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}

@@ -149,7 +149,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		ident := targetIdent(cfg.Namespace, ta.TargetTable)
 		if ta.CreateIfNotExists {
-			if err := drivers.EnsureTable(ctx, cat, ident, schema, core.CastPolicy{}); err != nil {
+			if err := drivers.EnsureTable(ctx, cat, ident, schema, nil, core.CastPolicy{}); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}

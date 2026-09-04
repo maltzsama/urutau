@@ -400,7 +400,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		ident := drivers.TargetIdent(s, ref.Target)
 		t := specBySource[ref.Source]
 		cast, _ := core.ParseCastPolicy(t.Cast)
-		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source], cast); err != nil {
+		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source], t.PartitionBy, cast); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
 		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey, cast, t.Metadata, t.Source)

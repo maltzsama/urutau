@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/maltzsama/urutau/internal/core"
@@ -14,6 +15,10 @@ var (
 	ErrAmbiguousFilterNode = errors.New("filter node carries more than one of all/any/not/where")
 	// identRe is the closed set of valid destination column identifiers.
 	identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// partitionExprRe is the closed grammar for partitionBy expressions.
+	partitionExprRe = regexp.MustCompile(
+		`^(?:(day|month|year|hour|identity)\((\w+)\)|(bucket|truncate)\((\d+),\s*(\w+)\))$`,
+	)
 )
 
 // Validate applies the hard, server-side rules. The same code must validate
@@ -101,6 +106,7 @@ func (s *Spec) Validate() error {
 		validateFilter(tbl.Filter, p+".filter", &problems)
 		validateMetadata(tbl, p, &problems)
 		validateCast(tbl, p, &problems)
+		validatePartitionBy(tbl, p, &problems)
 	}
 
 	if len(problems) > 0 {
@@ -159,6 +165,29 @@ func validateCast(tbl Table, path string, problems *[]string) {
 		}
 		if _, err := core.ParseCastTarget(text); err != nil {
 			*problems = append(*problems, fmt.Sprintf("%s.cast.%s: %v", path, name, err))
+		}
+	}
+}
+
+// validatePartitionBy checks the closed grammar of partition expressions:
+// day/month/year/hour(col), bucket(N, col), truncate(N, col), identity(col).
+// Bucket and truncate sizes must be > 0. Unknown transforms are rejected.
+func validatePartitionBy(tbl Table, path string, problems *[]string) {
+	for _, expr := range tbl.PartitionBy {
+		m := partitionExprRe.FindStringSubmatch(strings.TrimSpace(expr))
+		if m == nil {
+			*problems = append(*problems, fmt.Sprintf(
+				"%s.partitionBy: invalid expression %q: want transform(col), bucket(N, col), or truncate(N, col)",
+				path, expr))
+			continue
+		}
+		// Validate bucket/truncate size > 0.
+		if m[3] != "" {
+			n, err := strconv.Atoi(m[4])
+			if err != nil || n <= 0 {
+				*problems = append(*problems, fmt.Sprintf(
+					"%s.partitionBy: %q: bucket/truncate size must be > 0", path, expr))
+			}
 		}
 	}
 }
