@@ -108,3 +108,22 @@ func TestCollapseCompositeKey(t *testing.T) {
 		t.Fatalf("composite keys must stay distinct, got %+v", got.Upserts)
 	}
 }
+
+// Key rendering must never merge distinct values: int64(1) and float64(1)
+// format identically without a type tag, and a silent merge would collapse
+// two different rows into one map entry.
+func TestKeyStringDistinguishesTypes(t *testing.T) {
+	if KeyString([]any{int64(1)}) == KeyString([]any{float64(1)}) {
+		t.Fatal("int64(1) and float64(1) render the same key")
+	}
+	if KeyString([]any{int64(1)}) == KeyString([]any{"1"}) {
+		t.Fatal("int64(1) and string \"1\" render the same key")
+	}
+	if KeyString([]any{int64(1)}) == KeyString([]any{uint64(1)}) {
+		t.Fatal("int64(1) and uint64(1) render the same key")
+	}
+	// Equal values of the same type must still match.
+	if KeyString([]any{int64(1)}) != KeyString([]any{int64(1)}) {
+		t.Fatal("identical keys render differently")
+	}
+}

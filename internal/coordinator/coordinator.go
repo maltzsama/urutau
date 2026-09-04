@@ -999,7 +999,15 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			case *pb.WorkerMessage_Hello:
 				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_ChunkReady:
-				c.chunkReady <- m.ChunkReady
+				// A full chunkReady buffer with no draining snapshot loop
+				// (stale replies after a reset) must not wedge this recv
+				// goroutine; it aborts on session cancellation instead.
+				select {
+				case c.chunkReady <- m.ChunkReady:
+				case <-sessCtx.Done():
+					sess.done <- context.Canceled
+					return
+				}
 			case *pb.WorkerMessage_Error:
 				sess.done <- errors.New("coordinator: worker error: " + m.Error.Detail)
 				return

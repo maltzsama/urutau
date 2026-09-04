@@ -297,7 +297,14 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 				return err
 			}
 			if cr := m.GetChunk(); cr != nil {
-				chunkWork <- cr
+				// Hand the request to the chunk worker, aborting when the
+				// session ends — a bare send with a full buffer would wedge
+				// this loop and stall teardown.
+				select {
+				case chunkWork <- cr:
+				case <-sessCtx.Done():
+					return errShutdown
+				}
 			}
 			return nil
 		}},

@@ -461,9 +461,15 @@ func isRetryableError(err error) bool {
 		return true
 	}
 	s := err.Error()
-	// HTTP 5xx or network errors from REST catalog or S3.
+	// HTTP 5xx or throttling, or network errors from REST catalog or S3.
+	// The status-code tokens also cover the REST/S3 client messages that
+	// embed them; 429 and S3's SlowDown/RequestTimeout are the throttling
+	// signals a server overloaded enough to shed retries sends.
 	if strings.Contains(s, "500") || strings.Contains(s, "502") ||
 		strings.Contains(s, "503") || strings.Contains(s, "504") ||
+		strings.Contains(s, "429") || strings.Contains(s, "408") ||
+		strings.Contains(s, "SlowDown") || strings.Contains(s, "RequestTimeout") ||
+		strings.Contains(s, "throttl") || strings.Contains(s, "Too Many Requests") ||
 		strings.Contains(s, "connection refused") || strings.Contains(s, "EOF") ||
 		strings.Contains(s, "i/o timeout") || strings.Contains(s, "broken pipe") ||
 		strings.Contains(s, "reset by peer") {

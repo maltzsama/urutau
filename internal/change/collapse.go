@@ -43,17 +43,24 @@ func Collapse(changes []Change) Collapsed {
 // joined with a unit separator so adjacent values cannot merge.
 func KeyString(key []any) string { return keyString(key) }
 
-// keyString renders a primary key tuple into a unique map key. Strings are
-// prefixed so a string "1" never collides with the integer 1; elements are
-// joined with a unit separator so adjacent values cannot merge.
+// keyString renders a primary key tuple into a unique map key. Every value
+// carries its Go type as a prefix: without it, fmt of int64(1) and float64(1)
+// both yield "1" and two different rows would collapse into one — the sink
+// indexes equality-delete tuples by key position, so a silent merge is
+// corruption, not deduplication. Elements are joined with a unit separator
+// so adjacent values cannot merge.
 func keyString(key []any) string {
 	parts := make([]string, len(key))
 	for i, v := range key {
 		if s, ok := v.(string); ok {
 			parts[i] = "s:" + s
-		} else {
-			parts[i] = fmt.Sprintf("%v", v)
+			continue
 		}
+		if v == nil {
+			parts[i] = "nil"
+			continue
+		}
+		parts[i] = fmt.Sprintf("%T:%v", v, v)
 	}
 	return strings.Join(parts, "\x1f")
 }
