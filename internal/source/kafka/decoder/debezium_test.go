@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/change"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -135,4 +136,46 @@ func TestDebeziumJSONCustomTableMapping(t *testing.T) {
 	if changes[0].Table != "shop.users" {
 		t.Errorf("table = %q, want shop.users", changes[0].Table)
 	}
+}
+
+// The raw key tuple inherits JSON object disorder. OrderKey must rebuild it
+// in the declared primary-key order: downstream consumers treat the key as
+// positional (collapse map keys, equality-delete tuples).
+func TestOrderKeyCompositeInsert(t *testing.T) {
+	c := &change.Change{
+		Op:    change.OpInsert,
+		After: map[string]any{"tenant": "t1", "id": float64(7), "v": "x"},
+	}
+	OrderKey(c, []string{"tenant", "id"})
+	if c.Key[0] != "t1" || c.Key[1] != float64(7) {
+		t.Fatalf("key = %v, want [t1 7]", c.Key)
+	}
+}
+
+func TestOrderKeyDeleteReadsBefore(t *testing.T) {
+	c := &change.Change{
+		Op:     change.OpDelete,
+		Before: map[string]any{"tenant": "t1", "id": float64(7)},
+	}
+	OrderKey(c, []string{"tenant", "id"})
+	if c.Key[0] != "t1" || c.Key[1] != float64(7) {
+		t.Fatalf("key = %v, want [t1 7] from the before image", c.Key)
+	}
+}
+
+func TestOrderKeyNoopCases(t *testing.T) {
+	// No declared PK: leave the tuple alone.
+	c := &change.Change{After: map[string]any{"id": float64(1)}, Key: []any{"raw"}}
+	OrderKey(c, nil)
+	if c.Key[0] != "raw" {
+		t.Fatalf("key = %v, want untouched", c.Key)
+	}
+	// No row image: nothing to read from.
+	d := &change.Change{Op: change.OpDelete, Key: []any{"raw"}}
+	OrderKey(d, []string{"id"})
+	if d.Key[0] != "raw" {
+		t.Fatalf("key = %v, want untouched", d.Key)
+	}
+	// Nil change must not panic.
+	OrderKey(nil, []string{"id"})
 }

@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/apache/iceberg-go"
@@ -60,8 +61,19 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 			fmt.Errorf("kafka: table %q requires primaryKey", t.Source)
 	}
 
+	// The spec declares columns as a map, which carries no order — iterate
+	// sorted so every boot resolves the same column order. Downstream
+	// consumers are name-keyed, but a stable order keeps freshly created
+	// targets and their schemas reproducible.
+	names := make([]string, 0, len(t.Columns))
+	for name := range t.Columns {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	cols := make([]core.Column, 0, len(t.Columns))
-	for name, typeStr := range t.Columns {
+	for _, name := range names {
+		typeStr := t.Columns[name]
 		ct, err := core.ParseColumnType(typeStr)
 		if err != nil {
 			return core.TableRef{}, core.Schema{}, nil, nil,
@@ -151,9 +163,11 @@ func (s Source) NewChunker(_ *sql.DB, _, _ string, _ int) (snapshot.ChunkSource,
 // channel. No consumer group is used — the consumer manages its own
 // offsets.
 func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (srctypes.StreamSource, error) {
+	pkBySource := make(map[string][]string, len(refs))
 	topics := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		topics = append(topics, ref.Source)
+		pkBySource[ref.Source] = ref.PrimaryKey
 	}
 
 	opts := []kgo.Opt{
@@ -171,11 +185,12 @@ func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []snapshot.TableR
 	dec := &decoder.DebeziumJSON{}
 
 	r := &Reader{
-		client: client,
-		dec:    dec,
-		out:    out,
-		logger: s.Rt.Logger,
-		synced: &position.Offsets{},
+		client:     client,
+		dec:        dec,
+		out:        out,
+		logger:     s.Rt.Logger,
+		pkBySource: pkBySource,
+		synced:     &position.Offsets{},
 	}
 	return r, nil
 }
@@ -200,6 +215,10 @@ type Reader struct {
 	dec    decoder.Decoder
 	out    chan<- change.Change
 	logger *slog.Logger
+	// pkBySource maps a source table to its declared primary-key columns.
+	// The decoder's raw key tuple comes from a JSON object and has no
+	// stable order; composite keys need the declared order.
+	pkBySource map[string][]string
 
 	mu     sync.Mutex
 	synced *position.Offsets
@@ -257,6 +276,11 @@ func (r *Reader) Start(ctx context.Context, _ position.Position) error {
 					Topic: rec.Topic,
 					Parts: map[int32]int64{rec.Partition: rec.Offset},
 				}).String()
+				// The raw key tuple inherits JSON object disorder; rebuild
+				// it in the declared primary-key order so every downstream
+				// positional consumer (collapse, equality deletes) sees a
+				// stable tuple.
+				decoder.OrderKey(&c, r.pkBySource[c.Table])
 				select {
 				case r.out <- c:
 				case <-ctx.Done():
