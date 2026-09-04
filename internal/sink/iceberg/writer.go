@@ -571,6 +571,39 @@ func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, 
 			return "snapshot", nil
 		}
 		return "stream", nil
+	case core.MetaStream:
+		if c.Transport != nil && c.Transport.Stream != "" {
+			return c.Transport.Stream, nil
+		}
+		return sourceTable, nil // CDC: the source table IS the stream
+	case core.MetaShard:
+		if c.Transport == nil || c.Transport.Shard == "" {
+			return nil, nil
+		}
+		return c.Transport.Shard, nil
+	case core.MetaSeq:
+		if c.Transport != nil && c.Transport.Seq != "" {
+			return c.Transport.Seq, nil
+		}
+		if c.Position == "" {
+			return nil, nil
+		}
+		return c.Position, nil // CDC: the event coordinate (GTID/LSN)
+	case core.MetaMsgTS:
+		if c.Transport == nil || c.Transport.MsgTS.IsZero() {
+			return nil, nil
+		}
+		return c.Transport.MsgTS, nil
+	case core.MetaMsgKey:
+		if c.Transport == nil {
+			return nil, nil
+		}
+		return c.Transport.MsgKey, nil
+	case core.MetaHeaders:
+		if c.Transport == nil || c.Transport.Headers == "" {
+			return nil, nil
+		}
+		return c.Transport.Headers, nil
 	default:
 		return nil, fmt.Errorf("unknown metadata key %q", key)
 	}

@@ -40,6 +40,11 @@ type Source struct {
 	// The engine cannot verify this — it must be a conscious operator
 	// assertion. Required for writeMode: upsert on a Kafka source.
 	PartitionedByPrimaryKey bool `json:"partitionedByPrimaryKey,omitempty"`
+	// Format selects the Kafka message decoder: "debezium" (default) parses
+	// the envelope into typed rows; "raw" lands the payload verbatim
+	// without interpreting it (bronze landing). Raw requires append-only
+	// tables.
+	Format string `json:"format,omitempty"`
 }
 
 type Sink struct {

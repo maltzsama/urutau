@@ -45,6 +45,16 @@ func (s *Spec) Validate() error {
 	if s.Source.Kind == "postgres" && s.Source.SlotName == "" {
 		problems = append(problems, "source.slotName: required for postgres (logical replication slot)")
 	}
+	// Decoder format: raw is a message-log landing mode (kafka only) and it
+	// has no upsert semantics — every message is an insert.
+	switch s.Source.Format {
+	case "", "debezium", "raw":
+	default:
+		problems = append(problems, fmt.Sprintf("source.format: unsupported %q (want debezium | raw)", s.Source.Format))
+	}
+	if s.Source.Format == "raw" && s.Source.Kind != "kafka" {
+		problems = append(problems, "source.format: raw is only valid for kind kafka")
+	}
 	if s.Source.URI == "" {
 		problems = append(problems, "source.uri: required")
 	}
@@ -121,6 +131,11 @@ func (s *Spec) Validate() error {
 		if s.Source.Kind == "kafka" && mode == WriteModeUpsert && !s.Source.PartitionedByPrimaryKey {
 			problems = append(problems, p+".primaryKey: kafka upsert requires source.partitionedByPrimaryKey — the topics must be partitioned by the key, or the same key in different partitions applies stale versions silently")
 		}
+		// Raw landing is append-only: there is no update or delete, the log
+		// is the data.
+		if s.Source.Format == "raw" && mode == WriteModeUpsert {
+			problems = append(problems, p+".writeMode: source.format is raw — raw landing is append-only, set writeMode: append")
+		}
 
 		validateFilter(tbl.Filter, p+".filter", &problems)
 		validateMetadata(tbl, p, &problems)
@@ -143,6 +158,12 @@ var validMetadataKeys = map[core.MetadataKey]bool{
 	core.MetaPosition:    true,
 	core.MetaSourceTable: true,
 	core.MetaPhase:       true,
+	core.MetaStream:      true,
+	core.MetaShard:       true,
+	core.MetaSeq:         true,
+	core.MetaMsgTS:       true,
+	core.MetaMsgKey:      true,
+	core.MetaHeaders:     true,
 }
 
 // validateMetadata checks the closed metadata rules: catalog membership,
@@ -152,7 +173,7 @@ func validateMetadata(tbl Table, path string, problems *[]string) {
 	seen := map[string]bool{}
 	for _, m := range tbl.Metadata {
 		if !validMetadataKeys[m.From] {
-			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: op, commit_ts, ingest_ts, position, source_table, phase)", path, m.From))
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: op, commit_ts, ingest_ts, position, source_table, phase, stream, shard, sequence, msg_ts, msg_key, headers)", path, m.From))
 		}
 		if m.As == "" {
 			*problems = append(*problems, fmt.Sprintf("%s.metadata.as: required", path))
