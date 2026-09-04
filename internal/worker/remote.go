@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/core"
@@ -142,6 +143,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
 	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
+	pkByTable := make(map[string][]string, len(assign.Tables))
 	for _, ta := range assign.Tables {
 		schema := &iceberg.Schema{}
 		if err := json.Unmarshal([]byte(ta.SchemaJson), schema); err != nil {
@@ -158,6 +160,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
 		w.Register(ta.TargetTable, writer, change.UpsertMode)
+		pkByTable[ta.TargetTable] = ta.PrimaryKey
 	}
 
 	// Report phase + committed positions (design §5.6.1): STREAMING if any
@@ -240,6 +243,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		ingest:    ingest,
 		committed: committed,
 		parsePos:  parsePos,
+		pkByTable: pkByTable,
 		log:       cfg.Logger,
 	}
 
@@ -392,6 +396,7 @@ type batchReceiver struct {
 	ingest    chan<- change.Change
 	committed map[string]position.Position // target table → committed
 	parsePos  func(string) (position.Position, error)
+	pkByTable map[string][]string // target table → primary key columns
 	log       *slog.Logger
 }
 
@@ -426,7 +431,13 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 	}
 	defer rec.Release()
 
-	rows, meta, err := transport.DecodeBatch(rec, fd.AppMetadata)
+	// The key rebuild needs the table's PK, which lives in the meta —
+	// peek at it first (a tiny proto; the codec unmarshals it again).
+	meta := &pb.BatchMeta{}
+	if err := proto.Unmarshal(fd.AppMetadata, meta); err != nil {
+		return fmt.Errorf("worker: unmarshal batch meta: %w", err)
+	}
+	rows, _, err := transport.DecodeBatch(rec, fd.AppMetadata, r.pkByTable[meta.Table])
 	if err != nil {
 		return err
 	}
