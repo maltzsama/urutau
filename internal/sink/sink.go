@@ -1,4 +1,4 @@
-// Package sink holds the destination catalog contracts (CR-012). Sinks
+// Package sink holds the destination catalog contracts. Sinks
 // consume core.Schema and commit change.Batch; they know nothing about any
 // source. Drivers open sinks of one scheme; the driver registry lives in
 // internal/drivers.

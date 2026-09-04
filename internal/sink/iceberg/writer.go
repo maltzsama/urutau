@@ -829,8 +829,8 @@ var partitionExprRe = regexp.MustCompile(
 
 // buildPartitionSpec translates the closed catalog of partitionBy
 // expressions into an Iceberg PartitionSpec validated against the schema.
-// Only the transforms listed in the CR-016 closed catalog are accepted:
-// day, month, year, hour, bucket, truncate, identity.  Arbitrary expressions
+// Only the transforms listed in the closed catalog are accepted:
+// day, month, year, hour, bucket, truncate, identity. Arbitrary expressions
 // remain out of scope.
 func buildPartitionSpec(schema *iceberg.Schema, exprs []string) (iceberg.PartitionSpec, error) {
 	if len(exprs) == 0 {

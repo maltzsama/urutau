@@ -101,8 +101,8 @@ func New(cfg Config) *Worker {
 func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
 
 // Register wires a per-table writer to a target table. The writer is any
-// sink.TableWriter implementation — the worker knows nothing about the sink
-// (CR-012). The mode controls whether batches are collapsed (upsert) or
+// sink.TableWriter implementation — the worker knows nothing about the sink.
+// The mode controls whether batches are collapsed (upsert) or
 // passed through (append).
 func (w *Worker) Register(target string, c sink.TableWriter, mode change.WriteMode) {
 	w.tables[target] = newTablePipeline(target, c, mode)

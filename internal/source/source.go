@@ -1,4 +1,4 @@
-// Package source holds the replication source contracts (CR-012). Sources
+// Package source holds the replication source contracts. Sources
 // map their native types into core.Schema and stream row changes into
 // change.Change; they know nothing about any sink. Drivers open sources of
 // one scheme; the driver registry lives in internal/drivers.

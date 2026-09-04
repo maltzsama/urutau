@@ -16,8 +16,7 @@ import (
 )
 
 // TableRef maps one source table to its target and primary key. It is an
-// alias of the canonical core.TableRef — the pipeline-wide table identity
-// (CR-012).
+// alias of the canonical core.TableRef — the pipeline-wide table identity.
 type TableRef = core.TableRef
 
 // Chunk is a half-open primary-key range [Low, High). The last chunk of a

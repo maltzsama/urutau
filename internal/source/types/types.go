@@ -61,6 +61,6 @@ type StreamSource interface {
 	// SetConfirmed installs a callback that returns the minimum position
 	// committed to the sink across all tables. The Postgres reader uses
 	// this to advance the slot's confirmed_flush_lsn only to the point
-	// that has been durably written — never past it. See CR-019.
+	// that has been durably written — never past it.
 	SetConfirmed(f func() position.Position)
 }

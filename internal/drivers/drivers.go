@@ -1,5 +1,5 @@
 // Package drivers wires the concrete source and sink implementations into
-// the pipeline (CR-012). It is the ONLY package (besides cmd/) that knows
+// the pipeline. It is the ONLY package (besides cmd/) that knows
 // source/mysql, source/postgres and sink/iceberg — runner and coordinator
 // consume the Registry through its interface surface and stay free of the
 // implementations.
