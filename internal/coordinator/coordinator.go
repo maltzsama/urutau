@@ -139,7 +139,6 @@ type Coordinator struct {
 	gateMu  sync.Mutex
 	gateOn  bool
 	gateTgt string
-	gateChk uint32
 	gateBuf []change.Change
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
@@ -289,7 +288,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			}
 			c.workers[name] = w
 			c.byTicket[string(w.ticket)] = w
-			c.index[name] = newPositionIndex(name, c.runID)
+			c.index[name] = newPositionIndex(c.runID)
 		}
 		w.refs = append(w.refs, refs[i])
 		c.route[t.Target] = w
@@ -564,9 +563,9 @@ func (c *Coordinator) gateHold(ch change.Change) bool {
 // that opened and closed per chunk would let gap events (positioned AFTER
 // the gate's backlog) flow straight through, then release older backlog
 // after them — a reordering that resurrects old values.
-func (c *Coordinator) openWindow(target string, chunkID uint32) {
+func (c *Coordinator) openWindow(target string) {
 	c.gateMu.Lock()
-	c.gateOn, c.gateTgt, c.gateChk = true, target, chunkID
+	c.gateOn, c.gateTgt = true, target
 	c.gateMu.Unlock()
 }
 
@@ -576,7 +575,6 @@ func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 	c.gateMu.Lock()
 	buf, tgt := c.gateBuf, c.gateTgt
 	c.gateBuf = nil
-	c.gateChk = chunkID
 	c.gateMu.Unlock()
 
 	if len(buf) == 0 {
@@ -597,7 +595,7 @@ func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 func (c *Coordinator) closeWindow(ctx context.Context) error {
 	c.gateMu.Lock()
 	buf, tgt := c.gateBuf, c.gateTgt
-	c.gateOn, c.gateBuf, c.gateChk = false, nil, 0
+	c.gateOn, c.gateBuf = false, nil
 	c.gateMu.Unlock()
 
 	if len(buf) == 0 {
@@ -672,7 +670,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceRead
 			return err
 		}
 		if i == 0 {
-			c.openWindow(ref.Target, chunkID)
+			c.openWindow(ref.Target)
 		}
 
 		boundsB, err := transport.EncodeBounds(ch.Low, ch.High)

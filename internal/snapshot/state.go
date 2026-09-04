@@ -43,16 +43,6 @@ type SnapshotProgress struct {
 	Started string   // ISO 8601 timestamp of snapshot start
 }
 
-// IsComplete returns true when the snapshot phase is done.
-func (sp *SnapshotProgress) IsComplete() bool {
-	return sp.State == StateComplete || sp.State == ""
-}
-
-// HasPending returns true when there are chunks left to process.
-func (sp *SnapshotProgress) HasPending() bool {
-	return len(sp.Pending) > 0
-}
-
 // ReadSnapshotProgress reads snapshot state from table properties. The
 // plain map type keeps this source-side package free of the sink library
 // (the architecture wall); iceberg.Properties is assignable to it.
@@ -160,18 +150,6 @@ func EncodePending(pending []uint32) string {
 	return string(b)
 }
 
-// PendingFromProperty decodes a pending list from a table property.
-func PendingFromProperty(s string) []uint32 {
-	if s == "" || s == "[]" {
-		return nil
-	}
-	var pending []uint32
-	if err := json.Unmarshal([]byte(s), &pending); err != nil {
-		return nil
-	}
-	return pending
-}
-
 // RemoveFromPending removes chunkID from the pending list and returns
 // the new sorted list.
 func RemoveFromPending(pending []uint32, chunkID uint32) []uint32 {
@@ -185,17 +163,6 @@ func RemoveFromPending(pending []uint32, chunkID uint32) []uint32 {
 	return out
 }
 
-// SnapshotStateForTable reads the snapshot progress for a given table
-// from its properties. Returns a completed snapshot if no state is stored.
-func SnapshotStateForTable(props map[string]string) (*SnapshotProgress, error) {
-	return ReadSnapshotProgress(props)
-}
-
-// FormatBoundsForLog renders bounds as a compact log string: "N chunks [0, 1, ..., N-1]".
-func FormatBoundsForLog(bounds [][]any) string {
-	return fmt.Sprintf("%d chunks", len(bounds))
-}
-
 // PendingIDs renders a pending list as a compact string: "[3,4,5]".
 func PendingIDs(pending []uint32) string {
 	parts := make([]string, len(pending))
@@ -203,11 +170,6 @@ func PendingIDs(pending []uint32) string {
 		parts[i] = strconv.FormatUint(uint64(id), 10)
 	}
 	return "[" + strings.Join(parts, ",") + "]"
-}
-
-// ParseISO8601 parses an ISO 8601 timestamp string.
-func ParseISO8601(s string) (time.Time, error) {
-	return time.Parse(time.RFC3339, s)
 }
 
 // encodeBoundCell tags a bound value with its kind for JSON storage. The

@@ -109,7 +109,7 @@ type positionIndex struct {
 	runID string
 }
 
-func newPositionIndex(worker, runID string) *positionIndex {
+func newPositionIndex(runID string) *positionIndex {
 	return &positionIndex{acked: map[string]position.Position{}, runID: runID}
 }
 

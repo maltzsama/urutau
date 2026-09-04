@@ -383,7 +383,7 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 	}
 	// Table exists — verify cast divergence and partition spec divergence.
 	existSchema := existing.Schema()
-	for colName, target := range cast.Columns {
+	for colName := range cast.Columns {
 		newField, ok := schema.FindFieldByName(colName)
 		if !ok {
 			continue // column not in resolved schema — introspection will catch
@@ -396,7 +396,6 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 			return fmt.Errorf("iceberg: %v: cast column %q type divergence: spec wants %s, table has %s",
 				ident, colName, newField.Type, existField.Type)
 		}
-		_ = target // used for future PK-cast advisory
 	}
 	// Partition spec divergence: if partitionBy is specified, it must
 	// match the existing table's partition spec (single-partition-field

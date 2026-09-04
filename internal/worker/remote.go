@@ -268,14 +268,18 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 
 	// Chunk work is serialized: the coordinator sends one ChunkRequest at a
 	// time and waits for ChunkReady, so a single worker slot is enough and
-	// ordering between chunks is preserved.
+	// ordering between chunks is preserved. The worker exits on the shared
+	// context so it cannot outlive the session.
 	chunkWork := make(chan *pb.ChunkRequest, 4)
-	chunkErr := make(chan error, 1)
 	go func() {
-		for req := range chunkWork {
-			if err := chunks.run(sessCtx, req); err != nil {
-				chunkErr <- err
-				cancelAll(fmt.Errorf("worker: chunk: %w", err))
+		for {
+			select {
+			case req := <-chunkWork:
+				if err := chunks.run(sessCtx, req); err != nil {
+					cancelAll(fmt.Errorf("worker: chunk: %w", err))
+					return
+				}
+			case <-sessCtx.Done():
 				return
 			}
 		}

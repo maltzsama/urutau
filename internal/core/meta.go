@@ -6,8 +6,6 @@
 // a value that already exists.
 package core
 
-import "time"
-
 // MetadataKey identifies one pipeline-provided value that can be landed as a
 // column in the target table. The catalog is closed: every key has a fixed
 // canonical type and a fixed semantic, and there is no free-form field.
@@ -49,16 +47,6 @@ func (k MetadataKey) ColumnType() ColumnType {
 		return ColumnType{Kind: KindTimestampTZ}
 	default:
 		return ColumnType{Kind: KindString}
-	}
-}
-
-// ValueType returns the Go type a key's value is carried as in core.Row.
-func (k MetadataKey) ValueType() any {
-	switch k {
-	case MetaCommitTS, MetaIngestTS:
-		return time.Time{}
-	default:
-		return ""
 	}
 }
 
