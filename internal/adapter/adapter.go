@@ -117,11 +117,13 @@ type mysqlSource struct {
 
 func (a mysqlSource) Caps() Capabilities {
 	return Capabilities{
-		Snapshot:       true,
-		ChunkQuery:     true,
-		Stream:         true,
-		MaxConnections: 10,
-		Modes:          []srctypes.Mode{srctypes.ModeCDC},
+		Snapshot:          true,
+		ChunkQuery:        true,
+		Stream:            true,
+		MaxConnections:    10,
+		Modes:             []srctypes.Mode{srctypes.ModeCDC},
+		BeforeImage:       true,  // binlog row format always carries the deleted row
+		MonotonicSequence: false, // GTID sets grow but are not per-message coordinates
 	}
 }
 
@@ -230,11 +232,13 @@ type postgresSource struct {
 
 func (a postgresSource) Caps() Capabilities {
 	return Capabilities{
-		Snapshot:       true,
-		ChunkQuery:     true,
-		Stream:         true,
-		MaxConnections: 10,
-		Modes:          []srctypes.Mode{srctypes.ModeCDC},
+		Snapshot:          true,
+		ChunkQuery:        true,
+		Stream:            true,
+		MaxConnections:    10,
+		Modes:             []srctypes.Mode{srctypes.ModeCDC},
+		BeforeImage:       true,  // old tuple carries the deleted row (PK-only unless REPLICA IDENTITY FULL)
+		MonotonicSequence: false, // commit LSNs are monotonic but not per-message coordinates
 	}
 }
 

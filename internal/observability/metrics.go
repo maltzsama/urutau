@@ -27,6 +27,7 @@ type Metrics struct {
 	EqualityDeletes  *prometheus.CounterVec
 	SnapshotProgress *prometheus.GaugeVec
 	DroppedByWindow  *prometheus.CounterVec
+	DeletesDropped   *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -67,9 +68,12 @@ func New() *Metrics {
 	m.DroppedByWindow = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_worker_dblog_dropped_by_window_total", Help: "snapshot rows discarded by DBLog windows."},
 		[]string{"table"})
+	m.DeletesDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_worker_deletes_dropped_total", Help: "append-only deletes dropped (skip or no before image), per table."},
+		[]string{"table"})
 
 	reg.MustRegister(m.LagSeconds, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
-	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow)
+	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	return m
 }
 

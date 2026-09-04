@@ -40,6 +40,15 @@ type Capabilities struct {
 	MaxConnections int
 	// Modes lists the synchronization modes this source supports.
 	Modes []Mode
+	// BeforeImage reports whether the source carries the row image that was
+	// deleted on a DELETE. MySQL (binlog row) always does; Postgres only
+	// per replica identity; Kafka does not (tombstones are null). Append
+	// tables with onDelete: record depend on this.
+	BeforeImage bool
+	// MonotonicSequence reports whether the transport coordinate of a
+	// message never reappears (Kafka offset, Kinesis sequence) — the
+	// property append-idempotent relies on.
+	MonotonicSequence bool
 }
 
 // Runtime carries the replication knobs a driver passes through to the

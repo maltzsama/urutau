@@ -8,9 +8,11 @@ package kafka
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/apache/iceberg-go"
@@ -34,11 +36,13 @@ type Source struct {
 // Caps reports Kafka capabilities: streaming only, no DBLog snapshot.
 func (s Source) Caps() srctypes.Capabilities {
 	return srctypes.Capabilities{
-		Snapshot:       false,
-		ChunkQuery:     false,
-		Stream:         true,
-		MaxConnections: 0, // no query connections at all
-		Modes:          []srctypes.Mode{srctypes.ModeCDC},
+		Snapshot:          false,
+		ChunkQuery:        false,
+		Stream:            true,
+		MaxConnections:    0, // no query connections at all
+		Modes:             []srctypes.Mode{srctypes.ModeCDC},
+		BeforeImage:       false, // deletes are tombstones (null) — no image to record
+		MonotonicSequence: true,  // (partition, offset) never reappears
 	}
 }
 
@@ -55,11 +59,16 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 			fmt.Errorf("kafka: table %q requires columns in spec", t.Source)
 	}
 
-	pk := t.PrimaryKey
-	if len(pk) == 0 {
-		return core.TableRef{}, core.Schema{}, nil, nil,
-			fmt.Errorf("kafka: table %q requires primaryKey", t.Source)
+	mode := t.WriteMode
+	if mode == "" {
+		mode = spec.WriteModeUpsert // upsert-first: reflecting state is the default
 	}
+	isAppend := mode == spec.WriteModeAppend || mode == spec.WriteModeAppendIdempotent
+	if len(t.PrimaryKey) == 0 && !isAppend {
+		return core.TableRef{}, core.Schema{}, nil, nil,
+			fmt.Errorf("kafka: table %q requires primaryKey for writeMode=upsert", t.Source)
+	}
+	pk := t.PrimaryKey
 
 	// The spec declares columns as a map, which carries no order — iterate
 	// sorted so every boot resolves the same column order. Downstream
@@ -163,11 +172,11 @@ func (s Source) NewChunker(_ *sql.DB, _, _ string, _ int) (snapshot.ChunkSource,
 // channel. No consumer group is used — the consumer manages its own
 // offsets.
 func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (srctypes.StreamSource, error) {
-	pkBySource := make(map[string][]string, len(refs))
+	refBySource := make(map[string]snapshot.TableRef, len(refs))
 	topics := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		topics = append(topics, ref.Source)
-		pkBySource[ref.Source] = ref.PrimaryKey
+		refBySource[ref.Source] = ref
 	}
 
 	opts := []kgo.Opt{
@@ -182,15 +191,18 @@ func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []snapshot.TableR
 		return nil, fmt.Errorf("kafka: new client: %w", err)
 	}
 
-	dec := &decoder.DebeziumJSON{}
+	dec := decoder.Decoder(&decoder.DebeziumJSON{})
+	if s.Spec.Source.Format == "raw" {
+		dec = &decoder.Raw{}
+	}
 
 	r := &Reader{
-		client:     client,
-		dec:        dec,
-		out:        out,
-		logger:     s.Rt.Logger,
-		pkBySource: pkBySource,
-		synced:     &position.Offsets{},
+		client:      client,
+		dec:         dec,
+		out:         out,
+		logger:      s.Rt.Logger,
+		refBySource: refBySource,
+		synced:      &position.Offsets{},
 	}
 	return r, nil
 }
@@ -215,10 +227,10 @@ type Reader struct {
 	dec    decoder.Decoder
 	out    chan<- change.Change
 	logger *slog.Logger
-	// pkBySource maps a source table to its declared primary-key columns.
-	// The decoder's raw key tuple comes from a JSON object and has no
-	// stable order; composite keys need the declared order.
-	pkBySource map[string][]string
+	// refBySource resolves a decoded source (envelope source or topic) to
+	// its full table mapping, so the change is addressed by its TARGET —
+	// the worker routes on target names.
+	refBySource map[string]snapshot.TableRef
 
 	mu     sync.Mutex
 	synced *position.Offsets
@@ -272,15 +284,29 @@ func (r *Reader) Start(ctx context.Context, _ position.Position) error {
 				return
 			}
 			for _, c := range changes {
+				// Resolve the source (envelope source for debezium, topic for
+				// raw) to the target the worker routes on, and attach the
+				// message-queue envelope for transport metadata.
+				src := c.Table
+				if src == "" {
+					src = rec.Topic
+				}
+				ref, ok := r.refBySource[src]
+				if !ok {
+					r.logger.Warn("kafka: record for unmapped source", "topic", rec.Topic, "source", src)
+					return
+				}
+				c.Table = ref.Target
 				c.Position = (&position.Offsets{
 					Topic: rec.Topic,
 					Parts: map[int32]int64{rec.Partition: rec.Offset},
 				}).String()
+				c.Transport = transportOf(rec)
 				// The raw key tuple inherits JSON object disorder; rebuild
 				// it in the declared primary-key order so every downstream
 				// positional consumer (collapse, equality deletes) sees a
 				// stable tuple.
-				decoder.OrderKey(&c, r.pkBySource[c.Table])
+				decoder.OrderKey(&c, ref.PrimaryKey)
 				select {
 				case r.out <- c:
 				case <-ctx.Done():
@@ -297,6 +323,30 @@ func (r *Reader) Start(ctx context.Context, _ position.Position) error {
 			r.mu.Unlock()
 		})
 	}
+}
+
+// transportOf captures the message-queue envelope of a record for the
+// transport metadata columns (stream, shard, sequence, msg_ts, msg_key,
+// headers). Headers serialize to JSON because the canonical type system has
+// no map yet.
+func transportOf(rec *kgo.Record) *change.Transport {
+	t := &change.Transport{
+		Stream: rec.Topic,
+		Shard:  strconv.Itoa(int(rec.Partition)),
+		Seq:    strconv.FormatInt(rec.Offset, 10),
+		MsgTS:  rec.Timestamp,
+		MsgKey: string(rec.Key),
+	}
+	if len(rec.Headers) > 0 {
+		h := make(map[string]string, len(rec.Headers))
+		for _, hd := range rec.Headers {
+			h[hd.Key] = string(hd.Value)
+		}
+		if b, err := json.Marshal(h); err == nil {
+			t.Headers = string(b)
+		}
+	}
+	return t
 }
 
 // Close releases the Kafka client.

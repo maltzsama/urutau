@@ -198,3 +198,67 @@ func TestResumedSnapshotUsesUpsertPath(t *testing.T) {
 		t.Fatalf("upserts = %d pos %q, want 2 rows at low", len(b.Upserts), b.Position)
 	}
 }
+
+// 28.2: append-only delete handling. record with a before image appends the
+// row; a delete with no before image (Kafka tombstone) is dropped and
+// counted, never written as an all-null row; onDelete: skip drops deletes
+// even when a before image exists.
+func TestAppendModeDeleteHandling(t *testing.T) {
+	fc := &fakeCommitter{}
+	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
+	w.RegisterCommitter("t", fc, change.AppendMode)
+	var dropped []string
+	w.OnDroppedDelete(func(table, pos string) { dropped = append(dropped, pos) })
+
+	ingest := make(chan change.Change, 8)
+	ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{1},
+		After: map[string]any{"id": int64(1), "v": "a"}, Position: "p1"}
+	// record: has a before image -> row appended.
+	ingest <- change.Change{Op: change.OpDelete, Table: "t", Key: []any{2},
+		Before: map[string]any{"id": int64(2), "v": "gone"}, Position: "p2"}
+	// record: NO before image -> dropped, counted, never an all-null row.
+	ingest <- change.Change{Op: change.OpDelete, Table: "t", Key: []any{3},
+		Position: "p3"}
+	close(ingest)
+	if err := w.Run(context.Background(), ingest); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if len(fc.batches) != 1 {
+		t.Fatalf("batches = %d, want 1", len(fc.batches))
+	}
+	b := fc.batches[0]
+	if len(b.Upserts) != 2 {
+		t.Fatalf("upserts = %d, want 2 (insert + recorded delete) — no all-null row", len(b.Upserts))
+	}
+	if len(dropped) != 1 || dropped[0] != "p3" {
+		t.Fatalf("dropped = %v, want [p3]", dropped)
+	}
+	if w.DroppedDeletes("t") != 1 {
+		t.Fatalf("DroppedDeletes = %d, want 1", w.DroppedDeletes("t"))
+	}
+}
+
+func TestAppendModeOnDeleteSkip(t *testing.T) {
+	fc := &fakeCommitter{}
+	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
+	w.RegisterCommitter("t", fc, change.AppendMode)
+	w.SetDropDeletes("t", true)
+
+	ingest := make(chan change.Change, 4)
+	ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{1},
+		After: map[string]any{"id": int64(1), "v": "a"}, Position: "p1"}
+	ingest <- change.Change{Op: change.OpDelete, Table: "t", Key: []any{2},
+		Before: map[string]any{"id": int64(2), "v": "gone"}, Position: "p2"}
+	close(ingest)
+	if err := w.Run(context.Background(), ingest); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	b := fc.batches[0]
+	if len(b.Upserts) != 1 {
+		t.Fatalf("upserts = %d, want 1 — skip drops even a before-image delete", len(b.Upserts))
+	}
+	if w.DroppedDeletes("t") != 1 {
+		t.Fatalf("DroppedDeletes = %d, want 1", w.DroppedDeletes("t"))
+	}
+}

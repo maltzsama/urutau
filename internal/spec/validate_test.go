@@ -247,3 +247,80 @@ func TestValidateBootstrapStartAt(t *testing.T) {
 		t.Fatalf("want startAt problem, got %v", err)
 	}
 }
+
+// 28.1: kafka append-only needs no primary key; upsert does.
+func TestValidateKafkaPrimaryKeyByMode(t *testing.T) {
+	s := validSpec()
+	s.Source.Kind = "kafka"
+	s.Tables[0].WriteMode = WriteModeAppend
+	s.Tables[0].PrimaryKey = nil
+	s.Tables[0].OnDelete = OnDeleteSkip
+	s.Tables[0].Columns = map[string]string{"id": "string"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("kafka append without primaryKey must validate: %v", err)
+	}
+	// upsert requires the key + partitionedByPrimaryKey assertion.
+	s.Tables[0].WriteMode = ""
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "partitionedByPrimaryKey") {
+		t.Fatalf("want partitionedByPrimaryKey problem for kafka upsert, got %v", err)
+	}
+	s.Source.PartitionedByPrimaryKey = true
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "primaryKey") {
+		t.Fatalf("want primaryKey problem for kafka upsert without key, got %v", err)
+	}
+	s.Tables[0].PrimaryKey = []string{"id"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("kafka upsert with key + partitioned assertion must validate: %v", err)
+	}
+}
+
+// 28.2: kafka append-only must declare onDelete: skip (no before image).
+func TestValidateKafkaAppendOnDelete(t *testing.T) {
+	s := validSpec()
+	s.Source.Kind = "kafka"
+	s.Tables[0].WriteMode = WriteModeAppend
+	s.Tables[0].PrimaryKey = nil
+	s.Tables[0].Columns = map[string]string{"id": "string"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "onDelete") {
+		t.Fatalf("want onDelete problem for kafka append, got %v", err)
+	}
+	s.Tables[0].OnDelete = OnDeleteSkip
+	if err := s.Validate(); err != nil {
+		t.Fatalf("kafka append with onDelete: skip must validate: %v", err)
+	}
+}
+
+// 30: append-idempotent needs a monotonic-sequence source (kafka) and a
+// transport identity that includes the message coordinate.
+func TestValidateAppendIdempotent(t *testing.T) {
+	s := validSpec()
+	s.Source.Kind = "kafka"
+	s.Tables[0].WriteMode = WriteModeAppendIdempotent
+	s.Tables[0].PrimaryKey = nil
+	s.Tables[0].Columns = map[string]string{"payload": "string"}
+	s.Tables[0].OnDelete = OnDeleteSkip
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: core.MetaStream, As: "stream_name"},
+		{From: core.MetaShard, As: "partition"},
+		{From: core.MetaSeq, As: "offset"},
+	}
+	// No identity -> rejected.
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "identity") {
+		t.Fatalf("want identity problem, got %v", err)
+	}
+	// Identity without a coordinate (stream only) -> rejected.
+	s.Tables[0].Identity = []string{"stream_name"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "shard or sequence") {
+		t.Fatalf("want coordinate problem, got %v", err)
+	}
+	// Valid identity -> accepted.
+	s.Tables[0].Identity = []string{"partition", "offset"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("append-idempotent with transport identity must validate: %v", err)
+	}
+	// Identity pointing at a data column -> rejected.
+	s.Tables[0].Identity = []string{"payload"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "transport metadata") {
+		t.Fatalf("want transport-metadata problem, got %v", err)
+	}
+}

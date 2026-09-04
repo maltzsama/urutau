@@ -45,6 +45,16 @@ func (s *Spec) Validate() error {
 	if s.Source.Kind == "postgres" && s.Source.SlotName == "" {
 		problems = append(problems, "source.slotName: required for postgres (logical replication slot)")
 	}
+	// Decoder format: raw is a message-log landing mode (kafka only) and it
+	// has no upsert semantics — every message is an insert.
+	switch s.Source.Format {
+	case "", "debezium", "raw":
+	default:
+		problems = append(problems, fmt.Sprintf("source.format: unsupported %q (want debezium | raw)", s.Source.Format))
+	}
+	if s.Source.Format == "raw" && s.Source.Kind != "kafka" {
+		problems = append(problems, "source.format: raw is only valid for kind kafka")
+	}
 	if s.Source.URI == "" {
 		problems = append(problems, "source.uri: required")
 	}
@@ -90,17 +100,45 @@ func (s *Spec) Validate() error {
 		if mode == "" {
 			mode = WriteModeUpsert // upsert-first: reflecting state is the default
 		}
-		switch mode {
-		case WriteModeUpsert:
+		isAppend := mode == WriteModeAppend || mode == WriteModeAppendIdempotent
+		switch {
+		case mode == WriteModeUpsert:
 			if len(tbl.PrimaryKey) == 0 {
 				problems = append(problems, p+".primaryKey: required when writeMode is upsert")
 			}
-		case WriteModeAppend:
+		case isAppend:
 			if tbl.Filter != nil && !tbl.FilterImmutable {
 				problems = append(problems, p+".filterImmutable: required when writeMode is append and a filter is set")
 			}
+			// Append-only delete semantics are declared, never inferred. A
+			// source that carries no before image on deletes (Kafka
+			// tombstones) can only skip; recording is impossible.
+			switch tbl.OnDelete {
+			case "", OnDeleteRecord:
+				if s.Source.Kind == "kafka" {
+					problems = append(problems, p+".onDelete: kafka carries no before image on deletes — set onDelete: skip for append-only")
+				}
+			case OnDeleteSkip:
+			default:
+				problems = append(problems, fmt.Sprintf("%s.onDelete: unsupported %q (want skip | record)", p, tbl.OnDelete))
+			}
+			if mode == WriteModeAppendIdempotent {
+				validateIdentity(tbl, s.Source.Kind, p, &problems)
+			}
 		default:
 			problems = append(problems, fmt.Sprintf("%s.writeMode: unsupported %q", p, mode))
+		}
+
+		// Kafka only orders within a partition: an upsert across partitions
+		// could silently apply a stale version of a key. The operator must
+		// assert the topics are partitioned by the key.
+		if s.Source.Kind == "kafka" && mode == WriteModeUpsert && !s.Source.PartitionedByPrimaryKey {
+			problems = append(problems, p+".primaryKey: kafka upsert requires source.partitionedByPrimaryKey — the topics must be partitioned by the key, or the same key in different partitions applies stale versions silently")
+		}
+		// Raw landing is append-only: there is no update or delete, the log
+		// is the data.
+		if s.Source.Format == "raw" && mode == WriteModeUpsert {
+			problems = append(problems, p+".writeMode: source.format is raw — raw landing is append-only, set writeMode: append")
 		}
 
 		validateFilter(tbl.Filter, p+".filter", &problems)
@@ -124,6 +162,12 @@ var validMetadataKeys = map[core.MetadataKey]bool{
 	core.MetaPosition:    true,
 	core.MetaSourceTable: true,
 	core.MetaPhase:       true,
+	core.MetaStream:      true,
+	core.MetaShard:       true,
+	core.MetaSeq:         true,
+	core.MetaMsgTS:       true,
+	core.MetaMsgKey:      true,
+	core.MetaHeaders:     true,
 }
 
 // validateMetadata checks the closed metadata rules: catalog membership,
@@ -133,7 +177,7 @@ func validateMetadata(tbl Table, path string, problems *[]string) {
 	seen := map[string]bool{}
 	for _, m := range tbl.Metadata {
 		if !validMetadataKeys[m.From] {
-			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: op, commit_ts, ingest_ts, position, source_table, phase)", path, m.From))
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: op, commit_ts, ingest_ts, position, source_table, phase, stream, shard, sequence, msg_ts, msg_key, headers)", path, m.From))
 		}
 		if m.As == "" {
 			*problems = append(*problems, fmt.Sprintf("%s.metadata.as: required", path))
@@ -190,6 +234,45 @@ func validatePartitionBy(tbl Table, path string, problems *[]string) {
 					"%s.partitionBy: %q: bucket/truncate size must be > 0", path, expr))
 			}
 		}
+	}
+}
+
+// validateIdentity checks the append-idempotent identity: it must be
+// transport metadata (stream/shard/sequence), not content, and it must
+// include the uniquely-identifying coordinate (shard or sequence) — the
+// guarantee comes from the transport, never from a data column. Only a
+// source with a monotonic per-message sequence (kafka) qualifies.
+func validateIdentity(tbl Table, kind string, path string, problems *[]string) {
+	if kind != "kafka" {
+		*problems = append(*problems, path+".writeMode: append-idempotent requires a source with a monotonic per-message sequence (kafka)")
+		return
+	}
+	if len(tbl.Identity) == 0 {
+		*problems = append(*problems, path+".identity: required when writeMode is append-idempotent")
+		return
+	}
+	// Destination names of the transport metadata columns, and data columns.
+	transportAs := map[string]core.MetadataKey{}
+	for _, m := range tbl.Metadata {
+		switch m.From {
+		case core.MetaStream, core.MetaShard, core.MetaSeq:
+			transportAs[m.As] = m.From
+		}
+	}
+	hasCoordinate := false
+	for _, name := range tbl.Identity {
+		from, ok := transportAs[name]
+		if !ok {
+			*problems = append(*problems, fmt.Sprintf(
+				"%s.identity: %q is not a transport metadata column (stream/shard/sequence) — the identity must be transport, never content", path, name))
+			continue
+		}
+		if from == core.MetaShard || from == core.MetaSeq {
+			hasCoordinate = true
+		}
+	}
+	if !hasCoordinate {
+		*problems = append(*problems, path+".identity: must include shard or sequence — the transport coordinate that uniquely identifies a message")
 	}
 }
 

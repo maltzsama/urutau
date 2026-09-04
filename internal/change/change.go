@@ -47,6 +47,24 @@ type Change struct {
 	// Window tags the change as part of a DBLog snapshot window. Nil for
 	// plain stream events.
 	Window *Window
+	// Transport is the message-queue envelope when the event came from a
+	// message log (Kafka today, Kinesis next). CDC sources leave it nil and
+	// their transport metadata (stream = source table, sequence = position)
+	// is derived at projection time.
+	Transport *Transport
+}
+
+// Transport is the envelope of a message-log event. The coordinate names
+// are deliberately transport-neutral so Kafka, Kinesis, NATS and Pulsar fit
+// without renaming. Shard and Seq are strings because a Kinesis sequence
+// number is a decimal too large for int64.
+type Transport struct {
+	Stream  string // topic / stream name
+	Shard   string // partition / shard id
+	Seq     string // offset / sequence number
+	MsgTS   time.Time
+	MsgKey  string
+	Headers string // JSON-serialized headers
 }
 
 // Window carries DBLog snapshot-window signaling on a change. The runner

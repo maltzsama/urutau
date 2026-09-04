@@ -7,6 +7,15 @@ package core
 import "fmt"
 
 // Kind is the canonical scalar type.
+//
+// The system is intentionally scalar-only today. Composite types are
+// deferred debt: Iceberg supports struct/list/map natively, and the first
+// real Avro/Protobuf-with-schema-registry landing will need them (headers
+// as a native map is the current workaround — JSON in a string). A
+// non-scalar Kind is not a new enum value but a new dimension of the model:
+// it touches the cast matrix, the Arrow mapping, Iceberg schema generation,
+// the wire format, and schema comparison. Reopen only on a real demand for
+// nested typed landing, not on convenience.
 type Kind uint8
 
 const (
