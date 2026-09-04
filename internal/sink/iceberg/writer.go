@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,17 +42,17 @@ var ErrCommitExhausted = errors.New("iceberg: commit retries exhausted")
 // caller (the worker dedicates one committer goroutine per table, which is
 // the design's serialization invariant).
 type TableWriter struct {
-	cat           *rest.Catalog
-	ident         table.Identifier
-	eqIDs         []int
-	dataSchema    *arrow.Schema
-	delSchema     *arrow.Schema
-	delCols       []string
-	maxTries      int
-	backoff       time.Duration
-	cast          core.CastPolicy
-	metaByName    map[string]core.MetadataColumn
-	sourceTable   string
+	cat             *rest.Catalog
+	ident           table.Identifier
+	eqIDs           []int
+	dataSchema      *arrow.Schema
+	delSchema       *arrow.Schema
+	delCols         []string
+	maxTries        int
+	backoff         time.Duration
+	cast            core.CastPolicy
+	metaByName      map[string]core.MetadataColumn
+	sourceTable     string
 	recordBatchSize int64
 }
 
@@ -161,28 +162,36 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
 		if attempt > 0 {
-			if err := sleepCtx(ctx, w.backoff*time.Duration(attempt)); err != nil {
+			if err := sleepCtx(ctx, backoffDuration(w.backoff, attempt)); err != nil {
 				return err
 			}
 		}
 		tbl, err := w.cat.LoadTable(ctx, w.ident) // fresh metadata every attempt
 		if err != nil {
-			return err
+			if !isRetryableError(err) {
+				return err
+			}
+			lastErr = err
+			continue
 		}
 		txn := tbl.NewTransaction()
 		files, err := txn.WriteEqualityDeletes(ctx, w.eqIDs, oneBatch(rec))
 		if err != nil {
-			return err // non-conflict errors are terminal
+			if !isRetryableError(err) {
+				return err
+			}
+			lastErr = err
+			continue
 		}
 		if len(files) == 0 {
 			return nil
 		}
 		if err := txn.NewRowDelta(props(pos)).AddDeletes(files...).Commit(ctx); err != nil {
-			if errors.Is(err, table.ErrCommitFailed) {
-				lastErr = err
-				continue
+			if !isRetryableError(err) {
+				return err
 			}
-			return err
+			lastErr = err
+			continue
 		}
 		if pos != "" {
 			if err := txn.SetProperties(props(pos)); err != nil {
@@ -190,11 +199,11 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			}
 		}
 		if _, err := txn.Commit(ctx); err != nil {
-			if errors.Is(err, table.ErrCommitFailed) {
-				lastErr = err
-				continue
+			if !isRetryableError(err) {
+				return err
 			}
-			return err
+			lastErr = err
+			continue
 		}
 		return nil
 	}
@@ -213,27 +222,35 @@ func (w *TableWriter) commitAppend(ctx context.Context, upserts []change.Change,
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
 		if attempt > 0 {
-			if err := sleepCtx(ctx, w.backoff*time.Duration(attempt)); err != nil {
+			if err := sleepCtx(ctx, backoffDuration(w.backoff, attempt)); err != nil {
 				return err
 			}
 		}
 		tbl, err := w.cat.LoadTable(ctx, w.ident)
 		if err != nil {
-			return err
+			if !isRetryableError(err) {
+				return err
+			}
+			lastErr = err
+			continue
 		}
 		txn := tbl.NewTransaction()
 		if err := txn.AppendTable(ctx, at, w.recordBatchSize, props(pos)); err != nil {
-			return err
+			if !isRetryableError(err) {
+				return err
+			}
+			lastErr = err
+			continue
 		}
 		if err := txn.SetProperties(props(pos)); err != nil {
 			return err
 		}
 		if _, err := txn.Commit(ctx); err != nil {
-			if errors.Is(err, table.ErrCommitFailed) {
-				lastErr = err
-				continue
+			if !isRetryableError(err) {
+				return err
 			}
-			return err
+			lastErr = err
+			continue
 		}
 		return nil
 	}
@@ -362,6 +379,38 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+// backoffDuration computes exponential backoff with jitter: base * 2^attempt
+// clamped to 30s, plus 0-25% jitter. Jitter prevents synchronized retries
+// across N workers hitting the same table.
+func backoffDuration(base time.Duration, attempt int) time.Duration {
+	d := base * (1 << min(attempt, 7)) // cap at 2^7 = 128x
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	// Add 0-25% jitter.
+	jitter := time.Duration(rand.Int64N(int64(d) / 4))
+	return d + jitter
+}
+
+// isRetryableError classifies an error as transient (retryable) or
+// terminal. I/O and HTTP 5xx errors from the object store or catalog
+// are transient; schema, type, and 4xx errors are terminal.
+func isRetryableError(err error) bool {
+	if errors.Is(err, table.ErrCommitFailed) {
+		return true
+	}
+	s := err.Error()
+	// HTTP 5xx or network errors from REST catalog or S3.
+	if strings.Contains(s, "500") || strings.Contains(s, "502") ||
+		strings.Contains(s, "503") || strings.Contains(s, "504") ||
+		strings.Contains(s, "connection refused") || strings.Contains(s, "EOF") ||
+		strings.Contains(s, "i/o timeout") || strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "reset by peer") {
+		return true
+	}
+	return false
 }
 
 // deleteRecord builds one arrow record with the primary key tuples.
