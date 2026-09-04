@@ -467,6 +467,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			mode = change.AppendMode
 		}
 		w.Register(target, wr, mode)
+		if mode == change.AppendMode && specByTarget[target].OnDelete == spec.OnDeleteSkip {
+			w.SetDropDeletes(target, true)
+		}
 		// The drift check knows the introspected column set per table.
 		if cs := canonicalByTarget(canonical, refs, target); len(cs) > 0 {
 			w.SetKnownColumns(target, cs)
@@ -479,6 +482,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			"action", "declare the column in the spec and resume")
 		r.emit(eventlog.KindSchemaDrift, map[string]any{
 			"table": d.Table, "column": d.Column, "kind": d.Kind,
+		})
+	})
+	w.OnDroppedDelete(func(table, pos string) {
+		log.Warn("append-only delete dropped", "table", table, "position", pos,
+			"action", "the source carried no before image or the table declares onDelete: skip")
+		r.emit(eventlog.KindDeleteDropped, map[string]any{
+			"table": table, "position": pos,
 		})
 	})
 	w.OnCommit(func(b change.Batch, rows int) {

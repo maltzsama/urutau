@@ -33,6 +33,13 @@ type Source struct {
 	SnapshotMode  string `json:"snapshotMode,omitempty"`
 	BootstrapAdds string `json:"bootstrapServers,omitempty"`
 	GroupID       string `json:"groupId,omitempty"`
+	// PartitionedByPrimaryKey declares the Kafka topics are partitioned by
+	// the key, so ordering (and thus upsert correctness) holds within a
+	// key. Kafka only orders inside a partition: if the same key landed in
+	// different partitions, an upsert could apply a stale version silently.
+	// The engine cannot verify this — it must be a conscious operator
+	// assertion. Required for writeMode: upsert on a Kafka source.
+	PartitionedByPrimaryKey bool `json:"partitionedByPrimaryKey,omitempty"`
 }
 
 type Sink struct {
@@ -57,6 +64,7 @@ type Table struct {
 	PartitionBy       []string  `json:"partitionBy,omitempty"`
 	Filter            *Filter   `json:"filter,omitempty"`
 	WriteMode         WriteMode `json:"writeMode,omitempty"`
+	OnDelete          OnDelete  `json:"onDelete,omitempty"`
 	Worker            string    `json:"worker,omitempty"`
 	CreateIfNotExists bool      `json:"createIfNotExists,omitempty"`
 	FilterImmutable   bool      `json:"filterImmutable,omitempty"`
@@ -75,6 +83,22 @@ type Table struct {
 	// Bootstrap configures how the initial snapshot is handled.
 	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
 }
+
+// OnDelete declares how a DELETE is represented in append-only tables
+// (writeMode: append). Upsert tables never see this — deletes remove rows.
+type OnDelete string
+
+const (
+	// OnDeleteRecord appends the deleted row from its before-image. Only
+	// valid for sources that carry a before image on deletes; a delete with
+	// no before image is dropped and counted, never written as an all-null
+	// row.
+	OnDeleteRecord OnDelete = "record"
+	// OnDeleteSkip drops deletes entirely — the right choice for pure event
+	// streams (Kafka tombstones have no image to record) and for sources
+	// without a before image.
+	OnDeleteSkip OnDelete = "skip"
+)
 
 // BootstrapMode controls how the initial data load is performed.
 type BootstrapMode string

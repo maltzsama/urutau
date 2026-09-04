@@ -34,11 +34,13 @@ type Source struct {
 // Caps reports Kafka capabilities: streaming only, no DBLog snapshot.
 func (s Source) Caps() srctypes.Capabilities {
 	return srctypes.Capabilities{
-		Snapshot:       false,
-		ChunkQuery:     false,
-		Stream:         true,
-		MaxConnections: 0, // no query connections at all
-		Modes:          []srctypes.Mode{srctypes.ModeCDC},
+		Snapshot:          false,
+		ChunkQuery:        false,
+		Stream:            true,
+		MaxConnections:    0, // no query connections at all
+		Modes:             []srctypes.Mode{srctypes.ModeCDC},
+		BeforeImage:       false, // deletes are tombstones (null) — no image to record
+		MonotonicSequence: true,  // (partition, offset) never reappears
 	}
 }
 
@@ -55,11 +57,15 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 			fmt.Errorf("kafka: table %q requires columns in spec", t.Source)
 	}
 
-	pk := t.PrimaryKey
-	if len(pk) == 0 {
-		return core.TableRef{}, core.Schema{}, nil, nil,
-			fmt.Errorf("kafka: table %q requires primaryKey", t.Source)
+	mode := t.WriteMode
+	if mode == "" {
+		mode = spec.WriteModeUpsert // upsert-first: reflecting state is the default
 	}
+	if len(t.PrimaryKey) == 0 && mode != spec.WriteModeAppend {
+		return core.TableRef{}, core.Schema{}, nil, nil,
+			fmt.Errorf("kafka: table %q requires primaryKey for writeMode=upsert", t.Source)
+	}
+	pk := t.PrimaryKey
 
 	// The spec declares columns as a map, which carries no order — iterate
 	// sorted so every boot resolves the same column order. Downstream

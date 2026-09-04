@@ -99,8 +99,27 @@ func (s *Spec) Validate() error {
 			if tbl.Filter != nil && !tbl.FilterImmutable {
 				problems = append(problems, p+".filterImmutable: required when writeMode is append and a filter is set")
 			}
+			// Append-only delete semantics are declared, never inferred. A
+			// source that carries no before image on deletes (Kafka
+			// tombstones) can only skip; recording is impossible.
+			switch tbl.OnDelete {
+			case "", OnDeleteRecord:
+				if s.Source.Kind == "kafka" {
+					problems = append(problems, p+".onDelete: kafka carries no before image on deletes — set onDelete: skip for append-only")
+				}
+			case OnDeleteSkip:
+			default:
+				problems = append(problems, fmt.Sprintf("%s.onDelete: unsupported %q (want skip | record)", p, tbl.OnDelete))
+			}
 		default:
 			problems = append(problems, fmt.Sprintf("%s.writeMode: unsupported %q", p, mode))
+		}
+
+		// Kafka only orders within a partition: an upsert across partitions
+		// could silently apply a stale version of a key. The operator must
+		// assert the topics are partitioned by the key.
+		if s.Source.Kind == "kafka" && mode == WriteModeUpsert && !s.Source.PartitionedByPrimaryKey {
+			problems = append(problems, p+".primaryKey: kafka upsert requires source.partitionedByPrimaryKey — the topics must be partitioned by the key, or the same key in different partitions applies stale versions silently")
 		}
 
 		validateFilter(tbl.Filter, p+".filter", &problems)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
@@ -28,12 +29,18 @@ type Config struct {
 // OnCommit observes successful commits (bookkeeping, tests).
 type OnCommit func(b change.Batch, rows int)
 
+// OnDroppedDelete observes a DELETE that append-only dropped: either the
+// table declared onDelete: skip, or onDelete: record could not because the
+// source carried no before image for that message.
+type OnDroppedDelete func(table, pos string)
+
 type Worker struct {
-	cfg         Config
-	onCommit    OnCommit
-	schemaDrift func(SchemaDrift)
-	tables      map[string]*tablePipeline
-	metrics     *observability.Metrics
+	cfg             Config
+	onCommit        OnCommit
+	onDroppedDelete OnDroppedDelete
+	schemaDrift     func(SchemaDrift)
+	tables          map[string]*tablePipeline
+	metrics         *observability.Metrics
 }
 
 type tablePipeline struct {
@@ -41,6 +48,14 @@ type tablePipeline struct {
 	committer sink.TableWriter
 	mode      change.WriteMode
 	ch        chan change.Change
+
+	// appendDropDeletes implements onDelete: skip — every DELETE in an
+	// append-only table is dropped (counted) instead of appended from its
+	// before image.
+	appendDropDeletes bool
+	// droppedDeletes counts deletes dropped in append mode (skip or a
+	// record that had no before image). Read cross-goroutine.
+	droppedDeletes atomic.Int64
 
 	// readyCh carries collapsed batches from the batcher to the committer.
 	// This decouples collapse (CPU) from commit (I/O): while batch N is
@@ -123,6 +138,26 @@ func (w *Worker) Register(target string, c sink.TableWriter, mode change.WriteMo
 // contract as Register).
 func (w *Worker) RegisterCommitter(target string, c sink.TableWriter, mode change.WriteMode) {
 	w.tables[target] = newTablePipeline(target, c, mode)
+}
+
+// OnDroppedDelete installs the observer for deletes that append-only
+// dropped (declared skip, or a record with no before image).
+func (w *Worker) OnDroppedDelete(f OnDroppedDelete) { w.onDroppedDelete = f }
+
+// SetDropDeletes implements onDelete: skip — deletes in an append-only
+// table are dropped and counted, never appended from a before image.
+func (w *Worker) SetDropDeletes(target string, drop bool) {
+	if p := w.tables[target]; p != nil {
+		p.appendDropDeletes = drop
+	}
+}
+
+// DroppedDeletes reports how many deletes append-only dropped for a table.
+func (w *Worker) DroppedDeletes(target string) int64 {
+	if p := w.tables[target]; p != nil {
+		return p.droppedDeletes.Load()
+	}
+	return 0
 }
 
 func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) *tablePipeline {
@@ -424,6 +459,32 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			upserts := make([]change.Change, 0, len(buf))
 			for _, c := range buf {
 				if c.Op == change.OpDelete {
+					// onDelete: skip — the delete is a fact only its absence
+					// records. Drop and count.
+					if p.appendDropDeletes {
+						p.droppedDeletes.Add(1)
+						if w.metrics != nil {
+							w.metrics.DeletesDropped.WithLabelValues(p.target).Inc()
+						}
+						if w.onDroppedDelete != nil {
+							w.onDroppedDelete(p.target, c.Position)
+						}
+						continue
+					}
+					// onDelete: record — appends the deleted row from its
+					// before image. A delete with NO before image (Kafka
+					// tombstone, source without the image) must never write
+					// an all-null row: it is dropped and counted instead.
+					if len(c.Before) == 0 {
+						p.droppedDeletes.Add(1)
+						if w.metrics != nil {
+							w.metrics.DeletesDropped.WithLabelValues(p.target).Inc()
+						}
+						if w.onDroppedDelete != nil {
+							w.onDroppedDelete(p.target, c.Position)
+						}
+						continue
+					}
 					c.After = c.Before
 				}
 				upserts = append(upserts, c)
