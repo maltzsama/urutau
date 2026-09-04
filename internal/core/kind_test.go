@@ -93,10 +93,11 @@ func TestKindEnumIsClosed(t *testing.T) {
 		KindUnknown, KindBool, KindInt32, KindInt64, KindFloat32, KindFloat64,
 		KindDecimal, KindString, KindBinary, KindFixedBinary, KindDate, KindTime,
 		KindTimestamp, KindTimestampTZ, KindUUID, KindJSON,
+		KindStruct, KindList, KindMap,
 	}
-	if len(want) != int(KindJSON)+1 {
+	if len(want) != int(KindMap)+1 {
 		t.Fatalf("Kind set grew to %d entries without a documented decision; every addition needs a source and a sink",
-			int(KindJSON)+1)
+			int(KindMap)+1)
 	}
 	for i, k := range want {
 		if Kind(i) != k {

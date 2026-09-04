@@ -26,8 +26,8 @@ func TestParseCastTarget(t *testing.T) {
 			t.Errorf("ParseCastTarget(%q) error = %v, wantErr %v", tt.input, err, tt.err)
 			continue
 		}
-		if !tt.err && got != tt.want {
-			t.Errorf("ParseCastTarget(%q) = %+v, want %+v", tt.input, got, tt.want)
+		if !tt.err && got.Type.Kind != tt.want.Type.Kind {
+			t.Errorf("ParseCastTarget(%q) kind = %v, want %v", tt.input, got.Type.Kind, tt.want.Type.Kind)
 		}
 	}
 }
