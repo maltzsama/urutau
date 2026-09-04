@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/apache/iceberg-go"
 )
 
 // SnapshotState is the durable state machine for the DBLog snapshot phase.
@@ -55,8 +53,10 @@ func (sp *SnapshotProgress) HasPending() bool {
 	return len(sp.Pending) > 0
 }
 
-// ReadSnapshotProgress reads snapshot state from Iceberg table properties.
-func ReadSnapshotProgress(props iceberg.Properties) (*SnapshotProgress, error) {
+// ReadSnapshotProgress reads snapshot state from table properties. The
+// plain map type keeps this source-side package free of the sink library
+// (the architecture wall); iceberg.Properties is assignable to it.
+func ReadSnapshotProgress(props map[string]string) (*SnapshotProgress, error) {
 	sp := &SnapshotProgress{
 		State: StateComplete, // default: no snapshot in progress
 	}
@@ -104,10 +104,10 @@ func ReadSnapshotProgress(props iceberg.Properties) (*SnapshotProgress, error) {
 	return sp, nil
 }
 
-// EncodeSnapshotProgress serializes snapshot progress into Iceberg
-// table properties.
-func EncodeSnapshotProgress(sp *SnapshotProgress) iceberg.Properties {
-	props := iceberg.Properties{
+// EncodeSnapshotProgress serializes snapshot progress into table
+// properties (the caller passes it to the sink's property writer).
+func EncodeSnapshotProgress(sp *SnapshotProgress) map[string]string {
+	props := map[string]string{
 		PropSnapshotState: string(sp.State),
 	}
 	if sp.State == StateComplete || sp.State == StateNotStarted {
@@ -172,9 +172,8 @@ func RemoveFromPending(pending []uint32, chunkID uint32) []uint32 {
 }
 
 // SnapshotStateForTable reads the snapshot progress for a given table
-// from Iceberg properties. Returns a completed snapshot if no state is
-// stored.
-func SnapshotStateForTable(props iceberg.Properties) (*SnapshotProgress, error) {
+// from its properties. Returns a completed snapshot if no state is stored.
+func SnapshotStateForTable(props map[string]string) (*SnapshotProgress, error) {
 	return ReadSnapshotProgress(props)
 }
 
