@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -314,3 +315,217 @@ func TestWebhookRejectsEmptyOrAmbiguousDefinition(t *testing.T) {
 }
 
 var _ = client.IgnoreNotFound
+
+// 27.1: deleting a terminated pipeline must complete — the finalizer must
+// not be trapped behind the terminated short-circuit.
+func TestReconcilerDeleteTerminatedPipeline(t *testing.T) {
+	requireEnvtest(t)
+	nsName := "test-delterm-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	_ = cli.Create(testCtx, ns)
+
+	cr := pipelineCR("dead", nsName)
+	if err := cli.Create(testCtx, cr); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+	waitForSTS(t, nsName, "dead-coordinator")
+
+	// Terminate it first.
+	fresh := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh); err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
+	if err := cli.Status().Update(testCtx, fresh); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+
+	// Delete: the finalizer must be removed and the CR must go away.
+	if err := cli.Delete(testCtx, cr); err != nil {
+		t.Fatalf("delete CR: %v", err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		gone := &urutauv1alpha1.CDCPipeline{}
+		err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, gone)
+		if apierrors.IsNotFound(err) {
+			return // finalizer released; object gone
+		}
+		if err != nil {
+			t.Fatalf("get CR during delete: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("terminated pipeline stuck in Terminating: finalizer was not removed")
+}
+
+// 27.2 + 27.6: a spec change propagates to the StatefulSet (declarative
+// CRD) and the observed generation/spec hash are recorded.
+func TestReconcilerSpecUpdatePropagates(t *testing.T) {
+	requireEnvtest(t)
+	nsName := "test-upd-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	_ = cli.Create(testCtx, ns)
+
+	cr := pipelineCR("orders", nsName)
+	cr.Spec.Coordinator.Snapshot.ChunkSize = 500
+	if err := cli.Create(testCtx, cr); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+	sts := waitForSTS(t, nsName, "orders-coordinator")
+	cmd := strings.Join(sts.Spec.Template.Spec.Containers[0].Command, " ")
+	if !strings.Contains(cmd, "--chunk-size 500") {
+		t.Fatalf("initial command = %q, want --chunk-size 500", cmd)
+	}
+
+	// Change the spec; the reconciler must update the workload.
+	fresh := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "orders", Namespace: nsName}, fresh); err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	fresh.Spec.Coordinator.Snapshot.ChunkSize = 700
+	if err := cli.Update(testCtx, fresh); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		cur := &appsv1.StatefulSet{}
+		if err := cli.Get(testCtx, types.NamespacedName{Name: "orders-coordinator", Namespace: nsName}, cur); err == nil {
+			cmd = strings.Join(cur.Spec.Template.Spec.Containers[0].Command, " ")
+			if strings.Contains(cmd, "--chunk-size 700") {
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !strings.Contains(cmd, "--chunk-size 700") {
+		t.Fatalf("command after spec update = %q, want --chunk-size 700 — the CR is not declarative", cmd)
+	}
+
+	// observedGeneration must eventually match.
+	obs := &urutauv1alpha1.CDCPipeline{}
+	for i := 0; i < 50; i++ {
+		_ = cli.Get(testCtx, types.NamespacedName{Name: "orders", Namespace: nsName}, obs)
+		if obs.Status.ObservedGeneration == obs.Generation && obs.Status.ObservedGeneration != 0 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if obs.Status.ObservedGeneration == 0 {
+		t.Fatal("observedGeneration never recorded")
+	}
+}
+
+// 27.4: an unrunnable definition (no inline) terminates the pipeline with a
+// reason instead of requeueing forever.
+func TestReconcilerInvalidSpecTerminates(t *testing.T) {
+	requireEnvtest(t)
+	nsName := "test-inv-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	_ = cli.Create(testCtx, ns)
+
+	cr := pipelineCR("bad", nsName)
+	cr.Spec.Definition.Inline = nil
+	if err := cli.Create(testCtx, cr); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		fresh := &urutauv1alpha1.CDCPipeline{}
+		err := cli.Get(testCtx, types.NamespacedName{Name: "bad", Namespace: nsName}, fresh)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("get CR: %v", err)
+			}
+			time.Sleep(200 * time.Millisecond)
+			continue // cache not yet synced
+		}
+		if fresh.Status.Terminated != nil {
+			if fresh.Status.Terminated.Reason != "invalid_spec" {
+				t.Fatalf("terminated reason = %q, want invalid_spec", fresh.Status.Terminated.Reason)
+			}
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("invalid spec never reached the terminated state")
+}
+
+// 27.3: the service account is per pipeline and the role is scoped to its
+// own CR via resourceNames.
+func TestCoordinatorIdentityPerPipeline(t *testing.T) {
+	requireEnvtest(t)
+	nsName := "test-sa-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	_ = cli.Create(testCtx, ns)
+
+	cr := pipelineCR("orders", nsName)
+	if err := cli.Create(testCtx, cr); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+
+	// The coordinator pod runs as a per-pipeline service account.
+	sts := waitForSTS(t, nsName, "orders-coordinator")
+	wantSA := "orders-coordinator"
+	if got := sts.Spec.Template.Spec.ServiceAccountName; got != wantSA {
+		t.Fatalf("service account = %q, want per-pipeline %q", got, wantSA)
+	}
+	sa := &corev1.ServiceAccount{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: wantSA, Namespace: nsName}, sa); err != nil {
+		t.Fatalf("per-pipeline SA not created: %v", err)
+	}
+
+	// The role grants access only to this CR.
+	role := &rbacv1.Role{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "orders-coordinator", Namespace: nsName}, role); err != nil {
+		t.Fatalf("role not created: %v", err)
+	}
+	names := role.Rules[0].ResourceNames
+	if len(names) != 1 || names[0] != "orders" {
+		t.Fatalf("role resourceNames = %v, want [orders]", names)
+	}
+}
+
+// 27.5: OAuth2 secret keys are optional so a bearer-token catalog (no
+// client credentials) can start; uri stays required.
+func TestCoordinatorEnvOAuthKeysOptional(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Secrets = urutauv1alpha1.Secrets{Source: "mysql-creds", Catalog: "polaris-creds"}
+	env := coordinatorEnv(cr)
+
+	byName := map[string]corev1.EnvVar{}
+	for _, e := range env {
+		byName[e.Name] = e
+	}
+	uri := byName["URUTAU_SINK_URI"]
+	if uri.ValueFrom.SecretKeyRef.Optional != nil && *uri.ValueFrom.SecretKeyRef.Optional {
+		t.Fatal("URUTAU_SINK_URI must be required")
+	}
+	for _, k := range []string{"URUTAU_SINK_CLIENT_ID", "URUTAU_SINK_CLIENT_SECRET", "URUTAU_SINK_SCOPE"} {
+		e := byName[k]
+		if e.ValueFrom.SecretKeyRef.Optional == nil || !*e.ValueFrom.SecretKeyRef.Optional {
+			t.Fatalf("%s must be optional", k)
+		}
+	}
+}
+
+// waitForSTS polls until the named StatefulSet exists and returns it.
+func waitForSTS(t *testing.T, nsName, name string) *appsv1.StatefulSet {
+	t.Helper()
+	sts := &appsv1.StatefulSet{}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		err := cli.Get(testCtx, types.NamespacedName{Name: name, Namespace: nsName}, sts)
+		if err == nil {
+			return sts
+		}
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("get statefulset: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("statefulset %s was not created", name)
+	return nil
+}
