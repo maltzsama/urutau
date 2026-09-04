@@ -118,7 +118,7 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{CaughtUpPoll: time.Millisecond})
+		SnapshotConfig{CaughtUpPoll: time.Millisecond}, nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestSnapshotTableWithLSNPositions(t *testing.T) {
 	reader := &fakeReader{master: position.MustLSN("0/20"), early: position.MustLSN("0/10"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{CaughtUpPoll: time.Millisecond})
+		SnapshotConfig{CaughtUpPoll: time.Millisecond}, nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestSnapshotTableEmptySource(t *testing.T) {
 	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-1"), early: gt("1-1")}
 
-	err := SnapshotTable(context.Background(), &fakeSource{}, reader, relay, "raw.orders", SnapshotConfig{})
+	err := SnapshotTable(context.Background(), &fakeSource{}, reader, relay, "raw.orders", SnapshotConfig{}, nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 1 << 30}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{WindowTimeout: 50 * time.Millisecond, CaughtUpPoll: 5 * time.Millisecond})
+		SnapshotConfig{WindowTimeout: 50 * time.Millisecond, CaughtUpPoll: 5 * time.Millisecond}, nil)
 	if err == nil {
 		t.Fatal("stuck window must surface as an error, never close on a timer")
 	}
@@ -249,7 +249,7 @@ func TestSnapshotTableLagConvergesBeforeRelease(t *testing.T) {
 	reader := &fakeReader{master: gt("1-5"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{CaughtUpPoll: time.Millisecond})
+		SnapshotConfig{CaughtUpPoll: time.Millisecond}, nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}

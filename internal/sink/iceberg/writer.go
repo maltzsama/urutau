@@ -20,6 +20,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // ErrCommitExhausted marks a terminal commit failure: retries against the
@@ -138,25 +139,34 @@ func (w *TableWriter) Commit(ctx context.Context, b change.Batch) error {
 			if !hasUpserts {
 				pos = b.Position
 			}
-			if err := w.commitDeletes(ctx, keys, pos); err != nil {
+			if err := w.commitDeletes(ctx, keys, pos, b.SnapshotState, b.SnapshotPending); err != nil {
 				return err
 			}
 		}
 	}
 	if hasUpserts {
-		if err := w.commitAppend(ctx, b.Upserts, b.Position); err != nil {
+		if err := w.commitAppend(ctx, b); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos string) error {
+func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos string, snapshotState string, snapshotPending []uint32) error {
 	rec, err := w.deleteRecord(keys)
 	if err != nil {
 		return err
 	}
 	defer rec.Release()
+
+	// Build properties with snapshot state when present.
+	p := props(pos)
+	if snapshotState != "" {
+		p["cdc.snapshot.state"] = snapshotState
+	}
+	if snapshotPending != nil {
+		p["cdc.snapshot.pending"] = snapshot.EncodePending(snapshotPending)
+	}
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -187,7 +197,7 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			// (pos != "" means this is the last commit), still advance
 			// the position — there is nothing pending.
 			if pos != "" {
-				if err := txn.SetProperties(props(pos)); err != nil {
+				if err := txn.SetProperties(p); err != nil {
 					return err
 				}
 				if _, err := txn.Commit(ctx); err != nil {
@@ -200,7 +210,7 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			}
 			return nil
 		}
-		if err := txn.NewRowDelta(props(pos)).AddDeletes(files...).Commit(ctx); err != nil {
+		if err := txn.NewRowDelta(p).AddDeletes(files...).Commit(ctx); err != nil {
 			if !isRetryableError(err) {
 				return err
 			}
@@ -208,7 +218,7 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			continue
 		}
 		if pos != "" {
-			if err := txn.SetProperties(props(pos)); err != nil {
+			if err := txn.SetProperties(p); err != nil {
 				return err
 			}
 		}
@@ -224,14 +234,23 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	return fmt.Errorf("%w: delete commit on %v: %v", ErrCommitExhausted, w.ident, lastErr)
 }
 
-func (w *TableWriter) commitAppend(ctx context.Context, upserts []change.Change, pos string) error {
-	rec, err := w.dataRecord(upserts)
+func (w *TableWriter) commitAppend(ctx context.Context, b change.Batch) error {
+	rec, err := w.dataRecord(b.Upserts)
 	if err != nil {
 		return err
 	}
 	defer rec.Release()
 	at := array.NewTableFromRecords(rec.Schema(), []arrow.RecordBatch{rec})
 	defer at.Release()
+
+	// Build properties with snapshot state when present.
+	p := props(b.Position)
+	if b.SnapshotState != "" {
+		p["cdc.snapshot.state"] = b.SnapshotState
+	}
+	if b.SnapshotPending != nil {
+		p["cdc.snapshot.pending"] = snapshot.EncodePending(b.SnapshotPending)
+	}
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -249,14 +268,14 @@ func (w *TableWriter) commitAppend(ctx context.Context, upserts []change.Change,
 			continue
 		}
 		txn := tbl.NewTransaction()
-		if err := txn.AppendTable(ctx, at, w.recordBatchSize, props(pos)); err != nil {
+		if err := txn.AppendTable(ctx, at, w.recordBatchSize, p); err != nil {
 			if !isRetryableError(err) {
 				return err
 			}
 			lastErr = err
 			continue
 		}
-		if err := txn.SetProperties(props(pos)); err != nil {
+		if err := txn.SetProperties(p); err != nil {
 			return err
 		}
 		if _, err := txn.Commit(ctx); err != nil {
@@ -308,6 +327,24 @@ func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
 		}
 	}
 	return ""
+}
+
+// SetTableProperties writes arbitrary properties to an Iceberg table.
+// Used by adoption to mark snapshot complete without committing data.
+func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Identifier, props iceberg.Properties) error {
+	if len(props) == 0 {
+		return nil
+	}
+	tbl, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		return fmt.Errorf("iceberg: load %v: %w", ident, err)
+	}
+	txn := tbl.NewTransaction()
+	if err := txn.SetProperties(props); err != nil {
+		return err
+	}
+	_, err = txn.Commit(ctx)
+	return err
 }
 
 // EnsureTable creates the target table if absent. When the table already

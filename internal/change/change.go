@@ -106,4 +106,9 @@ type Batch struct {
 	Deletes  []Change
 	Position string
 	Mode     WriteMode
+	// SnapshotState is the durable snapshot state machine for resumable
+	// backfill. When non-empty, the writer persists it atomically with
+	// position.
+	SnapshotState   string
+	SnapshotPending []uint32 // chunk IDs still pending after this batch
 }

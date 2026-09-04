@@ -7,9 +7,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/internal/change"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/sink"
+	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // Config tunes batch accumulation.
@@ -54,6 +56,19 @@ type tablePipeline struct {
 	winMu   sync.Mutex
 	windows map[uint32]map[string]change.Change
 	dropped int64
+
+	// Snapshot state for resumable backfill. The snapshot state machine
+	// (not_started → in_progress → complete) and the pending chunk list
+	// are persisted atomically with position via the batch properties.
+	snapshotMu      sync.Mutex
+	snapshotState   string   // "not_started", "in_progress", "complete"
+	snapshotPending []uint32 // chunk IDs still to process
+
+	// bootstrapGuard tracks PKs touched by live events during the snapshot
+	// phase. Snapshot lines whose PK was never touched are written as pure
+	// appends (no equality delete), halving the write volume for initial
+	// backfill. Released when snapshot completes.
+	bootstrapGuard *bloom.BloomFilter
 }
 
 // readyBatch is a collapsed batch ready for commit.
@@ -94,12 +109,13 @@ func (w *Worker) RegisterCommitter(target string, c sink.TableWriter, mode chang
 
 func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) *tablePipeline {
 	return &tablePipeline{
-		target:    target,
-		committer: c,
-		mode:      mode,
-		ch:        make(chan change.Change, 1024),
-		readyCh:   make(chan readyBatch, 1),
-		windows:   map[uint32]map[string]change.Change{},
+		target:         target,
+		committer:      c,
+		mode:           mode,
+		ch:             make(chan change.Change, 1024),
+		readyCh:        make(chan readyBatch, 1),
+		windows:        map[uint32]map[string]change.Change{},
+		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
 	}
 }
 
@@ -136,6 +152,24 @@ func (w *Worker) DroppedByWindow(target string) int64 {
 	p.winMu.Lock()
 	defer p.winMu.Unlock()
 	return p.dropped
+}
+
+// SetSnapshotState sets the snapshot progress for a target table. The
+// batcher includes this state in every batch commit so it is persisted
+// atomically with position. When snapshot completes, the bloom filter is
+// released to free memory.
+func (w *Worker) SetSnapshotState(target string, state string, pending []uint32) {
+	p := w.tables[target]
+	if p == nil {
+		return
+	}
+	p.snapshotMu.Lock()
+	defer p.snapshotMu.Unlock()
+	p.snapshotState = state
+	p.snapshotPending = pending
+	if state == string(snapshot.StateComplete) {
+		p.bootstrapGuard = nil
+	}
 }
 
 // Run routes ingest to the per-table pipelines until the channel closes and
@@ -240,11 +274,75 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		if len(buf) == 0 {
 			return nil
 		}
+		pos := buf[len(buf)-1].Position
+
+		// During snapshot phase, separate snapshot lines into two groups:
+		// untouched PKs (pure append, no delete) and touched PKs (upsert
+		// with delete). This eliminates equality deletes for the initial
+		// backfill on an empty table.
+		p.snapshotMu.Lock()
+		inSnapshot := p.snapshotState == string(snapshot.StateInProgress)
+		guard := p.bootstrapGuard
+		p.snapshotMu.Unlock()
+
+		if inSnapshot && p.mode == change.UpsertMode {
+			// Partition: untouched snapshot lines go as pure append;
+			// everything else (live events + touched snapshot lines)
+			// goes as normal upsert.
+			var untouched []change.Change
+			var rest []change.Change
+			for _, c := range buf {
+				if c.Snapshot && !guard.TestAndAddString(change.KeyString(c.Key)) {
+					untouched = append(untouched, c)
+				} else {
+					rest = append(rest, c)
+				}
+			}
+			// Send untouched as append-only batch (no equality delete).
+			if len(untouched) > 0 {
+				ab := change.Batch{
+					Table:    p.target,
+					Upserts:  untouched,
+					Position: pos,
+					Mode:     change.AppendMode,
+				}
+				p.snapshotMu.Lock()
+				ab.SnapshotState = p.snapshotState
+				ab.SnapshotPending = p.snapshotPending
+				p.snapshotMu.Unlock()
+				select {
+				case p.readyCh <- readyBatch{batch: ab, rows: len(untouched)}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			// Send rest as normal upsert batch.
+			if len(rest) > 0 {
+				collapsed := change.Collapse(rest)
+				b := change.Batch{
+					Table:    p.target,
+					Upserts:  collapsed.Upserts,
+					Deletes:  collapsed.Deletes,
+					Position: pos,
+					Mode:     change.UpsertMode,
+				}
+				p.snapshotMu.Lock()
+				b.SnapshotState = p.snapshotState
+				b.SnapshotPending = p.snapshotPending
+				p.snapshotMu.Unlock()
+				select {
+				case p.readyCh <- readyBatch{batch: b, rows: len(rest)}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			buf = buf[:0]
+			return nil
+		}
+
 		var b change.Batch
 		switch p.mode {
 		case change.AppendMode:
-			// Append mode: every change becomes a row. Deletes are folded
-			// into upserts so the writer emits them with op='delete'.
 			upserts := make([]change.Change, 0, len(buf))
 			for _, c := range buf {
 				if c.Op == change.OpDelete {
@@ -255,7 +353,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			b = change.Batch{
 				Table:    p.target,
 				Upserts:  upserts,
-				Position: buf[len(buf)-1].Position,
+				Position: pos,
 				Mode:     change.AppendMode,
 			}
 		default:
@@ -264,10 +362,15 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				Table:    p.target,
 				Upserts:  collapsed.Upserts,
 				Deletes:  collapsed.Deletes,
-				Position: buf[len(buf)-1].Position,
+				Position: pos,
 				Mode:     change.UpsertMode,
 			}
 		}
+		// Attach snapshot state so it is persisted atomically with position.
+		p.snapshotMu.Lock()
+		b.SnapshotState = p.snapshotState
+		b.SnapshotPending = p.snapshotPending
+		p.snapshotMu.Unlock()
 		rows := len(buf)
 		buf = buf[:0]
 		select {
