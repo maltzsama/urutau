@@ -222,6 +222,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	go func() { runErr <- w.Run(pipeCtx, ingest) }()
 
 	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
+	defer chunks.Close()
 
 	w.OnCommit(func(b change.Batch, rows int) {
 		if cfg.FaultStopAck {

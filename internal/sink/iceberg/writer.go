@@ -210,6 +210,11 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			}
 			return nil
 		}
+		// The RowDelta builder's Commit stages the row-level update onto
+		// the transaction (txn.apply); it does NOT commit to the catalog.
+		// The single catalog commit happens below, after properties are
+		// staged, so the deletes and the position land in one atomic
+		// snapshot.
 		if err := txn.NewRowDelta(p).AddDeletes(files...).Commit(ctx); err != nil {
 			if !isRetryableError(err) {
 				return err

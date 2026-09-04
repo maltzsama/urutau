@@ -62,6 +62,16 @@ func (x *chunkExecutor) queryDB(ctx context.Context) (*sql.DB, error) {
 	return db, nil
 }
 
+// Close releases the query connection pool. The worker owns the executor
+// for its whole life, so this is shutdown hygiene rather than a leak, but
+// a dangling pool keeps sockets alive after the session ends.
+func (x *chunkExecutor) Close() {
+	if x.db != nil {
+		_ = x.db.Close()
+		x.db = nil
+	}
+}
+
 // run executes one chunk SELECT, feeds the window, and acks ChunkReady.
 func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	ta, ok := x.bySource[req.Table]
