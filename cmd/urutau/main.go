@@ -87,7 +87,6 @@ func runCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "pipeline.yaml", "pipeline spec (inline YAML)")
-	cmd.Flags().Bool("local", true, "run in collapsed (single process) mode")
 	cmd.Flags().Uint32Var(&serverID, "server-id", 1101, "MySQL server id for this replicator")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 10000, "DBLog snapshot chunk size (rows per chunk)")
 	cmd.Flags().IntVar(&maxParallelChunks, "max-parallel-chunks", 0, "Max concurrent chunk SELECTs during snapshot (0 = serial; must not exceed the source driver ceiling)")

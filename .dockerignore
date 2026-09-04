@@ -1,0 +1,13 @@
+# VCS and editor state — never in the build context.
+.git
+.idea
+.vscode
+*.swp
+
+# Local build outputs.
+bin/
+out/
+
+# E2E artifacts and docs the image does not need.
+test/e2e/
+*.md
