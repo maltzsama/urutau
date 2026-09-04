@@ -44,6 +44,20 @@ build:
 test:
 	$(GO) test -race ./...
 
+# Coverage floors for the two correctness-critical packages that are not
+# yet met (sink/iceberg 50%, coordinator 65%). A floor is the MINIMUM, not
+# proof of correctness — the proof is the fault-injection tests (canal
+# loss, crash between two commits, stale epoch) defined as acceptance in
+# the CRs. Running `make cover` reports the gap; it is not part of `make
+# test` until the heavy catalog/session fixtures that close it land.
+cover:
+	$(GO) test -cover -count=1 ./internal/sink/iceberg/ ./internal/coordinator/ | tee /tmp/urutau-cover.txt
+	@grep -qE 'sink/iceberg .*coverage: ([5-9][0-9]|100)%' /tmp/urutau-cover.txt \
+		|| { echo "FLOOR: sink/iceberg below 50% (minimum, not proof)"; exit 1; }
+	@grep -qE 'coordinator .*coverage: ([6-9][0-9]|100)%' /tmp/urutau-cover.txt \
+		|| { echo "FLOOR: coordinator below 65% (minimum, not proof)"; exit 1; }
+	@echo "coverage floors met"
+
 lint:
 	$(BIN)/golangci-lint run
 
