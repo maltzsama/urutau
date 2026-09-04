@@ -105,12 +105,10 @@ func TestBootstrapGuardTracksLiveKeys(t *testing.T) {
 	if len(ab.Upserts) != 1 || ab.Upserts[0].Key[0] != int64(6) {
 		t.Fatalf("append batch = %+v, want only the untouched key 6", ab.Upserts)
 	}
-	for _, u := range ub.Upserts {
-		if u.Key[0] == int64(5) && u.Snapshot {
-			// Acceptable: collapse keeps the last version (the snapshot
-			// re-read the updated row) and it carries an equality delete.
-		}
-	}
+	// Key 5 must take the upsert path (collapse keeps the last version —
+	// the snapshot re-read the updated row — and it carries an equality
+	// delete). The critical assertion is that it is NOT in the append
+	// batch above.
 	found := false
 	for _, u := range ub.Upserts {
 		if u.Key[0] == int64(5) {
