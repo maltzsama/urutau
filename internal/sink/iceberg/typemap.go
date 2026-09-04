@@ -18,52 +18,60 @@ func FromCanonical(cs core.Schema) (*iceberg.Schema, error) {
 	nextID := 1
 	fields := make([]iceberg.NestedField, 0, len(cs.Columns))
 	for _, col := range cs.Columns {
-		itype, err := icebergFromCanonicalType(col.Type, &nextID)
+		nf, err := nestedFieldFromColumn(col, &nextID)
 		if err != nil {
 			return nil, fmt.Errorf("iceberg: column %q: %w", col.Name, err)
 		}
-		fields = append(fields, iceberg.NestedField{
-			ID:       nextFieldID(&nextID),
-			Name:     col.Name,
-			Type:     itype,
-			Required: !col.Type.Nullable,
-		})
+		fields = append(fields, nf)
 	}
 	return iceberg.NewSchema(0, fields...), nil
 }
 
+// nestedFieldFromColumn builds one Iceberg NestedField for a canonical
+// column. Its own ID is allocated BEFORE its type recurses, so top-level
+// fields take the first ids in order and nested children continue the
+// counter — the Iceberg field-ID convention that keeps schema evolution
+// additive.
+func nestedFieldFromColumn(col core.Column, nextID *int) (iceberg.NestedField, error) {
+	id := nextFieldID(nextID)
+	itype, err := icebergFromCanonicalType(col.Type, nextID)
+	if err != nil {
+		return iceberg.NestedField{}, err
+	}
+	return iceberg.NestedField{
+		ID:       id,
+		Name:     col.Name,
+		Type:     itype,
+		Required: !col.Type.Nullable,
+	}, nil
+}
+
 // icebergFromCanonicalType maps a canonical column type to an Iceberg type.
-// Scalars map to primitives; composite kinds allocate child field IDs from
-// the running counter and recurse. Anything outside the supported set is a
-// hard error — silent coercion is how type bugs are born. JSON has no Iceberg
-// primitive, so it lands as a string.
+// Scalars map to primitives; composite kinds recurse, with each nested
+// field's own ID allocated before its children.
 func icebergFromCanonicalType(t core.ColumnType, nextID *int) (iceberg.Type, error) {
 	switch t.Kind {
 	case core.KindStruct:
 		fields := make([]iceberg.NestedField, 0, len(t.Fields))
 		for _, f := range t.Fields {
-			ft, err := icebergFromCanonicalType(f.Type, nextID)
+			nf, err := nestedFieldFromColumn(f, nextID)
 			if err != nil {
 				return nil, fmt.Errorf("struct field %q: %w", f.Name, err)
 			}
-			fields = append(fields, iceberg.NestedField{
-				ID:       nextFieldID(nextID),
-				Name:     f.Name,
-				Type:     ft,
-				Required: !f.Type.Nullable,
-			})
+			fields = append(fields, nf)
 		}
 		return &iceberg.StructType{FieldList: fields}, nil
 	case core.KindList:
 		if t.Elem == nil {
 			return nil, fmt.Errorf("list requires an element type")
 		}
+		elemID := nextFieldID(nextID)
 		et, err := icebergFromCanonicalType(*t.Elem, nextID)
 		if err != nil {
 			return nil, err
 		}
 		return &iceberg.ListType{
-			ElementID:       nextFieldID(nextID),
+			ElementID:       elemID,
 			Element:         et,
 			ElementRequired: !t.Elem.Nullable,
 		}, nil
@@ -71,18 +79,20 @@ func icebergFromCanonicalType(t core.ColumnType, nextID *int) (iceberg.Type, err
 		if t.KeyType == nil || t.ValueType == nil {
 			return nil, fmt.Errorf("map requires key and value types")
 		}
+		keyID := nextFieldID(nextID)
 		kt, err := icebergFromCanonicalType(*t.KeyType, nextID)
 		if err != nil {
 			return nil, err
 		}
+		valID := nextFieldID(nextID)
 		vt, err := icebergFromCanonicalType(*t.ValueType, nextID)
 		if err != nil {
 			return nil, err
 		}
 		return &iceberg.MapType{
-			KeyID:         nextFieldID(nextID),
+			KeyID:         keyID,
 			KeyType:       kt,
-			ValueID:       nextFieldID(nextID),
+			ValueID:       valID,
 			ValueType:     vt,
 			ValueRequired: !t.ValueType.Nullable,
 		}, nil
