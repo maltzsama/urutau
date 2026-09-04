@@ -69,7 +69,16 @@ type tablePipeline struct {
 	// phase. Snapshot lines whose PK was never touched are written as pure
 	// appends (no equality delete), halving the write volume for initial
 	// backfill. Released when snapshot completes.
-	bootstrapGuard *bloom.BloomFilter
+	//
+	// snapshotResumed marks a snapshot that resumed from persisted state.
+	// The guard is recreated empty on resume, so it no longer knows which
+	// keys live events touched before the crash — keys in chunks that are
+	// still pending would otherwise be pure-appended on top of already
+	// committed live rows. A resumed snapshot therefore disables the
+	// optimization and writes every snapshot row through the safe upsert
+	// path; only a fresh bootstrap pays nothing.
+	snapshotResumed bool
+	bootstrapGuard  *bloom.BloomFilter
 
 	// knownColumns is the set of column names known at introspection time.
 	// The batcher checks every incoming change to detect schema drift
@@ -182,11 +191,29 @@ func (w *Worker) SetSnapshotState(target string, state string, pending []uint32)
 	switch state {
 	case string(snapshot.StateComplete):
 		p.bootstrapGuard = nil
+		p.snapshotResumed = false
 	case string(snapshot.StateInProgress):
 		if p.bootstrapGuard == nil {
 			p.bootstrapGuard = bloom.NewWithEstimates(100_000, 0.01)
 		}
 	}
+}
+
+// MarkSnapshotResumed tells the worker that the snapshot it is about to run
+// resumed from persisted state rather than starting fresh. The bloom guard
+// is recreated empty on resume, so the pure-append optimization is unsafe —
+// keys live events touched before the crash would be duplicated by pending
+// chunks. The batcher writes every snapshot row through the upsert path
+// instead. Set by the runner when it detects in_progress state at boot.
+func (w *Worker) MarkSnapshotResumed(target string) {
+	p := w.tables[target]
+	if p == nil {
+		return
+	}
+	p.snapshotMu.Lock()
+	defer p.snapshotMu.Unlock()
+	p.snapshotResumed = true
+	p.bootstrapGuard = nil
 }
 
 // SetKnownColumns sets the column names known at introspection time. The
@@ -320,13 +347,15 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		// During snapshot phase, separate snapshot lines into two groups:
 		// untouched PKs (pure append, no delete) and touched PKs (upsert
 		// with delete). This eliminates equality deletes for the initial
-		// backfill on an empty table.
+		// backfill on an empty table. A resumed snapshot skips this path
+		// entirely (see snapshotResumed).
 		p.snapshotMu.Lock()
 		inSnapshot := p.snapshotState == string(snapshot.StateInProgress)
 		guard := p.bootstrapGuard
+		resumed := p.snapshotResumed
 		p.snapshotMu.Unlock()
 
-		if inSnapshot && p.mode == change.UpsertMode {
+		if inSnapshot && !resumed && p.mode == change.UpsertMode {
 			// Partition: untouched snapshot lines go as pure append;
 			// everything else (live events + touched snapshot lines)
 			// goes as normal upsert.

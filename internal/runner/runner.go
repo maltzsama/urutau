@@ -616,6 +616,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				}
 				// Set initial snapshot state on the worker so batches carry it.
 				w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), progress.Pending)
+				if progress.State == snapshot.StateInProgress {
+					// The bloom guard was recreated empty: keys live events
+					// touched before the crash are unknown, so pure appends
+					// could duplicate committed rows. Every snapshot row goes
+					// through the upsert path on a resumed snapshot.
+					w.MarkSnapshotResumed(ref.Target)
+				}
 				if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
 					WindowTimeout: cfg.WindowTimeout,
 					CaughtUpPoll:  cfg.CaughtUpPoll,

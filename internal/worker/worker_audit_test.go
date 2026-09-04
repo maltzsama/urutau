@@ -165,3 +165,36 @@ func TestSchemaDriftIsTerminal(t *testing.T) {
 }
 
 var _ sink.TableWriter = (*fakeCommitter)(nil)
+
+// A resumed snapshot disables the pure-append path: the bloom guard was
+// recreated empty, so it cannot know which keys live events touched before
+// the crash. Snapshot rows must take the upsert path (equality delete) or
+// pending chunks would duplicate already-committed live rows.
+func TestResumedSnapshotUsesUpsertPath(t *testing.T) {
+	fc := &fakeCommitter{}
+	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
+	w.RegisterCommitter("t", fc, change.UpsertMode)
+	w.SetSnapshotState("t", string(snapshot.StateInProgress), []uint32{2})
+	w.MarkSnapshotResumed("t")
+
+	ingest := make(chan change.Change, 4)
+	ingest <- snapChange("t", 1, "s1", "low")
+	ingest <- snapChange("t", 2, "s2", "low")
+	close(ingest)
+	if err := w.Run(context.Background(), ingest); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// A single upsert batch (no append-only split), carrying both rows
+	// through the delete-then-append path.
+	if len(fc.batches) != 1 {
+		t.Fatalf("batches = %d, want 1 upsert batch (no append split)", len(fc.batches))
+	}
+	b := fc.batches[0]
+	if b.Mode != change.UpsertMode {
+		t.Fatalf("mode = %v, want upsert on a resumed snapshot", b.Mode)
+	}
+	if len(b.Upserts) != 2 || b.Position != "low" {
+		t.Fatalf("upserts = %d pos %q, want 2 rows at low", len(b.Upserts), b.Position)
+	}
+}
