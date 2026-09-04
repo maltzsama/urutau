@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -25,7 +28,12 @@ func main() {
 	root.AddCommand(versionCmd())
 	root.AddCommand(runCmd())
 
-	if err := root.Execute(); err != nil {
+	// SIGINT/SIGTERM cancel the command context: the pipeline drains in
+	// flight commits and flushes buffered rows instead of dying at SIGKILL
+	// (kubernetes grace period).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }

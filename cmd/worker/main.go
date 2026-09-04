@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -64,7 +67,12 @@ func main() {
 	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics on this address (optional)")
 
 	root.AddCommand(cmd)
-	if err := root.Execute(); err != nil {
+	// SIGINT/SIGTERM cancel the command context: the remote session shuts
+	// down gracefully — buffered rows drain, the coordinator is told —
+	// instead of the process dying at SIGKILL.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }

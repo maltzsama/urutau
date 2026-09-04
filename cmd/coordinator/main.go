@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -91,12 +94,17 @@ func main() {
 	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics and /statusz on this address (optional)")
 
 	root.AddCommand(cmd)
-	if err := root.Execute(); err != nil {
+	// SIGINT/SIGTERM cancel the command context: worker sessions close with
+	// a graceful drain signal instead of the process dying at SIGKILL.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }
 
-// eventlogConfig builds the audit-trail config from the flag; nil when unset.
+// checkpointConfig builds the S3 position-manifest config from the flags;
+// nil when unset.
 func checkpointConfig(uri string, intervalSec int) *coordinator.CheckpointConfig {
 	if uri == "" {
 		return nil
