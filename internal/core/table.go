@@ -6,16 +6,19 @@ package core
 
 import "fmt"
 
-// Kind is the canonical scalar type.
+// Kind is the canonical type.
 //
-// The system is intentionally scalar-only today. Composite types are
-// deferred debt: Iceberg supports struct/list/map natively, and the first
-// real Avro/Protobuf-with-schema-registry landing will need them (headers
-// as a native map is the current workaround — JSON in a string). A
-// non-scalar Kind is not a new enum value but a new dimension of the model:
-// it touches the cast matrix, the Arrow mapping, Iceberg schema generation,
-// the wire format, and schema comparison. Reopen only on a real demand for
-// nested typed landing, not on convenience.
+// The admission criterion is deliberate: a value enters the Kind set only if
+// a supported source produces it natively AND a supported sink has a real
+// representation for it. Physical encodings of the same logical type
+// (dictionary, *_view, large_*) never become distinct Kinds; polymorphic
+// types with no source or destination (union, extension) never enter; and
+// the escape valve (KindUnknown + an explicit cast) is the deliberate
+// alternative to accepting anything silently. Composite types
+// (struct/list/map) are a separate dimension of the model — they touch the
+// cast matrix, the Arrow mapping, Iceberg schema generation, the wire format
+// and schema comparison — and land as a dedicated effort, not an enum
+// addition.
 type Kind uint8
 
 const (
@@ -28,6 +31,7 @@ const (
 	KindDecimal // uses Precision, Scale
 	KindString
 	KindBinary
+	KindFixedBinary // Iceberg fixed(L) — fixed-size byte sequence, distinct from variable binary
 	KindDate        // days since epoch
 	KindTime        // micros since midnight
 	KindTimestamp   // naive wall clock, NO timezone (MySQL DATETIME)
@@ -55,6 +59,8 @@ func (k Kind) String() string {
 		return "string"
 	case KindBinary:
 		return "binary"
+	case KindFixedBinary:
+		return "fixed"
 	case KindDate:
 		return "date"
 	case KindTime:
@@ -73,19 +79,50 @@ func (k Kind) String() string {
 }
 
 // ColumnType is a canonical column type. Precision/Scale are only
-// meaningful for KindDecimal.
+// meaningful for KindDecimal; FixedSize only for KindFixedBinary; Opaque
+// only when Kind is KindUnknown.
 type ColumnType struct {
 	Kind      Kind
 	Precision int
 	Scale     int
+	FixedSize int
 	Nullable  bool
+	// Opaque records the provenance of an unmappable source type: what it
+	// was and where it came from, so the validation error and any operator
+	// looking at it know what the escape valve is carrying. Non-nil only
+	// when Kind == KindUnknown.
+	Opaque *OpaqueOrigin
+}
+
+// OpaqueOrigin names an unmappable source type and its vendor. It is the
+// provenance half of the escape valve: KindUnknown says "this has no
+// canonical form and needs an explicit cast", Opaque says what it was
+// ("geometry" from "postgres", "point" from "mysql") instead of discarding
+// that knowledge at the mapping boundary.
+type OpaqueOrigin struct {
+	TypeName   string
+	VendorName string
+}
+
+func (o *OpaqueOrigin) String() string {
+	if o == nil {
+		return ""
+	}
+	if o.VendorName != "" {
+		return o.VendorName + " " + o.TypeName
+	}
+	return o.TypeName
 }
 
 func (t ColumnType) String() string {
-	if t.Kind == KindDecimal {
+	switch t.Kind {
+	case KindDecimal:
 		return fmt.Sprintf("decimal(%d,%d)", t.Precision, t.Scale)
+	case KindFixedBinary:
+		return fmt.Sprintf("fixed(%d)", t.FixedSize)
+	default:
+		return t.Kind.String()
 	}
-	return t.Kind.String()
 }
 
 // Column is one named canonical column.

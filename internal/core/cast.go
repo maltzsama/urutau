@@ -147,7 +147,7 @@ func CheckCast(from ColumnType, to CastTarget) error {
 			KindDecimal, KindString, KindDate, KindTime, KindTimestamp,
 			KindTimestampTZ, KindUUID, KindJSON:
 			return nil
-		case KindBinary:
+		case KindBinary, KindFixedBinary:
 			if to.Encoding == "" {
 				return fmt.Errorf("core: binary → string is ambiguous; declare string(hex) or string(base64)")
 			}
@@ -216,6 +216,10 @@ func CheckCast(from ColumnType, to CastTarget) error {
 		}
 		return fmt.Errorf("core: %s → timestamptz is not allowed", from.Kind)
 	case KindBinary:
+		// Fixed binary widens to variable binary without loss.
+		if from.Kind == KindBinary || from.Kind == KindFixedBinary {
+			return nil
+		}
 		return fmt.Errorf("core: %s → binary is not allowed", from.Kind)
 	default:
 		return fmt.Errorf("core: %s → %s is not allowed", from.Kind, to.Type.Kind)
@@ -239,6 +243,8 @@ func (t CastTarget) Convert(v any) (any, error) {
 	switch t.Type.Kind {
 	case KindString:
 		return castToString(v, t.Encoding)
+	case KindBinary:
+		return castToBinary(v)
 	case KindInt64:
 		return castToInt64(v)
 	case KindFloat64:
@@ -287,6 +293,19 @@ func castToString(v any, enc string) (any, error) {
 		}
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to string", v)
+	}
+}
+
+func castToBinary(v any) (any, error) {
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case []byte:
+		return t, nil
+	case string:
+		return []byte(t), nil
+	default:
+		return nil, fmt.Errorf("core: cannot cast %T to binary", v)
 	}
 }
 
@@ -494,6 +513,13 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 	for _, col := range src.Columns {
 		target, hasCast := p.Target(col.Name)
 		if col.Type.Kind == KindUnknown && !hasCast {
+			// The escape valve names what it is carrying when the source
+			// knew: "column location is unmappable (mysql point); declare a
+			// cast" beats a blind error that forces a guess.
+			prov := col.Type.Opaque
+			if prov != nil {
+				return Schema{}, nil, fmt.Errorf("core: column %q is unmappable (%s); declare a cast, e.g. cast: {%s: string}", col.Name, prov, col.Name)
+			}
 			return Schema{}, nil, fmt.Errorf("core: column %q has an unmappable source type; declare a cast", col.Name)
 		}
 		if !hasCast {

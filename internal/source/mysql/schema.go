@@ -36,7 +36,8 @@ func mapColumnType(col schema.TableColumn) core.ColumnType {
 		if col.IsUnsigned {
 			// BIGINT UNSIGNED overflows int64; a declared cast (e.g. to
 			// string) is the explicit way to land it.
-			return core.ColumnType{Kind: core.KindUnknown}
+			return core.ColumnType{Kind: core.KindUnknown,
+				Opaque: &core.OpaqueOrigin{TypeName: col.RawType, VendorName: "mysql"}}
 		}
 		return core.ColumnType{Kind: core.KindInt64}
 	case schema.TYPE_FLOAT:
@@ -56,10 +57,19 @@ func mapColumnType(col schema.TableColumn) core.ColumnType {
 	case schema.TYPE_JSON:
 		return core.ColumnType{Kind: core.KindJSON}
 	case schema.TYPE_BINARY:
+		// go-mysql maps both binary(n) and varbinary(n) to TYPE_BINARY; the
+		// fixed-size flag distinguishes them. A fixed byte sequence keeps
+		// its declared length (Iceberg fixed(L)) instead of degrading to
+		// variable binary.
+		if col.FixedSize > 0 {
+			return core.ColumnType{Kind: core.KindFixedBinary, FixedSize: int(col.FixedSize)}
+		}
 		return core.ColumnType{Kind: core.KindBinary}
 	default:
-		// TYPE_BIT, TYPE_POINT, unknown — no canonical form; a cast is the
-		// only way to land these columns.
-		return core.ColumnType{Kind: core.KindUnknown}
+		// TYPE_BIT, TYPE_POINT, geometry, unknown — no canonical form; a
+		// cast is the only way to land these columns. The raw type name is
+		// carried so the error says what the valve is holding.
+		return core.ColumnType{Kind: core.KindUnknown,
+			Opaque: &core.OpaqueOrigin{TypeName: col.RawType, VendorName: "mysql"}}
 	}
 }
