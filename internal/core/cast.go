@@ -152,6 +152,15 @@ func CheckCast(from ColumnType, to CastTarget) error {
 				return fmt.Errorf("core: binary → string is ambiguous; declare string(hex) or string(base64)")
 			}
 			return nil
+		case KindStruct, KindList, KindMap:
+			// A composite → string cast is the escape hatch that dumps the
+			// nested value as JSON when the developer does not want the
+			// native nested type. The hex/base64 encodings are meaningless
+			// here; only plain string applies.
+			if to.Encoding != "" {
+				return fmt.Errorf("core: %s → string(%s) is not allowed; composite dumps as JSON via plain string", from.Kind, to.Encoding)
+			}
+			return nil
 		default:
 			return fmt.Errorf("core: %s → string is not allowed", from.Kind)
 		}
@@ -291,6 +300,13 @@ func castToString(v any, enc string) (any, error) {
 		default:
 			return nil, fmt.Errorf("core: binary → string requires string(hex) or string(base64)")
 		}
+	case map[string]any, []any:
+		// Composite value dumped as JSON — the struct/list/map → string cast.
+		b, err := json.Marshal(t)
+		if err != nil {
+			return nil, fmt.Errorf("core: cannot JSON-encode %T to string", v)
+		}
+		return string(b), nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to string", v)
 	}

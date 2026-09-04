@@ -57,16 +57,11 @@ func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
 
 	// Data columns: typed per core.Kind.
 	for _, col := range cs.Columns {
-		at, err := kindToArrow(col.Type)
+		af, err := columnToArrowField(col)
 		if err != nil {
 			return nil, fmt.Errorf("transport: column %q: %w", col.Name, err)
 		}
-		fields = append(fields, arrow.Field{
-			Name:     col.Name,
-			Type:     at,
-			Nullable: col.Type.Nullable,
-			Metadata: fieldMetadata(col.Type),
-		})
+		fields = append(fields, af)
 	}
 
 	// Metadata columns: always nullable, appended at the end.
@@ -81,8 +76,80 @@ func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
 	return arrow.NewSchema(fields, nil), nil
 }
 
-// kindToArrow maps a canonical ColumnType to its Arrow primitive.
+// columnToArrowField builds the arrow.Field for one canonical column,
+// recursing into composite kinds so nested struct fields carry their own
+// nullability and extension metadata (uuid/json labels survive inside a
+// struct, not just at the top level).
+func columnToArrowField(col core.Column) (arrow.Field, error) {
+	at, err := kindToArrow(col.Type)
+	if err != nil {
+		return arrow.Field{}, err
+	}
+	return arrow.Field{
+		Name:     col.Name,
+		Type:     at,
+		Nullable: col.Type.Nullable,
+		Metadata: fieldMetadata(col.Type),
+	}, nil
+}
+
+// kindToArrow maps a canonical ColumnType to its Arrow type. Scalars map to
+// primitives; composite kinds recurse. Element and value nullability are
+// carried on the child field where Arrow supports it.
 func kindToArrow(ct core.ColumnType) (arrow.DataType, error) {
+	switch ct.Kind {
+	case core.KindStruct:
+		if len(ct.Fields) == 0 {
+			return nil, fmt.Errorf("struct requires fields")
+		}
+		fields := make([]arrow.Field, len(ct.Fields))
+		for i, f := range ct.Fields {
+			af, err := columnToArrowField(f)
+			if err != nil {
+				return nil, fmt.Errorf("struct field %q: %w", f.Name, err)
+			}
+			fields[i] = af
+		}
+		return arrow.StructOf(fields...), nil
+	case core.KindList:
+		if ct.Elem == nil {
+			return nil, fmt.Errorf("list requires an element type")
+		}
+		at, err := kindToArrow(*ct.Elem)
+		if err != nil {
+			return nil, err
+		}
+		return arrow.ListOfField(arrow.Field{
+			Name:     "item",
+			Type:     at,
+			Nullable: ct.Elem.Nullable,
+			Metadata: fieldMetadata(*ct.Elem),
+		}), nil
+	case core.KindMap:
+		if ct.KeyType == nil || ct.ValueType == nil {
+			return nil, fmt.Errorf("map requires key and value types")
+		}
+		kt, err := kindToArrow(*ct.KeyType)
+		if err != nil {
+			return nil, err
+		}
+		vt, err := kindToArrow(*ct.ValueType)
+		if err != nil {
+			return nil, err
+		}
+		// Arrow map keys are never nullable; Iceberg matches this.
+		return arrow.MapOfFields(
+			arrow.Field{Name: "key", Type: kt, Nullable: false, Metadata: fieldMetadata(*ct.KeyType)},
+			arrow.Field{Name: "value", Type: vt, Nullable: ct.ValueType.Nullable, Metadata: fieldMetadata(*ct.ValueType)},
+		), nil
+	default:
+		return kindToArrowScalar(ct)
+	}
+}
+
+// kindToArrowScalar maps a canonical scalar ColumnType to its Arrow
+// primitive. Composite kinds are handled by kindToArrow.
+func kindToArrowScalar(ct core.ColumnType) (arrow.DataType, error) {
 	switch ct.Kind {
 	case core.KindBool:
 		return arrow.FixedWidthTypes.Boolean, nil

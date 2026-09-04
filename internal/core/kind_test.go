@@ -93,14 +93,58 @@ func TestKindEnumIsClosed(t *testing.T) {
 		KindUnknown, KindBool, KindInt32, KindInt64, KindFloat32, KindFloat64,
 		KindDecimal, KindString, KindBinary, KindFixedBinary, KindDate, KindTime,
 		KindTimestamp, KindTimestampTZ, KindUUID, KindJSON,
+		KindStruct, KindList, KindMap,
 	}
-	if len(want) != int(KindJSON)+1 {
+	if len(want) != int(KindMap)+1 {
 		t.Fatalf("Kind set grew to %d entries without a documented decision; every addition needs a source and a sink",
-			int(KindJSON)+1)
+			int(KindMap)+1)
 	}
 	for i, k := range want {
 		if Kind(i) != k {
 			t.Fatalf("Kind[%d] = %d, want %d (%s) — the enum order diverged from the documented set", i, Kind(i), k, k)
 		}
+	}
+}
+
+// 034 §4/§7.6: a composite column casts to plain string by dumping JSON; no
+// cast builds structure from a scalar.
+func TestCompositeToStringCast(t *testing.T) {
+	st := ColumnType{Kind: KindStruct, Fields: []Column{
+		{Name: "city", Type: ColumnType{Kind: KindString}},
+		{Name: "zip", Type: ColumnType{Kind: KindInt64}},
+	}}
+	to, err := ParseCastTarget("string")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := CheckCast(st, to); err != nil {
+		t.Fatalf("struct → string must be allowed: %v", err)
+	}
+	got, err := to.Convert(map[string]any{"city": "sp", "zip": int64(12345)})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if got != `{"city":"sp","zip":12345}` {
+		t.Fatalf("json dump = %v", got)
+	}
+
+	// A list casts to string too.
+	lt := ColumnType{Kind: KindList, Elem: &ColumnType{Kind: KindString}}
+	if err := CheckCast(lt, to); err != nil {
+		t.Fatalf("list → string must be allowed: %v", err)
+	}
+	got, err = to.Convert([]any{"a", "b"})
+	if err != nil || got != `["a","b"]` {
+		t.Fatalf("list dump = %v (%v)", got, err)
+	}
+
+	// Nothing builds structure from a scalar.
+	fromScalar := CastTarget{Type: ColumnType{Kind: KindStruct, Fields: []Column{
+		{Name: "a", Type: ColumnType{Kind: KindString}},
+	}}}
+	// scalar → struct isn't even expressible as a target parse; ensure a
+	// string value cannot be CheckCast into a struct target either.
+	if err := CheckCast(ColumnType{Kind: KindString}, fromScalar); err == nil {
+		t.Fatal("string → struct must be rejected")
 	}
 }

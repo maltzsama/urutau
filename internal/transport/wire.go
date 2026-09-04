@@ -22,16 +22,11 @@ import (
 func EncodeTableSchema(cs core.Schema) ([]byte, error) {
 	fields := make([]arrow.Field, 0, len(cs.Columns))
 	for _, col := range cs.Columns {
-		at, err := kindToArrow(col.Type)
+		af, err := columnToArrowField(col)
 		if err != nil {
 			return nil, fmt.Errorf("transport: schema: column %q: %w", col.Name, err)
 		}
-		fields = append(fields, arrow.Field{
-			Name:     col.Name,
-			Type:     at,
-			Nullable: col.Type.Nullable,
-			Metadata: fieldMetadata(col.Type),
-		})
+		fields = append(fields, af)
 	}
 	return marshalArrowSchema(arrow.NewSchema(fields, nil))
 }

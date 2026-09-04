@@ -38,6 +38,14 @@ const (
 	KindTimestampTZ // UTC instant (MySQL TIMESTAMP)
 	KindUUID
 	KindJSON // semantically JSON; physically a string in most sinks
+
+	// Composite kinds — a separate dimension of the model, entered only
+	// because both sides of the boundary have a real representation for
+	// them: message-log sources (Avro/Protobuf via schema registry) produce
+	// nested values and Iceberg holds struct/list/map natively.
+	KindStruct
+	KindList
+	KindMap
 )
 
 // String renders the kind name for errors and diagnostics.
@@ -73,6 +81,12 @@ func (k Kind) String() string {
 		return "uuid"
 	case KindJSON:
 		return "json"
+	case KindStruct:
+		return "struct"
+	case KindList:
+		return "list"
+	case KindMap:
+		return "map"
 	default:
 		return "unknown"
 	}
@@ -80,7 +94,10 @@ func (k Kind) String() string {
 
 // ColumnType is a canonical column type. Precision/Scale are only
 // meaningful for KindDecimal; FixedSize only for KindFixedBinary; Opaque
-// only when Kind is KindUnknown.
+// only when Kind is KindUnknown; the composite fields only when Kind is
+// KindStruct (Fields), KindList (Elem) or KindMap (KeyType/ValueType). The
+// composite fields are pointers so a Struct can nest a Struct, or a List
+// hold a Struct, without a parallel type system.
 type ColumnType struct {
 	Kind      Kind
 	Precision int
@@ -92,6 +109,15 @@ type ColumnType struct {
 	// looking at it know what the escape valve is carrying. Non-nil only
 	// when Kind == KindUnknown.
 	Opaque *OpaqueOrigin
+
+	// Fields holds the ordered fields of a KindStruct column.
+	Fields []Column
+	// Elem is the element type of a KindList column.
+	Elem *ColumnType
+	// KeyType and ValueType are the key/value types of a KindMap column.
+	// Message-log map keys are almost always strings.
+	KeyType   *ColumnType
+	ValueType *ColumnType
 }
 
 // OpaqueOrigin names an unmappable source type and its vendor. It is the
