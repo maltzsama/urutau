@@ -282,6 +282,26 @@ func readSnapshotProgress(ctx context.Context, cat catalog.Catalog, ident table.
 	return snapshot.ReadSnapshotProgress(tbl.Properties())
 }
 
+// canonicalByTarget builds the known-column set for one target table from
+// its introspected canonical schema (the schema drift reference).
+func canonicalByTarget(canonical map[string]core.Schema, refs []core.TableRef, target string) map[string]bool {
+	for _, ref := range refs {
+		if ref.Target != target {
+			continue
+		}
+		cs, ok := canonical[ref.Source]
+		if !ok {
+			return nil
+		}
+		cols := make(map[string]bool, len(cs.Columns))
+		for _, c := range cs.Columns {
+			cols[c.Name] = true
+		}
+		return cols
+	}
+	return nil
+}
+
 // introspectAll resolves each spec table through the registry, so the
 // pipeline knows the PK (equality key) and the resolved target shape before
 // writing anything. The canonical schema carries the declared cast and
@@ -398,8 +418,10 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		return nil, fmt.Errorf("runner: open query db: %w", err)
 	}
 
-	// Resolve source tables and their Iceberg schemas.
-	refs, schemas, _, err := introspectAll(ctx, reg, qdb, s, log)
+	// Resolve source tables and their Iceberg schemas. The canonical
+	// schemas also feed the schema-drift check: the batcher compares every
+	// change against the column set known at introspection time.
+	refs, schemas, canonical, err := introspectAll(ctx, reg, qdb, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -445,9 +467,20 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			mode = change.AppendMode
 		}
 		w.Register(target, wr, mode)
+		// The drift check knows the introspected column set per table.
+		if cs := canonicalByTarget(canonical, refs, target); len(cs) > 0 {
+			w.SetKnownColumns(target, cs)
+		}
 	}
 	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() },
 		committedPositions: make(map[string]string)}
+	w.OnSchemaDrift(func(d worker.SchemaDrift) {
+		log.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
+			"action", "declare the column in the spec and resume")
+		r.emit(eventlog.KindSchemaDrift, map[string]any{
+			"table": d.Table, "column": d.Column, "kind": d.Kind,
+		})
+	})
 	w.OnCommit(func(b change.Batch, rows int) {
 		log.Info("commit", "table", b.Table, "rows", rows,
 			"upserts", len(b.Upserts), "deletes", len(b.Deletes), "position", b.Position)

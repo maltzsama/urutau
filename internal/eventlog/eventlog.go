@@ -52,6 +52,7 @@ const (
 	KindWorkerCreated   = "worker_created"
 	KindWorkerReset     = "worker_reset"
 	KindJobTerminated   = "job_terminated"
+	KindSchemaDrift     = "schema_drift"
 )
 
 // Run accumulates one run's events and uploads the trail object as it

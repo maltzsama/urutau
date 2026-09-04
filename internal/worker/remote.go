@@ -161,7 +161,18 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		w.Register(ta.TargetTable, writer, change.UpsertMode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
+		// The drift check knows the assigned schema's column set: Iceberg
+		// field names are the canonical column names.
+		cols := make(map[string]bool, schema.NumFields())
+		for _, f := range schema.Fields() {
+			cols[f.Name] = true
+		}
+		w.SetKnownColumns(ta.TargetTable, cols)
 	}
+	w.OnSchemaDrift(func(d SchemaDrift) {
+		cfg.Logger.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
+			"action", "coordinator must assign a schema with the column; declare it in the spec")
+	})
 
 	// Report phase + committed positions (design §5.6.1): STREAMING if any
 	// of our tables has a commit, SNAPSHOTTING otherwise. The committed map
