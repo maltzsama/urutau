@@ -41,17 +41,18 @@ var ErrCommitExhausted = errors.New("iceberg: commit retries exhausted")
 // caller (the worker dedicates one committer goroutine per table, which is
 // the design's serialization invariant).
 type TableWriter struct {
-	cat         *rest.Catalog
-	ident       table.Identifier
-	eqIDs       []int
-	dataSchema  *arrow.Schema
-	delSchema   *arrow.Schema
-	delCols     []string
-	maxTries    int
-	backoff     time.Duration
-	cast        core.CastPolicy
-	metaByName  map[string]core.MetadataColumn
-	sourceTable string
+	cat           *rest.Catalog
+	ident         table.Identifier
+	eqIDs         []int
+	dataSchema    *arrow.Schema
+	delSchema     *arrow.Schema
+	delCols       []string
+	maxTries      int
+	backoff       time.Duration
+	cast          core.CastPolicy
+	metaByName    map[string]core.MetadataColumn
+	sourceTable   string
+	recordBatchSize int64
 }
 
 // NewTableWriter loads the table, resolves the equality-delete key (the
@@ -93,17 +94,18 @@ func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifi
 	}
 
 	return &TableWriter{
-		cat:         cat,
-		ident:       ident,
-		eqIDs:       eqIDs,
-		dataSchema:  dataSchema,
-		delSchema:   delSchema,
-		delCols:     primaryKey,
-		maxTries:    5,
-		backoff:     200 * time.Millisecond,
-		cast:        cast,
-		metaByName:  metaByName,
-		sourceTable: sourceTable,
+		cat:             cat,
+		ident:           ident,
+		eqIDs:           eqIDs,
+		dataSchema:      dataSchema,
+		delSchema:       delSchema,
+		delCols:         primaryKey,
+		maxTries:        5,
+		backoff:         200 * time.Millisecond,
+		cast:            cast,
+		metaByName:      metaByName,
+		sourceTable:     sourceTable,
+		recordBatchSize: 64 * 1024, // 64k rows per Arrow record batch
 	}, nil
 }
 
@@ -220,7 +222,7 @@ func (w *TableWriter) commitAppend(ctx context.Context, upserts []change.Change,
 			return err
 		}
 		txn := tbl.NewTransaction()
-		if err := txn.AppendTable(ctx, at, -1, props(pos)); err != nil {
+		if err := txn.AppendTable(ctx, at, w.recordBatchSize, props(pos)); err != nil {
 			return err
 		}
 		if err := txn.SetProperties(props(pos)); err != nil {
