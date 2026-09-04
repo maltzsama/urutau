@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,7 +104,17 @@ func pipelineCR(name, ns string) *urutauv1alpha1.CDCPipeline {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: urutauv1alpha1.CDCPipelineSpec{
 			Definition: urutauv1alpha1.Definition{
-				Tables: []map[string]any{{"source": "shop.orders", "target": "raw.orders"}},
+				Inline: map[string]any{
+					"pipeline": "e2e",
+					"source":   map[string]any{"kind": "mysql", "uri": "mysql://repl@mysql:3306/shop"},
+					"sink": map[string]any{
+						"uri": "http://polaris:8181/api/catalog", "namespace": "raw",
+						"warehouse": "quickstart_catalog", "clientId": "root", "clientSecret": "s3cr3t",
+					},
+					"tables": []any{
+						map[string]any{"source": "shop.orders", "target": "raw.orders", "primaryKey": []any{"id"}},
+					},
+				},
 			},
 		},
 	}
@@ -116,6 +127,10 @@ func TestReconcilerCreatesCoordinator(t *testing.T) {
 	_ = cli.Create(testCtx, ns)
 
 	cr := pipelineCR("orders", nsName)
+	cr.Spec.Coordinator.Snapshot.ChunkSize = 500
+	cr.Spec.Coordinator.Supervision.AckTimeout = "30s"
+	cr.Spec.Coordinator.MetricsAddr = ":9090"
+	cr.Spec.Secrets = urutauv1alpha1.Secrets{Source: "mysql-creds", Catalog: "polaris-creds"}
 	if err := cli.Create(testCtx, cr); err != nil {
 		t.Fatalf("create CR: %v", err)
 	}
@@ -140,6 +155,41 @@ func TestReconcilerCreatesCoordinator(t *testing.T) {
 		t.Fatalf("replicas = %v, want 1", sts.Spec.Replicas)
 	}
 	t.Logf("reconciler ok: %s created", sts.Name)
+
+	// The ConfigMap carries the full inline spec (parsable, valid), not a
+	// bare table list the coordinator could never read.
+	cm := &corev1.ConfigMap{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "orders-coordinator", Namespace: nsName}, cm); err != nil {
+		t.Fatalf("get configmap: %v", err)
+	}
+	if _, ok := cm.Data["pipeline.yaml"]; !ok {
+		t.Fatalf("configmap data = %v, want pipeline.yaml", cm.Data)
+	}
+
+	// The coordinator command points at the YAML and carries the rendered
+	// CoordinatorSpec knobs.
+	cmd := strings.Join(sts.Spec.Template.Spec.Containers[0].Command, " ")
+	if !strings.Contains(cmd, "--file /etc/urutau/pipeline.yaml") ||
+		!strings.Contains(cmd, "--chunk-size 500") ||
+		!strings.Contains(cmd, "--ack-timeout 30s") ||
+		!strings.Contains(cmd, "--metrics-addr :9090") {
+		t.Fatalf("coordinator command = %q, want file + rendered flags", cmd)
+	}
+
+	// Referenced secrets are mounted as env with the documented key
+	// convention; nothing rides in the ConfigMap.
+	envByName := map[string]corev1.EnvVar{}
+	for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+		envByName[e.Name] = e
+	}
+	src := envByName["URUTAU_SOURCE_URI"]
+	if src.ValueFrom == nil || src.ValueFrom.SecretKeyRef.Name != "mysql-creds" || src.ValueFrom.SecretKeyRef.Key != "uri" {
+		t.Fatalf("URUTAU_SOURCE_URI env = %+v, want secretKeyRef mysql-creds/uri", src)
+	}
+	sec := envByName["URUTAU_SINK_CLIENT_SECRET"]
+	if sec.ValueFrom == nil || sec.ValueFrom.SecretKeyRef.Name != "polaris-creds" || sec.ValueFrom.SecretKeyRef.Key != "clientSecret" {
+		t.Fatalf("URUTAU_SINK_CLIENT_SECRET env = %+v, want secretKeyRef polaris-creds/clientSecret", sec)
+	}
 }
 
 func TestReconcilerStopsAtTerminated(t *testing.T) {
@@ -226,14 +276,41 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 	t.Log("terminated ok: no coordinator recreated")
 }
 
-func TestWebhookRejectsEmptyTables(t *testing.T) {
+func TestWebhookRejectsEmptyOrAmbiguousDefinition(t *testing.T) {
 	v := &pipelineValidator{}
+
+	// Zero definitions: rejected.
 	cr := pipelineCR("empty", "test-ops-unique")
-	cr.Spec.Definition.Tables = nil
+	cr.Spec.Definition.Inline = nil
 	if _, err := v.ValidateCreate(testCtx, cr); err == nil {
-		t.Fatal("webhook accepted a pipeline without tables")
+		t.Fatal("webhook accepted a pipeline with no definition")
 	}
-	t.Log("webhook ok: empty tables rejected")
+
+	// Two definitions: rejected.
+	cr2 := pipelineCR("both", "test-ops-unique")
+	cr2.Spec.Definition.Image = "urutau-runtime:dev"
+	if _, err := v.ValidateCreate(testCtx, cr2); err == nil {
+		t.Fatal("webhook accepted image AND inline")
+	}
+
+	// A valid inline definition with an invalid spec is rejected by the
+	// same validation the coordinator runs.
+	cr3 := pipelineCR("bad", "test-ops-unique")
+	cr3.Spec.Definition.Inline = map[string]any{
+		"pipeline": "bad",
+		"source":   map[string]any{"kind": "mysql", "uri": "mysql://u@m:3306/shop"},
+		"sink":     map[string]any{"uri": "http://polaris:8181/api/catalog"},
+		"tables":   []any{map[string]any{"source": "shop.orders", "target": "raw.orders"}},
+	}
+	if _, err := v.ValidateCreate(testCtx, cr3); err == nil {
+		t.Fatal("webhook accepted an inline spec without primaryKey on an upsert table")
+	}
+
+	// The well-formed CR passes.
+	ok := pipelineCR("ok", "test-ops-unique")
+	if _, err := v.ValidateCreate(testCtx, ok); err != nil {
+		t.Fatalf("webhook rejected a valid pipeline: %v", err)
+	}
 }
 
 var _ = client.IgnoreNotFound

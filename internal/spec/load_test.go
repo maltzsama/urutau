@@ -88,3 +88,51 @@ func TestLoadYAMLInvalid(t *testing.T) {
 		t.Fatal("want error for malformed yaml")
 	}
 }
+
+func TestLoadYAMLEnvFallback(t *testing.T) {
+	const y = `
+pipeline: k8s
+source:
+  kind: postgres
+sink:
+  namespace: raw
+  warehouse: wh
+tables:
+  - source: shop.orders
+    target: raw.orders
+    primaryKey: [id]
+`
+
+	t.Setenv("URUTAU_SOURCE_URI", "postgres://u@pg:5432/shop")
+	t.Setenv("URUTAU_SINK_URI", "http://polaris:8181/api/catalog")
+	t.Setenv("URUTAU_SINK_CLIENT_SECRET", "s3cr3t")
+
+	s, err := LoadYAML(strings.NewReader(y))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if s.Source.URI != "postgres://u@pg:5432/shop" {
+		t.Fatalf("source.uri = %q, want env value", s.Source.URI)
+	}
+	if s.Sink.URI != "http://polaris:8181/api/catalog" {
+		t.Fatalf("sink.uri = %q, want env value", s.Sink.URI)
+	}
+	if s.Sink.ClientSecret != "s3cr3t" {
+		t.Fatalf("sink.clientSecret = %q, want env value", s.Sink.ClientSecret)
+	}
+	// No env set: the field stays empty and downstream validation rejects it.
+	if s.Sink.ClientID != "" {
+		t.Fatalf("sink.clientId = %q, want empty (no env)", s.Sink.ClientID)
+	}
+}
+
+func TestLoadYAMLEnvDoesNotOverrideInline(t *testing.T) {
+	t.Setenv("URUTAU_SOURCE_URI", "postgres://env@pg:5432/shop")
+	s, err := LoadYAML(strings.NewReader("source:\n  kind: mysql\n  uri: mysql://inline@m:3306/shop\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if s.Source.URI != "mysql://inline@m:3306/shop" {
+		t.Fatalf("source.uri = %q, want the inline value to win", s.Source.URI)
+	}
+}

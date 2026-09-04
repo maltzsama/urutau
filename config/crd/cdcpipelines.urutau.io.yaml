@@ -29,11 +29,9 @@ spec:
                     image: {type: string}
                     entrypoint: {type: string}
                     s3: {type: string}
-                    tables:
-                      type: array
-                      items:
-                        type: object
-                        x-kubernetes-preserve-unknown-fields: true
+                    inline:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                 secrets:
                   type: object
                   properties:

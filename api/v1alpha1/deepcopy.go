@@ -1,17 +1,14 @@
 package v1alpha1
 
 // DeepCopyInto copies the spec, deep-copying the nested slices/maps. The
-// table definitions arrive from the API server as nested map[string]any /
+// inline definition arrives from the API server as nested map[string]any /
 // []any (preserve-unknown-fields); a shallow copy would share those
 // structures with the controller-runtime cache, and mutating a copy would
 // corrupt the cache's object.
 func (in *CDCPipelineSpec) DeepCopyInto(out *CDCPipelineSpec) {
 	*out = *in
-	if in.Definition.Tables != nil {
-		out.Definition.Tables = make([]map[string]any, len(in.Definition.Tables))
-		for i := range in.Definition.Tables {
-			out.Definition.Tables[i] = deepCopyAny(in.Definition.Tables[i]).(map[string]any)
-		}
+	if in.Definition.Inline != nil {
+		out.Definition.Inline = deepCopyAny(in.Definition.Inline).(map[string]any)
 	}
 	in.Coordinator.Resources.DeepCopyInto(&out.Coordinator.Resources)
 	in.WorkerDefaults.Resources.DeepCopyInto(&out.WorkerDefaults.Resources)

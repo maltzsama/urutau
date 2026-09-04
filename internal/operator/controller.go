@@ -6,8 +6,8 @@ package operator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/yaml"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
 )
@@ -123,7 +124,10 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	cm := coordinatorConfigMap(cr)
+	cm, err := coordinatorConfigMap(cr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := controllerutil.SetControllerReference(cr, cm, r.Scheme()); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -242,14 +246,25 @@ func coordinatorService(cr *urutauv1alpha1.CDCPipeline) *corev1.Service {
 // coordinatorConfigMap holds the resolved spec payload the coordinator
 // reads at boot. For now the inline tables become the spec's tables; the
 // planner (SDK repo) will render the full resolvedSpec.
-func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline) *corev1.ConfigMap {
+// coordinatorConfigMap holds the resolved spec the coordinator reads at
+// boot. For an inline definition the spec is rendered verbatim (credentials
+// left empty — they arrive as env from the mounted Secrets). A planner
+// (image/s3 definitions) will render the same artifact.
+func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline) (*corev1.ConfigMap, error) {
 	name := coordinatorName(cr)
-	payload, _ := json.Marshal(cr.Spec.Definition.Tables)
+	inline := cr.Spec.Definition.Inline
+	if len(inline) == 0 {
+		return nil, fmt.Errorf("pipeline %s: inline definition required (planner image/s3 not wired)", cr.Name)
+	}
+	payload, err := yaml.Marshal(inline)
+	if err != nil {
+		return nil, fmt.Errorf("render inline spec: %w", err)
+	}
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace,
-			Labels: map[string]string{"urutau.io/pipeline": cr.Name}},
-		Data: map[string]string{"pipeline.json": string(payload)},
-	}
+			Labels: pipelineLabels(cr)},
+		Data: map[string]string{"pipeline.yaml": string(payload)},
+	}, nil
 }
 
 // coordinatorStatefulSet builds the coordinator workload from the CR.
@@ -271,7 +286,8 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 					Containers: []corev1.Container{{
 						Name:         "coordinator",
 						Image:        image,
-						Command:      []string{"urutau-coordinator", "run", "--file", "/etc/urutau/pipeline.json"},
+						Command:      coordinatorCommand(cr),
+						Env:          coordinatorEnv(cr),
 						VolumeMounts: []corev1.VolumeMount{{Name: "spec", MountPath: "/etc/urutau"}},
 					}},
 					Volumes: []corev1.Volume{{
@@ -284,6 +300,67 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 			},
 		},
 	}
+}
+
+// coordinatorCommand renders the coordinator invocation. Flags mirror the
+// CoordinatorSpec knobs; only fields that are set are passed, so defaults
+// live in the binary.
+func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
+	args := []string{"urutau-coordinator", "run", "--file", "/etc/urutau/pipeline.yaml"}
+	snap := cr.Spec.Coordinator.Snapshot
+	if snap.ChunkSize > 0 {
+		args = append(args, "--chunk-size", strconv.Itoa(snap.ChunkSize))
+	}
+	if snap.MaxParallelChunks > 0 {
+		args = append(args, "--max-parallel-chunks", strconv.Itoa(snap.MaxParallelChunks))
+	}
+	sup := cr.Spec.Coordinator.Supervision
+	if sup.AckTimeout != "" {
+		args = append(args, "--ack-timeout", sup.AckTimeout)
+	}
+	if sup.MaxResets > 0 {
+		args = append(args, "--max-resets", strconv.Itoa(sup.MaxResets))
+	}
+	if sup.Window != "" {
+		args = append(args, "--reset-window", sup.Window)
+	}
+	if cr.Spec.Coordinator.MetricsAddr != "" {
+		args = append(args, "--metrics-addr", cr.Spec.Coordinator.MetricsAddr)
+	}
+	return args
+}
+
+// coordinatorEnv mounts the referenced Secrets as environment variables.
+// The spec's empty credential fields resolve from these at load time
+// (URUTAU_SOURCE_URI, URUTAU_SINK_*, …). Ref-less secrets are skipped.
+func coordinatorEnv(cr *urutauv1alpha1.CDCPipeline) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	if cr.Spec.Secrets.Source != "" {
+		env = append(env, corev1.EnvVar{
+			Name: "URUTAU_SOURCE_URI",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: cr.Spec.Secrets.Source},
+				Key:                  "uri",
+			}},
+		})
+	}
+	if cr.Spec.Secrets.Catalog != "" {
+		for _, kv := range []struct{ env, key string }{
+			{"URUTAU_SINK_URI", "uri"},
+			{"URUTAU_SINK_CLIENT_ID", "clientId"},
+			{"URUTAU_SINK_CLIENT_SECRET", "clientSecret"},
+			{"URUTAU_SINK_SCOPE", "scope"},
+		} {
+			env = append(env, corev1.EnvVar{
+				Name: kv.env,
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: cr.Spec.Secrets.Catalog},
+					Key:                  kv.key,
+				}},
+			})
+		}
+	}
+	return env
 }
 
 func int32Ptr(v int32) *int32 { return &v }
