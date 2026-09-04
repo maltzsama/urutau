@@ -562,6 +562,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 					WindowTimeout: cfg.WindowTimeout,
 					CaughtUpPoll:  cfg.CaughtUpPoll,
 					Progress:      progress,
+					Persist: func(sp snapshot.SnapshotProgress) error {
+						return drivers.SetTableProperties(ctx, cat, drivers.TargetIdent(s, ref.Target), snapshot.EncodeSnapshotProgress(&sp))
+					},
 				}, func(table string, completedChunkID uint32, remaining []uint32) {
 					w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)
 				}); err != nil {

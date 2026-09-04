@@ -93,10 +93,18 @@ type SourceReader interface {
 type SnapshotConfig struct {
 	WindowTimeout time.Duration
 	CaughtUpPoll  time.Duration
-	// Existing progress from a previous run. When non-nil, bounds are
-	// read from Progress.Bounds (not recalculated) and only chunks in
-	// Progress.Pending are processed.
+	// Existing progress from a previous run. When non-nil with persisted
+	// bounds, bounds are read from Progress.Bounds (not recalculated) and
+	// only chunks in Progress.Pending are processed.
 	Progress *SnapshotProgress
+	// Persist durably stores the snapshot state at cold start: bounds are
+	// calculated ONCE and written before the first chunk, so a restart
+	// resumes from the persisted bounds instead of recalculating them over
+	// a table that has since received rows — recalculated bounds would not
+	// correspond to the saved progress. The per-chunk pending updates
+	// travel with the data commits; this hook covers only the initial
+	// state.
+	Persist func(SnapshotProgress) error
 }
 
 // SnapshotCallback is called when a chunk completes. The caller persists
@@ -132,7 +140,9 @@ func SnapshotTable(
 		bounds = cfg.Progress.Bounds
 		pending = cfg.Progress.Pending
 	} else {
-		// Cold start: calculate bounds once and persist them.
+		// Cold start: calculate bounds once and persist them before any
+		// chunk runs — the persisted bounds are what a restart resumes
+		// from.
 		var err error
 		bounds, err = chunker.Bounds(ctx)
 		if err != nil {
@@ -142,6 +152,17 @@ func SnapshotTable(
 		pending = make([]uint32, len(bounds))
 		for i := range pending {
 			pending[i] = uint32(i)
+		}
+		if cfg.Persist != nil {
+			err := cfg.Persist(SnapshotProgress{
+				State:   StateInProgress,
+				Bounds:  bounds,
+				Pending: pending,
+				Started: time.Now().UTC().Format(time.RFC3339),
+			})
+			if err != nil {
+				return fmt.Errorf("dblog: persist snapshot bounds: %w", err)
+			}
 		}
 	}
 
