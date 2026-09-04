@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,10 +30,11 @@ type Config struct {
 type OnCommit func(b change.Batch, rows int)
 
 type Worker struct {
-	cfg      Config
-	onCommit OnCommit
-	tables   map[string]*tablePipeline
-	metrics  *observability.Metrics
+	cfg         Config
+	onCommit    OnCommit
+	schemaDrift func(SchemaDrift)
+	tables      map[string]*tablePipeline
+	metrics     *observability.Metrics
 }
 
 type tablePipeline struct {
@@ -58,7 +60,7 @@ type tablePipeline struct {
 	dropped int64
 
 	// Snapshot state for resumable backfill. The snapshot state machine
-	// (not_started → in_progress → complete) and the pending chunk list
+	// (not_started -> in_progress -> complete) and the pending chunk list
 	// are persisted atomically with position via the batch properties.
 	snapshotMu      sync.Mutex
 	snapshotState   string   // "not_started", "in_progress", "complete"
@@ -69,6 +71,11 @@ type tablePipeline struct {
 	// appends (no equality delete), halving the write volume for initial
 	// backfill. Released when snapshot completes.
 	bootstrapGuard *bloom.BloomFilter
+
+	// knownColumns is the set of column names known at introspection time.
+	// The batcher checks every incoming change to detect schema drift
+	// (ADD COLUMN, DROP COLUMN). An empty set disables the check.
+	knownColumns map[string]bool
 }
 
 // readyBatch is a collapsed batch ready for commit.
@@ -170,6 +177,30 @@ func (w *Worker) SetSnapshotState(target string, state string, pending []uint32)
 	if state == string(snapshot.StateComplete) {
 		p.bootstrapGuard = nil
 	}
+}
+
+// SetKnownColumns sets the column names known at introspection time. The
+// batcher uses this to detect schema drift (ADD COLUMN, DROP COLUMN). An
+// empty or nil map disables the check.
+func (w *Worker) SetKnownColumns(target string, cols map[string]bool) {
+	p := w.tables[target]
+	if p == nil {
+		return
+	}
+	p.knownColumns = cols
+}
+
+// SchemaDrift is emitted when the batcher detects a column in the change
+// stream that was not present at introspection time.
+type SchemaDrift struct {
+	Table  string
+	Column string
+	Kind   string // "added", "removed"
+}
+
+// OnSchemaDrift installs a callback for schema drift detection.
+func (w *Worker) OnSchemaDrift(f func(SchemaDrift)) {
+	w.schemaDrift = f
 }
 
 // Run routes ingest to the per-table pipelines until the channel closes and
@@ -387,7 +418,20 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			if !ok {
 				return flush()
 			}
-			// DBLog window application, design §3.4: an InWindow event is itself a
+			// Schema drift detection: check if the change contains columns
+			// not known at introspection time.
+			if len(p.knownColumns) > 0 && c.After != nil {
+				for col := range c.After {
+					if !p.knownColumns[col] && !strings.HasPrefix(col, "_") {
+						if w.schemaDrift != nil {
+							w.schemaDrift(SchemaDrift{Table: p.target, Column: col, Kind: "added"})
+						}
+						// Pause: do not buffer this change.
+						continue
+					}
+				}
+			}
+			// DBLog window application, design 3.4: an InWindow event is itself a
 			// real change — it removes its snapshot row from the owning
 			// chunk's window (the live version wins) and is then appended
 			// normally. The coordinator tags gated live events with the
