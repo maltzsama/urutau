@@ -184,6 +184,21 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			continue
 		}
 		if len(files) == 0 {
+			// No delete files produced. If this is a delete-only batch
+			// (pos != "" means this is the last commit), still advance
+			// the position — there is nothing pending.
+			if pos != "" {
+				if err := txn.SetProperties(props(pos)); err != nil {
+					return err
+				}
+				if _, err := txn.Commit(ctx); err != nil {
+					if !isRetryableError(err) {
+						return err
+					}
+					lastErr = err
+					continue
+				}
+			}
 			return nil
 		}
 		if err := txn.NewRowDelta(props(pos)).AddDeletes(files...).Commit(ctx); err != nil {
