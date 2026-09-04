@@ -1,8 +1,3 @@
-// Package v1alpha1 holds the CDCPipeline CR types and the machine-written
-// status. The spec mirrors the resolved spec contract (§8.2); the status is
-// written only by the coordinator (§9). One coordinator StatefulSet per CR;
-// the operator creates it and stops reconciling once status.terminated is
-// set.
 package v1alpha1
 
 import (
