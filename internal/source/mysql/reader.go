@@ -55,8 +55,6 @@ type Reader struct {
 	winOpen  bool
 	winLow   *position.GTID // source watermark captured at OpenWindow
 
-	lastDDL string // most recent DDL statement (SchemaMismatch trigger)
-
 	canal.DummyEventHandler // unimplemented hooks are no-ops
 }
 
@@ -275,23 +273,14 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	return nil
 }
 
-// OnDDL surfaces DDL statements seen on the stream (design §14). The DDL is
-// routed to the coordinator for the SchemaMismatch pause; here we log it and
-// expose it on the reader so the pipeline can decide. The query is the
-// authoritative statement; the table is best-effort from the query text.
+// OnDDL surfaces DDL statements seen on the stream. The query is the
+// authoritative statement. Row data is not produced here — schema drift on
+// the data path (ADD COLUMN etc.) is caught by the worker's drift check
+// comparing each change against the introspected schema, which is what
+// pauses the pipeline. This hook logs for operator visibility.
 func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replication.QueryEvent) error {
 	r.cfg.Logger.Warn("mysql: DDL detected", "query", string(q.Query))
-	r.mu.Lock()
-	r.lastDDL = string(q.Query)
-	r.mu.Unlock()
 	return nil
-}
-
-// LastDDL returns the most recent DDL statement seen on the stream.
-func (r *Reader) LastDDL() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.lastDDL
 }
 
 // decode maps one row (in table column order) to a change. key is built from

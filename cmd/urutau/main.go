@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -25,7 +28,12 @@ func main() {
 	root.AddCommand(versionCmd())
 	root.AddCommand(runCmd())
 
-	if err := root.Execute(); err != nil {
+	// SIGINT/SIGTERM cancel the command context: the pipeline drains in
+	// flight commits and flushes buffered rows instead of dying at SIGKILL
+	// (kubernetes grace period).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }
@@ -79,7 +87,6 @@ func runCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "pipeline.yaml", "pipeline spec (inline YAML)")
-	cmd.Flags().Bool("local", true, "run in collapsed (single process) mode")
 	cmd.Flags().Uint32Var(&serverID, "server-id", 1101, "MySQL server id for this replicator")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 10000, "DBLog snapshot chunk size (rows per chunk)")
 	cmd.Flags().IntVar(&maxParallelChunks, "max-parallel-chunks", 0, "Max concurrent chunk SELECTs during snapshot (0 = serial; must not exceed the source driver ceiling)")

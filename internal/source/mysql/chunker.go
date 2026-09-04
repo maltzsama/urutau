@@ -31,7 +31,14 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int) (*Chunker, error) 
 	if chunkSize <= 0 {
 		return nil, fmt.Errorf("mysql: chunker: chunkSize must be positive")
 	}
-	pks := strings.Split(pk, ",")
+	// A spec may write the key list as "a, b"; the raw split would leave a
+	// leading space on the second column and break every keyed comparison.
+	pks := make([]string, 0, 2)
+	for _, c := range strings.Split(pk, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			pks = append(pks, c)
+		}
+	}
 	return &Chunker{
 		db:        db,
 		schema:    schema,
@@ -144,6 +151,12 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	}
 	if err := rows.Scan(ptrs...); err != nil {
 		return nil, err
+	}
+	// Same scalar mapping as Scan, so bounds and snapshot rows agree: a
+	// []byte cell here would otherwise flow raw into the persisted bounds
+	// and be bound back into SQL as the wrong type.
+	for i := range vals {
+		vals[i] = normalize(vals[i])
 	}
 	return vals, nil
 }

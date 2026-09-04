@@ -3,7 +3,6 @@ package worker
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"google.golang.org/grpc"
@@ -145,8 +143,16 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
 	pkByTable := make(map[string][]string, len(assign.Tables))
 	for _, ta := range assign.Tables {
-		schema := &iceberg.Schema{}
-		if err := json.Unmarshal([]byte(ta.SchemaJson), schema); err != nil {
+		// The assignment schema arrives as Arrow IPC derived from the
+		// coordinator's canonical schema; rebuilding the Iceberg schema
+		// through FromCanonical keeps one encoding discipline on the wire.
+		cs, err := transport.DecodeTableSchema(ta.SchemaArrow)
+		if err != nil {
+			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
+		}
+		cs.PrimaryKey = ta.PrimaryKey
+		schema, err := icebergsink.FromCanonical(cs)
+		if err != nil {
 			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
 		}
 		ident := targetIdent(cfg.Namespace, ta.TargetTable)
@@ -161,7 +167,18 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		w.Register(ta.TargetTable, writer, change.UpsertMode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
+		// The drift check knows the assigned schema's column set: canonical
+		// column names are the target table's columns.
+		cols := make(map[string]bool, len(cs.Columns))
+		for _, col := range cs.Columns {
+			cols[col.Name] = true
+		}
+		w.SetKnownColumns(ta.TargetTable, cols)
 	}
+	w.OnSchemaDrift(func(d SchemaDrift) {
+		cfg.Logger.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
+			"action", "coordinator must assign a schema with the column; declare it in the spec")
+	})
 
 	// Report phase + committed positions (design §5.6.1): STREAMING if any
 	// of our tables has a commit, SNAPSHOTTING otherwise. The committed map
@@ -205,6 +222,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	go func() { runErr <- w.Run(pipeCtx, ingest) }()
 
 	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
+	defer chunks.Close()
 
 	w.OnCommit(func(b change.Batch, rows int) {
 		if cfg.FaultStopAck {
@@ -239,6 +257,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	}
 
 	recv := &batchReceiver{
+		ctx:       sessCtx,
 		w:         w,
 		ingest:    ingest,
 		committed: committed,
@@ -249,14 +268,18 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 
 	// Chunk work is serialized: the coordinator sends one ChunkRequest at a
 	// time and waits for ChunkReady, so a single worker slot is enough and
-	// ordering between chunks is preserved.
+	// ordering between chunks is preserved. The worker exits on the shared
+	// context so it cannot outlive the session.
 	chunkWork := make(chan *pb.ChunkRequest, 4)
-	chunkErr := make(chan error, 1)
 	go func() {
-		for req := range chunkWork {
-			if err := chunks.run(sessCtx, req); err != nil {
-				chunkErr <- err
-				cancelAll(fmt.Errorf("worker: chunk: %w", err))
+		for {
+			select {
+			case req := <-chunkWork:
+				if err := chunks.run(sessCtx, req); err != nil {
+					cancelAll(fmt.Errorf("worker: chunk: %w", err))
+					return
+				}
+			case <-sessCtx.Done():
 				return
 			}
 		}
@@ -274,7 +297,14 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 				return err
 			}
 			if cr := m.GetChunk(); cr != nil {
-				chunkWork <- cr
+				// Hand the request to the chunk worker, aborting when the
+				// session ends — a bare send with a full buffer would wedge
+				// this loop and stall teardown.
+				select {
+				case chunkWork <- cr:
+				case <-sessCtx.Done():
+					return errShutdown
+				}
 			}
 			return nil
 		}},
@@ -392,12 +422,26 @@ func dialOpts() []grpc.DialOption {
 // analysis case 4): a batch whose high position is at or before the
 // committed position was already applied by an earlier run.
 type batchReceiver struct {
+	ctx       context.Context
 	w         *Worker
 	ingest    chan<- change.Change
 	committed map[string]position.Position // target table → committed
 	parsePos  func(string) (position.Position, error)
 	pkByTable map[string][]string // target table → primary key columns
 	log       *slog.Logger
+}
+
+// sendIngest delivers one change into the pipeline, aborting when the
+// session ends. A bare send could block forever if the worker's internal
+// pipeline has already died — the session would then hang in its teardown
+// wait instead of exiting with the pipeline error.
+func (r *batchReceiver) sendIngest(c change.Change) error {
+	select {
+	case r.ingest <- c:
+		return nil
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
 }
 
 // covered reports whether a positioned batch was already committed. Batches
@@ -451,10 +495,12 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 			return err
 		}
 	case meta.Window != nil && meta.Window.Closes:
-		r.ingest <- change.Change{
+		if err := r.sendIngest(change.Change{
 			Table:    meta.Table,
 			Position: meta.LowPos,
 			Window:   &change.Window{Closes: true, ChunkID: meta.Window.ChunkId},
+		}); err != nil {
+			return err
 		}
 	default:
 		var win *change.Window
@@ -463,7 +509,9 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		}
 		for i := range rows {
 			rows[i].Window = win
-			r.ingest <- rows[i]
+			if err := r.sendIngest(rows[i]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -477,11 +525,18 @@ func targetIdent(namespace, target string) table.Identifier {
 }
 
 // parsePosition returns the parser for the assignment's source kind.
+// Getting this wrong is not a minor inconvenience: a Kafka pipeline whose
+// committed positions were parsed as GTID sets would fail the worker boot
+// the moment the first cdc.position existed.
 func parsePosition(kind string) func(string) (position.Position, error) {
-	if kind == "postgres" {
+	switch kind {
+	case "postgres":
 		return func(s string) (position.Position, error) { return position.ParseLSN(s) }
+	case "kafka":
+		return func(s string) (position.Position, error) { return position.ParseOffsets(s) }
+	default:
+		return func(s string) (position.Position, error) { return position.ParseGTID(s) }
 	}
-	return func(s string) (position.Position, error) { return position.ParseGTID(s) }
 }
 
 // committedStrings renders the committed map for the wire Hello.

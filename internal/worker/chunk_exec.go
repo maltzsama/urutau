@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/source/mysql"
 	"github.com/maltzsama/urutau/internal/source/postgres"
+	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
@@ -62,6 +62,16 @@ func (x *chunkExecutor) queryDB(ctx context.Context) (*sql.DB, error) {
 	return db, nil
 }
 
+// Close releases the query connection pool. The worker owns the executor
+// for its whole life, so this is shutdown hygiene rather than a leak, but
+// a dangling pool keeps sockets alive after the session ends.
+func (x *chunkExecutor) Close() {
+	if x.db != nil {
+		_ = x.db.Close()
+		x.db = nil
+	}
+}
+
 // run executes one chunk SELECT, feeds the window, and acks ChunkReady.
 func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	ta, ok := x.bySource[req.Table]
@@ -77,15 +87,15 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	}
 
 	var low, high []any
-	if len(req.Low) > 0 {
-		if err := json.Unmarshal(req.Low, &low); err != nil {
-			return fmt.Errorf("worker: chunk low bounds %q: %w", req.Low, err)
-		}
+	boundRows, err := transport.DecodeBounds(req.Bounds)
+	if err != nil {
+		return fmt.Errorf("worker: chunk %d bounds: %w", req.ChunkId, err)
 	}
-	if len(req.High) > 0 {
-		if err := json.Unmarshal(req.High, &high); err != nil {
-			return fmt.Errorf("worker: chunk high bounds %q: %w", req.High, err)
-		}
+	if len(boundRows) > 0 {
+		low = boundRows[0]
+	}
+	if len(boundRows) > 1 {
+		high = boundRows[1]
 	}
 
 	chunker, err := newChunkerFor(x.kind, db, req.Table, ta.PrimaryKey, x.chunkSz)

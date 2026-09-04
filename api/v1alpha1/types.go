@@ -1,8 +1,3 @@
-// Package v1alpha1 holds the CDCPipeline CR types and the machine-written
-// status. The spec mirrors the resolved spec contract (§8.2); the status is
-// written only by the coordinator (§9). One coordinator StatefulSet per CR;
-// the operator creates it and stops reconciling once status.terminated is
-// set.
 package v1alpha1
 
 import (
@@ -35,15 +30,23 @@ type CDCPipelineSpec struct {
 	WorkerDefaults WorkerDefaults  `json:"workerDefaults"`
 }
 
-// Definition is one of image | s3 | tables.
+// Definition is exactly one of image | s3 | inline.
 type Definition struct {
 	// Image is the user image (FROM urutau-runtime) whose entrypoint runs
-	// `urutau plan`. Exactly one of image/s3/tables must be set.
+	// `urutau plan`. Mutually exclusive with s3 and inline.
 	Image      string `json:"image,omitempty"`
 	Entrypoint string `json:"entrypoint,omitempty"`
 	S3         string `json:"s3,omitempty"`
-	// Tables is the inline YAML fallback (no planner).
-	Tables []map[string]any `json:"tables,omitempty"`
+	// Inline is the full pipeline spec (source, sink, tables) verbatim —
+	// the same artifact the planner would render from image/s3. Credentials
+	// stay out: URI and credential fields left empty are filled from the
+	// secrets mounted into the coordinator pod at boot. Validated with the
+	// same server-side rules the coordinator runs.
+	//
+	// Secret key convention (spec.secrets):
+	//   source: uri
+	//   catalog: uri, clientId, clientSecret, scope
+	Inline map[string]any `json:"inline,omitempty"`
 }
 
 // Secrets names the k8s Secrets holding credentials.

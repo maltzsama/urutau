@@ -66,7 +66,7 @@ func TestFlowBudgetCancelUnblocks(t *testing.T) {
 }
 
 func TestPositionIndexTruncatesByHead(t *testing.T) {
-	p := newPositionIndex("w", "run-0")
+	p := newPositionIndex("run-0")
 	lo, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-10")
 	hi, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-20")
 	hi2, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-30")
@@ -96,7 +96,7 @@ func TestPositionIndexTruncatesByHead(t *testing.T) {
 }
 
 func TestPositionIndexPositionlessPopsOnAnyAck(t *testing.T) {
-	p := newPositionIndex("w", "run-1")
+	p := newPositionIndex("run-1")
 	pos, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-5")
 
 	p.add(inflightBatch{table: "raw.orders", high: nil, bytes: 7}) // snapshot rows
@@ -108,7 +108,7 @@ func TestPositionIndexPositionlessPopsOnAnyAck(t *testing.T) {
 }
 
 func TestPositionIndexManifest(t *testing.T) {
-	p := newPositionIndex("w", "run-abc")
+	p := newPositionIndex("run-abc")
 	pos, _ := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-34")
 	p.add(inflightBatch{id: 7, table: "raw.orders", high: pos, bytes: 10})
 	p.add(inflightBatch{id: 8, table: "raw.items", high: nil, bytes: 5})

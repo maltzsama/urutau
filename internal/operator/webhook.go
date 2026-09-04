@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
@@ -8,8 +9,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	"sigs.k8s.io/yaml"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	"github.com/maltzsama/urutau/internal/spec"
 )
 
 // SetupWebhookWithManager registers the validating webhook.
@@ -19,7 +22,7 @@ func (r *CoordinatorReconciler) SetupWebhookWithManager(mgr ctrl.Manager) error 
 }
 
 // pipelineValidator validates CDCPipeline spec mutations. The hard rules
-// (§5.4) reuse the same server-side validation the coordinator boot runs.
+// reuse the same server-side validation the coordinator boot runs.
 type pipelineValidator struct{}
 
 var _ webhook.CustomValidator = (*pipelineValidator)(nil)
@@ -44,11 +47,44 @@ func validatePipeline(obj runtime.Object) error {
 	if !ok {
 		return fmt.Errorf("expected CDCPipeline, got %T", obj)
 	}
-	// Inline tables only for now; image/s3 definition is validated once the
-	// planner exists (its own repo).
-	if len(cr.Spec.Definition.Tables) == 0 {
-		return fmt.Errorf("spec.definition: inline tables required (planner not yet wired)")
+
+	// Exactly one definition source: image, s3, or inline. Anything else
+	// (zero or two) is a mistake the webhook must not guess about.
+	def := cr.Spec.Definition
+	defined := 0
+	if def.Image != "" {
+		defined++
 	}
+	if def.S3 != "" {
+		defined++
+	}
+	if len(def.Inline) > 0 {
+		defined++
+	}
+	switch defined {
+	case 0:
+		return fmt.Errorf("spec.definition: one of image | s3 | inline required")
+	case 1:
+	default:
+		return fmt.Errorf("spec.definition: image, s3 and inline are mutually exclusive")
+	}
+
+	// An inline definition is validated with the same rules the coordinator
+	// runs at boot — validation stays single and server-side.
+	if len(def.Inline) > 0 {
+		b, err := yaml.Marshal(def.Inline)
+		if err != nil {
+			return fmt.Errorf("spec.definition.inline: %w", err)
+		}
+		s, err := spec.LoadYAML(bytes.NewReader(b))
+		if err != nil {
+			return fmt.Errorf("spec.definition.inline: %w", err)
+		}
+		if err := s.Validate(); err != nil {
+			return fmt.Errorf("spec.definition.inline: %w", err)
+		}
+	}
+
 	// serverId uniqueness across CRs is enforced by the operator at
 	// reconcile time (it lists all CRs); the webhook checks the shape here.
 	if cr.Spec.Coordinator.Snapshot.ChunkSize < 0 {

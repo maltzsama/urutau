@@ -1,6 +1,3 @@
-// Package v1alpha1 holds the CDCPipeline CR types and the machine-written
-// status.
-//
 // +groupName=urutau.io
 package v1alpha1
 

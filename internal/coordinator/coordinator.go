@@ -108,7 +108,6 @@ type Coordinator struct {
 	qdb       *sql.DB
 	refs      []snapshot.TableRef
 	cat       catalog.Catalog
-	schemas   map[string]*iceberg.Schema
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
 	// Worker registry: groups resolved at boot from the spec, one queue and
@@ -140,11 +139,16 @@ type Coordinator struct {
 	gateMu  sync.Mutex
 	gateOn  bool
 	gateTgt string
-	gateChk uint32
 	gateBuf []change.Change
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
+
+	// confirmed tracks the latest position each target table durably
+	// committed (from worker Acks). The minimum across tables is reported
+	// to the source so its retention never advances past uncommitted data.
+	confirmedMu sync.Mutex
+	confirmed   map[string]position.Position
 
 	cp         *checkpoint
 	supervisor *supervisor
@@ -196,6 +200,7 @@ func Run(ctx context.Context, cfg Config) error {
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
+		confirmed:   make(map[string]position.Position),
 	}
 	if cfg.FlowTotalBytes <= 0 {
 		cfg.FlowTotalBytes = 512 << 20
@@ -269,7 +274,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 		canonical[t.Source] = cs
 	}
 	c.refs = refs
-	c.schemas = schemas
 	c.canonical = canonical
 
 	// Resolve worker groups: explicit worker= or the table's own pod.
@@ -284,7 +288,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			}
 			c.workers[name] = w
 			c.byTicket[string(w.ticket)] = w
-			c.index[name] = newPositionIndex(name, c.runID)
+			c.index[name] = newPositionIndex(c.runID)
 		}
 		w.refs = append(w.refs, refs[i])
 		c.route[t.Target] = w
@@ -375,6 +379,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	defer rdr.Close()
+	// The slot's confirmed point tracks the minimum position workers have
+	// durably committed (their Acks), never the decode position — otherwise
+	// a crash between decode and commit would lose the in-flight window.
+	rdr.SetConfirmed(c.confirmedPosition)
 
 	start := resume
 	if start == nil {
@@ -555,9 +563,9 @@ func (c *Coordinator) gateHold(ch change.Change) bool {
 // that opened and closed per chunk would let gap events (positioned AFTER
 // the gate's backlog) flow straight through, then release older backlog
 // after them — a reordering that resurrects old values.
-func (c *Coordinator) openWindow(target string, chunkID uint32) {
+func (c *Coordinator) openWindow(target string) {
 	c.gateMu.Lock()
-	c.gateOn, c.gateTgt, c.gateChk = true, target, chunkID
+	c.gateOn, c.gateTgt = true, target
 	c.gateMu.Unlock()
 }
 
@@ -567,7 +575,6 @@ func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 	c.gateMu.Lock()
 	buf, tgt := c.gateBuf, c.gateTgt
 	c.gateBuf = nil
-	c.gateChk = chunkID
 	c.gateMu.Unlock()
 
 	if len(buf) == 0 {
@@ -588,13 +595,41 @@ func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 func (c *Coordinator) closeWindow(ctx context.Context) error {
 	c.gateMu.Lock()
 	buf, tgt := c.gateBuf, c.gateTgt
-	c.gateOn, c.gateBuf, c.gateChk = false, nil, 0
+	c.gateOn, c.gateBuf = false, nil
 	c.gateMu.Unlock()
 
 	if len(buf) == 0 {
 		return nil
 	}
 	return c.enqueueBatch(ctx, buf, &pb.BatchMeta{Table: tgt})
+}
+
+// recordConfirmed stores a table's latest durably-committed position and
+// recomputes the pipeline-wide minimum. The minimum uses the position's own
+// ordering — LSNs and GTID sets are not lexicographically ordered, and a
+// wrong minimum would advance the source slot past data still in flight.
+func (c *Coordinator) recordConfirmed(table string, pos position.Position) {
+	if pos == nil {
+		return
+	}
+	c.confirmedMu.Lock()
+	defer c.confirmedMu.Unlock()
+	c.confirmed[table] = pos
+}
+
+// confirmedPosition returns the minimum committed position across all
+// target tables; nil while nothing is durably committed.
+func (c *Coordinator) confirmedPosition() position.Position {
+	c.confirmedMu.Lock()
+	defer c.confirmedMu.Unlock()
+	if len(c.confirmed) == 0 {
+		return nil
+	}
+	vals := make([]position.Position, 0, len(c.confirmed))
+	for _, p := range c.confirmed {
+		vals = append(vals, p)
+	}
+	return position.Min(vals)
 }
 
 // waitChunkReady blocks until the worker reports the chunk SELECT done.
@@ -635,21 +670,14 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceRead
 			return err
 		}
 		if i == 0 {
-			c.openWindow(ref.Target, chunkID)
+			c.openWindow(ref.Target)
 		}
 
-		lowB, err := json.Marshal(ch.Low)
+		boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
 		if err != nil {
-			return fmt.Errorf("coordinator: chunk %d low bounds: %w", chunkID, err)
+			return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
 		}
-		var highB []byte
-		if ch.High != nil {
-			highB, err = json.Marshal(ch.High)
-			if err != nil {
-				return fmt.Errorf("coordinator: chunk %d high bounds: %w", chunkID, err)
-			}
-		}
-		req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Low: lowB, High: highB}
+		req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Bounds: boundsB}
 
 		select {
 		case w.out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
@@ -790,6 +818,9 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	if freed > 0 {
 		c.budget.release(worker, freed)
 	}
+	// The ack is evidence of a durable commit: record it and recompute the
+	// pipeline-wide minimum the source's retention may advance to.
+	c.recordConfirmed(ack.Table, pos)
 	if c.metrics != nil {
 		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()
@@ -808,7 +839,9 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 }
 
 // assignmentFor builds one worker's table assignment with its own ticket.
-func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
+// The table schema travels as Arrow IPC derived from the canonical schema —
+// the same typed discipline as the Flight data plane, no JSON on the wire.
+func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, error) {
 	assign := &pb.Assignment{
 		WorkerName: w.name,
 		Epoch:      uint64(1),
@@ -822,7 +855,7 @@ func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.
 		},
 	}
 	for _, ref := range w.refs {
-		schemaJSON, err := json.Marshal(schemas[ref.Source])
+		schemaB, err := transport.EncodeTableSchema(c.canonical[ref.Source])
 		if err != nil {
 			return nil, fmt.Errorf("coordinator: schema %s: %w", ref.Source, err)
 		}
@@ -832,7 +865,7 @@ func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.
 			WriteMode:         pb.WriteMode_WRITE_MODE_UPSERT,
 			PrimaryKey:        ref.PrimaryKey,
 			CreateIfNotExists: true,
-			SchemaJson:        string(schemaJSON),
+			SchemaArrow:       schemaB,
 		})
 	}
 	return &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Assign{Assign: assign}}, nil
@@ -942,7 +975,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	// Assignment on every attach (including after a reset): the worker
 	// waits for it before opening Flight, and a resurrected worker needs a
 	// fresh one.
-	if msg, err := c.assignmentFor(w, c.schemas); err != nil {
+	if msg, err := c.assignmentFor(w); err != nil {
 		return err
 	} else {
 		select {
@@ -966,7 +999,15 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			case *pb.WorkerMessage_Hello:
 				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_ChunkReady:
-				c.chunkReady <- m.ChunkReady
+				// A full chunkReady buffer with no draining snapshot loop
+				// (stale replies after a reset) must not wedge this recv
+				// goroutine; it aborts on session cancellation instead.
+				select {
+				case c.chunkReady <- m.ChunkReady:
+				case <-sessCtx.Done():
+					sess.done <- context.Canceled
+					return
+				}
 			case *pb.WorkerMessage_Error:
 				sess.done <- errors.New("coordinator: worker error: " + m.Error.Detail)
 				return

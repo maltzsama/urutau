@@ -107,6 +107,7 @@ func (s *Spec) Validate() error {
 		validateMetadata(tbl, p, &problems)
 		validateCast(tbl, p, &problems)
 		validatePartitionBy(tbl, p, &problems)
+		validateBootstrap(tbl, p, &problems)
 	}
 
 	if len(problems) > 0 {
@@ -189,6 +190,37 @@ func validatePartitionBy(tbl Table, path string, problems *[]string) {
 					"%s.partitionBy: %q: bucket/truncate size must be > 0", path, expr))
 			}
 		}
+	}
+}
+
+// validateBootstrap checks the closed bootstrap grammar. An unrecognized
+// mode must be rejected, not silently treated as a full snapshot — a typo
+// in "adopt-verify" would otherwise trigger a complete backfill against
+// the operator's intent.
+func validateBootstrap(tbl Table, path string, problems *[]string) {
+	if tbl.Bootstrap == nil {
+		return
+	}
+	switch tbl.Bootstrap.Mode {
+	case "", BootstrapSnapshot, Adopt, AdoptVerify:
+	default:
+		*problems = append(*problems, fmt.Sprintf(
+			"%s.bootstrap.mode: unsupported %q (want snapshot | adopt | adopt-verify)", path, tbl.Bootstrap.Mode))
+	}
+	switch tbl.Bootstrap.StartAt {
+	case "", StartAtCurrent:
+	case StartAtExplicit:
+		if tbl.Bootstrap.Position == "" {
+			*problems = append(*problems, fmt.Sprintf(
+				"%s.bootstrap.position: required when startAt is \"explicit\"", path))
+		}
+	default:
+		*problems = append(*problems, fmt.Sprintf(
+			"%s.bootstrap.startAt: unsupported %q (want current | explicit)", path, tbl.Bootstrap.StartAt))
+	}
+	if tbl.Bootstrap.Position != "" && tbl.Bootstrap.StartAt != StartAtExplicit {
+		*problems = append(*problems, fmt.Sprintf(
+			"%s.bootstrap.startAt: must be \"explicit\" when a position is set", path))
 	}
 }
 

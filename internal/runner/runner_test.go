@@ -112,3 +112,34 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 		t.Fatalf("droppedByWindow = %d, want 1 (deterministic dedup)", n)
 	}
 }
+
+// The confirmed position must use the position's own ordering, not string
+// comparison: "0/10" sorts before "0/2" lexicographically while 16 follows 2
+// numerically — a string min would advance the Postgres slot past data still
+// in flight.
+func TestConfirmedPositionUsesPositionOrdering(t *testing.T) {
+	r := &Runner{committedPositions: make(map[string]position.Position)}
+
+	r.updateCommitted("raw.a", position.MustLSN("0/10"))
+	r.updateCommitted("raw.b", position.MustLSN("0/2"))
+
+	got := r.confirmedPosition()
+	want := position.MustLSN("0/2")
+	if got == nil || got.String() != want.String() {
+		t.Fatalf("confirmed = %v, want %v — the true minimum", got, want)
+	}
+
+	// A later, larger commit moves the floor to the other table's position.
+	r.updateCommitted("raw.b", position.MustLSN("0/40"))
+	if got := r.confirmedPosition().String(); got != "0/10" {
+		t.Fatalf("confirmed = %q after raw.b advanced, want 0/10 (raw.a's position)", got)
+	}
+}
+
+// Nothing durably committed means nil: the reader must not advance the slot.
+func TestConfirmedPositionEmptyIsNil(t *testing.T) {
+	r := &Runner{committedPositions: make(map[string]position.Position)}
+	if r.confirmedPosition() != nil {
+		t.Fatal("confirmed = non-nil with no commits, want nil")
+	}
+}

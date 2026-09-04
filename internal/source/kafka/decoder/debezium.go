@@ -120,16 +120,41 @@ func (d *DebeziumJSON) resolveTable(_ []byte, env debeziumEnvelope) string {
 }
 
 // extractKey pulls the primary key values from a debezium key or value
-// object. Debezium embeds the PK columns in both the key record and the
-// value's before/after images; we use the value image for ordering.
+// object. The key image is a JSON object, and encoding/json into
+// map[string]any discards field order — so the values here come out in map
+// iteration order. Callers that need positional meaning (composite primary
+// keys) must rebuild the tuple with OrderKey against the declared key
+// columns.
 func extractKey(m map[string]any) []any {
-	// Keys are returned in map iteration order — acceptable because the
-	// worker collapses by key string representation.
 	key := make([]any, 0, len(m))
 	for _, v := range m {
 		key = append(key, v)
 	}
 	return key
+}
+
+// OrderKey rebuilds a change's key tuple in primary-key order, reading the
+// values from the row image (after; before for deletes). Downstream
+// consumers treat the key as positional — per-key collapse joins values
+// into a map key, and the sink's equality deletes index the tuple by
+// primary-key column — so a shuffled tuple duplicates rows and deletes the
+// wrong ones.
+func OrderKey(c *change.Change, pk []string) {
+	if c == nil || len(pk) == 0 {
+		return
+	}
+	src := c.After
+	if src == nil {
+		src = c.Before
+	}
+	if src == nil {
+		return
+	}
+	key := make([]any, len(pk))
+	for i, col := range pk {
+		key[i] = src[col]
+	}
+	c.Key = key
 }
 
 // position is a lightweight offset carrier for the decoder. The reader

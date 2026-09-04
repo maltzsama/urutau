@@ -214,6 +214,74 @@ func TestSnapshotTableEmptySource(t *testing.T) {
 	}
 }
 
+// A cold start must persist the calculated bounds before any chunk runs:
+// a restart resumes from the persisted bounds instead of recalculating
+// them over a table that has since received rows.
+func TestSnapshotTablePersistsBoundsOnColdStart(t *testing.T) {
+	src := rowsFor(4)
+	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
+
+	var persisted *SnapshotProgress
+	cfg := SnapshotConfig{
+		CaughtUpPoll: time.Millisecond,
+		Persist: func(sp SnapshotProgress) error {
+			persisted = &sp
+			return nil
+		},
+	}
+	if err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders", cfg, nil); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if persisted == nil {
+		t.Fatal("cold start never persisted the snapshot state")
+	}
+	if persisted.State != StateInProgress {
+		t.Fatalf("persisted state = %v, want in_progress", persisted.State)
+	}
+	wantBounds, _ := src.Bounds(context.Background())
+	if len(persisted.Bounds) != len(wantBounds) {
+		t.Fatalf("persisted bounds = %d rows, want %d", len(persisted.Bounds), len(wantBounds))
+	}
+	if len(persisted.Pending) != len(wantBounds) {
+		t.Fatalf("persisted pending = %v, want all %d chunks", persisted.Pending, len(wantBounds))
+	}
+	if persisted.Started == "" {
+		t.Fatal("persisted started timestamp empty")
+	}
+}
+
+// Resume processes ONLY the pending chunks against the persisted bounds:
+// completed chunks are never touched again.
+func TestSnapshotTableResumesFromPersistedBounds(t *testing.T) {
+	src := rowsFor(6)
+	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
+
+	bounds, _ := src.Bounds(context.Background())
+	remaining := RemoveFromPending([]uint32{0, 1, 2}, 0)
+	remaining = RemoveFromPending(remaining, 1) // chunks 0,1 done on the earlier run
+	cfg := SnapshotConfig{
+		CaughtUpPoll: time.Millisecond,
+		Progress: &SnapshotProgress{
+			State:   StateInProgress,
+			Bounds:  bounds,
+			Pending: remaining,
+		},
+	}
+	if err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders", cfg, nil); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	for _, op := range relay.ops {
+		if op == "gateon:0" || op == "gateon:1" || op == "release:0" || op == "release:1" {
+			t.Fatalf("completed chunk reprocessed: %v", relay.ops)
+		}
+	}
+	if relay.relPos[2] != gt("1-9").String() {
+		t.Fatalf("chunk 2 release = %q, want caught-up position", relay.relPos[2])
+	}
+}
+
 func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 	src := rowsFor(4)
 	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}

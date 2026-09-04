@@ -282,6 +282,26 @@ func readSnapshotProgress(ctx context.Context, cat catalog.Catalog, ident table.
 	return snapshot.ReadSnapshotProgress(tbl.Properties())
 }
 
+// canonicalByTarget builds the known-column set for one target table from
+// its introspected canonical schema (the schema drift reference).
+func canonicalByTarget(canonical map[string]core.Schema, refs []core.TableRef, target string) map[string]bool {
+	for _, ref := range refs {
+		if ref.Target != target {
+			continue
+		}
+		cs, ok := canonical[ref.Source]
+		if !ok {
+			return nil
+		}
+		cols := make(map[string]bool, len(cs.Columns))
+		for _, c := range cs.Columns {
+			cols[c.Name] = true
+		}
+		return cols
+	}
+	return nil
+}
+
 // introspectAll resolves each spec table through the registry, so the
 // pipeline knows the PK (equality key) and the resolved target shape before
 // writing anything. The canonical schema carries the declared cast and
@@ -324,12 +344,12 @@ type Runner struct {
 	closeQuery                       func()
 	streamErr, workerErr, routerDone <-chan error
 
-	// committedPositions tracks the latest committed cdc.position per
-	// target table. The minimum across all tables is the confirmed
-	// position reported to the source (Postgres slot advancement).
+	// committedPositions tracks the latest durably-committed position per
+	// target table. The minimum across tables is the confirmed position
+	// reported to the source (Postgres slot advancement).
 	posMu              sync.Mutex
-	committedPositions map[string]string
-	minCommitted       string // cached minimum, recomputed on each commit
+	committedPositions map[string]position.Position
+	minConfirmed       position.Position // recomputed on each commit
 }
 
 // emit posts one lifecycle event to the audit trail, best-effort by
@@ -398,8 +418,10 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		return nil, fmt.Errorf("runner: open query db: %w", err)
 	}
 
-	// Resolve source tables and their Iceberg schemas.
-	refs, schemas, _, err := introspectAll(ctx, reg, qdb, s, log)
+	// Resolve source tables and their Iceberg schemas. The canonical
+	// schemas also feed the schema-drift check: the batcher compares every
+	// change against the column set known at introspection time.
+	refs, schemas, canonical, err := introspectAll(ctx, reg, qdb, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -445,9 +467,20 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			mode = change.AppendMode
 		}
 		w.Register(target, wr, mode)
+		// The drift check knows the introspected column set per table.
+		if cs := canonicalByTarget(canonical, refs, target); len(cs) > 0 {
+			w.SetKnownColumns(target, cs)
+		}
 	}
 	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() },
-		committedPositions: make(map[string]string)}
+		committedPositions: make(map[string]position.Position)}
+	w.OnSchemaDrift(func(d worker.SchemaDrift) {
+		log.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
+			"action", "declare the column in the spec and resume")
+		r.emit(eventlog.KindSchemaDrift, map[string]any{
+			"table": d.Table, "column": d.Column, "kind": d.Kind,
+		})
+	})
 	w.OnCommit(func(b change.Batch, rows int) {
 		log.Info("commit", "table", b.Table, "rows", rows,
 			"upserts", len(b.Upserts), "deletes", len(b.Deletes), "position", b.Position)
@@ -455,7 +488,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			"table": b.Table, "rows": rows,
 			"upserts": len(b.Upserts), "deletes": len(b.Deletes), "position": b.Position,
 		})
-		r.updateCommitted(b.Table, b.Position)
+		// A garbage position string never advances the confirmed point.
+		p, err := reg.ParsePosition(b.Position)
+		if err != nil {
+			log.Warn("runner: commit position parse", "table", b.Table, "position", b.Position, "err", err)
+			return
+		}
+		r.updateCommitted(b.Table, p)
 	})
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
@@ -486,7 +525,32 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	routerDone := make(chan error, 1)
 	go func() { routerDone <- router.run(ctx, out) }()
 
+	// Per-table bootstrap config, resolved once: the stream start below and
+	// the snapshot loop both consult it.
+	bootstrapByTarget := make(map[string]spec.Bootstrap, len(s.Tables))
+	var explicitPositions []position.Position
+	for _, t := range s.Tables {
+		if t.Bootstrap == nil {
+			continue
+		}
+		bootstrapByTarget[t.Target] = *t.Bootstrap
+		if t.Bootstrap.StartAt == spec.StartAtExplicit && t.Bootstrap.Position != "" {
+			p, err := reg.ParsePosition(t.Bootstrap.Position)
+			if err != nil {
+				_ = qdb.Close()
+				return nil, fmt.Errorf("runner: %s bootstrap.position %q: %w", t.Target, t.Bootstrap.Position, err)
+			}
+			explicitPositions = append(explicitPositions, p)
+		}
+	}
+
 	start := resume
+	if start == nil && len(explicitPositions) > 0 {
+		// An adopted table with an explicit start position overrides the
+		// source default. The minimum across tables is the safe choice: the
+		// stream is one per source, and starting too late would skip data.
+		start = position.Min(explicitPositions)
+	}
 	if start == nil {
 		if m, err := reg.InitialPosition(ctx, qdb); err != nil {
 			return nil, fmt.Errorf("runner: initial position: %w", err)
@@ -503,15 +567,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	caps := reg.Caps()
 	if caps.Snapshot {
 		for _, ref := range needsSnapshot {
-			// Check bootstrap mode for this table.
-			var bootstrapMode spec.BootstrapMode
-			var bootstrapPos string
-			for _, t := range s.Tables {
-				if t.Target == ref.Target && t.Bootstrap != nil {
-					bootstrapMode = t.Bootstrap.Mode
-					bootstrapPos = t.Bootstrap.Position
-					break
-				}
+			bootstrapMode := spec.BootstrapSnapshot
+			if b, ok := bootstrapByTarget[ref.Target]; ok {
+				bootstrapMode = b.Mode
 			}
 
 			switch bootstrapMode {
@@ -558,10 +616,20 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				}
 				// Set initial snapshot state on the worker so batches carry it.
 				w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), progress.Pending)
+				if progress.State == snapshot.StateInProgress {
+					// The bloom guard was recreated empty: keys live events
+					// touched before the crash are unknown, so pure appends
+					// could duplicate committed rows. Every snapshot row goes
+					// through the upsert path on a resumed snapshot.
+					w.MarkSnapshotResumed(ref.Target)
+				}
 				if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
 					WindowTimeout: cfg.WindowTimeout,
 					CaughtUpPoll:  cfg.CaughtUpPoll,
 					Progress:      progress,
+					Persist: func(sp snapshot.SnapshotProgress) error {
+						return drivers.SetTableProperties(ctx, cat, drivers.TargetIdent(s, ref.Target), snapshot.EncodeSnapshotProgress(&sp))
+					},
 				}, func(table string, completedChunkID uint32, remaining []uint32) {
 					w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)
 				}); err != nil {
@@ -573,11 +641,6 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
 				log.Info("snapshot done", "table", ref.Source)
 				r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
-			}
-			// Handle explicit start position for adopted tables.
-			if bootstrapMode == spec.Adopt && bootstrapPos != "" {
-				// Position will be used by the stream start.
-				_ = bootstrapPos
 			}
 		}
 	}
@@ -631,34 +694,31 @@ func (r *Runner) DroppedByWindow(target string) int64 {
 // updateCommitted is called from the OnCommit callback. It stores the
 // latest committed position for a target table and recomputes the minimum
 // across all tables.
-func (r *Runner) updateCommitted(table, pos string) {
-	if pos == "" {
+// updateCommitted records the position a target table durably committed and
+// recomputes the pipeline-wide minimum — the value reported to the source so
+// its retention never advances past uncommitted data. The minimum uses the
+// position's own ordering: LSNs and GTID sets are not lexicographically
+// ordered ("0/10" sorts before "0/2" as strings, 16 after 2 as positions),
+// and a wrong minimum would advance the slot past data still in flight.
+func (r *Runner) updateCommitted(table string, pos position.Position) {
+	if pos == nil {
 		return
 	}
 	r.posMu.Lock()
 	defer r.posMu.Unlock()
 	r.committedPositions[table] = pos
-	best := ""
+	vals := make([]position.Position, 0, len(r.committedPositions))
 	for _, p := range r.committedPositions {
-		if best == "" || p < best {
-			best = p
-		}
+		vals = append(vals, p)
 	}
-	r.minCommitted = best
+	r.minConfirmed = position.Min(vals)
 }
 
 // confirmedPosition returns the minimum committed position across all
 // target tables. The Postgres reader uses this to advance the slot's
-// confirmed_flush_lsn.
+// confirmed_flush_lsn; nil means nothing is durably committed yet.
 func (r *Runner) confirmedPosition() position.Position {
 	r.posMu.Lock()
 	defer r.posMu.Unlock()
-	if r.minCommitted == "" {
-		return nil
-	}
-	p, err := position.ParseLSN(r.minCommitted)
-	if err != nil {
-		return nil
-	}
-	return p
+	return r.minConfirmed
 }

@@ -210,6 +210,11 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			}
 			return nil
 		}
+		// The RowDelta builder's Commit stages the row-level update onto
+		// the transaction (txn.apply); it does NOT commit to the catalog.
+		// The single catalog commit happens below, after properties are
+		// staged, so the deletes and the position land in one atomic
+		// snapshot.
 		if err := txn.NewRowDelta(p).AddDeletes(files...).Commit(ctx); err != nil {
 			if !isRetryableError(err) {
 				return err
@@ -312,13 +317,17 @@ func committedPosition(tbl *table.Table) string {
 }
 
 // walkBackPosition finds cdc.position in the table properties, else walks
-// the snapshot summaries newest-first (Snapshots() is newest-first). Pure,
-// for tests.
+// the snapshot summaries newest-first. iceberg-go keeps snapshots in
+// chronological order (oldest first), so the walk starts at the last
+// element and scans backwards — a forward walk would return the OLDEST
+// position after a compaction drops the table property and rewind the
+// pipeline across a large amount of already-applied history. Pure, for
+// tests.
 func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
 	if pos := props["cdc.position"]; pos != "" {
 		return pos
 	}
-	for i := range snaps {
+	for i := len(snaps) - 1; i >= 0; i-- {
 		if snaps[i].Summary == nil {
 			continue
 		}
@@ -374,7 +383,7 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 	}
 	// Table exists — verify cast divergence and partition spec divergence.
 	existSchema := existing.Schema()
-	for colName, target := range cast.Columns {
+	for colName := range cast.Columns {
 		newField, ok := schema.FindFieldByName(colName)
 		if !ok {
 			continue // column not in resolved schema — introspection will catch
@@ -387,7 +396,6 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 			return fmt.Errorf("iceberg: %v: cast column %q type divergence: spec wants %s, table has %s",
 				ident, colName, newField.Type, existField.Type)
 		}
-		_ = target // used for future PK-cast advisory
 	}
 	// Partition spec divergence: if partitionBy is specified, it must
 	// match the existing table's partition spec (single-partition-field
@@ -453,9 +461,15 @@ func isRetryableError(err error) bool {
 		return true
 	}
 	s := err.Error()
-	// HTTP 5xx or network errors from REST catalog or S3.
+	// HTTP 5xx or throttling, or network errors from REST catalog or S3.
+	// The status-code tokens also cover the REST/S3 client messages that
+	// embed them; 429 and S3's SlowDown/RequestTimeout are the throttling
+	// signals a server overloaded enough to shed retries sends.
 	if strings.Contains(s, "500") || strings.Contains(s, "502") ||
 		strings.Contains(s, "503") || strings.Contains(s, "504") ||
+		strings.Contains(s, "429") || strings.Contains(s, "408") ||
+		strings.Contains(s, "SlowDown") || strings.Contains(s, "RequestTimeout") ||
+		strings.Contains(s, "throttl") || strings.Contains(s, "Too Many Requests") ||
 		strings.Contains(s, "connection refused") || strings.Contains(s, "EOF") ||
 		strings.Contains(s, "i/o timeout") || strings.Contains(s, "broken pipe") ||
 		strings.Contains(s, "reset by peer") {
