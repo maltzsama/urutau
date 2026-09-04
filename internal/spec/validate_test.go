@@ -289,3 +289,38 @@ func TestValidateKafkaAppendOnDelete(t *testing.T) {
 		t.Fatalf("kafka append with onDelete: skip must validate: %v", err)
 	}
 }
+
+// 30: append-idempotent needs a monotonic-sequence source (kafka) and a
+// transport identity that includes the message coordinate.
+func TestValidateAppendIdempotent(t *testing.T) {
+	s := validSpec()
+	s.Source.Kind = "kafka"
+	s.Tables[0].WriteMode = WriteModeAppendIdempotent
+	s.Tables[0].PrimaryKey = nil
+	s.Tables[0].Columns = map[string]string{"payload": "string"}
+	s.Tables[0].OnDelete = OnDeleteSkip
+	s.Tables[0].Metadata = []core.MetadataColumn{
+		{From: core.MetaStream, As: "stream_name"},
+		{From: core.MetaShard, As: "partition"},
+		{From: core.MetaSeq, As: "offset"},
+	}
+	// No identity -> rejected.
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "identity") {
+		t.Fatalf("want identity problem, got %v", err)
+	}
+	// Identity without a coordinate (stream only) -> rejected.
+	s.Tables[0].Identity = []string{"stream_name"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "shard or sequence") {
+		t.Fatalf("want coordinate problem, got %v", err)
+	}
+	// Valid identity -> accepted.
+	s.Tables[0].Identity = []string{"partition", "offset"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("append-idempotent with transport identity must validate: %v", err)
+	}
+	// Identity pointing at a data column -> rejected.
+	s.Tables[0].Identity = []string{"payload"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "transport metadata") {
+		t.Fatalf("want transport-metadata problem, got %v", err)
+	}
+}

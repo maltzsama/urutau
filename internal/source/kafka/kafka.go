@@ -63,7 +63,8 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 	if mode == "" {
 		mode = spec.WriteModeUpsert // upsert-first: reflecting state is the default
 	}
-	if len(t.PrimaryKey) == 0 && mode != spec.WriteModeAppend {
+	isAppend := mode == spec.WriteModeAppend || mode == spec.WriteModeAppendIdempotent
+	if len(t.PrimaryKey) == 0 && !isAppend {
 		return core.TableRef{}, core.Schema{}, nil, nil,
 			fmt.Errorf("kafka: table %q requires primaryKey for writeMode=upsert", t.Source)
 	}

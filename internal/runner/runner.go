@@ -463,7 +463,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	w := worker.New(worker.Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
 	for target, wr := range writers {
 		mode := change.UpsertMode
-		if specByTarget[target].WriteMode == spec.WriteModeAppend {
+		writeMode := specByTarget[target].WriteMode
+		if writeMode == spec.WriteModeAppend || writeMode == spec.WriteModeAppendIdempotent {
+			// append-idempotent is physically append: zero equality deletes.
+			// Its identity is a declared transport coordinate for downstream
+			// dedup and verification, not a write-path difference.
 			mode = change.AppendMode
 		}
 		w.Register(target, wr, mode)

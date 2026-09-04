@@ -100,12 +100,13 @@ func (s *Spec) Validate() error {
 		if mode == "" {
 			mode = WriteModeUpsert // upsert-first: reflecting state is the default
 		}
-		switch mode {
-		case WriteModeUpsert:
+		isAppend := mode == WriteModeAppend || mode == WriteModeAppendIdempotent
+		switch {
+		case mode == WriteModeUpsert:
 			if len(tbl.PrimaryKey) == 0 {
 				problems = append(problems, p+".primaryKey: required when writeMode is upsert")
 			}
-		case WriteModeAppend:
+		case isAppend:
 			if tbl.Filter != nil && !tbl.FilterImmutable {
 				problems = append(problems, p+".filterImmutable: required when writeMode is append and a filter is set")
 			}
@@ -120,6 +121,9 @@ func (s *Spec) Validate() error {
 			case OnDeleteSkip:
 			default:
 				problems = append(problems, fmt.Sprintf("%s.onDelete: unsupported %q (want skip | record)", p, tbl.OnDelete))
+			}
+			if mode == WriteModeAppendIdempotent {
+				validateIdentity(tbl, s.Source.Kind, p, &problems)
 			}
 		default:
 			problems = append(problems, fmt.Sprintf("%s.writeMode: unsupported %q", p, mode))
@@ -230,6 +234,45 @@ func validatePartitionBy(tbl Table, path string, problems *[]string) {
 					"%s.partitionBy: %q: bucket/truncate size must be > 0", path, expr))
 			}
 		}
+	}
+}
+
+// validateIdentity checks the append-idempotent identity: it must be
+// transport metadata (stream/shard/sequence), not content, and it must
+// include the uniquely-identifying coordinate (shard or sequence) — the
+// guarantee comes from the transport, never from a data column. Only a
+// source with a monotonic per-message sequence (kafka) qualifies.
+func validateIdentity(tbl Table, kind string, path string, problems *[]string) {
+	if kind != "kafka" {
+		*problems = append(*problems, path+".writeMode: append-idempotent requires a source with a monotonic per-message sequence (kafka)")
+		return
+	}
+	if len(tbl.Identity) == 0 {
+		*problems = append(*problems, path+".identity: required when writeMode is append-idempotent")
+		return
+	}
+	// Destination names of the transport metadata columns, and data columns.
+	transportAs := map[string]core.MetadataKey{}
+	for _, m := range tbl.Metadata {
+		switch m.From {
+		case core.MetaStream, core.MetaShard, core.MetaSeq:
+			transportAs[m.As] = m.From
+		}
+	}
+	hasCoordinate := false
+	for _, name := range tbl.Identity {
+		from, ok := transportAs[name]
+		if !ok {
+			*problems = append(*problems, fmt.Sprintf(
+				"%s.identity: %q is not a transport metadata column (stream/shard/sequence) — the identity must be transport, never content", path, name))
+			continue
+		}
+		if from == core.MetaShard || from == core.MetaSeq {
+			hasCoordinate = true
+		}
+	}
+	if !hasCoordinate {
+		*problems = append(*problems, path+".identity: must include shard or sequence — the transport coordinate that uniquely identifies a message")
 	}
 }
 

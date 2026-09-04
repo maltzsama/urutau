@@ -16,6 +16,14 @@ type WriteMode string
 const (
 	WriteModeUpsert WriteMode = "upsert"
 	WriteModeAppend WriteMode = "append"
+	// WriteModeAppendIdempotent is physically append (zero equality
+	// deletes) but declares the transport coordinate that makes the table
+	// logically idempotent: on a message log the coordinate never reappears,
+	// so duplicates are provably absent and cheaply removable if a
+	// re-partitioned batch ever overlaps. The identity must be transport
+	// metadata (shard/sequence/msg_key/…), never a data column — the
+	// guarantee comes from the transport, not the content.
+	WriteModeAppendIdempotent WriteMode = "append-idempotent"
 )
 
 type Spec struct {
@@ -70,6 +78,11 @@ type Table struct {
 	Filter            *Filter   `json:"filter,omitempty"`
 	WriteMode         WriteMode `json:"writeMode,omitempty"`
 	OnDelete          OnDelete  `json:"onDelete,omitempty"`
+	// Identity declares the transport-metadata columns that make an
+	// append-idempotent table logically idempotent. Each entry is the
+	// destination column (as) of a transport metadata column declared in
+	// Metadata. Empty outside append-idempotent.
+	Identity []string `json:"identity,omitempty"`
 	Worker            string    `json:"worker,omitempty"`
 	CreateIfNotExists bool      `json:"createIfNotExists,omitempty"`
 	FilterImmutable   bool      `json:"filterImmutable,omitempty"`
