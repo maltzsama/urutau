@@ -39,6 +39,11 @@ type tablePipeline struct {
 	mode      change.WriteMode
 	ch        chan change.Change
 
+	// readyCh carries collapsed batches from the batcher to the committer.
+	// This decouples collapse (CPU) from commit (I/O): while batch N is
+	// committing, batch N+1 collapses concurrently.
+	readyCh chan readyBatch
+
 	// DBLog snapshot windows, per design: each chunk's SELECT rows land in
 	// their own window (AddWindowRows); live events tagged InWindow remove
 	// their key from that chunk's window; the chunk's Closes marker flushes
@@ -49,6 +54,12 @@ type tablePipeline struct {
 	winMu   sync.Mutex
 	windows map[uint32]map[string]change.Change
 	dropped int64
+}
+
+// readyBatch is a collapsed batch ready for commit.
+type readyBatch struct {
+	batch change.Batch
+	rows  int
 }
 
 // New builds a worker; register tables before Run.
@@ -87,6 +98,7 @@ func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) 
 		committer: c,
 		mode:      mode,
 		ch:        make(chan change.Change, 1024),
+		readyCh:   make(chan readyBatch, 1),
 		windows:   map[uint32]map[string]change.Change{},
 	}
 }
@@ -177,6 +189,49 @@ func (w *Worker) Run(ctx context.Context, ingest <-chan change.Change) error {
 }
 
 func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
+	// The committer goroutine is the serialization point: it reads
+	// prepared batches from readyCh and commits them one at a time.
+	// While batch N commits (catalog round-trips, S3 writes), batch
+	// N+1 collapses concurrently in the batcher goroutine below.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.runCommitter(ctx, p)
+	}()
+
+	// Batcher goroutine: collects changes, collapses, sends to readyCh.
+	err := w.runBatcher(ctx, p)
+	close(p.readyCh) // signal committer to drain and exit
+	if err != nil {
+		return err
+	}
+	return <-errCh
+}
+
+// runCommitter reads prepared batches and commits them serially.
+func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
+	for rb := range p.readyCh {
+		start := time.Now()
+		if err := p.committer.Commit(ctx, rb.batch); err != nil {
+			if w.metrics != nil {
+				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
+			}
+			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
+		}
+		if w.metrics != nil {
+			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
+			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(len(rb.batch.Upserts)))
+			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(len(rb.batch.Deletes)))
+		}
+		if w.onCommit != nil {
+			w.onCommit(rb.batch, rb.rows)
+		}
+	}
+	return nil
+}
+
+// runBatcher collects changes, collapses them, and sends ready batches to
+// the committer. When the channel closes, the committer drains and exits.
+func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	var buf []change.Change
 	ticker := time.NewTicker(w.cfg.MaxInterval)
 	defer ticker.Stop()
@@ -215,20 +270,10 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 		}
 		rows := len(buf)
 		buf = buf[:0]
-		start := time.Now()
-		if err := p.committer.Commit(ctx, b); err != nil {
-			if w.metrics != nil {
-				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
-			}
-			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
-		}
-		if w.metrics != nil {
-			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
-			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(len(b.Upserts)))
-			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(len(b.Deletes)))
-		}
-		if w.onCommit != nil {
-			w.onCommit(b, rows)
+		select {
+		case p.readyCh <- readyBatch{batch: b, rows: rows}:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 		return nil
 	}
