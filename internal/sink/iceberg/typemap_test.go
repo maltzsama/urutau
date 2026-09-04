@@ -50,3 +50,33 @@ func TestUnmappableIsHardError(t *testing.T) {
 		t.Fatal("unsupported canonical kind did not error")
 	}
 }
+
+// 033 §6.1 acceptance: a fixed(L) canonical column reaches Iceberg as
+// fixed(L), preserving the declared size.
+func TestFromCanonicalFixedBinary(t *testing.T) {
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "digest", Type: core.ColumnType{Kind: core.KindFixedBinary, FixedSize: 16}},
+		{Name: "blob", Type: core.ColumnType{Kind: core.KindBinary}},
+	}}
+	sch, err := FromCanonical(cs)
+	if err != nil {
+		t.Fatalf("from canonical: %v", err)
+	}
+	digest, ok := sch.FindFieldByName("digest")
+	if !ok {
+		t.Fatal("digest field missing")
+	}
+	if digest.Type != iceberg.FixedTypeOf(16) {
+		t.Fatalf("digest type = %v, want fixed(16)", digest.Type)
+	}
+	blob, _ := sch.FindFieldByName("blob")
+	if blob.Type != iceberg.PrimitiveTypes.Binary {
+		t.Fatalf("blob type = %v, want binary (variable, unaffected)", blob.Type)
+	}
+	// fixed(0) is rejected.
+	cs.Columns[1].Type.FixedSize = 0
+	if _, err := FromCanonical(cs); err == nil {
+		t.Fatal("fixed(0) must be rejected")
+	}
+}

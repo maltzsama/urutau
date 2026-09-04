@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+
 	"github.com/maltzsama/urutau/internal/core"
 )
 
@@ -113,5 +115,102 @@ func TestBoundsEmpty(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("rows = %v, want none", rows)
+	}
+}
+
+// 033: a fixed(16) binary column round-trips as KindFixedBinary — NOT as
+// uuid — because it lacks the uuid extension on the field.
+func TestTableSchemaFixedBinaryNotUUID(t *testing.T) {
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "digest", Type: core.ColumnType{Kind: core.KindFixedBinary, FixedSize: 16}},
+	}}
+	b, err := EncodeTableSchema(cs)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, err := DecodeTableSchema(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	c := got.Columns[0]
+	if c.Type.Kind != core.KindFixedBinary || c.Type.FixedSize != 16 {
+		t.Fatalf("digest decoded as %+v, want fixed(16) — not uuid", c.Type)
+	}
+}
+
+func fieldByName(t *testing.T, sch *arrow.Schema, name string) arrow.Field {
+	t.Helper()
+	for _, f := range sch.Fields() {
+		if f.Name == name {
+			return f
+		}
+	}
+	t.Fatalf("field %q not in schema", name)
+	return arrow.Field{}
+}
+
+// 035: a uuid column carries the arrow.uuid extension and travels as
+// FixedSizeBinary(16), never String.
+func TestUUIDFieldIsFixedSizeBinaryWithExtension(t *testing.T) {
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "uid", Type: core.ColumnType{Kind: core.KindUUID}},
+		{Name: "name", Type: core.ColumnType{Kind: core.KindString}},
+	}}
+	sch, err := CoreSchemaToArrow(cs)
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	uid := fieldByName(t, sch, "uid")
+	if id := uid.Type.ID(); id != arrow.FIXED_SIZE_BINARY {
+		t.Fatalf("uid arrow type = %v, want FixedSizeBinary", id)
+	}
+	if v, ok := uid.Metadata.GetValue("ARROW:extension:name"); !ok || v != "arrow.uuid" {
+		t.Fatalf("uid metadata = %v, want arrow.uuid", uid.Metadata)
+	}
+
+	// Round trip: the extension survives, so uuid decodes as uuid.
+	b, err := EncodeTableSchema(cs)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, err := DecodeTableSchema(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Columns[0].Type.Kind != core.KindUUID {
+		t.Fatalf("uid decoded as %v, want uuid", got.Columns[0].Type.Kind)
+	}
+	if got.Columns[1].Type.Kind != core.KindString {
+		t.Fatalf("name decoded as %v, want string", got.Columns[1].Type.Kind)
+	}
+}
+
+// 035: a json column is stored as string but carries the arrow.json label.
+func TestJSONFieldHasExtension(t *testing.T) {
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "body", Type: core.ColumnType{Kind: core.KindJSON}},
+	}}
+	sch, err := CoreSchemaToArrow(cs)
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	body := fieldByName(t, sch, "body")
+	if body.Type.ID() != arrow.STRING {
+		t.Fatalf("json storage = %v, want string", body.Type.ID())
+	}
+	if v, ok := body.Metadata.GetValue("ARROW:extension:name"); !ok || v != "arrow.json" {
+		t.Fatalf("json metadata = %v, want arrow.json", body.Metadata)
+	}
+
+	b, err := EncodeTableSchema(cs)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, err := DecodeTableSchema(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Columns[0].Type.Kind != core.KindJSON {
+		t.Fatalf("json decoded as %v, want KindJSON (label survives)", got.Columns[0].Type.Kind)
 	}
 }
