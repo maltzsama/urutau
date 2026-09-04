@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/internal/adapter"
@@ -103,36 +103,36 @@ func TargetIdent(s *spec.Spec, target string) table.Identifier {
 }
 
 // NewCatalog opens the Iceberg REST catalog from the spec's sink config.
-func NewCatalog(ctx context.Context, s *spec.Spec) (*rest.Catalog, error) {
+func NewCatalog(ctx context.Context, s *spec.Spec) (catalog.Catalog, error) {
 	return icebergsink.NewCatalog(ctx, icebergsink.CatalogConfig(s))
 }
 
 // NewCatalogFromConfig opens the Iceberg REST catalog from a raw sink config
 // (used by remote workers, which hold the config directly).
-func NewCatalogFromConfig(ctx context.Context, cfg icebergsink.Config) (*rest.Catalog, error) {
+func NewCatalogFromConfig(ctx context.Context, cfg icebergsink.Config) (catalog.Catalog, error) {
 	return icebergsink.NewCatalog(ctx, cfg)
 }
 
 // EnsureNamespace creates the sink namespace if absent.
-func EnsureNamespace(ctx context.Context, cat *rest.Catalog, ident table.Identifier) error {
+func EnsureNamespace(ctx context.Context, cat catalog.Catalog, ident table.Identifier) error {
 	return icebergsink.EnsureNamespace(ctx, cat, ident)
 }
 
 // EnsureTable creates the target table if absent; on existing tables it
 // verifies cast column types have not diverged. The partition spec is
 // applied on create and verified for divergence on existing tables.
-func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
+func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
 	return icebergsink.EnsureTable(ctx, cat, ident, schema, partitionBy, cast)
 }
 
 // NewTableWriter opens the per-table Iceberg writer with its cast and
 // metadata plan. Casts are applied to source column values; metadata columns
 // are projected from the change header.
-func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifier, pk []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string) (*icebergsink.TableWriter, error) {
+func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identifier, pk []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string) (*icebergsink.TableWriter, error) {
 	return icebergsink.NewTableWriter(ctx, cat, ident, pk, cast, meta, sourceTable)
 }
 
 // CommittedPosition reads the committed cdc.position (with walk-back).
-func CommittedPosition(ctx context.Context, cat *rest.Catalog, ident table.Identifier) (string, error) {
+func CommittedPosition(ctx context.Context, cat catalog.Catalog, ident table.Identifier) (string, error) {
 	return icebergsink.CommittedPosition(ctx, cat, ident)
 }

@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/internal/change"
@@ -244,7 +244,7 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 
 // ── Positions and catalog ────────────────────────────────────────────
 
-func resumeFrom(ctx context.Context, reg *drivers.Registry, cat *rest.Catalog, s *spec.Spec, refs []core.TableRef) (position.Position, []core.TableRef, error) {
+func resumeFrom(ctx context.Context, reg *drivers.Registry, cat catalog.Catalog, s *spec.Spec, refs []core.TableRef) (position.Position, []core.TableRef, error) {
 	var positions []position.Position
 	var needsSnapshot []core.TableRef
 	for _, ref := range refs {

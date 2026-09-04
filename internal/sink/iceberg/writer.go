@@ -16,7 +16,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/internal/change"
@@ -42,7 +41,7 @@ var ErrCommitExhausted = errors.New("iceberg: commit retries exhausted")
 // caller (the worker dedicates one committer goroutine per table, which is
 // the design's serialization invariant).
 type TableWriter struct {
-	cat             *rest.Catalog
+	cat             catalog.Catalog
 	ident           table.Identifier
 	eqIDs           []int
 	dataSchema      *arrow.Schema
@@ -60,7 +59,7 @@ type TableWriter struct {
 // primary key) and precomputes the arrow schemas for data and delete rows.
 // The cast policy is applied to source column values during projection; the
 // metadata columns are projected from the change header.
-func NewTableWriter(ctx context.Context, cat *rest.Catalog, ident table.Identifier, primaryKey []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string) (*TableWriter, error) {
+func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identifier, primaryKey []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string) (*TableWriter, error) {
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return nil, fmt.Errorf("iceberg: load %v: %w", ident, err)
@@ -278,7 +277,7 @@ func (w *TableWriter) commitAppend(ctx context.Context, upserts []change.Change,
 // produces a replace without the property), the walk-back over snapshot
 // summaries is the fallback — defense, not coupling (design §2.2). Empty
 // string means the table has never committed (snapshot needed).
-func CommittedPosition(ctx context.Context, cat *rest.Catalog, ident table.Identifier) (string, error) {
+func CommittedPosition(ctx context.Context, cat catalog.Catalog, ident table.Identifier) (string, error) {
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return "", fmt.Errorf("iceberg: load %v: %w", ident, err)
@@ -316,7 +315,7 @@ func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
 // if the existing column's Iceberg type disagrees, a hard error prevents
 // silent data corruption. The partition spec is applied on create and
 // verified for divergence on existing tables.
-func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
+func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
 	existing, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		// Table does not exist — create.

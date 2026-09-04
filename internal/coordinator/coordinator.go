@@ -25,7 +25,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/apache/iceberg-go/catalog"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -104,7 +104,7 @@ type Coordinator struct {
 	reg       *drivers.Registry
 	qdb       *sql.DB
 	refs      []snapshot.TableRef
-	cat       *rest.Catalog
+	cat       catalog.Catalog
 	schemas   map[string]*iceberg.Schema
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
