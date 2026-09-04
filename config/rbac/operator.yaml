@@ -1,3 +1,8 @@
+# Permissions for the urutau-operator service account (urutau-system).
+#
+# The coordinator gets its OWN identity dynamically: for every pipeline the
+# reconciler creates a ServiceAccount, a Role (cdcpipelines + status in the
+# pipeline's namespace) and a RoleBinding — see internal/operator/controller.go.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -15,9 +20,22 @@ rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The operator references credentials in pod specs; it never mutates them.
   - apiGroups: [""]
-    resources: ["configmaps", "services", "secrets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # ConfigMap carries the resolved spec; the Service is the coordinator's
+  # headless stable identity. Delete flows through owner-reference GC.
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Per-pipeline coordinator identity, created dynamically at reconcile.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
