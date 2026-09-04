@@ -30,6 +30,7 @@ func EncodeTableSchema(cs core.Schema) ([]byte, error) {
 			Name:     col.Name,
 			Type:     at,
 			Nullable: col.Type.Nullable,
+			Metadata: fieldMetadata(col.Type),
 		})
 	}
 	return marshalArrowSchema(arrow.NewSchema(fields, nil))
@@ -48,7 +49,7 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 		if IsMetadataColumn(f.Name) {
 			continue
 		}
-		ct := arrowTypeToCore(f.Type)
+		ct := fieldTypeToCore(f)
 		ct.Nullable = f.Nullable
 		cs.Columns = append(cs.Columns, core.Column{Name: f.Name, Type: ct})
 	}

@@ -11,6 +11,43 @@ import (
 	"github.com/maltzsama/urutau/internal/core"
 )
 
+// Extension metadata carried on wire fields. UUID and fixed(16) are both
+// FixedSizeBinary in Arrow; the extension distinguishes them so decode
+// reconstructs the right canonical Kind. JSON is physically a string; the
+// extension labels it for consumers reading the RecordBatch directly.
+const (
+	extNameKey = "ARROW:extension:name"
+	extUUID    = "arrow.uuid"
+	extJSON    = "arrow.json"
+)
+
+// fieldMetadata returns the extension metadata a canonical kind carries on
+// the wire, or empty metadata when it carries none.
+func fieldMetadata(ct core.ColumnType) arrow.Metadata {
+	switch ct.Kind {
+	case core.KindUUID:
+		return arrow.NewMetadata([]string{extNameKey}, []string{extUUID})
+	case core.KindJSON:
+		return arrow.NewMetadata([]string{extNameKey}, []string{extJSON})
+	default:
+		return arrow.Metadata{}
+	}
+}
+
+// fieldTypeToCore reconstructs the canonical type of a wire field, honoring
+// extension metadata (uuid, json) before falling back to the raw Arrow type.
+func fieldTypeToCore(f arrow.Field) core.ColumnType {
+	if v, ok := f.Metadata.GetValue(extNameKey); ok {
+		switch v {
+		case extUUID:
+			return core.ColumnType{Kind: core.KindUUID}
+		case extJSON:
+			return core.ColumnType{Kind: core.KindJSON}
+		}
+	}
+	return arrowTypeToCore(f.Type)
+}
+
 // CoreSchemaToArrow maps a canonical core.Schema into a typed Arrow schema.
 // Data columns appear in schema order, followed by the fixed metadata
 // columns (__op, __pos, __commit_ts, __ingest_ts, __snapshot). This is
@@ -28,6 +65,7 @@ func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
 			Name:     col.Name,
 			Type:     at,
 			Nullable: col.Type.Nullable,
+			Metadata: fieldMetadata(col.Type),
 		})
 	}
 
@@ -65,6 +103,11 @@ func kindToArrow(ct core.ColumnType) (arrow.DataType, error) {
 		return arrow.BinaryTypes.String, nil
 	case core.KindBinary:
 		return arrow.BinaryTypes.Binary, nil
+	case core.KindFixedBinary:
+		if ct.FixedSize <= 0 {
+			return nil, fmt.Errorf("fixed requires size > 0")
+		}
+		return &arrow.FixedSizeBinaryType{ByteWidth: ct.FixedSize}, nil
 	case core.KindDate:
 		return arrow.PrimitiveTypes.Int32, nil // days since epoch, stored as int32
 	case core.KindTime:

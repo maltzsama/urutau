@@ -54,6 +54,11 @@ func mapCanonicalType(t core.ColumnType) (iceberg.Type, error) {
 		return iceberg.PrimitiveTypes.String, nil
 	case core.KindBinary:
 		return iceberg.PrimitiveTypes.Binary, nil
+	case core.KindFixedBinary:
+		if t.FixedSize <= 0 {
+			return nil, fmt.Errorf("fixed requires size > 0")
+		}
+		return iceberg.FixedTypeOf(t.FixedSize), nil
 	case core.KindDate:
 		return iceberg.PrimitiveTypes.Date, nil
 	case core.KindTime:

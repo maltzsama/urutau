@@ -147,7 +147,7 @@ func CheckCast(from ColumnType, to CastTarget) error {
 			KindDecimal, KindString, KindDate, KindTime, KindTimestamp,
 			KindTimestampTZ, KindUUID, KindJSON:
 			return nil
-		case KindBinary:
+		case KindBinary, KindFixedBinary:
 			if to.Encoding == "" {
 				return fmt.Errorf("core: binary → string is ambiguous; declare string(hex) or string(base64)")
 			}
@@ -216,6 +216,10 @@ func CheckCast(from ColumnType, to CastTarget) error {
 		}
 		return fmt.Errorf("core: %s → timestamptz is not allowed", from.Kind)
 	case KindBinary:
+		// Fixed binary widens to variable binary without loss.
+		if from.Kind == KindBinary || from.Kind == KindFixedBinary {
+			return nil
+		}
 		return fmt.Errorf("core: %s → binary is not allowed", from.Kind)
 	default:
 		return fmt.Errorf("core: %s → %s is not allowed", from.Kind, to.Type.Kind)
@@ -239,6 +243,8 @@ func (t CastTarget) Convert(v any) (any, error) {
 	switch t.Type.Kind {
 	case KindString:
 		return castToString(v, t.Encoding)
+	case KindBinary:
+		return castToBinary(v)
 	case KindInt64:
 		return castToInt64(v)
 	case KindFloat64:
@@ -287,6 +293,19 @@ func castToString(v any, enc string) (any, error) {
 		}
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to string", v)
+	}
+}
+
+func castToBinary(v any) (any, error) {
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case []byte:
+		return t, nil
+	case string:
+		return []byte(t), nil
+	default:
+		return nil, fmt.Errorf("core: cannot cast %T to binary", v)
 	}
 }
 

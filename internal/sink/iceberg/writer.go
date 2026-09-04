@@ -778,6 +778,10 @@ func appendColumn(builder array.Builder, name string, values []any) error {
 			switch t := v.(type) {
 			case nil:
 				b.AppendNull()
+			case []byte:
+				// Fixed-size binary column (iceberg fixed(L)); uuid also
+				// travels as raw bytes here.
+				b.Append(t)
 			case string:
 				raw, err := uuidToBytes(t)
 				if err != nil {
@@ -785,7 +789,7 @@ func appendColumn(builder array.Builder, name string, values []any) error {
 				}
 				b.Append(raw)
 			default:
-				return fmt.Errorf("iceberg: column %q: cannot append %T as uuid", name, v)
+				return fmt.Errorf("iceberg: column %q: cannot append %T as fixed-size binary", name, v)
 			}
 		}
 	case *array.BinaryBuilder:

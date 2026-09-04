@@ -138,10 +138,11 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 	numCols := int(rec.NumCols())
 	numDataCols := numCols - 5 // subtract metadata columns
 
-	// Pre-resolve core types for each data column from the Arrow schema.
+	// Pre-resolve core types for each data column from the Arrow schema,
+	// honoring extension metadata (uuid/json) so the Kind survives the wire.
 	colTypes := make([]core.ColumnType, numDataCols)
 	for j := 0; j < numDataCols; j++ {
-		colTypes[j] = arrowTypeToCore(schema.Field(j).Type)
+		colTypes[j] = fieldTypeToCore(schema.Field(j))
 	}
 	// Resolve key column positions once: data-column index per PK name.
 	keyCols := make([]int, 0, len(primaryKey))
@@ -238,7 +239,11 @@ func arrowTypeToCore(dt arrow.DataType) core.ColumnType {
 	case arrow.TIMESTAMP:
 		return core.ColumnType{Kind: core.KindTimestampTZ} // timestamps travel as UTC
 	case arrow.FIXED_SIZE_BINARY:
-		return core.ColumnType{Kind: core.KindUUID}
+		// A bare fixed-size binary without the uuid extension is a fixed
+		// byte sequence; uuid is disambiguated at the field level via
+		// extension metadata (fieldTypeToCore).
+		fsb := dt.(*arrow.FixedSizeBinaryType)
+		return core.ColumnType{Kind: core.KindFixedBinary, FixedSize: int(fsb.ByteWidth)}
 	default:
 		return core.ColumnType{Kind: core.KindString} // fallback
 	}
@@ -382,6 +387,17 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		default:
 			return fmt.Errorf("want []byte or string for uuid, got %T", v)
 		}
+	case core.KindFixedBinary:
+		// The builder validates the byte width against the field's declared
+		// size, surfacing a truncated/oversized value instead of writing it.
+		switch t := v.(type) {
+		case []byte:
+			bld.(*array.FixedSizeBinaryBuilder).Append(t)
+		case string:
+			bld.(*array.FixedSizeBinaryBuilder).Append([]byte(t))
+		default:
+			return fmt.Errorf("want []byte for fixed binary, got %T", v)
+		}
 	default:
 		return fmt.Errorf("unsupported kind %s", ct.Kind)
 	}
@@ -418,6 +434,8 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 		ts := col.(*array.Timestamp).Value(i)
 		return ts.ToTime(arrow.Microsecond), nil
 	case core.KindUUID:
+		return col.(*array.FixedSizeBinary).Value(i), nil
+	case core.KindFixedBinary:
 		return col.(*array.FixedSizeBinary).Value(i), nil
 	default:
 		return nil, fmt.Errorf("unsupported kind %s", ct.Kind)
