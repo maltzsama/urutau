@@ -48,7 +48,7 @@ func TestBackoffDuration(t *testing.T) {
 		if d < 200*time.Millisecond {
 			t.Fatalf("attempt %d: backoff %v below base", attempt, d)
 		}
-		if d > 31*time.Second {
+		if d > 38*time.Second { // 30s cap + 25% jitter on the capped value
 			t.Fatalf("attempt %d: backoff %v exceeds cap+jitter", attempt, d)
 		}
 	}
