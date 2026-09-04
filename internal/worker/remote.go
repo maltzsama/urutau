@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -148,15 +149,15 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		ident := targetIdent(cfg.Namespace, ta.TargetTable)
 		if ta.CreateIfNotExists {
-			if err := drivers.EnsureTable(ctx, cat, ident, schema); err != nil {
+			if err := drivers.EnsureTable(ctx, cat, ident, schema, core.CastPolicy{}); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}
-		writer, err := drivers.NewTableWriter(ctx, cat, ident, ta.PrimaryKey)
+		writer, err := drivers.NewTableWriter(ctx, cat, ident, ta.PrimaryKey, core.CastPolicy{}, nil, "")
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
-		w.Register(ta.TargetTable, writer)
+		w.Register(ta.TargetTable, writer, change.UpsertMode)
 	}
 
 	// Report phase + committed positions (design §5.6.1): STREAMING if any

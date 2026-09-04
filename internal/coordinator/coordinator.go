@@ -31,6 +31,7 @@ import (
 
 	"github.com/apache/iceberg-go/table"
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/observability"
@@ -249,7 +250,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, is, err := reg.Introspect(ctx, qdb, t)
+		ref, _, is, _, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
 			return err
 		}
@@ -305,7 +306,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	for _, ref := range refs {
-		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source]); err != nil {
+		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source], core.CastPolicy{}); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
@@ -650,8 +651,14 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceRead
 		c.log.Info("chunk ready", "table", ref.Source, "chunk", chunkID)
 
 		// The worker has the chunk rows in its window; prove the reader is
-		// caught up before releasing anything that touches this window.
-		high := rdr.Synced()
+		// caught up before releasing anything that touches this window. The
+		// high watermark is the source's FIXED position after the SELECT —
+		// never a live master — so a busy source cannot keep the window open
+		// forever.
+		high, err := rdr.Master(ctx)
+		if err != nil {
+			return fmt.Errorf("dblog: chunk %d: master: %w", chunkID, err)
+		}
 		if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 		}

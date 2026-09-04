@@ -3,12 +3,17 @@ package spec
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
+
+	"github.com/maltzsama/urutau/internal/core"
 )
 
 var (
 	ErrNilFilterNode       = errors.New("filter node is empty")
 	ErrAmbiguousFilterNode = errors.New("filter node carries more than one of all/any/not/where")
+	// identRe is the closed set of valid destination column identifiers.
+	identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // Validate applies the hard, server-side rules. The same code must validate
@@ -23,8 +28,12 @@ func (s *Spec) Validate() error {
 
 	switch s.Source.Kind {
 	case "mysql", "postgres":
+	case "kafka":
+		if s.Source.SnapshotMode != "" && s.Source.SnapshotMode != "none" {
+			problems = append(problems, "source.snapshotMode: must be \"none\" for kafka")
+		}
 	case "":
-		problems = append(problems, "source.kind: required (mysql | postgres)")
+		problems = append(problems, "source.kind: required (mysql | postgres | kafka)")
 	default:
 		problems = append(problems, fmt.Sprintf("source.kind: unsupported %q", s.Source.Kind))
 	}
@@ -90,12 +99,91 @@ func (s *Spec) Validate() error {
 		}
 
 		validateFilter(tbl.Filter, p+".filter", &problems)
+		validateMetadata(tbl, p, &problems)
+		validateCast(tbl, p, &problems)
 	}
 
 	if len(problems) > 0 {
 		return fmt.Errorf("spec: %s", strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+// validMetadataKeys is the closed metadata catalog.
+var validMetadataKeys = map[core.MetadataKey]bool{
+	core.MetaOp:          true,
+	core.MetaCommitTS:    true,
+	core.MetaIngestTS:    true,
+	core.MetaPosition:    true,
+	core.MetaSourceTable: true,
+	core.MetaPhase:       true,
+}
+
+// validateMetadata checks the closed metadata rules: catalog membership,
+// explicit valid destination name, no repeats, never part of the primary
+// key.
+func validateMetadata(tbl Table, path string, problems *[]string) {
+	seen := map[string]bool{}
+	for _, m := range tbl.Metadata {
+		if !validMetadataKeys[m.From] {
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: op, commit_ts, ingest_ts, position, source_table, phase)", path, m.From))
+		}
+		if m.As == "" {
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.as: required", path))
+		} else if !identRe.MatchString(m.As) {
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.as: %q is not a valid column name", path, m.As))
+		}
+		if m.As != "" && seen[m.As] {
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.as: duplicated %q", path, m.As))
+		}
+		seen[m.As] = true
+		if m.As != "" {
+			for _, pk := range tbl.PrimaryKey {
+				if pk == m.As {
+					*problems = append(*problems, fmt.Sprintf("%s.metadata: column %q cannot be part of the primary key (the equality key comes from the source)", path, m.As))
+				}
+			}
+		}
+	}
+}
+
+// validateCast checks the closed cast rules that are decidable without
+// source introspection: every value must parse to a canonical target, and
+// the key must not be empty. The matrix (source kind → target) is enforced
+// at schema resolution, where the source type is known.
+func validateCast(tbl Table, path string, problems *[]string) {
+	for name, text := range tbl.Cast {
+		if name == "" {
+			*problems = append(*problems, fmt.Sprintf("%s.cast: empty column name", path))
+			continue
+		}
+		if _, err := core.ParseCastTarget(text); err != nil {
+			*problems = append(*problems, fmt.Sprintf("%s.cast.%s: %v", path, name, err))
+		}
+	}
+}
+
+// Warnings returns the advisory outcomes of the spec — rules that do not
+// reject it but must be surfaced to the operator (eventlog, status).
+func (s *Spec) Warnings() []string {
+	var warns []string
+	for i, tbl := range s.Tables {
+		mode := tbl.WriteMode
+		if mode == "" {
+			mode = s.Sink.Defaults.WriteMode
+		}
+		if mode == "" {
+			mode = WriteModeUpsert
+		}
+		if mode == WriteModeUpsert {
+			for _, m := range tbl.Metadata {
+				if m.From == core.MetaOp {
+					warns = append(warns, fmt.Sprintf("tables[%d].metadata.op: in upsert mode a delete removes the row and op never lands as \"delete\" — use writeMode append to keep deletes", i))
+				}
+			}
+		}
+	}
+	return warns
 }
 
 // validateFilter checks the closed grammar: every node carries exactly one

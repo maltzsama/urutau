@@ -115,18 +115,13 @@ func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
 }
 
 // CanonicalSchema derives the canonical core.Schema from the introspected
-// table, mapping the scalar subset the pipeline supports (int64, float64,
-// string, bool). Anything outside the subset is a hard error — silent
-// coercion is how type bugs are born. The source knows nothing about any
-// sink (CR-012).
+// table. Mappable columns map to their canonical kind; unmappable ones are
+// carried as KindUnknown so a declared cast can land them explicitly — never
+// silent coercion. The source knows nothing about any sink.
 func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 	cols := make([]core.Column, 0, len(tbl.Columns))
 	for _, col := range tbl.Columns {
-		ct, err := mapColumnType(col)
-		if err != nil {
-			return core.Schema{}, fmt.Errorf("postgres: %s.%s column %q: %w", tbl.Schema, tbl.Name, col.Name, err)
-		}
-		cols = append(cols, core.Column{Name: col.Name, Type: ct})
+		cols = append(cols, core.Column{Name: col.Name, Type: mapColumnType(col)})
 	}
 	var pk []string
 	for _, idx := range tbl.PKColumns {
@@ -137,25 +132,40 @@ func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 	return core.Schema{Columns: cols, PrimaryKey: pk}, nil
 }
 
-// mapColumnType maps a PostgreSQL type to a canonical type, restricted to
-// the scalar subset the pipeline implements. Temporal types stay as strings
-// in this milestone — the source text representation round-trips losslessly
-// and the MySQL source behaves the same way.
-func mapColumnType(col Column) (core.ColumnType, error) {
+// mapColumnType maps a PostgreSQL type to a canonical type. Integer widths
+// map to int64; temporal, uuid and json keep their text representation as
+// the canonical value (the pgoutput text form round-trips losslessly, and
+// the snapshot chunker produces the same text). Unmappable types become
+// KindUnknown so a declared cast is the only way to land them.
+func mapColumnType(col Column) core.ColumnType {
 	switch strings.ToLower(col.DataType) {
 	case "smallint", "integer", "bigint":
-		return core.ColumnType{Kind: core.KindInt64}, nil
-	case "real", "double precision", "numeric", "money":
-		return core.ColumnType{Kind: core.KindFloat64}, nil
+		return core.ColumnType{Kind: core.KindInt64}
+	case "real", "double precision", "money":
+		return core.ColumnType{Kind: core.KindFloat64}
+	case "numeric":
+		return core.ColumnType{Kind: core.KindDecimal}
 	case "boolean":
-		return core.ColumnType{Kind: core.KindBool}, nil
-	case "character varying", "character", "text", "citext",
-		"date", "timestamp without time zone", "timestamp with time zone",
-		"time without time zone", "time with time zone",
-		"uuid", "json", "jsonb", "xml",
-		"inet", "cidr", "macaddr", "macaddr8", "interval", "bytea":
-		return core.ColumnType{Kind: core.KindString}, nil
+		return core.ColumnType{Kind: core.KindBool}
+	case "character varying", "character", "text", "citext":
+		return core.ColumnType{Kind: core.KindString}
+	case "date":
+		return core.ColumnType{Kind: core.KindDate}
+	case "time without time zone", "time with time zone":
+		return core.ColumnType{Kind: core.KindTime}
+	case "timestamp without time zone":
+		return core.ColumnType{Kind: core.KindTimestamp}
+	case "timestamp with time zone":
+		return core.ColumnType{Kind: core.KindTimestampTZ}
+	case "uuid":
+		return core.ColumnType{Kind: core.KindUUID}
+	case "json", "jsonb":
+		return core.ColumnType{Kind: core.KindJSON}
+	case "bytea":
+		return core.ColumnType{Kind: core.KindBinary}
 	default:
-		return core.ColumnType{}, fmt.Errorf("unsupported postgres type %q", col.DataType)
+		// xml, inet, cidr, macaddr, interval, extensions, … — no canonical
+		// form; a cast is the only way to land these columns.
+		return core.ColumnType{Kind: core.KindUnknown}
 	}
 }

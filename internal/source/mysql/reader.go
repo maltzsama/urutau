@@ -48,31 +48,47 @@ type Reader struct {
 	mu      sync.Mutex
 	curSet  *position.GTID // accumulated GTID set through the current transaction
 	curGTID string         // curSet.String() — the position rows of this txn carry
+	curTxn  *position.GTID // single GTID of the transaction being decoded (window check)
 
 	winMu    sync.Mutex
 	winChunk uint32 // chunkID of the open DBLog window, when winOpen
 	winOpen  bool
+	winLow   *position.GTID // source watermark captured at OpenWindow
 
 	lastDDL string // most recent DDL statement (SchemaMismatch trigger)
 
 	canal.DummyEventHandler // unimplemented hooks are no-ops
 }
 
-// MarkWindow opens the DBLog window for chunkID: every row event decoded
-// from now on is tagged InWindow for that chunk, until ClearWindow. The tag
-// is applied synchronously at decode — no event can escape the window by
-// racing a channel pull.
-func (r *Reader) MarkWindow(chunkID uint32) {
+// OpenWindow opens the DBLog window for chunkID. The reader captures its
+// source watermark — the master's executed GTID set — and, from now on, tags
+// decoded events whose transaction is strictly past that watermark InWindow
+// for the chunk, until ClearWindow. Events at or before the watermark are
+// already reflected in the chunk SELECT and must not be tagged. The tag is
+// applied synchronously at decode — no event can escape the window by racing
+// a channel pull.
+func (r *Reader) OpenWindow(ctx context.Context, chunkID uint32) {
+	var low *position.GTID
+	if g, ok := r.Synced().(*position.GTID); ok {
+		low = g
+	}
+	if m, err := r.Master(ctx); err == nil {
+		if g, ok := m.(*position.GTID); ok {
+			low = g
+		}
+	}
 	r.winMu.Lock()
 	r.winOpen = true
 	r.winChunk = chunkID
+	r.winLow = low
 	r.winMu.Unlock()
 }
 
-// ClearWindow closes the DBLog window opened by MarkWindow.
+// ClearWindow closes the DBLog window opened by OpenWindow.
 func (r *Reader) ClearWindow() {
 	r.winMu.Lock()
 	r.winOpen = false
+	r.winLow = nil
 	r.winMu.Unlock()
 }
 
@@ -145,13 +161,29 @@ func (r *Reader) Synced() position.Position {
 }
 
 // Master reports the master's current executed GTID set (the caught-up
-// target for the DBLog window).
-func (r *Reader) Master() (position.Position, error) {
-	set, err := r.canal.GetMasterGTIDSet()
-	if err != nil {
-		return nil, fmt.Errorf("mysql: master gtid: %w", err)
+// target for the DBLog window). go-mysql's GetMasterGTIDSet has no ctx
+// variant, so it runs in a goroutine and this call gives up when ctx is done
+// (the query itself is bounded by the canal connection's read timeout).
+func (r *Reader) Master(ctx context.Context) (position.Position, error) {
+	type result struct {
+		set *position.GTID
+		err error
 	}
-	return position.MustGTID(set.String()), nil
+	ch := make(chan result, 1)
+	go func() {
+		set, err := r.canal.GetMasterGTIDSet()
+		if err != nil {
+			ch <- result{err: fmt.Errorf("mysql: master gtid: %w", err)}
+			return
+		}
+		ch <- result{set: position.MustGTID(set.String())}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.set, res.err
+	}
 }
 
 // Close stops the reader and its replication connection.
@@ -168,6 +200,9 @@ func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) e
 	if err != nil {
 		return fmt.Errorf("mysql: gtid next parse: %w", err)
 	}
+	r.mu.Lock()
+	r.curTxn = g
+	r.mu.Unlock()
 	r.mergeGTID(g)
 	return nil
 }
@@ -194,9 +229,14 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 
 	r.mu.Lock()
 	pos := r.curGTID
+	txn := r.curTxn
 	r.winMu.Lock()
 	var win *change.Window
-	if r.winOpen {
+	// Only events strictly past the low watermark are InWindow: an event at
+	// or before low is already reflected in the chunk SELECT (or in an
+	// earlier chunk), so tagging it would resurrect a stale value. A missing
+	// watermark falls back to tagging everything — over-tagging is safe.
+	if r.winOpen && (r.winLow == nil || txn == nil || !r.winLow.Contains(txn)) {
 		win = &change.Window{ChunkID: r.winChunk, InWindow: true}
 	}
 	r.winMu.Unlock()
@@ -257,6 +297,7 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op change.Op, after, be
 		Op:       op,
 		Table:    ref.Target,
 		Position: pos,
+		IngestTS: time.Now(),
 	}
 
 	key := make([]any, 0, len(ref.PrimaryKey))

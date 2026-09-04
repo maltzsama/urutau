@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -105,6 +106,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte) ([]change.Change, *pb.
 			Op:       change.Op(opCol.Value(i)),
 			Position: posCol.Value(i),
 			Table:    meta.Table,
+			IngestTS: time.Now(),
 		}
 		if err := json.Unmarshal([]byte(keyCol.Value(i)), &c.Key); err != nil {
 			return nil, nil, fmt.Errorf("transport: unmarshal key: %w", err)

@@ -53,6 +53,14 @@ type Relay interface {
 	Release(table string, chunkID uint32, at position.Position)
 	// AddWindowRows feeds the chunk SELECT result into the worker's window.
 	AddWindowRows(target string, chunkID uint32, rows []change.Change) error
+	// GateOn starts buffering the table's live events while its chunk
+	// SELECT is in flight; GateFlush releases them InWindow-tagged, only
+	// after AddWindowRows has populated the window. This is the ordering the
+	// window proof needs — a live event must never be deduplicated against
+	// an empty window. The distributed coordinator implements the same gate
+	// over its pump; the collapsed runner over its relay.
+	GateOn(table string, chunkID uint32)
+	GateFlush()
 }
 
 // ChunkSource is the chunk SELECT surface the orchestrator consumes. The
@@ -68,12 +76,17 @@ type ChunkSource interface {
 }
 
 // SourceReader is the reader surface the orchestrator needs: positions for
-// the watermarks, and the window mark that tags events InWindow at decode
-// time — so no event can escape the window by racing a channel pull.
+// the watermarks, and the window that tags events InWindow at decode time —
+// so no event can escape the window by racing a channel pull.
 type SourceReader interface {
 	Synced() position.Position
-	Master() (position.Position, error)
-	MarkWindow(chunkID uint32)
+	Master(ctx context.Context) (position.Position, error)
+	// OpenWindow starts the DBLog window for chunkID: the reader captures
+	// its own source watermark and, from now on, tags decoded events whose
+	// position is strictly past that watermark InWindow for the chunk.
+	// Events at or before the watermark are already reflected in the chunk
+	// SELECT and must not be tagged. ClearWindow ends the window.
+	OpenWindow(ctx context.Context, chunkID uint32)
 	ClearWindow()
 }
 
@@ -108,9 +121,12 @@ func SnapshotTable(
 			return err
 		}
 
-		// Open the window first: events decoded from now on carry the
-		// InWindow tag for this chunk, applied synchronously at decode.
-		reader.MarkWindow(chunkID)
+		// Gate the table's live events ahead of the SELECT so none can be
+		// deduplicated against an empty window, and open the reader window:
+		// events decoded from now on are tagged InWindow (past the reader's
+		// source watermark), applied synchronously at decode.
+		relay.GateOn(target, chunkID)
+		reader.OpenWindow(ctx, chunkID)
 		low := reader.Synced()
 
 		rows, err := scanChunk(ctx, chunker, ch, target, low)
@@ -122,8 +138,19 @@ func SnapshotTable(
 			reader.ClearWindow()
 			return err
 		}
+		// The window now holds the chunk rows: release the gated live events
+		// InWindow-tagged so they deduplicate against them.
+		relay.GateFlush()
 
-		high := reader.Synced()
+		// The caught-up proof: the reader must have provably consumed
+		// everything the source had committed by the end of the SELECT. High
+		// is a FIXED source position — never a live master — so a busy
+		// source cannot keep the window open forever.
+		high, err := reader.Master(ctx)
+		if err != nil {
+			reader.ClearWindow()
+			return fmt.Errorf("dblog: chunk %d: master: %w", chunkID, err)
+		}
 		if err := WaitCaughtUp(ctx, reader, high, cfg); err != nil {
 			reader.ClearWindow()
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
@@ -151,16 +178,20 @@ func scanChunk(ctx context.Context, src ChunkSource, ch Chunk, target string, lo
 			Key:      key,
 			After:    row,
 			Position: low.String(),
+			Snapshot: true,
+			IngestTS: time.Now(),
 		})
 		return nil
 	})
 	return rows, err
 }
 
-// WaitCaughtUp polls the master position until the reader's synced position
-// contains it — the proof that everything up to high (and the current master
-// state) has been read. Exported so the distributed coordinator's snapshot
-// flow (worker-side SELECT) reuses the same proof.
+// WaitCaughtUp polls the reader's synced position until it contains high —
+// the proof that everything the source had committed by the end of the chunk
+// SELECT has been read. High is a fixed source watermark; the window never
+// closes on a timer and never chases a moving master. Exported so the
+// distributed coordinator's snapshot flow (worker-side SELECT) reuses the
+// same proof.
 func WaitCaughtUp(ctx context.Context, reader SourceReader, high position.Position, cfg SnapshotConfig) error {
 	poll := cfg.CaughtUpPoll
 	if poll <= 0 {
@@ -173,11 +204,12 @@ func WaitCaughtUp(ctx context.Context, reader SourceReader, high position.Positi
 
 	deadline := time.Now().Add(timeout)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		synced := reader.Synced()
-		if synced.Contains(high) {
-			if master, err := reader.Master(); err == nil && synced.Contains(master) {
-				return nil
-			}
+		if synced != nil && synced.Contains(high) {
+			return nil
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("window stuck open past %s: readPos %s does not contain high %s",

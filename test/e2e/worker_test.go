@@ -10,6 +10,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
@@ -70,18 +71,18 @@ tables:
 	if err := urutauiceberg.EnsureNamespace(ctx, cat, table.Identifier{"raw"}); err != nil {
 		t.Fatalf("namespace: %v", err)
 	}
-	if err := urutauiceberg.EnsureTable(ctx, cat, ident, schema); err != nil {
+	if err := urutauiceberg.EnsureTable(ctx, cat, ident, schema, core.CastPolicy{}); err != nil {
 		t.Fatalf("ensure table: %v", err)
 	}
 
-	wr, err := urutauiceberg.NewTableWriter(ctx, cat, ident, []string{"id"})
+	wr, err := urutauiceberg.NewTableWriter(ctx, cat, ident, []string{"id"}, core.CastPolicy{}, nil, "")
 	if err != nil {
 		t.Fatalf("writer: %v", err)
 	}
 
 	var committed []change.Batch
 	w := worker.New(worker.Config{MaxRows: 8, MaxInterval: 200 * time.Millisecond})
-	w.Register("raw.orders", wr)
+	w.Register("raw.orders", wr, change.UpsertMode)
 	w.OnCommit(func(b change.Batch, _ int) { committed = append(committed, b) })
 
 	ingest := make(chan change.Change, 32)

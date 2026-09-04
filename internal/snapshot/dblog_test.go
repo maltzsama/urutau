@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,6 +67,12 @@ func (r *fakeRelay) AddWindowRows(target string, id uint32, rows []change.Change
 	r.rows[id] = rows
 	return nil
 }
+func (r *fakeRelay) GateOn(table string, id uint32) {
+	r.ops = append(r.ops, fmt.Sprintf("gateon:%d", id))
+}
+func (r *fakeRelay) GateFlush() {
+	r.ops = append(r.ops, "gateflush")
+}
 
 // fakeReader converges to master after convergeAfter Synced() calls. The
 // positions are interface values, so the same fake exercises GTID sets and
@@ -89,9 +96,9 @@ func (r *fakeReader) Synced() position.Position {
 	return nil
 }
 
-func (r *fakeReader) Master() (position.Position, error) { return r.master, nil }
-func (r *fakeReader) MarkWindow(chunkID uint32)          { r.marks++ }
-func (r *fakeReader) ClearWindow()                       { r.clears++ }
+func (r *fakeReader) Master(ctx context.Context) (position.Position, error) { return r.master, nil }
+func (r *fakeReader) OpenWindow(ctx context.Context, chunkID uint32)        { r.marks++ }
+func (r *fakeReader) ClearWindow()                                          { r.clears++ }
 
 // rowsFor builds a deterministic source: ids 1..n with v = "v<id>".
 func rowsFor(n int) *fakeSource {
@@ -116,11 +123,11 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 		t.Fatalf("snapshot: %v", err)
 	}
 
-	// Order per chunk: mark → add → release.
+	// Order per chunk: gate on → add → gate flush → release.
 	want := []string{
-		"add:0:2", "release:0",
-		"add:1:2", "release:1",
-		"add:2:2", "release:2",
+		"gateon:0", "add:0:2", "gateflush", "release:0",
+		"gateon:1", "add:1:2", "gateflush", "release:1",
+		"gateon:2", "add:2:2", "gateflush", "release:2",
 	}
 	if len(relay.ops) != len(want) {
 		t.Fatalf("ops = %v, want %v", relay.ops, want)
@@ -179,7 +186,7 @@ func TestSnapshotTableWithLSNPositions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	if len(relay.ops) != 4 {
+	if len(relay.ops) != 8 {
 		t.Fatalf("ops = %v, want two full chunk cycles", relay.ops)
 	}
 	if relay.relPos[0] != "0/20" || relay.relPos[1] != "0/20" {
@@ -236,8 +243,9 @@ func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 func TestSnapshotTableLagConvergesBeforeRelease(t *testing.T) {
 	src := rowsFor(2)
 	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
-	// Four Synced calls per chunk cycle (low, high, poll×k, at) — converge
-	// only on the 4th, proving Release waits for the caught-up proof.
+	// Synced converges on the 4th call (low, poll×k, at) — proving Release
+	// waits for the caught-up proof against the fixed master high, never a
+	// timer.
 	reader := &fakeReader{master: gt("1-5"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
@@ -245,13 +253,44 @@ func TestSnapshotTableLagConvergesBeforeRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	if len(relay.ops) != 2 {
+	if len(relay.ops) != 4 {
 		t.Fatalf("ops = %v, want one full chunk cycle", relay.ops)
 	}
-	if relay.ops[1] != "release:0" {
-		t.Fatalf("op 1 = %q, want release:0", relay.ops[1])
+	if relay.ops[3] != "release:0" {
+		t.Fatalf("op 3 = %q, want release:0", relay.ops[3])
 	}
 	if relay.relPos[0] != gt("1-5").String() {
 		t.Fatalf("release at %q, want converged %q", relay.relPos[0], gt("1-5"))
+	}
+}
+
+// movingMasterReader keeps Master() advancing so a caught-up reader can never
+// contain the live master: the proof must target the FIXED high watermark
+// passed in, never the moving master — or a busy source would hold the window
+// open until the timeout pathology.
+type movingMasterReader struct {
+	synced *position.GTID
+	mu     sync.Mutex
+	n      int
+}
+
+func (r *movingMasterReader) Synced() position.Position { return r.synced }
+func (r *movingMasterReader) Master(ctx context.Context) (position.Position, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.n++
+	return gt(fmt.Sprintf("1-%d", 100+r.n)), nil
+}
+func (r *movingMasterReader) OpenWindow(ctx context.Context, chunkID uint32) {}
+func (r *movingMasterReader) ClearWindow()                                   {}
+
+func TestWaitCaughtUpTargetsFixedHighNotMovingMaster(t *testing.T) {
+	// The reader is caught up to "1-10" and high is "1-10": the proof must
+	// pass immediately, even though Master() keeps returning a set far ahead
+	// that the reader can never contain.
+	r := &movingMasterReader{synced: gt("1-10")}
+	if err := WaitCaughtUp(context.Background(), r, gt("1-10"),
+		SnapshotConfig{CaughtUpPoll: time.Millisecond, WindowTimeout: 2 * time.Second}); err != nil {
+		t.Fatalf("fixed high must end the wait even as the live master advances: %v", err)
 	}
 }

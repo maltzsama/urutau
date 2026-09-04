@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -62,15 +63,32 @@ func Run(ctx context.Context, s *spec.Spec, cfg Config) error {
 // relay pumps reader events into the worker's ingest channel and releases
 // the DBLog chunk markers. Window tagging happens in the reader at decode
 // time; the marker's Release first drains the pump, so every event decoded
-// inside the window is already enqueued ahead of it.
+// inside the window is already enqueued ahead of it. The gate mirrors the
+// coordinator's pump gate: while a chunk SELECT is in flight the table's
+// live events are buffered and released InWindow-tagged only after
+// AddWindowRows populates the worker window — the ordering the window proof
+// needs (a live event must never deduplicate against an empty window).
 type relay struct {
 	ingest   chan<- change.Change
 	window   *worker.Worker
 	flushReq chan chan struct{}
+
+	gateMu       sync.Mutex
+	gateOn       bool
+	gateTgt      string
+	gateChk      uint32
+	gateBuf      []change.Change
+	flushGate    bool
+	gateFlushReq chan chan struct{}
 }
 
 func newRelay(ingest chan<- change.Change, window *worker.Worker) *relay {
-	return &relay{ingest: ingest, window: window, flushReq: make(chan chan struct{}, 1)}
+	return &relay{
+		ingest:       ingest,
+		window:       window,
+		flushReq:     make(chan chan struct{}, 1),
+		gateFlushReq: make(chan chan struct{}, 1),
+	}
 }
 
 func (r *relay) Release(table string, chunkID uint32, at position.Position) {
@@ -88,13 +106,98 @@ func (r *relay) AddWindowRows(target string, chunkID uint32, rows []change.Chang
 	return r.window.AddWindowRows(target, chunkID, rows)
 }
 
+// GateOn starts buffering the table's live events for a chunk SELECT in
+// flight. Called by the orchestrator before the SELECT.
+func (r *relay) GateOn(table string, chunkID uint32) {
+	r.gateMu.Lock()
+	r.gateOn = true
+	r.gateTgt = table
+	r.gateChk = chunkID
+	r.gateMu.Unlock()
+}
+
+// GateFlush releases the buffered events InWindow-tagged for the chunk. It
+// is SYNCHRONOUS: it waits for the pump to drain the gate buffer into ingest
+// before returning, so a gated event can never be overtaken by the Closes
+// marker that Release sends afterwards. This makes the window deduplication
+// (and the droppedByWindow evidence) deterministic.
+func (r *relay) GateFlush() {
+	r.gateMu.Lock()
+	r.flushGate = true
+	r.gateMu.Unlock()
+	req := make(chan struct{})
+	r.gateFlushReq <- req
+	<-req
+}
+
+// gate buffers an event when the gate is on for its table.
+func (r *relay) gate(c change.Change) bool {
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	if !r.gateOn || c.Table != r.gateTgt {
+		return false
+	}
+	r.gateBuf = append(r.gateBuf, c)
+	return true
+}
+
+// drainGate writes the pending gate buffer to ingest, InWindow-tagged, and
+// turns the gate off. Returns true if a flush was performed. The reader's own
+// window decision is preserved: an event it explicitly left untagged (at or
+// before its source watermark) stays untagged; only events decoded in the
+// GateOn↔OpenWindow gap (reader never saw them) are tagged here.
+func (r *relay) drainGate(ctx context.Context) (bool, error) {
+	r.gateMu.Lock()
+	if !r.flushGate {
+		r.gateMu.Unlock()
+		return false, nil
+	}
+	buf := r.gateBuf
+	chunkID := r.gateChk
+	r.gateBuf = nil
+	r.gateOn = false
+	r.flushGate = false
+	r.gateMu.Unlock()
+
+	for _, c := range buf {
+		if c.Window == nil {
+			c.Window = &change.Window{ChunkID: chunkID, InWindow: true}
+		} else {
+			c.Window.ChunkID = chunkID
+		}
+		select {
+		case r.ingest <- c:
+		case <-ctx.Done():
+			return true, ctx.Err()
+		}
+	}
+	return true, nil
+}
+
 // run routes reader events into the worker's ingest channel.
 func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 	for {
+		// The gate buffer is drained before any select: the pump is the
+		// only writer to ingest, so a gated table's older events can never
+		// be overtaken by its later ones.
+		if flushed, err := r.drainGate(ctx); err != nil {
+			return err
+		} else if flushed {
+			continue
+		}
 		select {
 		case c, ok := <-out:
 			if !ok {
+				// A gate flush may be pending (GateFlush raced this select):
+				// flush it before exiting so buffered events are never
+				// dropped.
+				if _, err := r.drainGate(ctx); err != nil {
+					return err
+				}
 				return nil
+			}
+			if r.gate(c) {
+				continue
 			}
 			select {
 			case r.ingest <- c:
@@ -110,6 +213,9 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 					if !ok {
 						break drain
 					}
+					if r.gate(c) {
+						continue
+					}
 					select {
 					case r.ingest <- c:
 					case <-ctx.Done():
@@ -119,6 +225,15 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 				default:
 					break drain
 				}
+			}
+			close(req)
+		case req := <-r.gateFlushReq:
+			// Flush the gate buffer before acking: GateFlush blocks until
+			// the gated events are in ingest, so Release's Closes marker
+			// (sent after) can never overtake them.
+			if _, err := r.drainGate(ctx); err != nil {
+				close(req)
+				return err
 			}
 			close(req)
 		case <-ctx.Done():
@@ -154,20 +269,26 @@ func resumeFrom(ctx context.Context, reg *drivers.Registry, cat *rest.Catalog, s
 }
 
 // introspectAll resolves each spec table through the registry, so the
-// pipeline knows the PK (equality key) and the target shape before writing
-// anything.
-func introspectAll(ctx context.Context, reg *drivers.Registry, qdb *sql.DB, s *spec.Spec) ([]core.TableRef, map[string]*iceberg.Schema, error) {
+// pipeline knows the PK (equality key) and the resolved target shape before
+// writing anything. The canonical schema carries the declared cast and
+// metadata columns; the Iceberg schema is derived from it.
+func introspectAll(ctx context.Context, reg *drivers.Registry, qdb *sql.DB, s *spec.Spec, logger *slog.Logger) ([]core.TableRef, map[string]*iceberg.Schema, map[string]core.Schema, error) {
 	refs := make([]core.TableRef, 0, len(s.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(s.Tables))
+	canonical := make(map[string]core.Schema, len(s.Tables))
 	for _, t := range s.Tables {
-		ref, is, err := reg.Introspect(ctx, qdb, t)
+		ref, cs, is, warns, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
+		}
+		for _, w := range warns {
+			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
 		}
 		refs = append(refs, ref)
 		schemas[t.Source] = is
+		canonical[t.Source] = cs
 	}
-	return refs, schemas, nil
+	return refs, schemas, canonical, nil
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
@@ -252,7 +373,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	}
 
 	// Resolve source tables and their Iceberg schemas.
-	refs, schemas, err := introspectAll(ctx, reg, qdb, s)
+	refs, schemas, _, err := introspectAll(ctx, reg, qdb, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -266,13 +387,23 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		return nil, err
 	}
 
+	// Lookup spec tables by source and target for plan parameters.
+	specBySource := make(map[string]spec.Table, len(s.Tables))
+	specByTarget := make(map[string]spec.Table, len(s.Tables))
+	for _, t := range s.Tables {
+		specBySource[t.Source] = t
+		specByTarget[t.Target] = t
+	}
+
 	writers := make(map[string]sink.TableWriter, len(refs))
 	for _, ref := range refs {
 		ident := drivers.TargetIdent(s, ref.Target)
-		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source]); err != nil {
+		t := specBySource[ref.Source]
+		cast, _ := core.ParseCastPolicy(t.Cast)
+		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source], cast); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
-		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey)
+		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey, cast, t.Metadata, t.Source)
 		if err != nil {
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
 		}
@@ -283,7 +414,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	ingest := make(chan change.Change, 1024)
 	w := worker.New(worker.Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
 	for target, wr := range writers {
-		w.Register(target, wr)
+		mode := change.UpsertMode
+		if specByTarget[target].WriteMode == spec.WriteModeAppend {
+			mode = change.AppendMode
+		}
+		w.Register(target, wr, mode)
 	}
 	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() }}
 	w.OnCommit(func(b change.Batch, rows int) {
@@ -334,26 +469,30 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	streamErr := make(chan error, 1)
 	go func() { streamErr <- rdr.Start(ctx, start) }()
 
-	// Snapshot phase: DBLog for tables with no committed position.
-	for _, ref := range needsSnapshot {
-		log.Info("snapshot", "table", ref.Source)
-		r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
-		chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
-		if err != nil {
-			rdr.Close()
-			_ = qdb.Close()
-			return nil, err
+	// Snapshot phase: DBLog for tables with no committed position. Skip
+	// when the source does not support snapshot (e.g. Kafka).
+	caps := reg.Caps()
+	if caps.Snapshot {
+		for _, ref := range needsSnapshot {
+			log.Info("snapshot", "table", ref.Source)
+			r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
+			chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
+			if err != nil {
+				rdr.Close()
+				_ = qdb.Close()
+				return nil, err
+			}
+			if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
+				WindowTimeout: cfg.WindowTimeout,
+				CaughtUpPoll:  cfg.CaughtUpPoll,
+			}); err != nil {
+				rdr.Close()
+				_ = qdb.Close()
+				return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
+			}
+			log.Info("snapshot done", "table", ref.Source)
+			r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
 		}
-		if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
-			WindowTimeout: cfg.WindowTimeout,
-			CaughtUpPoll:  cfg.CaughtUpPoll,
-		}); err != nil {
-			rdr.Close()
-			_ = qdb.Close()
-			return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
-		}
-		log.Info("snapshot done", "table", ref.Source)
-		r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
 	}
 
 	r.streamErr = streamErr

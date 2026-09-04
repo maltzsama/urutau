@@ -36,6 +36,7 @@ type Worker struct {
 type tablePipeline struct {
 	target    string
 	committer sink.TableWriter
+	mode      change.WriteMode
 	ch        chan change.Change
 
 	// DBLog snapshot windows, per design: each chunk's SELECT rows land in
@@ -68,21 +69,23 @@ func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
 
 // Register wires a per-table writer to a target table. The writer is any
 // sink.TableWriter implementation — the worker knows nothing about the sink
-// (CR-012).
-func (w *Worker) Register(target string, c sink.TableWriter) {
-	w.tables[target] = newTablePipeline(target, c)
+// (CR-012). The mode controls whether batches are collapsed (upsert) or
+// passed through (append).
+func (w *Worker) Register(target string, c sink.TableWriter, mode change.WriteMode) {
+	w.tables[target] = newTablePipeline(target, c, mode)
 }
 
 // RegisterCommitter wires a writer to a target table (test helper; same
 // contract as Register).
-func (w *Worker) RegisterCommitter(target string, c sink.TableWriter) {
-	w.tables[target] = newTablePipeline(target, c)
+func (w *Worker) RegisterCommitter(target string, c sink.TableWriter, mode change.WriteMode) {
+	w.tables[target] = newTablePipeline(target, c, mode)
 }
 
-func newTablePipeline(target string, c sink.TableWriter) *tablePipeline {
+func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) *tablePipeline {
 	return &tablePipeline{
 		target:    target,
 		committer: c,
+		mode:      mode,
 		ch:        make(chan change.Change, 1024),
 		windows:   map[uint32]map[string]change.Change{},
 	}
@@ -182,12 +185,33 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 		if len(buf) == 0 {
 			return nil
 		}
-		collapsed := change.Collapse(buf)
-		b := change.Batch{
-			Table:    p.target,
-			Upserts:  collapsed.Upserts,
-			Deletes:  collapsed.Deletes,
-			Position: buf[len(buf)-1].Position,
+		var b change.Batch
+		switch p.mode {
+		case change.AppendMode:
+			// Append mode: every change becomes a row. Deletes are folded
+			// into upserts so the writer emits them with op='delete'.
+			upserts := make([]change.Change, 0, len(buf))
+			for _, c := range buf {
+				if c.Op == change.OpDelete {
+					c.After = c.Before
+				}
+				upserts = append(upserts, c)
+			}
+			b = change.Batch{
+				Table:    p.target,
+				Upserts:  upserts,
+				Position: buf[len(buf)-1].Position,
+				Mode:     change.AppendMode,
+			}
+		default:
+			collapsed := change.Collapse(buf)
+			b = change.Batch{
+				Table:    p.target,
+				Upserts:  collapsed.Upserts,
+				Deletes:  collapsed.Deletes,
+				Position: buf[len(buf)-1].Position,
+				Mode:     change.UpsertMode,
+			}
 		}
 		rows := len(buf)
 		buf = buf[:0]
