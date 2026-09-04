@@ -8,6 +8,7 @@ package drivers
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -56,6 +57,31 @@ func (r *Registry) Source() adapter.Source { return r.adapt }
 
 // Caps returns the source's capabilities.
 func (r *Registry) Caps() adapter.Capabilities { return r.adapt.Caps() }
+
+// CapsForKind returns a source kind's capabilities without a full spec.
+// Used by admission validation to enforce driver-declared resource ceilings.
+func CapsForKind(kind string) (adapter.Capabilities, error) {
+	return adapter.CapsForKind(kind)
+}
+
+// ValidateParallelism rejects a parallel-chunk setting above the ceiling the
+// source driver declares: a shared MySQL with max_connections=100 does not
+// tolerate the same snapshot concurrency as a dedicated Postgres. A ceiling
+// of 0 means the driver has no opinion.
+func ValidateParallelism(kind string, maxParallelChunks int) error {
+	if maxParallelChunks <= 0 {
+		return nil
+	}
+	caps, err := adapter.CapsForKind(kind)
+	if err != nil {
+		return err
+	}
+	if caps.MaxConnections > 0 && maxParallelChunks > caps.MaxConnections {
+		return fmt.Errorf("drivers: maxParallelChunks (%d) exceeds the %s driver ceiling (%d connections)",
+			maxParallelChunks, kind, caps.MaxConnections)
+	}
+	return nil
+}
 
 // OpenQuery opens the source query connection.
 func (r *Registry) OpenQuery(ctx context.Context) (*sql.DB, error) {

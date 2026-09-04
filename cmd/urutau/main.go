@@ -33,11 +33,12 @@ func main() {
 // runCmd wires the collapsed process from an inline YAML spec.
 func runCmd() *cobra.Command {
 	var (
-		file          string
-		serverID      uint32
-		chunkSize     int
-		windowTimeout time.Duration
-		eventlogURI   string
+		file              string
+		serverID          uint32
+		chunkSize         int
+		maxParallelChunks int
+		windowTimeout     time.Duration
+		eventlogURI       string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -56,13 +57,14 @@ func runCmd() *cobra.Command {
 				return err
 			}
 			rc := runner.Config{
-				ServerID:      serverID,
-				Heartbeat:     5 * time.Second,
-				ChunkSize:     chunkSize,
-				WindowTimeout: windowTimeout,
-				CaughtUpPoll:  time.Second,
-				MaxRows:       1000,
-				MaxInterval:   5 * time.Second,
+				ServerID:          serverID,
+				Heartbeat:         5 * time.Second,
+				ChunkSize:         chunkSize,
+				MaxParallelChunks: maxParallelChunks,
+				WindowTimeout:     windowTimeout,
+				CaughtUpPoll:      time.Second,
+				MaxRows:           1000,
+				MaxInterval:       5 * time.Second,
 			}
 			if eventlogURI != "" {
 				// Credentials and endpoint come from the standard AWS env
@@ -80,6 +82,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().Bool("local", true, "run in collapsed (single process) mode")
 	cmd.Flags().Uint32Var(&serverID, "server-id", 1101, "MySQL server id for this replicator")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 10000, "DBLog snapshot chunk size (rows per chunk)")
+	cmd.Flags().IntVar(&maxParallelChunks, "max-parallel-chunks", 0, "Max concurrent chunk SELECTs during snapshot (0 = serial; must not exceed the source driver ceiling)")
 	cmd.Flags().DurationVar(&windowTimeout, "window-timeout", 5*time.Minute, "DBLog window timeout (pathology detector)")
 	cmd.Flags().StringVar(&eventlogURI, "eventlog", "", "S3 URI for the run's JSONL audit trail (s3://bucket/prefix); AWS env supplies credentials/endpoint")
 	return cmd

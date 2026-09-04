@@ -74,6 +74,22 @@ func For(s *spec.Spec, rt Runtime) (Source, error) {
 	}
 }
 
+// CapsForKind returns a source kind's capabilities without a full spec.
+// Caps never reads the spec, so the zero adapters are safe here. Used by
+// admission validation, which must check resource ceilings before boot.
+func CapsForKind(kind string) (Capabilities, error) {
+	switch kind {
+	case "mysql":
+		return mysqlSource{}.Caps(), nil
+	case "postgres":
+		return postgresSource{}.Caps(), nil
+	case "kafka":
+		return kafka.Source{}.Caps(), nil
+	default:
+		return Capabilities{}, fmt.Errorf("adapter: unsupported source kind %q", kind)
+	}
+}
+
 // OpenQueryDB opens a query connection for a source kind and URI — the same
 // surface the per-source OpenQuery uses, exposed for remote workers that run
 // snapshot chunk SELECTs themselves (design §11.1).
@@ -100,7 +116,13 @@ type mysqlSource struct {
 }
 
 func (a mysqlSource) Caps() Capabilities {
-	return Capabilities{Snapshot: true, ChunkQuery: true, Stream: true}
+	return Capabilities{
+		Snapshot:       true,
+		ChunkQuery:     true,
+		Stream:         true,
+		MaxConnections: 10,
+		Modes:          []srctypes.Mode{srctypes.ModeCDC},
+	}
 }
 
 func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
@@ -207,7 +229,13 @@ type postgresSource struct {
 }
 
 func (a postgresSource) Caps() Capabilities {
-	return Capabilities{Snapshot: true, ChunkQuery: true, Stream: true}
+	return Capabilities{
+		Snapshot:       true,
+		ChunkQuery:     true,
+		Stream:         true,
+		MaxConnections: 10,
+		Modes:          []srctypes.Mode{srctypes.ModeCDC},
+	}
 }
 
 func (a postgresSource) OpenQuery(ctx context.Context) (*sql.DB, error) {

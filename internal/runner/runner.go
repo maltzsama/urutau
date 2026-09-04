@@ -37,6 +37,10 @@ type Config struct {
 	CaughtUpPoll  time.Duration
 	MaxRows       int
 	MaxInterval   time.Duration
+	// MaxParallelChunks caps concurrent chunk SELECTs during snapshot.
+	// Must not exceed the ceiling the source driver declares; 0 means the
+	// driver default (serial in the collapsed runner).
+	MaxParallelChunks int
 	// Eventlog, when set, records a per-run JSONL audit trail in S3
 	// (lifecycle + commit events). Nil disables the trail.
 	Eventlog *eventlog.Config
@@ -380,6 +384,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		if err != nil {
 			return nil, err
 		}
+	}
+	// The parallel-chunk setting may not exceed the ceiling the source
+	// driver declares — fail fast at boot, not mid-snapshot.
+	if err := drivers.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
 	}
 
 	// One query connection for chunk SELECTs, schema introspection, and the

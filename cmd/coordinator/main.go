@@ -23,6 +23,7 @@ func main() {
 		listen          string
 		serverID        uint32
 		chunkSize       int
+		maxParallel     int
 		windowTimeout   time.Duration
 		waitWorker      time.Duration
 		flowTotalBytes  int64
@@ -52,22 +53,23 @@ func main() {
 				return err
 			}
 			return coordinator.Run(cmd.Context(), coordinator.Config{
-				Spec:             s,
-				ListenAddr:       listen,
-				ServerID:         serverID,
-				Heartbeat:        5 * time.Second,
-				ChunkSize:        chunkSize,
-				WindowTimeout:    windowTimeout,
-				CaughtUpPoll:     time.Second,
-				WaitWorker:       waitWorker,
-				FlowTotalBytes:   flowTotalBytes,
-				FlowPerWorkerMin: flowPerWorkerMi << 20,
-				Eventlog:         eventlogConfig(eventlogURI),
-				Checkpoint:       checkpointConfig(checkpointURI, checkpointSec),
-				AckTimeout:       ackTimeout,
-				MaxResets:        maxResets,
-				ResetWindow:      resetWindow,
-				MetricsAddr:      metricsAddr,
+				Spec:              s,
+				ListenAddr:        listen,
+				ServerID:          serverID,
+				Heartbeat:         5 * time.Second,
+				ChunkSize:         chunkSize,
+				MaxParallelChunks: maxParallel,
+				WindowTimeout:     windowTimeout,
+				CaughtUpPoll:      time.Second,
+				WaitWorker:        waitWorker,
+				FlowTotalBytes:    flowTotalBytes,
+				FlowPerWorkerMin:  flowPerWorkerMi << 20,
+				Eventlog:          eventlogConfig(eventlogURI),
+				Checkpoint:        checkpointConfig(checkpointURI, checkpointSec),
+				AckTimeout:        ackTimeout,
+				MaxResets:         maxResets,
+				ResetWindow:       resetWindow,
+				MetricsAddr:       metricsAddr,
 			})
 		},
 	}
@@ -75,6 +77,7 @@ func main() {
 	cmd.Flags().StringVar(&listen, "listen", ":50051", "gRPC + Flight listen address")
 	cmd.Flags().Uint32Var(&serverID, "server-id", 1101, "MySQL server id for this replicator")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 10000, "DBLog snapshot chunk size (rows per chunk)")
+	cmd.Flags().IntVar(&maxParallel, "max-parallel-chunks", 0, "Max concurrent chunk SELECTs during snapshot (0 = serial; must not exceed the source driver ceiling)")
 	cmd.Flags().DurationVar(&windowTimeout, "window-timeout", 5*time.Minute, "DBLog window timeout (pathology detector)")
 	cmd.Flags().DurationVar(&waitWorker, "wait-worker", 2*time.Minute, "how long to wait for every expected worker session")
 	cmd.Flags().Int64Var(&flowTotalBytes, "flow-total-bytes", 512<<20, "process-wide ceiling on unacked batch bytes in flight")

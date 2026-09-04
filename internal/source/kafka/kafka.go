@@ -32,7 +32,13 @@ type Source struct {
 
 // Caps reports Kafka capabilities: streaming only, no DBLog snapshot.
 func (s Source) Caps() srctypes.Capabilities {
-	return srctypes.Capabilities{Snapshot: false, ChunkQuery: false, Stream: true}
+	return srctypes.Capabilities{
+		Snapshot:       false,
+		ChunkQuery:     false,
+		Stream:         true,
+		MaxConnections: 0, // no query connections at all
+		Modes:          []srctypes.Mode{srctypes.ModeCDC},
+	}
 }
 
 // OpenQuery returns nil — Kafka has no SQL query connection.
