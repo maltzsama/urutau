@@ -71,21 +71,21 @@ type Defaults struct {
 }
 
 type Table struct {
-	Source            string    `json:"source"`
-	Target            string    `json:"target"`
-	PrimaryKey        []string  `json:"primaryKey,omitempty"`
-	PartitionBy       []string  `json:"partitionBy,omitempty"`
-	Filter            *Filter   `json:"filter,omitempty"`
-	WriteMode         WriteMode `json:"writeMode,omitempty"`
-	OnDelete          OnDelete  `json:"onDelete,omitempty"`
+	Source      string    `json:"source"`
+	Target      string    `json:"target"`
+	PrimaryKey  []string  `json:"primaryKey,omitempty"`
+	PartitionBy []string  `json:"partitionBy,omitempty"`
+	Filter      *Filter   `json:"filter,omitempty"`
+	WriteMode   WriteMode `json:"writeMode,omitempty"`
+	OnDelete    OnDelete  `json:"onDelete,omitempty"`
 	// Identity declares the transport-metadata columns that make an
 	// append-idempotent table logically idempotent. Each entry is the
 	// destination column (as) of a transport metadata column declared in
 	// Metadata. Empty outside append-idempotent.
-	Identity []string `json:"identity,omitempty"`
-	Worker            string    `json:"worker,omitempty"`
-	CreateIfNotExists bool      `json:"createIfNotExists,omitempty"`
-	FilterImmutable   bool      `json:"filterImmutable,omitempty"`
+	Identity          []string `json:"identity,omitempty"`
+	Worker            string   `json:"worker,omitempty"`
+	CreateIfNotExists bool     `json:"createIfNotExists,omitempty"`
+	FilterImmutable   bool     `json:"filterImmutable,omitempty"`
 	// Metadata lands pipeline metadata columns (op, commit_ts, position, ...)
 	// in the target table. The destination name is explicit via As.
 	Metadata []core.MetadataColumn `json:"metadata,omitempty"`
