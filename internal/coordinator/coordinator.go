@@ -53,6 +53,9 @@ type Config struct {
 	CaughtUpPoll  time.Duration
 	ServerID      uint32
 	Heartbeat     time.Duration
+	// MaxParallelChunks caps concurrent chunk SELECTs during snapshot.
+	// Must not exceed the ceiling the source driver declares.
+	MaxParallelChunks int
 
 	// FlowTotalBytes is the process-wide ceiling on serialized batch bytes
 	// in flight (queued or sent, unacked). FlowPerWorkerMin is the floor
@@ -238,6 +241,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 	})
 	if err != nil {
 		return err
+	}
+	// The parallel-chunk setting may not exceed the ceiling the source
+	// driver declares — fail fast at boot, not mid-snapshot.
+	if err := drivers.ValidateParallelism(c.cfg.Spec.Source.Kind, c.cfg.MaxParallelChunks); err != nil {
+		return fmt.Errorf("coordinator: %w", err)
 	}
 	c.reg = reg
 

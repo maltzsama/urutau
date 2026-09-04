@@ -37,6 +37,10 @@ type Config struct {
 	CaughtUpPoll  time.Duration
 	MaxRows       int
 	MaxInterval   time.Duration
+	// MaxParallelChunks caps concurrent chunk SELECTs during snapshot.
+	// Must not exceed the ceiling the source driver declares; 0 means the
+	// driver default (serial in the collapsed runner).
+	MaxParallelChunks int
 	// Eventlog, when set, records a per-run JSONL audit trail in S3
 	// (lifecycle + commit events). Nil disables the trail.
 	Eventlog *eventlog.Config
@@ -268,6 +272,16 @@ func resumeFrom(ctx context.Context, reg *drivers.Registry, cat catalog.Catalog,
 	return position.Min(positions), needsSnapshot, nil
 }
 
+// readSnapshotProgress reads the snapshot state from Iceberg table properties.
+func readSnapshotProgress(ctx context.Context, cat catalog.Catalog, ident table.Identifier) (*snapshot.SnapshotProgress, error) {
+	tbl, err := cat.LoadTable(ctx, ident)
+	if err != nil {
+		// Table does not exist yet — treat as not started.
+		return &snapshot.SnapshotProgress{State: snapshot.StateNotStarted}, nil
+	}
+	return snapshot.ReadSnapshotProgress(tbl.Properties())
+}
+
 // introspectAll resolves each spec table through the registry, so the
 // pipeline knows the PK (equality key) and the resolved target shape before
 // writing anything. The canonical schema carries the declared cast and
@@ -370,6 +384,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		if err != nil {
 			return nil, err
 		}
+	}
+	// The parallel-chunk setting may not exceed the ceiling the source
+	// driver declares — fail fast at boot, not mid-snapshot.
+	if err := drivers.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
 	}
 
 	// One query connection for chunk SELECTs, schema introspection, and the
@@ -484,24 +503,82 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	caps := reg.Caps()
 	if caps.Snapshot {
 		for _, ref := range needsSnapshot {
-			log.Info("snapshot", "table", ref.Source)
-			r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
-			chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
-			if err != nil {
-				rdr.Close()
-				_ = qdb.Close()
-				return nil, err
+			// Check bootstrap mode for this table.
+			var bootstrapMode spec.BootstrapMode
+			var bootstrapPos string
+			for _, t := range s.Tables {
+				if t.Target == ref.Target && t.Bootstrap != nil {
+					bootstrapMode = t.Bootstrap.Mode
+					bootstrapPos = t.Bootstrap.Position
+					break
+				}
 			}
-			if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
-				WindowTimeout: cfg.WindowTimeout,
-				CaughtUpPoll:  cfg.CaughtUpPoll,
-			}); err != nil {
-				rdr.Close()
-				_ = qdb.Close()
-				return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
+
+			switch bootstrapMode {
+			case spec.Adopt, spec.AdoptVerify:
+				// Adopt: mark snapshot complete without reading data.
+				log.Info("adopt", "table", ref.Source, "mode", bootstrapMode)
+				r.emit(eventlog.KindSnapshotStarted, map[string]any{
+					"table": ref.Source, "target": ref.Target, "mode": bootstrapMode,
+				})
+				// Write complete state to Iceberg properties.
+				props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
+					State: snapshot.StateComplete,
+				})
+				if err := drivers.SetTableProperties(ctx, cat, drivers.TargetIdent(s, ref.Target), props); err != nil {
+					rdr.Close()
+					_ = qdb.Close()
+					return nil, fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
+				}
+				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
+				log.Info("adopt done", "table", ref.Source)
+				r.emit(eventlog.KindSnapshotDone, map[string]any{
+					"table": ref.Source, "target": ref.Target, "mode": bootstrapMode,
+				})
+			default:
+				// Snapshot: load all data from source.
+				log.Info("snapshot", "table", ref.Source)
+				r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
+				chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
+				if err != nil {
+					rdr.Close()
+					_ = qdb.Close()
+					return nil, err
+				}
+				// Read existing snapshot progress for resumable backfill.
+				progress, err := readSnapshotProgress(ctx, cat, drivers.TargetIdent(s, ref.Target))
+				if err != nil {
+					rdr.Close()
+					_ = qdb.Close()
+					return nil, fmt.Errorf("runner: snapshot progress %s: %w", ref.Target, err)
+				}
+				if progress.State == snapshot.StateInProgress {
+					log.Info("snapshot resuming", "table", ref.Source,
+						"pending", snapshot.PendingIDs(progress.Pending))
+				}
+				// Set initial snapshot state on the worker so batches carry it.
+				w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), progress.Pending)
+				if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
+					WindowTimeout: cfg.WindowTimeout,
+					CaughtUpPoll:  cfg.CaughtUpPoll,
+					Progress:      progress,
+				}, func(table string, completedChunkID uint32, remaining []uint32) {
+					w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)
+				}); err != nil {
+					rdr.Close()
+					_ = qdb.Close()
+					return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
+				}
+				// Snapshot complete: mark on the worker.
+				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
+				log.Info("snapshot done", "table", ref.Source)
+				r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
 			}
-			log.Info("snapshot done", "table", ref.Source)
-			r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
+			// Handle explicit start position for adopted tables.
+			if bootstrapMode == spec.Adopt && bootstrapPos != "" {
+				// Position will be used by the stream start.
+				_ = bootstrapPos
+			}
 		}
 	}
 

@@ -54,5 +54,8 @@ func validatePipeline(obj runtime.Object) error {
 	if cr.Spec.Coordinator.Snapshot.ChunkSize < 0 {
 		return fmt.Errorf("coordinator.snapshot.chunkSize must be >= 0")
 	}
+	if cr.Spec.Coordinator.Snapshot.MaxParallelChunks < 0 {
+		return fmt.Errorf("coordinator.snapshot.maxParallelChunks must be >= 0")
+	}
 	return nil
 }

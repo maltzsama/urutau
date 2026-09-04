@@ -62,7 +62,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, gotMeta, err := DecodeBatch(rec, metaBytes)
+	got, gotMeta, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -85,6 +85,11 @@ func TestCodecRoundTrip(t *testing.T) {
 			if gotRow.After[k] != v {
 				t.Errorf("row %d: after[%s] = %v (%T), want %v (%T)", i, k, gotRow.After[k], gotRow.After[k], v, v)
 			}
+		}
+		// The key tuple is rebuilt from the row's own values, in PK order.
+		wantKey := want.After["id"]
+		if len(gotRow.Key) != 1 || gotRow.Key[0] != wantKey {
+			t.Errorf("row %d: key = %v, want [%v]", i, gotRow.Key, wantKey)
 		}
 	}
 	// Typed wire format: int64 stays int64, float64 stays float64.
@@ -135,12 +140,15 @@ func TestCodecLargeInt64(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes)
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if got[0].After["id"] != bigID {
 		t.Errorf("after.id = %v, want %d (precision loss!)", got[0].After["id"], bigID)
+	}
+	if got[0].Key[0] != bigID {
+		t.Errorf("key = %v, want [%d]", got[0].Key, bigID)
 	}
 }
 
@@ -177,7 +185,7 @@ func TestCodecDecimal(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes)
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -186,4 +194,48 @@ func TestCodecDecimal(t *testing.T) {
 		t.Fatal("after.price is nil")
 	}
 	t.Logf("decimal value: %v (%T)", got[0].After["price"], got[0].After["price"])
+}
+
+func TestCodecDeleteKeyOnly(t *testing.T) {
+	// A delete may carry no row image — only the key (how the MySQL binlog
+	// decoder emits deletes). The key values must still travel so the
+	// equality delete matches at read time; a NULL tuple silently deletes
+	// nothing, which is how a distributed run lost deletes.
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	rows := []change.Change{
+		{Op: change.OpDelete, Table: "raw.orders", Key: []any{int64(2)}, Position: "p1"},
+	}
+	meta := &pb.BatchMeta{Table: "raw.orders", HighPos: "p1"}
+
+	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got[0].Key) != 1 || got[0].Key[0] != int64(2) {
+		t.Fatalf("key = %v, want [2] — the delete would match nothing", got[0].Key)
+	}
+	if got[0].After["id"] != int64(2) {
+		t.Fatalf("after.id = %v, want 2", got[0].After["id"])
+	}
 }

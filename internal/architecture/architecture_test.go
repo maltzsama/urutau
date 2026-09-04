@@ -1,4 +1,4 @@
-// Package architecture enforces the CR-012 dependency walls at test time.
+// Package architecture enforces the dependency walls at test time.
 // It checks the DIRECT imports of the contract packages: a wall leaks the
 // moment a package imports the other side. `go list -deps` (transitive) is
 // too strict — the runner legitimately depends on drivers, which know the

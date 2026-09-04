@@ -46,6 +46,19 @@ func EncodeBatch(rows []change.Change, cs core.Schema, meta *pb.BatchMeta) (body
 		if src == nil {
 			src = r.Before
 		}
+		// A delete may carry no row image at all — only the key (the MySQL
+		// binlog decoder works this way). The equality delete needs the key
+		// values on the wire to match at read time, so project the key onto
+		// the PK columns; without it the delete file holds NULL tuples and
+		// silently deletes nothing.
+		if src == nil && len(r.Key) > 0 {
+			src = make(map[string]any, len(r.Key))
+			for k, name := range cs.PrimaryKey {
+				if k < len(r.Key) {
+					src[name] = r.Key[k]
+				}
+			}
+		}
 		for j, col := range cs.Columns {
 			var v any
 			if src != nil {
@@ -85,7 +98,13 @@ func EncodeBatch(rows []change.Change, cs core.Schema, meta *pb.BatchMeta) (body
 // meta. Column types are read from the RecordBatch's embedded schema — no
 // separate schema parameter needed. Values are read directly from typed
 // columns — no JSON parsing, no float64 normalization, no precision loss.
-func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte) ([]change.Change, *pb.BatchMeta, error) {
+//
+// primaryKey names the columns that form the change key, in key order; the
+// decoded Key tuple is rebuilt from the row's own values. The wire schema
+// does not carry the key separately — the sink's equality deletes need it,
+// and an empty key would make every commit fail on arity. Pass nil only for
+// batches whose consumer never commits (tests).
+func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) ([]change.Change, *pb.BatchMeta, error) {
 	meta := &pb.BatchMeta{}
 	if err := proto.Unmarshal(metaBytes, meta); err != nil {
 		return nil, nil, fmt.Errorf("transport: unmarshal batch meta: %w", err)
@@ -99,6 +118,21 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte) ([]change.Change, *pb.
 	colTypes := make([]core.ColumnType, numDataCols)
 	for j := 0; j < numDataCols; j++ {
 		colTypes[j] = arrowTypeToCore(schema.Field(j).Type)
+	}
+	// Resolve key column positions once: data-column index per PK name.
+	keyCols := make([]int, 0, len(primaryKey))
+	for _, name := range primaryKey {
+		idx := -1
+		for j := 0; j < numDataCols; j++ {
+			if schema.Field(j).Name == name {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, nil, fmt.Errorf("transport: primary key column %q not in batch schema", name)
+		}
+		keyCols = append(keyCols, idx)
 	}
 
 	rows := make([]change.Change, 0, rec.NumRows())
@@ -120,6 +154,14 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte) ([]change.Change, *pb.
 				c.After[field.Name] = v
 			} else {
 				delete(c.After, field.Name)
+			}
+		}
+
+		// Rebuild the key tuple from the row's own values, in PK order.
+		if len(keyCols) > 0 {
+			c.Key = make([]any, len(keyCols))
+			for k, j := range keyCols {
+				c.Key[k] = c.After[schema.Field(j).Name]
 			}
 		}
 

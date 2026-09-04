@@ -152,19 +152,28 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 	if err := cli.Create(testCtx, cr); err != nil {
 		t.Fatalf("create CR: %v", err)
 	}
-	// The manager's cached client propagates asynchronously; wait for it.
-	// Status is a subresource: set it via the status endpoint, then delete
-	// the coordinator — a terminated pipeline must not have it recreated.
-	fresh := &urutauv1alpha1.CDCPipeline{}
-	for i := 0; i < 20; i++ {
-		err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh)
+	// Wait for the coordinator to exist first: the initial reconcile must
+	// have completed before we flip the status, or a slow CI lets the
+	// reconcile read a pre-termination snapshot and create the workload
+	// after the delete below — permanently.
+	sts := &appsv1.StatefulSet{}
+	for i := 0; i < 50; i++ {
+		err := cli.Get(testCtx, types.NamespacedName{Name: "dead-coordinator", Namespace: nsName}, sts)
 		if err == nil {
 			break
 		}
 		if !apierrors.IsNotFound(err) {
-			t.Fatalf("reget CR: %v", err)
+			t.Fatalf("get statefulset: %v", err)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	if sts.Name == "" {
+		t.Fatal("coordinator StatefulSet was not created")
+	}
+	// Status is a subresource: set it via the status endpoint.
+	fresh := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh); err != nil {
+		t.Fatalf("get CR: %v", err)
 	}
 	fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
 	for i := 0; i < 10; i++ {
@@ -179,14 +188,40 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 		}
 		fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
 	}
-	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "dead-coordinator", Namespace: nsName}}
-	_ = cli.Delete(testCtx, sts)
+	// The reconciler reads the manager's cache: wait until the termination
+	// is visible there, or the delete-event reconcile below can still see
+	// a pre-termination CR and recreate the workload.
+	for i := 0; i < 50; i++ {
+		if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh); err != nil {
+			t.Fatalf("reget CR: %v", err)
+		}
+		if fresh.Status.Terminated != nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if fresh.Status.Terminated == nil {
+		t.Fatal("terminated status never reached the manager cache")
+	}
+	if err := cli.Delete(testCtx, sts); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("delete statefulset: %v", err)
+	}
 
 	// No coordinator workload may reappear for a terminated pipeline.
-	time.Sleep(3 * time.Second)
-	err := cli.Get(testCtx, types.NamespacedName{Name: "dead-coordinator", Namespace: nsName}, sts)
-	if !apierrors.IsNotFound(err) {
-		t.Fatalf("terminated pipeline got a coordinator: %v", err)
+	// Poll: the deletion itself is asynchronous through the cache.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := cli.Get(testCtx, types.NamespacedName{Name: "dead-coordinator", Namespace: nsName}, sts)
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("get statefulset: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("terminated pipeline got a coordinator: statefulset still present after 10s")
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	t.Log("terminated ok: no coordinator recreated")
 }

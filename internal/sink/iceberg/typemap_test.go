@@ -9,8 +9,7 @@ import (
 )
 
 // TestFromCanonicalRoundTrip maps a canonical schema into Iceberg and back
-// via the primitive type, proving the canonical set survives the boundary
-// (CR-012 §8).
+// via the primitive type, proving the canonical set survives the boundary.
 func TestFromCanonicalRoundTrip(t *testing.T) {
 	cs := core.Schema{
 		Columns: []core.Column{

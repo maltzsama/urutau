@@ -12,12 +12,34 @@ import (
 	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
+// Mode declares the synchronization mode a source supports.
+type Mode uint8
+
+const (
+	// ModeCDC is log-based change data capture — the only mode implemented.
+	ModeCDC Mode = iota
+	// ModeIncremental is cursor-column incremental (e.g. updated_at). It
+	// exists in the contract now so adding it later does not change
+	// signatures. Not implemented: it misses deletes and needs a cursor
+	// column; it serves sources without replication access (RDS without
+	// grants, replicas without binlog). Post-0.1.0.
+	ModeIncremental
+	// ModeBackfillOnly is a single snapshot with no stream. Declared in the
+	// contract; not implemented.
+	ModeBackfillOnly
+)
+
 // Capabilities declares what a source supports: snapshot via DBLog, chunk
 // SELECT introspection, and/or replication streaming.
 type Capabilities struct {
 	Snapshot   bool
 	ChunkQuery bool
 	Stream     bool
+	// MaxConnections is the upper bound on concurrent query connections
+	// the source tolerates. 0 means no opinion (unlimited).
+	MaxConnections int
+	// Modes lists the synchronization modes this source supports.
+	Modes []Mode
 }
 
 // Runtime carries the replication knobs a driver passes through to the
@@ -39,6 +61,6 @@ type StreamSource interface {
 	// SetConfirmed installs a callback that returns the minimum position
 	// committed to the sink across all tables. The Postgres reader uses
 	// this to advance the slot's confirmed_flush_lsn only to the point
-	// that has been durably written — never past it. See CR-019.
+	// that has been durably written — never past it.
 	SetConfirmed(f func() position.Position)
 }

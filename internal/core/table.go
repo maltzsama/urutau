@@ -1,5 +1,5 @@
 // Package core holds the canonical, sink-agnostic type system that crosses
-// the source↔sink boundary (CR-012). Sources map their native types into
+// the source↔sink boundary. Sources map their native types into
 // core.Kind; sinks map out of it. Neither side knows the other — that is
 // what makes N sources × M sinks cost N+M mappings instead of N×M.
 package core

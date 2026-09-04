@@ -16,8 +16,7 @@ import (
 )
 
 // TableRef maps one source table to its target and primary key. It is an
-// alias of the canonical core.TableRef — the pipeline-wide table identity
-// (CR-012).
+// alias of the canonical core.TableRef — the pipeline-wide table identity.
 type TableRef = core.TableRef
 
 // Chunk is a half-open primary-key range [Low, High). The last chunk of a
@@ -94,13 +93,26 @@ type SourceReader interface {
 type SnapshotConfig struct {
 	WindowTimeout time.Duration
 	CaughtUpPoll  time.Duration
+	// Existing progress from a previous run. When non-nil, bounds are
+	// read from Progress.Bounds (not recalculated) and only chunks in
+	// Progress.Pending are processed.
+	Progress *SnapshotProgress
 }
+
+// SnapshotCallback is called when a chunk completes. The caller persists
+// the updated pending list atomically with the commit that advances
+// position — same crash-safety invariant as cdc.position itself.
+type SnapshotCallback func(table string, completedChunkID uint32, remaining []uint32)
 
 // SnapshotTable runs DBLog for a table with no committed position: chunks by
 // PK, low watermark before each SELECT, high watermark after, then waits for
 // the reader to provably catch up past high before releasing the window. The
 // window never closes on a timer — only on the caught-up proof; exceeding
 // WindowTimeout is a pathology surfaced as an error.
+//
+// When cfg.Progress is provided (resume path), bounds are read from the
+// persisted state and only pending chunks are processed. The callback is
+// called after each chunk completes so the caller can persist progress.
 func SnapshotTable(
 	ctx context.Context,
 	chunker ChunkSource,
@@ -108,18 +120,41 @@ func SnapshotTable(
 	relay Relay,
 	target string,
 	cfg SnapshotConfig,
+	cb SnapshotCallback,
 ) error {
-	bounds, err := chunker.Bounds(ctx)
-	if err != nil {
-		return err
+	// Determine bounds: either from persisted state (resume) or fresh
+	// calculation (cold start).
+	var bounds [][]any
+	var pending []uint32
+
+	if cfg.Progress != nil && cfg.Progress.State == StateInProgress && len(cfg.Progress.Bounds) > 0 {
+		// Resume: use persisted bounds and pending list.
+		bounds = cfg.Progress.Bounds
+		pending = cfg.Progress.Pending
+	} else {
+		// Cold start: calculate bounds once and persist them.
+		var err error
+		bounds, err = chunker.Bounds(ctx)
+		if err != nil {
+			return err
+		}
+		// All chunks are pending initially.
+		pending = make([]uint32, len(bounds))
+		for i := range pending {
+			pending[i] = uint32(i)
+		}
 	}
+
 	chunks := Chunks(bounds)
 
-	for i, ch := range chunks {
-		chunkID := uint32(i)
+	for _, chunkID := range pending {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if int(chunkID) >= len(chunks) {
+			continue // safety: bounds may have shrunk if table was compacted
+		}
+		ch := chunks[chunkID]
 
 		// Gate the table's live events ahead of the SELECT so none can be
 		// deduplicated against an empty window, and open the reader window:
@@ -158,6 +193,12 @@ func SnapshotTable(
 		at := reader.Synced()
 		reader.ClearWindow()
 		relay.Release(target, chunkID, at)
+
+		// Notify caller of completed chunk so progress is persisted.
+		if cb != nil {
+			remaining := RemoveFromPending(pending, chunkID)
+			cb(target, chunkID, remaining)
+		}
 	}
 	return nil
 }
