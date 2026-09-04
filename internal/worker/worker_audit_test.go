@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/sink"
 	"github.com/maltzsama/urutau/internal/snapshot"
 )
@@ -143,7 +144,9 @@ func TestSchemaDriftIsTerminal(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
 	w.RegisterCommitter("t", fc, change.UpsertMode)
-	w.SetKnownColumns("t", map[string]bool{"id": true})
+	w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+	}})
 	w.OnSchemaDrift(func(d SchemaDrift) { drifts = append(drifts, d) })
 
 	ingest := make(chan change.Change, 8)
@@ -260,5 +263,64 @@ func TestAppendModeOnDeleteSkip(t *testing.T) {
 	}
 	if w.DroppedDeletes("t") != 1 {
 		t.Fatalf("DroppedDeletes = %d, want 1", w.DroppedDeletes("t"))
+	}
+}
+
+// A field added inside a struct column is the same class of event as a
+// top-level ADD COLUMN: the table pauses and the drift reports the full
+// dotted path (address.complement), not just the top-level column.
+func TestSchemaDriftRecursiveStruct(t *testing.T) {
+	var drifts []SchemaDrift
+	fc := &fakeCommitter{}
+	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
+	w.RegisterCommitter("t", fc, change.UpsertMode)
+	w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "address", Type: core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
+			{Name: "city", Type: core.ColumnType{Kind: core.KindString}},
+		}}},
+	}})
+	w.OnSchemaDrift(func(d SchemaDrift) { drifts = append(drifts, d) })
+
+	ingest := make(chan change.Change, 4)
+	ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{1},
+		After: map[string]any{
+			"id":      int64(1),
+			"address": map[string]any{"city": "sp", "complement": "apto 4"},
+		}, Position: "p1"}
+	close(ingest)
+	err := w.Run(context.Background(), ingest)
+	if err == nil || !strings.Contains(err.Error(), "schema drift") {
+		t.Fatalf("err = %v, want terminal schema-drift error", err)
+	}
+	if len(drifts) != 1 || drifts[0].Column != "address.complement" {
+		t.Fatalf("drifts = %+v, want one report for the full path address.complement", drifts)
+	}
+}
+
+// A conforming nested value (no new fields) passes through untouched.
+func TestSchemaDriftRecursiveStructConforms(t *testing.T) {
+	fc := &fakeCommitter{}
+	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
+	w.RegisterCommitter("t", fc, change.UpsertMode)
+	w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "address", Type: core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
+			{Name: "city", Type: core.ColumnType{Kind: core.KindString}},
+		}}},
+	}})
+
+	ingest := make(chan change.Change, 4)
+	ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{1},
+		After: map[string]any{
+			"id":      int64(1),
+			"address": map[string]any{"city": "sp"},
+		}, Position: "p1"}
+	close(ingest)
+	if err := w.Run(context.Background(), ingest); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(fc.batches) != 1 {
+		t.Fatalf("batches = %d, want 1 committed", len(fc.batches))
 	}
 }

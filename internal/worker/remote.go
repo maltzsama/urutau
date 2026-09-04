@@ -167,13 +167,9 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		w.Register(ta.TargetTable, writer, change.UpsertMode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
-		// The drift check knows the assigned schema's column set: canonical
-		// column names are the target table's columns.
-		cols := make(map[string]bool, len(cs.Columns))
-		for _, col := range cs.Columns {
-			cols[col.Name] = true
-		}
-		w.SetKnownColumns(ta.TargetTable, cols)
+		// The drift check knows the assigned canonical schema — with its
+		// types, so a field added inside a struct column is caught too.
+		w.SetKnownSchema(ta.TargetTable, cs)
 	}
 	w.OnSchemaDrift(func(d SchemaDrift) {
 		cfg.Logger.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,

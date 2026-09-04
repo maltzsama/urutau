@@ -282,24 +282,15 @@ func readSnapshotProgress(ctx context.Context, cat catalog.Catalog, ident table.
 	return snapshot.ReadSnapshotProgress(tbl.Properties())
 }
 
-// canonicalByTarget builds the known-column set for one target table from
-// its introspected canonical schema (the schema drift reference).
-func canonicalByTarget(canonical map[string]core.Schema, refs []core.TableRef, target string) map[string]bool {
+// canonicalForTarget returns the canonical schema for one target table (the
+// schema drift reference). Zero schema when the target has no source.
+func canonicalForTarget(canonical map[string]core.Schema, refs []core.TableRef, target string) core.Schema {
 	for _, ref := range refs {
-		if ref.Target != target {
-			continue
+		if ref.Target == target {
+			return canonical[ref.Source]
 		}
-		cs, ok := canonical[ref.Source]
-		if !ok {
-			return nil
-		}
-		cols := make(map[string]bool, len(cs.Columns))
-		for _, c := range cs.Columns {
-			cols[c.Name] = true
-		}
-		return cols
 	}
-	return nil
+	return core.Schema{}
 }
 
 // introspectAll resolves each spec table through the registry, so the
@@ -474,9 +465,10 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		if mode == change.AppendMode && specByTarget[target].OnDelete == spec.OnDeleteSkip {
 			w.SetDropDeletes(target, true)
 		}
-		// The drift check knows the introspected column set per table.
-		if cs := canonicalByTarget(canonical, refs, target); len(cs) > 0 {
-			w.SetKnownColumns(target, cs)
+		// The drift check knows the introspected canonical schema (with its
+		// types, so nested struct drift is caught) per table.
+		if cs := canonicalForTarget(canonical, refs, target); len(cs.Columns) > 0 {
+			w.SetKnownSchema(target, cs)
 		}
 	}
 	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() },

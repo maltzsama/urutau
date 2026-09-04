@@ -10,6 +10,7 @@ import (
 
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/sink"
 	"github.com/maltzsama/urutau/internal/snapshot"
@@ -95,12 +96,15 @@ type tablePipeline struct {
 	snapshotResumed bool
 	bootstrapGuard  *bloom.BloomFilter
 
-	// knownColumns is the set of column names known at introspection time.
-	// The batcher checks every incoming change to detect schema drift
-	// (ADD COLUMN, DROP COLUMN). An empty set disables the check.
-	knownColumns map[string]bool
-	// driftReported deduplicates schema-drift reports per column, so the
-	// callback fires once even when many changes carry the unknown column.
+	// knownSchema is the canonical schema known at introspection time. The
+	// batcher checks every incoming change against it to detect schema
+	// drift (ADD COLUMN, DROP COLUMN) — descending into struct columns so a
+	// field added inside a nested payload pauses the table the same way a
+	// top-level column would. An empty schema disables the check.
+	knownSchema core.Schema
+	// driftReported deduplicates schema-drift reports per column path, so
+	// the callback fires once even when many changes carry the unknown
+	// column.
 	driftReported map[string]bool
 }
 
@@ -251,15 +255,59 @@ func (w *Worker) MarkSnapshotResumed(target string) {
 	p.bootstrapGuard = nil
 }
 
-// SetKnownColumns sets the column names known at introspection time. The
-// batcher uses this to detect schema drift (ADD COLUMN, DROP COLUMN). An
-// empty or nil map disables the check.
-func (w *Worker) SetKnownColumns(target string, cols map[string]bool) {
+// SetKnownSchema sets the canonical schema known at introspection time. The
+// batcher uses it to detect schema drift (ADD COLUMN, DROP COLUMN) — an
+// empty schema disables the check.
+func (w *Worker) SetKnownSchema(target string, schema core.Schema) {
 	p := w.tables[target]
 	if p == nil {
 		return
 	}
-	p.knownColumns = cols
+	p.knownSchema = schema
+}
+
+// checkDrift compares an incoming row's columns against the known schema,
+// recursing into struct columns. It returns the first drifted path (with its
+// full dotted name, e.g. "address.complement") and whether drift was found.
+func checkDrift(after map[string]any, schema core.Schema) (SchemaDrift, bool) {
+	for name, v := range after {
+		col, ok := schema.Column(name)
+		if !ok {
+			return SchemaDrift{Column: name, Kind: "added"}, true
+		}
+		if col.Type.Kind == core.KindStruct {
+			if nested, isMap := v.(map[string]any); isMap {
+				if d, hit := checkDriftNested(name, nested, col.Type.Fields); hit {
+					return d, true
+				}
+			}
+		}
+	}
+	return SchemaDrift{}, false
+}
+
+// checkDriftNested descends one level into a struct value, comparing its
+// keys against the struct's declared fields.
+func checkDriftNested(path string, m map[string]any, fields []core.Column) (SchemaDrift, bool) {
+	for name, v := range m {
+		full := path + "." + name
+		var f *core.Column
+		for i := range fields {
+			if fields[i].Name == name {
+				f = &fields[i]
+				break
+			}
+		}
+		if f == nil {
+			return SchemaDrift{Column: full, Kind: "added"}, true
+		}
+		if f.Type.Kind == core.KindStruct {
+			if nested, isMap := v.(map[string]any); isMap {
+				return checkDriftNested(full, nested, f.Type.Fields)
+			}
+		}
+	}
+	return SchemaDrift{}, false
 }
 
 // SchemaDrift is emitted when the batcher detects a column in the change
@@ -577,21 +625,19 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// pipeline. Writing the row would corrupt the target (unknown
 			// column) or silently drop data, so the change is refused and
 			// the pipeline stops — restart only after the spec declares the
-			// column. Reported once per column; `_`-prefixed metadata
-			// columns never appear in After and are not special-cased here.
-			if len(p.knownColumns) > 0 && c.After != nil {
-				for col := range c.After {
-					if p.knownColumns[col] {
-						continue
-					}
+			// column. The check is recursive: a field added inside a struct
+			// column is the same class of event as a top-level ADD COLUMN,
+			// reported with its full path. Reported once per path.
+			if len(p.knownSchema.Columns) > 0 && c.After != nil {
+				if d, hit := checkDrift(c.After, p.knownSchema); hit {
 					p.snapshotMu.Lock()
-					first := !p.driftReported[col]
-					p.driftReported[col] = true
+					first := !p.driftReported[d.Column]
+					p.driftReported[d.Column] = true
 					p.snapshotMu.Unlock()
 					if first && w.schemaDrift != nil {
-						w.schemaDrift(SchemaDrift{Table: p.target, Column: col, Kind: "added"})
+						w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
 					}
-					return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, col)
+					return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
 				}
 			}
 			buf = append(buf, c)
