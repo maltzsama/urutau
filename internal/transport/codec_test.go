@@ -239,3 +239,48 @@ func TestCodecDeleteKeyOnly(t *testing.T) {
 		t.Fatalf("after.id = %v, want 2", got[0].After["id"])
 	}
 }
+
+func TestCodecPartialBeforeBackfillsKey(t *testing.T) {
+	// A before-image that lacks the key column value must still produce a
+	// matching equality delete: the key tuple backfills the missing PK
+	// column on encode.
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	rows := []change.Change{
+		{Op: change.OpDelete, Table: "t", Key: []any{int64(9)},
+			Before:   map[string]any{"v": "old"}, // no id — partial image
+			Position: "p1"},
+	}
+	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
+
+	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got[0].Key[0] != int64(9) {
+		t.Fatalf("key = %v, want [9] — a NULL tuple deletes nothing", got[0].Key)
+	}
+	if got[0].After["v"] != "old" {
+		t.Fatalf("after.v = %v, want old", got[0].After["v"])
+	}
+}

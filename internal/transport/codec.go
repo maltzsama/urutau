@@ -59,6 +59,30 @@ func EncodeBatch(rows []change.Change, cs core.Schema, meta *pb.BatchMeta) (body
 				}
 			}
 		}
+		// Same guarantee when a row image exists but lacks a key column
+		// (partial before-images): backfill from the key tuple. The row map
+		// is copied, never mutated — it belongs to the caller.
+		if src != nil && len(cs.PrimaryKey) > 0 && len(r.Key) > 0 {
+			missing := false
+			for i, name := range cs.PrimaryKey {
+				if i < len(r.Key) && src[name] == nil {
+					missing = true
+					break
+				}
+			}
+			if missing {
+				cp := make(map[string]any, len(src)+len(cs.PrimaryKey))
+				for k, v := range src {
+					cp[k] = v
+				}
+				for i, name := range cs.PrimaryKey {
+					if i < len(r.Key) && cp[name] == nil {
+						cp[name] = r.Key[i]
+					}
+				}
+				src = cp
+			}
+		}
 		for j, col := range cs.Columns {
 			var v any
 			if src != nil {

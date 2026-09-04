@@ -210,3 +210,40 @@ func TestValidateWarningsOpInUpsert(t *testing.T) {
 		t.Errorf("expected op-in-upsert advisory warning, got %v", warns)
 	}
 }
+
+func TestValidateBootstrapModes(t *testing.T) {
+	// A typo in the mode must be rejected, not silently treated as a full
+	// snapshot — an accidental 400M-row backfill is the failure mode.
+	s := validSpec()
+	s.Tables[0].Bootstrap = &Bootstrap{Mode: BootstrapMode("adopt-verifi")}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "bootstrap.mode") {
+		t.Fatalf("want bootstrap.mode problem, got %v", err)
+	}
+
+	// Valid modes pass.
+	for _, m := range []BootstrapMode{BootstrapSnapshot, Adopt, AdoptVerify} {
+		s.Tables[0].Bootstrap = &Bootstrap{Mode: m}
+		if err := s.Validate(); err != nil {
+			t.Fatalf("mode %q must validate: %v", m, err)
+		}
+	}
+}
+
+func TestValidateBootstrapStartAt(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Bootstrap = &Bootstrap{Mode: Adopt, StartAt: StartAtExplicit}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "bootstrap.position") {
+		t.Fatalf("want bootstrap.position problem, got %v", err)
+	}
+
+	s.Tables[0].Bootstrap.Position = "lsn:0/1A"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("explicit position must validate: %v", err)
+	}
+
+	// A position without startAt=explicit is contradictory: reject.
+	s.Tables[0].Bootstrap.StartAt = StartAtCurrent
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "startAt") {
+		t.Fatalf("want startAt problem, got %v", err)
+	}
+}

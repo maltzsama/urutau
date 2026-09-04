@@ -519,7 +519,32 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	routerDone := make(chan error, 1)
 	go func() { routerDone <- router.run(ctx, out) }()
 
+	// Per-table bootstrap config, resolved once: the stream start below and
+	// the snapshot loop both consult it.
+	bootstrapByTarget := make(map[string]spec.Bootstrap, len(s.Tables))
+	var explicitPositions []position.Position
+	for _, t := range s.Tables {
+		if t.Bootstrap == nil {
+			continue
+		}
+		bootstrapByTarget[t.Target] = *t.Bootstrap
+		if t.Bootstrap.StartAt == spec.StartAtExplicit && t.Bootstrap.Position != "" {
+			p, err := reg.ParsePosition(t.Bootstrap.Position)
+			if err != nil {
+				_ = qdb.Close()
+				return nil, fmt.Errorf("runner: %s bootstrap.position %q: %w", t.Target, t.Bootstrap.Position, err)
+			}
+			explicitPositions = append(explicitPositions, p)
+		}
+	}
+
 	start := resume
+	if start == nil && len(explicitPositions) > 0 {
+		// An adopted table with an explicit start position overrides the
+		// source default. The minimum across tables is the safe choice: the
+		// stream is one per source, and starting too late would skip data.
+		start = position.Min(explicitPositions)
+	}
 	if start == nil {
 		if m, err := reg.InitialPosition(ctx, qdb); err != nil {
 			return nil, fmt.Errorf("runner: initial position: %w", err)
@@ -536,15 +561,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	caps := reg.Caps()
 	if caps.Snapshot {
 		for _, ref := range needsSnapshot {
-			// Check bootstrap mode for this table.
-			var bootstrapMode spec.BootstrapMode
-			var bootstrapPos string
-			for _, t := range s.Tables {
-				if t.Target == ref.Target && t.Bootstrap != nil {
-					bootstrapMode = t.Bootstrap.Mode
-					bootstrapPos = t.Bootstrap.Position
-					break
-				}
+			bootstrapMode := spec.BootstrapSnapshot
+			if b, ok := bootstrapByTarget[ref.Target]; ok {
+				bootstrapMode = b.Mode
 			}
 
 			switch bootstrapMode {
@@ -609,11 +628,6 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
 				log.Info("snapshot done", "table", ref.Source)
 				r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
-			}
-			// Handle explicit start position for adopted tables.
-			if bootstrapMode == spec.Adopt && bootstrapPos != "" {
-				// Position will be used by the stream start.
-				_ = bootstrapPos
 			}
 		}
 	}
