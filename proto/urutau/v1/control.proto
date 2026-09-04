@@ -78,7 +78,7 @@ message TableAssignment {
   repeated string partition_by   = 5;  // native Iceberg transforms
   bool      include_before       = 6;  // derived: true only with a mutable-column filter
   bool      create_if_not_exists = 7;
-  string    schema_json          = 8;  // Iceberg schema (JSON) — the coordinator owns introspection
+  bytes     schema_arrow         = 8;  // table schema as Arrow IPC (data columns); the coordinator owns introspection
 }
 
 message BatchConfig {
@@ -114,9 +114,8 @@ message Ack {
 message ChunkRequest {
   string table          = 1;  // source table
   uint32 chunk_id       = 2;
-  bytes  low            = 3;  // lower PK bound (lexicographic tuple)
-  bytes  high           = 4;  // upper PK bound
-  bool   inclusive_high = 5;  // true only on the last chunk
+  bytes  bounds         = 3;  // Arrow IPC record: row 0 = low, row 1 = high (absent = open high)
+  bool   inclusive_high = 4;  // true only on the last chunk
 }
 
 message ChunkReady {

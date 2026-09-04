@@ -623,7 +623,7 @@ type TableAssignment struct {
 	PartitionBy       []string               `protobuf:"bytes,5,rep,name=partition_by,json=partitionBy,proto3" json:"partition_by,omitempty"`        // native Iceberg transforms
 	IncludeBefore     bool                   `protobuf:"varint,6,opt,name=include_before,json=includeBefore,proto3" json:"include_before,omitempty"` // derived: true only with a mutable-column filter
 	CreateIfNotExists bool                   `protobuf:"varint,7,opt,name=create_if_not_exists,json=createIfNotExists,proto3" json:"create_if_not_exists,omitempty"`
-	SchemaJson        string                 `protobuf:"bytes,8,opt,name=schema_json,json=schemaJson,proto3" json:"schema_json,omitempty"` // Iceberg schema (JSON) — the coordinator owns introspection
+	SchemaArrow       []byte                 `protobuf:"bytes,8,opt,name=schema_arrow,json=schemaArrow,proto3" json:"schema_arrow,omitempty"` // table schema as Arrow IPC (data columns); the coordinator owns introspection
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -707,11 +707,11 @@ func (x *TableAssignment) GetCreateIfNotExists() bool {
 	return false
 }
 
-func (x *TableAssignment) GetSchemaJson() string {
+func (x *TableAssignment) GetSchemaArrow() []byte {
 	if x != nil {
-		return x.SchemaJson
+		return x.SchemaArrow
 	}
-	return ""
+	return nil
 }
 
 type BatchConfig struct {
@@ -980,9 +980,8 @@ type ChunkRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"` // source table
 	ChunkId       uint32                 `protobuf:"varint,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
-	Low           []byte                 `protobuf:"bytes,3,opt,name=low,proto3" json:"low,omitempty"`                                           // lower PK bound (lexicographic tuple)
-	High          []byte                 `protobuf:"bytes,4,opt,name=high,proto3" json:"high,omitempty"`                                         // upper PK bound
-	InclusiveHigh bool                   `protobuf:"varint,5,opt,name=inclusive_high,json=inclusiveHigh,proto3" json:"inclusive_high,omitempty"` // true only on the last chunk
+	Bounds        []byte                 `protobuf:"bytes,3,opt,name=bounds,proto3" json:"bounds,omitempty"`                                     // Arrow IPC record: row 0 = low, row 1 = high (absent = open high)
+	InclusiveHigh bool                   `protobuf:"varint,4,opt,name=inclusive_high,json=inclusiveHigh,proto3" json:"inclusive_high,omitempty"` // true only on the last chunk
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1031,16 +1030,9 @@ func (x *ChunkRequest) GetChunkId() uint32 {
 	return 0
 }
 
-func (x *ChunkRequest) GetLow() []byte {
+func (x *ChunkRequest) GetBounds() []byte {
 	if x != nil {
-		return x.Low
-	}
-	return nil
-}
-
-func (x *ChunkRequest) GetHigh() []byte {
-	if x != nil {
-		return x.High
+		return x.Bounds
 	}
 	return nil
 }
@@ -1555,7 +1547,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12)\n" +
 	"\x05value\x18\x02 \x01(\v2\x13.urutau.v1.ChunkIdsR\x05value:\x028\x01\"\x1c\n" +
 	"\bChunkIds\x12\x10\n" +
-	"\x03ids\x18\x01 \x03(\rR\x03ids\"\xc9\x02\n" +
+	"\x03ids\x18\x01 \x03(\rR\x03ids\"\xcb\x02\n" +
 	"\x0fTableAssignment\x12!\n" +
 	"\fsource_table\x18\x01 \x01(\tR\vsourceTable\x12!\n" +
 	"\ftarget_table\x18\x02 \x01(\tR\vtargetTable\x123\n" +
@@ -1565,9 +1557,8 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"primaryKey\x12!\n" +
 	"\fpartition_by\x18\x05 \x03(\tR\vpartitionBy\x12%\n" +
 	"\x0einclude_before\x18\x06 \x01(\bR\rincludeBefore\x12/\n" +
-	"\x14create_if_not_exists\x18\a \x01(\bR\x11createIfNotExists\x12\x1f\n" +
-	"\vschema_json\x18\b \x01(\tR\n" +
-	"schemaJson\"h\n" +
+	"\x14create_if_not_exists\x18\a \x01(\bR\x11createIfNotExists\x12!\n" +
+	"\fschema_arrow\x18\b \x01(\fR\vschemaArrow\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
 	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xda\x02\n" +
@@ -1596,13 +1587,12 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\bposition\x18\x04 \x01(\tR\bposition\x12\x12\n" +
 	"\x04rows\x18\x05 \x01(\x04R\x04rows\x12\x18\n" +
 	"\adeletes\x18\x06 \x01(\x04R\adeletes\x12B\n" +
-	"\x0fcommit_duration\x18\a \x01(\v2\x19.google.protobuf.DurationR\x0ecommitDuration\"\x8c\x01\n" +
+	"\x0fcommit_duration\x18\a \x01(\v2\x19.google.protobuf.DurationR\x0ecommitDuration\"~\n" +
 	"\fChunkRequest\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
-	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12\x10\n" +
-	"\x03low\x18\x03 \x01(\fR\x03low\x12\x12\n" +
-	"\x04high\x18\x04 \x01(\fR\x04high\x12%\n" +
-	"\x0einclusive_high\x18\x05 \x01(\bR\rinclusiveHigh\"}\n" +
+	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12\x16\n" +
+	"\x06bounds\x18\x03 \x01(\fR\x06bounds\x12%\n" +
+	"\x0einclusive_high\x18\x04 \x01(\bR\rinclusiveHigh\"}\n" +
 	"\n" +
 	"ChunkReady\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +

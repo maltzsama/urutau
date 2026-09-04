@@ -108,7 +108,6 @@ type Coordinator struct {
 	qdb       *sql.DB
 	refs      []snapshot.TableRef
 	cat       catalog.Catalog
-	schemas   map[string]*iceberg.Schema
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
 	// Worker registry: groups resolved at boot from the spec, one queue and
@@ -269,7 +268,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 		canonical[t.Source] = cs
 	}
 	c.refs = refs
-	c.schemas = schemas
 	c.canonical = canonical
 
 	// Resolve worker groups: explicit worker= or the table's own pod.
@@ -638,18 +636,11 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceRead
 			c.openWindow(ref.Target, chunkID)
 		}
 
-		lowB, err := json.Marshal(ch.Low)
+		boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
 		if err != nil {
-			return fmt.Errorf("coordinator: chunk %d low bounds: %w", chunkID, err)
+			return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
 		}
-		var highB []byte
-		if ch.High != nil {
-			highB, err = json.Marshal(ch.High)
-			if err != nil {
-				return fmt.Errorf("coordinator: chunk %d high bounds: %w", chunkID, err)
-			}
-		}
-		req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Low: lowB, High: highB}
+		req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Bounds: boundsB}
 
 		select {
 		case w.out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
@@ -808,7 +799,9 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 }
 
 // assignmentFor builds one worker's table assignment with its own ticket.
-func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.Schema) (*pb.CoordinatorMessage, error) {
+// The table schema travels as Arrow IPC derived from the canonical schema —
+// the same typed discipline as the Flight data plane, no JSON on the wire.
+func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, error) {
 	assign := &pb.Assignment{
 		WorkerName: w.name,
 		Epoch:      uint64(1),
@@ -822,7 +815,7 @@ func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.
 		},
 	}
 	for _, ref := range w.refs {
-		schemaJSON, err := json.Marshal(schemas[ref.Source])
+		schemaB, err := transport.EncodeTableSchema(c.canonical[ref.Source])
 		if err != nil {
 			return nil, fmt.Errorf("coordinator: schema %s: %w", ref.Source, err)
 		}
@@ -832,7 +825,7 @@ func (c *Coordinator) assignmentFor(w *workerState, schemas map[string]*iceberg.
 			WriteMode:         pb.WriteMode_WRITE_MODE_UPSERT,
 			PrimaryKey:        ref.PrimaryKey,
 			CreateIfNotExists: true,
-			SchemaJson:        string(schemaJSON),
+			SchemaArrow:       schemaB,
 		})
 	}
 	return &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Assign{Assign: assign}}, nil
@@ -942,7 +935,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	// Assignment on every attach (including after a reset): the worker
 	// waits for it before opening Flight, and a resurrected worker needs a
 	// fresh one.
-	if msg, err := c.assignmentFor(w, c.schemas); err != nil {
+	if msg, err := c.assignmentFor(w); err != nil {
 		return err
 	} else {
 		select {

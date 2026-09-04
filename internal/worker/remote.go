@@ -3,7 +3,6 @@ package worker
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"google.golang.org/grpc"
@@ -145,8 +143,16 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
 	pkByTable := make(map[string][]string, len(assign.Tables))
 	for _, ta := range assign.Tables {
-		schema := &iceberg.Schema{}
-		if err := json.Unmarshal([]byte(ta.SchemaJson), schema); err != nil {
+		// The assignment schema arrives as Arrow IPC derived from the
+		// coordinator's canonical schema; rebuilding the Iceberg schema
+		// through FromCanonical keeps one encoding discipline on the wire.
+		cs, err := transport.DecodeTableSchema(ta.SchemaArrow)
+		if err != nil {
+			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
+		}
+		cs.PrimaryKey = ta.PrimaryKey
+		schema, err := icebergsink.FromCanonical(cs)
+		if err != nil {
 			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
 		}
 		ident := targetIdent(cfg.Namespace, ta.TargetTable)
@@ -161,11 +167,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		w.Register(ta.TargetTable, writer, change.UpsertMode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
-		// The drift check knows the assigned schema's column set: Iceberg
-		// field names are the canonical column names.
-		cols := make(map[string]bool, schema.NumFields())
-		for _, f := range schema.Fields() {
-			cols[f.Name] = true
+		// The drift check knows the assigned schema's column set: canonical
+		// column names are the target table's columns.
+		cols := make(map[string]bool, len(cs.Columns))
+		for _, col := range cs.Columns {
+			cols[col.Name] = true
 		}
 		w.SetKnownColumns(ta.TargetTable, cols)
 	}
