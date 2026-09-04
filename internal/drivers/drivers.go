@@ -136,3 +136,8 @@ func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identi
 func CommittedPosition(ctx context.Context, cat catalog.Catalog, ident table.Identifier) (string, error) {
 	return icebergsink.CommittedPosition(ctx, cat, ident)
 }
+
+// SetTableProperties writes arbitrary properties to an Iceberg table.
+func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Identifier, props iceberg.Properties) error {
+	return icebergsink.SetTableProperties(ctx, cat, ident, props)
+}

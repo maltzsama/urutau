@@ -60,7 +60,7 @@ type Table struct {
 	Worker            string    `json:"worker,omitempty"`
 	CreateIfNotExists bool      `json:"createIfNotExists,omitempty"`
 	FilterImmutable   bool      `json:"filterImmutable,omitempty"`
-	// Metadata lands pipeline metadata columns (op, commit_ts, position, …)
+	// Metadata lands pipeline metadata columns (op, commit_ts, position, ...)
 	// in the target table. The destination name is explicit via As.
 	Metadata []core.MetadataColumn `json:"metadata,omitempty"`
 	// Cast overrides one source column's canonical type. Key is the source
@@ -72,4 +72,38 @@ type Table struct {
 	// canonical type string. Ignored for SQL sources which introspect
 	// automatically.
 	Columns map[string]string `json:"columns,omitempty"`
+	// Bootstrap configures how the initial snapshot is handled.
+	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
+}
+
+// BootstrapMode controls how the initial data load is performed.
+type BootstrapMode string
+
+const (
+	// BootstrapSnapshot loads all data from the source (default).
+	BootstrapSnapshot BootstrapMode = "snapshot"
+	// Adopt trusts existing data in the target table and starts streaming
+	// from the given position. No data is read from the source.
+	Adopt BootstrapMode = "adopt"
+	// AdoptVerify trusts existing data but verifies it against the source
+	// by counting rows per chunk. Divergent chunks are reloaded.
+	AdoptVerify BootstrapMode = "adopt-verify"
+)
+
+// BootstrapStartAt controls where the stream starts after adoption.
+type BootstrapStartAt string
+
+const (
+	// StartAtCurrent captures the source position at adopt time (default).
+	StartAtCurrent BootstrapStartAt = "current"
+	// StartAtExplicit uses a specific position string.
+	StartAtExplicit BootstrapStartAt = "explicit"
+)
+
+// Bootstrap configures how the initial data load is performed.
+type Bootstrap struct {
+	Mode    BootstrapMode    `json:"mode,omitempty"`
+	StartAt BootstrapStartAt `json:"startAt,omitempty"`
+	// Position is the explicit position string when StartAt is "explicit".
+	Position string `json:"position,omitempty"`
 }
