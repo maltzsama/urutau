@@ -494,11 +494,18 @@ func targetIdent(namespace, target string) table.Identifier {
 }
 
 // parsePosition returns the parser for the assignment's source kind.
+// Getting this wrong is not a minor inconvenience: a Kafka pipeline whose
+// committed positions were parsed as GTID sets would fail the worker boot
+// the moment the first cdc.position existed.
 func parsePosition(kind string) func(string) (position.Position, error) {
-	if kind == "postgres" {
+	switch kind {
+	case "postgres":
 		return func(s string) (position.Position, error) { return position.ParseLSN(s) }
+	case "kafka":
+		return func(s string) (position.Position, error) { return position.ParseOffsets(s) }
+	default:
+		return func(s string) (position.Position, error) { return position.ParseGTID(s) }
 	}
-	return func(s string) (position.Position, error) { return position.ParseGTID(s) }
 }
 
 // committedStrings renders the committed map for the wire Hello.
