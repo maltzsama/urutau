@@ -123,7 +123,8 @@ func TestKeyStringDistinguishesTypes(t *testing.T) {
 		t.Fatal("int64(1) and uint64(1) render the same key")
 	}
 	// Equal values of the same type must still match.
-	if KeyString([]any{int64(1)}) != KeyString([]any{int64(1)}) {
+	k1 := KeyString([]any{int64(1)})
+	if k1 != KeyString([]any{int64(1)}) {
 		t.Fatal("identical keys render differently")
 	}
 }
