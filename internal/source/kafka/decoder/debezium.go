@@ -24,8 +24,8 @@ type debeziumEnvelope struct {
 }
 
 type debeziumSource struct {
-	TsMs int64  `json:"ts_ms"`
-	DB   string `json:"db"`
+	TsMs  int64  `json:"ts_ms"`
+	DB    string `json:"db"`
 	Table string `json:"table"`
 }
 
@@ -111,12 +111,7 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]change.Change, error) {
 	return []change.Change{c}, nil
 }
 
-func (d *DebeziumJSON) resolveTable(key []byte, env debeziumEnvelope) string {
-	// Check explicit topic-to-table mapping first.
-	if d.TopicToTable != nil {
-		// The topic is not directly available here; the reader will
-		// set it. Fall through to envelope-based resolution.
-	}
+func (d *DebeziumJSON) resolveTable(_ []byte, env debeziumEnvelope) string {
 	// Use the envelope's source table if available.
 	if env.Source.Table != "" {
 		return env.Source.DB + "." + env.Source.Table

@@ -22,7 +22,7 @@ type Offsets struct {
 func ParseOffsets(s string) (*Offsets, error) {
 	topic, partsStr, ok := strings.Cut(s, ":")
 	if !ok {
-		return nil, fmt.Errorf("position: parse offsets %q: want topic:p0=offset,...", s)
+		return nil, fmt.Errorf("position: parse offsets %q: want topic:p0=offset,... form", s)
 	}
 	parts := make(map[int32]int64)
 	if partsStr == "" {
@@ -123,8 +123,8 @@ func (o *Offsets) MarshalJSON() ([]byte, error) {
 	}
 	sort.Slice(parts, func(i, j int) bool { return parts[i].Partition < parts[j].Partition })
 	return json.Marshal(struct {
-		Topic  string `json:"topic"`
-		Parts  []Part `json:"parts"`
+		Topic string `json:"topic"`
+		Parts []Part `json:"parts"`
 	}{Topic: o.Topic, Parts: parts})
 }
 

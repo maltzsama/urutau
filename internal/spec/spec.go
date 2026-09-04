@@ -51,15 +51,15 @@ type Defaults struct {
 }
 
 type Table struct {
-	Source            string                `json:"source"`
-	Target            string                `json:"target"`
-	PrimaryKey        []string              `json:"primaryKey,omitempty"`
-	PartitionBy       []string              `json:"partitionBy,omitempty"`
-	Filter            *Filter               `json:"filter,omitempty"`
-	WriteMode         WriteMode             `json:"writeMode,omitempty"`
-	Worker            string                `json:"worker,omitempty"`
-	CreateIfNotExists bool                  `json:"createIfNotExists,omitempty"`
-	FilterImmutable   bool                  `json:"filterImmutable,omitempty"`
+	Source            string    `json:"source"`
+	Target            string    `json:"target"`
+	PrimaryKey        []string  `json:"primaryKey,omitempty"`
+	PartitionBy       []string  `json:"partitionBy,omitempty"`
+	Filter            *Filter   `json:"filter,omitempty"`
+	WriteMode         WriteMode `json:"writeMode,omitempty"`
+	Worker            string    `json:"worker,omitempty"`
+	CreateIfNotExists bool      `json:"createIfNotExists,omitempty"`
+	FilterImmutable   bool      `json:"filterImmutable,omitempty"`
 	// Metadata lands pipeline metadata columns (op, commit_ts, position, …)
 	// in the target table. The destination name is explicit via As.
 	Metadata []core.MetadataColumn `json:"metadata,omitempty"`
