@@ -145,6 +145,12 @@ type Coordinator struct {
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
 
+	// confirmed tracks the latest position each target table durably
+	// committed (from worker Acks). The minimum across tables is reported
+	// to the source so its retention never advances past uncommitted data.
+	confirmedMu sync.Mutex
+	confirmed   map[string]position.Position
+
 	cp         *checkpoint
 	supervisor *supervisor
 	terminate  chan error
@@ -195,6 +201,7 @@ func Run(ctx context.Context, cfg Config) error {
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
+		confirmed:   make(map[string]position.Position),
 	}
 	if cfg.FlowTotalBytes <= 0 {
 		cfg.FlowTotalBytes = 512 << 20
@@ -373,6 +380,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	defer rdr.Close()
+	// The slot's confirmed point tracks the minimum position workers have
+	// durably committed (their Acks), never the decode position — otherwise
+	// a crash between decode and commit would lose the in-flight window.
+	rdr.SetConfirmed(c.confirmedPosition)
 
 	start := resume
 	if start == nil {
@@ -595,6 +606,34 @@ func (c *Coordinator) closeWindow(ctx context.Context) error {
 	return c.enqueueBatch(ctx, buf, &pb.BatchMeta{Table: tgt})
 }
 
+// recordConfirmed stores a table's latest durably-committed position and
+// recomputes the pipeline-wide minimum. The minimum uses the position's own
+// ordering — LSNs and GTID sets are not lexicographically ordered, and a
+// wrong minimum would advance the source slot past data still in flight.
+func (c *Coordinator) recordConfirmed(table string, pos position.Position) {
+	if pos == nil {
+		return
+	}
+	c.confirmedMu.Lock()
+	defer c.confirmedMu.Unlock()
+	c.confirmed[table] = pos
+}
+
+// confirmedPosition returns the minimum committed position across all
+// target tables; nil while nothing is durably committed.
+func (c *Coordinator) confirmedPosition() position.Position {
+	c.confirmedMu.Lock()
+	defer c.confirmedMu.Unlock()
+	if len(c.confirmed) == 0 {
+		return nil
+	}
+	vals := make([]position.Position, 0, len(c.confirmed))
+	for _, p := range c.confirmed {
+		vals = append(vals, p)
+	}
+	return position.Min(vals)
+}
+
 // waitChunkReady blocks until the worker reports the chunk SELECT done.
 func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32) error {
 	for {
@@ -781,6 +820,9 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	if freed > 0 {
 		c.budget.release(worker, freed)
 	}
+	// The ack is evidence of a durable commit: record it and recompute the
+	// pipeline-wide minimum the source's retention may advance to.
+	c.recordConfirmed(ack.Table, pos)
 	if c.metrics != nil {
 		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()

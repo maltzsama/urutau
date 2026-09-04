@@ -344,12 +344,12 @@ type Runner struct {
 	closeQuery                       func()
 	streamErr, workerErr, routerDone <-chan error
 
-	// committedPositions tracks the latest committed cdc.position per
-	// target table. The minimum across all tables is the confirmed
-	// position reported to the source (Postgres slot advancement).
+	// committedPositions tracks the latest durably-committed position per
+	// target table. The minimum across tables is the confirmed position
+	// reported to the source (Postgres slot advancement).
 	posMu              sync.Mutex
-	committedPositions map[string]string
-	minCommitted       string // cached minimum, recomputed on each commit
+	committedPositions map[string]position.Position
+	minConfirmed       position.Position // recomputed on each commit
 }
 
 // emit posts one lifecycle event to the audit trail, best-effort by
@@ -473,7 +473,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}
 	}
 	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() },
-		committedPositions: make(map[string]string)}
+		committedPositions: make(map[string]position.Position)}
 	w.OnSchemaDrift(func(d worker.SchemaDrift) {
 		log.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
 			"action", "declare the column in the spec and resume")
@@ -488,7 +488,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			"table": b.Table, "rows": rows,
 			"upserts": len(b.Upserts), "deletes": len(b.Deletes), "position": b.Position,
 		})
-		r.updateCommitted(b.Table, b.Position)
+		// A garbage position string never advances the confirmed point.
+		p, err := reg.ParsePosition(b.Position)
+		if err != nil {
+			log.Warn("runner: commit position parse", "table", b.Table, "position", b.Position, "err", err)
+			return
+		}
+		r.updateCommitted(b.Table, p)
 	})
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
@@ -681,34 +687,31 @@ func (r *Runner) DroppedByWindow(target string) int64 {
 // updateCommitted is called from the OnCommit callback. It stores the
 // latest committed position for a target table and recomputes the minimum
 // across all tables.
-func (r *Runner) updateCommitted(table, pos string) {
-	if pos == "" {
+// updateCommitted records the position a target table durably committed and
+// recomputes the pipeline-wide minimum — the value reported to the source so
+// its retention never advances past uncommitted data. The minimum uses the
+// position's own ordering: LSNs and GTID sets are not lexicographically
+// ordered ("0/10" sorts before "0/2" as strings, 16 after 2 as positions),
+// and a wrong minimum would advance the slot past data still in flight.
+func (r *Runner) updateCommitted(table string, pos position.Position) {
+	if pos == nil {
 		return
 	}
 	r.posMu.Lock()
 	defer r.posMu.Unlock()
 	r.committedPositions[table] = pos
-	best := ""
+	vals := make([]position.Position, 0, len(r.committedPositions))
 	for _, p := range r.committedPositions {
-		if best == "" || p < best {
-			best = p
-		}
+		vals = append(vals, p)
 	}
-	r.minCommitted = best
+	r.minConfirmed = position.Min(vals)
 }
 
 // confirmedPosition returns the minimum committed position across all
 // target tables. The Postgres reader uses this to advance the slot's
-// confirmed_flush_lsn.
+// confirmed_flush_lsn; nil means nothing is durably committed yet.
 func (r *Runner) confirmedPosition() position.Position {
 	r.posMu.Lock()
 	defer r.posMu.Unlock()
-	if r.minCommitted == "" {
-		return nil
-	}
-	p, err := position.ParseLSN(r.minCommitted)
-	if err != nil {
-		return nil
-	}
-	return p
+	return r.minConfirmed
 }
