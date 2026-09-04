@@ -1,14 +1,11 @@
 // Flight data-plane codec: change batches travel as Arrow IPC records with
-// a BatchMeta proto in the FlightData app_metadata. Rows use a stable wire
-// schema — op, key (JSON tuple), before/after (JSON objects, nullable),
-// position. JSON cannot distinguish whole floats from ints, so integral
-// numbers decode as int64; the sink coerces to the column type from the
-// table schema, which is authoritative.
+// a BatchMeta proto in the FlightData app_metadata. Rows use a typed wire
+// schema derived from the canonical core.Schema — each column travels as
+// its native Arrow type, no JSON blobs, no lossy round-trips.
 package transport
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -19,47 +16,62 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/core"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
-// ChangeSchema is the wire schema of one change row batch.
-var ChangeSchema = arrow.NewSchema([]arrow.Field{
-	{Name: "op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-	{Name: "key", Type: arrow.BinaryTypes.String, Nullable: false},
-	{Name: "before", Type: arrow.BinaryTypes.String, Nullable: true},
-	{Name: "after", Type: arrow.BinaryTypes.String, Nullable: true},
-	{Name: "position", Type: arrow.BinaryTypes.String, Nullable: false},
-}, nil)
-
 // EncodeBatch renders rows as one complete Arrow IPC stream (schema +
-// record) and marshals meta for the FlightData app_metadata. The serialized
-// body is produced here so the coordinator can account for its bytes in the
-// flow budget before the batch enters a worker queue.
-func EncodeBatch(rows []change.Change, meta *pb.BatchMeta) (body, metaBytes []byte, err error) {
+// record) and marshals meta for the FlightData app_metadata. The schema
+// is derived from the canonical core.Schema: data columns are typed,
+// metadata columns (__op, __pos, etc.) are appended at the end.
+func EncodeBatch(rows []change.Change, cs core.Schema, meta *pb.BatchMeta) (body, metaBytes []byte, err error) {
 	metaBytes, err = proto.Marshal(meta)
 	if err != nil {
 		return nil, nil, fmt.Errorf("transport: marshal batch meta: %w", err)
 	}
 
-	bld := array.NewRecordBuilder(memory.DefaultAllocator, ChangeSchema)
+	schema, err := CoreSchemaToArrow(cs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	defer bld.Release()
 
+	numDataCols := len(cs.Columns)
 	for i := range rows {
-		bld.Field(0).(*array.Uint8Builder).Append(uint8(rows[i].Op))
-		key, err := json.Marshal(rows[i].Key)
-		if err != nil {
-			return nil, nil, fmt.Errorf("transport: marshal key: %w", err)
+		r := &rows[i]
+		// Data columns: look up in After (or Before for deletes when After is nil).
+		src := r.After
+		if src == nil {
+			src = r.Before
 		}
-		bld.Field(1).(*array.StringBuilder).Append(string(key))
-		appendJSON(bld.Field(2), rows[i].Before)
-		appendJSON(bld.Field(3), rows[i].After)
-		bld.Field(4).(*array.StringBuilder).Append(rows[i].Position)
+		for j, col := range cs.Columns {
+			var v any
+			if src != nil {
+				v = src[col.Name]
+			}
+			if err := appendTypedValue(bld.Field(j), col.Type, v); err != nil {
+				return nil, nil, fmt.Errorf("transport: column %q row %d: %w", col.Name, i, err)
+			}
+		}
+		// Metadata columns.
+		bld.Field(numDataCols).(*array.Uint8Builder).Append(uint8(r.Op))
+		bld.Field(numDataCols + 1).(*array.StringBuilder).Append(r.Position)
+		if r.CommitTS.IsZero() {
+			bld.Field(numDataCols + 2).AppendNull()
+		} else {
+			bld.Field(numDataCols + 2).(*array.TimestampBuilder).AppendTime(r.CommitTS)
+		}
+		bld.Field(numDataCols + 3).(*array.TimestampBuilder).AppendTime(r.IngestTS)
+		bld.Field(numDataCols + 4).(*array.BooleanBuilder).Append(r.Snapshot)
 	}
+
 	rec := bld.NewRecordBatch()
 	defer rec.Release()
 
 	var buf bytes.Buffer
-	w := ipc.NewWriter(&buf, ipc.WithSchema(ChangeSchema))
+	w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
 	if err := w.Write(rec); err != nil {
 		return nil, nil, fmt.Errorf("transport: ipc write: %w", err)
 	}
@@ -69,93 +81,316 @@ func EncodeBatch(rows []change.Change, meta *pb.BatchMeta) (body, metaBytes []by
 	return buf.Bytes(), metaBytes, nil
 }
 
-// DecodeBatch reads a record + app_metadata back into rows and meta.
-// Window tags are per-batch (meta.Window): the caller routes snapshot rows
-// to the window builder and stamps live rows with the batch's tag — a
-// batch is always homogeneous by contract.
+// DecodeBatch reads a typed Arrow record + app_metadata back into rows and
+// meta. Column types are read from the RecordBatch's embedded schema — no
+// separate schema parameter needed. Values are read directly from typed
+// columns — no JSON parsing, no float64 normalization, no precision loss.
 func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte) ([]change.Change, *pb.BatchMeta, error) {
 	meta := &pb.BatchMeta{}
 	if err := proto.Unmarshal(metaBytes, meta); err != nil {
 		return nil, nil, fmt.Errorf("transport: unmarshal batch meta: %w", err)
 	}
 
-	opCol, ok := rec.Column(0).(*array.Uint8)
-	if !ok {
-		return nil, nil, fmt.Errorf("transport: op column type %T", rec.Column(0))
-	}
-	keyCol, ok := rec.Column(1).(*array.String)
-	if !ok {
-		return nil, nil, fmt.Errorf("transport: key column type %T", rec.Column(1))
-	}
-	beforeCol, ok := rec.Column(2).(*array.String)
-	if !ok {
-		return nil, nil, fmt.Errorf("transport: before column type %T", rec.Column(2))
-	}
-	afterCol, ok := rec.Column(3).(*array.String)
-	if !ok {
-		return nil, nil, fmt.Errorf("transport: after column type %T", rec.Column(3))
-	}
-	posCol, ok := rec.Column(4).(*array.String)
-	if !ok {
-		return nil, nil, fmt.Errorf("transport: position column type %T", rec.Column(4))
+	schema := rec.Schema()
+	numCols := int(rec.NumCols())
+	numDataCols := numCols - 5 // subtract metadata columns
+
+	// Pre-resolve core types for each data column from the Arrow schema.
+	colTypes := make([]core.ColumnType, numDataCols)
+	for j := 0; j < numDataCols; j++ {
+		colTypes[j] = arrowTypeToCore(schema.Field(j).Type)
 	}
 
 	rows := make([]change.Change, 0, rec.NumRows())
 	for i := 0; i < int(rec.NumRows()); i++ {
 		c := change.Change{
-			Op:       change.Op(opCol.Value(i)),
-			Position: posCol.Value(i),
 			Table:    meta.Table,
 			IngestTS: time.Now(),
 		}
-		if err := json.Unmarshal([]byte(keyCol.Value(i)), &c.Key); err != nil {
-			return nil, nil, fmt.Errorf("transport: unmarshal key: %w", err)
-		}
-		normalizeJSON(c.Key)
-		if !beforeCol.IsNull(i) {
-			if err := json.Unmarshal([]byte(beforeCol.Value(i)), &c.Before); err != nil {
-				return nil, nil, fmt.Errorf("transport: unmarshal before: %w", err)
+
+		// Data columns → After map.
+		c.After = make(map[string]any, numDataCols)
+		for j := 0; j < numDataCols; j++ {
+			field := schema.Field(j)
+			v, err := readTypedValue(rec.Column(j), colTypes[j], i)
+			if err != nil {
+				return nil, nil, fmt.Errorf("transport: column %q row %d: %w", field.Name, i, err)
 			}
-			normalizeMap(c.Before)
-		}
-		if !afterCol.IsNull(i) {
-			if err := json.Unmarshal([]byte(afterCol.Value(i)), &c.After); err != nil {
-				return nil, nil, fmt.Errorf("transport: unmarshal after: %w", err)
+			if v != nil {
+				c.After[field.Name] = v
+			} else {
+				delete(c.After, field.Name)
 			}
-			normalizeMap(c.After)
 		}
+
+		// Metadata columns (last 5, fixed positions).
+		opCol, _ := rec.Column(numDataCols).(*array.Uint8)
+		c.Op = change.Op(opCol.Value(i))
+		posCol, _ := rec.Column(numDataCols + 1).(*array.String)
+		c.Position = posCol.Value(i)
+		tsCol, _ := rec.Column(numDataCols + 2).(*array.Timestamp)
+		if !tsCol.IsNull(i) {
+			c.CommitTS = tsCol.Value(i).ToTime(arrow.Microsecond)
+		}
+		snapCol, _ := rec.Column(numDataCols + 4).(*array.Boolean)
+		c.Snapshot = snapCol.Value(i)
+
 		rows = append(rows, c)
 	}
 	return rows, meta, nil
 }
 
-func appendJSON(bld array.Builder, m map[string]any) {
-	if m == nil {
-		bld.AppendNull()
-		return
+// ── typed value helpers ──────────────────────────────────────────────
+
+// arrowTypeToCore maps an Arrow DataType back to a core.ColumnType for
+// driving the typed decoder.
+func arrowTypeToCore(dt arrow.DataType) core.ColumnType {
+	switch dt.ID() {
+	case arrow.BOOL:
+		return core.ColumnType{Kind: core.KindBool}
+	case arrow.INT8, arrow.INT16, arrow.INT32:
+		return core.ColumnType{Kind: core.KindInt32}
+	case arrow.INT64:
+		return core.ColumnType{Kind: core.KindInt64}
+	case arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64:
+		return core.ColumnType{Kind: core.KindInt64} // unsigned → int64
+	case arrow.FLOAT16, arrow.FLOAT32:
+		return core.ColumnType{Kind: core.KindFloat32}
+	case arrow.FLOAT64:
+		return core.ColumnType{Kind: core.KindFloat64}
+	case arrow.DECIMAL128:
+		d := dt.(*arrow.Decimal128Type)
+		return core.ColumnType{Kind: core.KindDecimal, Precision: int(d.Precision), Scale: int(d.Scale)}
+	case arrow.STRING, arrow.LARGE_STRING:
+		return core.ColumnType{Kind: core.KindString}
+	case arrow.BINARY, arrow.LARGE_BINARY:
+		return core.ColumnType{Kind: core.KindBinary}
+	case arrow.DATE32, arrow.DATE64:
+		return core.ColumnType{Kind: core.KindDate}
+	case arrow.TIME32, arrow.TIME64:
+		return core.ColumnType{Kind: core.KindTime}
+	case arrow.TIMESTAMP:
+		return core.ColumnType{Kind: core.KindTimestampTZ} // timestamps travel as UTC
+	case arrow.FIXED_SIZE_BINARY:
+		return core.ColumnType{Kind: core.KindUUID}
+	default:
+		return core.ColumnType{Kind: core.KindString} // fallback
 	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		bld.AppendNull()
-		return
-	}
-	bld.(*array.StringBuilder).Append(string(b))
 }
 
-// normalizeJSON restores integral JSON numbers to int64 in a key tuple.
-func normalizeJSON(v []any) {
-	for i, e := range v {
-		if f, ok := e.(float64); ok && f == float64(int64(f)) {
-			v[i] = int64(f)
+// appendTypedValue writes a single Go value into the appropriate Arrow
+// builder. nil maps to null. The Go type must match the canonical Kind.
+func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
+	if v == nil {
+		bld.AppendNull()
+		return nil
+	}
+	switch ct.Kind {
+	case core.KindBool:
+		t, ok := v.(bool)
+		if !ok {
+			return fmt.Errorf("want bool, got %T", v)
 		}
+		bld.(*array.BooleanBuilder).Append(t)
+	case core.KindInt32:
+		switch t := v.(type) {
+		case int32:
+			bld.(*array.Int32Builder).Append(t)
+		case int:
+			bld.(*array.Int32Builder).Append(int32(t))
+		case int64:
+			bld.(*array.Int32Builder).Append(int32(t))
+		case float64:
+			bld.(*array.Int32Builder).Append(int32(t))
+		default:
+			return fmt.Errorf("want int32-compatible, got %T", v)
+		}
+	case core.KindInt64:
+		switch t := v.(type) {
+		case int64:
+			bld.(*array.Int64Builder).Append(t)
+		case int:
+			bld.(*array.Int64Builder).Append(int64(t))
+		case int32:
+			bld.(*array.Int64Builder).Append(int64(t))
+		case float64:
+			bld.(*array.Int64Builder).Append(int64(t))
+		default:
+			return fmt.Errorf("want int64-compatible, got %T", v)
+		}
+	case core.KindFloat32:
+		switch t := v.(type) {
+		case float32:
+			bld.(*array.Float32Builder).Append(t)
+		case float64:
+			bld.(*array.Float32Builder).Append(float32(t))
+		case int64:
+			bld.(*array.Float32Builder).Append(float32(t))
+		default:
+			return fmt.Errorf("want float32-compatible, got %T", v)
+		}
+	case core.KindFloat64:
+		switch t := v.(type) {
+		case float64:
+			bld.(*array.Float64Builder).Append(t)
+		case float32:
+			bld.(*array.Float64Builder).Append(float64(t))
+		case int64:
+			bld.(*array.Float64Builder).Append(float64(t))
+		case int:
+			bld.(*array.Float64Builder).Append(float64(t))
+		case int32:
+			bld.(*array.Float64Builder).Append(float64(t))
+		default:
+			return fmt.Errorf("want float64-compatible, got %T", v)
+		}
+	case core.KindDecimal:
+		s, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("decimal: want string, got %T", v)
+		}
+		if err := bld.(*array.Decimal128Builder).AppendValueFromString(s); err != nil {
+			return fmt.Errorf("decimal parse: %w", err)
+		}
+	case core.KindString, core.KindJSON:
+		switch t := v.(type) {
+		case string:
+			bld.(*array.StringBuilder).Append(t)
+		case []byte:
+			bld.(*array.StringBuilder).Append(string(t))
+		default:
+			return fmt.Errorf("want string, got %T", v)
+		}
+	case core.KindBinary:
+		switch t := v.(type) {
+		case []byte:
+			bld.(*array.BinaryBuilder).Append(t)
+		case string:
+			bld.(*array.BinaryBuilder).Append([]byte(t))
+		default:
+			return fmt.Errorf("want []byte, got %T", v)
+		}
+	case core.KindDate:
+		// Dates travel as int32 (days since epoch).
+		switch t := v.(type) {
+		case int32:
+			bld.(*array.Int32Builder).Append(t)
+		case int64:
+			bld.(*array.Int32Builder).Append(int32(t))
+		case int:
+			bld.(*array.Int32Builder).Append(int32(t))
+		default:
+			return fmt.Errorf("want date-int32, got %T", v)
+		}
+	case core.KindTime:
+		// Times travel as int64 (micros since midnight).
+		switch t := v.(type) {
+		case int64:
+			bld.(*array.Int64Builder).Append(t)
+		case int:
+			bld.(*array.Int64Builder).Append(int64(t))
+		default:
+			return fmt.Errorf("want time-int64, got %T", v)
+		}
+	case core.KindTimestamp, core.KindTimestampTZ:
+		switch t := v.(type) {
+		case time.Time:
+			bld.(*array.TimestampBuilder).AppendTime(t)
+		default:
+			return fmt.Errorf("want time.Time, got %T", v)
+		}
+	case core.KindUUID:
+		switch t := v.(type) {
+		case []byte:
+			if len(t) != 16 {
+				return fmt.Errorf("uuid: want 16 bytes, got %d", len(t))
+			}
+			bld.(*array.FixedSizeBinaryBuilder).Append(t)
+		case string:
+			// Parse hex UUID.
+			raw, err := parseUUIDBytes(t)
+			if err != nil {
+				return err
+			}
+			bld.(*array.FixedSizeBinaryBuilder).Append(raw)
+		default:
+			return fmt.Errorf("want []byte or string for uuid, got %T", v)
+		}
+	default:
+		return fmt.Errorf("unsupported kind %s", ct.Kind)
+	}
+	return nil
+}
+
+// readTypedValue reads a single typed value from an Arrow column at row i.
+func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
+	if col.IsNull(i) {
+		return nil, nil
+	}
+	switch ct.Kind {
+	case core.KindBool:
+		return col.(*array.Boolean).Value(i), nil
+	case core.KindInt32:
+		return col.(*array.Int32).Value(i), nil
+	case core.KindInt64:
+		return col.(*array.Int64).Value(i), nil
+	case core.KindFloat32:
+		return float64(col.(*array.Float32).Value(i)), nil // promote to float64 for map[string]any
+	case core.KindFloat64:
+		return col.(*array.Float64).Value(i), nil
+	case core.KindDecimal:
+		return col.(*array.Decimal128).ValueStr(i), nil // canonical text form
+	case core.KindString, core.KindJSON:
+		return col.(*array.String).Value(i), nil
+	case core.KindBinary:
+		return col.(*array.Binary).Value(i), nil
+	case core.KindDate:
+		return col.(*array.Int32).Value(i), nil // days since epoch
+	case core.KindTime:
+		return col.(*array.Int64).Value(i), nil // micros since midnight
+	case core.KindTimestamp, core.KindTimestampTZ:
+		ts := col.(*array.Timestamp).Value(i)
+		return ts.ToTime(arrow.Microsecond), nil
+	case core.KindUUID:
+		return col.(*array.FixedSizeBinary).Value(i), nil
+	default:
+		return nil, fmt.Errorf("unsupported kind %s", ct.Kind)
 	}
 }
 
-// normalizeMap restores integral JSON numbers to int64 in a row image.
-func normalizeMap(m map[string]any) {
-	for k, e := range m {
-		if f, ok := e.(float64); ok && f == float64(int64(f)) {
-			m[k] = int64(f)
+// parseUUIDBytes parses a hyphenated or compact UUID string into 16 bytes.
+func parseUUIDBytes(s string) ([]byte, error) {
+	compact := make([]byte, 0, 32)
+	for _, c := range s {
+		if c == '-' {
+			continue
 		}
+		compact = append(compact, byte(c))
+	}
+	if len(compact) != 32 {
+		return nil, fmt.Errorf("uuid: want 32 hex chars, got %d", len(compact))
+	}
+	raw := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		hi := hexDigit(compact[i*2])
+		lo := hexDigit(compact[i*2+1])
+		if hi < 0 || lo < 0 {
+			return nil, fmt.Errorf("uuid: invalid hex char")
+		}
+		raw[i] = byte(hi<<4 | lo)
+	}
+	return raw, nil
+}
+
+func hexDigit(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	default:
+		return -1
 	}
 }

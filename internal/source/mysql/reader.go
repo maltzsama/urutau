@@ -189,6 +189,10 @@ func (r *Reader) Master(ctx context.Context) (position.Position, error) {
 // Close stops the reader and its replication connection.
 func (r *Reader) Close() { r.canal.Close() }
 
+// SetConfirmed is a no-op for MySQL: binlog retention is time/size-based,
+// not consumer-confirmed, so there is no slot to hold back.
+func (r *Reader) SetConfirmed(_ func() position.Position) {}
+
 // ── canal.EventHandler ──────────────────────────────────────────────
 
 func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {

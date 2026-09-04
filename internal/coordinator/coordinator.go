@@ -25,7 +25,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog/rest"
+	"github.com/apache/iceberg-go/catalog"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -101,11 +101,12 @@ type Coordinator struct {
 	cfg Config
 	log *slog.Logger
 
-	reg     *drivers.Registry
-	qdb     *sql.DB
-	refs    []snapshot.TableRef
-	cat     *rest.Catalog
-	schemas map[string]*iceberg.Schema
+	reg       *drivers.Registry
+	qdb       *sql.DB
+	refs      []snapshot.TableRef
+	cat       catalog.Catalog
+	schemas   map[string]*iceberg.Schema
+	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
 	// Worker registry: groups resolved at boot from the spec, one queue and
 	// one ticket each; route maps every target table to its owning worker.
@@ -249,16 +250,19 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
+	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, _, is, _, err := reg.Introspect(ctx, qdb, t)
+		ref, cs, is, _, err := reg.Introspect(ctx, qdb, t)
 		if err != nil {
 			return err
 		}
 		refs = append(refs, ref)
 		schemas[t.Source] = is
+		canonical[t.Source] = cs
 	}
 	c.refs = refs
 	c.schemas = schemas
+	c.canonical = canonical
 
 	// Resolve worker groups: explicit worker= or the table's own pod.
 	for i, t := range c.cfg.Spec.Tables {
@@ -306,7 +310,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	for _, ref := range refs {
-		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source], core.CastPolicy{}); err != nil {
+		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source], nil, core.CastPolicy{}); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
@@ -706,7 +710,15 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, me
 		return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
 	}
 	meta.BatchId = c.batchSeq.Add(1)
-	body, metaBytes, err := transport.EncodeBatch(rows, meta)
+	// Resolve the canonical schema for typed wire encoding.
+	var cs core.Schema
+	for _, ref := range c.refs {
+		if ref.Target == meta.Table {
+			cs = c.canonical[ref.Source]
+			break
+		}
+	}
+	body, metaBytes, err := transport.EncodeBatch(rows, cs, meta)
 	if err != nil {
 		return err
 	}

@@ -71,7 +71,7 @@ tables:
 	if err := urutauiceberg.EnsureNamespace(ctx, cat, table.Identifier{"raw"}); err != nil {
 		t.Fatalf("namespace: %v", err)
 	}
-	if err := urutauiceberg.EnsureTable(ctx, cat, ident, schema, core.CastPolicy{}); err != nil {
+	if err := urutauiceberg.EnsureTable(ctx, cat, ident, schema, nil, core.CastPolicy{}); err != nil {
 		t.Fatalf("ensure table: %v", err)
 	}
 

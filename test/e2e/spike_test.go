@@ -12,7 +12,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
 	_ "github.com/trinodb/trino-go-client/trino"
 
@@ -182,7 +181,7 @@ func must(t *testing.T, err error) {
 	}
 }
 
-func reload(t *testing.T, ctx context.Context, cat *rest.Catalog, ident table.Identifier) *table.Table {
+func reload(t *testing.T, ctx context.Context, cat catalog.Catalog, ident table.Identifier) *table.Table {
 	t.Helper()
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
