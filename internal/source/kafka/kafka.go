@@ -276,6 +276,10 @@ func (r *Reader) Close() {
 	}
 }
 
+// SetConfirmed is a no-op for Kafka: partition offsets are committed
+// directly, not via a replication slot.
+func (r *Reader) SetConfirmed(_ func() position.Position) {}
+
 // kgoLogger adapts slog.Logger to the kgo.Logger interface.
 type kgoLogger struct {
 	l *slog.Logger

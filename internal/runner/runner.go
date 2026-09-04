@@ -309,6 +309,13 @@ type Runner struct {
 	rdr                              drivers.StreamSource
 	closeQuery                       func()
 	streamErr, workerErr, routerDone <-chan error
+
+	// committedPositions tracks the latest committed cdc.position per
+	// target table. The minimum across all tables is the confirmed
+	// position reported to the source (Postgres slot advancement).
+	posMu              sync.Mutex
+	committedPositions map[string]string
+	minCommitted       string // cached minimum, recomputed on each commit
 }
 
 // emit posts one lifecycle event to the audit trail, best-effort by
@@ -420,7 +427,8 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}
 		w.Register(target, wr, mode)
 	}
-	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() }}
+	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() },
+		committedPositions: make(map[string]string)}
 	w.OnCommit(func(b change.Batch, rows int) {
 		log.Info("commit", "table", b.Table, "rows", rows,
 			"upserts", len(b.Upserts), "deletes", len(b.Deletes), "position", b.Position)
@@ -428,6 +436,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			"table": b.Table, "rows": rows,
 			"upserts": len(b.Upserts), "deletes": len(b.Deletes), "position": b.Position,
 		})
+		r.updateCommitted(b.Table, b.Position)
 	})
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
@@ -452,6 +461,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		return nil, err
 	}
 	r.rdr = rdr
+	rdr.SetConfirmed(r.confirmedPosition)
 
 	router := newRelay(ingest, w)
 	routerDone := make(chan error, 1)
@@ -539,4 +549,39 @@ func (r *Runner) run(ctx context.Context) error {
 // target table (proof of caught-up state).
 func (r *Runner) DroppedByWindow(target string) int64 {
 	return r.w.DroppedByWindow(target)
+}
+
+// updateCommitted is called from the OnCommit callback. It stores the
+// latest committed position for a target table and recomputes the minimum
+// across all tables.
+func (r *Runner) updateCommitted(table, pos string) {
+	if pos == "" {
+		return
+	}
+	r.posMu.Lock()
+	defer r.posMu.Unlock()
+	r.committedPositions[table] = pos
+	best := ""
+	for _, p := range r.committedPositions {
+		if best == "" || p < best {
+			best = p
+		}
+	}
+	r.minCommitted = best
+}
+
+// confirmedPosition returns the minimum committed position across all
+// target tables. The Postgres reader uses this to advance the slot's
+// confirmed_flush_lsn.
+func (r *Runner) confirmedPosition() position.Position {
+	r.posMu.Lock()
+	defer r.posMu.Unlock()
+	if r.minCommitted == "" {
+		return nil
+	}
+	p, err := position.ParseLSN(r.minCommitted)
+	if err != nil {
+		return nil
+	}
+	return p
 }

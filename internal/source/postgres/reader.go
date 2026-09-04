@@ -76,6 +76,11 @@ type Reader struct {
 	mu     sync.Mutex
 	synced *position.LSN // end LSN of the last committed transaction
 
+	// confirmed is set by the pipeline: the minimum position committed to
+	// the sink across every table this reader feeds. sendStandby uses it
+	// instead of synced to avoid advancing the slot past uncommitted data.
+	confirmed func() position.Position
+
 	winMu    sync.Mutex
 	winChunk uint32
 	winOpen  bool
@@ -506,14 +511,42 @@ func (r *Reader) advanceSyncedFloor(lsn pglogrepl.LSN) {
 }
 
 // sendStandby reports the applied LSN, advancing the slot's confirmed
-// point server-side.
+// point server-side. It reports the confirmed (committed) position, not
+// the decoded position, to prevent Postgres from discarding WAL for
+// events still in flight to the sink.
 func (r *Reader) sendStandby(ctx context.Context) error {
-	r.mu.Lock()
-	cur := *r.synced
-	r.mu.Unlock()
+	cur := r.confirmedLSN()
 	return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn.PgConn(), pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: pglogrepl.LSN(cur),
 	})
+}
+
+// SetConfirmed installs the confirmed-position callback.
+func (r *Reader) SetConfirmed(f func() position.Position) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.confirmed = f
+}
+
+// confirmedLSN returns the minimum committed position across all tables,
+// or 0/0 if no commit has happened yet. Returning 0 means "don't advance"
+// — Postgres ignores retrograde updates.
+func (r *Reader) confirmedLSN() position.LSN {
+	r.mu.Lock()
+	f := r.confirmed
+	r.mu.Unlock()
+	if f == nil {
+		return 0
+	}
+	p := f()
+	if p == nil {
+		return 0
+	}
+	lsn, ok := p.(*position.LSN)
+	if !ok || lsn == nil {
+		return 0
+	}
+	return *lsn
 }
 
 func (r *Reader) currentWindow() *change.Window {
