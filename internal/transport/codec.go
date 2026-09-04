@@ -244,6 +244,30 @@ func arrowTypeToCore(dt arrow.DataType) core.ColumnType {
 		// extension metadata (fieldTypeToCore).
 		fsb := dt.(*arrow.FixedSizeBinaryType)
 		return core.ColumnType{Kind: core.KindFixedBinary, FixedSize: int(fsb.ByteWidth)}
+	case arrow.STRUCT:
+		st := dt.(*arrow.StructType)
+		ct := core.ColumnType{Kind: core.KindStruct, Fields: make([]core.Column, 0, len(st.Fields()))}
+		for _, f := range st.Fields() {
+			ft := fieldTypeToCore(f)
+			ft.Nullable = f.Nullable
+			ct.Fields = append(ct.Fields, core.Column{Name: f.Name, Type: ft})
+		}
+		return ct
+	case arrow.LIST:
+		lt := dt.(*arrow.ListType)
+		ef := lt.ElemField()
+		et := fieldTypeToCore(ef)
+		et.Nullable = ef.Nullable
+		return core.ColumnType{Kind: core.KindList, Elem: &et}
+	case arrow.MAP:
+		mt := dt.(*arrow.MapType)
+		kf := mt.KeyField()
+		vf := mt.ItemField()
+		kt := fieldTypeToCore(kf)
+		kt.Nullable = kf.Nullable
+		vt := fieldTypeToCore(vf)
+		vt.Nullable = vf.Nullable
+		return core.ColumnType{Kind: core.KindMap, KeyType: &kt, ValueType: &vt}
 	default:
 		return core.ColumnType{Kind: core.KindString} // fallback
 	}
