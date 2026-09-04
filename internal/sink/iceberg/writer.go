@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,10 +32,10 @@ var ErrCommitExhausted = errors.New("iceberg: commit retries exhausted")
 // Commit applies a collapsed batch as delete-then-append — two snapshots —
 // per the spike finding: in iceberg-go an append and an equality
 // delete staged together produce two snapshots anyway, and the delete wins,
-// so the delete must land BEFORE the fresh rows. Both snapshots carry
-// cdc.position; the table property ends at the batch position. A crash
-// between the two snapshots is safe: the resume reprocesses the batch, and
-// under upsert that is idempotent.
+// so the delete must land BEFORE the fresh rows. The position is written
+// ONLY on the final commit of the batch: append when upserts exist, delete
+// when the batch is delete-only. This prevents advancing the position past
+// uncommitted data on a crash between the two snapshots.
 //
 // A writer is NOT safe for concurrent use: commits must be serialized by the
 // caller (the worker dedicates one committer goroutine per table, which is
@@ -112,20 +114,34 @@ func (w *TableWriter) Close() error { return nil }
 
 // Commit applies the batch: snapshot one equality-deletes every key in it
 // (upserts delete their older versions, deletes are the last word), snapshot
-// two appends the surviving rows. Only then is the position considered
-// advanced. Implements sink.TableWriter; INVARIANT 2 (position last) is
-// honoured by writing the position only on the final commit of the batch.
+// two appends the surviving rows. The position is written only on the final
+// commit the batch actually executes: when there are upserts, the append is
+// last and carries the position; when the batch is delete-only, the delete
+// commit carries it. This prevents advancing the position past uncommitted
+// data on a crash between the two snapshots.
+//
 // In append mode the equality delete is skipped: every change becomes a row.
+//
+// CRASH SAFETY: a crash between commitDeletes and commitAppend leaves the
+// batch temporarily absent (old rows deleted, new rows not yet written) but
+// the position has not advanced. Resume reprocesses the batch: deletes are
+// idempotent, appends rewrite. Converges without loss.
 func (w *TableWriter) Commit(ctx context.Context, b change.Batch) error {
+	hasUpserts := len(b.Upserts) > 0
 	if b.Mode == change.UpsertMode {
 		keys := append(collectKeys(b.Upserts), collectKeys(b.Deletes)...)
 		if len(keys) > 0 {
-			if err := w.commitDeletes(ctx, keys, b.Position); err != nil {
+			// Position goes on delete only when it IS the last commit.
+			pos := ""
+			if !hasUpserts {
+				pos = b.Position
+			}
+			if err := w.commitDeletes(ctx, keys, pos); err != nil {
 				return err
 			}
 		}
 	}
-	if len(b.Upserts) > 0 {
+	if hasUpserts {
 		if err := w.commitAppend(ctx, b.Upserts, b.Position); err != nil {
 			return err
 		}
@@ -166,8 +182,10 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			}
 			return err
 		}
-		if err := txn.SetProperties(props(pos)); err != nil {
-			return err
+		if pos != "" {
+			if err := txn.SetProperties(props(pos)); err != nil {
+				return err
+			}
 		}
 		if _, err := txn.Commit(ctx); err != nil {
 			if errors.Is(err, table.ErrCommitFailed) {
@@ -259,25 +277,32 @@ func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
 	return ""
 }
 
-// EnsureTable creates the table when it does not exist. Schema derivation
-// from source types arrives with the source plugin; callers pass the schema
-// explicitly for now.
 // EnsureTable creates the target table if absent. When the table already
 // exists, every column touched by a cast rule must match the resolved type:
 // if the existing column's Iceberg type disagrees, a hard error prevents
-// silent data corruption. On first create, a PK-cast advisory is logged.
-func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema, cast core.CastPolicy) error {
+// silent data corruption. The partition spec is applied on create and
+// verified for divergence on existing tables.
+func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
 	existing, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		// Table does not exist — create.
-		_, err := cat.CreateTable(ctx, ident, schema,
-			catalog.WithProperties(iceberg.Properties{"format-version": "2"}))
+		opts := []catalog.CreateTableOpt{
+			catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
+		}
+		if len(partitionBy) > 0 {
+			spec, err := buildPartitionSpec(schema, partitionBy)
+			if err != nil {
+				return fmt.Errorf("iceberg: %v: partition spec: %w", ident, err)
+			}
+			opts = append(opts, catalog.WithPartitionSpec(&spec))
+		}
+		_, err = cat.CreateTable(ctx, ident, schema, opts...)
 		if err != nil {
 			return fmt.Errorf("iceberg: create %v: %w", ident, err)
 		}
 		return nil
 	}
-	// Table exists — verify cast divergence.
+	// Table exists — verify cast divergence and partition spec divergence.
 	existSchema := existing.Schema()
 	for colName, target := range cast.Columns {
 		newField, ok := schema.FindFieldByName(colName)
@@ -294,10 +319,27 @@ func EnsureTable(ctx context.Context, cat *rest.Catalog, ident table.Identifier,
 		}
 		_ = target // used for future PK-cast advisory
 	}
+	// Partition spec divergence: if partitionBy is specified, it must
+	// match the existing table's partition spec (single-partition-field
+	// identity/transform match).
+	if len(partitionBy) > 0 {
+		wantSpec, err := buildPartitionSpec(schema, partitionBy)
+		if err != nil {
+			return fmt.Errorf("iceberg: %v: partition spec: %w", ident, err)
+		}
+		existSpec := existing.Spec()
+		if !wantSpec.CompatibleWith(&existSpec) {
+			return fmt.Errorf("iceberg: %v: partition spec divergence: spec wants %v, table has %v — partition evolution is a deliberate maintenance operation",
+				ident, wantSpec, existSpec)
+		}
+	}
 	return nil
 }
 
 func props(pos string) iceberg.Properties {
+	if pos == "" {
+		return iceberg.Properties{}
+	}
 	return iceberg.Properties{"cdc.position": pos}
 }
 
@@ -666,4 +708,84 @@ func uuidToBytes(s string) ([]byte, error) {
 		return nil, fmt.Errorf("uuid %q: not a valid uuid", s)
 	}
 	return raw, nil
+}
+
+// ── partition spec builder ──────────────────────────────────────────
+
+// partitionExprRe matches the closed grammar of partition expressions:
+//
+//	transform(col)        — temporal transforms
+//	bucket(N, col)        — hash bucketing
+//	truncate(N, col)      — string truncation
+//	identity(col)         — passthrough (explicit)
+//
+// Unknown transforms or malformed expressions are rejected at spec
+// validation time, not in the writer.
+var partitionExprRe = regexp.MustCompile(
+	`^(?:(day|month|year|hour|identity)\((\w+)\)|(bucket|truncate)\((\d+),\s*(\w+)\))$`,
+)
+
+// buildPartitionSpec translates the closed catalog of partitionBy
+// expressions into an Iceberg PartitionSpec validated against the schema.
+// Only the transforms listed in the CR-016 closed catalog are accepted:
+// day, month, year, hour, bucket, truncate, identity.  Arbitrary expressions
+// remain out of scope.
+func buildPartitionSpec(schema *iceberg.Schema, exprs []string) (iceberg.PartitionSpec, error) {
+	if len(exprs) == 0 {
+		return *iceberg.UnpartitionedSpec, nil
+	}
+
+	var fieldID int
+	opts := make([]iceberg.PartitionOption, 0, len(exprs))
+	for _, expr := range exprs {
+		m := partitionExprRe.FindStringSubmatch(strings.TrimSpace(expr))
+		if m == nil {
+			return iceberg.PartitionSpec{}, fmt.Errorf("invalid partition expression %q: "+
+				"want transform(col), bucket(N, col), or truncate(N, col)", expr)
+		}
+
+		var (
+			transform iceberg.Transform
+			col       string
+			target    string
+		)
+
+		switch {
+		case m[1] != "":
+			// Temporal transform: day/month/year/hour(col)
+			col = m[2]
+			target = m[1] + "_" + col
+			switch m[1] {
+			case "day":
+				transform = iceberg.DayTransform{}
+			case "month":
+				transform = iceberg.MonthTransform{}
+			case "year":
+				transform = iceberg.YearTransform{}
+			case "hour":
+				transform = iceberg.HourTransform{}
+			case "identity":
+				transform = iceberg.IdentityTransform{}
+			}
+		case m[3] != "":
+			// bucket(N, col) or truncate(N, col)
+			n, err := strconv.Atoi(m[4])
+			if err != nil || n <= 0 {
+				return iceberg.PartitionSpec{}, fmt.Errorf("partition %q: bucket/truncate size must be > 0", expr)
+			}
+			col = m[5]
+			switch m[3] {
+			case "bucket":
+				target = fmt.Sprintf("bucket_%d_%s", n, col)
+				transform = iceberg.BucketTransform{NumBuckets: n}
+			case "truncate":
+				target = fmt.Sprintf("trunc_%d_%s", n, col)
+				transform = iceberg.TruncateTransform{Width: n}
+			}
+		}
+
+		opts = append(opts, iceberg.AddPartitionFieldByName(col, target, transform, schema, &fieldID))
+	}
+
+	return iceberg.NewPartitionSpecOpts(opts...)
 }
