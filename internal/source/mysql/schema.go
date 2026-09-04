@@ -36,7 +36,8 @@ func mapColumnType(col schema.TableColumn) core.ColumnType {
 		if col.IsUnsigned {
 			// BIGINT UNSIGNED overflows int64; a declared cast (e.g. to
 			// string) is the explicit way to land it.
-			return core.ColumnType{Kind: core.KindUnknown}
+			return core.ColumnType{Kind: core.KindUnknown,
+				Opaque: &core.OpaqueOrigin{TypeName: col.RawType, VendorName: "mysql"}}
 		}
 		return core.ColumnType{Kind: core.KindInt64}
 	case schema.TYPE_FLOAT:
@@ -65,8 +66,10 @@ func mapColumnType(col schema.TableColumn) core.ColumnType {
 		}
 		return core.ColumnType{Kind: core.KindBinary}
 	default:
-		// TYPE_BIT, TYPE_POINT, unknown — no canonical form; a cast is the
-		// only way to land these columns.
-		return core.ColumnType{Kind: core.KindUnknown}
+		// TYPE_BIT, TYPE_POINT, geometry, unknown — no canonical form; a
+		// cast is the only way to land these columns. The raw type name is
+		// carried so the error says what the valve is holding.
+		return core.ColumnType{Kind: core.KindUnknown,
+			Opaque: &core.OpaqueOrigin{TypeName: col.RawType, VendorName: "mysql"}}
 	}
 }

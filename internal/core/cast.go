@@ -513,6 +513,13 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 	for _, col := range src.Columns {
 		target, hasCast := p.Target(col.Name)
 		if col.Type.Kind == KindUnknown && !hasCast {
+			// The escape valve names what it is carrying when the source
+			// knew: "column location is unmappable (mysql point); declare a
+			// cast" beats a blind error that forces a guess.
+			prov := col.Type.Opaque
+			if prov != nil {
+				return Schema{}, nil, fmt.Errorf("core: column %q is unmappable (%s); declare a cast, e.g. cast: {%s: string}", col.Name, prov, col.Name)
+			}
 			return Schema{}, nil, fmt.Errorf("core: column %q has an unmappable source type; declare a cast", col.Name)
 		}
 		if !hasCast {

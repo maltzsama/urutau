@@ -165,7 +165,9 @@ func mapColumnType(col Column) core.ColumnType {
 		return core.ColumnType{Kind: core.KindBinary}
 	default:
 		// xml, inet, cidr, macaddr, interval, extensions, … — no canonical
-		// form; a cast is the only way to land these columns.
-		return core.ColumnType{Kind: core.KindUnknown}
+		// form; a cast is the only way to land these columns. The type name
+		// is carried so the validation error says what the valve is holding.
+		return core.ColumnType{Kind: core.KindUnknown,
+			Opaque: &core.OpaqueOrigin{TypeName: col.DataType, VendorName: "postgres"}}
 	}
 }

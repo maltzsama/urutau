@@ -79,13 +79,39 @@ func (k Kind) String() string {
 }
 
 // ColumnType is a canonical column type. Precision/Scale are only
-// meaningful for KindDecimal; FixedSize only for KindFixedBinary.
+// meaningful for KindDecimal; FixedSize only for KindFixedBinary; Opaque
+// only when Kind is KindUnknown.
 type ColumnType struct {
 	Kind      Kind
 	Precision int
 	Scale     int
 	FixedSize int
 	Nullable  bool
+	// Opaque records the provenance of an unmappable source type: what it
+	// was and where it came from, so the validation error and any operator
+	// looking at it know what the escape valve is carrying. Non-nil only
+	// when Kind == KindUnknown.
+	Opaque *OpaqueOrigin
+}
+
+// OpaqueOrigin names an unmappable source type and its vendor. It is the
+// provenance half of the escape valve: KindUnknown says "this has no
+// canonical form and needs an explicit cast", Opaque says what it was
+// ("geometry" from "postgres", "point" from "mysql") instead of discarding
+// that knowledge at the mapping boundary.
+type OpaqueOrigin struct {
+	TypeName   string
+	VendorName string
+}
+
+func (o *OpaqueOrigin) String() string {
+	if o == nil {
+		return ""
+	}
+	if o.VendorName != "" {
+		return o.VendorName + " " + o.TypeName
+	}
+	return o.TypeName
 }
 
 func (t ColumnType) String() string {
