@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -76,6 +75,9 @@ type tablePipeline struct {
 	// The batcher checks every incoming change to detect schema drift
 	// (ADD COLUMN, DROP COLUMN). An empty set disables the check.
 	knownColumns map[string]bool
+	// driftReported deduplicates schema-drift reports per column, so the
+	// callback fires once even when many changes carry the unknown column.
+	driftReported map[string]bool
 }
 
 // readyBatch is a collapsed batch ready for commit.
@@ -123,6 +125,7 @@ func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) 
 		readyCh:        make(chan readyBatch, 1),
 		windows:        map[uint32]map[string]change.Change{},
 		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
+		driftReported:  map[string]bool{},
 	}
 }
 
@@ -163,8 +166,10 @@ func (w *Worker) DroppedByWindow(target string) int64 {
 
 // SetSnapshotState sets the snapshot progress for a target table. The
 // batcher includes this state in every batch commit so it is persisted
-// atomically with position. When snapshot completes, the bloom filter is
-// released to free memory.
+// atomically with position. Snapshot completion releases the bloom filter
+// to free memory; a later transition back to in_progress (a second
+// snapshot run in the same process) recreates it, so the batcher never
+// dereferences a nil guard.
 func (w *Worker) SetSnapshotState(target string, state string, pending []uint32) {
 	p := w.tables[target]
 	if p == nil {
@@ -174,8 +179,13 @@ func (w *Worker) SetSnapshotState(target string, state string, pending []uint32)
 	defer p.snapshotMu.Unlock()
 	p.snapshotState = state
 	p.snapshotPending = pending
-	if state == string(snapshot.StateComplete) {
+	switch state {
+	case string(snapshot.StateComplete):
 		p.bootstrapGuard = nil
+	case string(snapshot.StateInProgress):
+		if p.bootstrapGuard == nil {
+			p.bootstrapGuard = bloom.NewWithEstimates(100_000, 0.01)
+		}
 	}
 }
 
@@ -329,12 +339,20 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					rest = append(rest, c)
 				}
 			}
-			// Send untouched as append-only batch (no equality delete).
+			// The position travels only on the LAST commit: when an upsert
+			// batch follows, the append batch advances nothing — otherwise a
+			// crash between the two commits would resume past the not-yet-
+			// committed live events. When there is no upsert batch, the
+			// append is the last commit and carries the position.
+			appendPos := pos
+			if len(rest) > 0 {
+				appendPos = ""
+			}
 			if len(untouched) > 0 {
 				ab := change.Batch{
 					Table:    p.target,
 					Upserts:  untouched,
-					Position: pos,
+					Position: appendPos,
 					Mode:     change.AppendMode,
 				}
 				p.snapshotMu.Lock()
@@ -418,18 +436,18 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			if !ok {
 				return flush()
 			}
-			// Schema drift detection: check if the change contains columns
-			// not known at introspection time.
-			if len(p.knownColumns) > 0 && c.After != nil {
-				for col := range c.After {
-					if !p.knownColumns[col] && !strings.HasPrefix(col, "_") {
-						if w.schemaDrift != nil {
-							w.schemaDrift(SchemaDrift{Table: p.target, Column: col, Kind: "added"})
-						}
-						// Pause: do not buffer this change.
-						continue
-					}
+			// A live event during the snapshot marks its PK as touched:
+			// the snapshot row for that key must take the safe upsert path,
+			// never a pure append. The DBLog window only deduplicates events
+			// that arrive while the covering chunk is open — events that
+			// landed before their chunk was read would otherwise duplicate
+			// the row. Closes markers carry no key and skip this.
+			if !c.Snapshot && c.Key != nil {
+				p.snapshotMu.Lock()
+				if p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil {
+					p.bootstrapGuard.AddString(change.KeyString(c.Key))
 				}
+				p.snapshotMu.Unlock()
 			}
 			// DBLog window application, design 3.4: an InWindow event is itself a
 			// real change — it removes its snapshot row from the owning
@@ -463,6 +481,28 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					continue // the Closes marker is not a data row
 				}
 				p.winMu.Unlock()
+			}
+			// Schema drift: a column that appears in the data but was not
+			// known at introspection means the source schema moved under the
+			// pipeline. Writing the row would corrupt the target (unknown
+			// column) or silently drop data, so the change is refused and
+			// the pipeline stops — restart only after the spec declares the
+			// column. Reported once per column; `_`-prefixed metadata
+			// columns never appear in After and are not special-cased here.
+			if len(p.knownColumns) > 0 && c.After != nil {
+				for col := range c.After {
+					if p.knownColumns[col] {
+						continue
+					}
+					p.snapshotMu.Lock()
+					first := !p.driftReported[col]
+					p.driftReported[col] = true
+					p.snapshotMu.Unlock()
+					if first && w.schemaDrift != nil {
+						w.schemaDrift(SchemaDrift{Table: p.target, Column: col, Kind: "added"})
+					}
+					return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, col)
+				}
 			}
 			buf = append(buf, c)
 			if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
