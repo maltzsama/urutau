@@ -11,18 +11,19 @@ import (
 // current table property was dropped by a third-party replace snapshot, the
 // position still comes back from the newest snapshot summary (design §2.2).
 func TestWalkBackPosition(t *testing.T) {
-	// Newest snapshot has no property (a compaction replace); the one behind
-	// it carries cdc.position.
+	// Snapshots arrive chronologically (oldest first) — the order iceberg-go
+	// keeps them in. The NEWEST snapshot has no property (a compaction
+	// replace); the one behind it carries cdc.position.
 	snaps := []table.Snapshot{
-		{SnapshotID: 30, Summary: &table.Summary{Operation: table.OpReplace}},
-		{SnapshotID: 20, Summary: &table.Summary{
-			Operation:  table.OpAppend,
-			Properties: iceberg.Properties{"cdc.position": "gtid:1-20"},
-		}},
 		{SnapshotID: 10, Summary: &table.Summary{
 			Operation:  table.OpAppend,
 			Properties: iceberg.Properties{"cdc.position": "gtid:1-10"},
 		}},
+		{SnapshotID: 20, Summary: &table.Summary{
+			Operation:  table.OpAppend,
+			Properties: iceberg.Properties{"cdc.position": "gtid:1-20"},
+		}},
+		{SnapshotID: 30, Summary: &table.Summary{Operation: table.OpReplace}},
 	}
 
 	// Property present: fast path, no walk.

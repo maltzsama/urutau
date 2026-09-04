@@ -506,7 +506,12 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 		if w := CastWarning(col.Type.Kind, target); w != "" {
 			warns = append(warns, Warning{Message: fmt.Sprintf("core: column %q: %s", col.Name, w)})
 		}
-		out.Columns = append(out.Columns, Column{Name: col.Name, Type: target.Type})
+		// The cast changes the type, never the nullability: a nullable
+		// source column must stay nullable in the sink schema, or a
+		// legitimate NULL would violate the typed Arrow schema downstream.
+		tt := target.Type
+		tt.Nullable = col.Type.Nullable
+		out.Columns = append(out.Columns, Column{Name: col.Name, Type: tt})
 	}
 	return out, warns, nil
 }

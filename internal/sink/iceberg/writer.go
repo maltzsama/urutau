@@ -317,13 +317,17 @@ func committedPosition(tbl *table.Table) string {
 }
 
 // walkBackPosition finds cdc.position in the table properties, else walks
-// the snapshot summaries newest-first (Snapshots() is newest-first). Pure,
-// for tests.
+// the snapshot summaries newest-first. iceberg-go keeps snapshots in
+// chronological order (oldest first), so the walk starts at the last
+// element and scans backwards — a forward walk would return the OLDEST
+// position after a compaction drops the table property and rewind the
+// pipeline across a large amount of already-applied history. Pure, for
+// tests.
 func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
 	if pos := props["cdc.position"]; pos != "" {
 		return pos
 	}
-	for i := range snaps {
+	for i := len(snaps) - 1; i >= 0; i-- {
 		if snaps[i].Summary == nil {
 			continue
 		}

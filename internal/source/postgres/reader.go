@@ -353,7 +353,16 @@ func (r *Reader) handleXLogData(ctx context.Context, xld pglogrepl.XLogData) err
 			return err
 		}
 	case msgCommit:
-		return r.handleCommit(ctx, xld.WALStart+pglogrepl.LSN(len(xld.WALData)))
+		commit := &pglogrepl.CommitMessage{}
+		if err := commit.Decode(body); err != nil {
+			return fmt.Errorf("postgres: commit: %w", err)
+		}
+		// CommitLSN is the authoritative end of the transaction. The
+		// transport LSN (WALStart + len(WALData)) is only the end of the
+		// bytes received — using it as the commit position makes the
+		// synced watermark drift from pg_current_wal_lsn, which the
+		// caught-up proof compares against.
+		return r.handleCommit(ctx, commit.CommitLSN)
 	case msgTruncate:
 		r.cfg.Logger.Warn("postgres: truncate received; ignored (not part of the scalar milestone)")
 	default:

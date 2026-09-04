@@ -217,3 +217,33 @@ func TestResolveSchemaDuplicateMetadata(t *testing.T) {
 		t.Error("ResolveSchema should error on duplicate metadata as")
 	}
 }
+
+// A cast changes the type, never the nullability: a nullable source column
+// that is cast must stay nullable in the resolved schema, or a legitimate
+// NULL would violate the typed Arrow schema downstream.
+func TestResolveSchemaCastPreservesNullable(t *testing.T) {
+	src := Schema{Columns: []Column{
+		{Name: "id", Type: ColumnType{Kind: KindInt64, Nullable: false}},
+		{Name: "note", Type: ColumnType{Kind: KindInt64, Nullable: true}},
+	}}
+	p, err := ParseCastPolicy(map[string]string{"note": "string"})
+	if err != nil {
+		t.Fatalf("cast policy: %v", err)
+	}
+	resolved, _, err := p.Resolve(src)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	for _, c := range resolved.Columns {
+		switch c.Name {
+		case "id":
+			if c.Type.Kind != KindInt64 || c.Type.Nullable {
+				t.Fatalf("id = %+v, want non-nullable int64", c.Type)
+			}
+		case "note":
+			if c.Type.Kind != KindString || !c.Type.Nullable {
+				t.Fatalf("note = %+v, want nullable string (cast changed kind, kept nullability)", c.Type)
+			}
+		}
+	}
+}

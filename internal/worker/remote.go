@@ -257,6 +257,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	}
 
 	recv := &batchReceiver{
+		ctx:       sessCtx,
 		w:         w,
 		ingest:    ingest,
 		committed: committed,
@@ -410,12 +411,26 @@ func dialOpts() []grpc.DialOption {
 // analysis case 4): a batch whose high position is at or before the
 // committed position was already applied by an earlier run.
 type batchReceiver struct {
+	ctx       context.Context
 	w         *Worker
 	ingest    chan<- change.Change
 	committed map[string]position.Position // target table → committed
 	parsePos  func(string) (position.Position, error)
 	pkByTable map[string][]string // target table → primary key columns
 	log       *slog.Logger
+}
+
+// sendIngest delivers one change into the pipeline, aborting when the
+// session ends. A bare send could block forever if the worker's internal
+// pipeline has already died — the session would then hang in its teardown
+// wait instead of exiting with the pipeline error.
+func (r *batchReceiver) sendIngest(c change.Change) error {
+	select {
+	case r.ingest <- c:
+		return nil
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
 }
 
 // covered reports whether a positioned batch was already committed. Batches
@@ -469,10 +484,12 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 			return err
 		}
 	case meta.Window != nil && meta.Window.Closes:
-		r.ingest <- change.Change{
+		if err := r.sendIngest(change.Change{
 			Table:    meta.Table,
 			Position: meta.LowPos,
 			Window:   &change.Window{Closes: true, ChunkID: meta.Window.ChunkId},
+		}); err != nil {
+			return err
 		}
 	default:
 		var win *change.Window
@@ -481,7 +498,9 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		}
 		for i := range rows {
 			rows[i].Window = win
-			r.ingest <- rows[i]
+			if err := r.sendIngest(rows[i]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
