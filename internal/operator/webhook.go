@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -82,6 +83,14 @@ func validatePipeline(obj runtime.Object) error {
 		}
 		if err := s.Validate(); err != nil {
 			return fmt.Errorf("spec.definition.inline: %w", err)
+		}
+		// The known kinds/types come from the driver registry, not a
+		// hardcoded list — a spec must name a registered driver.
+		if _, err := driver.CapsForKind(s.Source.Kind); err != nil {
+			return fmt.Errorf("spec.definition.inline: %w", err)
+		}
+		if !driver.SinkTypeExists(s.Sink.Type) {
+			return fmt.Errorf("spec.definition.inline: sink.type: unknown sink type %q", s.Sink.Type)
 		}
 	}
 
