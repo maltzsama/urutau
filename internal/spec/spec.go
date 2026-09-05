@@ -50,9 +50,13 @@ type Source struct {
 	PartitionedByPrimaryKey bool `json:"partitionedByPrimaryKey,omitempty"`
 	// Format selects the Kafka message decoder: "debezium" (default) parses
 	// the envelope into typed rows; "raw" lands the payload verbatim
-	// without interpreting it (bronze landing). Raw requires append-only
-	// tables.
+	// without interpreting it (bronze landing); "avro" decodes
+	// Confluent-Avro records resolved by schema id from the registry. Raw
+	// and avro require append-only tables.
 	Format string `json:"format,omitempty"`
+	// SchemaRegistry is the Confluent-compatible schema registry base URL
+	// (e.g. http://registry:8081), required when format is avro.
+	SchemaRegistry string `json:"schemaRegistry,omitempty"`
 }
 
 type Sink struct {

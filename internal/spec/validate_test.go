@@ -324,3 +324,25 @@ func TestValidateAppendIdempotent(t *testing.T) {
 		t.Fatalf("want transport-metadata problem, got %v", err)
 	}
 }
+
+// format avro requires kafka + a schema registry URL.
+func TestValidateAvroFormat(t *testing.T) {
+	s := validSpec()
+	s.Source.Kind = "kafka"
+	s.Tables[0].WriteMode = WriteModeAppend
+	s.Tables[0].OnDelete = OnDeleteSkip
+	s.Tables[0].Columns = map[string]string{"payload": "string"}
+	s.Source.Format = "avro"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "schemaRegistry") {
+		t.Fatalf("want schemaRegistry problem, got %v", err)
+	}
+	s.Source.SchemaRegistry = "http://registry:8081"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("avro with registry must validate: %v", err)
+	}
+	// avro on a non-kafka source is rejected.
+	s.Source.Kind = "mysql"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "avro") {
+		t.Fatalf("want avro-kind problem, got %v", err)
+	}
+}

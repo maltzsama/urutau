@@ -192,8 +192,15 @@ func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []snapshot.TableR
 	}
 
 	dec := decoder.Decoder(&decoder.DebeziumJSON{})
-	if s.Spec.Source.Format == "raw" {
+	switch s.Spec.Source.Format {
+	case "raw":
 		dec = &decoder.Raw{}
+	case "avro":
+		if s.Spec.Source.SchemaRegistry == "" {
+			client.Close()
+			return nil, fmt.Errorf("kafka: source.schemaRegistry required when format is avro")
+		}
+		dec = decoder.NewAvroDecoder(decoder.NewHTTPRegistry(s.Spec.Source.SchemaRegistry))
 	}
 
 	r := &Reader{
