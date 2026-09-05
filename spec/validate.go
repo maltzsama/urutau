@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 var (

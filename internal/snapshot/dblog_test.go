@@ -8,8 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 )
 
 const testUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
@@ -35,7 +36,7 @@ func (f *fakeSource) Bounds(ctx context.Context) ([][]any, error) {
 	return bounds, nil
 }
 
-func (f *fakeSource) Scan(ctx context.Context, ch Chunk, fn func(map[string]any) error) error {
+func (f *fakeSource) Scan(ctx context.Context, ch source.Chunk, fn func(map[string]any) error) error {
 	for _, row := range f.rows {
 		id := row["id"].(int64)
 		if ch.Low != nil && id < ch.Low[0].(int64) {
@@ -141,7 +142,7 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 		t.Fatalf("marks/clears = %d/%d, want 3/3 (one window per chunk)", reader.marks, reader.clears)
 	}
 
-	// Window rows: inserts keyed by id. Chunk 0's rows carry the
+	// Window rows: inserts keyed by id. source.Chunk 0's rows carry the
 	// pre-snapshot low watermark; later chunks read an already-converged
 	// synced position.
 	for chunkID, rows := range relay.rows {
@@ -192,7 +193,7 @@ func TestSnapshotTableWithLSNPositions(t *testing.T) {
 	if relay.relPos[0] != "0/20" || relay.relPos[1] != "0/20" {
 		t.Fatalf("releases at %v, want caught-up 0/20", relay.relPos)
 	}
-	// Chunk 0 rows carry the early watermark; chunk 1 rows the converged one.
+	// source.Chunk 0 rows carry the early watermark; chunk 1 rows the converged one.
 	if relay.rows[0][0].Position != "0/10" {
 		t.Errorf("chunk 0 position = %q, want 0/10", relay.rows[0][0].Position)
 	}

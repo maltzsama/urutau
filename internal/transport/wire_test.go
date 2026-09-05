@@ -6,7 +6,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // The assignment schema round trip must preserve every canonical kind —

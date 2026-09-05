@@ -6,8 +6,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 

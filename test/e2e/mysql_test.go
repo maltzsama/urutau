@@ -13,7 +13,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/runner"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // TestMySQLPipeline drives the real stack: MySQL binlog → DBLog snapshot →

@@ -7,7 +7,7 @@
 package decoder
 
 import (
-	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/change"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 

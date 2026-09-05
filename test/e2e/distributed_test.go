@@ -15,8 +15,9 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/maltzsama/urutau/internal/coordinator"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
+	"github.com/maltzsama/urutau/sink"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // TestDistributedPipeline runs the split architecture end to end over real
@@ -97,6 +98,19 @@ func sinkConfig() icebergsink.Config {
 	}
 }
 
+// workerSink renders the neutral sink config the distributed worker consumes.
+func workerSink() sink.Config {
+	return sink.Config{
+		URI: env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog"),
+		Options: map[string]string{
+			"warehouse":     env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog"),
+			"client_id":     "root",
+			"client_secret": "s3cr3t",
+			"scope":         "PRINCIPAL_ROLE:ALL",
+		},
+	}
+}
+
 // dropIcebergNamed drops a target table from the catalog.
 func dropIcebergNamed(t *testing.T, ctx context.Context, target string) {
 	t.Helper()
@@ -139,7 +153,7 @@ func TestWorkerSuicide(t *testing.T) {
 	wErr := make(chan error, 1)
 	cErr := make(chan error, 1)
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second})
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second})
 	}()
 	go func() {
 		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
@@ -207,7 +221,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 	// buffer (not committed by a timer) when the shutdown signal arrives;
 	// the drain must commit it.
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 10000, MaxInterval: 30 * time.Second})
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 10000, MaxInterval: 30 * time.Second})
 	}()
 	go func() {
 		// AckTimeout generous: this test exercises the drain, not
@@ -260,7 +274,7 @@ func bootPipeline(t *testing.T, ctx context.Context, addr string, s *spec.Spec, 
 				Coordinator: addr,
 				Name:        name,
 				Namespace:   "raw",
-				Sink:        sinkConfig(),
+				Sink:        workerSink(),
 				MaxRows:     100,
 				MaxInterval: 2 * time.Second,
 			})
@@ -508,7 +522,7 @@ func TestCrashloopKillsJob(t *testing.T) {
 	cErr := make(chan error, 1)
 	wErr := make(chan error, 1)
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: true})
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: true})
 	}()
 	// Aggressive supervision: stale after 5s, only 2 resets allowed, 1m window.
 	go func() {
@@ -570,7 +584,7 @@ func TestObservabilityEndpoints(t *testing.T) {
 	defer wStop()
 	cCtx, cStop := context.WithCancel(ctx)
 	go func() {
-		_ = worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
+		_ = worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
 	}()
 	go func() {
 		_ = coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, MetricsAddr: metricsAddr, AckTimeout: 2 * time.Minute})
@@ -659,7 +673,7 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 		t.Cleanup(wStop)
 		wErr := make(chan error, 1)
 		go func() {
-			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: sinkConfig(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: fault})
+			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: fault})
 		}()
 		return wErr
 	}

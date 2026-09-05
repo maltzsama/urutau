@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 )
 
 // Transport metadata projects the message-queue envelope for a kafka event.

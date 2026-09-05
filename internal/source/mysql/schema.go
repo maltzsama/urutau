@@ -3,7 +3,7 @@ package mysql
 import (
 	"github.com/go-mysql-org/go-mysql/schema"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // CanonicalSchema derives the canonical core.Schema from the canal table

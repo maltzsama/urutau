@@ -9,8 +9,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
+	_ "github.com/maltzsama/urutau/internal/builtin"
 	"github.com/maltzsama/urutau/internal/worker"
+	"github.com/maltzsama/urutau/sink"
 )
 
 func main() {
@@ -41,12 +42,14 @@ func main() {
 				Coordinator: coordinator,
 				Name:        name,
 				Namespace:   namespace,
-				Sink: icebergsink.Config{
-					URI:          catalogURI,
-					Warehouse:    warehouse,
-					ClientID:     clientID,
-					ClientSecret: clientSecret,
-					Scope:        scope,
+				Sink: sink.Config{
+					URI: catalogURI,
+					Options: map[string]string{
+						"warehouse":     warehouse,
+						"client_id":     clientID,
+						"client_secret": clientSecret,
+						"scope":         scope,
+					},
 				},
 				MaxRows:     maxRows,
 				MaxInterval: maxInterval,

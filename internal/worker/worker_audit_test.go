@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
-	"github.com/maltzsama/urutau/internal/sink"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/sink"
 )
 
 // snapChange builds a snapshot row (chunk SELECT result).

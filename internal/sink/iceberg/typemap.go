@@ -5,7 +5,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // FromCanonical maps a canonical core.Schema into an Iceberg schema. This is

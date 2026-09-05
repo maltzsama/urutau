@@ -13,7 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // EncodeTableSchema serializes the table's data columns as an Arrow IPC

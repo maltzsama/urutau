@@ -8,7 +8,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // Extension metadata carried on wire fields. UUID and fixed(16) are both

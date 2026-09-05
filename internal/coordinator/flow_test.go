@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/position"
 )
 
 func TestFlowBudgetBlocksOverCeiling(t *testing.T) {

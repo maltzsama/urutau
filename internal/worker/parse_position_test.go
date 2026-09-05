@@ -3,7 +3,7 @@ package worker
 import (
 	"testing"
 
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/position"
 )
 
 // Each source kind must parse its own position format back. Kafka is the

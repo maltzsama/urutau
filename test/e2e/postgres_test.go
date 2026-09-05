@@ -11,7 +11,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/maltzsama/urutau/internal/runner"
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // TestPostgresPipeline drives the second source end to end: Postgres

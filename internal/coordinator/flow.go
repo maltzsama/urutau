@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/position"
 )
 
 // flowBudget is the coordinator's global in-flight budget (design §5.4.1):

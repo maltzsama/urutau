@@ -24,22 +24,21 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/apache/iceberg-go/table"
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
-	"github.com/maltzsama/urutau/internal/drivers"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/observability"
-	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/sink"
+	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -104,10 +103,11 @@ type Coordinator struct {
 	cfg Config
 	log *slog.Logger
 
-	reg       *drivers.Registry
+	src       source.Source
+	qsrc      source.QuerySource
 	qdb       *sql.DB
-	refs      []snapshot.TableRef
-	cat       catalog.Catalog
+	refs      []source.TableRef
+	snk       sink.Sink
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
 	// Worker registry: groups resolved at boot from the spec, one queue and
@@ -160,7 +160,7 @@ type Coordinator struct {
 // Flight queue, and — once it connects — its control surface.
 type workerState struct {
 	name   string
-	refs   []snapshot.TableRef
+	refs   []source.TableRef
 	queue  chan queuedBatch
 	ticket []byte
 
@@ -239,7 +239,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
-	reg, err := drivers.New(c.cfg.Spec, drivers.Runtime{
+	src, err := driver.OpenSource(c.cfg.Spec, source.Runtime{
 		ServerID:  c.cfg.ServerID,
 		Heartbeat: c.cfg.Heartbeat,
 		Logger:    c.log,
@@ -247,30 +247,33 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.src = src
+	qsrc, ok := src.(source.QuerySource)
+	if !ok {
+		return fmt.Errorf("coordinator: source %q has no SQL query surface", c.cfg.Spec.Source.Kind)
+	}
+	c.qsrc = qsrc
 	// The parallel-chunk setting may not exceed the ceiling the source
 	// driver declares — fail fast at boot, not mid-snapshot.
-	if err := drivers.ValidateParallelism(c.cfg.Spec.Source.Kind, c.cfg.MaxParallelChunks); err != nil {
+	if err := driver.ValidateParallelism(c.cfg.Spec.Source.Kind, c.cfg.MaxParallelChunks); err != nil {
 		return fmt.Errorf("coordinator: %w", err)
 	}
-	c.reg = reg
 
-	qdb, err := reg.OpenQuery(ctx)
+	qdb, err := qsrc.OpenQuery(ctx)
 	if err != nil {
 		return fmt.Errorf("coordinator: open query db: %w", err)
 	}
 	defer func() { closeQueryDB(qdb) }()
 	c.qdb = qdb
 
-	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
-	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
+	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
 	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, cs, is, _, err := reg.Introspect(ctx, qdb, t)
+		ref, cs, _, err := src.Introspect(ctx, qdb, t)
 		if err != nil {
 			return err
 		}
 		refs = append(refs, ref)
-		schemas[t.Source] = is
 		canonical[t.Source] = cs
 	}
 	c.refs = refs
@@ -312,22 +315,19 @@ func (c *Coordinator) run(ctx context.Context) error {
 		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
 	}
 
-	// Catalog + tables: the coordinator owns DDL.
-	cat, err := drivers.NewCatalog(ctx, c.cfg.Spec)
+	// Sink + tables: the coordinator owns DDL.
+	snk, err := driver.OpenSink(ctx, c.cfg.Spec)
 	if err != nil {
 		return fmt.Errorf("coordinator: catalog: %w", err)
 	}
-	c.cat = cat
-	if err := drivers.EnsureNamespace(ctx, cat, table.Identifier{c.cfg.Spec.Sink.Namespace}); err != nil {
-		return err
-	}
+	c.snk = snk
 	for _, ref := range refs {
-		if err := drivers.EnsureTable(ctx, cat, drivers.TargetIdent(c.cfg.Spec, ref.Target), schemas[ref.Source], nil, core.CastPolicy{}); err != nil {
+		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], nil, core.CastPolicy{}); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
 
-	resume, needsSnapshot, err := c.resumeFrom(ctx, reg, refs)
+	resume, needsSnapshot, err := c.resumeFrom(ctx, refs)
 	if err != nil {
 		return err
 	}
@@ -374,7 +374,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.
 	out := make(chan change.Change, 1024)
-	rdr, err := reg.NewReader(ctx, qdb, refs, out)
+	rdr, err := c.src.NewReader(ctx, qdb, refs, out)
 	if err != nil {
 		return err
 	}
@@ -386,7 +386,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	start := resume
 	if start == nil {
-		m, err := reg.InitialPosition(ctx, qdb)
+		m, err := c.src.InitialPosition(ctx, qdb)
 		if err != nil {
 			return fmt.Errorf("coordinator: initial position: %w", err)
 		}
@@ -409,7 +409,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 			c.log.Warn("coordinator: eventlog emit", "err", err)
 		}
-		chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
+		chunker, err := c.qsrc.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 		if err != nil {
 			return err
 		}
@@ -653,7 +653,7 @@ func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID 
 // caught-up, then releases the gated live events InWindow-tagged and the
 // Closes marker. The worker holds the chunk rows in its window; the window
 // is what InWindow events drain and the Closes marker flushes.
-func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceReader, chunker snapshot.ChunkSource, ref snapshot.TableRef, cfg snapshot.SnapshotConfig) error {
+func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
 	bounds, err := chunker.Bounds(ctx)
 	if err != nil {
 		return err
@@ -769,7 +769,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, me
 	}
 	var high position.Position
 	if posStr != "" {
-		high, err = c.reg.ParsePosition(posStr)
+		high, err = c.src.ParsePosition(posStr)
 		if err != nil {
 			c.budget.release(w.name, n)
 			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
@@ -809,7 +809,7 @@ func (c *Coordinator) onHello(worker string, h *pb.Hello) {
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.noteAck(worker, time.Now())
-	pos, err := c.reg.ParsePosition(ack.Position)
+	pos, err := c.src.ParsePosition(ack.Position)
 	if err != nil {
 		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
 		return
@@ -873,16 +873,16 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
 // is the resume point, tables without one need the snapshot.
-func (c *Coordinator) resumeFrom(ctx context.Context, reg *drivers.Registry, refs []snapshot.TableRef) (position.Position, []snapshot.TableRef, error) {
+func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (position.Position, []source.TableRef, error) {
 	var positions []position.Position
-	var needsSnapshot []snapshot.TableRef
+	var needsSnapshot []source.TableRef
 	for _, ref := range refs {
-		pos, err := drivers.CommittedPosition(ctx, c.cat, drivers.TargetIdent(c.cfg.Spec, ref.Target))
+		pos, err := c.snk.Position(ctx, ref)
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
 		}
 		if pos != "" {
-			p, err := reg.ParsePosition(pos)
+			p, err := c.src.ParsePosition(pos)
 			if err != nil {
 				return nil, nil, fmt.Errorf("coordinator: %s cdc.position %q: %w", ref.Target, pos, err)
 			}
@@ -1154,7 +1154,7 @@ func randSuffix(n int) string {
 }
 
 // tableNames renders a group's source tables for the audit trail.
-func tableNames(refs []snapshot.TableRef) []string {
+func tableNames(refs []source.TableRef) []string {
 	out := make([]string, len(refs))
 	for i, r := range refs {
 		out[i] = r.Source

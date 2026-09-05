@@ -7,8 +7,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 )
 
 // testWriter builds a TableWriter directly with hand-constructed arrow

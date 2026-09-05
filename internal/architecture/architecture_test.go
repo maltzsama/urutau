@@ -1,8 +1,9 @@
 // Package architecture enforces the dependency walls at test time.
 // It checks the DIRECT imports of the contract packages: a wall leaks the
 // moment a package imports the other side. `go list -deps` (transitive) is
-// too strict — the runner legitimately depends on drivers, which know the
-// implementations.
+// too strict — the orchestration legitimately depends on the driver registry,
+// which is populated by the concrete implementations only through blank
+// imports in the binaries.
 package architecture
 
 import (
@@ -33,11 +34,14 @@ func TestSourcesNeverKnowSinks(t *testing.T) {
 	for _, pkg := range []string{
 		"github.com/maltzsama/urutau/internal/source/mysql",
 		"github.com/maltzsama/urutau/internal/source/postgres",
+		"github.com/maltzsama/urutau/internal/source/kafka",
 		"github.com/maltzsama/urutau/internal/snapshot",
 	} {
 		d := directImports(t, pkg)
 		for imp := range d {
-			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/sink") || imp == "github.com/apache/iceberg-go" {
+			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/sink") ||
+				strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/sink") ||
+				strings.HasPrefix(imp, "github.com/apache/iceberg-go") {
 				t.Errorf("%s imports %s — sources map to core.Schema", pkg, imp)
 			}
 		}
@@ -49,39 +53,52 @@ func TestSourcesNeverKnowSinks(t *testing.T) {
 func TestSinksNeverKnowSources(t *testing.T) {
 	d := directImports(t, "github.com/maltzsama/urutau/internal/sink/iceberg")
 	for imp := range d {
-		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source") ||
+		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/source") ||
+			strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source") ||
 			strings.HasPrefix(imp, "github.com/go-mysql-org/go-mysql") {
 			t.Errorf("internal/sink/iceberg imports %s — sinks consume core.Schema", imp)
 		}
 	}
 }
 
-// TestRunnerConsumesInterfaces: the runner must not directly import the
-// concrete source or sink implementations (acceptance §7).
-func TestRunnerConsumesInterfaces(t *testing.T) {
-	d := directImports(t, "github.com/maltzsama/urutau/internal/runner")
-	for imp := range d {
-		if imp == "github.com/maltzsama/urutau/internal/source/mysql" ||
-			imp == "github.com/maltzsama/urutau/internal/sink/iceberg" ||
-			imp == "github.com/maltzsama/urutau/internal/adapter" {
-			t.Errorf("internal/runner imports %s — consume drivers/interfaces instead", imp)
+// TestOrchestrationConsumesContracts: runner, coordinator and worker consume
+// only the source/sink/driver contracts — never a concrete source or sink,
+// and never iceberg-go.
+func TestOrchestrationConsumesContracts(t *testing.T) {
+	for _, pkg := range []string{
+		"github.com/maltzsama/urutau/internal/runner",
+		"github.com/maltzsama/urutau/internal/coordinator",
+		"github.com/maltzsama/urutau/internal/worker",
+	} {
+		d := directImports(t, pkg)
+		for imp := range d {
+			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source") ||
+				strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/sink") ||
+				strings.HasPrefix(imp, "github.com/apache/iceberg-go") {
+				t.Errorf("%s imports %s — consume the source/sink/driver contracts", pkg, imp)
+			}
 		}
 	}
 }
 
-// TestAdapterIsContractsOnly: the adapter must not directly import any
-// concrete source or sink implementation — it holds contracts and the type
-// aliases only. The assembly (the switch that names the sources) lives in
-// internal/drivers. source/types is exempt: it carries the shared contract
-// types (Runtime, Capabilities, StreamSource), not an implementation.
-func TestAdapterIsContractsOnly(t *testing.T) {
-	d := directImports(t, "github.com/maltzsama/urutau/internal/adapter")
-	for imp := range d {
-		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source/") && imp != "github.com/maltzsama/urutau/internal/source/types" {
-			t.Errorf("internal/adapter imports %s — resolve implementations in drivers", imp)
-		}
-		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/sink/") {
-			t.Errorf("internal/adapter imports %s — sinks consume core.Schema via drivers", imp)
+// TestContractsArePluginSafe: the public contract packages must not import
+// anything under internal/ — an external plugin imports these contracts and
+// must not transitively pull the engine internals.
+func TestContractsArePluginSafe(t *testing.T) {
+	for _, pkg := range []string{
+		"github.com/maltzsama/urutau/source",
+		"github.com/maltzsama/urutau/sink",
+		"github.com/maltzsama/urutau/driver",
+		"github.com/maltzsama/urutau/core",
+		"github.com/maltzsama/urutau/change",
+		"github.com/maltzsama/urutau/position",
+		"github.com/maltzsama/urutau/spec",
+	} {
+		d := directImports(t, pkg)
+		for imp := range d {
+			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/") {
+				t.Errorf("%s imports %s — contracts must stay free of engine internals", pkg, imp)
+			}
 		}
 	}
 }

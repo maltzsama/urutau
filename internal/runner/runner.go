@@ -13,19 +13,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/catalog"
-	"github.com/apache/iceberg-go/table"
-
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
-	"github.com/maltzsama/urutau/internal/drivers"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/eventlog"
-	"github.com/maltzsama/urutau/internal/position"
-	"github.com/maltzsama/urutau/internal/sink"
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
+	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/sink"
+	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // Config carries the runtime knobs for a local run.
@@ -45,9 +42,6 @@ type Config struct {
 	// (lifecycle + commit events). Nil disables the trail.
 	Eventlog *eventlog.Config
 	Logger   *slog.Logger
-	// Drivers, when set, is the source/sink driver assembly to use; nil
-	// resolves the default registry from the spec (local mode).
-	Drivers *drivers.Registry
 }
 
 // Run executes the collapsed pipeline for a validated spec until ctx is
@@ -248,16 +242,16 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 
 // ── Positions and catalog ────────────────────────────────────────────
 
-func resumeFrom(ctx context.Context, reg *drivers.Registry, cat catalog.Catalog, s *spec.Spec, refs []core.TableRef) (position.Position, []core.TableRef, error) {
+func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []core.TableRef) (position.Position, []core.TableRef, error) {
 	var positions []position.Position
 	var needsSnapshot []core.TableRef
 	for _, ref := range refs {
-		pos, err := drivers.CommittedPosition(ctx, cat, drivers.TargetIdent(s, ref.Target))
+		pos, err := snk.Position(ctx, ref)
 		if err != nil {
 			return nil, nil, fmt.Errorf("runner: %s: %w", ref.Target, err)
 		}
 		if pos != "" {
-			p, err := reg.ParsePosition(pos)
+			p, err := src.ParsePosition(pos)
 			if err != nil {
 				return nil, nil, fmt.Errorf("runner: %s cdc.position %q: %w", ref.Target, pos, err)
 			}
@@ -272,14 +266,14 @@ func resumeFrom(ctx context.Context, reg *drivers.Registry, cat catalog.Catalog,
 	return position.Min(positions), needsSnapshot, nil
 }
 
-// readSnapshotProgress reads the snapshot state from Iceberg table properties.
-func readSnapshotProgress(ctx context.Context, cat catalog.Catalog, ident table.Identifier) (*snapshot.SnapshotProgress, error) {
-	tbl, err := cat.LoadTable(ctx, ident)
+// readSnapshotProgress reads the snapshot state from the sink's table
+// properties.
+func readSnapshotProgress(ctx context.Context, snk sink.Sink, ref core.TableRef) (*snapshot.SnapshotProgress, error) {
+	props, err := snk.Properties(ctx, ref)
 	if err != nil {
-		// Table does not exist yet — treat as not started.
-		return &snapshot.SnapshotProgress{State: snapshot.StateNotStarted}, nil
+		return nil, err
 	}
-	return snapshot.ReadSnapshotProgress(tbl.Properties())
+	return snapshot.ReadSnapshotProgress(props)
 }
 
 // canonicalForTarget returns the canonical schema for one target table (the
@@ -293,27 +287,25 @@ func canonicalForTarget(canonical map[string]core.Schema, refs []core.TableRef, 
 	return core.Schema{}
 }
 
-// introspectAll resolves each spec table through the registry, so the
-// pipeline knows the PK (equality key) and the resolved target shape before
-// writing anything. The canonical schema carries the declared cast and
-// metadata columns; the Iceberg schema is derived from it.
-func introspectAll(ctx context.Context, reg *drivers.Registry, qdb *sql.DB, s *spec.Spec, logger *slog.Logger) ([]core.TableRef, map[string]*iceberg.Schema, map[string]core.Schema, error) {
+// introspectAll resolves each spec table through the source, so the pipeline
+// knows the PK (equality key) and the resolved canonical shape before writing
+// anything. The canonical schema carries the declared cast and metadata
+// columns; the target schema is the sink's concern.
+func introspectAll(ctx context.Context, src source.Source, qdb *sql.DB, s *spec.Spec, logger *slog.Logger) ([]core.TableRef, map[string]core.Schema, error) {
 	refs := make([]core.TableRef, 0, len(s.Tables))
-	schemas := make(map[string]*iceberg.Schema, len(s.Tables))
 	canonical := make(map[string]core.Schema, len(s.Tables))
 	for _, t := range s.Tables {
-		ref, cs, is, warns, err := reg.Introspect(ctx, qdb, t)
+		ref, cs, warns, err := src.Introspect(ctx, qdb, t)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 		for _, w := range warns {
 			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
 		}
 		refs = append(refs, ref)
-		schemas[t.Source] = is
 		canonical[t.Source] = cs
 	}
-	return refs, schemas, canonical, nil
+	return refs, canonical, nil
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
@@ -331,7 +323,7 @@ type Runner struct {
 	w                                *worker.Worker
 	log                              *slog.Logger
 	ev                               *eventlog.Run
-	rdr                              drivers.StreamSource
+	rdr                              source.StreamSource
 	closeQuery                       func()
 	streamErr, workerErr, routerDone <-chan error
 
@@ -385,44 +377,48 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}()
 	}
 
-	reg := cfg.Drivers
-	if reg == nil {
-		reg, err = drivers.New(s, drivers.Runtime{
-			ServerID:  cfg.ServerID,
-			Heartbeat: cfg.Heartbeat,
-			Logger:    log,
-		})
-		if err != nil {
-			return nil, err
-		}
+	// Open the source and sink through the driver registry — the runner
+	// consumes only the contracts, never a concrete implementation.
+	src, err := driver.OpenSource(s, source.Runtime{
+		ServerID:  cfg.ServerID,
+		Heartbeat: cfg.Heartbeat,
+		Logger:    log,
+	})
+	if err != nil {
+		return nil, err
 	}
+	snk, err := driver.OpenSink(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if r == nil {
+			_ = snk.Close()
+		}
+	}()
 	// The parallel-chunk setting may not exceed the ceiling the source
 	// driver declares — fail fast at boot, not mid-snapshot.
-	if err := drivers.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
+	if err := driver.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
 		return nil, fmt.Errorf("runner: %w", err)
 	}
 
 	// One query connection for chunk SELECTs, schema introspection, and the
-	// position queries (caught-up proof, slot state).
-	qdb, err := reg.OpenQuery(ctx)
+	// position queries (caught-up proof, slot state). A stream source
+	// (kafka) has no SQL surface.
+	qsrc, ok := src.(source.QuerySource)
+	if !ok {
+		return nil, fmt.Errorf("runner: source %q has no SQL query surface", s.Source.Kind)
+	}
+	qdb, err := qsrc.OpenQuery(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("runner: open query db: %w", err)
 	}
 
-	// Resolve source tables and their Iceberg schemas. The canonical
+	// Resolve source tables and their canonical schemas. The canonical
 	// schemas also feed the schema-drift check: the batcher compares every
 	// change against the column set known at introspection time.
-	refs, schemas, canonical, err := introspectAll(ctx, reg, qdb, s, log)
+	refs, canonical, err := introspectAll(ctx, src, qdb, s, log)
 	if err != nil {
-		return nil, err
-	}
-
-	// Catalog + writers, ensuring tables exist.
-	cat, err := drivers.NewCatalog(ctx, s)
-	if err != nil {
-		return nil, fmt.Errorf("runner: catalog: %w", err)
-	}
-	if err := drivers.EnsureNamespace(ctx, cat, table.Identifier{s.Sink.Namespace}); err != nil {
 		return nil, err
 	}
 
@@ -434,15 +430,15 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		specByTarget[t.Target] = t
 	}
 
+	// Writers, ensuring tables exist through the sink.
 	writers := make(map[string]sink.TableWriter, len(refs))
 	for _, ref := range refs {
-		ident := drivers.TargetIdent(s, ref.Target)
 		t := specBySource[ref.Source]
 		cast, _ := core.ParseCastPolicy(t.Cast)
-		if err := drivers.EnsureTable(ctx, cat, ident, schemas[ref.Source], t.PartitionBy, cast); err != nil {
+		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], t.PartitionBy, cast); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
-		wr, err := drivers.NewTableWriter(ctx, cat, ident, ref.PrimaryKey, cast, t.Metadata, t.Source)
+		wr, err := snk.Writer(ctx, ref, cast, t.Metadata)
 		if err != nil {
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
 		}
@@ -495,7 +491,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			"upserts": len(b.Upserts), "deletes": len(b.Deletes), "position": b.Position,
 		})
 		// A garbage position string never advances the confirmed point.
-		p, err := reg.ParsePosition(b.Position)
+		p, err := src.ParsePosition(b.Position)
 		if err != nil {
 			log.Warn("runner: commit position parse", "table", b.Table, "position", b.Position, "err", err)
 			return
@@ -505,7 +501,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
 
-	resume, needsSnapshot, err := resumeFrom(ctx, reg, cat, s, refs)
+	resume, needsSnapshot, err := resumeFrom(ctx, src, snk, refs)
 	if err != nil {
 		closeQueryDB(qdb)
 		return nil, err
@@ -519,7 +515,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	// constructor also performs the source's server-side setup (Postgres
 	// slot and publication).
 	out := make(chan change.Change, 1024)
-	rdr, err := reg.NewReader(ctx, qdb, refs, out)
+	rdr, err := src.NewReader(ctx, qdb, refs, out)
 	if err != nil {
 		closeQueryDB(qdb)
 		return nil, err
@@ -541,7 +537,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}
 		bootstrapByTarget[t.Target] = *t.Bootstrap
 		if t.Bootstrap.StartAt == spec.StartAtExplicit && t.Bootstrap.Position != "" {
-			p, err := reg.ParsePosition(t.Bootstrap.Position)
+			p, err := src.ParsePosition(t.Bootstrap.Position)
 			if err != nil {
 				closeQueryDB(qdb)
 				return nil, fmt.Errorf("runner: %s bootstrap.position %q: %w", t.Target, t.Bootstrap.Position, err)
@@ -558,7 +554,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		start = position.Min(explicitPositions)
 	}
 	if start == nil {
-		if m, err := reg.InitialPosition(ctx, qdb); err != nil {
+		if m, err := src.InitialPosition(ctx, qdb); err != nil {
 			return nil, fmt.Errorf("runner: initial position: %w", err)
 		} else {
 			start = m
@@ -570,7 +566,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 
 	// Snapshot phase: DBLog for tables with no committed position. Skip
 	// when the source does not support snapshot (e.g. Kafka).
-	caps := reg.Caps()
+	caps, _ := driver.CapsForKind(s.Source.Kind)
 	if caps.Snapshot {
 		for _, ref := range needsSnapshot {
 			bootstrapMode := spec.BootstrapSnapshot
@@ -589,7 +585,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
 					State: snapshot.StateComplete,
 				})
-				if err := drivers.SetTableProperties(ctx, cat, drivers.TargetIdent(s, ref.Target), props); err != nil {
+				if err := snk.SetProperties(ctx, ref, props); err != nil {
 					rdr.Close()
 					closeQueryDB(qdb)
 					return nil, fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
@@ -603,14 +599,14 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				// Snapshot: load all data from source.
 				log.Info("snapshot", "table", ref.Source)
 				r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
-				chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
+				chunker, err := qsrc.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
 				if err != nil {
 					rdr.Close()
 					closeQueryDB(qdb)
 					return nil, err
 				}
 				// Read existing snapshot progress for resumable backfill.
-				progress, err := readSnapshotProgress(ctx, cat, drivers.TargetIdent(s, ref.Target))
+				progress, err := readSnapshotProgress(ctx, snk, ref)
 				if err != nil {
 					rdr.Close()
 					closeQueryDB(qdb)
@@ -634,7 +630,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 					CaughtUpPoll:  cfg.CaughtUpPoll,
 					Progress:      progress,
 					Persist: func(sp snapshot.SnapshotProgress) error {
-						return drivers.SetTableProperties(ctx, cat, drivers.TargetIdent(s, ref.Target), snapshot.EncodeSnapshotProgress(&sp))
+						return snk.SetProperties(ctx, ref, snapshot.EncodeSnapshotProgress(&sp))
 					},
 				}, func(table string, completedChunkID uint32, remaining []uint32) {
 					w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)

@@ -5,7 +5,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // TestFromCanonicalRoundTrip maps a canonical schema into Iceberg and back

@@ -3,7 +3,7 @@ package coordinator
 import (
 	"testing"
 
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/position"
 )
 
 // The confirmed position reported to the source must use the position's own

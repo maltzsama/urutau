@@ -9,9 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 
+	_ "github.com/maltzsama/urutau/internal/builtin"
 	"github.com/maltzsama/urutau/internal/coordinator"
 	"github.com/maltzsama/urutau/internal/eventlog"
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 func main() {

@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // SetupWebhookWithManager registers the validating webhook.
