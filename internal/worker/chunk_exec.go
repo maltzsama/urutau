@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/adapter"
 	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/source/mysql"
 	"github.com/maltzsama/urutau/internal/source/postgres"
@@ -54,7 +54,7 @@ func (x *chunkExecutor) queryDB(ctx context.Context) (*sql.DB, error) {
 	if x.db != nil {
 		return x.db, nil
 	}
-	db, err := adapter.OpenQueryDB(x.kind, x.dsn)
+	db, err := drivers.OpenQueryDB(x.kind, x.dsn)
 	if err != nil {
 		return nil, err
 	}

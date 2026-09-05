@@ -1,8 +1,8 @@
 // Package drivers wires the concrete source and sink implementations into
 // the pipeline. It is the ONLY package (besides cmd/) that knows
-// source/mysql, source/postgres and sink/iceberg — runner and coordinator
-// consume the Registry through its interface surface and stay free of the
-// implementations.
+// source/mysql, source/postgres, source/kafka and sink/iceberg — runner and
+// coordinator consume the Registry through its interface surface and stay
+// free of the implementations.
 package drivers
 
 import (
@@ -45,7 +45,7 @@ type Registry struct {
 
 // New resolves the source adapter for the spec's source kind.
 func New(s *spec.Spec, rt Runtime) (*Registry, error) {
-	adapt, err := adapter.For(s, adapter.Runtime(rt))
+	adapt, err := forSource(s, adapter.Runtime(rt))
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +61,7 @@ func (r *Registry) Caps() adapter.Capabilities { return r.adapt.Caps() }
 // CapsForKind returns a source kind's capabilities without a full spec.
 // Used by admission validation to enforce driver-declared resource ceilings.
 func CapsForKind(kind string) (adapter.Capabilities, error) {
-	return adapter.CapsForKind(kind)
+	return capsForKind(kind)
 }
 
 // ValidateParallelism rejects a parallel-chunk setting above the ceiling the
@@ -72,7 +72,7 @@ func ValidateParallelism(kind string, maxParallelChunks int) error {
 	if maxParallelChunks <= 0 {
 		return nil
 	}
-	caps, err := adapter.CapsForKind(kind)
+	caps, err := capsForKind(kind)
 	if err != nil {
 		return err
 	}
@@ -101,7 +101,7 @@ func (r *Registry) OpenQuery(ctx context.Context) (*sql.DB, error) {
 
 // OpenQueryDB opens a query connection for a kind+uri (remote workers).
 func OpenQueryDB(kind, uri string) (*sql.DB, error) {
-	return adapter.OpenQueryDB(kind, uri)
+	return openQueryDB(kind, uri)
 }
 
 // Introspect resolves one spec table into its ref, the resolved canonical
