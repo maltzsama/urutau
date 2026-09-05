@@ -48,12 +48,20 @@ func (s *Spec) Validate() error {
 	// Decoder format: raw is a message-log landing mode (kafka only) and it
 	// has no upsert semantics — every message is an insert.
 	switch s.Source.Format {
-	case "", "debezium", "raw":
+	case "", "debezium", "raw", "avro":
 	default:
-		problems = append(problems, fmt.Sprintf("source.format: unsupported %q (want debezium | raw)", s.Source.Format))
+		problems = append(problems, fmt.Sprintf("source.format: unsupported %q (want debezium | raw | avro)", s.Source.Format))
 	}
 	if s.Source.Format == "raw" && s.Source.Kind != "kafka" {
 		problems = append(problems, "source.format: raw is only valid for kind kafka")
+	}
+	if s.Source.Format == "avro" {
+		if s.Source.Kind != "kafka" {
+			problems = append(problems, "source.format: avro is only valid for kind kafka")
+		}
+		if s.Source.SchemaRegistry == "" {
+			problems = append(problems, "source.schemaRegistry: required when format is avro (Confluent-compatible registry base URL)")
+		}
 	}
 	if s.Source.URI == "" {
 		problems = append(problems, "source.uri: required")
@@ -105,6 +113,14 @@ func (s *Spec) Validate() error {
 		case mode == WriteModeUpsert:
 			if len(tbl.PrimaryKey) == 0 {
 				problems = append(problems, p+".primaryKey: required when writeMode is upsert")
+			}
+			for _, pk := range tbl.PrimaryKey {
+				// An equality delete must encode the key as a comparable
+				// scalar. A path into a nested field (address.city) has no
+				// such encoding; promote the field to a top-level column.
+				if strings.Contains(pk, ".") {
+					problems = append(problems, p+".primaryKey: "+pk+" points into a nested field — primary keys must be top-level scalar columns (promote the field to a column if that is the intent)")
+				}
 			}
 		case isAppend:
 			if tbl.Filter != nil && !tbl.FilterImmutable {
