@@ -73,6 +73,13 @@ func (s *Spec) Validate() error {
 	if s.Sink.Namespace == "" {
 		problems = append(problems, "sink.namespace: required")
 	}
+	switch s.Sink.Type {
+	case "":
+		s.Sink.Type = "iceberg+rest" // the default sink
+	case "iceberg+rest":
+	default:
+		problems = append(problems, fmt.Sprintf("sink.type: unsupported %q (want iceberg+rest)", s.Sink.Type))
+	}
 
 	if len(s.Tables) == 0 {
 		problems = append(problems, "tables: at least one required")

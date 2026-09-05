@@ -14,7 +14,7 @@ All code, comments, and documentation in this repository are **English**.
 
 ## Architecture
 
-Sources and sinks are decoupled behind **contracts** (CR-012): a canonical type system (`internal/core`) crosses the source↔sink boundary, so N sources × M sinks cost N+M type mappings instead of N×M. The DBLog snapshot orchestrator is source-agnostic (`internal/snapshot`); concrete drivers are registered in `internal/drivers`, which is the only place that knows the implementations.
+Sources and sinks are decoupled behind **public contracts** at the module root (`source`, `sink`, `driver`, `core`, `change`, `position`, `spec`): a canonical type system (`core`) crosses the source↔sink boundary, so N sources × M sinks cost N+M type mappings instead of N×M. The DBLog snapshot orchestrator is source-agnostic (`internal/snapshot`); each concrete driver is self-contained and registers itself with the driver registry (`driver`) from `init()` — the orchestration (`runner`/`coordinator`/`worker`) consumes only the contracts, never a concrete implementation. `internal/builtin` blank-imports the built-in drivers; a third-party driver registers the same way from its own module (see [`docs/plugins.md`](docs/plugins.md)).
 
 ```mermaid
 flowchart TB
@@ -32,7 +32,7 @@ flowchart TB
         ICE["sink/iceberg"]
     end
 
-    DRV["drivers — registration, assembled in cmd/"]
+    DRV["driver — registry (self-registration via init)"]
     RUN["runner / coordinator — consume interfaces only"]
 
     CORE --- SRC & SNK & SNAP & WRK & STD
@@ -52,25 +52,26 @@ The dependency walls are enforced by a test (`internal/architecture`) that check
 | `cmd/coordinator` | coordinator binary (reader, router, supervisor, Flight) |
 | `cmd/worker` | worker binary (Iceberg writer, Flight consumer) |
 | `cmd/operator` | Kubernetes operator (CRD reconciler + webhook) |
-| `internal/core` | canonical type system (`Kind`, `Schema`, `TableRef`), cast policy, metadata catalog |
-| `internal/source` | source contracts (`Source`, `Introspector`, `Chunker`, `Driver`) |
-| `internal/source/types` | shared source types (`Capabilities`, `Runtime`, `StreamSource`) |
-| `internal/sink` | sink contracts (`Sink`, `TableWriter` with commit invariants) |
+| `core` | canonical type system (`Kind`, `Schema`, `TableRef`), cast policy, metadata catalog |
+| `source` | source contract (`Source`, `Reader`, `ChunkSource`, `Capabilities`, `Runtime`, `Chunk`) |
+| `sink` | sink contract (`Sink`, `TableWriter` with commit invariants, `Config`) |
+| `driver` | the driver registry — `RegisterSource`/`RegisterSink`, resolved by kind/type |
+| `change` | row change event, per-key collapse, batch, write mode |
+| `position` | position contract (GTID/LSN/Kafka offsets, `Compare`/`Contains`) |
+| `spec` | resolvedSpec + single server-side validation (metadata, cast, columns) |
+| `internal/builtin` | blank-imports the built-in drivers so their `init()` registers them |
 | `internal/snapshot` | generic DBLog orchestrator (chunk + caught-up proof) |
 | `internal/source/mysql` | MySQL source (`go-mysql`/canal, GTID) |
 | `internal/source/postgres` | Postgres source (`pgx`, pgoutput, LSN slot) |
 | `internal/source/kafka` | Kafka source (franz-go, manual partition assignment, debezium-json) |
 | `internal/source/kafka/decoder` | Kafka message decoders (debezium-json envelope) |
 | `internal/sink/iceberg` | Iceberg writes (upsert/equality delete, `FromCanonical`, cast projection) |
-| `internal/drivers` | driver registry — the only place that knows implementations |
 | `internal/coordinator` | reader/router loops, flow budget, supervisor, control plane |
 | `internal/worker` | per-table batcher + serialized committer (sink-agnostic, append/upsert mode) |
-| `internal/spec` | resolvedSpec + single server-side validation (metadata, cast, columns) |
-| `internal/change` | row change event, per-key collapse, batch, write mode |
-| `internal/position` | position contract (GTID/LSN/Kafka offsets, `Compare`/`Contains`) |
 | `internal/transport` | gRPC control + Arrow Flight; generated in `internal/transport/pb` |
 | `internal/eventlog` | per-run-id JSONL audit trail in S3 |
 | `internal/observability` | lean Prometheus metrics + live `/statusz` |
+| `test/plugin` | reference external driver (a source + sink written against only the public contracts) |
 | `api/v1alpha1` | CDCPipeline CR types |
 | `config/` | CRD + RBAC manifests |
 | `proto/` | coordinator↔worker wire contract |
@@ -102,7 +103,7 @@ All verified through Trino. Key finding: in `iceberg-go` v0.6.0 an append and an
 
 ## Status
 
-- **Sources:** MySQL (`go-mysql`/canal, GTID, heartbeat), Postgres (`pgx`, pgoutput, LSN slot), and **Kafka** (franz-go, manual partition assignment, debezium-json decoder) — one replication reader per source, mapped to the canonical type system. Kafka sources report `Caps().Snapshot=false`; the runner skips DBLog and streams directly from the committed offset.
+- **Sources:** MySQL (`go-mysql`/canal, GTID, heartbeat), Postgres (`pgx`, pgoutput, LSN slot), and **Kafka** (franz-go, manual partition assignment, debezium-json decoder) — one replication reader per source, mapped to the canonical type system. Kafka registers `Capabilities{Stream: true}` (no snapshot); the runner skips DBLog and streams directly from the committed offset.
 - **Metadata columns:** closed catalog of pipeline metadata (`op`, `commit_ts`, `ingest_ts`, `position`, `source_table`, `phase`) landed as nullable columns at the end of the canonical schema. Declared per-table in the spec via `metadata`.
 - **Per-column cast:** explicit type overrides (`cast` map on `spec.Table`) with a closed matrix — widening always, `to-string` always, narrowing/parsing never except explicit temporal reinterpretations (`timestamptz(assume_utc)`). Unmappable source types (unsigned, geometry) map to `KindUnknown` and bypass the cast.
 - **DBLog snapshot:** generic in `internal/snapshot` — chunk by PK, low/high watermarks, and the caught-up proof that closes each window (never a timer; `windowTimeout` is a pathology detector). Skipped for sources without snapshot capability (Kafka).
