@@ -46,10 +46,9 @@ func (s Source) Caps() srctypes.Capabilities {
 	}
 }
 
-// OpenQuery returns nil — Kafka has no SQL query connection.
-func (s Source) OpenQuery(_ context.Context) (*sql.DB, error) {
-	return nil, nil
-}
+// OpenQuery is intentionally absent: Kafka has no SQL query connection, and
+// the Source interface no longer carries a SQL surface — that lives on
+// QuerySource, which only relational sources implement.
 
 // Introspect resolves one spec table into its ref and schema. Kafka has
 // no SQL introspection; the schema comes from the spec's Columns map.
@@ -160,11 +159,6 @@ func mapColumnType(ct core.ColumnType) (iceberg.Type, error) {
 	default:
 		return nil, fmt.Errorf("kafka: unsupported column type %s", ct.Kind)
 	}
-}
-
-// NewChunker is not supported for Kafka.
-func (s Source) NewChunker(_ *sql.DB, _, _ string, _ int) (snapshot.ChunkSource, error) {
-	return nil, fmt.Errorf("kafka: chunking not supported")
 }
 
 // NewReader builds the Kafka consumer. It subscribes to the topics

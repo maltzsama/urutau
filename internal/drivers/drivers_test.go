@@ -1,6 +1,11 @@
 package drivers
 
-import "testing"
+import (
+	"log/slog"
+	"testing"
+
+	"github.com/maltzsama/urutau/internal/spec"
+)
 
 func TestCapsForKind(t *testing.T) {
 	for _, kind := range []string{"mysql", "postgres", "kafka"} {
@@ -36,5 +41,29 @@ func TestValidateParallelism(t *testing.T) {
 	// Unknown kind surfaces the adapter error.
 	if err := ValidateParallelism("oracle", 4); err == nil {
 		t.Error("ValidateParallelism(oracle, 4) = nil, want unsupported kind")
+	}
+}
+
+// The SQL surface is a capability only relational sources have: kafka must
+// not be forced to implement OpenQuery/NewChunker, and the registry reports
+// whether the source has a query surface instead of stubbing it.
+func TestRegistrySupportsQueryBySource(t *testing.T) {
+	cases := []struct {
+		kind string
+		want bool
+	}{
+		{"mysql", true},
+		{"postgres", true},
+		{"kafka", false},
+	}
+	for _, tc := range cases {
+		s := &spec.Spec{Source: spec.Source{Kind: tc.kind}}
+		r, err := New(s, Runtime{Logger: slog.New(slog.DiscardHandler)})
+		if err != nil {
+			t.Fatalf("New(%s): %v", tc.kind, err)
+		}
+		if got := r.SupportsQuery(); got != tc.want {
+			t.Errorf("SupportsQuery(%s) = %v, want %v", tc.kind, got, tc.want)
+		}
 	}
 }
