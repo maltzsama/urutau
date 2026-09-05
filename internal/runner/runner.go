@@ -5,7 +5,6 @@ package runner
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -291,11 +290,11 @@ func canonicalForTarget(canonical map[string]core.Schema, refs []core.TableRef, 
 // knows the PK (equality key) and the resolved canonical shape before writing
 // anything. The canonical schema carries the declared cast and metadata
 // columns; the target schema is the sink's concern.
-func introspectAll(ctx context.Context, src source.Source, qdb *sql.DB, s *spec.Spec, logger *slog.Logger) ([]core.TableRef, map[string]core.Schema, error) {
+func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) ([]core.TableRef, map[string]core.Schema, error) {
 	refs := make([]core.TableRef, 0, len(s.Tables))
 	canonical := make(map[string]core.Schema, len(s.Tables))
 	for _, t := range s.Tables {
-		ref, cs, warns, err := src.Introspect(ctx, qdb, t)
+		ref, cs, warns, err := src.Introspect(ctx, t)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -323,7 +322,7 @@ type Runner struct {
 	w                                *worker.Worker
 	log                              *slog.Logger
 	ev                               *eventlog.Run
-	rdr                              source.StreamSource
+	rdr                              source.Reader
 	closeQuery                       func()
 	streamErr, workerErr, routerDone <-chan error
 
@@ -402,22 +401,20 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		return nil, fmt.Errorf("runner: %w", err)
 	}
 
-	// One query connection for chunk SELECTs, schema introspection, and the
-	// position queries (caught-up proof, slot state). A stream source
-	// (kafka) has no SQL surface.
-	qsrc, ok := src.(source.QuerySource)
-	if !ok {
-		return nil, fmt.Errorf("runner: source %q has no SQL query surface", s.Source.Kind)
-	}
-	qdb, err := qsrc.OpenQuery(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("runner: open query db: %w", err)
+	// The SQL surface (chunked snapshot SELECTs) is optional: a stream source
+	// (kafka) has no query connection. The source owns that connection; the
+	// runner only releases it on shutdown.
+	qsrc, _ := src.(source.QuerySource)
+	closeQuery := func() {
+		if qsrc != nil {
+			_ = qsrc.CloseQuery()
+		}
 	}
 
 	// Resolve source tables and their canonical schemas. The canonical
 	// schemas also feed the schema-drift check: the batcher compares every
 	// change against the column set known at introspection time.
-	refs, canonical, err := introspectAll(ctx, src, qdb, s, log)
+	refs, canonical, err := introspectAll(ctx, src, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -467,7 +464,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			w.SetKnownSchema(target, cs)
 		}
 	}
-	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { closeQueryDB(qdb) },
+	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() {
+		if qsrc != nil {
+			_ = qsrc.CloseQuery()
+		}
+	},
 		committedPositions: make(map[string]position.Position)}
 	w.OnSchemaDrift(func(d worker.SchemaDrift) {
 		log.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
@@ -503,7 +504,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 
 	resume, needsSnapshot, err := resumeFrom(ctx, src, snk, refs)
 	if err != nil {
-		closeQueryDB(qdb)
+		closeQuery()
 		return nil, err
 	}
 	log.Info("resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
@@ -514,18 +515,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	// Reader (one replication connection) → relay → ingest. The reader
 	// constructor also performs the source's server-side setup (Postgres
 	// slot and publication).
-	out := make(chan change.Change, 1024)
-	rdr, err := src.NewReader(ctx, qdb, refs, out)
+	rdr, err := src.Open(ctx, refs)
 	if err != nil {
-		closeQueryDB(qdb)
+		closeQuery()
 		return nil, err
 	}
 	r.rdr = rdr
 	rdr.SetConfirmed(r.confirmedPosition)
-
-	router := newRelay(ingest, w)
-	routerDone := make(chan error, 1)
-	go func() { routerDone <- router.run(ctx, out) }()
 
 	// Per-table bootstrap config, resolved once: the stream start below and
 	// the snapshot loop both consult it.
@@ -539,7 +535,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		if t.Bootstrap.StartAt == spec.StartAtExplicit && t.Bootstrap.Position != "" {
 			p, err := src.ParsePosition(t.Bootstrap.Position)
 			if err != nil {
-				closeQueryDB(qdb)
+				closeQuery()
 				return nil, fmt.Errorf("runner: %s bootstrap.position %q: %w", t.Target, t.Bootstrap.Position, err)
 			}
 			explicitPositions = append(explicitPositions, p)
@@ -554,15 +550,19 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		start = position.Min(explicitPositions)
 	}
 	if start == nil {
-		if m, err := src.InitialPosition(ctx, qdb); err != nil {
+		if m, err := src.InitialPosition(ctx); err != nil {
 			return nil, fmt.Errorf("runner: initial position: %w", err)
 		} else {
 			start = m
 		}
 	}
 
-	streamErr := make(chan error, 1)
-	go func() { streamErr <- rdr.Start(ctx, start) }()
+	// Stream: the reader emits changes on a channel the relay consumes; the
+	// terminal-error channel surfaces a dead stream.
+	ch, streamErr := rdr.Stream(ctx, start)
+	router := newRelay(ingest, w)
+	routerDone := make(chan error, 1)
+	go func() { routerDone <- router.run(ctx, ch) }()
 
 	// Snapshot phase: DBLog for tables with no committed position. Skip
 	// when the source does not support snapshot (e.g. Kafka).
@@ -587,7 +587,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				})
 				if err := snk.SetProperties(ctx, ref, props); err != nil {
 					rdr.Close()
-					closeQueryDB(qdb)
+					closeQuery()
 					return nil, fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
 				}
 				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
@@ -599,17 +599,17 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				// Snapshot: load all data from source.
 				log.Info("snapshot", "table", ref.Source)
 				r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
-				chunker, err := qsrc.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
+				chunker, err := qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
 				if err != nil {
 					rdr.Close()
-					closeQueryDB(qdb)
+					closeQuery()
 					return nil, err
 				}
 				// Read existing snapshot progress for resumable backfill.
 				progress, err := readSnapshotProgress(ctx, snk, ref)
 				if err != nil {
 					rdr.Close()
-					closeQueryDB(qdb)
+					closeQuery()
 					return nil, fmt.Errorf("runner: snapshot progress %s: %w", ref.Target, err)
 				}
 				if progress.State == snapshot.StateInProgress {
@@ -636,7 +636,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 					w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)
 				}); err != nil {
 					rdr.Close()
-					closeQueryDB(qdb)
+					closeQuery()
 					return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
 				}
 				// Snapshot complete: mark on the worker.
@@ -723,13 +723,4 @@ func (r *Runner) confirmedPosition() position.Position {
 	r.posMu.Lock()
 	defer r.posMu.Unlock()
 	return r.minConfirmed
-}
-
-// closeQueryDB closes the source query connection, tolerating a nil handle:
-// a source without SQL (kafka) returns (nil, nil) from OpenQuery, and Close on
-// a nil *sql.DB would dereference the zero receiver and panic at shutdown.
-func closeQueryDB(qdb *sql.DB) {
-	if qdb != nil {
-		_ = qdb.Close()
-	}
 }

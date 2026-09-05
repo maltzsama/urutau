@@ -27,7 +27,7 @@ func TestIntrospectDeterministicColumnOrder(t *testing.T) {
 
 	var first []string
 	for i := 0; i < 20; i++ {
-		_, cs, _, err := s.Introspect(context.Background(), nil, tbl)
+		_, cs, _, err := s.Introspect(context.Background(), tbl)
 		if err != nil {
 			t.Fatalf("introspect %d: %v", i, err)
 		}

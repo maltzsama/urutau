@@ -31,16 +31,15 @@ func (s *Spec) Validate() error {
 		problems = append(problems, "pipeline: required")
 	}
 
-	switch s.Source.Kind {
-	case "mysql", "postgres":
-	case "kafka":
-		if s.Source.SnapshotMode != "" && s.Source.SnapshotMode != "none" {
-			problems = append(problems, "source.snapshotMode: must be \"none\" for kafka")
-		}
-	case "":
-		problems = append(problems, "source.kind: required (mysql | postgres | kafka)")
-	default:
-		problems = append(problems, fmt.Sprintf("source.kind: unsupported %q", s.Source.Kind))
+	// source.kind is validated by the driver registry (admission webhook +
+	// driver.OpenSource at boot), not here: the set of known kinds is the set
+	// of registered drivers, and spec must stay open to future sources. Here
+	// we check only that a kind is present and the kafka-specific shape.
+	if s.Source.Kind == "" {
+		problems = append(problems, "source.kind: required")
+	}
+	if s.Source.Kind == "kafka" && s.Source.SnapshotMode != "" && s.Source.SnapshotMode != "none" {
+		problems = append(problems, "source.snapshotMode: must be \"none\" for kafka")
 	}
 	if s.Source.Kind == "postgres" && s.Source.SlotName == "" {
 		problems = append(problems, "source.slotName: required for postgres (logical replication slot)")
@@ -72,6 +71,11 @@ func (s *Spec) Validate() error {
 	}
 	if s.Sink.Namespace == "" {
 		problems = append(problems, "sink.namespace: required")
+	}
+	// sink.type is validated by the driver registry (admission webhook +
+	// driver.OpenSink at boot), not here. We only normalize the default.
+	if s.Sink.Type == "" {
+		s.Sink.Type = "iceberg+rest" // the default sink
 	}
 
 	if len(s.Tables) == 0 {

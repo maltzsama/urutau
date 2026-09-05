@@ -102,3 +102,16 @@ func TestContractsArePluginSafe(t *testing.T) {
 		}
 	}
 }
+
+// TestPluginPackageImportsOnlyContracts: the reference plugin (test/plugin)
+// implements a source and sink using only the public contracts — no
+// internal/ import. This is the CI-locked proof that a driver can be written
+// outside the engine.
+func TestPluginPackageImportsOnlyContracts(t *testing.T) {
+	d := directImports(t, "github.com/maltzsama/urutau/test/plugin")
+	for imp := range d {
+		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/") {
+			t.Errorf("test/plugin imports %s — a driver must use only the public contracts", imp)
+		}
+	}
+}

@@ -23,6 +23,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	_ "github.com/maltzsama/urutau/internal/builtin"
 )
 
 var (

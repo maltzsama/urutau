@@ -84,6 +84,18 @@ func CapsForKind(kind string) (source.Capabilities, error) {
 	return entry.caps, nil
 }
 
+// SinkTypeExists reports whether a sink type is registered. An empty type
+// resolves to the default sink. Used by admission validation.
+func SinkTypeExists(scheme string) bool {
+	if scheme == "" {
+		scheme = DefaultSinkType
+	}
+	reg.mu.RLock()
+	_, ok := reg.sinks[scheme]
+	reg.mu.RUnlock()
+	return ok
+}
+
 // OpenSink resolves and instantiates a sink for a spec's sink section.
 func OpenSink(ctx context.Context, s *spec.Spec) (sink.Sink, error) {
 	return OpenSinkConfig(ctx, SinkConfig(s))

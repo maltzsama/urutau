@@ -7,7 +7,6 @@ package kafka
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -58,7 +57,7 @@ var _ source.Source = Source{}
 
 // Introspect resolves one spec table into its ref and schema. Kafka has
 // no SQL introspection; the schema comes from the spec's Columns map.
-func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
+func (s Source) Introspect(_ context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
 	if len(t.Columns) == 0 {
 		return core.TableRef{}, core.Schema{}, nil,
 			fmt.Errorf("kafka: table %q requires columns in spec", t.Source)
@@ -115,7 +114,7 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 // derived from the spec tables and produces changes to the output
 // channel. No consumer group is used — the consumer manages its own
 // offsets.
-func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []source.TableRef, out chan<- change.Change) (source.StreamSource, error) {
+func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader, error) {
 	refBySource := make(map[string]source.TableRef, len(refs))
 	topics := make([]string, 0, len(refs))
 	for _, ref := range refs {
@@ -150,7 +149,7 @@ func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []source.TableRef
 	r := &Reader{
 		client:      client,
 		dec:         dec,
-		out:         out,
+		out:         make(chan change.Change, 1024),
 		logger:      s.Rt.Logger,
 		refBySource: refBySource,
 		synced:      &position.Offsets{},
@@ -160,7 +159,7 @@ func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []source.TableRef
 
 // InitialPosition returns an empty offset — Kafka consumers start from
 // the committed position or the beginning.
-func (s Source) InitialPosition(_ context.Context, _ *sql.DB) (position.Position, error) {
+func (s Source) InitialPosition(_ context.Context) (position.Position, error) {
 	return &position.Offsets{}, nil
 }
 
@@ -171,12 +170,12 @@ func (s Source) ParsePosition(pos string) (position.Position, error) {
 
 // ── Reader ─────────────────────────────────────────────────────────
 
-// Reader implements StreamSource for Kafka: it consumes records,
+// Reader implements source.Reader for Kafka: it consumes records,
 // decodes them, and feeds changes to the output channel.
 type Reader struct {
 	client *kgo.Client
 	dec    decoder.Decoder
-	out    chan<- change.Change
+	out    chan change.Change
 	logger *slog.Logger
 	// refBySource resolves a decoded source (envelope source or topic) to
 	// its full table mapping, so the change is addressed by its TARGET —
@@ -209,9 +208,17 @@ func (r *Reader) OpenWindow(_ context.Context, _ uint32) {}
 // ClearWindow is a no-op for Kafka.
 func (r *Reader) ClearWindow() {}
 
-// Start begins consuming from Kafka, blocking until ctx is cancelled
-// or the client is closed.
-func (r *Reader) Start(ctx context.Context, _ position.Position) error {
+// Stream begins consuming from Kafka, emitting changes on the returned
+// channel until ctx is cancelled or the client is closed.
+func (r *Reader) Stream(ctx context.Context, _ position.Position) (<-chan change.Change, <-chan error) {
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.consume(ctx) }()
+	return r.out, errCh
+}
+
+// consume is the blocking consume loop: it polls fetches and feeds decoded
+// changes to r.out, returning the terminal error.
+func (r *Reader) consume(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
