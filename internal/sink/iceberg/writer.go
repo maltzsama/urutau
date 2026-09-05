@@ -482,7 +482,7 @@ func isRetryableError(err error) bool {
 func (w *TableWriter) deleteRecord(keys [][]any) (arrow.RecordBatch, error) {
 	b := array.NewRecordBuilder(memory.DefaultAllocator, w.delSchema)
 	defer b.Release()
-	for i, col := range w.delCols {
+	for i, field := range w.delSchema.Fields() {
 		values := make([]any, len(keys))
 		for j, k := range keys {
 			if len(k) != len(w.delCols) {
@@ -490,7 +490,7 @@ func (w *TableWriter) deleteRecord(keys [][]any) (arrow.RecordBatch, error) {
 			}
 			values[j] = k[i]
 		}
-		if err := appendColumn(b.Field(i), col, values); err != nil {
+		if err := appendColumn(b.Field(i), field, values); err != nil {
 			return nil, err
 		}
 	}
@@ -510,7 +510,7 @@ func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, er
 			}
 			values[j] = proj[field.Name]
 		}
-		if err := appendColumn(b.Field(i), field.Name, values); err != nil {
+		if err := appendColumn(b.Field(i), field, values); err != nil {
 			return nil, err
 		}
 	}
@@ -609,13 +609,25 @@ func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, 
 	}
 }
 
-// appendColumn appends values into a builder, tolerating a small, explicit
-// set of scalar types. Numeric coercion is schema-directed, not silent: the
-// Iceberg column type is authoritative, and JSON-based wire formats cannot
-// distinguish whole floats from ints, so int64 may arrive for a double
-// column and vice versa. Temporal, decimal, uuid and json values arrive as
-// their canonical text and are parsed at the column boundary.
-func appendColumn(builder array.Builder, name string, values []any) error {
+// appendColumn appends a column of values into its builder. Composite
+// columns (struct/list/map) dispatch to the recursive nested path; scalar
+// columns convert each value against the concrete builder type. Numeric
+// coercion is schema-directed, not silent: the Iceberg column type is
+// authoritative, and JSON-based wire formats cannot distinguish whole
+// floats from ints, so int64 may arrive for a double column and vice versa.
+// Temporal, decimal, uuid and json values arrive as their canonical text and
+// are parsed at the column boundary.
+func appendColumn(builder array.Builder, field arrow.Field, values []any) error {
+	switch builder.(type) {
+	case *array.StructBuilder, *array.ListBuilder, *array.MapBuilder:
+		for _, v := range values {
+			if err := appendOneComposite(builder, field, v); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	name := field.Name
 	switch b := builder.(type) {
 	case *array.Int64Builder:
 		for _, v := range values {

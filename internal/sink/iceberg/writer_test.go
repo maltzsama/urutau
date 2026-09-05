@@ -131,13 +131,14 @@ func TestAppendColumnTypeErrors(t *testing.T) {
 		{Name: "n", Type: arrow.PrimitiveTypes.Int64},
 	}, nil))
 	defer b.Release()
-	if err := appendColumn(b.Field(0), "n", []any{"not-a-number"}); err == nil {
+	intField := arrow.Field{Name: "n", Type: arrow.PrimitiveTypes.Int64}
+	if err := appendColumn(b.Field(0), intField, []any{"not-a-number"}); err == nil {
 		t.Fatal("string into int64 column must be rejected")
 	}
-	if err := appendColumn(b.Field(0), "n", []any{float64(1.5)}); err == nil {
+	if err := appendColumn(b.Field(0), intField, []any{float64(1.5)}); err == nil {
 		t.Fatal("fractional float into int64 column must be rejected")
 	}
-	if err := appendColumn(b.Field(0), "n", []any{nil, int64(1), int32(2)}); err != nil {
+	if err := appendColumn(b.Field(0), intField, []any{nil, int64(1), int32(2)}); err != nil {
 		t.Fatalf("valid ints rejected: %v", err)
 	}
 }
