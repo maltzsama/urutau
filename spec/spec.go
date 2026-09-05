@@ -5,6 +5,7 @@
 package spec
 
 import (
+	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 )
 
@@ -25,6 +26,18 @@ const (
 	// guarantee comes from the transport, not the content.
 	WriteModeAppendIdempotent WriteMode = "append-idempotent"
 )
+
+// ChangeMode maps the spec's declared write mode onto the engine's write
+// shape. Append-idempotent is physically append — its identity is a declared
+// transport coordinate for downstream dedup and verification, not a
+// write-path difference. An empty declaration is upsert: reflecting state
+// is the default.
+func (m WriteMode) ChangeMode() change.WriteMode {
+	if m == WriteModeAppend || m == WriteModeAppendIdempotent {
+		return change.AppendMode
+	}
+	return change.UpsertMode
+}
 
 type Spec struct {
 	Pipeline string  `json:"pipeline"`

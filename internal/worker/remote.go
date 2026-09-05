@@ -156,7 +156,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		cs.PrimaryKey = ta.PrimaryKey
 		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey}
 		if ta.CreateIfNotExists {
-			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}); err != nil {
+			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}

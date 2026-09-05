@@ -46,6 +46,27 @@ services:
     volumes:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
 
+  # Analytics sink target (CR-040). ReplacingMergeTree's is_deleted version
+  # parameter needs ClickHouse >= 24.2. Native protocol maps to 9002 — 9000
+  # and 9001 belong to RustFS.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ports:
+      - "8123:8123"
+      - "9002:9000"
+    environment:
+      CLICKHOUSE_PASSWORD: clickpass
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --password clickpass --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
   rustfs:
     image: rustfs/rustfs:latest
     ports:

@@ -66,6 +66,7 @@ The dependency walls are enforced by a test (`internal/architecture`) that check
 | `internal/source/kafka` | Kafka source (franz-go, manual partition assignment, debezium-json) |
 | `internal/source/kafka/decoder` | Kafka message decoders (debezium-json envelope) |
 | `internal/sink/iceberg` | Iceberg writes (upsert/equality delete, `FromCanonical`, cast projection) |
+| `internal/sink/clickhouse` | ClickHouse sink (ReplacingMergeTree upsert, tombstone deletes, position-as-column resume) |
 | `internal/coordinator` | reader/router loops, flow budget, supervisor, control plane |
 | `internal/worker` | per-table batcher + serialized committer (sink-agnostic, append/upsert mode) |
 | `internal/transport` | gRPC control + Arrow Flight; generated in `internal/transport/pb` |
@@ -104,6 +105,7 @@ All verified through Trino. Key finding: in `iceberg-go` v0.6.0 an append and an
 ## Status
 
 - **Sources:** MySQL (`go-mysql`/canal, GTID, heartbeat), Postgres (`pgx`, pgoutput, LSN slot), and **Kafka** (franz-go, manual partition assignment, debezium-json decoder) — one replication reader per source, mapped to the canonical type system. Kafka registers `Capabilities{Stream: true}` (no snapshot); the runner skips DBLog and streams directly from the committed offset.
+- **ClickHouse sink (`sink.type: clickhouse`):** upsert via `ReplacingMergeTree(seq, is_deleted)` (`ORDER BY` = the declared primary key), append via plain `MergeTree`. One INSERT per batch — upserts as rows, deletes as tombstones hidden from `FINAL` reads. Resume reads the position from the data itself: `argMax(position, seq)` — never a separate control table. Default table has **no `PARTITION BY`**, which is what makes a batch atomic; **partitioning is opt-in and weakens that guarantee**: a batch crossing a partition boundary commits as multiple parts and is no longer all-or-nothing — keep `maxInterval` well inside the partition granularity. Tombstone physical cleanup is operator maintenance (periodic `OPTIMIZE ... FINAL CLEANUP`); reads are correct under `FINAL` regardless.
 - **Metadata columns:** closed catalog of pipeline metadata (`op`, `commit_ts`, `ingest_ts`, `position`, `source_table`, `phase`) landed as nullable columns at the end of the canonical schema. Declared per-table in the spec via `metadata`.
 - **Per-column cast:** explicit type overrides (`cast` map on `spec.Table`) with a closed matrix — widening always, `to-string` always, narrowing/parsing never except explicit temporal reinterpretations (`timestamptz(assume_utc)`). Unmappable source types (unsigned, geometry) map to `KindUnknown` and bypass the cast.
 - **DBLog snapshot:** generic in `internal/snapshot` — chunk by PK, low/high watermarks, and the caught-up proof that closes each window (never a timer; `windowTimeout` is a pathology detector). Skipped for sources without snapshot capability (Kafka).

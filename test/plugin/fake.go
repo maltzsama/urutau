@@ -166,7 +166,7 @@ type Sink struct {
 
 var _ sink.Sink = &Sink{}
 
-func (s *Sink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy) error {
+func (s *Sink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, change.WriteMode) error {
 	return nil
 }
 

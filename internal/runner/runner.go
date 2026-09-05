@@ -427,12 +427,16 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		specByTarget[t.Target] = t
 	}
 
-	// Writers, ensuring tables exist through the sink.
+	// Writers, ensuring tables exist through the sink. The table's write
+	// shape is resolved once: the sink's DDL (where the engine is chosen)
+	// and the worker's collapse must agree on it.
 	writers := make(map[string]sink.TableWriter, len(refs))
+	modes := make(map[string]change.WriteMode, len(refs))
 	for _, ref := range refs {
 		t := specBySource[ref.Source]
 		cast, _ := core.ParseCastPolicy(t.Cast)
-		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], t.PartitionBy, cast); err != nil {
+		mode := t.WriteMode.ChangeMode()
+		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], t.PartitionBy, cast, mode); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
 		wr, err := snk.Writer(ctx, ref, cast, t.Metadata)
@@ -440,20 +444,14 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
 		}
 		writers[ref.Target] = wr
+		modes[ref.Target] = mode
 	}
 
 	// Worker + ingest channel.
 	ingest := make(chan change.Change, 1024)
 	w := worker.New(worker.Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
 	for target, wr := range writers {
-		mode := change.UpsertMode
-		writeMode := specByTarget[target].WriteMode
-		if writeMode == spec.WriteModeAppend || writeMode == spec.WriteModeAppendIdempotent {
-			// append-idempotent is physically append: zero equality deletes.
-			// Its identity is a declared transport coordinate for downstream
-			// dedup and verification, not a write-path difference.
-			mode = change.AppendMode
-		}
+		mode := modes[target]
 		w.Register(target, wr, mode)
 		if mode == change.AppendMode && specByTarget[target].OnDelete == spec.OnDeleteSkip {
 			w.SetDropDeletes(target, true)

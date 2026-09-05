@@ -6,6 +6,7 @@ import (
 
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
+	"github.com/maltzsama/urutau/change"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
@@ -49,8 +50,9 @@ func (s *Sink) ident(target string) table.Identifier {
 }
 
 // EnsureTable creates the target table from the canonical schema if absent,
-// and validates compatibility if present.
-func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy) error {
+// and validates compatibility if present. Mode is ignored: an Iceberg table
+// is write-shape agnostic (the worker's collapse handles upsert vs append).
+func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy, _ change.WriteMode) error {
 	is, err := FromCanonical(schema)
 	if err != nil {
 		return err
