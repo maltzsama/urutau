@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/change"
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/position"
 )
 
 const testUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"

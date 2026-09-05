@@ -20,7 +20,7 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/position"
 )
 
 // TableRef is the source-agnostic table mapping (kept here as an alias for
@@ -131,11 +131,23 @@ func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error 
 	r.curSet = start
 	r.mu.Unlock()
 
+	// The position contract carries its own GTID set; convert it back to
+	// go-mysql's type at this boundary — the mysql source is the only place
+	// that knows go-mysql.
+	raw, err := gomysql.ParseMysqlGTIDSet(start.String())
+	if err != nil {
+		return fmt.Errorf("mysql: convert start gtid: %w", err)
+	}
+	startSet, ok := raw.(*gomysql.MysqlGTIDSet)
+	if !ok {
+		return fmt.Errorf("mysql: unexpected gtid set type %T", raw)
+	}
+
 	// canal.StartFromGTID runs the stream to completion — it must be the
 	// ONLY sync loop. A second canal.Run() would kill the first
 	// connection ("kill last connection" / "Sync was closed").
 	done := make(chan error, 1)
-	go func() { done <- r.canal.StartFromGTID(start.Raw()) }()
+	go func() { done <- r.canal.StartFromGTID(startSet) }()
 
 	select {
 	case <-ctx.Done():

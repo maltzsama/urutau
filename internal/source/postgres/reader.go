@@ -16,8 +16,8 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/maltzsama/urutau/change"
-	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/position"
 )
 
 // statusInterval is how often the reader reports its applied LSN back to

@@ -23,9 +23,9 @@ import (
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/drivers"
-	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
 )
 
 // RemoteConfig wires one distributed worker: where the coordinator lives,

@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/maltzsama/urutau/internal/position"
+	"github.com/maltzsama/urutau/position"
 )
 
 // TestCurrentWindowTagsOnlyPastLowLSN drives the DBLog window predicate: only

@@ -7,8 +7,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/position"
 )
 
 // slotNameRe matches the server's slot-name rules: lowercase letters,

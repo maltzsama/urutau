@@ -21,10 +21,10 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/eventlog"
-	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/sink"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/worker"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/spec"
 )
 

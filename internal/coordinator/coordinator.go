@@ -35,10 +35,10 @@ import (
 	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/observability"
-	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/spec"
 	"google.golang.org/grpc/keepalive"
 )

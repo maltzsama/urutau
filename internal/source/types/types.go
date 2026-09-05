@@ -8,8 +8,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/position"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/position"
 )
 
 // Mode declares the synchronization mode a source supports.
