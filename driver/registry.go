@@ -8,6 +8,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/maltzsama/urutau/sink"
@@ -61,13 +62,50 @@ func RegisterSink(scheme string, factory SinkFactory) {
 	reg.sinks[scheme] = factory
 }
 
+// registeredKinds lists the registered source kinds, sorted so diagnostics
+// read deterministically. Called with the map lock released.
+func registeredKinds() []string {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	kinds := make([]string, 0, len(reg.sources))
+	for k := range reg.sources {
+		kinds = append(kinds, k)
+	}
+	slices.Sort(kinds)
+	return kinds
+}
+
+// registeredSinks lists the registered sink types, sorted so diagnostics
+// read deterministically. Called with the map lock released.
+func registeredSinks() []string {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	schemes := make([]string, 0, len(reg.sinks))
+	for s := range reg.sinks {
+		schemes = append(schemes, s)
+	}
+	slices.Sort(schemes)
+	return schemes
+}
+
+// unknownSourceErr is the unknown-kind error. Registration happens via
+// blank import, so an absent kind usually means the binary was built without
+// the driver — the message must point there, not at the user's spec.
+func unknownSourceErr(kind string) error {
+	return fmt.Errorf("driver: unknown source kind %q (registered: %v) — if this kind should exist, check that its package is blank-imported in internal/builtin", kind, registeredKinds())
+}
+
+func unknownSinkErr(scheme string) error {
+	return fmt.Errorf("driver: unknown sink type %q (registered: %v) — if this type should exist, check that its package is blank-imported in internal/builtin", scheme, registeredSinks())
+}
+
 // OpenSource resolves and instantiates a source for a spec's source kind.
 func OpenSource(s *spec.Spec, rt source.Runtime) (source.Source, error) {
 	reg.mu.RLock()
 	entry, ok := reg.sources[s.Source.Kind]
 	reg.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("driver: unknown source kind %q", s.Source.Kind)
+		return nil, unknownSourceErr(s.Source.Kind)
 	}
 	return entry.factory(s, rt)
 }
@@ -79,7 +117,7 @@ func CapsForKind(kind string) (source.Capabilities, error) {
 	entry, ok := reg.sources[kind]
 	reg.mu.RUnlock()
 	if !ok {
-		return source.Capabilities{}, fmt.Errorf("driver: unknown source kind %q", kind)
+		return source.Capabilities{}, unknownSourceErr(kind)
 	}
 	return entry.caps, nil
 }
@@ -126,7 +164,7 @@ func OpenSinkConfig(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
 	factory, ok := reg.sinks[scheme]
 	reg.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("driver: unknown sink type %q", scheme)
+		return nil, unknownSinkErr(scheme)
 	}
 	return factory(ctx, cfg)
 }
