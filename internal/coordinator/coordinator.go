@@ -260,6 +260,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
 	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
+	tableBySource := make(map[string]spec.Table, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
 		ref, cs, _, err := src.Introspect(ctx, t)
 		if err != nil {
@@ -267,6 +268,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		refs = append(refs, ref)
 		canonical[t.Source] = cs
+		tableBySource[t.Source] = t
 	}
 	c.refs = refs
 	c.canonical = canonical
@@ -314,7 +316,8 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 	c.snk = snk
 	for _, ref := range refs {
-		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], nil, core.CastPolicy{}); err != nil {
+		tbl := tableBySource[ref.Source]
+		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], tbl.PartitionBy, core.CastPolicy{}, tbl.WriteMode.ChangeMode()); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}

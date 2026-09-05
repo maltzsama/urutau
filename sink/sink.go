@@ -44,8 +44,13 @@ type TableWriter interface {
 // Ensurer creates the target table from the canonical schema if absent, and
 // validates compatibility if present. The sink derives its own target
 // identifier and storage schema (e.g. Iceberg field mapping) internally.
+// Mode is the write shape the table serves — upsert (versioned, dedup
+// capable) or append (plain log) — so sinks whose storage engine is chosen
+// at DDL time (ClickHouse MergeTree family) build a table that tells the
+// truth about what it is. Sinks with mode-agnostic tables (Iceberg) may
+// ignore it.
 type Ensurer interface {
-	EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy) error
+	EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy, mode change.WriteMode) error
 }
 
 // Writer opens the per-table committer. The primary key, cast plan and
