@@ -346,3 +346,17 @@ func TestValidateAvroFormat(t *testing.T) {
 		t.Fatalf("want avro-kind problem, got %v", err)
 	}
 }
+
+// A primary key that points into a nested field is rejected: an equality
+// delete cannot encode it as a comparable scalar.
+func TestValidateNestedPrimaryKeyRejected(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].PrimaryKey = []string{"address.city"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "nested") {
+		t.Fatalf("want nested-pk problem, got %v", err)
+	}
+	s.Tables[0].PrimaryKey = []string{"id"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("top-level pk must validate: %v", err)
+	}
+}

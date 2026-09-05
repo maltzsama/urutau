@@ -114,6 +114,14 @@ func (s *Spec) Validate() error {
 			if len(tbl.PrimaryKey) == 0 {
 				problems = append(problems, p+".primaryKey: required when writeMode is upsert")
 			}
+			for _, pk := range tbl.PrimaryKey {
+				// An equality delete must encode the key as a comparable
+				// scalar. A path into a nested field (address.city) has no
+				// such encoding; promote the field to a top-level column.
+				if strings.Contains(pk, ".") {
+					problems = append(problems, p+".primaryKey: "+pk+" points into a nested field — primary keys must be top-level scalar columns (promote the field to a column if that is the intent)")
+				}
+			}
 		case isAppend:
 			if tbl.Filter != nil && !tbl.FilterImmutable {
 				problems = append(problems, p+".filterImmutable: required when writeMode is append and a filter is set")
