@@ -5,7 +5,7 @@ import (
 
 	"github.com/hamba/avro/v2"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // avroSchemaToCanonical maps an Avro schema to a canonical ColumnType. It is

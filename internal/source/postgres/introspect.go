@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // Column is one introspected source column.

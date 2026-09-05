@@ -10,7 +10,7 @@ import (
 	"github.com/hamba/avro/v2"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/change"
 )
 
 // fakeRegistry serves schemas by id and counts fetches.

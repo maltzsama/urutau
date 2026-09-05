@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 func TestCapsForKind(t *testing.T) {

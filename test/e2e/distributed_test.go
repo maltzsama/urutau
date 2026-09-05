@@ -15,8 +15,8 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/maltzsama/urutau/internal/coordinator"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // TestDistributedPipeline runs the split architecture end to end over real

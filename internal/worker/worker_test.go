@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/internal/sink"
 )
 

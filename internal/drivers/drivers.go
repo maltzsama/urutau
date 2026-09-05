@@ -16,13 +16,13 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/adapter"
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
 	"github.com/maltzsama/urutau/internal/position"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // StreamSource is the replication reader surface (snapshot.SourceReader +

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/internal/drivers"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/source/mysql"

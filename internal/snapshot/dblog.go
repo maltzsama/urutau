@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/position"
 )
 

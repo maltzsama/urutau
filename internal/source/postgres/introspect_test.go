@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // 033/035: an unmappable Postgres type (interval) maps to KindUnknown with

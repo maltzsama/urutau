@@ -9,11 +9,11 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 
-	"github.com/maltzsama/urutau/internal/change"
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/worker"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // TestWorkerEndToEnd drives the collapsed worker with synthetic changes

@@ -5,7 +5,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // nestedSchema is a two-level struct with a list of structs and a map.

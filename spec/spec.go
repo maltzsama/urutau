@@ -5,7 +5,7 @@
 package spec
 
 import (
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 // WriteMode selects how a table is written: upsert reflects state through

@@ -11,8 +11,8 @@ import (
 
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/runner"
-	"github.com/maltzsama/urutau/internal/spec"
 	"github.com/maltzsama/urutau/internal/version"
+	"github.com/maltzsama/urutau/spec"
 )
 
 func main() {

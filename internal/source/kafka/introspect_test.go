@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // The spec declares columns as a map with no order; introspection must

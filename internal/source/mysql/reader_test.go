@@ -7,7 +7,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/schema"
 
-	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/internal/position"
 )
 

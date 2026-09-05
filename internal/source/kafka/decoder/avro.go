@@ -8,7 +8,7 @@ import (
 	"github.com/hamba/avro/v2"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/maltzsama/urutau/internal/change"
+	"github.com/maltzsama/urutau/change"
 )
 
 // Avro decodes Confluent-Avro messages: a 1-byte magic (0x00), a 4-byte

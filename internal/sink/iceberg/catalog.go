@@ -5,7 +5,7 @@ import (
 
 	"github.com/apache/iceberg-go/table"
 
-	"github.com/maltzsama/urutau/internal/spec"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // TargetIdent resolves a target table name into an iceberg identifier,

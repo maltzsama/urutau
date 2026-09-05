@@ -5,7 +5,7 @@ import (
 
 	"github.com/hamba/avro/v2"
 
-	"github.com/maltzsama/urutau/internal/core"
+	"github.com/maltzsama/urutau/core"
 )
 
 func mustParse(t *testing.T, json string) avro.Schema {
