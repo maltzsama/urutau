@@ -10,7 +10,6 @@ package coordinator
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -105,7 +104,6 @@ type Coordinator struct {
 
 	src       source.Source
 	qsrc      source.QuerySource
-	qdb       *sql.DB
 	refs      []source.TableRef
 	snk       sink.Sink
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
@@ -253,23 +251,17 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return fmt.Errorf("coordinator: source %q has no SQL query surface", c.cfg.Spec.Source.Kind)
 	}
 	c.qsrc = qsrc
+	defer func() { _ = qsrc.CloseQuery() }()
 	// The parallel-chunk setting may not exceed the ceiling the source
 	// driver declares — fail fast at boot, not mid-snapshot.
 	if err := driver.ValidateParallelism(c.cfg.Spec.Source.Kind, c.cfg.MaxParallelChunks); err != nil {
 		return fmt.Errorf("coordinator: %w", err)
 	}
 
-	qdb, err := qsrc.OpenQuery(ctx)
-	if err != nil {
-		return fmt.Errorf("coordinator: open query db: %w", err)
-	}
-	defer func() { closeQueryDB(qdb) }()
-	c.qdb = qdb
-
 	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
 	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, cs, _, err := src.Introspect(ctx, qdb, t)
+		ref, cs, _, err := src.Introspect(ctx, t)
 		if err != nil {
 			return err
 		}
@@ -373,8 +365,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.
-	out := make(chan change.Change, 1024)
-	rdr, err := c.src.NewReader(ctx, qdb, refs, out)
+	rdr, err := c.src.Open(ctx, refs)
 	if err != nil {
 		return err
 	}
@@ -386,14 +377,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	start := resume
 	if start == nil {
-		m, err := c.src.InitialPosition(ctx, qdb)
+		m, err := c.src.InitialPosition(ctx)
 		if err != nil {
 			return fmt.Errorf("coordinator: initial position: %w", err)
 		}
 		start = m
 	}
-	streamErr := make(chan error, 1)
-	go func() { streamErr <- rdr.Start(ctx, start) }()
+	out, streamErr := rdr.Stream(ctx, start)
 
 	// Pump: every decoded change becomes one Flight batch. The FIFO queue
 	// preserves the wire ordering the window protocol needs, so the
@@ -409,7 +399,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 			c.log.Warn("coordinator: eventlog emit", "err", err)
 		}
-		chunker, err := c.qsrc.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
+		chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 		if err != nil {
 			return err
 		}
@@ -1160,13 +1150,4 @@ func tableNames(refs []source.TableRef) []string {
 		out[i] = r.Source
 	}
 	return out
-}
-
-// closeQueryDB closes the source query connection, tolerating a nil handle:
-// a source without SQL (kafka) returns (nil, nil) from OpenQuery, and Close on
-// a nil *sql.DB would dereference the zero receiver and panic at shutdown.
-func closeQueryDB(qdb *sql.DB) {
-	if qdb != nil {
-		_ = qdb.Close()
-	}
 }

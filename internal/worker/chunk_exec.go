@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -26,7 +25,6 @@ type chunkExecutor struct {
 	chunkSz  int
 	bySource map[string]*pb.TableAssignment // source table → target/PK
 	qsrc     source.QuerySource
-	db       *sql.DB
 	w        *Worker
 	log      *slog.Logger
 	send     func(*pb.WorkerMessage) error // session sender, serialized
@@ -67,31 +65,13 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 	return q, nil
 }
 
-// queryDB opens the source query connection on first use (snapshot only;
-// the design gives workers query conns precisely for this).
-func (x *chunkExecutor) queryDB(ctx context.Context) (*sql.DB, error) {
-	if x.db != nil {
-		return x.db, nil
-	}
-	q, err := x.querySource(ctx)
-	if err != nil {
-		return nil, err
-	}
-	db, err := q.OpenQuery(ctx)
-	if err != nil {
-		return nil, err
-	}
-	x.db = db
-	return db, nil
-}
-
-// Close releases the query connection pool. The worker owns the executor
+// Close releases the source's query connection. The worker owns the executor
 // for its whole life, so this is shutdown hygiene rather than a leak, but
 // a dangling pool keeps sockets alive after the session ends.
 func (x *chunkExecutor) Close() {
-	if x.db != nil {
-		_ = x.db.Close()
-		x.db = nil
+	if x.qsrc != nil {
+		_ = x.qsrc.CloseQuery()
+		x.qsrc = nil
 	}
 }
 
@@ -108,10 +88,6 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	if err != nil {
 		return err
 	}
-	db, err := x.queryDB(ctx)
-	if err != nil {
-		return fmt.Errorf("worker: chunk query db: %w", err)
-	}
 
 	var low, high []any
 	boundRows, err := transport.DecodeBounds(req.Bounds)
@@ -125,7 +101,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		high = boundRows[1]
 	}
 
-	chunker, err := q.NewChunker(db, req.Table, strings.Join(ta.PrimaryKey, ","), x.chunkSz)
+	chunker, err := q.NewChunker(req.Table, strings.Join(ta.PrimaryKey, ","), x.chunkSz)
 	if err != nil {
 		return err
 	}

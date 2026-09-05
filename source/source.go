@@ -8,7 +8,6 @@ package source
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"time"
 
@@ -104,13 +103,16 @@ type SourceReader interface {
 	ClearWindow()
 }
 
-// StreamSource is the replication reader surface a driver drives: the DBLog
-// watermark surface plus start/stop of the stream.
-type StreamSource interface {
+// Reader is the replication reader surface a driver drives: the DBLog
+// watermark surface plus the stream. A Reader is a handle obtained from
+// Source.Open; the stream itself flows through a channel.
+type Reader interface {
 	SourceReader
-	// Start begins streaming at the given position, blocking until the
-	// stream ends or ctx is cancelled. Call in a goroutine.
-	Start(ctx context.Context, at position.Position) error
+	// Stream begins streaming from `from`, emitting changes on the returned
+	// channel. The terminal-error channel receives the stream's final error
+	// exactly once (nil for a clean, ctx-driven end) and then the stream is
+	// over. Call in a goroutine.
+	Stream(ctx context.Context, from position.Position) (<-chan change.Change, <-chan error)
 	Close()
 	// SetConfirmed installs a callback that returns the minimum position
 	// committed to the sink across all tables. The Postgres reader uses
@@ -119,16 +121,17 @@ type StreamSource interface {
 	SetConfirmed(f func() position.Position)
 }
 
-// Streamer opens the replication reader over the pipeline's tables.
+// Streamer opens the replication reader over the pipeline's tables. The
+// source owns its own connections; the reader carries no SQL shape.
 type Streamer interface {
-	NewReader(ctx context.Context, db *sql.DB, refs []TableRef, out chan<- change.Change) (StreamSource, error)
+	Open(ctx context.Context, refs []TableRef) (Reader, error)
 }
 
 // Positioner resolves the stream start position: the first-boot start and
 // the codec for a stored cdc.position.
 type Positioner interface {
 	// InitialPosition is the stream start for a first boot (no resume).
-	InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error)
+	InitialPosition(ctx context.Context) (position.Position, error)
 	// ParsePosition decodes a stored cdc.position string.
 	ParsePosition(s string) (position.Position, error)
 }
@@ -138,28 +141,28 @@ type Positioner interface {
 // cast warnings. The final target (Iceberg/Delta) schema is the sink's
 // concern, not the source's.
 type Introspector interface {
-	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error)
+	Introspect(ctx context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error)
 }
 
 // Source is the minimal surface every source provides: it streams changes,
 // resolves positions, and introspects schemas. It deliberately carries NO
-// SQL shape; the SQL-only surface (opening a query connection and chunked
-// snapshot SELECTs) lives on QuerySource, which only relational sources
-// implement, so a stream source never stubs methods it cannot do.
+// SQL shape; the SQL-only surface (the chunked snapshot SELECT) lives on
+// QuerySource, which only relational sources implement, so a stream source
+// never stubs methods it cannot do.
 type Source interface {
 	Streamer
 	Positioner
 	Introspector
 }
 
-// QuerySource is the SQL-backed surface of a relational source: opening the
-// query connection used by chunk SELECTs, schema introspection and position
-// queries, and building the chunk SELECT source for one table. MySQL and
-// Postgres implement it; a stream source (kafka) does not.
+// QuerySource is the SQL-backed surface of a relational source: the chunk
+// SELECT source for one table and the query-connection lifecycle. MySQL and
+// Postgres implement it; a stream source (kafka) does not. The source owns
+// its query connection — opened at driver construction, released on
+// CloseQuery — so the orchestration never touches *sql.DB.
 type QuerySource interface {
-	// OpenQuery opens the SQL connection for chunk SELECTs, schema
-	// introspection, and position queries.
-	OpenQuery(ctx context.Context) (*sql.DB, error)
 	// NewChunker builds the chunk SELECT source for one table.
-	NewChunker(db *sql.DB, source, pk string, chunkSize int) (ChunkSource, error)
+	NewChunker(source, pk string, chunkSize int) (ChunkSource, error)
+	// CloseQuery releases the source's query connection.
+	CloseQuery() error
 }

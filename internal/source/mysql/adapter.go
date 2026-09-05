@@ -17,11 +17,12 @@ import (
 )
 
 // Source adapts the MySQL canal reader to the source contract. It is the
-// self-contained driver entry point: the adapter and its capabilities live
-// here, and init() registers the kind with the driver registry.
+// self-contained driver entry point: the adapter, its capabilities, and its
+// query connection all live here, and init() registers the kind.
 type Source struct {
 	spec *spec.Spec
 	rt   source.Runtime
+	db   *sql.DB // the source's query connection (chunk SELECTs, introspection)
 }
 
 func capabilities() source.Capabilities {
@@ -38,29 +39,28 @@ func capabilities() source.Capabilities {
 
 func init() {
 	driver.RegisterSource("mysql", capabilities(), func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
-		return Source{spec: s, rt: rt}, nil
+		conn, err := ParseURI(s.Source.URI)
+		if err != nil {
+			return nil, err
+		}
+		db, err := sql.Open("mysql", conn.QueryDSN())
+		if err != nil {
+			return nil, err
+		}
+		return Source{spec: s, rt: rt, db: db}, nil
 	})
 }
 
 var _ source.Source = Source{}
 var _ source.QuerySource = Source{}
 
-// OpenQuery opens the SQL connection for chunk SELECTs and introspection.
-func (a Source) OpenQuery(ctx context.Context) (*sql.DB, error) {
-	conn, err := ParseURI(a.spec.Source.URI)
-	if err != nil {
-		return nil, err
-	}
-	return sql.Open("mysql", conn.QueryDSN())
-}
-
 // Introspect resolves one spec table into its ref and canonical schema.
-func (a Source) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
+func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: source %q must be db.table", t.Source)
 	}
-	st, err := QueryTable(ctx, db, schemaName, tableName)
+	st, err := QueryTable(ctx, a.db, schemaName, tableName)
 	if err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: introspect %s: %w", t.Source, err)
 	}
@@ -86,16 +86,25 @@ func (a Source) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.
 }
 
 // NewChunker builds the chunk SELECT source for one table.
-func (a Source) NewChunker(db *sql.DB, source, pk string, chunkSize int) (source.ChunkSource, error) {
-	return NewChunker(db, source, pk, chunkSize)
+func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
+	return NewChunker(a.db, source, pk, chunkSize)
 }
 
-// NewReader builds the replication reader over the pipeline's tables.
-func (a Source) NewReader(ctx context.Context, db *sql.DB, refs []source.TableRef, out chan<- change.Change) (source.StreamSource, error) {
+// CloseQuery releases the query connection.
+func (a Source) CloseQuery() error {
+	if a.db != nil {
+		return a.db.Close()
+	}
+	return nil
+}
+
+// Open builds the replication reader over the pipeline's tables.
+func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader, error) {
 	conn, err := ParseURI(a.spec.Source.URI)
 	if err != nil {
 		return nil, err
 	}
+	out := make(chan change.Change, 1024)
 	rdr, err := New(ctx, Config{
 		Addr:      conn.Addr(),
 		User:      conn.User,
@@ -108,14 +117,14 @@ func (a Source) NewReader(ctx context.Context, db *sql.DB, refs []source.TableRe
 	if err != nil {
 		return nil, err
 	}
-	return stream{Reader: rdr}, nil
+	return stream{Reader: rdr, out: out}, nil
 }
 
 // InitialPosition returns the master's executed GTID set — the same query
 // canal's GetMasterGTIDSet issues, without spinning a replication handle.
-func (a Source) InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error) {
+func (a Source) InitialPosition(ctx context.Context) (position.Position, error) {
 	var gtid string
-	if err := db.QueryRowContext(ctx, `SELECT @@GLOBAL.gtid_executed`).Scan(&gtid); err != nil {
+	if err := a.db.QueryRowContext(ctx, `SELECT @@GLOBAL.gtid_executed`).Scan(&gtid); err != nil {
 		return nil, fmt.Errorf("mysql: gtid_executed: %w", err)
 	}
 	return position.ParseGTID(gtid)
@@ -126,16 +135,21 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 	return position.ParseGTID(s)
 }
 
-// stream adapts the concrete canal reader to StreamSource.
+// stream adapts the concrete canal reader to the Reader contract, carrying
+// the change channel the concrete reader writes into.
 type stream struct {
 	*Reader
+	out chan change.Change
 }
 
-// Start begins the stream at the given GTID set.
-func (s stream) Start(ctx context.Context, at position.Position) error {
-	g, ok := at.(*position.GTID)
+// Stream begins the stream at the given GTID set.
+func (s stream) Stream(ctx context.Context, from position.Position) (<-chan change.Change, <-chan error) {
+	errCh := make(chan error, 1)
+	g, ok := from.(*position.GTID)
 	if !ok {
-		return fmt.Errorf("mysql: start position must be a GTID set, got %T", at)
+		errCh <- fmt.Errorf("mysql: start position must be a GTID set, got %T", from)
+		return s.out, errCh
 	}
-	return s.StartFromGTID(ctx, g)
+	go func() { errCh <- s.StartFromGTID(ctx, g) }()
+	return s.out, errCh
 }

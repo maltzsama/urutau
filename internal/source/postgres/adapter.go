@@ -21,6 +21,7 @@ import (
 type Source struct {
 	spec *spec.Spec
 	rt   source.Runtime
+	db   *sql.DB // the source's query connection (chunk SELECTs, introspection)
 }
 
 func capabilities() source.Capabilities {
@@ -37,25 +38,24 @@ func capabilities() source.Capabilities {
 
 func init() {
 	driver.RegisterSource("postgres", capabilities(), func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
-		return Source{spec: s, rt: rt}, nil
+		db, err := sql.Open("pgx", s.Source.URI)
+		if err != nil {
+			return nil, err
+		}
+		return Source{spec: s, rt: rt, db: db}, nil
 	})
 }
 
 var _ source.Source = Source{}
 var _ source.QuerySource = Source{}
 
-// OpenQuery opens the SQL connection for chunk SELECTs and introspection.
-func (a Source) OpenQuery(ctx context.Context) (*sql.DB, error) {
-	return sql.Open("pgx", a.spec.Source.URI)
-}
-
 // Introspect resolves one spec table into its ref and canonical schema.
-func (a Source) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
+func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: source %q must be db.table", t.Source)
 	}
-	st, err := QueryTable(ctx, db, schemaName, tableName)
+	st, err := QueryTable(ctx, a.db, schemaName, tableName)
 	if err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: introspect %s: %w", t.Source, err)
 	}
@@ -81,19 +81,28 @@ func (a Source) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.
 }
 
 // NewChunker builds the chunk SELECT source for one table.
-func (a Source) NewChunker(db *sql.DB, source, pk string, chunkSize int) (source.ChunkSource, error) {
-	return NewChunker(db, source, pk, chunkSize)
+func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
+	return NewChunker(a.db, source, pk, chunkSize)
 }
 
-// NewReader builds the replication reader over the pipeline's tables.
-func (a Source) NewReader(ctx context.Context, db *sql.DB, refs []source.TableRef, out chan<- change.Change) (source.StreamSource, error) {
+// CloseQuery releases the query connection.
+func (a Source) CloseQuery() error {
+	if a.db != nil {
+		return a.db.Close()
+	}
+	return nil
+}
+
+// Open builds the replication reader over the pipeline's tables.
+func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader, error) {
 	slot := a.spec.Source.SlotName
 	if slot == "" {
 		return nil, fmt.Errorf("postgres: source requires slotName")
 	}
+	out := make(chan change.Change, 1024)
 	rdr, err := New(ctx, Config{
 		URI:      a.spec.Source.URI,
-		DB:       db,
+		DB:       a.db,
 		SlotName: slot,
 		Tables:   refs,
 		Logger:   a.rt.Logger,
@@ -101,14 +110,14 @@ func (a Source) NewReader(ctx context.Context, db *sql.DB, refs []source.TableRe
 	if err != nil {
 		return nil, err
 	}
-	return stream{Reader: rdr}, nil
+	return stream{Reader: rdr, out: out}, nil
 }
 
 // InitialPosition returns the slot's confirmed LSN: a first boot starts
 // streaming from the slot's consistency point — everything after it flows
 // through the stream, everything before it belongs to the snapshot.
-func (a Source) InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error) {
-	return ConfirmedLSN(ctx, db, a.spec.Source.SlotName)
+func (a Source) InitialPosition(ctx context.Context) (position.Position, error) {
+	return ConfirmedLSN(ctx, a.db, a.spec.Source.SlotName)
 }
 
 // ParsePosition decodes a stored cdc.position as an LSN.
@@ -116,16 +125,20 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 	return position.ParseLSN(s)
 }
 
-// stream adapts the concrete pgoutput reader to StreamSource.
+// stream adapts the concrete pgoutput reader to the Reader contract.
 type stream struct {
 	*Reader
+	out chan change.Change
 }
 
-// Start begins the stream at the given LSN.
-func (s stream) Start(ctx context.Context, at position.Position) error {
-	l, ok := at.(*position.LSN)
+// Stream begins the stream at the given LSN.
+func (s stream) Stream(ctx context.Context, from position.Position) (<-chan change.Change, <-chan error) {
+	errCh := make(chan error, 1)
+	l, ok := from.(*position.LSN)
 	if !ok {
-		return fmt.Errorf("postgres: start position must be an LSN, got %T", at)
+		errCh <- fmt.Errorf("postgres: start position must be an LSN, got %T", from)
+		return s.out, errCh
 	}
-	return s.StartFromLSN(ctx, l)
+	go func() { errCh <- s.StartFromLSN(ctx, l) }()
+	return s.out, errCh
 }
