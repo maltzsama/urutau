@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/change"
-	"github.com/maltzsama/urutau/internal/drivers"
-	"github.com/maltzsama/urutau/internal/source/mysql"
-	"github.com/maltzsama/urutau/internal/source/postgres"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // chunkExecutor runs DBLog chunk SELECTs against the source (design §11.1:
@@ -26,6 +25,7 @@ type chunkExecutor struct {
 	dsn      string
 	chunkSz  int
 	bySource map[string]*pb.TableAssignment // source table → target/PK
+	qsrc     source.QuerySource
 	db       *sql.DB
 	w        *Worker
 	log      *slog.Logger
@@ -48,13 +48,36 @@ func newChunkExecutor(assign *pb.Assignment, w *Worker, log *slog.Logger, send f
 	}
 }
 
+// querySource opens the source's SQL surface on first use. The worker holds
+// only kind + dsn from the assignment, so it builds a minimal spec and
+// resolves the driver through the registry.
+func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, error) {
+	if x.qsrc != nil {
+		return x.qsrc, nil
+	}
+	src, err := driver.OpenSource(&spec.Spec{Source: spec.Source{Kind: x.kind, URI: x.dsn}}, source.Runtime{Logger: x.log})
+	if err != nil {
+		return nil, err
+	}
+	q, ok := src.(source.QuerySource)
+	if !ok {
+		return nil, fmt.Errorf("worker: source %q has no SQL query surface", x.kind)
+	}
+	x.qsrc = q
+	return q, nil
+}
+
 // queryDB opens the source query connection on first use (snapshot only;
 // the design gives workers query conns precisely for this).
 func (x *chunkExecutor) queryDB(ctx context.Context) (*sql.DB, error) {
 	if x.db != nil {
 		return x.db, nil
 	}
-	db, err := drivers.OpenQueryDB(x.kind, x.dsn)
+	q, err := x.querySource(ctx)
+	if err != nil {
+		return nil, err
+	}
+	db, err := q.OpenQuery(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -81,6 +104,10 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	if x.chunkSz <= 0 {
 		x.chunkSz = 10000
 	}
+	q, err := x.querySource(ctx)
+	if err != nil {
+		return err
+	}
 	db, err := x.queryDB(ctx)
 	if err != nil {
 		return fmt.Errorf("worker: chunk query db: %w", err)
@@ -98,7 +125,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		high = boundRows[1]
 	}
 
-	chunker, err := newChunkerFor(x.kind, db, req.Table, ta.PrimaryKey, x.chunkSz)
+	chunker, err := q.NewChunker(db, req.Table, strings.Join(ta.PrimaryKey, ","), x.chunkSz)
 	if err != nil {
 		return err
 	}
@@ -132,15 +159,4 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		Rows:            uint64(len(rows)),
 		DroppedByWindow: uint64(x.w.DroppedByWindow(ta.TargetTable)),
 	}}})
-}
-
-func newChunkerFor(kind string, db *sql.DB, source string, pk []string, size int) (source.ChunkSource, error) {
-	switch kind {
-	case "mysql":
-		return mysql.NewChunker(db, source, strings.Join(pk, ","), size)
-	case "postgres":
-		return postgres.NewChunker(db, source, strings.Join(pk, ","), size)
-	default:
-		return nil, fmt.Errorf("worker: chunker: unknown source kind %q", kind)
-	}
 }

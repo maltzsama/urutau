@@ -7,14 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
-	"github.com/apache/iceberg-go/table"
-	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
@@ -22,19 +19,20 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/drivers"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/sink"
 )
 
 // RemoteConfig wires one distributed worker: where the coordinator lives,
 // which sink this worker owns, and how it batches.
 type RemoteConfig struct {
-	Coordinator string             // host:port of the coordinator
-	Name        string             // worker name (Hello)
-	Sink        icebergsink.Config // catalog access — workers own their writes
-	Namespace   string             // fallback namespace for bare targets
+	Coordinator string      // host:port of the coordinator
+	Name        string      // worker name (Hello)
+	Sink        sink.Config // catalog access — workers own their writes
+	Namespace   string      // fallback namespace for bare targets
 	MaxRows     int
 	MaxInterval time.Duration
 	Logger      *slog.Logger
@@ -136,7 +134,12 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 
 	// Catalog + writers from the assignment: the coordinator owns DDL and
 	// introspection, but the writes are this worker's.
-	cat, err := drivers.NewCatalogFromConfig(ctx, cfg.Sink)
+	snk, err := driver.OpenSinkConfig(ctx, sink.Config{
+		Type:      cfg.Sink.Type,
+		URI:       cfg.Sink.URI,
+		Namespace: cfg.Namespace,
+		Options:   cfg.Sink.Options,
+	})
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
@@ -144,24 +147,20 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	pkByTable := make(map[string][]string, len(assign.Tables))
 	for _, ta := range assign.Tables {
 		// The assignment schema arrives as Arrow IPC derived from the
-		// coordinator's canonical schema; rebuilding the Iceberg schema
-		// through FromCanonical keeps one encoding discipline on the wire.
+		// coordinator's canonical schema; the sink maps it to its own
+		// storage schema.
 		cs, err := transport.DecodeTableSchema(ta.SchemaArrow)
 		if err != nil {
 			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
 		}
 		cs.PrimaryKey = ta.PrimaryKey
-		schema, err := icebergsink.FromCanonical(cs)
-		if err != nil {
-			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
-		}
-		ident := targetIdent(cfg.Namespace, ta.TargetTable)
+		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey}
 		if ta.CreateIfNotExists {
-			if err := drivers.EnsureTable(ctx, cat, ident, schema, nil, core.CastPolicy{}); err != nil {
+			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}
-		writer, err := drivers.NewTableWriter(ctx, cat, ident, ta.PrimaryKey, core.CastPolicy{}, nil, "")
+		writer, err := snk.Writer(ctx, ref, core.CastPolicy{}, nil)
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
@@ -184,7 +183,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	committed := make(map[string]position.Position, len(assign.Tables))
 	phase := pb.WorkerPhase_WORKER_PHASE_SNAPSHOTTING
 	for _, ta := range assign.Tables {
-		pos, err := drivers.CommittedPosition(ctx, cat, targetIdent(cfg.Namespace, ta.TargetTable))
+		pos, err := snk.Position(ctx, core.TableRef{Target: ta.TargetTable})
 		if err != nil {
 			return fmt.Errorf("worker: committed %s: %w", ta.TargetTable, err)
 		}
@@ -511,13 +510,6 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		}
 	}
 	return nil
-}
-
-func targetIdent(namespace, target string) table.Identifier {
-	if ns, name, ok := strings.Cut(target, "."); ok {
-		return table.Identifier{ns, name}
-	}
-	return table.Identifier{namespace, target}
 }
 
 // parsePosition returns the parser for the assignment's source kind.

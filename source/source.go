@@ -2,8 +2,8 @@
 // native types into core.Schema and streams row changes into change.Change;
 // it knows nothing about any sink. The contract is deliberately small: a
 // source implements a handful of focused interfaces, and the driver registry
-// (internal/drivers resolution) resolves a spec's source kind into a
-// concrete Source. Orchestration composes the interfaces it needs.
+// resolves a spec's source kind into a concrete Source. Orchestration
+// composes the interfaces it needs.
 package source
 
 import (

@@ -15,25 +15,24 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/apache/iceberg-go"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/source/kafka/decoder"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
 
-// Source implements adapter.Source for Kafka.
+// Source implements source.Source for Kafka.
 type Source struct {
 	Spec *spec.Spec
 	Rt   source.Runtime
 }
 
-// Caps reports Kafka capabilities: streaming only, no DBLog snapshot.
-func (s Source) Caps() source.Capabilities {
+func capabilities() source.Capabilities {
 	return source.Capabilities{
 		Snapshot:          false,
 		ChunkQuery:        false,
@@ -45,15 +44,23 @@ func (s Source) Caps() source.Capabilities {
 	}
 }
 
+func init() {
+	driver.RegisterSource("kafka", capabilities(), func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
+		return Source{Spec: s, Rt: rt}, nil
+	})
+}
+
+var _ source.Source = Source{}
+
 // OpenQuery is intentionally absent: Kafka has no SQL query connection, and
 // the Source interface no longer carries a SQL surface — that lives on
 // QuerySource, which only relational sources implement.
 
 // Introspect resolves one spec table into its ref and schema. Kafka has
 // no SQL introspection; the schema comes from the spec's Columns map.
-func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error) {
+func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
 	if len(t.Columns) == 0 {
-		return core.TableRef{}, core.Schema{}, nil, nil,
+		return core.TableRef{}, core.Schema{}, nil,
 			fmt.Errorf("kafka: table %q requires columns in spec", t.Source)
 	}
 
@@ -63,7 +70,7 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 	}
 	isAppend := mode == spec.WriteModeAppend || mode == spec.WriteModeAppendIdempotent
 	if len(t.PrimaryKey) == 0 && !isAppend {
-		return core.TableRef{}, core.Schema{}, nil, nil,
+		return core.TableRef{}, core.Schema{}, nil,
 			fmt.Errorf("kafka: table %q requires primaryKey for writeMode=upsert", t.Source)
 	}
 	pk := t.PrimaryKey
@@ -83,7 +90,7 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 		typeStr := t.Columns[name]
 		ct, err := core.ParseColumnType(typeStr)
 		if err != nil {
-			return core.TableRef{}, core.Schema{}, nil, nil,
+			return core.TableRef{}, core.Schema{}, nil,
 				fmt.Errorf("kafka: table %q column %q: %w", t.Source, name, err)
 		}
 		cols = append(cols, core.Column{Name: name, Type: ct})
@@ -92,72 +99,16 @@ func (s Source) Introspect(_ context.Context, _ *sql.DB, t spec.Table) (core.Tab
 
 	cast, err := core.ParseCastPolicy(t.Cast)
 	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil, nil,
+		return core.TableRef{}, core.Schema{}, nil,
 			fmt.Errorf("kafka: table %q: %w", t.Source, err)
 	}
 	resolved, warns, err := core.ResolveSchema(cs, cast, t.Metadata)
 	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil, nil,
+		return core.TableRef{}, core.Schema{}, nil,
 			fmt.Errorf("kafka: table %q: %w", t.Source, err)
 	}
 
-	is, err := icebergSchema(resolved)
-	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil, nil,
-			fmt.Errorf("kafka: table %q: %w", t.Source, err)
-	}
-
-	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, is, warns, nil
-}
-
-// icebergSchema converts a resolved canonical schema into an Iceberg
-// schema by mapping each column type.
-func icebergSchema(cs core.Schema) (*iceberg.Schema, error) {
-	fields := make([]iceberg.NestedField, 0, len(cs.Columns))
-	for i, col := range cs.Columns {
-		itype, err := mapColumnType(col.Type)
-		if err != nil {
-			return nil, err
-		}
-		fields = append(fields, iceberg.NestedField{
-			ID:       i + 1,
-			Name:     col.Name,
-			Type:     itype,
-			Required: false,
-		})
-	}
-	return iceberg.NewSchema(0, fields...), nil
-}
-
-func mapColumnType(ct core.ColumnType) (iceberg.Type, error) {
-	switch ct.Kind {
-	case core.KindBool:
-		return iceberg.PrimitiveTypes.Bool, nil
-	case core.KindInt32:
-		return iceberg.PrimitiveTypes.Int32, nil
-	case core.KindInt64:
-		return iceberg.PrimitiveTypes.Int64, nil
-	case core.KindFloat32:
-		return iceberg.PrimitiveTypes.Float32, nil
-	case core.KindFloat64:
-		return iceberg.PrimitiveTypes.Float64, nil
-	case core.KindString, core.KindJSON:
-		return iceberg.PrimitiveTypes.String, nil
-	case core.KindBinary:
-		return iceberg.PrimitiveTypes.Binary, nil
-	case core.KindDate:
-		return iceberg.PrimitiveTypes.Date, nil
-	case core.KindTime:
-		return iceberg.PrimitiveTypes.Time, nil
-	case core.KindTimestamp:
-		return iceberg.PrimitiveTypes.Timestamp, nil
-	case core.KindTimestampTZ:
-		return iceberg.PrimitiveTypes.TimestampTz, nil
-	case core.KindUUID:
-		return iceberg.PrimitiveTypes.UUID, nil
-	default:
-		return nil, fmt.Errorf("kafka: unsupported column type %s", ct.Kind)
-	}
+	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, warns, nil
 }
 
 // NewReader builds the Kafka consumer. It subscribes to the topics

@@ -11,6 +11,15 @@ import (
 	"github.com/maltzsama/urutau/core"
 )
 
+// Config is everything a sink needs, in neutral terms. Driver-specific
+// knobs (warehouse, credentials, file size, codec) live in Options.
+type Config struct {
+	Type      string // "iceberg+rest" (empty defaults to it)
+	URI       string // REST catalog endpoint / connection string
+	Namespace string
+	Options   map[string]string // warehouse, client_id, client_secret, scope, …
+}
+
 // TableWriter commits one table's batches. Implementations MUST honour the
 // two invariants below; they are correctness, not style. The CDC position
 // travels inside change.Batch.Position (a serialized position string).

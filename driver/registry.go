@@ -18,10 +18,10 @@ import (
 // SourceFactory opens a source from a spec and runtime knobs.
 type SourceFactory func(s *spec.Spec, rt source.Runtime) (source.Source, error)
 
-// SinkFactory opens a sink from a spec.
-type SinkFactory func(ctx context.Context, s *spec.Spec) (sink.Sink, error)
+// SinkFactory opens a sink from a neutral config.
+type SinkFactory func(ctx context.Context, cfg sink.Config) (sink.Sink, error)
 
-// DefaultSinkType is the sink type used when the spec does not declare one.
+// DefaultSinkType is the sink type used when a config does not declare one.
 // It is the only sink type today; a future non-Iceberg sink registers its
 // own type and the spec names it explicitly.
 const DefaultSinkType = "iceberg+rest"
@@ -84,9 +84,29 @@ func CapsForKind(kind string) (source.Capabilities, error) {
 	return entry.caps, nil
 }
 
-// OpenSink resolves and instantiates a sink for a spec's sink type.
+// OpenSink resolves and instantiates a sink for a spec's sink section.
 func OpenSink(ctx context.Context, s *spec.Spec) (sink.Sink, error) {
-	scheme := s.Sink.Type
+	return OpenSinkConfig(ctx, SinkConfig(s))
+}
+
+// SinkConfig renders a spec's sink section into the neutral config.
+func SinkConfig(s *spec.Spec) sink.Config {
+	return sink.Config{
+		Type:      s.Sink.Type,
+		URI:       s.Sink.URI,
+		Namespace: s.Sink.Namespace,
+		Options: map[string]string{
+			"warehouse":     s.Sink.Warehouse,
+			"client_id":     s.Sink.ClientID,
+			"client_secret": s.Sink.ClientSecret,
+			"scope":         s.Sink.Scope,
+		},
+	}
+}
+
+// OpenSinkConfig resolves and instantiates a sink from a neutral config.
+func OpenSinkConfig(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
+	scheme := cfg.Type
 	if scheme == "" {
 		scheme = DefaultSinkType
 	}
@@ -96,5 +116,24 @@ func OpenSink(ctx context.Context, s *spec.Spec) (sink.Sink, error) {
 	if !ok {
 		return nil, fmt.Errorf("driver: unknown sink type %q", scheme)
 	}
-	return factory(ctx, s)
+	return factory(ctx, cfg)
+}
+
+// ValidateParallelism rejects a parallel-chunk setting above the ceiling the
+// source driver declares: a shared MySQL with max_connections=100 does not
+// tolerate the same snapshot concurrency as a dedicated Postgres. A ceiling
+// of 0 means the driver has no opinion.
+func ValidateParallelism(kind string, maxParallelChunks int) error {
+	if maxParallelChunks <= 0 {
+		return nil
+	}
+	caps, err := CapsForKind(kind)
+	if err != nil {
+		return err
+	}
+	if caps.MaxConnections > 0 && maxParallelChunks > caps.MaxConnections {
+		return fmt.Errorf("driver: maxParallelChunks (%d) exceeds the %s driver ceiling (%d connections)",
+			maxParallelChunks, kind, caps.MaxConnections)
+	}
+	return nil
 }
