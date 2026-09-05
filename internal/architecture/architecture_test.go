@@ -68,3 +68,20 @@ func TestRunnerConsumesInterfaces(t *testing.T) {
 		}
 	}
 }
+
+// TestAdapterIsContractsOnly: the adapter must not directly import any
+// concrete source or sink implementation — it holds contracts and the type
+// aliases only. The assembly (the switch that names the sources) lives in
+// internal/drivers. source/types is exempt: it carries the shared contract
+// types (Runtime, Capabilities, StreamSource), not an implementation.
+func TestAdapterIsContractsOnly(t *testing.T) {
+	d := directImports(t, "github.com/maltzsama/urutau/internal/adapter")
+	for imp := range d {
+		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source/") && imp != "github.com/maltzsama/urutau/internal/source/types" {
+			t.Errorf("internal/adapter imports %s — resolve implementations in drivers", imp)
+		}
+		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/sink/") {
+			t.Errorf("internal/adapter imports %s — sinks consume core.Schema via drivers", imp)
+		}
+	}
+}
