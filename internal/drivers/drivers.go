@@ -83,9 +83,20 @@ func ValidateParallelism(kind string, maxParallelChunks int) error {
 	return nil
 }
 
-// OpenQuery opens the source query connection.
+// SupportsQuery reports whether the source has a SQL query surface.
+func (r *Registry) SupportsQuery() bool {
+	_, ok := r.adapt.(adapter.QuerySource)
+	return ok
+}
+
+// OpenQuery opens the source query connection. A source without a SQL
+// surface (kafka) returns (nil, nil) — the pipeline mediates this through
+// the capability seam instead of the source stubbing the method.
 func (r *Registry) OpenQuery(ctx context.Context) (*sql.DB, error) {
-	return r.adapt.OpenQuery(ctx)
+	if q, ok := r.adapt.(adapter.QuerySource); ok {
+		return q.OpenQuery(ctx)
+	}
+	return nil, nil
 }
 
 // OpenQueryDB opens a query connection for a kind+uri (remote workers).
@@ -115,9 +126,13 @@ func (r *Registry) NewReader(ctx context.Context, db *sql.DB, refs []core.TableR
 	return r.adapt.NewReader(ctx, db, refs, out)
 }
 
-// NewChunker builds the chunk SELECT source.
+// NewChunker builds the chunk SELECT source. Only a SQL-capable source has
+// one; callers must gate on SupportsQuery (or Caps().Snapshot) first.
 func (r *Registry) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {
-	return r.adapt.NewChunker(db, source, pk, chunkSize)
+	if q, ok := r.adapt.(adapter.QuerySource); ok {
+		return q.NewChunker(db, source, pk, chunkSize)
+	}
+	return nil, fmt.Errorf("drivers: source has no SQL chunking surface")
 }
 
 // ── Sink side ─────────────────────────────────────────────────────────

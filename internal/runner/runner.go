@@ -471,7 +471,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			w.SetKnownSchema(target, cs)
 		}
 	}
-	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { _ = qdb.Close() },
+	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() { closeQueryDB(qdb) },
 		committedPositions: make(map[string]position.Position)}
 	w.OnSchemaDrift(func(d worker.SchemaDrift) {
 		log.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
@@ -507,7 +507,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 
 	resume, needsSnapshot, err := resumeFrom(ctx, reg, cat, s, refs)
 	if err != nil {
-		_ = qdb.Close()
+		closeQueryDB(qdb)
 		return nil, err
 	}
 	log.Info("resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
@@ -521,7 +521,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	out := make(chan change.Change, 1024)
 	rdr, err := reg.NewReader(ctx, qdb, refs, out)
 	if err != nil {
-		_ = qdb.Close()
+		closeQueryDB(qdb)
 		return nil, err
 	}
 	r.rdr = rdr
@@ -543,7 +543,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		if t.Bootstrap.StartAt == spec.StartAtExplicit && t.Bootstrap.Position != "" {
 			p, err := reg.ParsePosition(t.Bootstrap.Position)
 			if err != nil {
-				_ = qdb.Close()
+				closeQueryDB(qdb)
 				return nil, fmt.Errorf("runner: %s bootstrap.position %q: %w", t.Target, t.Bootstrap.Position, err)
 			}
 			explicitPositions = append(explicitPositions, p)
@@ -591,7 +591,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				})
 				if err := drivers.SetTableProperties(ctx, cat, drivers.TargetIdent(s, ref.Target), props); err != nil {
 					rdr.Close()
-					_ = qdb.Close()
+					closeQueryDB(qdb)
 					return nil, fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
 				}
 				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
@@ -606,14 +606,14 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				chunker, err := reg.NewChunker(qdb, ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
 				if err != nil {
 					rdr.Close()
-					_ = qdb.Close()
+					closeQueryDB(qdb)
 					return nil, err
 				}
 				// Read existing snapshot progress for resumable backfill.
 				progress, err := readSnapshotProgress(ctx, cat, drivers.TargetIdent(s, ref.Target))
 				if err != nil {
 					rdr.Close()
-					_ = qdb.Close()
+					closeQueryDB(qdb)
 					return nil, fmt.Errorf("runner: snapshot progress %s: %w", ref.Target, err)
 				}
 				if progress.State == snapshot.StateInProgress {
@@ -640,7 +640,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 					w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)
 				}); err != nil {
 					rdr.Close()
-					_ = qdb.Close()
+					closeQueryDB(qdb)
 					return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
 				}
 				// Snapshot complete: mark on the worker.
@@ -727,4 +727,13 @@ func (r *Runner) confirmedPosition() position.Position {
 	r.posMu.Lock()
 	defer r.posMu.Unlock()
 	return r.minConfirmed
+}
+
+// closeQueryDB closes the source query connection, tolerating a nil handle:
+// a source without SQL (kafka) returns (nil, nil) from OpenQuery, and Close on
+// a nil *sql.DB would dereference the zero receiver and panic at shutdown.
+func closeQueryDB(qdb *sql.DB) {
+	if qdb != nil {
+		_ = qdb.Close()
+	}
 }

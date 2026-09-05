@@ -258,7 +258,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("coordinator: open query db: %w", err)
 	}
-	defer func() { _ = qdb.Close() }()
+	defer func() { closeQueryDB(qdb) }()
 	c.qdb = qdb
 
 	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
@@ -1160,4 +1160,13 @@ func tableNames(refs []snapshot.TableRef) []string {
 		out[i] = r.Source
 	}
 	return out
+}
+
+// closeQueryDB closes the source query connection, tolerating a nil handle:
+// a source without SQL (kafka) returns (nil, nil) from OpenQuery, and Close on
+// a nil *sql.DB would dereference the zero receiver and panic at shutdown.
+func closeQueryDB(qdb *sql.DB) {
+	if qdb != nil {
+		_ = qdb.Close()
+	}
 }
