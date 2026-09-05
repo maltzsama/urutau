@@ -60,6 +60,10 @@ type Source struct {
 }
 
 type Sink struct {
+	// Type selects the sink implementation ("iceberg+rest"). Empty defaults
+	// to "iceberg+rest"; a future sink declares its own type and the spec
+	// names it explicitly.
+	Type         string   `json:"type,omitempty"`
 	URI          string   `json:"uri"`
 	Namespace    string   `json:"namespace"`
 	Warehouse    string   `json:"warehouse,omitempty"`

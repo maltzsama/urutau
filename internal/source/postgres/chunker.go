@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/source"
 )
 
 // Chunker splits a table by its primary key, using the chunk-skipping
@@ -83,7 +83,7 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 // Scan executes the chunk SELECT and calls fn for every row, keyed by
 // column name. Values decode through the same scalar mapping the pgoutput
 // reader uses, so snapshot rows and stream rows land in Iceberg identically.
-func (c *Chunker) Scan(ctx context.Context, ch snapshot.Chunk, fn func(row map[string]any) error) error {
+func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
 	// Row-constructor comparison keeps composite PKs lexicographic; the
 	// placeholder index runs across clauses ($1..$k, then $k+1..).
 	cond := make([]string, 0, 2)

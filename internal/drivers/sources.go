@@ -14,12 +14,11 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/adapter"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/source/kafka"
 	"github.com/maltzsama/urutau/internal/source/mysql"
 	"github.com/maltzsama/urutau/internal/source/postgres"
-	srctypes "github.com/maltzsama/urutau/internal/source/types"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -86,7 +85,7 @@ func (a mysqlSource) Caps() adapter.Capabilities {
 		ChunkQuery:        true,
 		Stream:            true,
 		MaxConnections:    10,
-		Modes:             []srctypes.Mode{srctypes.ModeCDC},
+		Modes:             []source.Mode{source.ModeCDC},
 		BeforeImage:       true,  // binlog row format always carries the deleted row
 		MonotonicSequence: false, // GTID sets grow but are not per-message coordinates
 	}
@@ -103,11 +102,11 @@ func (a mysqlSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
-		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: source %q must be db.table", t.Source)
+		return source.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: source %q must be db.table", t.Source)
 	}
 	st, err := mysql.QueryTable(ctx, db, schemaName, tableName)
 	if err != nil {
-		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: introspect %s: %w", t.Source, err)
+		return source.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: introspect %s: %w", t.Source, err)
 	}
 	pk := t.PrimaryKey
 	if len(pk) == 0 && len(st.PKColumns) > 0 {
@@ -134,11 +133,11 @@ func (a mysqlSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, is, warns, nil
 }
 
-func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {
+func (a mysqlSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (source.ChunkSource, error) {
 	return mysql.NewChunker(db, source, pk, chunkSize)
 }
 
-func (a mysqlSource) NewReader(ctx context.Context, db *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (adapter.StreamSource, error) {
+func (a mysqlSource) NewReader(ctx context.Context, db *sql.DB, refs []source.TableRef, out chan<- change.Change) (adapter.StreamSource, error) {
 	conn, err := mysql.ParseURI(a.spec.Source.URI)
 	if err != nil {
 		return nil, err
@@ -201,7 +200,7 @@ func (a postgresSource) Caps() adapter.Capabilities {
 		ChunkQuery:        true,
 		Stream:            true,
 		MaxConnections:    10,
-		Modes:             []srctypes.Mode{srctypes.ModeCDC},
+		Modes:             []source.Mode{source.ModeCDC},
 		BeforeImage:       true,  // old tuple carries the deleted row (PK-only unless REPLICA IDENTITY FULL)
 		MonotonicSequence: false, // commit LSNs are monotonic but not per-message coordinates
 	}
@@ -214,11 +213,11 @@ func (a postgresSource) OpenQuery(ctx context.Context) (*sql.DB, error) {
 func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error) {
 	schemaName, tableName, ok := strings.Cut(t.Source, ".")
 	if !ok {
-		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: source %q must be db.table", t.Source)
+		return source.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: source %q must be db.table", t.Source)
 	}
 	st, err := postgres.QueryTable(ctx, db, schemaName, tableName)
 	if err != nil {
-		return snapshot.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: introspect %s: %w", t.Source, err)
+		return source.TableRef{}, core.Schema{}, nil, nil, fmt.Errorf("drivers: introspect %s: %w", t.Source, err)
 	}
 	pk := t.PrimaryKey
 	if len(pk) == 0 && len(st.PKColumns) > 0 {
@@ -245,11 +244,11 @@ func (a postgresSource) Introspect(ctx context.Context, db *sql.DB, t spec.Table
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, is, warns, nil
 }
 
-func (a postgresSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {
+func (a postgresSource) NewChunker(db *sql.DB, source, pk string, chunkSize int) (source.ChunkSource, error) {
 	return postgres.NewChunker(db, source, pk, chunkSize)
 }
 
-func (a postgresSource) NewReader(ctx context.Context, db *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (adapter.StreamSource, error) {
+func (a postgresSource) NewReader(ctx context.Context, db *sql.DB, refs []source.TableRef, out chan<- change.Change) (adapter.StreamSource, error) {
 	slot := a.spec.Source.SlotName
 	if slot == "" {
 		return nil, fmt.Errorf("drivers: postgres source requires slotName")

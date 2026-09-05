@@ -20,8 +20,8 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/adapter"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -128,7 +128,7 @@ func (r *Registry) NewReader(ctx context.Context, db *sql.DB, refs []core.TableR
 
 // NewChunker builds the chunk SELECT source. Only a SQL-capable source has
 // one; callers must gate on SupportsQuery (or Caps().Snapshot) first.
-func (r *Registry) NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error) {
+func (r *Registry) NewChunker(db *sql.DB, source, pk string, chunkSize int) (source.ChunkSource, error) {
 	if q, ok := r.adapt.(adapter.QuerySource); ok {
 		return q.NewChunker(db, source, pk, chunkSize)
 	}

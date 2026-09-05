@@ -37,7 +37,7 @@ func TestSourcesNeverKnowSinks(t *testing.T) {
 	} {
 		d := directImports(t, pkg)
 		for imp := range d {
-			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/sink") || imp == "github.com/apache/iceberg-go" {
+			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/sink") || imp == "github.com/apache/iceberg-go" {
 				t.Errorf("%s imports %s — sources map to core.Schema", pkg, imp)
 			}
 		}

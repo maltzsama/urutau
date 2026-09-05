@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/change"
-	"github.com/maltzsama/urutau/internal/sink"
+	"github.com/maltzsama/urutau/sink"
 )
 
 type fakeCommitter struct {

@@ -10,11 +10,11 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/internal/drivers"
-	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/source/mysql"
 	"github.com/maltzsama/urutau/internal/source/postgres"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/source"
 )
 
 // chunkExecutor runs DBLog chunk SELECTs against the source (design §11.1:
@@ -104,7 +104,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	}
 
 	rows := make([]change.Change, 0, x.chunkSz)
-	err = chunker.Scan(ctx, snapshot.Chunk{Low: low, High: high}, func(row map[string]any) error {
+	err = chunker.Scan(ctx, source.Chunk{Low: low, High: high}, func(row map[string]any) error {
 		key := make([]any, 0, len(ta.PrimaryKey))
 		for _, col := range ta.PrimaryKey {
 			key = append(key, row[col])
@@ -134,7 +134,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	}}})
 }
 
-func newChunkerFor(kind string, db *sql.DB, source string, pk []string, size int) (snapshot.ChunkSource, error) {
+func newChunkerFor(kind string, db *sql.DB, source string, pk []string, size int) (source.ChunkSource, error) {
 	switch kind {
 	case "mysql":
 		return mysql.NewChunker(db, source, strings.Join(pk, ","), size)

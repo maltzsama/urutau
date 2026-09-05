@@ -12,8 +12,8 @@ import (
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/observability"
-	"github.com/maltzsama/urutau/internal/sink"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/sink"
 )
 
 // Config tunes batch accumulation.

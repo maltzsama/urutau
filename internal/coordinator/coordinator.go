@@ -39,6 +39,7 @@ import (
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 	"google.golang.org/grpc/keepalive"
 )
@@ -106,7 +107,7 @@ type Coordinator struct {
 
 	reg       *drivers.Registry
 	qdb       *sql.DB
-	refs      []snapshot.TableRef
+	refs      []source.TableRef
 	cat       catalog.Catalog
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
@@ -160,7 +161,7 @@ type Coordinator struct {
 // Flight queue, and — once it connects — its control surface.
 type workerState struct {
 	name   string
-	refs   []snapshot.TableRef
+	refs   []source.TableRef
 	queue  chan queuedBatch
 	ticket []byte
 
@@ -261,7 +262,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	defer func() { closeQueryDB(qdb) }()
 	c.qdb = qdb
 
-	refs := make([]snapshot.TableRef, 0, len(c.cfg.Spec.Tables))
+	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
 	schemas := make(map[string]*iceberg.Schema, len(c.cfg.Spec.Tables))
 	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
@@ -653,7 +654,7 @@ func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID 
 // caught-up, then releases the gated live events InWindow-tagged and the
 // Closes marker. The worker holds the chunk rows in its window; the window
 // is what InWindow events drain and the Closes marker flushes.
-func (c *Coordinator) snapshotTable(ctx context.Context, rdr snapshot.SourceReader, chunker snapshot.ChunkSource, ref snapshot.TableRef, cfg snapshot.SnapshotConfig) error {
+func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
 	bounds, err := chunker.Bounds(ctx)
 	if err != nil {
 		return err
@@ -873,9 +874,9 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
 // is the resume point, tables without one need the snapshot.
-func (c *Coordinator) resumeFrom(ctx context.Context, reg *drivers.Registry, refs []snapshot.TableRef) (position.Position, []snapshot.TableRef, error) {
+func (c *Coordinator) resumeFrom(ctx context.Context, reg *drivers.Registry, refs []source.TableRef) (position.Position, []source.TableRef, error) {
 	var positions []position.Position
-	var needsSnapshot []snapshot.TableRef
+	var needsSnapshot []source.TableRef
 	for _, ref := range refs {
 		pos, err := drivers.CommittedPosition(ctx, c.cat, drivers.TargetIdent(c.cfg.Spec, ref.Target))
 		if err != nil {
@@ -1154,7 +1155,7 @@ func randSuffix(n int) string {
 }
 
 // tableNames renders a group's source tables for the audit trail.
-func tableNames(refs []snapshot.TableRef) []string {
+func tableNames(refs []source.TableRef) []string {
 	out := make([]string, len(refs))
 	for i, r := range refs {
 		out[i] = r.Source

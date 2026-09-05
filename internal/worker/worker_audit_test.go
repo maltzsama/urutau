@@ -8,8 +8,8 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/sink"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/sink"
 )
 
 // snapChange builds a snapshot row (chunk SELECT result).

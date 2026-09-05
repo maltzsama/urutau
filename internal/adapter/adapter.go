@@ -15,21 +15,20 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/snapshot"
-	srctypes "github.com/maltzsama/urutau/internal/source/types"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
 
 // Runtime carries the replication knobs a driver passes through to the
 // source reader.
-type Runtime = srctypes.Runtime
+type Runtime = source.Runtime
 
 // Capabilities declares what a source supports.
-type Capabilities = srctypes.Capabilities
+type Capabilities = source.Capabilities
 
 // StreamSource is the replication reader surface a driver drives.
-type StreamSource = srctypes.StreamSource
+type StreamSource = source.StreamSource
 
 // Source is the per-source surface every source provides. It deliberately
 // carries NO SQL shape: introspection, reading and position are the common
@@ -48,7 +47,7 @@ type Source interface {
 	// outcomes.
 	Introspect(ctx context.Context, db *sql.DB, t spec.Table) (core.TableRef, core.Schema, *iceberg.Schema, []core.Warning, error)
 	// NewReader builds the replication reader over the pipeline's tables.
-	NewReader(ctx context.Context, db *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (StreamSource, error)
+	NewReader(ctx context.Context, db *sql.DB, refs []source.TableRef, out chan<- change.Change) (StreamSource, error)
 	// InitialPosition is the stream start for a first boot (no resume).
 	InitialPosition(ctx context.Context, db *sql.DB) (position.Position, error)
 	// ParsePosition decodes a stored cdc.position string.
@@ -65,5 +64,5 @@ type QuerySource interface {
 	// introspection, and position queries.
 	OpenQuery(ctx context.Context) (*sql.DB, error)
 	// NewChunker builds the chunk SELECT source for one table.
-	NewChunker(db *sql.DB, source, pk string, chunkSize int) (snapshot.ChunkSource, error)
+	NewChunker(db *sql.DB, source, pk string, chunkSize int) (source.ChunkSource, error)
 }

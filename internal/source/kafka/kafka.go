@@ -20,27 +20,26 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/source/kafka/decoder"
-	srctypes "github.com/maltzsama/urutau/internal/source/types"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
 
 // Source implements adapter.Source for Kafka.
 type Source struct {
 	Spec *spec.Spec
-	Rt   srctypes.Runtime
+	Rt   source.Runtime
 }
 
 // Caps reports Kafka capabilities: streaming only, no DBLog snapshot.
-func (s Source) Caps() srctypes.Capabilities {
-	return srctypes.Capabilities{
+func (s Source) Caps() source.Capabilities {
+	return source.Capabilities{
 		Snapshot:          false,
 		ChunkQuery:        false,
 		Stream:            true,
 		MaxConnections:    0, // no query connections at all
-		Modes:             []srctypes.Mode{srctypes.ModeCDC},
+		Modes:             []source.Mode{source.ModeCDC},
 		BeforeImage:       false, // deletes are tombstones (null) — no image to record
 		MonotonicSequence: true,  // (partition, offset) never reappears
 	}
@@ -165,8 +164,8 @@ func mapColumnType(ct core.ColumnType) (iceberg.Type, error) {
 // derived from the spec tables and produces changes to the output
 // channel. No consumer group is used — the consumer manages its own
 // offsets.
-func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []snapshot.TableRef, out chan<- change.Change) (srctypes.StreamSource, error) {
-	refBySource := make(map[string]snapshot.TableRef, len(refs))
+func (s Source) NewReader(ctx context.Context, _ *sql.DB, refs []source.TableRef, out chan<- change.Change) (source.StreamSource, error) {
+	refBySource := make(map[string]source.TableRef, len(refs))
 	topics := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		topics = append(topics, ref.Source)
@@ -231,7 +230,7 @@ type Reader struct {
 	// refBySource resolves a decoded source (envelope source or topic) to
 	// its full table mapping, so the change is addressed by its TARGET —
 	// the worker routes on target names.
-	refBySource map[string]snapshot.TableRef
+	refBySource map[string]source.TableRef
 
 	mu     sync.Mutex
 	synced *position.Offsets
