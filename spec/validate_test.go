@@ -31,6 +31,7 @@ func TestValidateEnrich(t *testing.T) {
 			Table:    "users",
 			Source:   EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, name FROM users"},
 			On:       map[string]string{"user_ref": "id"},
+			Select:   []string{"name", "tier"},
 			JoinType: "left",
 		}}
 		return s
@@ -74,6 +75,30 @@ func TestValidateEnrich(t *testing.T) {
 	s.Tables[0].Enrich = append(s.Tables[0].Enrich, s.Tables[0].Enrich[0])
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicated") {
 		t.Fatalf("want duplicated reference, got %v", err)
+	}
+
+	// CR-044: select is required and its grammar is closed.
+	s = base()
+	s.Tables[0].Enrich[0].Select = nil
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "select: required") {
+		t.Fatalf("want select required, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"*", "name"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), `select: "*" must be the only entry`) {
+		t.Fatalf("want star-only rule, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"name", "name"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), `select: duplicated "name"`) {
+		t.Fatalf("want duplicated select, got %v", err)
+	}
+	// The star sugar is valid, and renames ride along.
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"*"}
+	s.Tables[0].Enrich[0].As = map[string]string{"name": "user_name"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("star + rename must validate: %v", err)
 	}
 }
 

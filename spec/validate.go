@@ -386,9 +386,28 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 				*problems = append(*problems, fmt.Sprintf("%s.bufferLimits.maxWait: %q is not a duration (e.g. 30s)", ep, e.BufferLimits.MaxWait))
 			}
 		}
-		if len(e.Select) > 0 && len(e.As) > 0 {
+		// select is REQUIRED: the user declares what the reference adds,
+		// so the sink never receives unlisted columns. "*" is the one
+		// sugar (documented as careful-use: it injects everything).
+		switch {
+		case len(e.Select) == 0:
+			*problems = append(*problems, ep+`.select: required — declare the reference columns the event receives ("*" injects all of them; prefer an explicit list)`)
+		case len(e.Select) == 1 && e.Select[0] == "*":
+			// star projection; any rename is allowed (checked against the
+			// query result at first load)
+		default:
 			sel := make(map[string]bool, len(e.Select))
 			for _, s := range e.Select {
+				if s == "*" {
+					*problems = append(*problems, ep+`.select: "*" must be the only entry`)
+					continue
+				}
+				if s == "" {
+					*problems = append(*problems, ep+".select: empty column name")
+				}
+				if sel[s] {
+					*problems = append(*problems, fmt.Sprintf("%s.select: duplicated %q", ep, s))
+				}
 				sel[s] = true
 			}
 			for ref := range e.As {
@@ -397,10 +416,9 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 				}
 			}
 		}
-		// A rename colliding with an event column would overwrite live data;
-		// the destination set must be disjoint from the event's columns.
-		// The event schema is not known here, so only the same-reference
-		// collisions (two renames landing on one name) are caught.
+		// A destination colliding with an EVENT column is documented
+		// overwrite semantics (the reference column wins) — not an error.
+		// What IS an error: two renames landing on the same name.
 		dest := map[string]bool{}
 		for ref, as := range e.As {
 			if dest[as] {

@@ -407,3 +407,159 @@ func TestDeleteChangePassesThrough(t *testing.T) {
 		t.Fatalf("delete must pass untouched: %+v", out)
 	}
 }
+
+// ── CR-044: explicit projection and renaming ────────────────────────────
+
+// refRows are richer than the join needs: email and created_at exist in
+// the query result but must never reach the event unless selected.
+func refRows() []map[string]any {
+	return []map[string]any{
+		{"id": int64(1), "name": "ana", "tier": "gold", "email": "ana@x", "created_at": "2020-01-01"},
+		{"id": int64(2), "name": "beto", "tier": "silver", "email": "beto@x", "created_at": "2020-01-02"},
+	}
+}
+
+// 5.1 — Projection: only the selected columns reach the event.
+func TestProjectionOnlySelectedColumns(t *testing.T) {
+	s, _ := newTestStage(t, refCfg(nil), refRows())
+	out, err := s.applyOne(t, searchEvent(1, int64(1)))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if out[0].After["name"] != "ana" || out[0].After["tier"] != "gold" {
+		t.Fatalf("selected columns missing: %v", out[0].After)
+	}
+	for _, absent := range []string{"email", "created_at"} {
+		if _, ok := out[0].After[absent]; ok {
+			t.Fatalf("unselected column %q leaked into the event", absent)
+		}
+	}
+}
+
+// 5.2 — Renaming resolves at LOAD time: the event receives the final name.
+func TestRenameAtLoad(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) {
+		c.As = map[string]string{"name": "user_name"} // tier keeps its name
+	})
+	s, _ := newTestStage(t, cfg, refRows())
+	out, err := s.applyOne(t, searchEvent(1, int64(1)))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if out[0].After["user_name"] != "ana" {
+		t.Fatalf("rename not applied: %v", out[0].After)
+	}
+	if _, ok := out[0].After["name"]; ok {
+		t.Fatalf("original name survived the rename: %v", out[0].After)
+	}
+	if out[0].After["tier"] != "gold" {
+		t.Fatalf("unrenamed column lost: %v", out[0].After)
+	}
+}
+
+// 5.3 — Collision: selecting the join column overwrites the source's
+// value (documented semantics); renaming gives coexistence.
+func TestCollisionOverwriteAndCoexistence(t *testing.T) {
+	// Overwrite: select [id, name] — id IS the join column, explicitly
+	// listed, so the reference's id replaces the source's id.
+	cfg := refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"id", "name"}
+	})
+	s, _ := newTestStage(t, cfg, refRows())
+	out, err := s.applyOne(t, searchEvent(99, int64(1))) // source id=99
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if out[0].After["id"] != int64(1) {
+		t.Fatalf("reference id did not overwrite: %v", out[0].After)
+	}
+
+	// Coexistence: rename the join column and both survive.
+	cfgAs := refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"id", "name"}
+		c.As = map[string]string{"id": "ref_id"}
+	})
+	sAs, _ := newTestStage(t, cfgAs, refRows())
+	outAs, err := sAs.applyOne(t, searchEvent(99, int64(1)))
+	if err != nil {
+		t.Fatalf("apply as: %v", err)
+	}
+	if outAs[0].After["id"] != int64(99) || outAs[0].After["ref_id"] != int64(1) {
+		t.Fatalf("coexistence broken: %v", outAs[0].After)
+	}
+}
+
+// 5.4 — Star projection: everything except the join column lands.
+func TestStarProjectionInjectsAllButJoinKey(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"*"}
+	})
+	s, _ := newTestStage(t, cfg, refRows())
+	out, err := s.applyOne(t, searchEvent(1, int64(2)))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for _, want := range []string{"name", "tier", "email", "created_at"} {
+		if _, ok := out[0].After[want]; !ok {
+			t.Fatalf("star projection missed %q: %v", want, out[0].After)
+		}
+	}
+	// The join column is not re-injected: the source's own id (1) must
+	// survive untouched — the reference's id (2) never overwrites it
+	// under a star.
+	if out[0].After["id"] != int64(1) {
+		t.Fatalf("star let the join column overwrite the source value: %v", out[0].After)
+	}
+	if out[0].After["name"] != "beto" {
+		t.Fatalf("star values wrong: %v", out[0].After)
+	}
+}
+
+// The image itself carries ONLY the projected columns, under their final
+// names — the memory contract of the map.
+func TestImageHoldsProjectedColumnsOnly(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) {
+		c.As = map[string]string{"name": "user_name"}
+	})
+	s, _ := newTestStage(t, cfg, refRows())
+	rj := s.refs[0]
+	rj.mu.Lock()
+	img := rj.image
+	rj.mu.Unlock()
+	for k, row := range img {
+		if len(row) != len(cfg.Select) {
+			t.Fatalf("key %s: image row has %d columns, want %d: %v", k, len(row), len(cfg.Select), row)
+		}
+		if _, ok := row["user_name"]; !ok {
+			t.Fatalf("image keyed by original name, not final: %v", row)
+		}
+		if _, ok := row["name"]; ok {
+			t.Fatalf("image holds the pre-rename name: %v", row)
+		}
+	}
+}
+
+// Select listing a column the query does not return rejects the load —
+// sticky before hot.
+func TestSelectColumnMissingFromQueryRejected(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"name", "nope"}
+	})
+	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: refRows()})
+	s.Start(context.Background())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.refs[0].stickyErr() != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := s.applyOne(t, searchEvent(1, int64(1))); err == nil {
+		t.Fatal("missing select column surfaced no error")
+	}
+	s.Stop()
+}

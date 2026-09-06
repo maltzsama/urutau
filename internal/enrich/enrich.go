@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -115,6 +116,9 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 	for _, cfg := range cfgs {
 		if len(cfg.On) != 1 {
 			return nil, fmt.Errorf("enrich: reference %q: on: exactly one join pair is supported today", cfg.Table)
+		}
+		if len(cfg.Select) == 0 {
+			return nil, fmt.Errorf("enrich: reference %q: select is required — declare the reference columns the event receives (\"*\" injects all)", cfg.Table)
 		}
 		rj := &refJoin{cfg: cfg}
 		for ev, ref := range cfg.On {
@@ -262,49 +266,91 @@ func (rj *refJoin) setFirstErr(err error) {
 	rj.mu.Unlock()
 }
 
-// buildImage indexes the loaded rows and resolves the projection once:
-// select limits the columns, as renames them, and the reference side of
-// the join key must exist and be unique — the validation the spec cannot
-// do without running the query.
+// buildImage resolves the projection once and indexes the reference with
+// ONLY the projected columns, already carrying their FINAL names (as
+// renames at load, not per event). Semantics:
+//
+//   - select lists the reference columns the event receives; a listed
+//     column missing from the query result is a rejected load.
+//   - select ["*"] projects everything EXCEPT the join column — the
+//     join key lives in the event already; re-injecting it would
+//     overwrite the source's own value by accident.
+//   - as renames a selected column; unrenamed columns keep their name.
+//   - A projected name colliding with an EVENT column overwrites it —
+//     documented semantics (the reference is the point of the join);
+//     use as to give a distinct name when coexistence is wanted.
+//
+// The on-reference column is validated to exist and be unique; it is
+// projected only when explicitly listed in select.
 func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, error) {
 	if len(rows) == 0 {
 		return nil, nil, fmt.Errorf("reference query returned no rows")
 	}
-	sel := map[string]bool{}
+	if _, ok := rows[0][rj.onRef]; !ok {
+		return nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
+	}
+
+	star := len(rj.cfg.Select) == 1 && rj.cfg.Select[0] == "*"
+	sel := make(map[string]bool, len(rj.cfg.Select))
 	for _, s := range rj.cfg.Select {
 		sel[s] = true
 	}
-	take := func(refCol string) bool { return len(rj.cfg.Select) == 0 || sel[refCol] }
-
-	destSet := map[string]dest{}
-	for _, row := range rows {
-		if _, ok := row[rj.onRef]; !ok {
-			return nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
-		}
-		for refCol := range row {
-			if refCol == rj.onRef || !take(refCol) {
-				continue
+	available := map[string]bool{}
+	for col := range rows[0] {
+		available[col] = true
+	}
+	if !star {
+		for _, s := range rj.cfg.Select {
+			if !available[s] {
+				return nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
 			}
-			name := refCol
-			if as, ok := rj.cfg.As[refCol]; ok {
-				name = as
-			}
-			destSet[refCol] = dest{ref: refCol, as: name}
 		}
 	}
+
+	// Resolve the projection: reference column → destination name. Under
+	// the star it is every column except the join key.
+	projection := map[string]string{}
+	var dests []dest
+	addDest := func(refCol string) {
+		if _, done := projection[refCol]; done {
+			return
+		}
+		name := refCol
+		if as, ok := rj.cfg.As[refCol]; ok {
+			name = as
+		}
+		projection[refCol] = name
+		dests = append(dests, dest{ref: refCol, as: name})
+	}
+	if star {
+		for col := range available {
+			if col == rj.onRef {
+				continue
+			}
+			addDest(col)
+		}
+	} else {
+		for _, s := range rj.cfg.Select {
+			addDest(s)
+		}
+	}
+	// Deterministic order: the join writes by name, but reproducible
+	// column order costs nothing and makes traces comparable.
+	sort.Slice(dests, func(i, j int) bool { return dests[i].as < dests[j].as })
+
 	image := make(map[string]map[string]any, len(rows))
 	for _, row := range rows {
 		k := joinKey(row[rj.onRef])
 		if _, dup := image[k]; dup {
 			return nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
 		}
-		image[k] = row
+		projected := make(map[string]any, len(dests))
+		for refCol, name := range projection {
+			projected[name] = row[refCol]
+		}
+		image[k] = projected
 	}
-	out := make([]dest, 0, len(destSet))
-	for _, d := range destSet {
-		out = append(out, d)
-	}
-	return image, out, nil
+	return image, dests, nil
 }
 
 // Apply runs the batch through every reference in order and returns the
@@ -440,7 +486,7 @@ func (rj *refJoin) join(c *change.Change, row map[string]any) applyResult {
 		return applied
 	}
 	for _, d := range rj.currentDests() {
-		c.After[d.as] = row[d.ref]
+		c.After[d.as] = row[d.as] // the image is already projected + renamed
 	}
 	return applied
 }

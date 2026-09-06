@@ -25,6 +25,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		Table:    "users",
 		Source:   spec.EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, name FROM users"},
 		On:       map[string]string{"user_ref": "id"},
+		Select:   []string{"name"},
 		JoinType: "left",
 	}
 	build := func(t *testing.T, joinType string) (*fakeCommitter, *enrich.Stage) {
