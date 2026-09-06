@@ -34,8 +34,8 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe endpoint")
 	flag.StringVar(&image, "coordinator-image", "urutau:latest", "coordinator container image")
-	flag.BoolVar(&enableWebhook, "enable-webhook", false, "enable the admission webhook")
-	opts := zap.Options{Development: true}
+	flag.BoolVar(&enableWebhook, "enable-webhook", true, "enable the admission webhook")
+	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
