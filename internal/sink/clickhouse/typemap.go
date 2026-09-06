@@ -40,6 +40,8 @@ func chBaseType(ct core.ColumnType) (string, error) {
 		return "Int32", nil
 	case core.KindInt64:
 		return "Int64", nil
+	case core.KindUInt64:
+		return "UInt64", nil
 	case core.KindFloat32:
 		return "Float32", nil
 	case core.KindFloat64:
@@ -59,16 +61,46 @@ func chBaseType(ct core.ColumnType) (string, error) {
 		return "UUID", nil
 	case core.KindDecimal:
 		return fmt.Sprintf("Decimal(%d, %d)", ct.Precision, ct.Scale), nil
+	case core.KindList:
+		if ct.Elem == nil {
+			return "", fmt.Errorf("list requires an element type")
+		}
+		elem, err := chBaseType(*ct.Elem)
+		if err != nil {
+			return "", fmt.Errorf("list element: %w", err)
+		}
+		return "Array(" + elem + ")", nil
+	case core.KindMap:
+		if ct.KeyType == nil || ct.ValueType == nil {
+			return "", fmt.Errorf("map requires key and value types")
+		}
+		key, err := chBaseType(*ct.KeyType)
+		if err != nil {
+			return "", fmt.Errorf("map key: %w", err)
+		}
+		val, err := chBaseType(*ct.ValueType)
+		if err != nil {
+			return "", fmt.Errorf("map value: %w", err)
+		}
+		return "Map(" + key + ", " + val + ")", nil
+	case core.KindStruct:
+		if len(ct.Fields) == 0 {
+			return "", fmt.Errorf("struct requires fields")
+		}
+		parts := make([]string, len(ct.Fields))
+		for i, f := range ct.Fields {
+			ft, err := chBaseType(f.Type)
+			if err != nil {
+				return "", fmt.Errorf("struct field %q: %w", f.Name, err)
+			}
+			parts[i] = quoteIdent(f.Name) + " " + ft
+		}
+		return "Tuple(" + strings.Join(parts, ", ") + ")", nil
 	case core.KindUnknown:
 		if ct.Opaque != nil {
 			return "", fmt.Errorf("%s has no canonical form — declare an explicit cast", ct.Opaque)
 		}
 		return "", fmt.Errorf("unknown column type — declare an explicit cast")
-	case core.KindStruct, core.KindList, core.KindMap:
-		// The canonical system carries nested types (CR-034) and ClickHouse
-		// has native Array/Map; choosing the Struct shape (named Tuple vs
-		// flattened columns) is a deliberate follow-up, not a gap.
-		return "", fmt.Errorf("nested column type %s not supported yet", ct.Kind)
 	default:
 		return "", fmt.Errorf("unsupported column kind %s", ct.Kind)
 	}
@@ -141,6 +173,19 @@ func coerce(base string, v any) (any, error) {
 		case decimal.Decimal:
 			return t, nil
 		}
+	case strings.HasPrefix(base, "Array"), strings.HasPrefix(base, "Tuple"):
+		// Nested types arrive as []any from the canonical decoder.
+		if arr, ok := v.([]any); ok {
+			return arr, nil
+		}
+	case strings.HasPrefix(base, "Map"):
+		// Maps arrive as map[string]any or map[any]any from the canonical decoder.
+		if m, ok := v.(map[string]any); ok {
+			return m, nil
+		}
+		if m, ok := v.(map[any]any); ok {
+			return m, nil
+		}
 	}
 	return nil, fmt.Errorf("cannot encode %T as %s", v, base)
 }
@@ -161,6 +206,12 @@ func zeroOf(base string) any {
 		return time.Unix(0, 0).UTC()
 	case strings.HasPrefix(base, "Decimal"):
 		return decimal.Zero
+	case strings.HasPrefix(base, "Array"):
+		return []any{}
+	case strings.HasPrefix(base, "Map"):
+		return map[any]any{}
+	case strings.HasPrefix(base, "Tuple"):
+		return []any{}
 	default:
 		return int64(0)
 	}
