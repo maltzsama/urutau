@@ -19,7 +19,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test envtest-setup docs
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed envtest-setup docs
 
 all: lint test build
 
@@ -88,3 +88,29 @@ e2e-down:
 
 e2e-test: e2e-up
 	URUTAU_E2E=1 $(GO) test -count=1 -v ./test/e2e
+
+# ── E2E test groups ────────────────────────────────────────────────────
+E2E_FILTER := -count=1 -v
+
+e2e-test-mysql: e2e-up
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestMySQLPipeline$$' ./test/e2e
+
+e2e-test-postgres: e2e-up
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestPostgresPipeline$$' ./test/e2e
+
+e2e-test-clickhouse: e2e-up
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestClickHouse' ./test/e2e
+
+e2e-test-couchbase: e2e-up
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestCouchbase' ./test/e2e
+
+e2e-test-distributed: e2e-up
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestDistributed|TestWorkerSuicide|TestWorkerGracefulShutdown|TestCrashloop|TestObservability|TestWorkerRecovery' ./test/e2e
+
+e2e-test-worker: e2e-up
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestWorkerEndToEnd|TestSpike|TestNestedSpike|TestDBLog|TestEventlog' ./test/e2e
+
+# Seed: roda o pipeline MySQL e deixa os dados no Trino pra inspecionar.
+e2e-seed: e2e-up
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestMySQLPipeline$$' ./test/e2e
+	@echo "✓ MySQL pipeline rodado. Abra Trino: SELECT * FROM iceberg.raw.orders"
