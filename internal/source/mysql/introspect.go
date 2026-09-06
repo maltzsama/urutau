@@ -35,7 +35,8 @@ func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (
 
 func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableColumn, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT column_name, data_type, column_type
+		SELECT column_name, data_type, column_type,
+		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0)
 		FROM information_schema.columns
 		WHERE table_schema = ? AND table_name = ?
 		ORDER BY ordinal_position`, s, t)
@@ -47,10 +48,15 @@ func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableC
 	var out []schema.TableColumn
 	for rows.Next() {
 		var name, dataType, colType string
-		if err := rows.Scan(&name, &dataType, &colType); err != nil {
+		var precision, scale int
+		if err := rows.Scan(&name, &dataType, &colType, &precision, &scale); err != nil {
 			return nil, err
 		}
-		out = append(out, schema.TableColumn{Name: name, RawType: colType, Type: mapTypeByName(dataType)})
+		col := schema.TableColumn{Name: name, RawType: colType, Type: mapTypeByName(dataType)}
+		if col.Type == schema.TYPE_DECIMAL {
+			col.EnumValues = []string{fmt.Sprintf("%d,%d", precision, scale)}
+		}
+		out = append(out, col)
 	}
 	return out, rows.Err()
 }

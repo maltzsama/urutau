@@ -1,6 +1,8 @@
 package mysql
 
 import (
+	"fmt"
+
 	"github.com/go-mysql-org/go-mysql/schema"
 
 	"github.com/maltzsama/urutau/core"
@@ -43,7 +45,14 @@ func mapColumnType(col schema.TableColumn) core.ColumnType {
 	case schema.TYPE_FLOAT:
 		return core.ColumnType{Kind: core.KindFloat64}
 	case schema.TYPE_DECIMAL:
-		return core.ColumnType{Kind: core.KindDecimal}
+		// Precision and scale are carried via EnumValues[0] as "precision,scale"
+		// by the introspection path (queryColumns). When absent (canal runtime),
+		// both default to 0 — the sink infers its own defaults.
+		precision, scale := 0, 0
+		if len(col.EnumValues) == 1 {
+			_, _ = fmt.Sscanf(col.EnumValues[0], "%d,%d", &precision, &scale)
+		}
+		return core.ColumnType{Kind: core.KindDecimal, Precision: precision, Scale: scale}
 	case schema.TYPE_STRING, schema.TYPE_ENUM, schema.TYPE_SET:
 		return core.ColumnType{Kind: core.KindString}
 	case schema.TYPE_DATE:
