@@ -20,22 +20,24 @@ type Config struct {
 	Options   map[string]string // warehouse, client_id, client_secret, scope, …
 }
 
-// TableWriter commits one table's batches. Implementations MUST honour the
-// two invariants below; they are correctness, not style. The CDC position
-// travels inside change.Batch.Position (a serialized position string).
+// TableWriter commits one table's batches. The CDC position travels inside
+// change.Batch.Position (a serialized position string), and implementations
+// MUST honour the invariant below — it is correctness, not style:
+//
+// The position must never advance past durably written data. How each sink
+// achieves that is its own mechanism:
+//
+//   - Iceberg (transactional commits): delete-then-append in SEPARATE
+//     commits, position written only on the LAST one. Staging equality
+//     deletes and data rows in a single transaction produces two snapshots
+//     in iceberg-go v0.6.0 with the delete holding the HIGHER sequence
+//     number — it also deletes the freshly appended rows.
+//   - ClickHouse (no multi-statement transaction): the position travels on
+//     every row of ONE insert, so it can never separate from the data.
 type TableWriter interface {
-	// Commit writes the collapsed batch and the position.
-	//
-	// INVARIANT 1 (delete-then-append): equality deletes and the data rows
-	// MUST NOT be staged in a single transaction. In iceberg-go v0.6.0 that
-	// produces two snapshots with the delete holding the HIGHER sequence
-	// number, so it also deletes the freshly appended rows. Deletes commit
-	// first, data second.
-	//
-	// INVARIANT 2 (position last): the CDC position is written only on the
-	// LAST commit of the batch. Writing it on the delete commit while an
-	// append is still pending would advance the position past data that was
-	// never written — permanent loss on crash.
+	// Commit writes the collapsed batch and the position. A batch that
+	// fails must leave the table untouched — a partially applied batch is
+	// indistinguishable from data loss on resume.
 	Commit(ctx context.Context, b change.Batch) error
 
 	Close() error
