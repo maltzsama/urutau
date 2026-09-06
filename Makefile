@@ -36,8 +36,8 @@ envtest-setup:
 	$(info KUBEBUILDER_ASSETS=$(KUBEBUILDER_ASSETS))
 	@echo "export KUBEBUILDER_ASSETS=$(KUBEBUILDER_ASSETS)"
 
-docs: ## Serve Go documentation locally (localhost:8080)
-	$(BIN)/pkgsite -http=:8080 .
+docs: ## Serve Go documentation locally (http://localhost:8080/github.com/maltzsama/urutau/)
+	$(BIN)/pkgsite -http=:8080 -open .
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/urutau ./cmd/urutau
