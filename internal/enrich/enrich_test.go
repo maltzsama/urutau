@@ -73,9 +73,8 @@ func newTestStage(t *testing.T, cfg spec.Enrich, rows []map[string]any) (*Stage,
 }
 
 func (rj *refJoin) isHot() bool {
-	rj.mu.Lock()
-	defer rj.mu.Unlock()
-	return rj.hot
+	snap := rj.snap.Load()
+	return snap != nil && snap.hot
 }
 
 func (s *Stage) applyOne(t *testing.T, c change.Change) ([]change.Change, error) {
@@ -254,9 +253,9 @@ func TestBufferMaxWaitExpires(t *testing.T) {
 	time.Sleep(5 * time.Millisecond) // the parked event is now past MaxWait
 	// Pretend the reference went hot with an empty drain list... no: the
 	// real path flips hot in refresh; simulate by flipping manually.
+	img, dests, _ := buildImage(s.refs[0], usersRows())
+	s.refs[0].snap.Store(&snapshot{hot: true, image: img, dests: dests})
 	s.refs[0].mu.Lock()
-	s.refs[0].hot = true
-	s.refs[0].image, _, _ = buildImage(s.refs[0], usersRows())
 	s.refs[0].pendingDrain = s.refs[0].queue
 	s.refs[0].queue = nil
 	s.refs[0].mu.Unlock()
@@ -523,9 +522,11 @@ func TestImageHoldsProjectedColumnsOnly(t *testing.T) {
 	})
 	s, _ := newTestStage(t, cfg, refRows())
 	rj := s.refs[0]
-	rj.mu.Lock()
-	img := rj.image
-	rj.mu.Unlock()
+	snap := rj.snap.Load()
+	if snap == nil {
+		t.Fatal("snapshot not loaded")
+	}
+	img := snap.image
 	for k, row := range img {
 		if len(row) != len(cfg.Select) {
 			t.Fatalf("key %s: image row has %d columns, want %d: %v", k, len(row), len(cfg.Select), row)
