@@ -90,7 +90,7 @@ func TestResolveOpaqueUnknown(t *testing.T) {
 // criterion requires a source and a sink for every entry.
 func TestKindEnumIsClosed(t *testing.T) {
 	want := []Kind{
-		KindUnknown, KindBool, KindInt32, KindInt64, KindFloat32, KindFloat64,
+		KindUnknown, KindBool, KindInt32, KindInt64, KindUInt64, KindFloat32, KindFloat64,
 		KindDecimal, KindString, KindBinary, KindFixedBinary, KindDate, KindTime,
 		KindTimestamp, KindTimestampTZ, KindUUID, KindJSON,
 		KindStruct, KindList, KindMap,

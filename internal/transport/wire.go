@@ -163,14 +163,15 @@ func marshalArrowRecord(schema *arrow.Schema, rec arrow.RecordBatch) ([]byte, er
 }
 
 // inferBoundType picks a column's Arrow type from the first non-nil cell
-// across both bound tuples. An all-null column decodes as string/null.
+// across both bound tuples. An all-null column decodes as Null — the caller
+// reads nil for every cell, so the exact type is irrelevant.
 func inferBoundType(low, high []any, j int) (arrow.DataType, error) {
 	for _, row := range [][]any{low, high} {
 		if j < len(row) && row[j] != nil {
 			return inferArrowType(row[j])
 		}
 	}
-	return arrow.BinaryTypes.String, nil
+	return arrow.Null, nil
 }
 
 func inferArrowType(v any) (arrow.DataType, error) {
@@ -181,6 +182,16 @@ func inferArrowType(v any) (arrow.DataType, error) {
 		return arrow.PrimitiveTypes.Int32, nil
 	case int64:
 		return arrow.PrimitiveTypes.Int64, nil
+	case int:
+		return arrow.PrimitiveTypes.Int64, nil
+	case uint32:
+		return arrow.PrimitiveTypes.Uint32, nil
+	case uint64:
+		return arrow.PrimitiveTypes.Uint64, nil
+	case uint:
+		return arrow.PrimitiveTypes.Uint64, nil
+	case float32:
+		return arrow.PrimitiveTypes.Float32, nil
 	case float64:
 		return arrow.PrimitiveTypes.Float64, nil
 	case string:

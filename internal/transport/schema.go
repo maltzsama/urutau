@@ -157,6 +157,8 @@ func kindToArrowScalar(ct core.ColumnType) (arrow.DataType, error) {
 		return arrow.PrimitiveTypes.Int32, nil
 	case core.KindInt64:
 		return arrow.PrimitiveTypes.Int64, nil
+	case core.KindUInt64:
+		return arrow.PrimitiveTypes.Uint64, nil
 	case core.KindFloat32:
 		return arrow.PrimitiveTypes.Float32, nil
 	case core.KindFloat64:
