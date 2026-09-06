@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/maltzsama/urutau/driver"
 	_ "github.com/maltzsama/urutau/internal/builtin"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/runner"
@@ -48,11 +49,18 @@ func runCmd() *cobra.Command {
 		maxParallelChunks int
 		windowTimeout     time.Duration
 		eventlogURI       string
+		pluginPaths       []string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run the pipeline from a YAML spec",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Load dynamic plugins before anything else.
+			for _, p := range pluginPaths {
+				if err := driver.LoadPlugin(p); err != nil {
+					return err
+				}
+			}
 			f, err := os.Open(file)
 			if err != nil {
 				return err
@@ -93,6 +101,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().IntVar(&maxParallelChunks, "max-parallel-chunks", 0, "Max concurrent chunk SELECTs during snapshot (0 = serial; must not exceed the source driver ceiling)")
 	cmd.Flags().DurationVar(&windowTimeout, "window-timeout", 5*time.Minute, "DBLog window timeout (pathology detector)")
 	cmd.Flags().StringVar(&eventlogURI, "eventlog", "", "S3 URI for the run's JSONL audit trail (s3://bucket/prefix); AWS env supplies credentials/endpoint")
+	cmd.Flags().StringSliceVar(&pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
 	return cmd
 }
 
