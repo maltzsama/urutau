@@ -129,6 +129,10 @@ func (r *Run) Emitted() int {
 	return r.emitted
 }
 
+// putTimeout bounds a single S3 PutObject so a slow endpoint stalls only
+// this event, not the entire pipeline.
+const putTimeout = 10 * time.Second
+
 // Emit appends one event and uploads the trail. Fields are free-form; ts,
 // run_id, and kind are added automatically. Best-effort by contract:
 // callers log failures and carry on.
@@ -158,7 +162,9 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	copy(body, r.buf)
 	r.mu.Unlock()
 
-	if err := r.putter.Put(ctx, r.bucket, r.key, body); err != nil {
+	putCtx, cancel := context.WithTimeout(ctx, putTimeout)
+	defer cancel()
+	if err := r.putter.Put(putCtx, r.bucket, r.key, body); err != nil {
 		return fmt.Errorf("eventlog: put %s/%s: %w", r.bucket, r.key, err)
 	}
 	return nil

@@ -4,6 +4,7 @@ package observability
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -85,7 +86,14 @@ func (m *Metrics) Serve(addr string, encoder func(w http.ResponseWriter, r *http
 	if encoder != nil {
 		mux.HandleFunc("/statusz", encoder)
 	}
-	return http.ListenAndServe(addr, mux)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+	return srv.ListenAndServe()
 }
 
 // Registry exposes the underlying registry (for tests).
