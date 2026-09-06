@@ -164,6 +164,10 @@ func mapColumnType(dataType, rawType string) core.ColumnType {
 		return core.ColumnType{Kind: core.KindJSON}
 	case dataType == "bytea":
 		return core.ColumnType{Kind: core.KindBinary}
+	case dataType == "interval":
+		// interval is text-encoded by pgoutput; map to String so the
+		// sink stores it verbatim (no canonical numeric form).
+		return core.ColumnType{Kind: core.KindString}
 	default:
 		// xml, inet, cidr, macaddr, interval, extensions, … — no canonical
 		// form; a cast is the only way to land them. The type name is
