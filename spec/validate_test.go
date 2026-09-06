@@ -24,6 +24,84 @@ func TestValidateAcceptsMinimalUpsert(t *testing.T) {
 	}
 }
 
+func TestValidateEnrich(t *testing.T) {
+	base := func() *Spec {
+		s := validSpec()
+		s.Tables[0].Enrich = []Enrich{{
+			Table:    "users",
+			Source:   EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, name FROM users"},
+			On:       map[string]string{"user_ref": "id"},
+			Select:   []string{"name", "tier"},
+			JoinType: "left",
+		}}
+		return s
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("minimal enrich must validate: %v", err)
+	}
+
+	s := base()
+	s.Tables[0].Enrich[0].JoinType = ""
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "joinType") {
+		t.Fatalf("want joinType required, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].JoinType = "full"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "joinType") {
+		t.Fatalf("want joinType grammar, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].OnColdStart = "retry"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "onColdStart") {
+		t.Fatalf("want onColdStart grammar, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Refresh = "soon"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "refresh") {
+		t.Fatalf("want refresh duration, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Source.Query = ""
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "source.query") {
+		t.Fatalf("want source.query required, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"name"}
+	s.Tables[0].Enrich[0].As = map[string]string{"tier": "user_tier"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "as") {
+		t.Fatalf("want as-not-in-select problem, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich = append(s.Tables[0].Enrich, s.Tables[0].Enrich[0])
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("want duplicated reference, got %v", err)
+	}
+
+	// CR-044: select is required and its grammar is closed.
+	s = base()
+	s.Tables[0].Enrich[0].Select = nil
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "select: required") {
+		t.Fatalf("want select required, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"*", "name"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), `select: "*" must be the only entry`) {
+		t.Fatalf("want star-only rule, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"name", "name"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), `select: duplicated "name"`) {
+		t.Fatalf("want duplicated select, got %v", err)
+	}
+	// The star sugar is valid, and renames ride along.
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"*"}
+	s.Tables[0].Enrich[0].As = map[string]string{"name": "user_name"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("star + rename must validate: %v", err)
+	}
+}
+
 func TestValidateCommitMode(t *testing.T) {
 	s := validSpec()
 	s.Sink.CommitMode = CommitModeAtomic

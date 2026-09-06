@@ -466,6 +466,15 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 	st := map[string]any{
 		"run_id": c.runID,
 	}
+	// Point-in-time enrichment is visible to the operator: enriched columns
+	// are NOT reproducible by replay (the reference is a snapshot, not
+	// CDC), and that trade is declared, not hidden.
+	for _, t := range c.cfg.Spec.Tables {
+		if len(t.Enrich) > 0 {
+			st["enrichment"] = "point-in-time"
+			break
+		}
+	}
 	ws := map[string]*workerStatus{}
 	for name, w := range c.workers {
 		c.mu.Lock()
@@ -852,14 +861,38 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		if err != nil {
 			return nil, fmt.Errorf("coordinator: schema %s: %w", ref.Source, err)
 		}
-		assign.Tables = append(assign.Tables, &pb.TableAssignment{
+		ta := &pb.TableAssignment{
 			SourceTable:       ref.Source,
 			TargetTable:       ref.Target,
 			WriteMode:         pb.WriteMode_WRITE_MODE_UPSERT,
 			PrimaryKey:        ref.PrimaryKey,
 			CreateIfNotExists: true,
 			SchemaArrow:       schemaB,
-		})
+		}
+		// Broadcast reference joins travel with the assignment: the worker
+		// owns the join, the coordinator only forwards the declaration.
+		for _, t := range c.cfg.Spec.Tables {
+			if t.Source != ref.Source {
+				continue
+			}
+			for _, e := range t.Enrich {
+				ta.Enrich = append(ta.Enrich, &pb.EnrichRef{
+					Table:           e.Table,
+					SourceUri:       e.Source.URI,
+					SourceQuery:     e.Source.Query,
+					On:              e.On,
+					Select:          e.Select,
+					As:              e.As,
+					JoinType:        e.JoinType,
+					Refresh:         e.Refresh,
+					OnColdStart:     e.OnColdStart,
+					BufferMaxEvents: int64(e.BufferLimits.MaxEvents),
+					BufferMaxWait:   e.BufferLimits.MaxWait,
+				})
+			}
+			break
+		}
+		assign.Tables = append(assign.Tables, ta)
 	}
 	return &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Assign{Assign: assign}}, nil
 }

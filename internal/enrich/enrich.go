@@ -1,0 +1,557 @@
+// Package enrich is the table-level enrichment stage: a broadcast hash
+// join against small reference tables. The reference is read WHOLE into a
+// worker-local map (one map per reference), every batch matches against it
+// in O(rows), and the map is swapped atomically on a full periodic re-read.
+// There is no lookup per event against a database, no shuffle, no windowed
+// state — the reference is small by contract, and if it stops being small
+// the answer is a different tool, not a cache.
+//
+// Enrichment is point-in-time: the enriched columns depend on the
+// reference image when the event passed, and the image is a snapshot, not
+// CDC — a replay may therefore enrich with a different (newer) image.
+// Pipelines with enrich report enrichment "point-in-time"; the source
+// columns and the position stay deterministic either way.
+package enrich
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/spec"
+)
+
+// DefaultRefresh re-reads a reference this often when the spec is silent.
+const DefaultRefresh = 5 * time.Minute
+
+// coldStartPolicy resolves the onColdStart grammar.
+type coldStartPolicy int
+
+const (
+	coldBuffer coldStartPolicy = iota // default
+	coldPass
+	coldDrop
+)
+
+// Stage enriches one table's changes across its declared references, in
+// declaration order. Apply runs on the worker's batcher goroutine; the
+// refresh goroutines only swap images and park the drained cold-start
+// queue for the next Apply to release.
+type Stage struct {
+	refs []*refJoin
+
+	stopped chan struct{}
+	wg      sync.WaitGroup
+	log     *slog.Logger
+
+	// Counters are the evidence the stage ran, and what it cost.
+	misses       atomic.Int64 // left-join misses (events that passed with NULLs)
+	innerDropped atomic.Int64 // events an inner join discarded
+	evicted      atomic.Int64 // cold-start evacuations (maxEvents / maxWait)
+}
+
+// refJoin is one reference: its config, the hot lookup image, and the
+// cold-start queue. The image swaps atomically under mu — an in-flight
+// batch finishes against the old map, never a half-built one.
+type refJoin struct {
+	cfg    spec.Enrich
+	loader Loader
+	dests  []dest // projected reference columns, resolved at first load
+	onKey  string // event column name
+	onRef  string // reference column name
+	policy coldStartPolicy
+
+	mu    sync.Mutex
+	hot   bool
+	image map[string]map[string]any // normalized join key → reference row
+	// queue holds events absorbed before the first successful load; next
+	// is the index of the reference the event has NOT yet been joined
+	// against (the one that parked it).
+	queue []buffered
+	// pendingDrain is the queue captured at the hot flip, released into
+	// the pipeline by the next Apply (the batcher goroutine owns Apply).
+	pendingDrain []buffered
+
+	firstErr error // sticky: a broken reference surfaces on the first event
+
+	// misses is the stage-level counter, shared by reference pointers.
+	misses *atomic.Int64
+}
+
+type dest struct {
+	ref string // reference column
+	as  string // destination event column
+}
+
+// buffered is an event parked by a cold-start buffer.
+type buffered struct {
+	c      change.Change
+	next   int // reference index the event still has to pass
+	queued time.Time
+}
+
+// New builds the stage and validates the declarations against the event's
+// known columns — the checks spec.Validate cannot make without schemas:
+// the join's event side must exist, and the grammar is re-checked so a
+// spec that reached us unvalidated fails loudly here.
+func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, error) {
+	if len(cfgs) == 0 {
+		return nil, errors.New("enrich: no references declared")
+	}
+	evCols := make(map[string]bool, len(eventColumns))
+	for _, c := range eventColumns {
+		evCols[c] = true
+	}
+	s := &Stage{stopped: make(chan struct{}), log: log}
+	if s.log == nil {
+		s.log = slog.Default()
+	}
+	for _, cfg := range cfgs {
+		if len(cfg.On) != 1 {
+			return nil, fmt.Errorf("enrich: reference %q: on: exactly one join pair is supported today", cfg.Table)
+		}
+		if len(cfg.Select) == 0 {
+			return nil, fmt.Errorf("enrich: reference %q: select is required — declare the reference columns the event receives (\"*\" injects all)", cfg.Table)
+		}
+		rj := &refJoin{cfg: cfg}
+		for ev, ref := range cfg.On {
+			if !evCols[ev] {
+				return nil, fmt.Errorf("enrich: reference %q: on: event column %q is not in the table's schema", cfg.Table, ev)
+			}
+			rj.onKey, rj.onRef = ev, ref
+		}
+		switch cfg.OnColdStart {
+		case "", "buffer":
+			rj.policy = coldBuffer
+		case "pass":
+			rj.policy = coldPass
+		case "drop":
+			rj.policy = coldDrop
+		default:
+			return nil, fmt.Errorf("enrich: reference %q: onColdStart %q unknown (want buffer | pass | drop)", cfg.Table, cfg.OnColdStart)
+		}
+		if _, err := rj.refreshInterval(); err != nil {
+			return nil, err
+		}
+		rj.misses = &s.misses
+		s.refs = append(s.refs, rj)
+	}
+	return s, nil
+}
+
+// refreshInterval resolves the re-read cadence.
+func (rj *refJoin) refreshInterval() (time.Duration, error) {
+	if rj.cfg.Refresh == "" {
+		return DefaultRefresh, nil
+	}
+	d, err := time.ParseDuration(rj.cfg.Refresh)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("enrich: reference %q: refresh %q is not a positive duration", rj.cfg.Table, rj.cfg.Refresh)
+	}
+	return d, nil
+}
+
+// UseLoader overrides the SQL loader for one reference (test seam).
+func (s *Stage) UseLoader(refTable string, l Loader) error {
+	for _, rj := range s.refs {
+		if rj.cfg.Table == refTable {
+			rj.loader = l
+			return nil
+		}
+	}
+	return fmt.Errorf("enrich: no reference named %q", refTable)
+}
+
+// Start launches the first load and the refresh loop per reference —
+// asynchronously: the pipeline boots without waiting for the references,
+// and the cold-start policy governs whatever arrives early.
+func (s *Stage) Start(ctx context.Context) {
+	for _, rj := range s.refs {
+		rj := rj
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			interval, _ := rj.refreshInterval()
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			// First load immediately; a failure is sticky (it surfaces on
+			// the first event) and the ticker keeps retrying, so a
+			// reference database that boots late still comes hot.
+			rj.refresh(ctx, s.log)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.stopped:
+					return
+				case <-t.C:
+					rj.refresh(ctx, s.log)
+				}
+			}
+		}()
+	}
+}
+
+// Stop ends the refresh loops and closes SQL loaders.
+func (s *Stage) Stop() {
+	select {
+	case <-s.stopped:
+		return
+	default:
+	}
+	close(s.stopped)
+	s.wg.Wait()
+	for _, rj := range s.refs {
+		if rj.loader != nil {
+			_ = rj.loader.Close()
+		}
+	}
+}
+
+// refresh re-reads the reference and swaps the image atomically. The
+// FIRST successful load also resolves the projection and flips hot —
+// parking the cold-start queue for the next Apply to release.
+func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
+	if rj.loader == nil {
+		l, err := NewSQLLoader(rj.cfg.Source.URI, rj.cfg.Source.Query)
+		if err != nil {
+			rj.setFirstErr(err)
+			log.Error("enrich: reference loader failed (will retry)", "reference", rj.cfg.Table, "err", err)
+			return
+		}
+		rj.loader = l
+	}
+	rows, err := rj.loader.Load(ctx)
+	if err != nil {
+		rj.setFirstErr(err)
+		log.Error("enrich: reference load failed (keeping previous image, will retry)", "reference", rj.cfg.Table, "err", err)
+		return
+	}
+	image, dests, err := buildImage(rj, rows)
+	if err != nil {
+		rj.setFirstErr(err)
+		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
+		return
+	}
+	rj.mu.Lock()
+	defer rj.mu.Unlock()
+	rj.dests = dests
+	wasHot := rj.hot
+	rj.image = image
+	rj.hot = true
+	if !wasHot {
+		rj.pendingDrain = rj.queue
+		rj.queue = nil
+	}
+	log.Info("enrich: reference loaded", "reference", rj.cfg.Table, "rows", len(image))
+}
+
+// setFirstErr records a load failure. Sticky ONLY before the first
+// success: a broken join declaration is permanent, not transient — the
+// pipeline pauses on the first event instead of silently passing
+// unenriched forever. Once hot, a failed refresh is tolerated (the
+// previous image stays authoritative); the caller logs it.
+func (rj *refJoin) setFirstErr(err error) {
+	rj.mu.Lock()
+	if !rj.hot && rj.firstErr == nil {
+		rj.firstErr = err
+	}
+	rj.mu.Unlock()
+}
+
+// buildImage resolves the projection once and indexes the reference with
+// ONLY the projected columns, already carrying their FINAL names (as
+// renames at load, not per event). Semantics:
+//
+//   - select lists the reference columns the event receives; a listed
+//     column missing from the query result is a rejected load.
+//   - select ["*"] projects everything EXCEPT the join column — the
+//     join key lives in the event already; re-injecting it would
+//     overwrite the source's own value by accident.
+//   - as renames a selected column; unrenamed columns keep their name.
+//   - A projected name colliding with an EVENT column overwrites it —
+//     documented semantics (the reference is the point of the join);
+//     use as to give a distinct name when coexistence is wanted.
+//
+// The on-reference column is validated to exist and be unique; it is
+// projected only when explicitly listed in select.
+func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, error) {
+	if len(rows) == 0 {
+		return nil, nil, fmt.Errorf("reference query returned no rows")
+	}
+	if _, ok := rows[0][rj.onRef]; !ok {
+		return nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
+	}
+
+	star := len(rj.cfg.Select) == 1 && rj.cfg.Select[0] == "*"
+	sel := make(map[string]bool, len(rj.cfg.Select))
+	for _, s := range rj.cfg.Select {
+		sel[s] = true
+	}
+	available := map[string]bool{}
+	for col := range rows[0] {
+		available[col] = true
+	}
+	if !star {
+		for _, s := range rj.cfg.Select {
+			if !available[s] {
+				return nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
+			}
+		}
+	}
+
+	// Resolve the projection: reference column → destination name. Under
+	// the star it is every column except the join key.
+	projection := map[string]string{}
+	var dests []dest
+	addDest := func(refCol string) {
+		if _, done := projection[refCol]; done {
+			return
+		}
+		name := refCol
+		if as, ok := rj.cfg.As[refCol]; ok {
+			name = as
+		}
+		projection[refCol] = name
+		dests = append(dests, dest{ref: refCol, as: name})
+	}
+	if star {
+		for col := range available {
+			if col == rj.onRef {
+				continue
+			}
+			addDest(col)
+		}
+	} else {
+		for _, s := range rj.cfg.Select {
+			addDest(s)
+		}
+	}
+	// Deterministic order: the join writes by name, but reproducible
+	// column order costs nothing and makes traces comparable.
+	sort.Slice(dests, func(i, j int) bool { return dests[i].as < dests[j].as })
+
+	image := make(map[string]map[string]any, len(rows))
+	for _, row := range rows {
+		k := joinKey(row[rj.onRef])
+		if _, dup := image[k]; dup {
+			return nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
+		}
+		projected := make(map[string]any, len(dests))
+		for refCol, name := range projection {
+			projected[name] = row[refCol]
+		}
+		image[k] = projected
+	}
+	return image, dests, nil
+}
+
+// Apply runs the batch through every reference in order and returns the
+// events that survived: joined, miss-marked, or drained from a cold-start
+// buffer. Dropped events (inner miss, drop policy) vanish — dropping IS
+// their effect, and the batch position advances past them.
+func (s *Stage) Enrich(changes []change.Change) ([]change.Change, error) {
+	out := make([]change.Change, 0, len(changes))
+	// Release cold-start queues first: FIFO order beats the new traffic.
+	for i, rj := range s.refs {
+		for _, b := range rj.takeDrained() {
+			// MaxWait: an event parked past the cap follows the join type
+			// at drain time — latency bound, not a third policy.
+			if wait := rj.maxWait(); wait > 0 && time.Since(b.queued) > wait {
+				s.evicted.Add(1)
+				s.forceMiss(i, b.c, &out)
+				continue
+			}
+			s.applyFrom(i, b.c, &out)
+		}
+	}
+	for _, c := range changes {
+		s.applyFrom(0, c, &out)
+	}
+	// A sticky first-load error pauses the pipeline on the first event —
+	// never silently pass unenriched rows.
+	for _, rj := range s.refs {
+		if err := rj.stickyErr(); err != nil {
+			return nil, fmt.Errorf("enrich: reference %q: %w", rj.cfg.Table, err)
+		}
+	}
+	return out, nil
+}
+
+// applyFrom pushes one change through references starting at i.
+func (s *Stage) applyFrom(i int, c change.Change, out *[]change.Change) {
+	for ; i < len(s.refs); i++ {
+		rj := s.refs[i]
+		switch rj.apply(&c) {
+		case applied:
+			// continue to the next reference
+		case dropped:
+			s.innerDropped.Add(1)
+			return
+		case parked:
+			s.enqueue(rj, i, c, out)
+			return
+		}
+	}
+	*out = append(*out, c)
+}
+
+// forceMiss joins a change against reference i as a miss (whatever the
+// event was, it will not be matched) and continues downstream.
+func (s *Stage) forceMiss(i int, c change.Change, out *[]change.Change) {
+	if c.After == nil {
+		return // nothing to enrich; a key-only delete just vanishes
+	}
+	rj := s.refs[i]
+	if rj.join(&c, nil) == applied {
+		s.applyFrom(i+1, c, out)
+	}
+}
+
+// enqueue parks a change in a cold-start buffer, evacuating the oldest
+// when MaxEvents is exceeded. An evacuated change follows the join type —
+// the buffer's bounds are a latency/memory contract, not a third policy.
+func (s *Stage) enqueue(rj *refJoin, at int, c change.Change, out *[]change.Change) {
+	rj.mu.Lock()
+	max := rj.cfg.BufferLimits.MaxEvents
+	var evicted []change.Change
+	for max > 0 && len(rj.queue) >= max {
+		evicted = append(evicted, rj.queue[0].c)
+		rj.queue = rj.queue[1:]
+	}
+	rj.queue = append(rj.queue, buffered{c: c, next: at, queued: time.Now()})
+	rj.mu.Unlock()
+	for _, e := range evicted {
+		s.evicted.Add(1)
+		s.forceMiss(at, e, out)
+	}
+}
+
+type applyResult int
+
+const (
+	applied applyResult = iota
+	dropped
+	parked
+)
+
+// apply joins one change against this reference, mutating After in place.
+func (rj *refJoin) apply(c *change.Change) applyResult {
+	rj.mu.Lock()
+	hot := rj.hot
+	image := rj.image
+	rj.mu.Unlock()
+
+	if !hot {
+		switch rj.policy {
+		case coldDrop:
+			return dropped
+		case coldPass:
+			// Cold map: every lookup misses; the miss follows the join
+			// type. Reference columns are unknown until the first load,
+			// so a cold left-miss marks the row without adding NULLs.
+			return rj.join(c, nil)
+		default: // coldBuffer
+			return parked
+		}
+	}
+	if c.After == nil {
+		// A key-only delete carries nothing to enrich.
+		return applied
+	}
+	return rj.join(c, image[joinKey(c.After[rj.onKey])])
+}
+
+// join materializes the hit or the miss. A miss in a left join passes the
+// event with NULL reference columns and marks it; an inner join drops it.
+// That grammar is the ONLY miss policy — cold start, eviction and expiry
+// all route through it.
+func (rj *refJoin) join(c *change.Change, row map[string]any) applyResult {
+	if row == nil {
+		rj.misses.Add(1)
+		if rj.cfg.JoinType == "inner" {
+			return dropped
+		}
+		for _, d := range rj.currentDests() {
+			c.After[d.as] = nil
+		}
+		c.EnrichMiss = true
+		return applied
+	}
+	for _, d := range rj.currentDests() {
+		c.After[d.as] = row[d.as] // the image is already projected + renamed
+	}
+	return applied
+}
+
+func (rj *refJoin) currentDests() []dest {
+	rj.mu.Lock()
+	defer rj.mu.Unlock()
+	return rj.dests
+}
+
+func (rj *refJoin) stickyErr() error {
+	rj.mu.Lock()
+	defer rj.mu.Unlock()
+	return rj.firstErr
+}
+
+func (rj *refJoin) maxWait() time.Duration {
+	if rj.cfg.BufferLimits.MaxWait == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(rj.cfg.BufferLimits.MaxWait)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// takeDrained returns (and clears) the queue captured at the hot flip.
+func (rj *refJoin) takeDrained() []buffered {
+	rj.mu.Lock()
+	q := rj.pendingDrain
+	rj.pendingDrain = nil
+	rj.mu.Unlock()
+	return q
+}
+
+// joinKey renders a join value into the map key. Numeric families
+// normalize (drivers disagree on int widths), []byte becomes string; a
+// string "5" and an int64 5 stay DISTINCT — the cast lives in the
+// reference query's SQL, not in silent coercion.
+func joinKey(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return "nil"
+	case string:
+		return "s:" + t
+	case []byte:
+		return "s:" + string(t)
+	case int:
+		return strconv.FormatInt(int64(t), 10)
+	case int32:
+		return strconv.FormatInt(int64(t), 10)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case uint:
+		return "u:" + strconv.FormatUint(uint64(t), 10)
+	case uint32:
+		return "u:" + strconv.FormatUint(uint64(t), 10)
+	case uint64:
+		return "u:" + strconv.FormatUint(t, 10)
+	case float32:
+		return "f:" + strconv.FormatFloat(float64(t), 'g', -1, 64)
+	case float64:
+		return "f:" + strconv.FormatFloat(t, 'g', -1, 64)
+	default:
+		return change.KeyString([]any{v})
+	}
+}

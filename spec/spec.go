@@ -141,6 +141,63 @@ type Table struct {
 	Columns map[string]string `json:"columns,omitempty"`
 	// Bootstrap configures how the initial snapshot is handled.
 	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
+	// Enrich joins each event against reference tables loaded in memory
+	// (broadcast hash join): the reference is read whole at boot and fully
+	// re-read on a refresh interval — never CDC'd, never queried per event.
+	// Applied in declaration order; an inner-join miss at any reference
+	// drops the event.
+	Enrich []Enrich `json:"enrich,omitempty"`
+}
+
+// Enrich declares one broadcast reference join. The reference table is
+// small by contract: it must fit the worker's RAM, because it is held
+// whole as a map keyed by the join column.
+type Enrich struct {
+	// Table names the reference (diagnostics and duplicate detection).
+	Table string `json:"table"`
+	// Source is the reference read: a plain SQL connection and a query
+	// returning the full reference image. Types matter at the join: cast
+	// in SQL (CAST(id AS CHAR)) when the event column's type differs.
+	Source EnrichSource `json:"source"`
+	// On maps event column → reference column (the join key pair). One
+	// pair today; a composite key is a future need, not a current one.
+	On map[string]string `json:"on"`
+	// Select limits the reference columns taken; empty takes all.
+	Select []string `json:"select,omitempty"`
+	// As renames reference columns on the way into the event (ref column
+	// → destination name). Keys must appear in Select when Select is set.
+	As map[string]string `json:"as,omitempty"`
+	// JoinType is required — there is no universal miss policy: left
+	// passes the event with NULL reference columns (and enrich_miss when
+	// declared), inner drops the event.
+	JoinType string `json:"joinType"`
+	// Refresh is the full re-read interval (e.g. 5m). Empty means the
+	// default (5m). A refresh swaps the map atomically: in-flight events
+	// finish on the old image.
+	Refresh string `json:"refresh,omitempty"`
+	// OnColdStart governs events that arrive before the first reference
+	// load completes: buffer (default) holds them up to BufferLimits and
+	// drains in order once the reference is hot; pass processes them
+	// immediately against the cold map (a miss follows JoinType); drop
+	// discards them.
+	OnColdStart string `json:"onColdStart,omitempty"`
+	// BufferLimits bounds the cold-start queue: MaxEvents caps memory
+	// (the oldest event is evacuated, and follows JoinType), MaxWait caps
+	// latency (an event queued longer follows JoinType at drain time).
+	BufferLimits EnrichBufferLimits `json:"bufferLimits,omitempty"`
+}
+
+// EnrichSource is where a reference table is read from.
+type EnrichSource struct {
+	URI   string `json:"uri"`
+	Query string `json:"query"`
+}
+
+// EnrichBufferLimits bounds the cold-start buffer. Both are optional; a
+// zero disables that bound.
+type EnrichBufferLimits struct {
+	MaxEvents int    `json:"maxEvents,omitempty"`
+	MaxWait   string `json:"maxWait,omitempty"`
 }
 
 // OnDelete declares how a DELETE is represented in append-only tables
