@@ -31,6 +31,10 @@ import (
 // DefaultRefresh re-reads a reference this often when the spec is silent.
 const DefaultRefresh = 5 * time.Minute
 
+// defaultMaxEvents caps the cold-start buffer when the spec leaves
+// BufferLimits.MaxEvents at zero (the Go int zero value).
+const defaultMaxEvents = 100_000
+
 // coldStartPolicy resolves the onColdStart grammar.
 type coldStartPolicy int
 
@@ -421,6 +425,9 @@ func (s *Stage) forceMiss(i int, c change.Change, out *[]change.Change) {
 func (s *Stage) enqueue(rj *refJoin, at int, c change.Change, out *[]change.Change) {
 	rj.mu.Lock()
 	max := rj.cfg.BufferLimits.MaxEvents
+	if max <= 0 {
+		max = defaultMaxEvents
+	}
 	var evicted []change.Change
 	for max > 0 && len(rj.queue) >= max {
 		evicted = append(evicted, rj.queue[0].c)
@@ -503,6 +510,11 @@ func (rj *refJoin) stickyErr() error {
 	return rj.firstErr
 }
 
+// maxWait parses the optional latency cap. The value is checked at drain
+// time (Enrich), not per-event during the buffer — events that exceed
+// maxWait are evicted when the cold-start queue is released, not on a
+// background timer. This is a deliberate simplicity trade-off: the drain
+// is a single pass that handles all events at once.
 func (rj *refJoin) maxWait() time.Duration {
 	if rj.cfg.BufferLimits.MaxWait == "" {
 		return 0
@@ -536,11 +548,11 @@ func joinKey(v any) string {
 	case []byte:
 		return "s:" + string(t)
 	case int:
-		return strconv.FormatInt(int64(t), 10)
+		return "i:" + strconv.FormatInt(int64(t), 10)
 	case int32:
-		return strconv.FormatInt(int64(t), 10)
+		return "i:" + strconv.FormatInt(int64(t), 10)
 	case int64:
-		return strconv.FormatInt(t, 10)
+		return "i:" + strconv.FormatInt(t, 10)
 	case uint:
 		return "u:" + strconv.FormatUint(uint64(t), 10)
 	case uint32:
