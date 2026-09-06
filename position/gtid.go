@@ -201,7 +201,9 @@ func (g *GTID) String() string {
 
 // Compare orders sets. Containment is the natural order: a set containing
 // another is greater. Incomparable sets (disjoint uuid universes) fall back
-// to their maximum transaction number.
+// to their maximum transaction number — a heuristic that may return 0 for
+// sets that are structurally different (e.g. uuid1:1 vs uuid2:1). Callers
+// that need strict equality should also check Contains in both directions.
 func (g *GTID) Compare(other Position) int {
 	o, ok := other.(*GTID)
 	if !ok {

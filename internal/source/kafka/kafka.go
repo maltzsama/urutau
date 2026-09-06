@@ -33,13 +33,14 @@ type Source struct {
 
 func capabilities() source.Capabilities {
 	return source.Capabilities{
-		Snapshot:          false,
-		ChunkQuery:        false,
-		Stream:            true,
-		MaxConnections:    0, // no query connections at all
-		Modes:             []source.Mode{source.ModeCDC},
-		BeforeImage:       false, // deletes are tombstones (null) — no image to record
-		MonotonicSequence: true,  // (partition, offset) never reappears
+		Snapshot:            false,
+		ChunkQuery:          false,
+		Stream:              true,
+		MaxConnections:      0, // no query connections at all
+		Modes:               []source.Mode{source.ModeCDC},
+		BeforeImage:         false, // deletes are tombstones (null) — no image to record
+		MonotonicSequence:   true,  // (partition, offset) never reappears
+		RecoverablePosition: true,  // offsets allow exact resume
 	}
 }
 

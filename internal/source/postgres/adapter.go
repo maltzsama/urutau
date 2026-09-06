@@ -26,13 +26,14 @@ type Source struct {
 
 func capabilities() source.Capabilities {
 	return source.Capabilities{
-		Snapshot:          true,
-		ChunkQuery:        true,
-		Stream:            true,
-		MaxConnections:    10,
-		Modes:             []source.Mode{source.ModeCDC},
-		BeforeImage:       true,  // old tuple carries the deleted row (PK-only unless REPLICA IDENTITY FULL)
-		MonotonicSequence: false, // commit LSNs are monotonic but not per-message coordinates
+		Snapshot:            true,
+		ChunkQuery:          true,
+		Stream:              true,
+		MaxConnections:      10,
+		Modes:               []source.Mode{source.ModeCDC},
+		BeforeImage:         true,  // old tuple carries the deleted row (PK-only unless REPLICA IDENTITY FULL)
+		MonotonicSequence:   false, // commit LSNs are monotonic but not per-message coordinates
+		RecoverablePosition: true,  // LSN allows exact resume
 	}
 }
 

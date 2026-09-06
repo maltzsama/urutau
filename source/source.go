@@ -60,6 +60,11 @@ type Capabilities struct {
 	// message never reappears (Kafka offset, Kinesis sequence) — the
 	// property append-idempotent relies on.
 	MonotonicSequence bool
+	// RecoverablePosition reports whether the source's position can be
+	// used to resume exactly from where it left off. Sources without
+	// replay (TCP firehose, webhooks) must declare false so the
+	// coordinator does not attempt gapless recovery on them.
+	RecoverablePosition bool
 }
 
 // Runtime carries the replication knobs a driver passes through to the
