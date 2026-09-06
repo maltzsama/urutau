@@ -1,7 +1,6 @@
 package couchbase
 
 import (
-	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -58,10 +57,9 @@ func (p *tablePlan) buildDoc(c change.Change) (map[string]any, map[string]any, e
 }
 
 // jsonValue converts a canonical Go value into its JSON document form.
-// Nested composites recurse; leaves use their natural JSON encoding, with
-// two deliberate exceptions: UUIDs render hyphenated (queryable, not
-// base64 noise) and []byte leaves inside composites fall to encoding/json's
-// base64 (documented).
+// Nested composites recurse; leaves use their natural JSON encoding.
+// KindUUID columns arrive as string after the cast converts them; raw
+// []byte values are left for encoding/json to base64-encode.
 func jsonValue(v any) (any, error) {
 	switch t := v.(type) {
 	case nil:
@@ -69,11 +67,9 @@ func jsonValue(v any) (any, error) {
 	case bool, string, int32, int64, float32, float64, time.Time:
 		return v, nil
 	case []byte:
-		// A bare 16-byte value is a UUID by convention (the canonical
-		// KindUUID wire form); longer binaries stay base64 via encoding/json.
-		if len(t) == 16 {
-			return formatUUID(t), nil
-		}
+		// Binary data serializes to base64 via encoding/json. The cast
+		// system already converts KindUUID to hyphenated string; raw
+		// []byte of length 16 is NOT assumed to be a UUID.
 		return v, nil
 	case map[string]any:
 		out := make(map[string]any, len(t))
@@ -98,23 +94,6 @@ func jsonValue(v any) (any, error) {
 	default:
 		return nil, fmt.Errorf("couchbase: unsupported value type %T", v)
 	}
-}
-
-// formatUUID renders 16 raw bytes as the canonical hyphenated form — the
-// same rendering the Iceberg sink parses back with hex (uuidToBytes there,
-// formatting here).
-func formatUUID(b []byte) string {
-	dst := make([]byte, 36)
-	hex.Encode(dst[0:8], b[0:4])
-	dst[8] = '-'
-	hex.Encode(dst[9:13], b[4:6])
-	dst[13] = '-'
-	hex.Encode(dst[14:18], b[6:8])
-	dst[18] = '-'
-	hex.Encode(dst[19:23], b[8:10])
-	dst[23] = '-'
-	hex.Encode(dst[24:36], b[10:16])
-	return string(dst)
 }
 
 // metaValue resolves one metadata key to its concrete value for a change.

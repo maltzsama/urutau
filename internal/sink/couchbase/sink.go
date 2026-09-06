@@ -381,7 +381,10 @@ func (t *realTx) run(ctx context.Context, fn func(tx kvStore) error) error {
 	// Timeout, and the SDK retries transient failures itself.
 	_, err := t.txns.Run(func(ac *gocb.TransactionAttemptContext) error {
 		return fn(&txAttempt{ac: ac, coll: t.coll})
-	}, &gocb.TransactionOptions{DurabilityLevel: t.dur})
+	}, &gocb.TransactionOptions{
+		DurabilityLevel: t.dur,
+		Timeout:         30 * time.Second,
+	})
 	return err
 }
 
