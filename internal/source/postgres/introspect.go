@@ -121,7 +121,7 @@ func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
 func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 	cols := make([]core.Column, 0, len(tbl.Columns))
 	for _, col := range tbl.Columns {
-		cols = append(cols, core.Column{Name: col.Name, Type: mapColumnType(col)})
+		cols = append(cols, core.Column{Name: col.Name, Type: mapColumnType(col.DataType, col.DataType)})
 	}
 	var pk []string
 	for _, idx := range tbl.PKColumns {
@@ -137,37 +137,60 @@ func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 // the canonical value (the pgoutput text form round-trips losslessly, and
 // the snapshot chunker produces the same text). Unmappable types become
 // KindUnknown so a declared cast is the only way to land them.
-func mapColumnType(col Column) core.ColumnType {
-	switch strings.ToLower(col.DataType) {
-	case "smallint", "integer", "bigint":
+func mapColumnType(dataType, rawType string) core.ColumnType {
+	switch {
+	case dataType == "smallint", dataType == "integer", dataType == "bigint":
 		return core.ColumnType{Kind: core.KindInt64}
-	case "real", "double precision", "money":
+	case dataType == "real", dataType == "double precision", dataType == "money":
 		return core.ColumnType{Kind: core.KindFloat64}
-	case "numeric":
-		return core.ColumnType{Kind: core.KindDecimal}
-	case "boolean":
+	case strings.HasPrefix(dataType, "numeric"):
+		precision, scale := parseNumericPrecision(rawType)
+		return core.ColumnType{Kind: core.KindDecimal, Precision: precision, Scale: scale}
+	case dataType == "boolean":
 		return core.ColumnType{Kind: core.KindBool}
-	case "character varying", "character", "text", "citext":
+	case dataType == "character varying", dataType == "character", dataType == "text", dataType == "citext":
 		return core.ColumnType{Kind: core.KindString}
-	case "date":
+	case dataType == "date":
 		return core.ColumnType{Kind: core.KindDate}
-	case "time without time zone", "time with time zone":
+	case dataType == "time without time zone", dataType == "time with time zone":
 		return core.ColumnType{Kind: core.KindTime}
-	case "timestamp without time zone":
+	case dataType == "timestamp without time zone":
 		return core.ColumnType{Kind: core.KindTimestamp}
-	case "timestamp with time zone":
+	case dataType == "timestamp with time zone":
 		return core.ColumnType{Kind: core.KindTimestampTZ}
-	case "uuid":
+	case dataType == "uuid":
 		return core.ColumnType{Kind: core.KindUUID}
-	case "json", "jsonb":
+	case dataType == "json", dataType == "jsonb":
 		return core.ColumnType{Kind: core.KindJSON}
-	case "bytea":
+	case dataType == "bytea":
 		return core.ColumnType{Kind: core.KindBinary}
 	default:
 		// xml, inet, cidr, macaddr, interval, extensions, … — no canonical
-		// form; a cast is the only way to land these columns. The type name
-		// is carried so the validation error says what the valve is holding.
+		// form; a cast is the only way to land them. The type name is
+		// carried so the validation error says what the valve is holding.
 		return core.ColumnType{Kind: core.KindUnknown,
-			Opaque: &core.OpaqueOrigin{TypeName: col.DataType, VendorName: "postgres"}}
+			Opaque: &core.OpaqueOrigin{TypeName: rawType, VendorName: "postgres"}}
 	}
+}
+
+// parseNumericPrecision extracts precision and scale from a PostgreSQL
+// numeric type string like "numeric(10,2)". Returns 0,0 when absent.
+func parseNumericPrecision(s string) (precision, scale int) {
+	s = strings.TrimPrefix(s, "numeric")
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "(") {
+		return 0, 0
+	}
+	s = strings.TrimPrefix(s, "(")
+	s = strings.TrimSuffix(s, ")")
+	parts := strings.Split(s, ",")
+	if len(parts) == 1 {
+		_, _ = fmt.Sscanf(parts[0], "%d", &precision)
+		return precision, 0
+	}
+	if len(parts) == 2 {
+		_, _ = fmt.Sscanf(parts[0], "%d", &precision)
+		_, _ = fmt.Sscanf(parts[1], "%d", &scale)
+	}
+	return precision, scale
 }
