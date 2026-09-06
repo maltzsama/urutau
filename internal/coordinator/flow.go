@@ -107,6 +107,7 @@ type positionIndex struct {
 	head  []inflightBatch
 	acked map[string]position.Position
 	runID string
+	dirty bool // set on add/truncate; cleared by MarkClean
 }
 
 func newPositionIndex(runID string) *positionIndex {
@@ -117,6 +118,21 @@ func (p *positionIndex) add(b inflightBatch) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.head = append(p.head, b)
+	p.dirty = true
+}
+
+// Dirty reports whether the manifest changed since the last MarkClean.
+func (p *positionIndex) Dirty() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dirty
+}
+
+// MarkClean clears the dirty flag after a successful checkpoint write.
+func (p *positionIndex) MarkClean() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dirty = false
 }
 
 // Manifest snapshots the acked positions and the in-flight batch-id range
@@ -158,6 +174,7 @@ func (p *positionIndex) truncate(table string, pos position.Position) int64 {
 	defer p.mu.Unlock()
 	if cur, ok := p.acked[table]; !ok || pos.Compare(cur) > 0 {
 		p.acked[table] = pos
+		p.dirty = true
 	}
 	var freed int64
 	for len(p.head) > 0 {
@@ -171,6 +188,7 @@ func (p *positionIndex) truncate(table string, pos position.Position) int64 {
 		}
 		freed += h.bytes
 		p.head = p.head[1:]
+		p.dirty = true
 	}
 	return freed
 }
