@@ -11,6 +11,7 @@
 package eventlog
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -224,7 +225,7 @@ func (p *s3Putter) Put(ctx context.Context, bucket, key string, body []byte) err
 	_, err := p.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-		Body:   strings.NewReader(string(body)),
+		Body:   bytes.NewReader(body),
 	})
 	return err
 }

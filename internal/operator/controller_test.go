@@ -133,6 +133,18 @@ func TestReconcilerCreatesCoordinator(t *testing.T) {
 	cr.Spec.Coordinator.Supervision.AckTimeout = "30s"
 	cr.Spec.Coordinator.MetricsAddr = ":9090"
 	cr.Spec.Secrets = urutauv1alpha1.Secrets{Source: "mysql-creds", Catalog: "polaris-creds"}
+
+	// Create the referenced secrets so the reconciler's validation passes.
+	for _, name := range []string{"mysql-creds", "polaris-creds"} {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: nsName},
+			StringData: map[string]string{"uri": "test://placeholder"},
+		}
+		if err := cli.Create(testCtx, secret); err != nil {
+			t.Fatalf("create secret %s: %v", name, err)
+		}
+	}
+
 	if err := cli.Create(testCtx, cr); err != nil {
 		t.Fatalf("create CR: %v", err)
 	}

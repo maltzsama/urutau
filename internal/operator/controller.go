@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -156,6 +157,14 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// Validate that referenced secrets exist before creating the StatefulSet.
+	// A missing secret would cause the pod to fail at startup with a cryptic
+	// error; catching it here gives the operator a clear terminal state.
+	if err := r.validateSecrets(ctx, cr); err != nil {
+		r.markTerminated(ctx, cr, "SecretValidationFailed", err.Error())
+		return ctrl.Result{}, nil
+	}
+
 	sts := coordinatorStatefulSet(cr, r.Image)
 	if err := controllerutil.SetControllerReference(cr, sts, r.Scheme()); err != nil {
 		return ctrl.Result{}, err
@@ -250,6 +259,11 @@ func (r *CoordinatorReconciler) ensure(ctx context.Context, desired client.Objec
 		}
 	}
 	desired.SetResourceVersion(existing.GetResourceVersion())
+	// Skip the update if the desired state is identical to the live state.
+	// This avoids unnecessary API writes on every reconcile.
+	if reflect.DeepEqual(existing, desired) {
+		return nil
+	}
 	if err := r.Update(ctx, desired); err != nil {
 		return fmt.Errorf("update %s: %w", what, err)
 	}
@@ -493,3 +507,23 @@ func coordinatorEnv(cr *urutauv1alpha1.CDCPipeline) []corev1.EnvVar {
 }
 
 func int32Ptr(v int32) *int32 { return &v }
+
+// validateSecrets checks that the Secrets referenced by the CR exist in the
+// cluster. Missing secrets cause pods to fail at startup; catching them here
+// gives a clear terminal state instead of a cryptic CrashLoopBackOff.
+func (r *CoordinatorReconciler) validateSecrets(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) error {
+	for _, name := range []string{cr.Spec.Secrets.Source, cr.Spec.Secrets.Catalog} {
+		if name == "" {
+			continue
+		}
+		secret := &corev1.Secret{}
+		key := types.NamespacedName{Name: name, Namespace: cr.Namespace}
+		if err := r.Get(ctx, key, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("secret %q not found in namespace %q", name, cr.Namespace)
+			}
+			return fmt.Errorf("check secret %q: %w", name, err)
+		}
+	}
+	return nil
+}
