@@ -20,10 +20,12 @@ import (
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // RemoteConfig wires one distributed worker: where the coordinator lives,
@@ -43,6 +45,38 @@ type RemoteConfig struct {
 	// the coordinator's supervisor sees a stale worker — the crashloop
 	// proof.
 	FaultStopAck bool
+}
+
+// buildEnrichStage converts an assignment's reference joins into the
+// worker-local enrichment stage.
+func buildEnrichStage(refs []*pb.EnrichRef, target string, eventColumns []string, log *slog.Logger) (*enrich.Stage, error) {
+	cfgs := make([]spec.Enrich, 0, len(refs))
+	for _, e := range refs {
+		cfgs = append(cfgs, spec.Enrich{
+			Table: e.Table,
+			Source: spec.EnrichSource{
+				URI:   e.SourceUri,
+				Query: e.SourceQuery,
+			},
+			On:           e.On,
+			Select:       e.Select,
+			As:           e.As,
+			JoinType:     e.JoinType,
+			Refresh:      e.Refresh,
+			OnColdStart:  e.OnColdStart,
+			BufferLimits: spec.EnrichBufferLimits{MaxEvents: int(e.BufferMaxEvents), MaxWait: e.BufferMaxWait},
+		})
+	}
+	return enrich.New(cfgs, eventColumns, log)
+}
+
+// columnNames lists a schema's columns for the enrich boot validation.
+func columnNames(s core.Schema) []string {
+	names := make([]string, 0, len(s.Columns))
+	for _, c := range s.Columns {
+		names = append(names, c.Name)
+	}
+	return names
 }
 
 // sessionSender serializes Session sends: grpc client streams are not
@@ -144,6 +178,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
 	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
+	var stages []*enrich.Stage
 	pkByTable := make(map[string][]string, len(assign.Tables))
 	for _, ta := range assign.Tables {
 		// The assignment schema arrives as Arrow IPC derived from the
@@ -169,7 +204,26 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		// The drift check knows the assigned canonical schema — with its
 		// types, so a field added inside a struct column is caught too.
 		w.SetKnownSchema(ta.TargetTable, cs)
+		// Broadcast reference joins arrive with the assignment; the stage
+		// validates the event side against the assigned schema here and
+		// loads its references asynchronously (cold-start policy applies).
+		if len(ta.Enrich) > 0 {
+			st, err := buildEnrichStage(ta.Enrich, ta.TargetTable, columnNames(cs), cfg.Logger)
+			if err != nil {
+				return err
+			}
+			st.Start(ctx)
+			stages = append(stages, st)
+			w.SetEnricher(ta.TargetTable, st)
+		}
 	}
+	// The stages' refresh loops live on sessCtx: they die with the session.
+	// Close, though, is deterministic — after the pipelines drain.
+	defer func() {
+		for _, st := range stages {
+			st.Stop()
+		}
+	}()
 	w.OnSchemaDrift(func(d SchemaDrift) {
 		cfg.Logger.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
 			"action", "coordinator must assign a schema with the column; declare it in the spec")

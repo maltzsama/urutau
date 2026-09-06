@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/maltzsama/urutau/core"
 )
@@ -171,6 +172,7 @@ func (s *Spec) Validate() error {
 		validateCast(tbl, p, &problems)
 		validatePartitionBy(tbl, p, &problems)
 		validateBootstrap(tbl, p, &problems)
+		validateEnrich(tbl, p, &problems)
 	}
 
 	if len(problems) > 0 {
@@ -329,6 +331,83 @@ func validateBootstrap(tbl Table, path string, problems *[]string) {
 	if tbl.Bootstrap.Position != "" && tbl.Bootstrap.StartAt != StartAtExplicit {
 		*problems = append(*problems, fmt.Sprintf(
 			"%s.bootstrap.startAt: must be \"explicit\" when a position is set", path))
+	}
+}
+
+// validateEnrich checks the broadcast reference join declarations.
+// Structural only — whether the join columns exist in both schemas is a
+// boot-time check in internal/enrich, which holds the reference image and
+// the event schema. Every knob that changes correctness (joinType, cold
+// start) is closed-grammar here.
+func validateEnrich(tbl Table, path string, problems *[]string) {
+	if len(tbl.Enrich) == 0 {
+		return
+	}
+	seen := map[string]bool{}
+	for i, e := range tbl.Enrich {
+		ep := fmt.Sprintf("%s.enrich[%d]", path, i)
+		if e.Table == "" {
+			*problems = append(*problems, ep+".table: required")
+		} else if seen[e.Table] {
+			*problems = append(*problems, ep+".table: duplicated %q", e.Table)
+		}
+		seen[e.Table] = true
+		if e.Source.URI == "" {
+			*problems = append(*problems, ep+".source.uri: required")
+		}
+		if e.Source.Query == "" {
+			*problems = append(*problems, ep+".source.query: required")
+		}
+		if len(e.On) == 0 {
+			*problems = append(*problems, ep+".on: required (event column → reference column)")
+		}
+		switch e.JoinType {
+		case "left", "inner":
+		case "":
+			*problems = append(*problems, ep+".joinType: required — there is no universal miss policy (left | inner)")
+		default:
+			*problems = append(*problems, fmt.Sprintf("%s.joinType: unsupported %q (want left | inner)", ep, e.JoinType))
+		}
+		switch e.OnColdStart {
+		case "", "buffer", "pass", "drop":
+		default:
+			*problems = append(*problems, fmt.Sprintf("%s.onColdStart: unsupported %q (want buffer | pass | drop)", ep, e.OnColdStart))
+		}
+		if e.Refresh != "" {
+			if _, err := time.ParseDuration(e.Refresh); err != nil {
+				*problems = append(*problems, fmt.Sprintf("%s.refresh: %q is not a duration (e.g. 5m)", ep, e.Refresh))
+			}
+		}
+		if e.BufferLimits.MaxEvents < 0 {
+			*problems = append(*problems, ep+".bufferLimits.maxEvents: must be positive")
+		}
+		if e.BufferLimits.MaxWait != "" {
+			if _, err := time.ParseDuration(e.BufferLimits.MaxWait); err != nil {
+				*problems = append(*problems, fmt.Sprintf("%s.bufferLimits.maxWait: %q is not a duration (e.g. 30s)", ep, e.BufferLimits.MaxWait))
+			}
+		}
+		if len(e.Select) > 0 && len(e.As) > 0 {
+			sel := make(map[string]bool, len(e.Select))
+			for _, s := range e.Select {
+				sel[s] = true
+			}
+			for ref := range e.As {
+				if !sel[ref] {
+					*problems = append(*problems, fmt.Sprintf("%s.as: renames %q which is not in select", ep, ref))
+				}
+			}
+		}
+		// A rename colliding with an event column would overwrite live data;
+		// the destination set must be disjoint from the event's columns.
+		// The event schema is not known here, so only the same-reference
+		// collisions (two renames landing on one name) are caught.
+		dest := map[string]bool{}
+		for ref, as := range e.As {
+			if dest[as] {
+				*problems = append(*problems, fmt.Sprintf("%s.as: %q and %q land on the same column", ep, ref, as))
+			}
+			dest[as] = true
+		}
 	}
 }
 

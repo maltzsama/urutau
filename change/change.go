@@ -52,6 +52,10 @@ type Change struct {
 	// their transport metadata (stream = source table, sequence = position)
 	// is derived at projection time.
 	Transport *Transport
+	// EnrichMiss marks a left-join reference miss set by the enrichment
+	// stage: the event passed with NULL reference columns. Materialized
+	// only when the table declares the enrich_miss metadata column.
+	EnrichMiss bool
 }
 
 // Transport is the envelope of a message-log event. The coordinate names

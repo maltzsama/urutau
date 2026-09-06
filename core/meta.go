@@ -36,6 +36,14 @@ const (
 	// an axis orthogonal to op — a snapshot row is semantically an insert.
 	MetaPhase MetadataKey = "phase"
 
+	// MetaEnrichMiss marks a row whose enrichment stage ran with a left
+	// join and found no reference match: true on a miss, NULL otherwise.
+	// It is set by the enrichment stage on the change and materialized only
+	// when the table declares it via metadata — like every catalog entry,
+	// declaring it is explicit. An inner join never produces it (a miss is
+	// a dropped row, and the count is the evidence).
+	MetaEnrichMiss MetadataKey = "enrich_miss"
+
 	// Transport metadata — the message-queue envelope (Kafka today, Kinesis
 	// next). Names are transport-neutral so they do not need renaming as
 	// sources are added. For CDC sources only MetaStream and MetaSequence
@@ -57,6 +65,8 @@ func (k MetadataKey) ColumnType() ColumnType {
 	switch k {
 	case MetaCommitTS, MetaIngestTS, MetaMsgTS:
 		return ColumnType{Kind: KindTimestampTZ}
+	case MetaEnrichMiss:
+		return ColumnType{Kind: KindBool, Nullable: true}
 	default:
 		return ColumnType{Kind: KindString}
 	}

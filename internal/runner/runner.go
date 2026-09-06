@@ -15,6 +15,7 @@ import (
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/worker"
@@ -286,6 +287,16 @@ func canonicalForTarget(canonical map[string]core.Schema, refs []core.TableRef, 
 	return core.Schema{}
 }
 
+// columnNames lists a schema's columns — the event-side join validation
+// needs names, not types.
+func columnNames(s core.Schema) []string {
+	names := make([]string, 0, len(s.Columns))
+	for _, c := range s.Columns {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
 // introspectAll resolves each spec table through the source, so the pipeline
 // knows the PK (equality key) and the resolved canonical shape before writing
 // anything. The canonical schema carries the declared cast and metadata
@@ -320,6 +331,7 @@ func resumeOrNone(p position.Position) string {
 // dropped rows by window (proof of caught-up state).
 type Runner struct {
 	w                                *worker.Worker
+	enrichStages                     []*enrich.Stage
 	log                              *slog.Logger
 	ev                               *eventlog.Run
 	rdr                              source.Reader
@@ -447,6 +459,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		modes[ref.Target] = mode
 	}
 
+	var enrichStages []*enrich.Stage
+	closeStages := func() {
+		for _, st := range enrichStages {
+			st.Stop()
+		}
+	}
+
 	// Worker + ingest channel.
 	ingest := make(chan change.Change, 1024)
 	w := worker.New(worker.Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
@@ -461,8 +480,25 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		if cs := canonicalForTarget(canonical, refs, target); len(cs.Columns) > 0 {
 			w.SetKnownSchema(target, cs)
 		}
+		// Enrichment: broadcast reference joins declared for this table.
+		// Built against the introspected schema — a join on a column the
+		// table does not have fails boot, not the first event. Loads run
+		// asynchronously; the cold-start policy governs early traffic.
+		if t := specByTarget[target]; len(t.Enrich) > 0 {
+			st, err := enrich.New(t.Enrich, columnNames(canonicalForTarget(canonical, refs, target)), log)
+			if err != nil {
+				closeQuery()
+				closeStages()
+				closeStages()
+				closeStages()
+				return nil, fmt.Errorf("runner: %s: %w", target, err)
+			}
+			st.Start(ctx)
+			enrichStages = append(enrichStages, st)
+			w.SetEnricher(target, st)
+		}
 	}
-	r = &Runner{w: w, log: log, ev: ev, closeQuery: func() {
+	r = &Runner{w: w, log: log, ev: ev, enrichStages: enrichStages, closeQuery: func() {
 		if qsrc != nil {
 			_ = qsrc.CloseQuery()
 		}
@@ -503,6 +539,8 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	resume, needsSnapshot, err := resumeFrom(ctx, src, snk, refs)
 	if err != nil {
 		closeQuery()
+		closeStages()
+		closeStages()
 		return nil, err
 	}
 	log.Info("resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
@@ -516,6 +554,8 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	rdr, err := src.Open(ctx, refs)
 	if err != nil {
 		closeQuery()
+		closeStages()
+		closeStages()
 		return nil, err
 	}
 	r.rdr = rdr
@@ -534,6 +574,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			p, err := src.ParsePosition(t.Bootstrap.Position)
 			if err != nil {
 				closeQuery()
+				closeStages()
+				closeStages()
+				closeStages()
 				return nil, fmt.Errorf("runner: %s bootstrap.position %q: %w", t.Target, t.Bootstrap.Position, err)
 			}
 			explicitPositions = append(explicitPositions, p)
@@ -586,6 +629,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				if err := snk.SetProperties(ctx, ref, props); err != nil {
 					rdr.Close()
 					closeQuery()
+					closeStages()
+					closeStages()
+					closeStages()
 					return nil, fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
 				}
 				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
@@ -601,6 +647,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				if err != nil {
 					rdr.Close()
 					closeQuery()
+					closeStages()
+					closeStages()
+					closeStages()
 					return nil, err
 				}
 				// Read existing snapshot progress for resumable backfill.
@@ -608,6 +657,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				if err != nil {
 					rdr.Close()
 					closeQuery()
+					closeStages()
+					closeStages()
+					closeStages()
 					return nil, fmt.Errorf("runner: snapshot progress %s: %w", ref.Target, err)
 				}
 				if progress.State == snapshot.StateInProgress {
@@ -635,6 +687,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 				}); err != nil {
 					rdr.Close()
 					closeQuery()
+					closeStages()
+					closeStages()
+					closeStages()
 					return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
 				}
 				// Snapshot complete: mark on the worker.
@@ -667,6 +722,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.rdr.Close()
 	r.closeQuery()
+	for _, st := range r.enrichStages {
+		st.Stop()
+	}
 	return err
 }
 

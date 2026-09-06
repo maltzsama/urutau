@@ -24,6 +24,59 @@ func TestValidateAcceptsMinimalUpsert(t *testing.T) {
 	}
 }
 
+func TestValidateEnrich(t *testing.T) {
+	base := func() *Spec {
+		s := validSpec()
+		s.Tables[0].Enrich = []Enrich{{
+			Table:    "users",
+			Source:   EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, name FROM users"},
+			On:       map[string]string{"user_ref": "id"},
+			JoinType: "left",
+		}}
+		return s
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("minimal enrich must validate: %v", err)
+	}
+
+	s := base()
+	s.Tables[0].Enrich[0].JoinType = ""
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "joinType") {
+		t.Fatalf("want joinType required, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].JoinType = "full"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "joinType") {
+		t.Fatalf("want joinType grammar, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].OnColdStart = "retry"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "onColdStart") {
+		t.Fatalf("want onColdStart grammar, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Refresh = "soon"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "refresh") {
+		t.Fatalf("want refresh duration, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Source.Query = ""
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "source.query") {
+		t.Fatalf("want source.query required, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].Select = []string{"name"}
+	s.Tables[0].Enrich[0].As = map[string]string{"tier": "user_tier"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "as") {
+		t.Fatalf("want as-not-in-select problem, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich = append(s.Tables[0].Enrich, s.Tables[0].Enrich[0])
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("want duplicated reference, got %v", err)
+	}
+}
+
 func TestValidateCommitMode(t *testing.T) {
 	s := validSpec()
 	s.Sink.CommitMode = CommitModeAtomic

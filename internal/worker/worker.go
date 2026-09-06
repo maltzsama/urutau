@@ -58,6 +58,12 @@ type tablePipeline struct {
 	// record that had no before image). Read cross-goroutine.
 	droppedDeletes atomic.Int64
 
+	// enricher rewrites rows with reference-table columns before buffering
+	// (nil when the table declares no enrich). enrichDropped counts
+	// inner-join misses the stage discarded. Read cross-goroutine.
+	enricher      Enricher
+	enrichDropped atomic.Int64
+
 	// readyCh carries collapsed batches from the batcher to the committer.
 	// This decouples collapse (CPU) from commit (I/O): while batch N is
 	// committing, batch N+1 collapses concurrently.
@@ -147,6 +153,33 @@ func (w *Worker) RegisterCommitter(target string, c sink.TableWriter, mode chang
 // OnDroppedDelete installs the observer for deletes that append-only
 // dropped (declared skip, or a record with no before image).
 func (w *Worker) OnDroppedDelete(f OnDroppedDelete) { w.onDroppedDelete = f }
+
+// Enricher rewrites a change's row with reference-table columns before it
+// is buffered. Drop reports an inner-join miss: the event's only effect is
+// its absence, and the batch position advances past it. Implemented by
+// internal/enrich.Stage; the interface keeps the worker free of the
+// reference-join machinery.
+type Enricher interface {
+	Enrich(changes []change.Change) ([]change.Change, error)
+}
+
+// SetEnricher installs the enrichment stage for a target table. Nil (the
+// default) keeps the pass-through path byte-identical to a pipeline
+// without enrich.
+func (w *Worker) SetEnricher(target string, e Enricher) {
+	if p := w.tables[target]; p != nil {
+		p.enricher = e
+	}
+}
+
+// EnrichDropped reports how many events the enrichment stage discarded
+// (inner-join misses).
+func (w *Worker) EnrichDropped(target string) int64 {
+	if p := w.tables[target]; p != nil {
+		return p.enrichDropped.Load()
+	}
+	return 0
+}
 
 // SetDropDeletes implements onDelete: skip — deletes in an append-only
 // table are dropped and counted, never appended from a before image.
@@ -534,6 +567,17 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 						continue
 					}
 					c.After = c.Before
+					// A rewritten delete is a full row: it is enriched like
+					// any other, and an inner miss drops it here.
+					if p.enricher != nil {
+						enriched, err := p.enricher.Enrich([]change.Change{c})
+						if err != nil {
+							return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
+						}
+						p.enrichDropped.Add(int64(1 - len(enriched)))
+						upserts = append(upserts, enriched...)
+						continue
+					}
 				}
 				upserts = append(upserts, c)
 			}
@@ -639,6 +683,24 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					}
 					return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
 				}
+			}
+			// Enrichment runs after the drift check (reference columns are
+			// not source columns — they must not trip drift) and before
+			// buffering, so a dropped event never enters the batch and a
+			// drained cold-start queue keeps its FIFO order.
+			if p.enricher != nil && c.After != nil {
+				enriched, err := p.enricher.Enrich([]change.Change{c})
+				if err != nil {
+					return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
+				}
+				p.enrichDropped.Add(int64(1 - len(enriched)))
+				buf = append(buf, enriched...)
+				if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+				continue
 			}
 			buf = append(buf, c)
 			if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {

@@ -176,6 +176,11 @@ func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, 
 			return nil, nil
 		}
 		return c.Transport.Headers, nil
+	case core.MetaEnrichMiss:
+		if c.EnrichMiss {
+			return true, nil
+		}
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("unknown metadata key %q", key)
 	}

@@ -70,6 +70,24 @@ enum WriteMode {
   WRITE_MODE_APPEND      = 2;
 }
 
+// EnrichRef is one broadcast reference join the worker applies to the
+// table's events: the reference is read whole into the worker's RAM and
+// re-read on the refresh interval. The coordinator owns the spec; the
+// worker owns the join.
+message EnrichRef {
+  string              table        = 1;  // reference name (diagnostics)
+  string              source_uri   = 2;  // reference connection (mysql:// | postgres://)
+  string              source_query = 3;  // full reference image SELECT
+  map<string, string> on           = 4;  // event column → reference column
+  repeated string     select       = 5;  // reference columns taken (empty: all)
+  map<string, string> as           = 6;  // reference column → destination name
+  string              join_type    = 7;  // left | inner
+  string              refresh      = 8;  // duration; empty = worker default (5m)
+  string              on_cold_start = 9; // buffer | pass | drop (empty = buffer)
+  int64               buffer_max_events = 10;
+  string              buffer_max_wait   = 11; // duration; empty = unbounded
+}
+
 message TableAssignment {
   string    source_table         = 1;  // "shop.orders"
   string    target_table         = 2;  // "lakehouse.orders"
@@ -79,6 +97,7 @@ message TableAssignment {
   bool      include_before       = 6;  // derived: true only with a mutable-column filter
   bool      create_if_not_exists = 7;
   bytes     schema_arrow         = 8;  // table schema as Arrow IPC (data columns); the coordinator owns introspection
+  repeated EnrichRef enrich      = 9;  // broadcast reference joins, applied in order
 }
 
 message BatchConfig {
