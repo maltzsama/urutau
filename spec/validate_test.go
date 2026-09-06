@@ -24,6 +24,18 @@ func TestValidateAcceptsMinimalUpsert(t *testing.T) {
 	}
 }
 
+func TestValidateCommitMode(t *testing.T) {
+	s := validSpec()
+	s.Sink.CommitMode = CommitModeAtomic
+	if err := s.Validate(); err != nil {
+		t.Fatalf("atomic commit mode must validate: %v", err)
+	}
+	s.Sink.CommitMode = CommitMode("eventual")
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "commitMode") {
+		t.Fatalf("want commitMode problem, got %v", err)
+	}
+}
+
 func TestValidateUpsertRequiresPrimaryKey(t *testing.T) {
 	s := validSpec()
 	s.Tables[0].PrimaryKey = nil

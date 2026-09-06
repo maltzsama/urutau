@@ -150,6 +150,7 @@ func SinkConfig(s *spec.Spec) sink.Config {
 			"client_id":     s.Sink.ClientID,
 			"client_secret": s.Sink.ClientSecret,
 			"scope":         s.Sink.Scope,
+			"commit_mode":   string(s.Sink.CommitMode),
 		},
 	}
 }

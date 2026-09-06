@@ -23,4 +23,7 @@ func TestAllDriversRegistered(t *testing.T) {
 	if !driver.SinkTypeExists("clickhouse") {
 		t.Error(`sink "clickhouse" not registered`)
 	}
+	if !driver.SinkTypeExists("couchbase") {
+		t.Error(`sink "couchbase" not registered`)
+	}
 }
