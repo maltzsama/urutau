@@ -77,6 +77,11 @@ func (s *Spec) Validate() error {
 	if s.Sink.Type == "" {
 		s.Sink.Type = "iceberg+rest" // the default sink
 	}
+	switch s.Sink.CommitMode {
+	case "", CommitModeFast, CommitModeAtomic:
+	default:
+		problems = append(problems, fmt.Sprintf("sink.commitMode: unknown %q (fast | atomic)", s.Sink.CommitMode))
+	}
 
 	if len(s.Tables) == 0 {
 		problems = append(problems, "tables: at least one required")

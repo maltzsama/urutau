@@ -4,7 +4,7 @@
 
 Go ≥ 1.26 · pre-0.1.0, hardening in progress · license: **Apache-2.0**
 
-Urutau replicates MySQL, Postgres, and Kafka into Apache Iceberg and ClickHouse **reflecting source state** — upsert by primary key, first-class UPDATE/DELETE — with the CDC position committed **alongside the data it describes**, never in a store that could drift from it.
+Urutau replicates MySQL, Postgres, and Kafka into Apache Iceberg, ClickHouse, and Couchbase **reflecting source state** — upsert by primary key, first-class UPDATE/DELETE — with the CDC position committed **alongside the data it describes**, never in a store that could drift from it.
 
 > This repository holds the **Go engine** (coordinator, workers, CLI,
 > operator). The Python SDK/planner lives in its own repository.
@@ -53,11 +53,12 @@ purpose: it flows into the spec as written, and a UUID server id is legal.)
 
 ## Status
 
-**Pre-0.1.0.** The engine runs end to end — MySQL/Postgres/Kafka into Iceberg or ClickHouse, single-process or distributed, with the k8s operator — and the commit path has been verified by reading back through Trino rather than trusting a successful write. Correctness-critical paths are still being actively hardened; see **Known limitations** before relying on this for anything you can't afford to lose.
+**Pre-0.1.0.** The engine runs end to end — MySQL/Postgres/Kafka into Iceberg, ClickHouse, or Couchbase, single-process or distributed, with the k8s operator — and the commit path has been verified by reading back through Trino rather than trusting a successful write. Correctness-critical paths are still being actively hardened; see **Known limitations** before relying on this for anything you can't afford to lose.
 
 - **Sources:** MySQL (`go-mysql`/canal, GTID, heartbeat), Postgres (`pgx`, pgoutput, LSN slot), Kafka (franz-go, manual partition assignment, debezium-json/raw/avro decoders) — one replication reader per source, mapped through the canonical type system. Kafka registers `Capabilities{Stream: true}` (no snapshot capability); the runner skips DBLog and streams directly from the committed offset.
 - **Iceberg sink:** upsert via equality delete, delete-then-append as two separate commits (see **E2E spike** below for why), position committed as both a snapshot property (audit trail) and a table property (O(1) resume, survives compaction).
 - **ClickHouse sink:** upsert via `ReplacingMergeTree(seq, is_deleted)` (`ORDER BY` the declared primary key), append via plain `MergeTree`. One `INSERT` per batch — upserts as rows, deletes as tombstones hidden from `FINAL` reads. Resume reads the position from the data itself — `argMax(position, seq)` — never a separate control table. **The atomicity guarantee is narrower than Iceberg's**: the default table has no `PARTITION BY`, which is what makes a batch atomic (ClickHouse guarantees atomicity per insert, per partition — not across a multi-partition write). Partitioning is opt-in and weakens that guarantee: a batch crossing a partition boundary commits as multiple parts, no longer all-or-nothing. Tombstone physical cleanup is operator maintenance (`OPTIMIZE ... FINAL CLEANUP`); reads are correct under `FINAL` regardless of whether cleanup has run.
+- **Couchbase sink:** key-document writes where upsert-by-key IS the native operation — one collection per table, one control document per collection carrying the committed position (a single O(1) `Get` on resume, never a scan or aggregation). Documents hold data fields at the top level and pipeline metadata under a reserved `_urutau` sub-object, so a data field named `op` never collides with the metadata `op`. Nested canonical types (`Struct`/`List`/`Map`) land as native JSON — the one sink where nesting is not a special case. Deletes are `Remove`, immediate, not tombstones. **The atomicity trade is a mode, not a caveat**: `commitMode: fast` (default) writes data first and the control document last — a crash in between leaves the position un-advanced and the restart replays the batch, which is idempotent because every mutation is keyed by the row's primary key. `commitMode: atomic` wraps data and control document in a distributed ACID transaction, closing the window at the cost of transaction overhead per batch. Every write acknowledges at synchronous-durability `majority`; on a single node that requires a 0-replica bucket (which is what the sink creates) — `DurabilityImpossible` is a loud error, not a silent downgrade.
 - **Metadata columns:** closed catalog — CDC (`op`, `commit_ts`, `ingest_ts`, `position`, `source_table`, `phase`) and transport-native (`stream`, `shard`, `sequence`, `msg_ts`, `msg_key`, `headers`) — landed as nullable columns at the end of the canonical schema, renamed per-table via `metadata`.
 - **Per-column cast:** explicit type overrides with a closed matrix — widening always, to-string always, narrowing/parsing never except explicit temporal reinterpretation (`timestamptz(assume_utc)`). Unmappable source types bypass the cast rather than silently coercing.
 - **DBLog snapshot:** generic in `internal/snapshot` — chunk by primary key, low/high watermarks, and a caught-up **proof** that closes each window (never a timer; `windowTimeout` is a pathology detector, not a trigger). Skipped for sources without snapshot capability (Kafka).
@@ -73,7 +74,7 @@ purpose: it flows into the spec as written, and a UUID server id is legal.)
 This list is expected to shrink, not grow, before 0.1.0:
 
 - A terminated pipeline (`status.terminated` set) is terminal by design — the operator parts ways and nothing recreates the job; a new run means a new CR.
-- Composite (nested) columns are not yet mappable into ClickHouse: `KindList`/`KindMap`/`KindStruct` hit the escape valve and require an explicit cast today (Iceberg takes them natively). Native `Array`/`Map`/`Tuple` mapping is a planned follow-up.
+- Composite (nested) columns are not yet mappable into ClickHouse: `KindList`/`KindMap`/`KindStruct` hit the escape valve and require an explicit cast today (Iceberg and Couchbase take them natively). Native `Array`/`Map`/`Tuple` mapping is a planned follow-up.
 - Iceberg tables with a `map` column cannot be written by `iceberg-go` v0.6.0 (`AppendTable` rejects the composite record); tracked upstream, worked around by an explicit cast to string.
 - The ClickHouse sink's atomicity is per-insert-per-partition, not per-commit like Iceberg's; see **Status** above and don't opt into `PARTITION BY` without reading that paragraph.
 
@@ -104,6 +105,7 @@ flowchart TB
         KAFKA["source/kafka"]
         ICE["sink/iceberg"]
         CH["sink/clickhouse"]
+        CB["sink/couchbase"]
     end
 
     DRV["driver — registry (self-registration via init)"]
@@ -111,8 +113,8 @@ flowchart TB
 
     CORE --- SRC & SNK & SNAP & WRK & STD
     SRC --> MYSQL & PG & KAFKA
-    SNK --> ICE & CH
-    MYSQL & PG & KAFKA & ICE & CH --> DRV
+    SNK --> ICE & CH & CB
+    MYSQL & PG & KAFKA & ICE & CH & CB --> DRV
     DRV --> RUN
 ```
 
@@ -142,6 +144,7 @@ The dependency walls are enforced by a test (`internal/architecture`) that check
 | `internal/source/kafka/decoder` | Kafka message decoders |
 | `internal/sink/iceberg` | Iceberg writes (upsert/equality delete, `FromCanonical`, cast projection) |
 | `internal/sink/clickhouse` | ClickHouse sink (`ReplacingMergeTree` upsert, tombstone deletes, position-as-column resume) |
+| `internal/sink/couchbase` | Couchbase sink (key-document upsert, `_urutau` metadata sub-object, control-document position, fast/atomic commit modes) |
 | `internal/coordinator` | reader/router loops, flow budget, supervisor, control plane |
 | `internal/worker` | per-table batcher + serialized committer |
 | `internal/transport` | gRPC control + Arrow Flight; generated code in `internal/transport/pb` |
@@ -169,7 +172,7 @@ No `protoc` needed — generation uses `buf` with the `protoc-gen-go`/
 
 ## E2E spike
 
-The suite proves the write path by **reading it back** — Iceberg through Trino, ClickHouse through its own `FINAL` reads — rather than trusting a successful commit. Stack: MySQL + Postgres (sources), RustFS (S3) + Polaris (REST catalog) + Trino, and a ClickHouse container for that sink's suite.
+The suite proves the write path by **reading it back** — Iceberg through Trino, ClickHouse through its own `FINAL` reads, Couchbase through independent SDK reads — rather than trusting a successful commit. Stack: MySQL + Postgres (sources), RustFS (S3) + Polaris (REST catalog) + Trino, a ClickHouse container, and a Couchbase container (single-node, 0-replica bucket — the configuration where synchronous durability works).
 
 ```sh
 make e2e-test   # compose up --wait, then URUTAU_E2E=1 go test ./test/e2e

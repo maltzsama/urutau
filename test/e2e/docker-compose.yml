@@ -67,6 +67,66 @@ services:
         soft: 262144
         hard: 262144
 
+  # Key-document sink target (CR-041). The image does not self-initialize,
+  # so couchbase-setup runs cluster-init and creates the bucket after the
+  # HTTP endpoint answers. Community edition: durability and distributed
+  # transactions both work; the one hard requirement is 0 replicas — a
+  # single-node bucket with replicas makes every durable write fail with
+  # DurabilityImpossible. Host ports are 1:1 (8091 mgmt, 11210 KV) so the
+  # SDK's node discovery resolves from the host.
+  couchbase:
+    image: couchbase/server:community-7.6.2
+    ports:
+      - "8091:8091"
+      - "11210:11210"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8091/ui/index.html || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  couchbase-setup:
+    image: couchbase/server:community-7.6.2
+    depends_on:
+      couchbase:
+        condition: service_healthy
+    # Shares the server's network namespace: once the node hostname is
+    # 127.0.0.1 (so the host-side SDK resolves it), management calls from
+    # another container get redirected to that loopback — running the CLI
+    # inside the same namespace makes 127.0.0.1 the server itself.
+    # Stays resident with a readiness healthcheck (not a one-shot): compose
+    # up --wait fails on completed top-level services with no dependents.
+    network_mode: service:couchbase
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        CC="127.0.0.1:8091"
+        # server-list succeeds only on an initialized cluster with these
+        # credentials — the idempotency probe.
+        if ! couchbase-cli server-list -c $$CC -u urutau -p urutaupass >/dev/null 2>&1; then
+          couchbase-cli cluster-init -c $$CC \
+            --cluster-username urutau --cluster-password urutaupass \
+            --services data,index,query \
+            --cluster-ramsize 1024 --cluster-index-ramsize 512
+          couchbase-cli node-init -c $$CC -u urutau -p urutaupass \
+            --node-init-hostname 127.0.0.1
+        fi
+        if ! couchbase-cli bucket-list -c $$CC -u urutau -p urutaupass | grep -q lakehouse; then
+          couchbase-cli bucket-create -c $$CC -u urutau -p urutaupass \
+            --bucket lakehouse --bucket-type couchbase \
+            --bucket-ramsize 256 --bucket-replica 0
+        fi
+        echo couchbase ready
+        sleep infinity
+    healthcheck:
+      test: ["CMD-SHELL", "couchbase-cli bucket-list -c 127.0.0.1:8091 -u urutau -p urutaupass | grep -q lakehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+
   rustfs:
     image: rustfs/rustfs:latest
     ports:

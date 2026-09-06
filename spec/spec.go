@@ -84,7 +84,27 @@ type Sink struct {
 	ClientSecret string   `json:"clientSecret,omitempty"`
 	Scope        string   `json:"scope,omitempty"`
 	Defaults     Defaults `json:"defaults"`
+	// CommitMode selects how a sink that cannot commit data and position in
+	// one atomic write sequences the two (Couchbase today). Empty means the
+	// sink's own default ("fast": data first, control document last —
+	// recovery replays the batch idempotently). "atomic" wraps data and
+	// control document in a distributed transaction, closing the recovery
+	// window at the cost of transaction overhead per batch.
+	CommitMode CommitMode `json:"commitMode,omitempty"`
 }
+
+// CommitMode is the data-vs-position commit sequencing selector.
+type CommitMode string
+
+const (
+	// CommitModeFast writes data first, the position-carrying control
+	// document last. A crash in between leaves the position un-advanced and
+	// the restart replays the batch — idempotent for key-addressed sinks.
+	CommitModeFast CommitMode = "fast"
+	// CommitModeAtomic commits data and the control document inside one
+	// distributed transaction.
+	CommitModeAtomic CommitMode = "atomic"
+)
 
 type Defaults struct {
 	WriteMode      WriteMode `json:"writeMode,omitempty"`

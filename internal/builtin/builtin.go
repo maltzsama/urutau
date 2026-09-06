@@ -6,6 +6,7 @@ package builtin
 
 import (
 	_ "github.com/maltzsama/urutau/internal/sink/clickhouse"
+	_ "github.com/maltzsama/urutau/internal/sink/couchbase"
 	_ "github.com/maltzsama/urutau/internal/sink/iceberg"
 	_ "github.com/maltzsama/urutau/internal/source/kafka"
 	_ "github.com/maltzsama/urutau/internal/source/mysql"
