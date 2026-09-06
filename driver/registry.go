@@ -1,13 +1,15 @@
 // Package driver is the plugin registry. It maps a source kind or sink type
 // to the factory that opens it, so the orchestration consumes only the
 // source and sink contracts and never a concrete implementation. Concrete
-// drivers register themselves from init() via a blank import; the zero
-// Registry is safe to use and lazy-initializes its maps.
+// drivers register themselves from init() via a blank import or dynamically
+// via LoadPlugin; the zero Registry is safe to use and lazy-initializes
+// its maps.
 package driver
 
 import (
 	"context"
 	"fmt"
+	"plugin"
 	"slices"
 	"sync"
 
@@ -62,6 +64,29 @@ func RegisterSink(scheme string, factory SinkFactory) {
 	reg.sinks[scheme] = factory
 }
 
+// LoadPlugin opens a Go plugin (.so) and calls its exported Init function.
+// The plugin must export:
+//
+//	func Init() error
+//
+// Init is responsible for calling RegisterSource/RegisterSink.
+// Rules: same Go version, same dependency graph, Linux/macOS only.
+func LoadPlugin(path string) error {
+	p, err := plugin.Open(path)
+	if err != nil {
+		return fmt.Errorf("driver: open plugin %s: %w", path, err)
+	}
+	sym, err := p.Lookup("Init")
+	if err != nil {
+		return fmt.Errorf("driver: plugin %s missing exported Init: %w", path, err)
+	}
+	initFunc, ok := sym.(func() error)
+	if !ok {
+		return fmt.Errorf("driver: plugin %s Init has wrong signature (want func() error)", path)
+	}
+	return initFunc()
+}
+
 // registeredKinds lists the registered source kinds, sorted so diagnostics
 // read deterministically. Called with the map lock released.
 func registeredKinds() []string {
@@ -89,14 +114,14 @@ func registeredSinks() []string {
 }
 
 // unknownSourceErr is the unknown-kind error. Registration happens via
-// blank import, so an absent kind usually means the binary was built without
-// the driver — the message must point there, not at the user's spec.
+// blank import (built-in) or LoadPlugin (dynamic); an absent kind usually
+// means the binary was built without the driver or the plugin was not loaded.
 func unknownSourceErr(kind string) error {
-	return fmt.Errorf("driver: unknown source kind %q (registered: %v) — if this kind should exist, check that its package is blank-imported in internal/builtin", kind, registeredKinds())
+	return fmt.Errorf("driver: unknown source kind %q (registered: %v) — check that its package is blank-imported in internal/builtin or loaded via --plugin", kind, registeredKinds())
 }
 
 func unknownSinkErr(scheme string) error {
-	return fmt.Errorf("driver: unknown sink type %q (registered: %v) — if this type should exist, check that its package is blank-imported in internal/builtin", scheme, registeredSinks())
+	return fmt.Errorf("driver: unknown sink type %q (registered: %v) — check that its package is blank-imported in internal/builtin or loaded via --plugin", scheme, registeredSinks())
 }
 
 // OpenSource resolves and instantiates a source for a spec's source kind.

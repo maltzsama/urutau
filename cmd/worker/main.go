@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/maltzsama/urutau/driver"
 	_ "github.com/maltzsama/urutau/internal/builtin"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/sink"
@@ -34,11 +35,18 @@ func main() {
 		maxRows      int
 		maxInterval  time.Duration
 		metricsAddr  string
+		pluginPaths  []string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Connect to a coordinator and write its stream to Iceberg",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Load dynamic plugins before anything else.
+			for _, p := range pluginPaths {
+				if err := driver.LoadPlugin(p); err != nil {
+					return err
+				}
+			}
 			if clientID == "" || clientSecret == "" {
 				return fmt.Errorf("--client-id and --client-secret are required")
 			}
@@ -72,6 +80,7 @@ func main() {
 	cmd.Flags().IntVar(&maxRows, "max-rows", 1000, "flush the batch once this many rows are buffered")
 	cmd.Flags().DurationVar(&maxInterval, "max-interval", 2*time.Second, "flush cadence")
 	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics on this address (optional)")
+	cmd.Flags().StringSliceVar(&pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
 
 	root.AddCommand(cmd)
 	// SIGINT/SIGTERM cancel the command context: the remote session shuts

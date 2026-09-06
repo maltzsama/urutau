@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/maltzsama/urutau/driver"
 	_ "github.com/maltzsama/urutau/internal/builtin"
 	"github.com/maltzsama/urutau/internal/coordinator"
 	"github.com/maltzsama/urutau/internal/eventlog"
@@ -39,11 +40,18 @@ func main() {
 		maxResets       int
 		resetWindow     time.Duration
 		metricsAddr     string
+		pluginPaths     []string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Serve the source pipeline to workers",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Load dynamic plugins before anything else.
+			for _, p := range pluginPaths {
+				if err := driver.LoadPlugin(p); err != nil {
+					return err
+				}
+			}
 			f, err := os.Open(file)
 			if err != nil {
 				return err
@@ -93,6 +101,7 @@ func main() {
 	cmd.Flags().IntVar(&maxResets, "max-resets", 5, "resets within the window before the job terminates")
 	cmd.Flags().DurationVar(&resetWindow, "reset-window", 15*time.Minute, "sliding window for the reset count")
 	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics and /statusz on this address (optional)")
+	cmd.Flags().StringSliceVar(&pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
 
 	root.AddCommand(cmd)
 	// SIGINT/SIGTERM cancel the command context: worker sessions close with
