@@ -2,7 +2,6 @@ package couchbase
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -379,8 +378,9 @@ func TestDocKeyRules(t *testing.T) {
 }
 
 // TestBuildDocValueForms: the canonical value → JSON conversions the sink
-// promises — UUID hyphenated, decimal as canonical text, nested composites
-// recursive, cast plan applied before serialization.
+// promises — UUID as hyphenated string (cast-converted), decimal as
+// canonical text, nested composites recursive, cast plan applied before
+// serialization.
 func TestBuildDocValueForms(t *testing.T) {
 	p := &tablePlan{
 		schema: core.Schema{Columns: []core.Column{
@@ -401,7 +401,7 @@ func TestBuildDocValueForms(t *testing.T) {
 		Key: []any{int64(1)},
 		After: map[string]any{
 			"id":     int64(1),
-			"uid":    rawHex(t, "018f6a1e7d3f7aa1bb3a5f3f5e6a7b8c"),
+			"uid":    "018f6a1e-7d3f-7aa1-bb3a-5f3f5e6a7b8c", // UUID arrives as string after cast
 			"amount": "123.45",
 			"addr":   map[string]any{"city": "Curitiba"},
 			"tags":   []any{"a", "b"},
@@ -466,16 +466,6 @@ func schemaWithoutReserved() core.Schema {
 	return core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
 	}}
-}
-
-// rawHex decodes a hex uuid into its canonical 16 raw bytes.
-func rawHex(t *testing.T, s string) []byte {
-	t.Helper()
-	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != 16 {
-		t.Fatalf("bad hex uuid %q: %v", s, err)
-	}
-	return b
 }
 
 // TestParseCommitModeRules covers the option parsing contract.

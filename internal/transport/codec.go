@@ -164,7 +164,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 	for i := 0; i < int(rec.NumRows()); i++ {
 		c := change.Change{
 			Table:    meta.Table,
-			IngestTS: time.Now(),
+			IngestTS: time.Now(), // fallback when the wire column is null
 		}
 
 		// Data columns → After map.
@@ -198,6 +198,10 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 		tsCol, _ := rec.Column(numDataCols + 2).(*array.Timestamp)
 		if !tsCol.IsNull(i) {
 			c.CommitTS = tsCol.Value(i).ToTime(arrow.Microsecond)
+		}
+		ingestCol, _ := rec.Column(numDataCols + 3).(*array.Timestamp)
+		if !ingestCol.IsNull(i) {
+			c.IngestTS = ingestCol.Value(i).ToTime(arrow.Microsecond)
 		}
 		snapCol, _ := rec.Column(numDataCols + 4).(*array.Boolean)
 		c.Snapshot = snapCol.Value(i)
@@ -312,6 +316,19 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Int64Builder).Append(int64(t))
 		default:
 			return fmt.Errorf("want int64-compatible, got %T", v)
+		}
+	case core.KindUInt64:
+		switch t := v.(type) {
+		case uint64:
+			bld.(*array.Uint64Builder).Append(t)
+		case int:
+			bld.(*array.Uint64Builder).Append(uint64(t))
+		case int64:
+			bld.(*array.Uint64Builder).Append(uint64(t))
+		case float64:
+			bld.(*array.Uint64Builder).Append(uint64(t))
+		default:
+			return fmt.Errorf("want uint64-compatible, got %T", v)
 		}
 	case core.KindFloat32:
 		switch t := v.(type) {
@@ -440,6 +457,8 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 		return col.(*array.Int32).Value(i), nil
 	case core.KindInt64:
 		return col.(*array.Int64).Value(i), nil
+	case core.KindUInt64:
+		return col.(*array.Uint64).Value(i), nil
 	case core.KindFloat32:
 		return float64(col.(*array.Float32).Value(i)), nil // promote to float64 for map[string]any
 	case core.KindFloat64:

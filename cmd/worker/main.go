@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -38,6 +39,9 @@ func main() {
 		Use:   "run",
 		Short: "Connect to a coordinator and write its stream to Iceberg",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if clientID == "" || clientSecret == "" {
+				return fmt.Errorf("--client-id and --client-secret are required")
+			}
 			return worker.RunRemote(cmd.Context(), worker.RemoteConfig{
 				Coordinator: coordinator,
 				Name:        name,
@@ -61,8 +65,8 @@ func main() {
 	cmd.Flags().StringVar(&name, "name", "worker-1", "worker name (Hello)")
 	cmd.Flags().StringVar(&catalogURI, "catalog-uri", "http://localhost:8181/api/catalog", "Iceberg REST catalog URI")
 	cmd.Flags().StringVar(&warehouse, "warehouse", "quickstart_catalog", "catalog warehouse name")
-	cmd.Flags().StringVar(&clientID, "client-id", "root", "catalog OAuth2 client id")
-	cmd.Flags().StringVar(&clientSecret, "client-secret", "s3cr3t", "catalog OAuth2 client secret")
+	cmd.Flags().StringVar(&clientID, "client-id", "", "catalog OAuth2 client id (required)")
+	cmd.Flags().StringVar(&clientSecret, "client-secret", "", "catalog OAuth2 client secret (required)")
 	cmd.Flags().StringVar(&scope, "scope", "PRINCIPAL_ROLE:ALL", "catalog OAuth2 scope")
 	cmd.Flags().StringVar(&namespace, "namespace", "raw", "fallback namespace for bare targets")
 	cmd.Flags().IntVar(&maxRows, "max-rows", 1000, "flush the batch once this many rows are buffered")

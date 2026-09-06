@@ -26,6 +26,8 @@ const (
 	KindBool
 	KindInt32
 	KindInt64
+	KindUInt64 // unsigned 64-bit integer; sources that natively emit uint64 keep
+	// their exact width instead of silently widening to int64.
 	KindFloat32
 	KindFloat64
 	KindDecimal // uses Precision, Scale
@@ -57,6 +59,8 @@ func (k Kind) String() string {
 		return "int32"
 	case KindInt64:
 		return "int64"
+	case KindUInt64:
+		return "uint64"
 	case KindFloat32:
 		return "float32"
 	case KindFloat64:

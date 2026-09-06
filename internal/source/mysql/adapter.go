@@ -27,13 +27,14 @@ type Source struct {
 
 func capabilities() source.Capabilities {
 	return source.Capabilities{
-		Snapshot:          true,
-		ChunkQuery:        true,
-		Stream:            true,
-		MaxConnections:    10,
-		Modes:             []source.Mode{source.ModeCDC},
-		BeforeImage:       true,  // binlog row format always carries the deleted row
-		MonotonicSequence: false, // GTID sets grow but are not per-message coordinates
+		Snapshot:            true,
+		ChunkQuery:          true,
+		Stream:              true,
+		MaxConnections:      10,
+		Modes:               []source.Mode{source.ModeCDC},
+		BeforeImage:         true,  // binlog row format always carries the deleted row
+		MonotonicSequence:   false, // GTID sets grow but are not per-message coordinates
+		RecoverablePosition: true,  // GTID sets allow exact resume
 	}
 }
 

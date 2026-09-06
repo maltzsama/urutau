@@ -109,13 +109,18 @@ func TestBuildDDLUnknownPKColumn(t *testing.T) {
 }
 
 func TestBuildDDLNestedUnsupported(t *testing.T) {
+	// Nested types are now supported. Verify that a list column produces
+	// a valid DDL with Array(...) type.
 	schema := core.Schema{Columns: []core.Column{
 		{Name: "tags", Type: core.ColumnType{Kind: core.KindList, Elem: &core.ColumnType{Kind: core.KindString}}},
 	}}
 	ref := core.TableRef{Target: "orders", PrimaryKey: []string{"tags"}}
-	_, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, change.AppendMode)
-	if err == nil || !strings.Contains(err.Error(), "not supported yet") {
-		t.Fatalf("nested list: want escape-valve error, got %v", err)
+	ddl, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, change.AppendMode)
+	if err != nil {
+		t.Fatalf("nested list: unexpected error: %v", err)
+	}
+	if !strings.Contains(ddl, "Array(String)") {
+		t.Fatalf("nested list: want Array(String) in DDL, got:\n%s", ddl)
 	}
 }
 
@@ -134,7 +139,13 @@ func TestCHTypeMapping(t *testing.T) {
 		{core.ColumnType{Kind: core.KindUUID}, "UUID", false},
 		{core.ColumnType{Kind: core.KindDecimal, Precision: 20, Scale: 4}, "Decimal(20, 4)", false},
 		{core.ColumnType{Kind: core.KindUnknown}, "", true},
-		{core.ColumnType{Kind: core.KindStruct}, "", true},
+		// Nested types are now supported.
+		{core.ColumnType{Kind: core.KindList, Elem: &core.ColumnType{Kind: core.KindString}}, "Array(String)", false},
+		{core.ColumnType{Kind: core.KindMap, KeyType: &core.ColumnType{Kind: core.KindString}, ValueType: &core.ColumnType{Kind: core.KindInt64}}, "Map(String, Int64)", false},
+		{core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
+			{Name: "a", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "b", Type: core.ColumnType{Kind: core.KindInt64}},
+		}}, "Tuple(`a` String, `b` Int64)", false},
 	}
 	for _, tc := range cases {
 		got, err := chType(tc.ct, false)

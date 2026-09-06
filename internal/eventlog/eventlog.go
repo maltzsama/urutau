@@ -11,6 +11,7 @@
 package eventlog
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -83,7 +84,7 @@ func New(ctx context.Context, cfg Config) (*Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	awsCfg, err := loadAWSConfig(cfg)
+	awsCfg, err := loadAWSConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("eventlog: aws config: %w", err)
 	}
@@ -129,6 +130,10 @@ func (r *Run) Emitted() int {
 	return r.emitted
 }
 
+// putTimeout bounds a single S3 PutObject so a slow endpoint stalls only
+// this event, not the entire pipeline.
+const putTimeout = 10 * time.Second
+
 // Emit appends one event and uploads the trail. Fields are free-form; ts,
 // run_id, and kind are added automatically. Best-effort by contract:
 // callers log failures and carry on.
@@ -158,7 +163,9 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	copy(body, r.buf)
 	r.mu.Unlock()
 
-	if err := r.putter.Put(ctx, r.bucket, r.key, body); err != nil {
+	putCtx, cancel := context.WithTimeout(ctx, putTimeout)
+	defer cancel()
+	if err := r.putter.Put(putCtx, r.bucket, r.key, body); err != nil {
 		return fmt.Errorf("eventlog: put %s/%s: %w", r.bucket, r.key, err)
 	}
 	return nil
@@ -197,7 +204,7 @@ func parseURI(uri string) (bucket, prefix string, err error) {
 	return bucket, prefix, nil
 }
 
-func loadAWSConfig(cfg Config) (aws.Config, error) {
+func loadAWSConfig(ctx context.Context, cfg Config) (aws.Config, error) {
 	region := cfg.Region
 	if region == "" {
 		region = "us-east-1"
@@ -206,7 +213,7 @@ func loadAWSConfig(cfg Config) (aws.Config, error) {
 	if cfg.Endpoint != "" {
 		opts = append(opts, awsconfig.WithBaseEndpoint(cfg.Endpoint))
 	}
-	return awsconfig.LoadDefaultConfig(context.Background(), opts...)
+	return awsconfig.LoadDefaultConfig(ctx, opts...)
 }
 
 // s3Putter adapts the S3 client to the putter interface.
@@ -218,7 +225,7 @@ func (p *s3Putter) Put(ctx context.Context, bucket, key string, body []byte) err
 	_, err := p.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-		Body:   strings.NewReader(string(body)),
+		Body:   bytes.NewReader(body),
 	})
 	return err
 }

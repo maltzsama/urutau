@@ -68,9 +68,14 @@ func (o *Offsets) String() string {
 	return b.String()
 }
 
-// Compare implements Position. Offsets with different topics are compared
-// lexicographically on topic name. Within the same topic, the position
-// with the higher maximum partition offset is greater.
+// Compare implements a total order for Offsets to satisfy the Position
+// interface. Offsets with different topics are compared lexicographically
+// on topic name — an artificial order with no semantic meaning. Within the
+// same topic, the position with the higher maximum partition offset is
+// greater. This is a heuristic: two positions with different partition
+// sets but the same maxOffset are treated as equal. For correctness
+// decisions (e.g. "does this position cover that one?"), use Contains
+// instead of Compare.
 func (o *Offsets) Compare(other Position) int {
 	oth, ok := other.(*Offsets)
 	if !ok {
@@ -79,7 +84,14 @@ func (o *Offsets) Compare(other Position) int {
 	if o.Topic != oth.Topic {
 		return strings.Compare(o.Topic, oth.Topic)
 	}
-	return int(o.maxOffset() - oth.maxOffset())
+	diff := o.maxOffset() - oth.maxOffset()
+	if diff > 0 {
+		return 1
+	}
+	if diff < 0 {
+		return -1
+	}
+	return 0
 }
 
 // Contains returns true when o's offsets are all at least as large as

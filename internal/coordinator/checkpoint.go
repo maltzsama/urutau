@@ -60,6 +60,10 @@ func newCheckpoint(ctx context.Context, cfg CheckpointConfig) (*checkpoint, erro
 	return &checkpoint{interval: interval, client: client, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/")}, nil
 }
 
+// putTimeout bounds a single S3 PutObject so a slow endpoint stalls only
+// this tick, not the entire checkpoint loop.
+const putTimeout = 10 * time.Second
+
 // run writes the manifests until ctx is done. Async and best-effort by
 // contract: a failed checkpoint is logged, never fatal.
 func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*positionIndex, log *slog.Logger) {
@@ -71,20 +75,26 @@ func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*po
 			return
 		case <-ticker.C:
 			for worker, idx := range index {
+				if !idx.Dirty() {
+					continue
+				}
 				m := idx.Manifest()
 				body, err := json.Marshal(m)
 				if err != nil {
-					log.Warn("checkpoint: marshal", "worker", worker, "err", err)
+					log.Warn("checkpoint: marshal", "run", runID, "worker", worker, "err", err)
 					continue
 				}
-				key := fmt.Sprintf("%s/%s/%s/manifest.json", c.prefix, runID, worker)
-				if _, err := c.client.PutObject(ctx, &s3.PutObjectInput{
+				key := strings.TrimPrefix(c.prefix+"/", "/") + runID + "/" + worker + "/manifest.json"
+				putCtx, cancel := context.WithTimeout(ctx, putTimeout)
+				if _, err := c.client.PutObject(putCtx, &s3.PutObjectInput{
 					Bucket: aws.String(c.bucket),
 					Key:    aws.String(key),
 					Body:   strings.NewReader(string(body)),
 				}); err != nil {
-					log.Warn("checkpoint: put", "key", key, "err", err)
+					log.Warn("checkpoint: put", "run", runID, "worker", worker, "key", key, "err", err)
 				}
+				cancel()
+				idx.MarkClean()
 			}
 		}
 	}

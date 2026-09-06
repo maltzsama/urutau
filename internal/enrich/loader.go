@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	// The reference read is a plain SQL query against a second database —
 	// the same engines as the sources, registered for database/sql.
@@ -40,6 +41,7 @@ func NewSQLLoader(uri, query string) (Loader, error) {
 		return nil, fmt.Errorf("enrich: open reference: %w", err)
 	}
 	db.SetMaxOpenConns(1) // one sequential re-read per refresh; no pool theater
+	db.SetConnMaxLifetime(5 * time.Minute)
 	return &sqlLoader{db: db, query: query}, nil
 }
 

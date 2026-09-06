@@ -111,8 +111,13 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]change.Change, error) {
 	return []change.Change{c}, nil
 }
 
-func (d *DebeziumJSON) resolveTable(_ []byte, env debeziumEnvelope) string {
-	// Use the envelope's source table if available.
+func (d *DebeziumJSON) resolveTable(topic []byte, env debeziumEnvelope) string {
+	// Check the TopicToTable map first — allows explicit topic → target
+	// mapping when the envelope's source table doesn't match the pipeline.
+	if t, ok := d.TopicToTable[string(topic)]; ok {
+		return t
+	}
+	// Fall back to the envelope's source table if available.
 	if env.Source.Table != "" {
 		return env.Source.DB + "." + env.Source.Table
 	}

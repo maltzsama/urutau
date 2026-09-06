@@ -31,6 +31,10 @@ import (
 // DefaultRefresh re-reads a reference this often when the spec is silent.
 const DefaultRefresh = 5 * time.Minute
 
+// defaultMaxEvents caps the cold-start buffer when the spec leaves
+// BufferLimits.MaxEvents at zero (the Go int zero value).
+const defaultMaxEvents = 100_000
+
 // coldStartPolicy resolves the onColdStart grammar.
 type coldStartPolicy int
 
@@ -55,6 +59,17 @@ type Stage struct {
 	misses       atomic.Int64 // left-join misses (events that passed with NULLs)
 	innerDropped atomic.Int64 // events an inner join discarded
 	evicted      atomic.Int64 // cold-start evacuations (maxEvents / maxWait)
+
+	// metrics is optional; when set, counters are mirrored to Prometheus.
+	metrics *enrichMetrics
+}
+
+// enrichMetrics wraps the Prometheus counters for the enrichment stage.
+// Nil-safe: if the pointer is nil, Inc calls are no-ops.
+type enrichMetrics struct {
+	misses  func(table, ref string)
+	dropped func(table, ref string)
+	evicted func(table, ref string)
 }
 
 // refJoin is one reference: its config, the hot lookup image, and the
@@ -82,7 +97,8 @@ type refJoin struct {
 	firstErr error // sticky: a broken reference surfaces on the first event
 
 	// misses is the stage-level counter, shared by reference pointers.
-	misses *atomic.Int64
+	misses  *atomic.Int64
+	metrics *enrichMetrics // shared with Stage; nil-safe
 }
 
 type dest struct {
@@ -144,6 +160,16 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		s.refs = append(s.refs, rj)
 	}
 	return s, nil
+}
+
+// SetMetrics wires Prometheus counters into the stage. Call after New;
+// nil-safe (metrics pointer is stored, not dereferenced).
+func (s *Stage) SetMetrics(misses, dropped, evicted func(table, ref string)) {
+	m := &enrichMetrics{misses: misses, dropped: dropped, evicted: evicted}
+	s.metrics = m
+	for _, rj := range s.refs {
+		rj.metrics = m
+	}
 }
 
 // refreshInterval resolves the re-read cadence.
@@ -366,6 +392,9 @@ func (s *Stage) Enrich(changes []change.Change) ([]change.Change, error) {
 			// at drain time — latency bound, not a third policy.
 			if wait := rj.maxWait(); wait > 0 && time.Since(b.queued) > wait {
 				s.evicted.Add(1)
+				if s.metrics != nil {
+					s.metrics.evicted(rj.cfg.Table, rj.cfg.Table)
+				}
 				s.forceMiss(i, b.c, &out)
 				continue
 			}
@@ -394,6 +423,9 @@ func (s *Stage) applyFrom(i int, c change.Change, out *[]change.Change) {
 			// continue to the next reference
 		case dropped:
 			s.innerDropped.Add(1)
+			if s.metrics != nil {
+				s.metrics.dropped(rj.cfg.Table, rj.cfg.Table)
+			}
 			return
 		case parked:
 			s.enqueue(rj, i, c, out)
@@ -421,6 +453,9 @@ func (s *Stage) forceMiss(i int, c change.Change, out *[]change.Change) {
 func (s *Stage) enqueue(rj *refJoin, at int, c change.Change, out *[]change.Change) {
 	rj.mu.Lock()
 	max := rj.cfg.BufferLimits.MaxEvents
+	if max <= 0 {
+		max = defaultMaxEvents
+	}
 	var evicted []change.Change
 	for max > 0 && len(rj.queue) >= max {
 		evicted = append(evicted, rj.queue[0].c)
@@ -430,6 +465,9 @@ func (s *Stage) enqueue(rj *refJoin, at int, c change.Change, out *[]change.Chan
 	rj.mu.Unlock()
 	for _, e := range evicted {
 		s.evicted.Add(1)
+		if s.metrics != nil {
+			s.metrics.evicted(rj.cfg.Table, rj.cfg.Table)
+		}
 		s.forceMiss(at, e, out)
 	}
 }
@@ -476,6 +514,9 @@ func (rj *refJoin) apply(c *change.Change) applyResult {
 func (rj *refJoin) join(c *change.Change, row map[string]any) applyResult {
 	if row == nil {
 		rj.misses.Add(1)
+		if rj.metrics != nil {
+			rj.metrics.misses(rj.cfg.Table, rj.cfg.Table)
+		}
 		if rj.cfg.JoinType == "inner" {
 			return dropped
 		}
@@ -503,6 +544,11 @@ func (rj *refJoin) stickyErr() error {
 	return rj.firstErr
 }
 
+// maxWait parses the optional latency cap. The value is checked at drain
+// time (Enrich), not per-event during the buffer — events that exceed
+// maxWait are evicted when the cold-start queue is released, not on a
+// background timer. This is a deliberate simplicity trade-off: the drain
+// is a single pass that handles all events at once.
 func (rj *refJoin) maxWait() time.Duration {
 	if rj.cfg.BufferLimits.MaxWait == "" {
 		return 0
@@ -536,11 +582,11 @@ func joinKey(v any) string {
 	case []byte:
 		return "s:" + string(t)
 	case int:
-		return strconv.FormatInt(int64(t), 10)
+		return "i:" + strconv.FormatInt(int64(t), 10)
 	case int32:
-		return strconv.FormatInt(int64(t), 10)
+		return "i:" + strconv.FormatInt(int64(t), 10)
 	case int64:
-		return strconv.FormatInt(t, 10)
+		return "i:" + strconv.FormatInt(t, 10)
 	case uint:
 		return "u:" + strconv.FormatUint(uint64(t), 10)
 	case uint32:

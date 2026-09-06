@@ -11,9 +11,9 @@ import (
 	"github.com/maltzsama/urutau/source"
 )
 
-// slotNameRe matches the server's slot-name rules: lowercase letters,
-// digits, underscore.
-var slotNameRe = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+// slotNameRe matches the server's slot-name rules: letters (any case),
+// digits, underscore, up to 63 characters.
+var slotNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // publicationFor derives the publication name from the slot name: one
 // publication per pipeline slot.
@@ -86,7 +86,9 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 }
 
 // syncPublication aligns an existing publication's table set with the
-// pipeline: adds missing members, drops extra ones.
+// pipeline: adds missing members, drops extra ones. All ALTER PUBLICATION
+// statements run inside a single transaction so a failure leaves the
+// publication in its previous state.
 func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []source.TableRef) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT schemaname, tablename FROM pg_catalog.pg_publication_tables WHERE pubname = $1`, pub)
@@ -112,10 +114,17 @@ func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []sourc
 	for _, ref := range tables {
 		want[ref.Source] = true
 	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: publication tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	for src := range members {
 		if !want[src] {
 			schema, table, _ := strings.Cut(src, ".")
-			if _, err := db.ExecContext(ctx, fmt.Sprintf(
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(
 				`ALTER PUBLICATION %s DROP TABLE %s.%s`,
 				quoteIdent(pub), quoteIdent(schema), quoteIdent(table))); err != nil {
 				return fmt.Errorf("postgres: publication drop %s: %w", src, err)
@@ -125,14 +134,14 @@ func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []sourc
 	for src := range want {
 		if !members[src] {
 			schema, table, _ := strings.Cut(src, ".")
-			if _, err := db.ExecContext(ctx, fmt.Sprintf(
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(
 				`ALTER PUBLICATION %s ADD TABLE %s.%s`,
 				quoteIdent(pub), quoteIdent(schema), quoteIdent(table))); err != nil {
 				return fmt.Errorf("postgres: publication add %s: %w", src, err)
 			}
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // ConfirmedLSN reads the slot's confirmed_flush_lsn: the stream start for

@@ -32,6 +32,9 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	}
 	opt, err := ch.ParseDSN(cfg.URI)
 	if err != nil {
+		if strings.HasPrefix(cfg.URI, "clickhouse://") {
+			return nil, fmt.Errorf("clickhouse: parse dsn %q: %w", cfg.URI, err)
+		}
 		// A bare host:port is accepted as the native address.
 		opt = &ch.Options{Addr: []string{cfg.URI}}
 	}

@@ -4,6 +4,7 @@ package observability
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -28,6 +29,11 @@ type Metrics struct {
 	SnapshotProgress *prometheus.GaugeVec
 	DroppedByWindow  *prometheus.CounterVec
 	DeletesDropped   *prometheus.CounterVec
+
+	// Enrich.
+	EnrichMisses  *prometheus.CounterVec
+	EnrichDropped *prometheus.CounterVec
+	EnrichEvicted *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -72,8 +78,19 @@ func New() *Metrics {
 		Name: "urutau_worker_deletes_dropped_total", Help: "append-only deletes dropped (skip or no before image), per table."},
 		[]string{"table"})
 
+	m.EnrichMisses = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_enrich_misses_total", Help: "enrichment left-join misses (events passed with NULL reference columns)."},
+		[]string{"table", "reference"})
+	m.EnrichDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_enrich_inner_dropped_total", Help: "events dropped by inner-join miss."},
+		[]string{"table", "reference"})
+	m.EnrichEvicted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_enrich_evicted_total", Help: "events evicted from the cold-start buffer (maxEvents or maxWait)."},
+		[]string{"table", "reference"})
+
 	reg.MustRegister(m.LagSeconds, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
 	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
+	reg.MustRegister(m.EnrichMisses, m.EnrichDropped, m.EnrichEvicted)
 	return m
 }
 
@@ -85,7 +102,14 @@ func (m *Metrics) Serve(addr string, encoder func(w http.ResponseWriter, r *http
 	if encoder != nil {
 		mux.HandleFunc("/statusz", encoder)
 	}
-	return http.ListenAndServe(addr, mux)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+	return srv.ListenAndServe()
 }
 
 // Registry exposes the underlying registry (for tests).

@@ -624,7 +624,7 @@ type EnrichRef struct {
 	SourceUri       string                 `protobuf:"bytes,2,opt,name=source_uri,json=sourceUri,proto3" json:"source_uri,omitempty"`                                            // reference connection (mysql:// | postgres://)
 	SourceQuery     string                 `protobuf:"bytes,3,opt,name=source_query,json=sourceQuery,proto3" json:"source_query,omitempty"`                                      // full reference image SELECT
 	On              map[string]string      `protobuf:"bytes,4,rep,name=on,proto3" json:"on,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // event column → reference column
-	Select          []string               `protobuf:"bytes,5,rep,name=select,proto3" json:"select,omitempty"`                                                                   // reference columns taken (empty: all)
+	Select          []string               `protobuf:"bytes,5,rep,name=select,proto3" json:"select,omitempty"`                                                                   // required: reference columns to inject ("*" = all except join key)
 	As              map[string]string      `protobuf:"bytes,6,rep,name=as,proto3" json:"as,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // reference column → destination name
 	JoinType        string                 `protobuf:"bytes,7,opt,name=join_type,json=joinType,proto3" json:"join_type,omitempty"`                                               // left | inner
 	Refresh         string                 `protobuf:"bytes,8,opt,name=refresh,proto3" json:"refresh,omitempty"`                                                                 // duration; empty = worker default (5m)

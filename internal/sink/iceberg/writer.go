@@ -449,7 +449,10 @@ func backoffDuration(base time.Duration, attempt int) time.Duration {
 		d = 30 * time.Second
 	}
 	// Add 0-25% jitter.
-	jitter := time.Duration(rand.Int64N(int64(d) / 4))
+	var jitter time.Duration
+	if d > 0 {
+		jitter = time.Duration(rand.Int64N(int64(d) / 4))
+	}
 	return d + jitter
 }
 

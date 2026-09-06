@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -86,12 +87,22 @@ func decodeScalar(dataType string, data []byte) (any, error) {
 		// KindDecimal); the sink parses it at the column boundary.
 		return cleanNumeric(s), nil
 	case "money":
-		// Money renders as "$1,234.56"; strip the decorations.
+		// Money renders as "$1,234.56" or "($1,234.56)" for negatives;
+		// strip the decorations and convert parenthesized negatives.
 		v, err := strconv.ParseFloat(cleanNumeric(s), 64)
 		if err != nil {
 			return nil, err
 		}
 		return v, nil
+	case "bytea":
+		// pgoutput transmits bytea as hex text (e.g. "\\x6f6f").
+		// Strip the "\\x" prefix and decode to raw bytes.
+		hex := strings.TrimPrefix(s, "\\x")
+		b, err := decodeStringToBytes(hex)
+		if err != nil {
+			return nil, fmt.Errorf("bytea hex: %w", err)
+		}
+		return b, nil
 	case "boolean":
 		switch strings.ToLower(s) {
 		case "t", "true":
@@ -110,6 +121,16 @@ func decodeScalar(dataType string, data []byte) (any, error) {
 }
 
 // cleanNumeric strips the money decorations from a numeric text.
+// Parenthesized values like "($1,234.56)" are converted to negatives.
 func cleanNumeric(s string) string {
+	// Convert parenthesized negatives: (1234.56) → -1234.56
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		s = "-" + strings.TrimPrefix(strings.TrimSuffix(s, "("), ")")
+	}
 	return strings.NewReplacer("$", "", ",", "", " ", "").Replace(s)
+}
+
+// decodeStringToBytes decodes a hex string to []byte.
+func decodeStringToBytes(s string) ([]byte, error) {
+	return hex.DecodeString(s)
 }

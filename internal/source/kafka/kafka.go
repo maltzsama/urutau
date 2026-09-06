@@ -33,13 +33,14 @@ type Source struct {
 
 func capabilities() source.Capabilities {
 	return source.Capabilities{
-		Snapshot:          false,
-		ChunkQuery:        false,
-		Stream:            true,
-		MaxConnections:    0, // no query connections at all
-		Modes:             []source.Mode{source.ModeCDC},
-		BeforeImage:       false, // deletes are tombstones (null) — no image to record
-		MonotonicSequence: true,  // (partition, offset) never reappears
+		Snapshot:            false,
+		ChunkQuery:          false,
+		Stream:              true,
+		MaxConnections:      0, // no query connections at all
+		Modes:               []source.Mode{source.ModeCDC},
+		BeforeImage:         false, // deletes are tombstones (null) — no image to record
+		MonotonicSequence:   true,  // (partition, offset) never reappears
+		RecoverablePosition: true,  // offsets allow exact resume
 	}
 }
 
@@ -134,7 +135,9 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		return nil, fmt.Errorf("kafka: new client: %w", err)
 	}
 
-	dec := decoder.Decoder(&decoder.DebeziumJSON{})
+	dec := decoder.Decoder(&decoder.DebeziumJSON{
+		TopicToTable: topicToTarget(refs),
+	})
 	switch s.Spec.Source.Format {
 	case "raw":
 		dec = &decoder.Raw{}
@@ -161,6 +164,15 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 // the committed position or the beginning.
 func (s Source) InitialPosition(_ context.Context) (position.Position, error) {
 	return &position.Offsets{}, nil
+}
+
+// topicToTarget builds a topic → target table map from the table refs.
+func topicToTarget(refs []source.TableRef) map[string]string {
+	m := make(map[string]string, len(refs))
+	for _, ref := range refs {
+		m[ref.Source] = ref.Target
+	}
+	return m
 }
 
 // ParsePosition decodes a stored cdc.position as Kafka offsets.

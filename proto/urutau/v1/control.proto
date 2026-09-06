@@ -79,7 +79,7 @@ message EnrichRef {
   string              source_uri   = 2;  // reference connection (mysql:// | postgres://)
   string              source_query = 3;  // full reference image SELECT
   map<string, string> on           = 4;  // event column → reference column
-  repeated string     select       = 5;  // reference columns taken (empty: all)
+  repeated string     select       = 5;  // required: reference columns to inject ("*" = all except join key)
   map<string, string> as           = 6;  // reference column → destination name
   string              join_type    = 7;  // left | inner
   string              refresh      = 8;  // duration; empty = worker default (5m)

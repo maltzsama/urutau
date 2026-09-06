@@ -53,7 +53,7 @@ func fieldTypeToCore(f arrow.Field) core.ColumnType {
 // columns (__op, __pos, __commit_ts, __ingest_ts, __snapshot). This is
 // the wire schema used by EncodeBatch/DecodeBatch.
 func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
-	fields := make([]arrow.Field, 0, len(cs.Columns)+8)
+	fields := make([]arrow.Field, 0, len(cs.Columns)+5)
 
 	// Data columns: typed per core.Kind.
 	for _, col := range cs.Columns {
@@ -157,6 +157,8 @@ func kindToArrowScalar(ct core.ColumnType) (arrow.DataType, error) {
 		return arrow.PrimitiveTypes.Int32, nil
 	case core.KindInt64:
 		return arrow.PrimitiveTypes.Int64, nil
+	case core.KindUInt64:
+		return arrow.PrimitiveTypes.Uint64, nil
 	case core.KindFloat32:
 		return arrow.PrimitiveTypes.Float32, nil
 	case core.KindFloat64:
@@ -190,8 +192,8 @@ func kindToArrowScalar(ct core.ColumnType) (arrow.DataType, error) {
 	}
 }
 
-// IsMetadataColumn returns true for the fixed metadata column names.
-func IsMetadataColumn(name string) bool {
+// isMetadataColumn returns true for the fixed metadata column names.
+func isMetadataColumn(name string) bool {
 	switch name {
 	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot":
 		return true
