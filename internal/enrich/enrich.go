@@ -72,35 +72,23 @@ type enrichMetrics struct {
 	evicted func(table, ref string)
 }
 
-// snapshot is the immutable reference state swapped atomically on refresh.
-// Bundling hot, image, and dests ensures the hot path reads a consistent
-// view with a single atomic.Load — no lock, no partial reads.
-type snapshot struct {
-	hot   bool
-	image map[string]map[string]any // normalized join key → reference row
-	dests []dest                    // projected reference columns
-}
-
 // refJoin is one reference: its config, the hot lookup image, and the
-// cold-start queue. The snapshot is swapped atomically — an in-flight
-// batch finishes against the old map, never a half-built one. The mutex
-// only protects cold-start state (queue, pendingDrain) and the sticky
-// error; the hot path is lock-free.
+// cold-start queue. The image swaps atomically under mu — an in-flight
+// batch finishes against the old map, never a half-built one.
 type refJoin struct {
 	cfg    spec.Enrich
 	loader Loader
+	dests  []dest // projected reference columns, resolved at first load
 	onKey  string // event column name
 	onRef  string // reference column name
 	policy coldStartPolicy
 
-	// snap is the hot-path state: image + dests + hot flag, swapped
-	// atomically on refresh. Load() is lock-free; Store() is called
-	// only by refresh (one goroutine per reference).
-	snap atomic.Pointer[snapshot]
-
-	// mu protects cold-start state and the sticky error — written
-	// rarely (cold start, first load), never on the hot path.
 	mu    sync.Mutex
+	hot   bool
+	image map[string]map[string]any // normalized join key → reference row
+	// queue holds events absorbed before the first successful load; next
+	// is the index of the reference the event has NOT yet been joined
+	// against (the one that parked it).
 	queue []buffered
 	// pendingDrain is the queue captured at the hot flip, released into
 	// the pipeline by the next Apply (the batcher goroutine owns Apply).
@@ -253,7 +241,7 @@ func (s *Stage) Stop() {
 	}
 }
 
-// refresh re-reads the reference and swaps the snapshot atomically. The
+// refresh re-reads the reference and swaps the image atomically. The
 // FIRST successful load also resolves the projection and flips hot —
 // parking the cold-start queue for the next Apply to release.
 func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
@@ -278,15 +266,15 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
 		return
 	}
-	// Atomic swap: the hot path reads this with a single Load(), no lock.
-	wasHot := rj.snap.Load() != nil
-	rj.snap.Store(&snapshot{hot: true, image: image, dests: dests})
-	// Cold-start queue flip: captured under mu for the batcher to drain.
+	rj.mu.Lock()
+	defer rj.mu.Unlock()
+	rj.dests = dests
+	wasHot := rj.hot
+	rj.image = image
+	rj.hot = true
 	if !wasHot {
-		rj.mu.Lock()
 		rj.pendingDrain = rj.queue
 		rj.queue = nil
-		rj.mu.Unlock()
 	}
 	log.Info("enrich: reference loaded", "reference", rj.cfg.Table, "rows", len(image))
 }
@@ -298,12 +286,10 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 // previous image stays authoritative); the caller logs it.
 func (rj *refJoin) setFirstErr(err error) {
 	rj.mu.Lock()
-	defer rj.mu.Unlock()
-	if snap := rj.snap.Load(); snap == nil || !snap.hot {
-		if rj.firstErr == nil {
-			rj.firstErr = err
-		}
+	if !rj.hot && rj.firstErr == nil {
+		rj.firstErr = err
 	}
+	rj.mu.Unlock()
 }
 
 // buildImage resolves the projection once and indexes the reference with
@@ -456,12 +442,7 @@ func (s *Stage) forceMiss(i int, c change.Change, out *[]change.Change) {
 		return // nothing to enrich; a key-only delete just vanishes
 	}
 	rj := s.refs[i]
-	snap := rj.snap.Load()
-	var dests []dest
-	if snap != nil {
-		dests = snap.dests
-	}
-	if rj.join(&c, nil, dests) == applied {
+	if rj.join(&c, nil) == applied {
 		s.applyFrom(i+1, c, out)
 	}
 }
@@ -501,9 +482,12 @@ const (
 
 // apply joins one change against this reference, mutating After in place.
 func (rj *refJoin) apply(c *change.Change) applyResult {
-	snap := rj.snap.Load() // lock-free read
+	rj.mu.Lock()
+	hot := rj.hot
+	image := rj.image
+	rj.mu.Unlock()
 
-	if snap == nil || !snap.hot {
+	if !hot {
 		switch rj.policy {
 		case coldDrop:
 			return dropped
@@ -511,7 +495,7 @@ func (rj *refJoin) apply(c *change.Change) applyResult {
 			// Cold map: every lookup misses; the miss follows the join
 			// type. Reference columns are unknown until the first load,
 			// so a cold left-miss marks the row without adding NULLs.
-			return rj.join(c, nil, nil)
+			return rj.join(c, nil)
 		default: // coldBuffer
 			return parked
 		}
@@ -520,14 +504,14 @@ func (rj *refJoin) apply(c *change.Change) applyResult {
 		// A key-only delete carries nothing to enrich.
 		return applied
 	}
-	return rj.join(c, snap.image[joinKey(c.After[rj.onKey])], snap.dests)
+	return rj.join(c, image[joinKey(c.After[rj.onKey])])
 }
 
 // join materializes the hit or the miss. A miss in a left join passes the
 // event with NULL reference columns and marks it; an inner join drops it.
 // That grammar is the ONLY miss policy — cold start, eviction and expiry
 // all route through it.
-func (rj *refJoin) join(c *change.Change, row map[string]any, dests []dest) applyResult {
+func (rj *refJoin) join(c *change.Change, row map[string]any) applyResult {
 	if row == nil {
 		rj.misses.Add(1)
 		if rj.metrics != nil {
@@ -536,16 +520,22 @@ func (rj *refJoin) join(c *change.Change, row map[string]any, dests []dest) appl
 		if rj.cfg.JoinType == "inner" {
 			return dropped
 		}
-		for _, d := range dests {
+		for _, d := range rj.currentDests() {
 			c.After[d.as] = nil
 		}
 		c.EnrichMiss = true
 		return applied
 	}
-	for _, d := range dests {
+	for _, d := range rj.currentDests() {
 		c.After[d.as] = row[d.as] // the image is already projected + renamed
 	}
 	return applied
+}
+
+func (rj *refJoin) currentDests() []dest {
+	rj.mu.Lock()
+	defer rj.mu.Unlock()
+	return rj.dests
 }
 
 func (rj *refJoin) stickyErr() error {
