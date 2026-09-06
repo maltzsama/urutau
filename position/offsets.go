@@ -79,7 +79,14 @@ func (o *Offsets) Compare(other Position) int {
 	if o.Topic != oth.Topic {
 		return strings.Compare(o.Topic, oth.Topic)
 	}
-	return int(o.maxOffset() - oth.maxOffset())
+	diff := o.maxOffset() - oth.maxOffset()
+	if diff > 0 {
+		return 1
+	}
+	if diff < 0 {
+		return -1
+	}
+	return 0
 }
 
 // Contains returns true when o's offsets are all at least as large as

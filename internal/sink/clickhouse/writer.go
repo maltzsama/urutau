@@ -233,9 +233,17 @@ func (w *tableWriter) project(c change.Change, isDeleted bool, batchPos string, 
 func (w *tableWriter) valueFor(col column, proj map[string]any) (any, error) {
 	switch col.name {
 	case "position":
-		return proj[positionKey].(string), nil
+		s, ok := proj[positionKey].(string)
+		if !ok {
+			return nil, fmt.Errorf("clickhouse: position column is not string: %T", proj[positionKey])
+		}
+		return s, nil
 	case "seq":
-		return proj[seqKey].(uint64), nil
+		u, ok := proj[seqKey].(uint64)
+		if !ok {
+			return nil, fmt.Errorf("clickhouse: seq column is not uint64: %T", proj[seqKey])
+		}
+		return u, nil
 	case "is_deleted":
 		if proj[deletedKey] == true {
 			return uint8(1), nil

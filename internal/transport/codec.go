@@ -164,7 +164,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 	for i := 0; i < int(rec.NumRows()); i++ {
 		c := change.Change{
 			Table:    meta.Table,
-			IngestTS: time.Now(),
+			IngestTS: time.Now(), // fallback when the wire column is null
 		}
 
 		// Data columns → After map.
@@ -198,6 +198,10 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 		tsCol, _ := rec.Column(numDataCols + 2).(*array.Timestamp)
 		if !tsCol.IsNull(i) {
 			c.CommitTS = tsCol.Value(i).ToTime(arrow.Microsecond)
+		}
+		ingestCol, _ := rec.Column(numDataCols + 3).(*array.Timestamp)
+		if !ingestCol.IsNull(i) {
+			c.IngestTS = ingestCol.Value(i).ToTime(arrow.Microsecond)
 		}
 		snapCol, _ := rec.Column(numDataCols + 4).(*array.Boolean)
 		c.Snapshot = snapCol.Value(i)

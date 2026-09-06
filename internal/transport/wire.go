@@ -41,7 +41,7 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 	}
 	cs := core.Schema{Columns: make([]core.Column, 0, len(schema.Fields()))}
 	for _, f := range schema.Fields() {
-		if IsMetadataColumn(f.Name) {
+		if isMetadataColumn(f.Name) {
 			continue
 		}
 		ct := fieldTypeToCore(f)

@@ -6,6 +6,8 @@ package iceberg
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
@@ -35,6 +37,9 @@ func NewCatalog(ctx context.Context, cfg Config) (catalog.Catalog, error) {
 
 // EnsureNamespace creates the namespace, tolerating an existing one.
 func EnsureNamespace(ctx context.Context, cat catalog.Catalog, ns table.Identifier) error {
-	_ = cat.CreateNamespace(ctx, ns, nil)
+	err := cat.CreateNamespace(ctx, ns, nil)
+	if err != nil && !errors.Is(err, catalog.ErrNamespaceAlreadyExists) {
+		return fmt.Errorf("ensure namespace %v: %w", ns, err)
+	}
 	return nil
 }

@@ -83,7 +83,7 @@ func New(ctx context.Context, cfg Config) (*Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	awsCfg, err := loadAWSConfig(cfg)
+	awsCfg, err := loadAWSConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("eventlog: aws config: %w", err)
 	}
@@ -197,7 +197,7 @@ func parseURI(uri string) (bucket, prefix string, err error) {
 	return bucket, prefix, nil
 }
 
-func loadAWSConfig(cfg Config) (aws.Config, error) {
+func loadAWSConfig(ctx context.Context, cfg Config) (aws.Config, error) {
 	region := cfg.Region
 	if region == "" {
 		region = "us-east-1"
@@ -206,7 +206,7 @@ func loadAWSConfig(cfg Config) (aws.Config, error) {
 	if cfg.Endpoint != "" {
 		opts = append(opts, awsconfig.WithBaseEndpoint(cfg.Endpoint))
 	}
-	return awsconfig.LoadDefaultConfig(context.Background(), opts...)
+	return awsconfig.LoadDefaultConfig(ctx, opts...)
 }
 
 // s3Putter adapts the S3 client to the putter interface.
