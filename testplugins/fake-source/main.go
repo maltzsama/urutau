@@ -293,7 +293,7 @@ func (s *sourceService) streamSnapshot(stream flight.FlightService_DoGetServer) 
 		builder := array.NewRecordBuilder(s.mem, tableSchema)
 		builder.Field(0).(*array.Int64Builder).Append(int64(i + 1))
 		builder.Field(1).(*array.Int32Builder).Append(int32((i + 1) * 10))
-		rec := builder.NewRecord()
+		rec := builder.NewRecordBatch()
 
 		var buf bytes.Buffer
 		writer := ipc.NewWriter(&buf, ipc.WithSchema(tableSchema), ipc.WithAllocator(s.mem))
@@ -301,7 +301,10 @@ func (s *sourceService) streamSnapshot(stream flight.FlightService_DoGetServer) 
 			rec.Release()
 			return err
 		}
-		writer.Close()
+		if err := writer.Close(); err != nil {
+			rec.Release()
+			return err
+		}
 
 		if err := stream.Send(&flight.FlightData{
 			DataBody: buf.Bytes(),
@@ -343,14 +346,17 @@ func (s *sourceService) streamChanges(stream flight.FlightService_DoGetServer) e
 		tableOffsets["orders"] = offset
 		mu.Unlock()
 
-		rec := newCDCRecord(s.mem, cdcSchema, ch.op, ch.before, ch.after, []byte(offset))
+		rec := newCDCRecordBatch(s.mem, cdcSchema, ch.op, ch.before, ch.after, []byte(offset))
 		var buf bytes.Buffer
 		writer := ipc.NewWriter(&buf, ipc.WithSchema(cdcSchema), ipc.WithAllocator(s.mem))
 		if err := writer.Write(rec); err != nil {
 			rec.Release()
 			return err
 		}
-		writer.Close()
+		if err := writer.Close(); err != nil {
+			rec.Release()
+			return err
+		}
 		rec.Release()
 
 		if err := stream.Send(&flight.FlightData{
@@ -368,7 +374,7 @@ func (s *sourceService) streamChanges(stream flight.FlightService_DoGetServer) e
 	}
 }
 
-func newCDCRecord(mem memory.Allocator, schema *arrow.Schema, op string, before, after *struct{ id, qty int64 }, offset []byte) arrow.Record {
+func newCDCRecordBatch(mem memory.Allocator, schema *arrow.Schema, op string, before, after *struct{ id, qty int64 }, offset []byte) arrow.RecordBatch {
 	bld := array.NewRecordBuilder(mem, schema)
 	defer bld.Release()
 
@@ -394,7 +400,7 @@ func newCDCRecord(mem memory.Allocator, schema *arrow.Schema, op string, before,
 	ts, _ := arrow.TimestampFromTime(time.Now(), arrow.Microsecond)
 	bld.Field(4).(*array.TimestampBuilder).Append(ts)
 
-	return bld.NewRecord()
+	return bld.NewRecordBatch()
 }
 
 func (s *sourceService) verifyBearer(ctx context.Context) error {
