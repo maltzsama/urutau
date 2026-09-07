@@ -23,7 +23,7 @@ func TestSpawnMissingBinary(t *testing.T) {
 
 func TestSpawnMissingToken(t *testing.T) {
 	bin := writeScript(t, "echo '{\"ready\":true,\"protocolVersion\":1}'")
-	defer os.Remove(bin)
+	defer os.Remove(bin) //nolint:errcheck
 
 	_, err := proc.Spawn(context.Background(), proc.Config{
 		Bin:  bin,
@@ -36,7 +36,7 @@ func TestSpawnMissingToken(t *testing.T) {
 
 func TestSpawnReadinessTimeout(t *testing.T) {
 	bin := writeScript(t, "sleep 10")
-	defer os.Remove(bin)
+	defer os.Remove(bin) //nolint:errcheck
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -56,7 +56,7 @@ func TestSpawnReadinessTimeout(t *testing.T) {
 
 func TestSpawnInvalidJSON(t *testing.T) {
 	bin := writeScript(t, "echo 'not json'")
-	defer os.Remove(bin)
+	defer os.Remove(bin) //nolint:errcheck
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -76,7 +76,7 @@ func TestSpawnInvalidJSON(t *testing.T) {
 
 func TestSpawnReadyFalse(t *testing.T) {
 	bin := writeScript(t, "echo '{\"ready\":false,\"protocolVersion\":1}'")
-	defer os.Remove(bin)
+	defer os.Remove(bin) //nolint:errcheck
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -96,7 +96,7 @@ func TestSpawnReadyFalse(t *testing.T) {
 
 func TestSpawnSuccess(t *testing.T) {
 	bin := writeScript(t, "echo '{\"ready\":true,\"protocolVersion\":1,\"pid\":123}' && sleep 60")
-	defer os.Remove(bin)
+	defer os.Remove(bin) //nolint:errcheck
 
 	p, err := proc.Spawn(context.Background(), proc.Config{
 		Bin:        bin,
@@ -109,7 +109,7 @@ func TestSpawnSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	defer p.Kill()
+	defer p.Kill() //nolint:errcheck
 
 	ready := p.ReadyInfo()
 	if !ready.Ready {
@@ -122,7 +122,7 @@ func TestSpawnSuccess(t *testing.T) {
 
 func TestProcessKill(t *testing.T) {
 	bin := writeScript(t, "echo '{\"ready\":true,\"protocolVersion\":1}' && sleep 60")
-	defer os.Remove(bin)
+	defer os.Remove(bin) //nolint:errcheck
 
 	p, err := proc.Spawn(context.Background(), proc.Config{
 		Bin:        bin,
