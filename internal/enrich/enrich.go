@@ -11,6 +11,11 @@
 // CDC — a replay may therefore enrich with a different (newer) image.
 // Pipelines with enrich report enrichment "point-in-time"; the source
 // columns and the position stay deterministic either way.
+//
+// Column namespacing follows Spark DataFrame semantics: unrenamed columns
+// are automatically prefixed with "{table}.{column}" (e.g., "users.name",
+// "products.id") to prevent silent collisions when multiple references
+// inject columns with the same name. The "as" map overrides the prefix.
 package enrich
 
 import (
@@ -317,10 +322,10 @@ func (rj *refJoin) setFirstErr(err error) {
 //     unrenamed join column preserves the source's own value (the
 //     reference value is projected but not applied); use "as" to
 //     inject the reference value under a distinct name.
-//   - as renames a selected column; unrenamed columns keep their name.
-//   - A projected name colliding with an EVENT column overwrites it —
-//     documented semantics (the reference is the point of the join);
-//     use as to give a distinct name when coexistence is wanted.
+//   - as renames a selected column; unrenamed columns get a
+//     table-prefixed name (e.g., "produtos.id") to avoid silent
+//     collisions when multiple references inject columns with the same
+//     name. This matches Spark DataFrame semantics.
 //
 // The on-reference column is validated to exist and be unique; it is
 // projected only when explicitly listed in select or under "*".
@@ -350,14 +355,16 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	}
 
 	// Resolve the projection: reference column → destination name. Under
-	// the star it is every column except the join key.
+	// the star it is every column except the join key. Unrenamed columns
+	// get a table-prefixed name (Spark-style) to avoid silent collisions
+	// when multiple references inject columns with the same name.
 	projection := map[string]string{}
 	var dests []dest
 	addDest := func(refCol string) {
 		if _, done := projection[refCol]; done {
 			return
 		}
-		name := refCol
+		name := fmt.Sprintf("%s.%s", rj.cfg.Table, refCol)
 		if as, ok := rj.cfg.As[refCol]; ok {
 			name = as
 		}
@@ -544,15 +551,11 @@ func (rj *refJoin) join(c *change.Change, row map[string]any, dests []dest, star
 		return applied
 	}
 	for _, d := range dests {
-		// Under star projection, when the join column is not renamed, the
-		// source's own value prevails — re-injecting it would silently
-		// overwrite the value the event already carries. A rename via "as"
-		// opts in to using the reference value under a distinct name.
-		// Under explicit select the user asked for the column, so it
-		// overwrites (documented collision semantics).
-		if star && d.ref == rj.onRef && d.as == d.ref {
-			continue
-		}
+		// With table-prefixed names (Spark-style), the reference's join
+		// column is injected as "table.column" while the source retains
+		// its original name. Both coexist without collision. When the
+		// user renames via "as", the reference value is used under the
+		// new name.
 		c.After[d.as] = row[d.as] // the image is already projected + renamed
 	}
 	return applied
