@@ -9,7 +9,7 @@ import (
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
-func newTestRecord(t *testing.T, alloc memory.Allocator) arrow.Record {
+func newTestRecord(t *testing.T, alloc memory.Allocator) arrow.RecordBatch {
 	t.Helper()
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
@@ -21,7 +21,7 @@ func newTestRecord(t *testing.T, alloc memory.Allocator) arrow.Record {
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.StringBuilder).Append("alice")
 
-	return bb.NewRecord()
+	return bb.NewRecordBatch()
 }
 
 func TestReleaseNilRecord(t *testing.T) {

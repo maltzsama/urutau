@@ -24,7 +24,7 @@ type Batch struct {
 	Table string
 	// Record is the CR-021 wire schema: data columns in schema order,
 	// followed by __op, __pos, __commit_ts, __ingest_ts, __snapshot.
-	Record arrow.Record
+	Record arrow.RecordBatch
 	// Watermark is __pos of the LAST row as received — the commit point.
 	// Captured at RECEIVE time, before any transform (CR-069 §3.3).
 	// Transforms reorder and drop rows; they may never move the watermark.
