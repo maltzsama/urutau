@@ -15,7 +15,8 @@
 // Column namespacing follows Spark DataFrame semantics: unrenamed columns
 // are automatically prefixed with "{table}.{column}" (e.g., "users.name",
 // "products.id") to prevent silent collisions when multiple references
-// inject columns with the same name. The "as" map overrides the prefix.
+// inject columns with the same name. The "as" map is keyed by the prefixed
+// name (e.g., {"users.name": "user_name"}) for consistency.
 package enrich
 
 import (
@@ -357,7 +358,8 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	// Resolve the projection: reference column → destination name. Under
 	// the star it is every column except the join key. Unrenamed columns
 	// get a table-prefixed name (Spark-style) to avoid silent collisions
-	// when multiple references inject columns with the same name.
+	// when multiple references inject columns with the same name. The "as"
+	// map is keyed by the prefixed name (e.g., "users.id") for consistency.
 	projection := map[string]string{}
 	var dests []dest
 	addDest := func(refCol string) {
@@ -365,7 +367,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 			return
 		}
 		name := fmt.Sprintf("%s.%s", rj.cfg.Table, refCol)
-		if as, ok := rj.cfg.As[refCol]; ok {
+		if as, ok := rj.cfg.As[name]; ok {
 			name = as
 		}
 		projection[refCol] = name

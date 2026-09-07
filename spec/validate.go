@@ -407,14 +407,24 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 				}
 				if sel[s] {
 					*problems = append(*problems, fmt.Sprintf("%s.select: duplicated %q", ep, s))
-				}
-				sel[s] = true
 			}
-			for ref := range e.As {
-				if !sel[ref] {
-					*problems = append(*problems, fmt.Sprintf("%s.as: renames %q which is not in select", ep, ref))
+			sel[s] = true
+		}
+		// For explicit select, validate that as keys match the prefixed
+		// column names (e.g., "users.name") since buildImage uses prefixed
+		// names as the as map keys.
+		for ref := range e.As {
+			found := false
+			for s := range sel {
+				if s == ref {
+					found = true
+					break
 				}
 			}
+			if !found {
+				*problems = append(*problems, fmt.Sprintf("%s.as: renames %q which is not in select (use prefixed name like %q)", ep, ref, "table.column"))
+			}
+		}
 		}
 		// A destination colliding with an EVENT column is documented
 		// overwrite semantics (the reference column wins) — not an error.

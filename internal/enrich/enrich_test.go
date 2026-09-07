@@ -438,7 +438,7 @@ func TestProjectionOnlySelectedColumns(t *testing.T) {
 // 5.2 — Renaming resolves at LOAD time: the event receives the final name.
 func TestRenameAtLoad(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
-		c.As = map[string]string{"name": "user_name"} // tier keeps its name
+		c.As = map[string]string{"users.name": "user_name"} // tier keeps its name
 	})
 	s, _ := newTestStage(t, cfg, refRows())
 	out, err := s.applyOne(t, searchEvent(1, int64(1)))
@@ -480,7 +480,7 @@ func TestCollisionOverwriteAndCoexistence(t *testing.T) {
 	// Rename: explicit "as" gives a custom destination name.
 	cfgAs := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"id", "name"}
-		c.As = map[string]string{"id": "ref_id"}
+		c.As = map[string]string{"users.id": "ref_id"}
 	})
 	sAs, _ := newTestStage(t, cfgAs, refRows())
 	outAs, err := sAs.applyOne(t, searchEvent(99, int64(1)))
@@ -527,7 +527,7 @@ func TestStarProjectionPreservesJoinKey(t *testing.T) {
 func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"*"}
-		c.As = map[string]string{"id": "ref_id"}
+		c.As = map[string]string{"users.id": "ref_id"}
 	})
 	s, _ := newTestStage(t, cfg, refRows())
 	out, err := s.applyOne(t, searchEvent(1, int64(2)))
@@ -552,7 +552,7 @@ func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
 // prefixed names — the memory contract of the map.
 func TestImageHoldsProjectedColumnsOnly(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
-		c.As = map[string]string{"name": "user_name"}
+		c.As = map[string]string{"users.name": "user_name"}
 	})
 	s, _ := newTestStage(t, cfg, refRows())
 	rj := s.refs[0]
