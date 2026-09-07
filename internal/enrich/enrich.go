@@ -79,6 +79,7 @@ type snapshot struct {
 	hot   bool
 	image map[string]map[string]any // normalized join key → reference row
 	dests []dest                    // projected reference columns
+	star  bool                      // true when select is ["*"]
 }
 
 // refJoin is one reference: its config, the hot lookup image, and the
@@ -272,7 +273,7 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		log.Error("enrich: reference load failed (keeping previous image, will retry)", "reference", rj.cfg.Table, "err", err)
 		return
 	}
-	image, dests, err := buildImage(rj, rows)
+	image, dests, star, err := buildImage(rj, rows)
 	if err != nil {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
@@ -280,7 +281,7 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 	}
 	// Atomic swap: the hot path reads this with a single Load(), no lock.
 	wasHot := rj.snap.Load() != nil
-	rj.snap.Store(&snapshot{hot: true, image: image, dests: dests})
+	rj.snap.Store(&snapshot{hot: true, image: image, dests: dests, star: star})
 	// Cold-start queue flip: captured under mu for the batcher to drain.
 	if !wasHot {
 		rj.mu.Lock()
@@ -312,22 +313,23 @@ func (rj *refJoin) setFirstErr(err error) {
 //
 //   - select lists the reference columns the event receives; a listed
 //     column missing from the query result is a rejected load.
-//   - select ["*"] projects everything EXCEPT the join column — the
-//     join key lives in the event already; re-injecting it would
-//     overwrite the source's own value by accident.
+//   - select ["*"] projects everything including the join column. The
+//     unrenamed join column preserves the source's own value (the
+//     reference value is projected but not applied); use "as" to
+//     inject the reference value under a distinct name.
 //   - as renames a selected column; unrenamed columns keep their name.
 //   - A projected name colliding with an EVENT column overwrites it —
 //     documented semantics (the reference is the point of the join);
 //     use as to give a distinct name when coexistence is wanted.
 //
 // The on-reference column is validated to exist and be unique; it is
-// projected only when explicitly listed in select.
-func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, error) {
+// projected only when explicitly listed in select or under "*".
+func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, bool, error) {
 	if len(rows) == 0 {
-		return nil, nil, fmt.Errorf("reference query returned no rows")
+		return nil, nil, false, fmt.Errorf("reference query returned no rows")
 	}
 	if _, ok := rows[0][rj.onRef]; !ok {
-		return nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
+		return nil, nil, false, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
 	}
 
 	star := len(rj.cfg.Select) == 1 && rj.cfg.Select[0] == "*"
@@ -342,7 +344,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	if !star {
 		for _, s := range rj.cfg.Select {
 			if !available[s] {
-				return nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
+				return nil, nil, false, fmt.Errorf("select: reference column %q is not in the query result", s)
 			}
 		}
 	}
@@ -364,9 +366,6 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	}
 	if star {
 		for col := range available {
-			if col == rj.onRef {
-				continue
-			}
 			addDest(col)
 		}
 	} else {
@@ -382,7 +381,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	for _, row := range rows {
 		k := joinKey(row[rj.onRef])
 		if _, dup := image[k]; dup {
-			return nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
+			return nil, nil, false, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
 		}
 		projected := make(map[string]any, len(dests))
 		for refCol, name := range projection {
@@ -390,7 +389,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 		}
 		image[k] = projected
 	}
-	return image, dests, nil
+	return image, dests, star, nil
 }
 
 // Apply runs the batch through every reference in order and returns the
@@ -458,10 +457,12 @@ func (s *Stage) forceMiss(i int, c change.Change, out *[]change.Change) {
 	rj := s.refs[i]
 	snap := rj.snap.Load()
 	var dests []dest
+	var star bool
 	if snap != nil {
 		dests = snap.dests
+		star = snap.star
 	}
-	if rj.join(&c, nil, dests) == applied {
+	if rj.join(&c, nil, dests, star) == applied {
 		s.applyFrom(i+1, c, out)
 	}
 }
@@ -511,7 +512,7 @@ func (rj *refJoin) apply(c *change.Change) applyResult {
 			// Cold map: every lookup misses; the miss follows the join
 			// type. Reference columns are unknown until the first load,
 			// so a cold left-miss marks the row without adding NULLs.
-			return rj.join(c, nil, nil)
+			return rj.join(c, nil, nil, false)
 		default: // coldBuffer
 			return parked
 		}
@@ -520,14 +521,14 @@ func (rj *refJoin) apply(c *change.Change) applyResult {
 		// A key-only delete carries nothing to enrich.
 		return applied
 	}
-	return rj.join(c, snap.image[joinKey(c.After[rj.onKey])], snap.dests)
+	return rj.join(c, snap.image[joinKey(c.After[rj.onKey])], snap.dests, snap.star)
 }
 
 // join materializes the hit or the miss. A miss in a left join passes the
 // event with NULL reference columns and marks it; an inner join drops it.
 // That grammar is the ONLY miss policy — cold start, eviction and expiry
 // all route through it.
-func (rj *refJoin) join(c *change.Change, row map[string]any, dests []dest) applyResult {
+func (rj *refJoin) join(c *change.Change, row map[string]any, dests []dest, star bool) applyResult {
 	if row == nil {
 		rj.misses.Add(1)
 		if rj.metrics != nil {
@@ -543,6 +544,15 @@ func (rj *refJoin) join(c *change.Change, row map[string]any, dests []dest) appl
 		return applied
 	}
 	for _, d := range dests {
+		// Under star projection, when the join column is not renamed, the
+		// source's own value prevails — re-injecting it would silently
+		// overwrite the value the event already carries. A rename via "as"
+		// opts in to using the reference value under a distinct name.
+		// Under explicit select the user asked for the column, so it
+		// overwrites (documented collision semantics).
+		if star && d.ref == rj.onRef && d.as == d.ref {
+			continue
+		}
 		c.After[d.as] = row[d.as] // the image is already projected + renamed
 	}
 	return applied

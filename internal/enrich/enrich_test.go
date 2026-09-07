@@ -253,8 +253,8 @@ func TestBufferMaxWaitExpires(t *testing.T) {
 	time.Sleep(5 * time.Millisecond) // the parked event is now past MaxWait
 	// Pretend the reference went hot with an empty drain list... no: the
 	// real path flips hot in refresh; simulate by flipping manually.
-	img, dests, _ := buildImage(s.refs[0], usersRows())
-	s.refs[0].snap.Store(&snapshot{hot: true, image: img, dests: dests})
+	img, dests, star, _ := buildImage(s.refs[0], usersRows())
+	s.refs[0].snap.Store(&snapshot{hot: true, image: img, dests: dests, star: star})
 	s.refs[0].mu.Lock()
 	s.refs[0].pendingDrain = s.refs[0].queue
 	s.refs[0].queue = nil
@@ -488,8 +488,9 @@ func TestCollisionOverwriteAndCoexistence(t *testing.T) {
 	}
 }
 
-// 5.4 — Star projection: everything except the join column lands.
-func TestStarProjectionInjectsAllButJoinKey(t *testing.T) {
+// 5.4 — Star projection: everything lands; the unrenamed join column
+// preserves the source's own value.
+func TestStarProjectionPreservesJoinKey(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"*"}
 	})
@@ -503,14 +504,35 @@ func TestStarProjectionInjectsAllButJoinKey(t *testing.T) {
 			t.Fatalf("star projection missed %q: %v", want, out[0].After)
 		}
 	}
-	// The join column is not re-injected: the source's own id (1) must
-	// survive untouched — the reference's id (2) never overwrites it
-	// under a star.
+	// The join column IS projected but does NOT overwrite the source's
+	// own value: source id=1 stays, reference id=2 never touches it.
 	if out[0].After["id"] != int64(1) {
 		t.Fatalf("star let the join column overwrite the source value: %v", out[0].After)
 	}
 	if out[0].After["name"] != "beto" {
 		t.Fatalf("star values wrong: %v", out[0].After)
+	}
+}
+
+// 5.5 — Star with as: the renamed join column injects the reference
+// value under the new name while the source's own column survives.
+func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"*"}
+		c.As = map[string]string{"id": "ref_id"}
+	})
+	s, _ := newTestStage(t, cfg, refRows())
+	out, err := s.applyOne(t, searchEvent(1, int64(2)))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// Source id preserved.
+	if out[0].After["id"] != int64(1) {
+		t.Fatalf("source id overwritten: %v", out[0].After)
+	}
+	// Reference id injected under the renamed key.
+	if out[0].After["ref_id"] != int64(2) {
+		t.Fatalf("renamed join column missing or wrong: %v", out[0].After)
 	}
 }
 
