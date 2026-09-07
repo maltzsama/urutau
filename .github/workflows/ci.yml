@@ -8,12 +8,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # New push to the same PR cancels the in-progress run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # ────────────────────────────────────────────────────────────────
-  # Job 1: Lint (runs in parallel with tests)
-  # ────────────────────────────────────────────────────────────────
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -51,14 +54,17 @@ jobs:
           make proto
           git diff --exit-code -- internal/transport/pb
 
+      - name: Check module tidiness
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
       - name: Lint
         run: make lint
 
-  # ────────────────────────────────────────────────────────────────
-  # Job 2: Test (runs in parallel with lint)
-  # ────────────────────────────────────────────────────────────────
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -76,18 +82,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-envtest-v1-
 
-      - name: Cache build binaries
-        uses: actions/cache@v4
-        with:
-          path: |
-            ./bin/urutau
-            ./bin/urutau-coordinator
-            ./bin/urutau-worker
-            ./bin/urutau-operator
-          key: ${{ runner.os }}-build-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-build-
-
       - name: Bootstrap tools
         run: make bootstrap
 
@@ -96,28 +90,47 @@ jobs:
           make envtest-setup
           echo "KUBEBUILDER_ASSETS=$(./bin/setup-envtest use -p path)" >> "$GITHUB_ENV"
 
+      # Requires: test: go test -race -count=1 ./... in the Makefile.
+      # The concurrency tests (heartbeat, pumps, MVCC, watchdog) are
+      # theater without the race detector.
       - name: Test
         run: make test
 
-      - name: Build
+      - name: Build (host)
         run: make build
 
-  # ────────────────────────────────────────────────────────────────
-  # Job 3: Build (separate parallel job, optional)
-  # ────────────────────────────────────────────────────────────────
-  # Uncomment if you want build to run as a separate parallel job.
-  # Note: the test job already runs `make build`, so this is
-  # only useful if you want to separate concerns or run additional
-  # build targets.
-  #
+  # Cross-compile: enforces the PR-3 acceptance ("GOOS=darwin/windows
+  # go build pass") forever. Build tags in internal/plugin/proc only
+  # compile for the running OS — Linux-only CI lets them rot silently.
+  # Compile-only, pure Go, from linux runners — no macOS/Windows runners
+  # needed. CGO_ENABLED=0 is also the phase-2 constraint: tarball
+  # binaries must be static per platform, so cgo debt fails HERE, today,
+  # not in the release job later.
   build:
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build
-        run: make build
+          cache-dependency-path: go.sum
+
+      - name: Cross-compile ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build ./...
