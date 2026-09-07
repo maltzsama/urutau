@@ -30,6 +30,7 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+	bolt_errors "go.etcd.io/bbolt/errors"
 )
 
 var (
@@ -190,9 +191,9 @@ func (s *Store) CommitPositions(pipeline string, positions map[string][]byte) er
 // table) — contract §7. Written BEFORE the snapshot is consumed (crash
 // mid-snapshot re-runs from this point), not after completion.
 type SnapshotMetadata struct {
-	EndOffset  []byte     `json:"endOffset"`
-	Schema     []byte     `json:"schema,omitempty"`
-	CapturedAt time.Time  `json:"capturedAt"`
+	EndOffset  []byte    `json:"endOffset"`
+	Schema     []byte    `json:"schema,omitempty"`
+	CapturedAt time.Time `json:"capturedAt"`
 }
 
 // SetSnapshot persists the handoff metadata for (pipeline, table).
@@ -240,7 +241,7 @@ func (s *Store) DeletePipeline(pipeline string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		for _, top := range [][]byte{positionBucket, snapshotBucket} {
 			if err := tx.Bucket(top).DeleteBucket([]byte(pipeline)); err != nil {
-				if errors.Is(err, bolt.ErrBucketNotFound) {
+				if errors.Is(err, bolt_errors.ErrBucketNotFound) {
 					continue
 				}
 				return fmt.Errorf("state: delete pipeline: %w", err)

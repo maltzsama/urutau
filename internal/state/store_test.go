@@ -47,7 +47,7 @@ func TestOpenSecondInstanceBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer s1.Close()
+	defer func() { _ = s1.Close() }()
 
 	done := make(chan error, 1)
 	go func() {
@@ -74,8 +74,8 @@ func TestCommitPositionsAtomic(t *testing.T) {
 	s := openTestStore(t)
 
 	initial := map[string][]byte{
-		"orders":  []byte("offset-orders-1"),
-		"users":   []byte("offset-users-1"),
+		"orders":   []byte("offset-orders-1"),
+		"users":    []byte("offset-users-1"),
 		"products": []byte("offset-products-1"),
 	}
 	if err := s.CommitPositions("pipeline-1", initial); err != nil {
@@ -83,8 +83,8 @@ func TestCommitPositionsAtomic(t *testing.T) {
 	}
 
 	bad := map[string][]byte{
-		"orders":  []byte("offset-orders-2"),
-		"users":   {},                          // empty offset → should fail
+		"orders":   []byte("offset-orders-2"),
+		"users":    {}, // empty offset → should fail
 		"products": []byte("offset-products-2"),
 	}
 	err := s.CommitPositions("pipeline-1", bad)
@@ -156,8 +156,8 @@ func TestPositionsMultipleTables(t *testing.T) {
 	s := openTestStore(t)
 
 	watermarks := map[string][]byte{
-		"orders":  []byte("w-orders"),
-		"users":   []byte("w-users"),
+		"orders":   []byte("w-orders"),
+		"users":    []byte("w-users"),
 		"products": []byte("w-products"),
 	}
 	if err := s.CommitPositions("p1", watermarks); err != nil {
@@ -424,7 +424,7 @@ func TestCommitSurvivesCloseReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after close: %v", err)
 	}
-	defer s2.Close()
+	defer func() { _ = s2.Close() }()
 
 	got, err := s2.GetPosition("p", "t")
 	if err != nil {
@@ -456,7 +456,7 @@ func TestPositionValueJSONRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer s2.Close()
+	defer func() { _ = s2.Close() }()
 
 	pos, err := s2.GetPosition("p", "t")
 	if err != nil {
