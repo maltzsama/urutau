@@ -94,7 +94,7 @@ func TestBroadcastJoinLoaderCalledOnce(t *testing.T) {
 		if len(out) != 1 {
 			t.Fatalf("event %d vanished", i)
 		}
-		if out[0].After["name"] != "ana" || out[0].After["tier"] != "gold" {
+		if out[0].After["users.name"] != "ana" || out[0].After["users.tier"] != "gold" {
 			t.Fatalf("event %d enriched wrong: %v", i, out[0].After)
 		}
 	}
@@ -114,7 +114,7 @@ func TestLeftMissPassesWithNullsAndFlag(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("left miss dropped the event")
 	}
-	if out[0].After["name"] != nil || out[0].After["tier"] != nil {
+	if out[0].After["users.name"] != nil || out[0].After["users.tier"] != nil {
 		t.Fatalf("miss columns not NULL: %v", out[0].After)
 	}
 	if !out[0].EnrichMiss {
@@ -192,7 +192,7 @@ func TestColdStartBufferDrainsInOrder(t *testing.T) {
 		if c.After["id"] != int64(i+1) {
 			t.Fatalf("drain order broken at %d: %v", i, c.After)
 		}
-		if c.After["name"] != "ana" {
+		if c.After["users.name"] != "ana" {
 			t.Fatalf("drained event %d not enriched: %v", i, c.After)
 		}
 	}
@@ -253,8 +253,8 @@ func TestBufferMaxWaitExpires(t *testing.T) {
 	time.Sleep(5 * time.Millisecond) // the parked event is now past MaxWait
 	// Pretend the reference went hot with an empty drain list... no: the
 	// real path flips hot in refresh; simulate by flipping manually.
-	img, dests, _ := buildImage(s.refs[0], usersRows())
-	s.refs[0].snap.Store(&snapshot{hot: true, image: img, dests: dests})
+	img, dests, star, _ := buildImage(s.refs[0], usersRows())
+	s.refs[0].snap.Store(&snapshot{hot: true, image: img, dests: dests, star: star})
 	s.refs[0].mu.Lock()
 	s.refs[0].pendingDrain = s.refs[0].queue
 	s.refs[0].queue = nil
@@ -293,7 +293,7 @@ func TestRefreshAtomicSwapUnderConcurrency(t *testing.T) {
 					t.Errorf("apply: %v", err)
 					return
 				}
-				if out[0].After["name"] != "beto" {
+				if out[0].After["users.name"] != "beto" {
 					t.Errorf("torn read: %v", out[0].After)
 					return
 				}
@@ -323,7 +323,7 @@ func TestSameImageDeterministicOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply 2: %v", err)
 	}
-	if o1[0].After["name"] != o2[0].After["name"] || o1[0].After["tier"] != o2[0].After["tier"] {
+	if o1[0].After["users.name"] != o2[0].After["users.name"] || o1[0].After["users.tier"] != o2[0].After["users.tier"] {
 		t.Fatalf("same image, different output: %v vs %v", o1[0].After, o2[0].After)
 	}
 }
@@ -376,7 +376,7 @@ func TestFailedRefreshKeepsPreviousImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if out[0].After["name"] != "ana" {
+	if out[0].After["users.name"] != "ana" {
 		t.Fatalf("previous image lost: %v", out[0].After)
 	}
 }
@@ -425,7 +425,7 @@ func TestProjectionOnlySelectedColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if out[0].After["name"] != "ana" || out[0].After["tier"] != "gold" {
+	if out[0].After["users.name"] != "ana" || out[0].After["users.tier"] != "gold" {
 		t.Fatalf("selected columns missing: %v", out[0].After)
 	}
 	for _, absent := range []string{"email", "created_at"} {
@@ -438,7 +438,7 @@ func TestProjectionOnlySelectedColumns(t *testing.T) {
 // 5.2 — Renaming resolves at LOAD time: the event receives the final name.
 func TestRenameAtLoad(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
-		c.As = map[string]string{"name": "user_name"} // tier keeps its name
+		c.As = map[string]string{"users.name": "user_name"} // tier keeps its name
 	})
 	s, _ := newTestStage(t, cfg, refRows())
 	out, err := s.applyOne(t, searchEvent(1, int64(1)))
@@ -451,16 +451,17 @@ func TestRenameAtLoad(t *testing.T) {
 	if _, ok := out[0].After["name"]; ok {
 		t.Fatalf("original name survived the rename: %v", out[0].After)
 	}
-	if out[0].After["tier"] != "gold" {
+	if out[0].After["users.tier"] != "gold" {
 		t.Fatalf("unrenamed column lost: %v", out[0].After)
 	}
 }
 
-// 5.3 — Collision: selecting the join column overwrites the source's
-// value (documented semantics); renaming gives coexistence.
+// 5.3 — Collision: with table-prefixed names, the reference's join column
+// coexists with the source under "table.column". Renaming via "as" gives
+// a custom destination name.
 func TestCollisionOverwriteAndCoexistence(t *testing.T) {
-	// Overwrite: select [id, name] — id IS the join column, explicitly
-	// listed, so the reference's id replaces the source's id.
+	// Coexistence: select [id, name] — reference id is projected as
+	// "users.id" while source id=99 remains untouched.
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"id", "name"}
 	})
@@ -469,14 +470,17 @@ func TestCollisionOverwriteAndCoexistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if out[0].After["id"] != int64(1) {
-		t.Fatalf("reference id did not overwrite: %v", out[0].After)
+	if out[0].After["id"] != int64(99) {
+		t.Fatalf("source id was overwritten: %v", out[0].After)
+	}
+	if out[0].After["users.id"] != int64(1) {
+		t.Fatalf("reference id not projected with prefix: %v", out[0].After)
 	}
 
-	// Coexistence: rename the join column and both survive.
+	// Rename: explicit "as" gives a custom destination name.
 	cfgAs := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"id", "name"}
-		c.As = map[string]string{"id": "ref_id"}
+		c.As = map[string]string{"users.id": "ref_id"}
 	})
 	sAs, _ := newTestStage(t, cfgAs, refRows())
 	outAs, err := sAs.applyOne(t, searchEvent(99, int64(1)))
@@ -488,8 +492,9 @@ func TestCollisionOverwriteAndCoexistence(t *testing.T) {
 	}
 }
 
-// 5.4 — Star projection: everything except the join column lands.
-func TestStarProjectionInjectsAllButJoinKey(t *testing.T) {
+// 5.4 — Star projection: everything lands with table prefixes; the
+// source's own columns remain unprefixed.
+func TestStarProjectionPreservesJoinKey(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"*"}
 	})
@@ -498,27 +503,56 @@ func TestStarProjectionInjectsAllButJoinKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	for _, want := range []string{"name", "tier", "email", "created_at"} {
+	// Reference columns are prefixed with table name.
+	for _, want := range []string{"users.name", "users.tier", "users.email", "users.created_at"} {
 		if _, ok := out[0].After[want]; !ok {
 			t.Fatalf("star projection missed %q: %v", want, out[0].After)
 		}
 	}
-	// The join column is not re-injected: the source's own id (1) must
-	// survive untouched — the reference's id (2) never overwrites it
-	// under a star.
+	// Source columns remain unprefixed.
 	if out[0].After["id"] != int64(1) {
-		t.Fatalf("star let the join column overwrite the source value: %v", out[0].After)
+		t.Fatalf("source id overwritten: %v", out[0].After)
 	}
-	if out[0].After["name"] != "beto" {
+	// Reference join column is projected with prefix.
+	if out[0].After["users.id"] != int64(2) {
+		t.Fatalf("reference join column not projected: %v", out[0].After)
+	}
+	if out[0].After["users.name"] != "beto" {
 		t.Fatalf("star values wrong: %v", out[0].After)
 	}
 }
 
+// 5.5 — Star with as: the renamed join column injects the reference
+// value under the custom name while the source's own column survives.
+func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"*"}
+		c.As = map[string]string{"users.id": "ref_id"}
+	})
+	s, _ := newTestStage(t, cfg, refRows())
+	out, err := s.applyOne(t, searchEvent(1, int64(2)))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// Source id preserved.
+	if out[0].After["id"] != int64(1) {
+		t.Fatalf("source id overwritten: %v", out[0].After)
+	}
+	// Reference id injected under the renamed key (no prefix because of "as").
+	if out[0].After["ref_id"] != int64(2) {
+		t.Fatalf("renamed join column missing or wrong: %v", out[0].After)
+	}
+	// Other reference columns are prefixed.
+	if out[0].After["users.name"] != "beto" {
+		t.Fatalf("other reference columns not prefixed: %v", out[0].After)
+	}
+}
+
 // The image itself carries ONLY the projected columns, under their final
-// names — the memory contract of the map.
+// prefixed names — the memory contract of the map.
 func TestImageHoldsProjectedColumnsOnly(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
-		c.As = map[string]string{"name": "user_name"}
+		c.As = map[string]string{"users.name": "user_name"}
 	})
 	s, _ := newTestStage(t, cfg, refRows())
 	rj := s.refs[0]
@@ -531,11 +565,20 @@ func TestImageHoldsProjectedColumnsOnly(t *testing.T) {
 		if len(row) != len(cfg.Select) {
 			t.Fatalf("key %s: image row has %d columns, want %d: %v", k, len(row), len(cfg.Select), row)
 		}
+		// Renamed column uses the custom name.
 		if _, ok := row["user_name"]; !ok {
-			t.Fatalf("image keyed by original name, not final: %v", row)
+			t.Fatalf("image missing renamed column: %v", row)
 		}
+		// Unrenamed column uses prefixed name.
+		if _, ok := row["users.tier"]; !ok {
+			t.Fatalf("image missing prefixed column: %v", row)
+		}
+		// Original unprefixed name should not exist.
 		if _, ok := row["name"]; ok {
 			t.Fatalf("image holds the pre-rename name: %v", row)
+		}
+		if _, ok := row["tier"]; ok {
+			t.Fatalf("image holds unprefixed name: %v", row)
 		}
 	}
 }
@@ -563,4 +606,93 @@ func TestSelectColumnMissingFromQueryRejected(t *testing.T) {
 		t.Fatal("missing select column surfaced no error")
 	}
 	s.Stop()
+}
+
+// 6 — Multi-reference collision: when two references inject columns with
+// the same name, the table prefix prevents silent overwrites.
+func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
+	// Two references: both have a "name" column.
+	cfg1 := spec.Enrich{
+		Table: "users",
+		Source: spec.EnrichSource{
+			URI:   "mysql://refdb/internal",
+			Query: "SELECT id, name FROM users",
+		},
+		On:       map[string]string{"user_ref": "id"},
+		Select:   []string{"name"},
+		JoinType: "left",
+	}
+	cfg2 := spec.Enrich{
+		Table: "products",
+		Source: spec.EnrichSource{
+			URI:   "mysql://refdb/internal",
+			Query: "SELECT id, name FROM products",
+		},
+		On:       map[string]string{"product_ref": "id"},
+		Select:   []string{"name"},
+		JoinType: "left",
+	}
+
+	s, err := New([]spec.Enrich{cfg1, cfg2}, []string{"id", "user_ref", "product_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	// Load users reference.
+	fl1 := &fakeLoader{rows: []map[string]any{
+		{"id": int64(1), "name": "ana"},
+	}}
+	if err := s.UseLoader(cfg1.Table, fl1); err != nil {
+		t.Fatalf("use loader 1: %v", err)
+	}
+
+	// Load products reference.
+	fl2 := &fakeLoader{rows: []map[string]any{
+		{"id": int64(10), "name": "laptop"},
+	}}
+	if err := s.UseLoader(cfg2.Table, fl2); err != nil {
+		t.Fatalf("use loader 2: %v", err)
+	}
+
+	s.Start(context.Background())
+	t.Cleanup(s.Stop)
+
+	// Wait for both references to go hot.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.refs[0].isHot() && s.refs[1].isHot() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !s.refs[0].isHot() || !s.refs[1].isHot() {
+		t.Fatal("references never went hot")
+	}
+
+	// Event with both join keys set.
+	event := change.Change{
+		Op: change.OpInsert, Key: []any{int64(1)},
+		After:    map[string]any{"id": int64(1), "user_ref": int64(1), "product_ref": int64(10), "q": "test"},
+		IngestTS: time.Now(),
+	}
+
+	out, err := s.Enrich([]change.Change{event})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("event vanished")
+	}
+
+	// Both "name" columns coexist with table prefixes.
+	if out[0].After["users.name"] != "ana" {
+		t.Fatalf("users.name not injected: %v", out[0].After)
+	}
+	if out[0].After["products.name"] != "laptop" {
+		t.Fatalf("products.name not injected: %v", out[0].After)
+	}
+	// Source columns remain unprefixed.
+	if out[0].After["id"] != int64(1) {
+		t.Fatalf("source id overwritten: %v", out[0].After)
+	}
 }

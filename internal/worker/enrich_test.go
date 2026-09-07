@@ -45,7 +45,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
 			out, _ := s.Enrich([]change.Change{{Op: change.OpInsert, After: map[string]any{"user_ref": int64(7)}}})
-			if len(out) == 1 && out[0].After["name"] == "ana" {
+			if len(out) == 1 && out[0].After["users.name"] == "ana" {
 				return nil, s
 			}
 			time.Sleep(time.Millisecond)
@@ -71,7 +71,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 			t.Fatalf("batches: %+v", fc.batches)
 		}
 		row := fc.batches[0].Upserts[0]
-		if row.After["name"] != "ana" {
+		if row.After["users.name"] != "ana" {
 			t.Fatalf("row not enriched: %v", row.After)
 		}
 	})
