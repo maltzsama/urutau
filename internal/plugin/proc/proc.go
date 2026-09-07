@@ -282,7 +282,7 @@ func (p *Process) Stop() error {
 	select {
 	case <-p.exited:
 	case <-time.After(hardStopGrace):
-		p.Kill()
+		_ = p.Kill()
 	}
 	return p.Wait()
 }
