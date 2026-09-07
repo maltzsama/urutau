@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 
 	"github.com/maltzsama/urutau/internal/plugin/contract"
 )
@@ -79,6 +80,10 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 	cmd := exec.CommandContext(ctx, cfg.Bin)
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stderr = &logWriter{cfg.Logger}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: syscall.SIGKILL,
+		Setpgid:   true,
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -184,7 +189,8 @@ func (p *Process) Kill() error {
 	if p.cmd.Process == nil {
 		return nil
 	}
-	return p.cmd.Process.Kill()
+	// Kill the whole process group (shell + children like sleep).
+	return syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 }
 
 func (p *Process) Wait() error {
