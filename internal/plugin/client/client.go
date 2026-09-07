@@ -187,8 +187,8 @@ func (c *Client) markDead(err error) {
 }
 
 func (c *Client) Dead() <-chan struct{} { return c.dead }
-func (c *Client) DeadErr() error       { return c.deadErr }
-func (c *Client) Healthy() bool        { return c.healthy.Load() }
+func (c *Client) DeadErr() error        { return c.deadErr }
+func (c *Client) Healthy() bool         { return c.healthy.Load() }
 
 // ---- actions (contract §11) ----
 

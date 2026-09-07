@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -376,15 +374,4 @@ func connectClient(t *testing.T, addr string) *client.Client {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
-}
-
-func writeConfig(t *testing.T) string {
-	t.Helper()
-	cfg := map[string]any{"test": true}
-	b, _ := json.Marshal(cfg)
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }
