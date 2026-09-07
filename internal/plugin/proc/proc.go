@@ -1,5 +1,6 @@
-// Package proc manages external plugin processes: spawn, readiness, orphan
-// protection, and lifecycle.
+// Package proc manages external plugin processes: spawn, readiness, log
+// pumping, and lifecycle. Platform behavior lives in sys_linux.go,
+// sys_darwin.go, and sys_windows.go.
 package proc
 
 import (
@@ -9,20 +10,30 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
-	"syscall"
+	"time"
 
 	"github.com/maltzsama/urutau/internal/plugin/contract"
 )
 
+const (
+	readinessTimeout = 30 * time.Second
+	hardStopGrace    = 10 * time.Second
+	maxLogLine       = 16 * 1024
+)
+
 type Ready struct {
-	Ready           bool   `json:"ready"`
-	ProtocolVersion int    `json:"protocolVersion"`
-	PID             int    `json:"pid,omitempty"`
-	Port            string `json:"port,omitempty"`
+	Ready           bool `json:"ready"`
+	ProtocolVersion int  `json:"protocolVersion"`
+	PID             int  `json:"pid,omitempty"`
+	Port            int  `json:"port,omitempty"` // contract: integer, TCP mode only
 }
 
 type Config struct {
@@ -41,7 +52,12 @@ type Process struct {
 	ready  Ready
 	addr   string
 	socket string
+
 	mu     sync.Mutex
+	reaped bool
+
+	waitErr error
+	exited  chan struct{}
 }
 
 func Spawn(ctx context.Context, cfg Config) (*Process, error) {
@@ -54,169 +70,219 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	if err := os.MkdirAll(cfg.WorkDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create work dir: %w", err)
+	}
 
-	useSocket := true
+	useTCP := runtime.GOOS == "windows"
 	socketPath := filepath.Join(cfg.WorkDir, "plugin.sock")
-	bindAddr := ""
-
-	if isWindows() {
-		useSocket = false
-		bindAddr = "127.0.0.1:0"
+	if !useTCP && len(socketPath) > 100 {
+		return nil, fmt.Errorf("socket path too long (%d bytes): %s", len(socketPath), socketPath)
 	}
 
-	env := []string{
+	env := append(os.Environ(),
 		fmt.Sprintf("URUTAU_STAGE=%s", cfg.Role),
-		fmt.Sprintf("URUTAU_TOKEN=%s", cfg.Token),
-		fmt.Sprintf("URUTAU_CONFIG=%s", cfg.ConfigPath),
-		fmt.Sprintf("URUTAU_PLUGIN_DIR=%s", cfg.PluginDir),
+		"URUTAU_TOKEN="+cfg.Token,
+		"URUTAU_CONFIG="+cfg.ConfigPath,
+		"URUTAU_PLUGIN_DIR="+cfg.PluginDir,
 		fmt.Sprintf("URUTAU_PROTOCOL_VERSION=%d", contract.ProtocolVersion),
-	}
-	if useSocket {
-		env = append(env, fmt.Sprintf("URUTAU_SOCKET=%s", socketPath))
+	)
+	if useTCP {
+		env = append(env, "URUTAU_BIND=127.0.0.1:0")
 	} else {
-		env = append(env, fmt.Sprintf("URUTAU_BIND=%s", bindAddr))
+		env = append(env, "URUTAU_SOCKET="+socketPath)
 	}
 
-	cmd := exec.CommandContext(ctx, cfg.Bin)
-	cmd.Env = append(os.Environ(), env...)
-	cmd.Stderr = &logWriter{cfg.Logger}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGKILL,
-		Setpgid:   true,
-	}
+	cmd := exec.Command(cfg.Bin)
+	cmd.Env = env
+	setSysProcAttr(cmd)
 
-	stdout, err := cmd.StdoutPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 
 	if err := cmd.Start(); err != nil {
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
 		return nil, fmt.Errorf("start plugin: %w", err)
 	}
+	stdoutW.Close()
+	stderrW.Close()
 
-	p := &Process{
-		cfg: cfg,
-		cmd: cmd,
-	}
+	p := &Process{cfg: cfg, cmd: cmd, exited: make(chan struct{})}
 
-	ready, err := readReady(ctx, stdout)
-	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return nil, fmt.Errorf("plugin readiness: %w", err)
-	}
-	p.ready = *ready
+	readyCh := make(chan readyResult, 1)
+	go pump(stdoutR, cfg.Logger, "stdout", readyCh)
+	go pump(stderrR, cfg.Logger, "stderr", nil)
 
-	if !isWindows() {
-		p.socket = socketPath
-		p.addr = socketPath
-	} else {
-		p.addr = bindAddr
-	}
-
-	// Drain remaining stdout in background
 	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-		}
+		err := cmd.Wait()
+		p.mu.Lock()
+		p.reaped = true
+		p.mu.Unlock()
+		p.waitErr = err
+		close(p.exited)
 	}()
 
-	cfg.Logger.Info("plugin ready",
-		"pid", ready.PID,
-		"protocol", ready.ProtocolVersion,
-		"addr", p.addr,
-	)
+	if err := waitReady(ctx, readyCh, &p.ready); err != nil {
+		p.Kill()
+		<-p.exited
+		return nil, fmt.Errorf("plugin startup: %w", err)
+	}
+	if p.ready.ProtocolVersion != contract.ProtocolVersion {
+		p.Kill()
+		<-p.exited
+		return nil, fmt.Errorf("plugin speaks protocol v%d, urutau speaks v%d",
+			p.ready.ProtocolVersion, contract.ProtocolVersion)
+	}
 
+	if useTCP {
+		if p.ready.Port <= 0 {
+			p.Kill()
+			<-p.exited
+			return nil, fmt.Errorf("TCP mode: plugin did not report a port")
+		}
+		p.addr = net.JoinHostPort("127.0.0.1", strconv.Itoa(p.ready.Port))
+	} else {
+		p.socket = socketPath
+		p.addr = socketPath
+	}
+
+	cfg.Logger.Info("plugin ready",
+		"pid", p.cmd.Process.Pid,
+		"addr", p.addr,
+		"protocol", p.ready.ProtocolVersion,
+	)
 	return p, nil
 }
 
-func readReady(ctx context.Context, r io.Reader) (*Ready, error) {
-	type result struct {
-		ready *Ready
-		err   error
-	}
-	ch := make(chan result, 1)
+type readyResult struct {
+	ready Ready
+	err   error
+}
 
-	go func() {
-		scanner := bufio.NewScanner(r)
-		scanner.Buffer(make([]byte, 8*1024), 8*1024)
-		if !scanner.Scan() {
-			ch <- result{err: fmt.Errorf("no readiness line from plugin")}
-			return
-		}
-		line := scanner.Bytes()
-		var ready Ready
-		if err := json.Unmarshal(line, &ready); err != nil {
-			ch <- result{err: fmt.Errorf("invalid readiness JSON: %w", err)}
-			return
-		}
-		if !ready.Ready {
-			ch <- result{err: fmt.Errorf("readiness line has ready=false")}
-			return
-		}
-		ch <- result{ready: &ready}
-	}()
-
+func waitReady(ctx context.Context, ch <-chan readyResult, out *Ready) error {
+	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
+	defer cancel()
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-ch:
-		return r.ready, r.err
+		return fmt.Errorf("no readiness line within %s: %w", readinessTimeout, ctx.Err())
+	case res := <-ch:
+		if res.err != nil {
+			return res.err
+		}
+		*out = res.ready
+		return nil
 	}
 }
 
-func (p *Process) Addr() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.addr
+func pump(r io.ReadCloser, logger *slog.Logger, stream string, readyCh chan<- readyResult) {
+	defer r.Close()
+	br := bufio.NewReaderSize(r, 64*1024)
+	pending := readyCh != nil
+	for {
+		line, err := readLine(br)
+		if line != "" {
+			if pending {
+				pending = false
+				readyCh <- parseReady(line)
+				continue
+			}
+			if len(line) > maxLogLine {
+				line = line[:maxLogLine] + "…(truncated)"
+			}
+			logger.Info(line, "stream", stream)
+		}
+		if err != nil {
+			if pending {
+				readyCh <- readyResult{err: fmt.Errorf("stdout closed before readiness line: %w", err)}
+			}
+			return
+		}
+	}
 }
 
-func (p *Process) Socket() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.socket
+func parseReady(line string) readyResult {
+	if len(line) > 8*1024 {
+		return readyResult{err: fmt.Errorf("readiness line exceeds 8KB")}
+	}
+	var r Ready
+	if err := json.Unmarshal([]byte(line), &r); err != nil {
+		return readyResult{err: fmt.Errorf("invalid readiness JSON (%q): %w", line, err)}
+	}
+	if !r.Ready {
+		return readyResult{err: fmt.Errorf("readiness line has ready=false")}
+	}
+	return readyResult{ready: r}
 }
 
-func (p *Process) ReadyInfo() Ready {
+func readLine(br *bufio.Reader) (string, error) {
+	s, err := br.ReadString('\n')
+	return strings.TrimRight(s, "\r\n"), err
+}
+
+func (p *Process) Addr() string      { return p.addr }
+func (p *Process) Socket() string    { return p.socket }
+func (p *Process) ReadyInfo() Ready  { return p.ready }
+
+// Exited returns a channel that is closed when the process exits.
+func (p *Process) Exited() <-chan struct{} { return p.exited }
+
+func (p *Process) Wait() error {
+	<-p.exited
+	return p.waitErr
+}
+
+func (p *Process) ExitCode() int {
+	select {
+	case <-p.exited:
+	default:
+		return -1
+	}
+	if ee, ok := p.waitErr.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	}
+	if p.waitErr != nil {
+		return -1
+	}
+	return 0
+}
+
+func (p *Process) Terminate() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.ready
+	if p.reaped {
+		return nil
+	}
+	return terminateGroup(p.cmd.Process.Pid)
 }
 
 func (p *Process) Kill() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.cmd.Process == nil {
+	if p.reaped {
 		return nil
 	}
-	// Kill the whole process group (shell + children like sleep).
-	return syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+	return killGroup(p.cmd.Process.Pid)
 }
 
-func (p *Process) Wait() error {
-	return p.cmd.Wait()
-}
-
-func (p *Process) ExitCode() int {
-	if p.cmd.Process == nil {
-		return -1
+func (p *Process) Stop() error {
+	p.Terminate()
+	select {
+	case <-p.exited:
+	case <-time.After(hardStopGrace):
+		p.Kill()
 	}
-	state := p.cmd.ProcessState
-	if state == nil {
-		return -1
-	}
-	return state.ExitCode()
-}
-
-func isWindows() bool {
-	return filepath.VolumeName(`C:\`) != ""
-}
-
-type logWriter struct {
-	logger *slog.Logger
-}
-
-func (w *logWriter) Write(p []byte) (n int, err error) {
-	w.logger.Error(string(p), "source", "plugin-stderr")
-	return len(p), nil
+	return p.Wait()
 }
