@@ -1,15 +1,15 @@
-// Package client wraps the Arrow Flight client with plugin-specific auth,
-// heartbeat, and lifecycle management.
 package client
 
 import (
-	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -27,9 +27,17 @@ import (
 const (
 	heartbeatInterval = 2 * time.Second
 	heartbeatTimeout  = 1 * time.Second
+	healthThreshold   = 7
+	handshakeTimeout  = 10 * time.Second
+	actionTimeout     = 10 * time.Second
+	flushTimeout      = 30 * time.Second
+	shutdownTimeout   = 15 * time.Second
 )
 
-// Client is a plugin Flight client with auth and heartbeat.
+// Client is a plugin Flight client with auth, heartbeat, and health
+// monitoring. No mutex around RPCs: grpc.ClientConn is safe for concurrent
+// use and multiplexes over HTTP/2. A shared lock would starve the heartbeat
+// during long DoPuts — liveness never waits on the data path.
 type Client struct {
 	conn   *grpc.ClientConn
 	flight flight.Client
@@ -37,26 +45,30 @@ type Client struct {
 	mem    memory.Allocator
 	logger *slog.Logger
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
+	hbCancel context.CancelFunc
+	done     chan struct{}
+
+	healthy  atomic.Bool
+	failures atomic.Int32
+	dead     chan struct{}
+	deadErr  error
+	deadOnce sync.Once
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
-// Connect creates a new client, performs Handshake, and starts heartbeat.
-// addr can be a unix socket path or "host:port".
 func Connect(ctx context.Context, addr, token string, logger *slog.Logger) (*Client, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	var opts []grpc.DialOption
-	opts = append(opts,
+	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	}
 
 	target := addr
-	// Unix socket: use custom dialer.
-	if len(addr) > 0 && (addr[0] == '/' || addr[0] == '.') {
+	if isUnixPath(addr) {
 		opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", addr)
@@ -69,46 +81,57 @@ func Connect(ctx context.Context, addr, token string, logger *slog.Logger) (*Cli
 		return nil, fmt.Errorf("dial plugin: %w", err)
 	}
 
-	fc := flight.NewClientFromConn(conn, nil)
-
-	// Handshake
-	if err := handshake(ctx, fc, token); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-
 	c := &Client{
 		conn:   conn,
-		flight: fc,
+		flight: flight.NewClientFromConn(conn, nil),
 		token:  token,
 		mem:    memory.NewGoAllocator(),
 		logger: logger,
+		dead:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
+	c.healthy.Store(true)
 
-	// Start heartbeat goroutine
-	hCtx, cancel := context.WithCancel(context.Background())
-	c.cancel = cancel
-	go c.heartbeatLoop(hCtx)
+	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+	if err := c.handshake(hctx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("handshake: %w", err)
+	}
+
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	c.hbCancel = hbCancel
+	go c.heartbeatLoop(hbCtx)
 
 	return c, nil
 }
 
-func handshake(ctx context.Context, fc flight.Client, token string) error {
-	stream, err := fc.Handshake(ctx)
+func (c *Client) handshake(ctx context.Context) error {
+	stream, err := c.flight.Handshake(ctx)
 	if err != nil {
-		return fmt.Errorf("handshake: %w", err)
+		return err
 	}
-	if err := stream.Send(&flight.HandshakeRequest{Payload: []byte(token)}); err != nil {
-		return fmt.Errorf("handshake send: %w", err)
+	if err := stream.Send(&flight.HandshakeRequest{Payload: []byte(c.token)}); err != nil {
+		return err
+	}
+	if err := stream.CloseSend(); err != nil {
+		return err
 	}
 	resp, err := stream.Recv()
 	if err != nil {
-		return fmt.Errorf("handshake recv: %w", err)
+		return err
 	}
-	_ = resp
+	if len(resp.Payload) != 0 {
+		c.logger.Warn("handshake response has non-empty payload", "len", len(resp.Payload))
+	}
 	return nil
 }
+
+func (c *Client) bearerCtx(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.token)
+}
+
+// ---- heartbeat & health ----
 
 func (c *Client) heartbeatLoop(ctx context.Context) {
 	defer close(c.done)
@@ -120,39 +143,124 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			c.mu.Lock()
-			err := c.doHeartbeat(ctx)
-			c.mu.Unlock()
-			if err != nil {
-				c.logger.Error("heartbeat failed", "err", err)
+			if err := c.heartbeatOnce(ctx); err != nil {
+				if UnauthError(err) {
+					c.markDead(fmt.Errorf("heartbeat rejected: %w", err))
+					return
+				}
+				n := c.failures.Add(1)
+				c.logger.Warn("heartbeat failed", "err", err, "consecutive", n)
+				if int(n) >= healthThreshold {
+					c.markDead(fmt.Errorf("plugin unhealthy: %d consecutive heartbeat failures", n))
+					return
+				}
+				continue
 			}
+			c.failures.Store(0)
+			c.healthy.Store(true)
 		}
 	}
 }
 
-func (c *Client) doHeartbeat(ctx context.Context) error {
-	tCtx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
+func (c *Client) heartbeatOnce(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, heartbeatTimeout)
 	defer cancel()
-
-	stream, err := c.flight.DoAction(tCtx, &flight.Action{
+	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{
 		Type: "urutau.heartbeat",
 	})
 	if err != nil {
 		return err
 	}
-	_, err = stream.Recv()
-	return err
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	return drainActionStream(stream)
 }
 
-func (c *Client) bearerCtx(ctx context.Context) context.Context {
-	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.token)
+func (c *Client) markDead(err error) {
+	c.healthy.Store(false)
+	c.logger.Error("plugin marked unhealthy", "err", err)
+	c.deadOnce.Do(func() {
+		c.deadErr = err
+		close(c.dead)
+	})
 }
 
-// ListActions returns the actions the plugin supports.
+func (c *Client) Dead() <-chan struct{} { return c.dead }
+func (c *Client) DeadErr() error       { return c.deadErr }
+func (c *Client) Healthy() bool        { return c.healthy.Load() }
+
+// ---- actions (contract §11) ----
+
+func (c *Client) doAction(ctx context.Context, name string, result any) error {
+	ctx, cancel := withTimeout(ctx, actionTimeout)
+	defer cancel()
+
+	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{Type: name})
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	res, err := stream.Recv()
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if err := drainActionStream(stream); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if result != nil {
+		if err := json.Unmarshal(res.Body, result); err != nil {
+			return fmt.Errorf("%s: unmarshal: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func drainActionStream(stream flight.FlightService_DoActionClient) error {
+	if _, err := stream.Recv(); err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	}
+	return fmt.Errorf("more than one ActionResult (contract §11)")
+}
+
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+func (c *Client) ListTables(ctx context.Context) (*contract.ListTablesResponse, error) {
+	var resp contract.ListTablesResponse
+	if err := c.doAction(ctx, "urutau.list_tables", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) Status(ctx context.Context) (*contract.StatusResponse, error) {
+	var resp contract.StatusResponse
+	if err := c.doAction(ctx, "urutau.status", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) Flush(ctx context.Context) error {
+	ctx, cancel := withTimeout(ctx, flushTimeout)
+	defer cancel()
+	return c.doAction(ctx, "urutau.flush", nil)
+}
+
+func (c *Client) Shutdown(ctx context.Context) error {
+	ctx, cancel := withTimeout(ctx, shutdownTimeout)
+	defer cancel()
+	return c.doAction(ctx, "urutau.shutdown", nil)
+}
+
 func (c *Client) ListActions(ctx context.Context) ([]*flight.ActionType, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	stream, err := c.flight.ListActions(c.bearerCtx(ctx), &flight.Empty{})
 	if err != nil {
 		return nil, err
@@ -160,96 +268,22 @@ func (c *Client) ListActions(ctx context.Context) ([]*flight.ActionType, error) 
 	var actions []*flight.ActionType
 	for {
 		a, err := stream.Recv()
+		if err == io.EOF {
+			return actions, nil
+		}
 		if err != nil {
-			break
+			return nil, err
 		}
 		actions = append(actions, a)
 	}
-	return actions, nil
 }
 
-// ListTables calls urutau.list_tables on a source plugin.
-func (c *Client) ListTables(ctx context.Context) (*contract.ListTablesResponse, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// ---- data plane ----
 
-	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{
-		Type: "urutau.list_tables",
-	})
-	if err != nil {
-		return nil, err
-	}
-	result, err := stream.Recv()
-	if err != nil {
-		return nil, err
-	}
-	var resp contract.ListTablesResponse
-	if err := json.Unmarshal(result.Body, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal list_tables: %w", err)
-	}
-	return &resp, nil
-}
-
-// Status calls urutau.status on the plugin.
-func (c *Client) Status(ctx context.Context) (*contract.StatusResponse, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{
-		Type: "urutau.status",
-	})
-	if err != nil {
-		return nil, err
-	}
-	result, err := stream.Recv()
-	if err != nil {
-		return nil, err
-	}
-	var resp contract.StatusResponse
-	if err := json.Unmarshal(result.Body, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal status: %w", err)
-	}
-	return &resp, nil
-}
-
-// Flush calls urutau.flush on a sink plugin.
-func (c *Client) Flush(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{
-		Type: "urutau.flush",
-	})
-	if err != nil {
-		return err
-	}
-	_, err = stream.Recv()
-	return err
-}
-
-// Shutdown calls urutau.shutdown on the plugin.
-func (c *Client) Shutdown(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{
-		Type: "urutau.shutdown",
-	})
-	if err != nil {
-		return err
-	}
-	_, err = stream.Recv()
-	return err
-}
-
-// GetFlightInfo calls GetFlightInfo on the plugin.
 func (c *Client) GetFlightInfo(ctx context.Context, req contract.GetFlightInfoRequest) (*flight.FlightInfo, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	b, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal descriptor: %w", err)
 	}
 	return c.flight.GetFlightInfo(c.bearerCtx(ctx), &flight.FlightDescriptor{
 		Type: flight.DescriptorCMD,
@@ -257,7 +291,24 @@ func (c *Client) GetFlightInfo(ctx context.Context, req contract.GetFlightInfoRe
 	})
 }
 
-// GetSchema returns the schema for a table in the given mode.
+// EndOffset extracts the snapshot handoff offset from a snapshot
+// FlightInfo's app_metadata (contract §6/§7).
+func EndOffset(info *flight.FlightInfo) ([]byte, error) {
+	var meta struct {
+		EndOffset string `json:"endOffset"`
+	}
+	if len(info.AppMetadata) == 0 {
+		return nil, fmt.Errorf("FlightInfo has no app_metadata")
+	}
+	if err := json.Unmarshal(info.AppMetadata, &meta); err != nil {
+		return nil, fmt.Errorf("parse app_metadata: %w", err)
+	}
+	if meta.EndOffset == "" {
+		return nil, fmt.Errorf("app_metadata missing endOffset")
+	}
+	return base64.StdEncoding.DecodeString(meta.EndOffset)
+}
+
 func (c *Client) GetSchema(ctx context.Context, req contract.GetFlightInfoRequest) (*arrow.Schema, error) {
 	info, err := c.GetFlightInfo(ctx, req)
 	if err != nil {
@@ -266,55 +317,54 @@ func (c *Client) GetSchema(ctx context.Context, req contract.GetFlightInfoReques
 	return flight.DeserializeSchema(info.Schema, c.mem)
 }
 
-// DoGet starts a DoGet stream. Returns the flight data stream.
 func (c *Client) DoGet(ctx context.Context, ticket *flight.Ticket) (flight.FlightService_DoGetClient, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return c.flight.DoGet(c.bearerCtx(ctx), ticket)
 }
 
-// DoPut sends records to a sink plugin. Schema is embedded in the IPC stream.
+// DoPut writes records to a sink (contract §10). Uses flight.NewRecordWriter
+// for correct wire format. Drains ack stream to surface sink errors.
 func (c *Client) DoPut(ctx context.Context, desc contract.DoPutRequest, schema *arrow.Schema, records []arrow.RecordBatch) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	descJSON, err := json.Marshal(desc)
+	if err != nil {
+		return fmt.Errorf("marshal descriptor: %w", err)
+	}
 
 	stream, err := c.flight.DoPut(c.bearerCtx(ctx))
 	if err != nil {
 		return err
 	}
 
-	// Send schema as first message.
-	schemaBytes := flight.SerializeSchema(schema, c.mem)
-	if err := stream.Send(&flight.FlightData{
-		FlightDescriptor: &flight.FlightDescriptor{
-			Type: flight.DescriptorCMD,
-			Cmd:  mustJSON(desc),
-		},
-		DataHeader: schemaBytes,
-	}); err != nil {
-		return err
-	}
+	w := flight.NewRecordWriter(stream,
+		ipc.WithSchema(schema),
+		ipc.WithAllocator(c.mem),
+	)
+	w.SetFlightDescriptor(&flight.FlightDescriptor{
+		Type: flight.DescriptorCMD,
+		Cmd:  descJSON,
+	})
 
-	// Send records as IPC batches.
 	for _, rec := range records {
-		var buf bytes.Buffer
-		w := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(c.mem))
 		if err := w.Write(rec); err != nil {
 			return err
 		}
-		if err := w.Close(); err != nil {
-			return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	_ = stream.CloseSend()
+
+	// Drain ack: sink errors surface only here (contract §10).
+	for {
+		_, err := stream.Recv()
+		if err == io.EOF {
+			return nil
 		}
-		if err := stream.Send(&flight.FlightData{DataBody: buf.Bytes()}); err != nil {
-			return err
+		if err != nil {
+			return fmt.Errorf("sink rejected write: %w", err)
 		}
 	}
-
-	// Close the send side and wait for ack.
-	return stream.Send(nil)
 }
 
-// UnauthError returns true if the error is UNAUTHENTICATED.
 func UnauthError(err error) bool {
 	if err == nil {
 		return false
@@ -323,18 +373,15 @@ func UnauthError(err error) bool {
 	return ok && st.Code() == codes.Unauthenticated
 }
 
-// Close stops the heartbeat and closes the connection.
 func (c *Client) Close() error {
-	if c.cancel != nil {
-		c.cancel()
-	}
-	if c.done != nil {
+	c.closeOnce.Do(func() {
+		c.hbCancel()
 		<-c.done
-	}
-	return c.conn.Close()
+		c.closeErr = c.conn.Close()
+	})
+	return c.closeErr
 }
 
-func mustJSON(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
+func isUnixPath(addr string) bool {
+	return len(addr) > 0 && (addr[0] == '/' || addr[0] == '.')
 }
