@@ -9,7 +9,10 @@ permissions:
   contents: read
 
 jobs:
-  ci:
+  # ────────────────────────────────────────────────────────────────
+  # Job 1: Lint (runs in parallel with tests)
+  # ────────────────────────────────────────────────────────────────
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,14 +20,31 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
 
-      - name: Bootstrap tools
+      - name: Cache golangci-lint
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/golangci-lint
+            ./bin/golangci-lint
+          key: ${{ runner.os }}-golangci-lint-v1-${{ hashFiles('Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-golangci-lint-v1-
+
+      - name: Cache buf
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/buf
+            ./bin/buf
+          key: ${{ runner.os }}-buf-v1-${{ hashFiles('Makefile', 'buf.yaml', 'buf.gen.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-buf-v1-
+
+      - name: Bootstrap tools (lint + proto)
         run: make bootstrap
-
-      - name: Install envtest assets
-        run: |
-          make envtest-setup
-          echo "KUBEBUILDER_ASSETS=$(./bin/setup-envtest use -p path)" >> "$GITHUB_ENV"
 
       - name: Regenerate proto (check freshness)
         run: |
@@ -34,8 +54,70 @@ jobs:
       - name: Lint
         run: make lint
 
+  # ────────────────────────────────────────────────────────────────
+  # Job 2: Test (runs in parallel with lint)
+  # ────────────────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Cache envtest assets
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/setup-envtest
+          key: ${{ runner.os }}-envtest-v1-${{ hashFiles('Makefile', 'go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-envtest-v1-
+
+      - name: Cache build binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ./bin/urutau
+            ./bin/urutau-coordinator
+            ./bin/urutau-worker
+            ./bin/urutau-operator
+          key: ${{ runner.os }}-build-${{ hashFiles('**/*.go', 'go.mod', 'go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      - name: Bootstrap tools
+        run: make bootstrap
+
+      - name: Install envtest assets
+        run: |
+          make envtest-setup
+          echo "KUBEBUILDER_ASSETS=$(./bin/setup-envtest use -p path)" >> "$GITHUB_ENV"
+
       - name: Test
         run: make test
 
+      - name: Build
+        run: make build
+
+  # ────────────────────────────────────────────────────────────────
+  # Job 3: Build (separate parallel job, optional)
+  # ────────────────────────────────────────────────────────────────
+  # Uncomment if you want build to run as a separate parallel job.
+  # Note: the test job already runs `make build`, so this is
+  # only useful if you want to separate concerns or run additional
+  # build targets.
+  #
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Build
         run: make build
