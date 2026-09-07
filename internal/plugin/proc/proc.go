@@ -103,22 +103,22 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
-		stdoutR.Close()
-		stdoutW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return nil, fmt.Errorf("stderr pipe: %w", err)
 	}
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
 	if err := cmd.Start(); err != nil {
-		stdoutR.Close()
-		stdoutW.Close()
-		stderrR.Close()
-		stderrW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		return nil, fmt.Errorf("start plugin: %w", err)
 	}
-	stdoutW.Close()
-	stderrW.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	p := &Process{cfg: cfg, cmd: cmd, exited: make(chan struct{})}
 
@@ -136,12 +136,12 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 	}()
 
 	if err := waitReady(ctx, readyCh, &p.ready); err != nil {
-		p.Kill()
+		_ = p.Kill()
 		<-p.exited
 		return nil, fmt.Errorf("plugin startup: %w", err)
 	}
 	if p.ready.ProtocolVersion != contract.ProtocolVersion {
-		p.Kill()
+		_ = p.Kill()
 		<-p.exited
 		return nil, fmt.Errorf("plugin speaks protocol v%d, urutau speaks v%d",
 			p.ready.ProtocolVersion, contract.ProtocolVersion)
@@ -149,7 +149,7 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 
 	if useTCP {
 		if p.ready.Port <= 0 {
-			p.Kill()
+			_ = p.Kill()
 			<-p.exited
 			return nil, fmt.Errorf("TCP mode: plugin did not report a port")
 		}
@@ -188,7 +188,7 @@ func waitReady(ctx context.Context, ch <-chan readyResult, out *Ready) error {
 }
 
 func pump(r io.ReadCloser, logger *slog.Logger, stream string, readyCh chan<- readyResult) {
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	br := bufio.NewReaderSize(r, 64*1024)
 	pending := readyCh != nil
 	for {
@@ -232,9 +232,9 @@ func readLine(br *bufio.Reader) (string, error) {
 	return strings.TrimRight(s, "\r\n"), err
 }
 
-func (p *Process) Addr() string      { return p.addr }
-func (p *Process) Socket() string    { return p.socket }
-func (p *Process) ReadyInfo() Ready  { return p.ready }
+func (p *Process) Addr() string     { return p.addr }
+func (p *Process) Socket() string   { return p.socket }
+func (p *Process) ReadyInfo() Ready { return p.ready }
 
 // Exited returns a channel that is closed when the process exits.
 func (p *Process) Exited() <-chan struct{} { return p.exited }
@@ -278,7 +278,7 @@ func (p *Process) Kill() error {
 }
 
 func (p *Process) Stop() error {
-	p.Terminate()
+	_ = p.Terminate()
 	select {
 	case <-p.exited:
 	case <-time.After(hardStopGrace):
