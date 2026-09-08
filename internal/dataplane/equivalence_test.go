@@ -10,9 +10,6 @@ import (
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
-// kernelAlloc is defined in collapse_test.go — a plain allocator for
-// tests that exercise compute kernels.
-
 // eqChange mirrors a row for order-sensitive comparison.
 type eqChange struct {
 	ID  int64
@@ -64,7 +61,7 @@ func extractOpCol(b *dataplane.Batch) []uint8 {
 // produces the same row-level classification as iterating the batch
 // row-by-row and checking __op.
 func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
 		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
@@ -130,7 +127,7 @@ func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
 // columnar Collapse produces the same result as change.Collapse (the
 // production row-side reference).
 func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
 		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{
@@ -178,7 +175,7 @@ func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 // TestEquivalence_FilterPredicate_MatchesRowPath verifies that
 // EvaluatePredicate matches row-by-row filtering.
 func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
 		// PKDomain=5 with NumRows=25 → ~5 rows per PK → multi-row matches
@@ -254,7 +251,7 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 // TestEquivalence_CollapseInsertAfterDelete verifies that an
 // insert-after-delete ends up as an upsert (not a delete).
 func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
@@ -288,7 +285,7 @@ func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 // TestEquivalence_DeleteLast verifies that a PK whose last operation
 // is DELETE ends up in deletes, not upserts.
 func TestEquivalence_DeleteLast(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
@@ -316,7 +313,7 @@ func TestEquivalence_DeleteLast(t *testing.T) {
 // TestEquivalence_CompositeKey verifies that two distinct composite
 // PKs survive collapse as separate rows.
 func TestEquivalence_CompositeKey(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
@@ -342,7 +339,7 @@ func TestEquivalence_CompositeKey(t *testing.T) {
 // TestEquivalence_Int64Overflow verifies that int64 values outside
 // float64 precision survive with exact values.
 func TestEquivalence_Int64Overflow(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 

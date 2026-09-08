@@ -10,13 +10,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
-// allocCtx returns a context that carries the allocator so compute
-// kernels allocate through the same pool our builders do. This makes
-// CheckedAllocator see kernel allocations.
-func allocCtx(ctx context.Context, alloc memory.Allocator) context.Context {
-	return compute.WithAllocator(ctx, alloc)
-}
-
 // Op values matching the wire schema __op column (CR-021).
 const (
 	OpInsert = 0
@@ -62,18 +55,16 @@ func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arro
 	defer updMask.Release()
 
 	filterOpts := compute.DefaultFilterOptions()
-	kctx := allocCtx(ctx, alloc)
-
-	filteredDelete, err := compute.FilterRecordBatch(kctx, batch.Record, delMask, filterOpts)
+	filteredDelete, err := compute.FilterRecordBatch(ctx, batch.Record, delMask, filterOpts)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("dataplane: filter deletes: %w", err)
 	}
-	filteredInsert, err := compute.FilterRecordBatch(kctx, batch.Record, insMask, filterOpts)
+	filteredInsert, err := compute.FilterRecordBatch(ctx, batch.Record, insMask, filterOpts)
 	if err != nil {
 		filteredDelete.Release()
 		return nil, nil, nil, fmt.Errorf("dataplane: filter inserts: %w", err)
 	}
-	filteredUpdate, err := compute.FilterRecordBatch(kctx, batch.Record, updMask, filterOpts)
+	filteredUpdate, err := compute.FilterRecordBatch(ctx, batch.Record, updMask, filterOpts)
 	if err != nil {
 		filteredDelete.Release()
 		filteredInsert.Release()
@@ -266,18 +257,16 @@ func SplitByOp(ctx context.Context, alloc memory.Allocator, batch *Batch) (inser
 	defer updMask.Release()
 
 	filterOpts := compute.DefaultFilterOptions()
-	kctx := allocCtx(ctx, alloc)
-
-	filteredIns, err := compute.FilterRecordBatch(kctx, batch.Record, insMask, filterOpts)
+	filteredIns, err := compute.FilterRecordBatch(ctx, batch.Record, insMask, filterOpts)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	filteredDel, err := compute.FilterRecordBatch(kctx, batch.Record, delMask, filterOpts)
+	filteredDel, err := compute.FilterRecordBatch(ctx, batch.Record, delMask, filterOpts)
 	if err != nil {
 		filteredIns.Release()
 		return nil, nil, nil, err
 	}
-	filteredUpd, err := compute.FilterRecordBatch(kctx, batch.Record, updMask, filterOpts)
+	filteredUpd, err := compute.FilterRecordBatch(ctx, batch.Record, updMask, filterOpts)
 	if err != nil {
 		filteredIns.Release()
 		filteredDel.Release()

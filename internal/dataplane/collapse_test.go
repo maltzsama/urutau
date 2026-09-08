@@ -6,29 +6,11 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
-// kernelAlloc returns a plain allocator for tests that exercise compute
-// kernels through our operators (which thread allocCtx).
-//
-// arrow-go v18.7.0 compute kernels allocate internal buffers via the
-// allocator passed through context (KernelCtx.Allocate, bufferBuilder.resize,
-// builder.init). These internal buffers are never freed by explicit Release
-// inside arrow-go — they are a confirmed leak in the arrow-go compute
-// package, not a GC timing issue. Verified by TestAllocatorThreadingExperiment
-// (pinned, isolated).
-//
-// Tests using kernelAlloc verify correctness via value assertions (row
-// counts, schema, watermark, data values). Builder-only tests should
-// still use checkedAlloc(t) — our builders DO balance Allocate/Free.
-func kernelAlloc() memory.Allocator {
-	return memory.NewGoAllocator()
-}
-
 func TestCollapseBasic(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
@@ -58,7 +40,7 @@ func TestCollapseBasic(t *testing.T) {
 }
 
 func TestCollapseDeleteLast(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
@@ -84,7 +66,7 @@ func TestCollapseDeleteLast(t *testing.T) {
 }
 
 func TestCollapseInsertAfterDelete(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
@@ -110,7 +92,7 @@ func TestCollapseInsertAfterDelete(t *testing.T) {
 }
 
 func TestCollapseCompositeKey(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
@@ -155,7 +137,7 @@ func TestCollapseNullPK(t *testing.T) {
 }
 
 func TestCollapsePreservesWatermark(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
@@ -198,7 +180,7 @@ func TestCollapseEmptyBatch(t *testing.T) {
 }
 
 func TestCollapseInt64Overflow(t *testing.T) {
-	alloc := kernelAlloc()
+	alloc := checkedAlloc(t)
 	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 

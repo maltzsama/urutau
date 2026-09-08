@@ -87,10 +87,9 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	defer idxArr.Release()
 
 	// 5. Take each column independently — TakeArray works on flat arrays.
-	kctx := allocCtx(ctx, alloc)
 	cols := make([]arrow.Array, batch.Record.NumCols())
 	for i := range int(batch.Record.NumCols()) {
-		taken, err := compute.TakeArray(kctx, batch.Record.Column(i), idxArr)
+		taken, err := compute.TakeArray(ctx, batch.Record.Column(i), idxArr)
 		if err != nil {
 			// Release already-taken columns.
 			for j := range i {
@@ -136,11 +135,11 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	delBool := delMask.NewBooleanArray()
 	defer delBool.Release()
 
-	filteredUpserts, err := compute.FilterRecordBatch(kctx, collapsed, insUpdBool, filterOpts)
+	filteredUpserts, err := compute.FilterRecordBatch(ctx, collapsed, insUpdBool, filterOpts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dataplane: collapse filter upserts: %w", err)
 	}
-	filteredDeletes, err := compute.FilterRecordBatch(kctx, collapsed, delBool, filterOpts)
+	filteredDeletes, err := compute.FilterRecordBatch(ctx, collapsed, delBool, filterOpts)
 	if err != nil {
 		filteredUpserts.Release()
 		return nil, nil, fmt.Errorf("dataplane: collapse filter deletes: %w", err)
