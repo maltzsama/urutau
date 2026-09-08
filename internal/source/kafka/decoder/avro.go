@@ -8,7 +8,7 @@ import (
 	"github.com/hamba/avro/v2"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // Avro decodes Confluent-Avro messages: a 1-byte magic (0x00), a 4-byte
@@ -37,7 +37,7 @@ func (e *ErrBadWireFormat) Error() string {
 	return "avro: message is missing the Confluent wire header (magic 0x00 + 4-byte schema id)"
 }
 
-func (d *Avro) Decode(rec *kgo.Record) ([]change.Change, error) {
+func (d *Avro) Decode(rec *kgo.Record) ([]rowchange.Change, error) {
 	v := rec.Value
 	if len(v) < 5 || v[0] != 0x00 {
 		return nil, &ErrBadWireFormat{}
@@ -61,8 +61,8 @@ func (d *Avro) Decode(rec *kgo.Record) ([]change.Change, error) {
 	if err := avro.Unmarshal(schema, payload, &after); err != nil {
 		return nil, fmt.Errorf("avro: decode payload (schema id %d): %w", id, err)
 	}
-	return []change.Change{{
-		Op:    change.OpInsert,
+	return []rowchange.Change{{
+		Op:    rowchange.OpInsert,
 		After: after,
 	}}, nil
 }

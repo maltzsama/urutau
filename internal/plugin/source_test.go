@@ -5,7 +5,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 func TestStringPositionCompare(t *testing.T) {
@@ -114,15 +114,15 @@ func TestCollectColumns(t *testing.T) {
 
 func TestBatchToRecords(t *testing.T) {
 	alloc := memory.NewGoAllocator()
-	b := change.Batch{
+	b := rowchange.Batch{
 		Table:    "test",
 		Position: "pos123",
-		Upserts: []change.Change{
-			{Op: change.OpInsert, Table: "test", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "name": "alice"}},
-			{Op: change.OpUpdate, Table: "test", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "name": "bob"}},
+		Upserts: []rowchange.Change{
+			{Op: rowchange.OpInsert, Table: "test", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "name": "alice"}},
+			{Op: rowchange.OpUpdate, Table: "test", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "name": "bob"}},
 		},
-		Deletes: []change.Change{
-			{Op: change.OpDelete, Table: "test", Key: []any{int64(3)}, Before: map[string]any{"id": int64(3), "name": "charlie"}},
+		Deletes: []rowchange.Change{
+			{Op: rowchange.OpDelete, Table: "test", Key: []any{int64(3)}, Before: map[string]any{"id": int64(3), "name": "charlie"}},
 		},
 	}
 
@@ -149,11 +149,11 @@ func mustArrowSchema(t *testing.T) *arrow.Schema {
 	}, nil)
 }
 
-func batchWithColumns(t *testing.T, cols ...string) change.Batch {
+func batchWithColumns(t *testing.T, cols ...string) rowchange.Batch {
 	t.Helper()
-	b := change.Batch{Table: "test"}
+	b := rowchange.Batch{Table: "test"}
 	for _, c := range cols {
-		b.Upserts = append(b.Upserts, change.Change{
+		b.Upserts = append(b.Upserts, rowchange.Change{
 			After: map[string]any{c: "val"},
 		})
 	}

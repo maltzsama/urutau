@@ -8,10 +8,15 @@ package plugin
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -47,39 +52,106 @@ func (p fakePos) Contains(o position.Position) bool {
 	return p >= q
 }
 
+// recRow is the fake sink's local row representation — the fake cannot
+// import engine internals, so it decodes committed batches itself.
+type recRow struct {
+	Key   []any
+	After map[string]any
+}
+
 // records captures every committed batch. The mutex makes the test's reads
 // race-free against the worker's commits.
 type records struct {
 	mu      sync.Mutex
-	upserts map[string][]change.Change
-	deletes map[string][]change.Change
+	upserts map[string][]recRow
+	deletes map[string][]recRow
 }
 
 func newRecords() *records {
 	return &records{
-		upserts: map[string][]change.Change{},
-		deletes: map[string][]change.Change{},
+		upserts: map[string][]recRow{},
+		deletes: map[string][]recRow{},
 	}
 }
 
-func (r *records) commit(b change.Batch) {
+func (r *records) commit(b *dataplane.Batch) {
+	if b == nil || b.Record == nil {
+		return
+	}
+	schema := b.Record.Schema()
+	opIdx := -1
+	dataIdx := make(map[string]int)
+	for i := range schema.NumFields() {
+		name := schema.Field(i).Name
+		switch name {
+		case "__op":
+			opIdx = i
+		default:
+			if !strings.HasPrefix(name, "__") {
+				dataIdx[name] = i
+			}
+		}
+	}
+	n := int(b.Record.NumRows())
+	upserts := make([]recRow, 0, n)
+	deletes := make([]recRow, 0, n)
+	for row := 0; row < n; row++ {
+		rr := recRow{After: make(map[string]any, len(dataIdx))}
+		isDel := false
+		if opIdx >= 0 {
+			if oc, ok := b.Record.Column(opIdx).(*array.Uint8); ok && oc.Value(row) == uint8(2) { // OpDelete
+				isDel = true
+			}
+		}
+		for name, ci := range dataIdx {
+			col := b.Record.Column(ci)
+			if col.IsNull(row) {
+				continue
+			}
+			v := arrowValue(col, row)
+			rr.After[name] = v
+			if name == "id" {
+				rr.Key = []any{v}
+			}
+		}
+		if isDel {
+			deletes = append(deletes, rr)
+		} else {
+			upserts = append(upserts, rr)
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.upserts[b.Table] = append(r.upserts[b.Table], b.Upserts...)
-	r.deletes[b.Table] = append(r.deletes[b.Table], b.Deletes...)
+	r.upserts[b.Table] = append(r.upserts[b.Table], upserts...)
+	r.deletes[b.Table] = append(r.deletes[b.Table], deletes...)
 }
 
-func (r *records) rows(target string) []change.Change {
+// arrowValue reads a scalar Arrow value at row.
+func arrowValue(col arrow.Array, row int) any {
+	switch c := col.(type) {
+	case *array.Int64:
+		return c.Value(row)
+	case *array.Int32:
+		return c.Value(row)
+	case *array.String:
+		return c.Value(row)
+	case *array.Boolean:
+		return c.Value(row)
+	case *array.Float64:
+		return c.Value(row)
+	default:
+		return nil
+	}
+}
+
+func (r *records) rows(target string) []recRow {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]change.Change, 0, len(r.upserts[target])+len(r.deletes[target]))
+	out := make([]recRow, 0, len(r.upserts[target])+len(r.deletes[target]))
 	out = append(out, r.upserts[target]...)
 	out = append(out, r.deletes[target]...)
 	return out
 }
-
-// seedRows are the changes the fake source streams; set before a run.
-var seedRows []change.Change
 
 // committed is the sink singleton the runner writes into and the test reads.
 var committed = newRecords()
@@ -123,33 +195,59 @@ func (Source) ParsePosition(s string) (position.Position, error) {
 	return fakePos(n), nil
 }
 
-func (Source) Open(_ context.Context, _ []source.TableRef) (source.Reader, error) {
-	return reader{out: make(chan change.Change, len(seedRows)+1)}, nil
+func (Source) Open(_ context.Context, refs []source.TableRef) (source.Reader, error) {
+	target := "raw.t"
+	if len(refs) > 0 {
+		target = refs[0].Target
+	}
+	return &reader{batch: seedBatch(target)}, nil
 }
 
 type reader struct {
-	out chan change.Change
+	batch *dataplane.Batch
+	sent  bool
 }
 
-var _ source.Reader = reader{}
+var _ source.Reader = &reader{}
 
-// Stream emits the seeded rows, then holds open until ctx is cancelled —
-// the same shape a real source's stream has.
-func (r reader) Stream(ctx context.Context, _ position.Position) (<-chan change.Change, <-chan error) {
-	errCh := make(chan error, 1)
-	go func() {
-		for _, c := range seedRows {
-			select {
-			case r.out <- c:
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-				return
-			}
-		}
-		<-ctx.Done()
-		errCh <- ctx.Err()
-	}()
-	return r.out, errCh
+// Start is a no-op: the batch is pre-built.
+func (r *reader) Start(context.Context, position.Position) error { return nil }
+
+// Next emits the seeded batch once, then holds open until ctx is cancelled.
+func (r *reader) Next(ctx context.Context) (*dataplane.Batch, error) {
+	if !r.sent {
+		r.sent = true
+		return r.batch, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// seedBatch builds the two-row wire batch the fake source emits (id=1 v=a,
+// id=2 v=b). The fake cannot import engine internals, so it builds Arrow
+// directly.
+func seedBatch(target string) *dataplane.Batch {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "v", Type: arrow.BinaryTypes.String},
+		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
+		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+	}, nil)
+	bb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	for i, v := range []string{"a", "b"} {
+		bb.Field(0).(*array.Int64Builder).Append(int64(i + 1))
+		bb.Field(1).(*array.StringBuilder).Append(v)
+		bb.Field(2).(*array.Uint8Builder).Append(0) // insert
+		bb.Field(3).(*array.StringBuilder).Append("p")
+		bb.Field(4).(*array.TimestampBuilder).AppendNull()
+		bb.Field(5).(*array.TimestampBuilder).AppendNull()
+		bb.Field(6).(*array.BooleanBuilder).Append(false)
+	}
+	rec := bb.NewRecordBatch()
+	return &dataplane.Batch{Table: target, Record: rec, Watermark: []byte("p2")}
 }
 
 func (r reader) Synced() position.Position                         { return fakePos(0) }
@@ -166,7 +264,7 @@ type Sink struct {
 
 var _ sink.Sink = &Sink{}
 
-func (s *Sink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, change.WriteMode) error {
+func (s *Sink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, dataplane.WriteMode) error {
 	return nil
 }
 
@@ -189,7 +287,7 @@ type writer struct {
 
 var _ sink.TableWriter = writer{}
 
-func (w writer) Commit(_ context.Context, b change.Batch) error {
+func (w writer) Commit(_ context.Context, b *dataplane.Batch) error {
 	w.s.rec.commit(b)
 	return nil
 }

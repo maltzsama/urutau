@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -37,9 +37,9 @@ func usersRows() []map[string]any {
 	}
 }
 
-func searchEvent(id int64, userRef any) change.Change {
-	return change.Change{
-		Op: change.OpInsert, Key: []any{id},
+func searchEvent(id int64, userRef any) rowchange.Change {
+	return rowchange.Change{
+		Op: rowchange.OpInsert, Key: []any{id},
 		After:    map[string]any{"id": id, "user_ref": userRef, "q": "flight"},
 		IngestTS: time.Now(),
 	}
@@ -77,9 +77,9 @@ func (rj *refJoin) isHot() bool {
 	return snap != nil && snap.hot
 }
 
-func (s *Stage) applyOne(t *testing.T, c change.Change) ([]change.Change, error) {
+func (s *Stage) applyOne(t *testing.T, c rowchange.Change) ([]rowchange.Change, error) {
 	t.Helper()
-	return s.Enrich([]change.Change{c})
+	return s.Enrich([]rowchange.Change{c})
 }
 
 // 1 — Broadcast join: N events × M rows in O(N); the loader runs once per
@@ -128,7 +128,7 @@ func TestLeftMissPassesWithNullsAndFlag(t *testing.T) {
 // 3 — Inner miss: the event is dropped; survivors are the matches.
 func TestInnerMissDrops(t *testing.T) {
 	s, _ := newTestStage(t, refCfg(func(c *spec.Enrich) { c.JoinType = "inner" }), usersRows())
-	out, err := s.Enrich([]change.Change{
+	out, err := s.Enrich([]rowchange.Change{
 		searchEvent(1, int64(1)),  // hit
 		searchEvent(2, int64(99)), // miss → dropped
 		searchEvent(3, int64(2)),  // hit
@@ -160,9 +160,9 @@ func TestColdStartBufferDrainsInOrder(t *testing.T) {
 	// NOT started: the reference stays cold.
 	_, _ = s.Enrich(nil) // warm call: no-op
 
-	var survived []change.Change
+	var survived []rowchange.Change
 	for i := 1; i <= 3; i++ {
-		out, err := s.Enrich([]change.Change{searchEvent(int64(i), int64(1))})
+		out, err := s.Enrich([]rowchange.Change{searchEvent(int64(i), int64(1))})
 		if err != nil {
 			t.Fatalf("apply %d: %v", i, err)
 		}
@@ -212,7 +212,7 @@ func TestBufferMaxEventsEvictsOldest(t *testing.T) {
 
 	// Three events cold with a queue of 2: the first is evacuated
 	// (follows left-join miss) and surfaces in the output.
-	out, err := s.Enrich([]change.Change{
+	out, err := s.Enrich([]rowchange.Change{
 		searchEvent(1, int64(1)),
 		searchEvent(2, int64(1)),
 		searchEvent(3, int64(1)),
@@ -247,7 +247,7 @@ func TestBufferMaxWaitExpires(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: usersRows()})
-	if _, err := s.Enrich([]change.Change{searchEvent(1, int64(1))}); err != nil {
+	if _, err := s.Enrich([]rowchange.Change{searchEvent(1, int64(1))}); err != nil {
 		t.Fatalf("park: %v", err)
 	}
 	time.Sleep(5 * time.Millisecond) // the parked event is now past MaxWait
@@ -397,7 +397,7 @@ func TestJoinKeyTyping(t *testing.T) {
 // Enrich on a key-only delete is a no-op: tombstones carry nothing.
 func TestDeleteChangePassesThrough(t *testing.T) {
 	s, _ := newTestStage(t, refCfg(nil), usersRows())
-	del := change.Change{Op: change.OpDelete, Key: []any{int64(1)}}
+	del := rowchange.Change{Op: rowchange.OpDelete, Key: []any{int64(1)}}
 	out, err := s.applyOne(t, del)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
@@ -670,13 +670,13 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 	}
 
 	// Event with both join keys set.
-	event := change.Change{
-		Op: change.OpInsert, Key: []any{int64(1)},
+	event := rowchange.Change{
+		Op: rowchange.OpInsert, Key: []any{int64(1)},
 		After:    map[string]any{"id": int64(1), "user_ref": int64(1), "product_ref": int64(10), "q": "test"},
 		IngestTS: time.Now(),
 	}
 
-	out, err := s.Enrich([]change.Change{event})
+	out, err := s.Enrich([]rowchange.Change{event})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}

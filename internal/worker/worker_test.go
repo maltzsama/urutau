@@ -7,59 +7,139 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 )
 
 type fakeCommitter struct {
 	mu      sync.Mutex
-	batches []change.Batch
+	batches []rowchange.Batch
 	failAt  map[int]bool // fail the Nth flush (0-based)
 }
 
 func (f *fakeCommitter) Close() error { return nil }
 
-func (f *fakeCommitter) Commit(_ context.Context, b change.Batch) error {
+func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	i := len(f.batches)
-	f.batches = append(f.batches, b)
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode)})
+	} else {
+		rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
+		if b.Mode == dataplane.AppendMode {
+			// Append: every row is an upsert (deletes already rewritten/dropped).
+			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: rows, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode)})
+		} else {
+			var upserts, deletes []rowchange.Change
+			for _, r := range rows {
+				if r.Op == rowchange.OpDelete {
+					deletes = append(deletes, r)
+				} else {
+					upserts = append(upserts, r)
+				}
+			}
+			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: upserts, Deletes: deletes, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode)})
+		}
+	}
 	if f.failAt != nil && f.failAt[i] {
 		return errors.New("boom")
 	}
 	return nil
 }
 
-func chg(table string, op change.Op, id int64, v, pos string) change.Change {
-	c := change.Change{Op: op, Table: table, Key: []any{id}, Position: pos}
-	if op != change.OpDelete {
+func chg(table string, op rowchange.Op, id int64, v, pos string) rowchange.Change {
+	c := rowchange.Change{Op: op, Table: table, Key: []any{id}, Position: pos}
+	if op != rowchange.OpDelete {
 		c.After = map[string]any{"id": id, "v": v}
 	}
 	return c
 }
 
-func runWorker(t *testing.T, cfg Config, targets []string, committers map[string]sink.TableWriter, changes []change.Change) error {
+// regTable registers a table with the id/v schema (tests). The worker's
+// columnar collapse needs the PK; tests that set up workers manually must
+// use this instead of bare RegisterCommitter.
+func regTable(t *testing.T, w *Worker, target string, c sink.TableWriter, mode dataplane.WriteMode) {
+	t.Helper()
+	w.RegisterCommitter(target, c, mode)
+	w.SetKnownSchema(target, core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	})
+}
+
+func runWorker(t *testing.T, cfg Config, targets []string, committers map[string]sink.TableWriter, changes []rowchange.Change) error {
 	t.Helper()
 	w := New(cfg)
 	for _, target := range targets {
-		w.RegisterCommitter(target, committers[target], change.UpsertMode)
+		w.RegisterCommitter(target, committers[target], dataplane.UpsertMode)
+		w.SetKnownSchema(target, testSchema())
 	}
-	ingest := make(chan change.Change, len(changes)+1)
+	raw := make(chan rowchange.Change, len(changes)+1)
 	for _, c := range changes {
-		ingest <- c
+		raw <- c
 	}
-	close(ingest)
+	close(raw)
+	ingest := IngestFromChanges(context.Background(), raw, testSchema())
 	return w.Run(context.Background(), ingest)
+}
+
+// testSchema is the id/v schema used across worker tests.
+func testSchema() core.Schema {
+	return core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+}
+
+// toIngest wraps one change into an Ingest (bridging to a batch), or a
+// window marker into Ingest with Win set.
+func toIngest(t *testing.T, c rowchange.Change) Ingest {
+	t.Helper()
+	cb := rowchange.Batch{Table: c.Table, Upserts: []rowchange.Change{c}, Mode: rowchange.UpsertMode}
+	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
+	if err != nil {
+		t.Fatalf("toIngest: %v", err)
+	}
+	if c.Window != nil {
+		if c.Window.Closes {
+			return Ingest{Table: c.Table, Win: c.Window, Position: c.Position}
+		}
+		// InWindow is DATA + a routing tag; the batch must survive.
+		return Ingest{Table: c.Table, Batch: dpb, Win: c.Window}
+	}
+	return Ingest{Table: c.Table, Batch: dpb}
+}
+
+// toWindow bridges window rows into a batch for AddWindowRows.
+func toWindow(t *testing.T, target string, rows []rowchange.Change) *dataplane.Batch {
+	t.Helper()
+	cb := rowchange.Batch{Table: target, Upserts: rows, Mode: rowchange.AppendMode}
+	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
+	if err != nil {
+		t.Fatalf("toWindow: %v", err)
+	}
+	return dpb
 }
 
 func TestFlushOnCloseCollapses(t *testing.T) {
 	fc := &fakeCommitter{}
 	err := runWorker(t, Config{MaxRows: 100, MaxInterval: time.Hour}, []string{"raw.orders"},
-		map[string]sink.TableWriter{"raw.orders": fc}, []change.Change{
-			chg("raw.orders", change.OpInsert, 1, "a", "p1"),
-			chg("raw.orders", change.OpUpdate, 1, "b", "p2"),
-			chg("raw.orders", change.OpInsert, 2, "x", "p3"),
-			chg("raw.orders", change.OpDelete, 2, "", "p4"),
+		map[string]sink.TableWriter{"raw.orders": fc}, []rowchange.Change{
+			chg("raw.orders", rowchange.OpInsert, 1, "a", "p1"),
+			chg("raw.orders", rowchange.OpUpdate, 1, "b", "p2"),
+			chg("raw.orders", rowchange.OpInsert, 2, "x", "p3"),
+			chg("raw.orders", rowchange.OpDelete, 2, "", "p4"),
 		})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -83,10 +163,10 @@ func TestFlushOnCloseCollapses(t *testing.T) {
 func TestFlushByMaxRows(t *testing.T) {
 	fc := &fakeCommitter{}
 	err := runWorker(t, Config{MaxRows: 2, MaxInterval: time.Hour}, []string{"t"},
-		map[string]sink.TableWriter{"t": fc}, []change.Change{
-			chg("t", change.OpInsert, 1, "a", "p1"),
-			chg("t", change.OpInsert, 2, "b", "p2"),
-			chg("t", change.OpInsert, 3, "c", "p3"),
+		map[string]sink.TableWriter{"t": fc}, []rowchange.Change{
+			chg("t", rowchange.OpInsert, 1, "a", "p1"),
+			chg("t", rowchange.OpInsert, 2, "b", "p2"),
+			chg("t", rowchange.OpInsert, 3, "c", "p3"),
 		})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -102,15 +182,16 @@ func TestFlushByMaxRows(t *testing.T) {
 func TestFlushByInterval(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: 30 * time.Millisecond})
-	w.RegisterCommitter("t", fc, change.UpsertMode)
+	regTable(t, w, "t", fc, dataplane.UpsertMode)
 
-	ingest := make(chan change.Change, 2)
+	ingest := make(chan rowchange.Change, 2)
+	dpIngest := IngestFromChanges(context.Background(), ingest, testSchema())
 	done := make(chan error, 1)
-	go func() { done <- w.Run(context.Background(), ingest) }()
+	go func() { done <- w.Run(context.Background(), dpIngest) }()
 
-	ingest <- chg("t", change.OpInsert, 1, "a", "p1")
+	ingest <- chg("t", rowchange.OpInsert, 1, "a", "p1")
 	time.Sleep(120 * time.Millisecond) // interval fires while channel stays open
-	ingest <- chg("t", change.OpInsert, 2, "b", "p2")
+	ingest <- chg("t", rowchange.OpInsert, 2, "b", "p2")
 	close(ingest)
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
@@ -124,9 +205,9 @@ func TestFlushByInterval(t *testing.T) {
 func TestCommitFailureIsTerminalAndNeverSkips(t *testing.T) {
 	fc := &fakeCommitter{failAt: map[int]bool{0: true}}
 	err := runWorker(t, Config{MaxRows: 1, MaxInterval: time.Hour}, []string{"t"},
-		map[string]sink.TableWriter{"t": fc}, []change.Change{
-			chg("t", change.OpInsert, 1, "a", "p1"), // batch 0: fails
-			chg("t", change.OpInsert, 2, "b", "p2"), // batch 1: must NOT be committed after failure
+		map[string]sink.TableWriter{"t": fc}, []rowchange.Change{
+			chg("t", rowchange.OpInsert, 1, "a", "p1"), // batch 0: fails
+			chg("t", rowchange.OpInsert, 2, "b", "p2"), // batch 1: must NOT be committed after failure
 		})
 	if err == nil {
 		t.Fatal("commit failure must surface")
@@ -144,10 +225,10 @@ func TestTablesCommitIndependently(t *testing.T) {
 	err := runWorker(t, Config{MaxRows: 100, MaxInterval: time.Hour},
 		[]string{"raw.orders", "raw.order_items"},
 		map[string]sink.TableWriter{"raw.orders": orders, "raw.order_items": items},
-		[]change.Change{
-			chg("raw.orders", change.OpInsert, 1, "a", "p1"),
-			chg("raw.order_items", change.OpInsert, 1, "x", "p2"),
-			chg("raw.orders", change.OpDelete, 1, "", "p3"),
+		[]rowchange.Change{
+			chg("raw.orders", rowchange.OpInsert, 1, "a", "p1"),
+			chg("raw.order_items", rowchange.OpInsert, 1, "x", "p2"),
+			chg("raw.orders", rowchange.OpDelete, 1, "", "p3"),
 		})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -166,7 +247,7 @@ func TestCommitsAreSerializedPerTable(t *testing.T) {
 	var mu sync.Mutex
 	inFlight := 0
 	overlapped := false
-	slow := CommitterFunc(func(context.Context, change.Batch) error {
+	slow := CommitterFunc(func(context.Context, *dataplane.Batch) error {
 		mu.Lock()
 		inFlight++
 		if inFlight > 1 {
@@ -180,9 +261,9 @@ func TestCommitsAreSerializedPerTable(t *testing.T) {
 		return nil
 	})
 
-	changes := make([]change.Change, 0, 50)
+	changes := make([]rowchange.Change, 0, 50)
 	for i := range 50 {
-		changes = append(changes, chg("t", change.OpInsert, int64(i), "v", "p"))
+		changes = append(changes, chg("t", rowchange.OpInsert, int64(i), "v", "p"))
 	}
 	if err := runWorker(t, Config{MaxRows: 5, MaxInterval: time.Hour}, []string{"t"},
 		map[string]sink.TableWriter{"t": slow}, changes); err != nil {
@@ -193,8 +274,8 @@ func TestCommitsAreSerializedPerTable(t *testing.T) {
 	}
 }
 
-type CommitterFunc func(context.Context, change.Batch) error
+type CommitterFunc func(context.Context, *dataplane.Batch) error
 
 func (f CommitterFunc) Close() error { return nil }
 
-func (f CommitterFunc) Commit(ctx context.Context, b change.Batch) error { return f(ctx, b) }
+func (f CommitterFunc) Commit(ctx context.Context, b *dataplane.Batch) error { return f(ctx, b) }

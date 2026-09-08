@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
@@ -36,7 +36,7 @@ type controlDoc struct {
 // single-insert-per-partition rule. Existing properties are preserved:
 // the control document is the merge point of the commit path and the
 // snapshot orchestrator's SetProperties calls.
-func controlWrite(prev *controlDoc, b change.Batch, now time.Time) *controlDoc {
+func controlWrite(prev *controlDoc, b rowchange.Batch, now time.Time) *controlDoc {
 	ctrl := &controlDoc{Properties: map[string]string{}}
 	if prev != nil && prev.Properties != nil {
 		ctrl.Properties = prev.Properties

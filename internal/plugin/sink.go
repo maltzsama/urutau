@@ -10,15 +10,17 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/plugin/client"
 	"github.com/maltzsama/urutau/internal/plugin/contract"
+	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 )
 
 // SinkAdapter wraps a Flight client as a sink.Sink. It translates the
-// internal change.Batch into Arrow records and writes them via DoPut,
+// internal rowchange.Batch into Arrow records and writes them via DoPut,
 // then calls Flush to guarantee durability.
 type SinkAdapter struct {
 	client *client.Client
@@ -43,7 +45,7 @@ func NewSinkAdapter(c *client.Client, logger *slog.Logger) *SinkAdapter {
 
 // EnsureTable delegates to the plugin via Flight action. The plugin
 // manages its own schema internally.
-func (a *SinkAdapter) EnsureTable(ctx context.Context, ref core.TableRef, _ core.Schema, _ []string, _ core.CastPolicy, _ change.WriteMode) error {
+func (a *SinkAdapter) EnsureTable(ctx context.Context, ref core.TableRef, _ core.Schema, _ []string, _ core.CastPolicy, _ dataplane.WriteMode) error {
 	// No-op for now — the plugin handles its own schema.
 	return nil
 }
@@ -97,10 +99,16 @@ type sinkWriter struct {
 	wg     *sync.WaitGroup
 }
 
-// Commit converts the change.Batch into Arrow records and sends them via
+// Commit converts the rowchange.Batch into Arrow records and sends them via
 // DoPut, then calls Flush to guarantee durability (contract §10).
-func (w *sinkWriter) Commit(ctx context.Context, b change.Batch) error {
-	records := batchToRecords(b, w.alloc)
+func (w *sinkWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
+	// Unpack: decode RecordBatch back to changes for the existing writer.
+	// QUARANTINE: this bridge dies when the plugin sink consumes RecordBatch directly.
+	cb, err := w.unpackBatch(b)
+	if err != nil {
+		return fmt.Errorf("plugin sink: unpack: %w", err)
+	}
+	records := batchToRecords(cb, w.alloc)
 	if len(records) == 0 {
 		return nil
 	}
@@ -140,9 +148,9 @@ func (w *sinkWriter) Close() error {
 	return nil
 }
 
-// batchToRecords converts a change.Batch into a single Arrow record batch
+// batchToRecords converts a rowchange.Batch into a single Arrow record batch
 // with typed columns for efficiency.
-func batchToRecords(b change.Batch, alloc memory.Allocator) []arrow.RecordBatch {
+func batchToRecords(b rowchange.Batch, alloc memory.Allocator) []arrow.RecordBatch {
 	total := len(b.Upserts) + len(b.Deletes)
 	if total == 0 {
 		return nil
@@ -177,7 +185,7 @@ func batchToRecords(b change.Batch, alloc memory.Allocator) []arrow.RecordBatch 
 	return []arrow.RecordBatch{rec}
 }
 
-func appendChange(bb *array.RecordBuilder, op string, chg change.Change, colNames []string, position string) {
+func appendChange(bb *array.RecordBuilder, op string, chg rowchange.Change, colNames []string, position string) {
 	bb.Field(0).(*array.StringBuilder).Append(op)
 	for i, name := range colNames {
 		val := resolveColumn(chg, name)
@@ -191,7 +199,7 @@ func appendChange(bb *array.RecordBuilder, op string, chg change.Change, colName
 	bb.Field(len(colNames) + 2).(*array.TimestampBuilder).Append(arrow.Timestamp(time.Now().UTC().UnixMicro()))
 }
 
-func resolveColumn(chg change.Change, name string) any {
+func resolveColumn(chg rowchange.Change, name string) any {
 	if chg.After != nil {
 		if v, ok := chg.After[name]; ok {
 			return v
@@ -205,7 +213,7 @@ func resolveColumn(chg change.Change, name string) any {
 	return nil
 }
 
-func collectColumns(b change.Batch) []string {
+func collectColumns(b rowchange.Batch) []string {
 	seen := make(map[string]bool)
 	for _, u := range b.Upserts {
 		for k := range u.After {
@@ -222,4 +230,33 @@ func collectColumns(b change.Batch) []string {
 		cols = append(cols, k)
 	}
 	return cols
+}
+
+// unpackBatch converts a columnar dataplane.Batch back to a row-oriented
+// rowchange.Batch. QUARANTINE: dies when the plugin sink consumes RecordBatch
+// directly.
+func (w *sinkWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
+	}
+	rows, _, err := transport.DecodeBatch(b.Record, nil, nil)
+	if err != nil {
+		return rowchange.Batch{}, err
+	}
+	var upserts, deletes []rowchange.Change
+	for _, r := range rows {
+		switch r.Op {
+		case rowchange.OpDelete:
+			deletes = append(deletes, r)
+		default:
+			upserts = append(upserts, r)
+		}
+	}
+	return rowchange.Batch{
+		Table:    b.Table,
+		Upserts:  upserts,
+		Deletes:  deletes,
+		Position: string(b.Watermark),
+		Mode:     rowchange.WriteMode(b.Mode),
+	}, nil
 }

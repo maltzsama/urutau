@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
@@ -55,7 +55,7 @@ func (f *fakeSource) Scan(ctx context.Context, ch source.Chunk, fn func(map[stri
 // fakeRelay records the orchestrator's calls in order.
 type fakeRelay struct {
 	ops    []string
-	rows   map[uint32][]change.Change
+	rows   map[uint32][]rowchange.Change
 	relPos map[uint32]string
 }
 
@@ -63,7 +63,7 @@ func (r *fakeRelay) Release(table string, id uint32, at position.Position) {
 	r.ops = append(r.ops, fmt.Sprintf("release:%d", id))
 	r.relPos[id] = at.String()
 }
-func (r *fakeRelay) AddWindowRows(target string, id uint32, rows []change.Change) error {
+func (r *fakeRelay) AddWindowRows(target string, id uint32, rows []rowchange.Change) error {
 	r.ops = append(r.ops, fmt.Sprintf("add:%d:%d", id, len(rows)))
 	r.rows[id] = rows
 	return nil
@@ -115,7 +115,7 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 	// converges on its 4th Synced call: chunk 0's low is the pre-snapshot
 	// position, later chunks read an already-caught-up low.
 	src := rowsFor(6)
-	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
@@ -151,7 +151,7 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 			wantLow = gt("1-9")
 		}
 		for j, row := range rows {
-			if row.Op != change.OpInsert {
+			if row.Op != rowchange.OpInsert {
 				t.Fatalf("chunk %d row %d: op %v, want insert", chunkID, j, row.Op)
 			}
 			wantID := int64(chunkID*2) + int64(j) + 1
@@ -179,7 +179,7 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 // positions — the proof that the orchestrator is source-agnostic.
 func TestSnapshotTableWithLSNPositions(t *testing.T) {
 	src := rowsFor(4)
-	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: position.MustLSN("0/20"), early: position.MustLSN("0/10"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
@@ -203,7 +203,7 @@ func TestSnapshotTableWithLSNPositions(t *testing.T) {
 }
 
 func TestSnapshotTableEmptySource(t *testing.T) {
-	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-1"), early: gt("1-1")}
 
 	err := SnapshotTable(context.Background(), &fakeSource{}, reader, relay, "raw.orders", SnapshotConfig{}, nil)
@@ -220,7 +220,7 @@ func TestSnapshotTableEmptySource(t *testing.T) {
 // them over a table that has since received rows.
 func TestSnapshotTablePersistsBoundsOnColdStart(t *testing.T) {
 	src := rowsFor(4)
-	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	var persisted *SnapshotProgress
@@ -256,7 +256,7 @@ func TestSnapshotTablePersistsBoundsOnColdStart(t *testing.T) {
 // completed chunks are never touched again.
 func TestSnapshotTableResumesFromPersistedBounds(t *testing.T) {
 	src := rowsFor(6)
-	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	bounds, _ := src.Bounds(context.Background())
@@ -285,7 +285,7 @@ func TestSnapshotTableResumesFromPersistedBounds(t *testing.T) {
 
 func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 	src := rowsFor(4)
-	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
 	// The reader never converges: synced stays behind master forever.
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 1 << 30}
 
@@ -311,7 +311,7 @@ func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 
 func TestSnapshotTableLagConvergesBeforeRelease(t *testing.T) {
 	src := rowsFor(2)
-	relay := &fakeRelay{rows: map[uint32][]change.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
 	// Synced converges on the 4th call (low, poll×k, at) — proving Release
 	// waits for the caught-up proof against the fixed master high, never a
 	// timer.

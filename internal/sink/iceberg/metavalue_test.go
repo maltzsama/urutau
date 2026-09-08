@@ -4,16 +4,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // Transport metadata projects the message-queue envelope for a kafka event.
 func TestMetaValueTransport(t *testing.T) {
 	ts := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
-	c := change.Change{
+	c := rowchange.Change{
 		Position: "kafka:orders@0=42",
-		Transport: &change.Transport{
+		Transport: &rowchange.Transport{
 			Stream:  "orders",
 			Shard:   "0",
 			Seq:     "42",
@@ -54,7 +54,7 @@ func TestMetaValueTransport(t *testing.T) {
 // For a CDC source (no Transport), stream is the source table and sequence
 // is the event coordinate; the transport-only keys are NULL.
 func TestMetaValueTransportDerivedForCDC(t *testing.T) {
-	c := change.Change{Position: "0/1A"}
+	c := rowchange.Change{Position: "0/1A"}
 	if v, _ := metaValue(core.MetaStream, c, "shop.orders"); v != "shop.orders" {
 		t.Fatalf("stream = %v, want shop.orders (the source table)", v)
 	}

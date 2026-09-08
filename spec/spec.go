@@ -5,8 +5,8 @@
 package spec
 
 import (
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 )
 
 // WriteMode selects how a table is written: upsert reflects state through
@@ -32,11 +32,11 @@ const (
 // transport coordinate for downstream dedup and verification, not a
 // write-path difference. An empty declaration is upsert: reflecting state
 // is the default.
-func (m WriteMode) ChangeMode() change.WriteMode {
+func (m WriteMode) ChangeMode() dataplane.WriteMode {
 	if m == WriteModeAppend || m == WriteModeAppendIdempotent {
-		return change.AppendMode
+		return dataplane.AppendMode
 	}
-	return change.UpsertMode
+	return dataplane.UpsertMode
 }
 
 type Spec struct {

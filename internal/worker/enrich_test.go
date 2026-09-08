@@ -5,8 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -44,7 +46,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		// Warm: wait until the join answers.
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
-			out, _ := s.Enrich([]change.Change{{Op: change.OpInsert, After: map[string]any{"user_ref": int64(7)}}})
+			out, _ := s.Enrich([]rowchange.Change{{Op: rowchange.OpInsert, After: map[string]any{"user_ref": int64(7)}}})
 			if len(out) == 1 && out[0].After["users.name"] == "ana" {
 				return nil, s
 			}
@@ -58,13 +60,18 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		_, st := build(t, "left")
 		fc := &fakeCommitter{}
 		w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-		w.RegisterCommitter("t", fc, change.UpsertMode)
+		regTable(t, w, "t", fc, dataplane.UpsertMode)
+		w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}},
+		}, PrimaryKey: []string{"id"}})
 		w.SetEnricher("t", st)
-		ingest := make(chan change.Change, 2)
-		ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",
+		ingest := make(chan rowchange.Change, 2)
+		ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",
 			After: map[string]any{"id": int64(1), "v": "a", "user_ref": int64(7)}}
 		close(ingest)
-		if err := w.Run(context.Background(), ingest); err != nil {
+		if err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema())); err != nil {
 			t.Fatalf("run: %v", err)
 		}
 		if len(fc.batches) != 1 || len(fc.batches[0].Upserts) != 1 {
@@ -80,13 +87,18 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		_, st := build(t, "inner")
 		fc := &fakeCommitter{}
 		w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-		w.RegisterCommitter("t", fc, change.UpsertMode)
+		regTable(t, w, "t", fc, dataplane.UpsertMode)
+		w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}},
+		}, PrimaryKey: []string{"id"}})
 		w.SetEnricher("t", st)
-		ingest := make(chan change.Change, 2)
-		ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",
+		ingest := make(chan rowchange.Change, 2)
+		ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",
 			After: map[string]any{"id": int64(1), "v": "a", "user_ref": int64(99)}} // miss
 		close(ingest)
-		if err := w.Run(context.Background(), ingest); err != nil {
+		if err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema())); err != nil {
 			t.Fatalf("run: %v", err)
 		}
 		if len(fc.batches) != 0 {
@@ -103,8 +115,8 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 func TestWorkerWithoutEnricherUnchanged(t *testing.T) {
 	fc := &fakeCommitter{}
 	if err := runWorker(t, Config{MaxRows: 100, MaxInterval: time.Hour}, []string{"t"},
-		map[string]sink.TableWriter{"t": fc}, []change.Change{
-			chg("t", change.OpInsert, 1, "a", "p1"),
+		map[string]sink.TableWriter{"t": fc}, []rowchange.Change{
+			chg("t", rowchange.OpInsert, 1, "a", "p1"),
 		}); err != nil {
 		t.Fatalf("run: %v", err)
 	}

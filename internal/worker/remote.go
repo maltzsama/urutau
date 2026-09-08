@@ -17,10 +17,11 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/enrich"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
@@ -191,7 +192,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		cs.PrimaryKey = ta.PrimaryKey
 		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey}
 		if ta.CreateIfNotExists {
-			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}
@@ -199,7 +200,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
-		w.Register(ta.TargetTable, writer, change.UpsertMode)
+		w.Register(ta.TargetTable, writer, dataplane.UpsertMode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
 		// The drift check knows the assigned canonical schema — with its
 		// types, so a field added inside a struct column is caught too.
@@ -267,20 +268,20 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	pipeCtx, pipeCancel := context.WithCancel(ctx)
 	defer pipeCancel()
 	runErr := make(chan error, 1)
-	ingest := make(chan change.Change, 1024)
+	ingest := make(chan Ingest, 1024)
 	go func() { runErr <- w.Run(pipeCtx, ingest) }()
 
 	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
 	defer chunks.Close()
 
-	w.OnCommit(func(b change.Batch, rows int) {
+	w.OnCommit(func(b *dataplane.Batch, rows int) {
 		if cfg.FaultStopAck {
 			return
 		}
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
 			Table:    b.Table,
 			Epoch:    assign.Epoch,
-			Position: b.Position,
+			Position: string(b.Watermark),
 			Rows:     uint64(rows),
 		}}})
 	})
@@ -418,7 +419,7 @@ var (
 // a commit that completes after the channel is lost is indistinguishable
 // from a zombie's (design §5.5).
 func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.Context,
-	runErr <-chan error, ingest chan<- change.Change, log *slog.Logger) error {
+	runErr <-chan error, ingest chan<- Ingest, log *slog.Logger) error {
 
 	graceful := errors.Is(cause, errGracefulEOF) || errors.Is(cause, errShutdown) ||
 		errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded)
@@ -473,7 +474,7 @@ func dialOpts() []grpc.DialOption {
 type batchReceiver struct {
 	ctx       context.Context
 	w         *Worker
-	ingest    chan<- change.Change
+	ingest    chan<- Ingest
 	committed map[string]position.Position // target table → committed
 	parsePos  func(string) (position.Position, error)
 	pkByTable map[string][]string // target table → primary key columns
@@ -484,9 +485,9 @@ type batchReceiver struct {
 // session ends. A bare send could block forever if the worker's internal
 // pipeline has already died — the session would then hang in its teardown
 // wait instead of exiting with the pipeline error.
-func (r *batchReceiver) sendIngest(c change.Change) error {
+func (r *batchReceiver) sendIngest(ing Ingest) error {
 	select {
-	case r.ingest <- c:
+	case r.ingest <- ing:
 		return nil
 	case <-r.ctx.Done():
 		return r.ctx.Err()
@@ -507,8 +508,11 @@ func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
 	return high.Compare(cp) <= 0
 }
 
-// apply routes one decoded batch: snapshot rows build windows, closes
-// markers release them, live rows feed ingest.
+// apply routes one Flight batch: the demux. It builds a *dataplane.Batch
+// from the IPC record and routes by BatchMeta (four-readers rule: routing
+// tags live in app_metadata, consumed here, never on the record). Snapshot
+// window rows build windows; closes markers release them; live rows feed
+// ingest as columnar batches. The transport no longer materializes rows.
 func (r *batchReceiver) apply(fd *flight.FlightData) error {
 	reader, err := ipc.NewReader(bytes.NewReader(fd.DataBody))
 	if err != nil {
@@ -522,46 +526,46 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 	if rec == nil {
 		return errors.New("worker: empty flight batch")
 	}
-	defer rec.Release()
+	rec.Retain() // the demux owns the record; the worker releases the Batch
 
-	// The key rebuild needs the table's PK, which lives in the meta —
-	// peek at it first (a tiny proto; the codec unmarshals it again).
 	meta := &pb.BatchMeta{}
 	if err := proto.Unmarshal(fd.AppMetadata, meta); err != nil {
+		rec.Release()
 		return fmt.Errorf("worker: unmarshal batch meta: %w", err)
 	}
-	rows, _, err := transport.DecodeBatch(rec, fd.AppMetadata, r.pkByTable[meta.Table])
-	if err != nil {
-		return err
-	}
+
 	if r.covered(meta) {
+		rec.Release()
 		r.log.Info("worker skip covered batch", "table", meta.Table, "high", meta.HighPos)
 		return nil
 	}
+
+	b := &dataplane.Batch{
+		Table:     meta.Table,
+		Record:    rec,
+		Watermark: []byte(meta.HighPos),
+	}
+
 	switch {
 	case meta.Window != nil && meta.Window.Snapshot:
-		if err := r.w.AddWindowRows(meta.Table, meta.Window.ChunkId, rows); err != nil {
+		err := r.w.AddWindowRows(meta.Table, meta.Window.ChunkId, b)
+		b.Release()
+		if err != nil {
 			return err
 		}
 	case meta.Window != nil && meta.Window.Closes:
-		if err := r.sendIngest(change.Change{
+		b.Release()
+		return r.sendIngest(Ingest{
 			Table:    meta.Table,
+			Win:      &rowchange.Window{Closes: true, ChunkID: meta.Window.ChunkId},
 			Position: meta.LowPos,
-			Window:   &change.Window{Closes: true, ChunkID: meta.Window.ChunkId},
-		}); err != nil {
-			return err
-		}
+		})
 	default:
-		var win *change.Window
+		var win *rowchange.Window
 		if meta.Window != nil && meta.Window.InWindow {
-			win = &change.Window{InWindow: true, ChunkID: meta.Window.ChunkId}
+			win = &rowchange.Window{InWindow: true, ChunkID: meta.Window.ChunkId}
 		}
-		for i := range rows {
-			rows[i].Window = win
-			if err := r.sendIngest(rows[i]); err != nil {
-				return err
-			}
-		}
+		return r.sendIngest(Ingest{Table: meta.Table, Batch: b, Win: win})
 	}
 	return nil
 }

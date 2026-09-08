@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // fakeKV is an in-memory kvStore with JSON fidelity: documents round-trip
@@ -150,24 +152,40 @@ func metaIngest() map[string]core.MetadataColumn {
 	}
 }
 
-func upsertBatch(pos string, rows ...int64) change.Batch {
-	b := change.Batch{Table: "orders", Position: pos, Mode: change.UpsertMode}
+func upsertBatch(pos string, rows ...int64) *dataplane.Batch {
+	cb := rowchange.Batch{Table: "orders", Position: pos, Mode: rowchange.UpsertMode}
 	for _, id := range rows {
-		b.Upserts = append(b.Upserts, change.Change{
-			Op: change.OpInsert, Key: []any{id},
+		cb.Upserts = append(cb.Upserts, rowchange.Change{
+			Op: rowchange.OpInsert, Key: []any{id},
 			After:    map[string]any{"id": id, "v": fmt.Sprintf("v%d", id)},
 			IngestTS: time.Unix(1700000000, 0).UTC(),
 		})
 	}
-	return b
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+	}, PrimaryKey: []string{"id"}}
+	dpb, err := dpint.BatchFromChangeBatch(cb, cs)
+	if err != nil {
+		panic(err)
+	}
+	return dpb
 }
 
-func deleteBatch(pos string, ids ...int64) change.Batch {
-	b := change.Batch{Table: "orders", Position: pos, Mode: change.UpsertMode}
+func deleteBatch(pos string, ids ...int64) *dataplane.Batch {
+	cb := rowchange.Batch{Table: "orders", Position: pos, Mode: rowchange.UpsertMode}
 	for _, id := range ids {
-		b.Deletes = append(b.Deletes, change.Change{Op: change.OpDelete, Key: []any{id}})
+		cb.Deletes = append(cb.Deletes, rowchange.Change{Op: rowchange.OpDelete, Key: []any{id}})
 	}
-	return b
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+	}, PrimaryKey: []string{"id"}}
+	dpb, err := dpint.BatchFromChangeBatch(cb, cs)
+	if err != nil {
+		panic(err)
+	}
+	return dpb
 }
 
 // TestFastCommitDataThenControl: the batch lands as documents, the control
@@ -323,7 +341,7 @@ func TestControlPreservesProperties(t *testing.T) {
 	// And the batch's own snapshot state merges in the same write.
 	b := upsertBatch("g1:2", 2)
 	b.SnapshotState = "complete"
-	b.SnapshotPending = []uint32{4, 5}
+	b.SnapshotPending = []uint32{1, 2, 3}
 	if err := w.Commit(ctx, b); err != nil {
 		t.Fatalf("snapshot commit: %v", err)
 	}
@@ -355,11 +373,11 @@ func TestDocKeyRules(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ka, err := docKey(change.Change{Key: tc.a})
+			ka, err := docKey(rowchange.Change{Key: tc.a})
 			if err != nil {
 				t.Fatalf("key a: %v", err)
 			}
-			kb, err := docKey(change.Change{Key: tc.b})
+			kb, err := docKey(rowchange.Change{Key: tc.b})
 			if err != nil {
 				t.Fatalf("key b: %v", err)
 			}
@@ -371,7 +389,7 @@ func TestDocKeyRules(t *testing.T) {
 			}
 		})
 	}
-	long := change.Change{Key: []any{strings.Repeat("x", maxKeyLen)}}
+	long := rowchange.Change{Key: []any{strings.Repeat("x", maxKeyLen)}}
 	if _, err := docKey(long); err == nil {
 		t.Fatal("oversized key accepted")
 	}
@@ -396,8 +414,8 @@ func TestBuildDocValueForms(t *testing.T) {
 		}},
 		sourceTable: "src.orders",
 	}
-	c := change.Change{
-		Op:  change.OpInsert,
+	c := rowchange.Change{
+		Op:  rowchange.OpInsert,
 		Key: []any{int64(1)},
 		After: map[string]any{
 			"id":     int64(1),

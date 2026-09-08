@@ -1,5 +1,5 @@
 // Package source defines the replication source contract. A source maps its
-// native types into core.Schema and streams row changes into change.Change;
+// native types into core.Schema and streams row changes into rowchange.Change;
 // it knows nothing about any sink. The contract is deliberately small: a
 // source implements a handful of focused interfaces, and the driver registry
 // resolves a spec's source kind into a concrete Source. Orchestration
@@ -11,8 +11,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -109,15 +109,18 @@ type SourceReader interface {
 }
 
 // Reader is the replication reader surface a driver drives: the DBLog
-// watermark surface plus the stream. A Reader is a handle obtained from
-// Source.Open; the stream itself flows through a channel.
+// watermark surface plus the columnar pull stream. A Reader is a handle
+// obtained from Source.Open; the stream is pulled via Next (M4: sources
+// produce Arrow RecordBatches, one batch per call).
 type Reader interface {
 	SourceReader
-	// Stream begins streaming from `from`, emitting changes on the returned
-	// channel. The terminal-error channel receives the stream's final error
-	// exactly once (nil for a clean, ctx-driven end) and then the stream is
-	// over. Call in a goroutine.
-	Stream(ctx context.Context, from position.Position) (<-chan change.Change, <-chan error)
+	// Start begins replication from `from`. Called once before the first
+	// Next. Sources that need a resume position (MySQL GTID set, Postgres
+	// LSN, Kafka offsets) apply it here; sources without replay ignore it.
+	Start(ctx context.Context, from position.Position) error
+	// Next returns the next columnar batch, or (nil, nil) at a clean end.
+	// The caller owns the returned batch and must Release() it.
+	Next(ctx context.Context) (*dataplane.Batch, error)
 	Close()
 	// SetConfirmed installs a callback that returns the minimum position
 	// committed to the sink across all tables. The Postgres reader uses

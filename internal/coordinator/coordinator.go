@@ -26,11 +26,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/observability"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -137,7 +137,7 @@ type Coordinator struct {
 	gateMu  sync.Mutex
 	gateOn  bool
 	gateTgt string
-	gateBuf []change.Change
+	gateBuf []rowchange.Change
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
@@ -386,7 +386,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		start = m
 	}
-	out, streamErr := rdr.Stream(ctx, start)
+	if err := rdr.Start(ctx, start); err != nil {
+		return fmt.Errorf("coordinator: start stream: %w", err)
+	}
+	// QUARANTINE: the pull-based reader is decoded back to changes for the
+	// coordinator's per-change pump; dies when the coordinator consumes
+	// batches directly (M4).
+	out, streamErr := changesFromReader(ctx, rdr)
 
 	// Pump: every decoded change becomes one Flight batch. The FIFO queue
 	// preserves the wire ordering the window protocol needs, so the
@@ -524,7 +530,7 @@ func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error
 // open (gateOn), events of the gated table are buffered instead — released
 // InWindow-tagged by flushWindow after the worker confirms ChunkReady. Other
 // tables flow freely.
-func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
+func (c *Coordinator) pump(ctx context.Context, out <-chan rowchange.Change) {
 	for {
 		select {
 		case ch, ok := <-out:
@@ -537,7 +543,7 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
 			if c.gateHold(ch) {
 				continue
 			}
-			if err := c.enqueueBatch(ctx, []change.Change{ch}, batchMeta(ch)); err != nil {
+			if err := c.enqueueBatch(ctx, []rowchange.Change{ch}, batchMeta(ch)); err != nil {
 				c.log.Warn("coordinator: enqueue failed", "err", err)
 				return
 			}
@@ -548,7 +554,7 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan change.Change) {
 }
 
 // gateHold buffers an event when a window is open for its table.
-func (c *Coordinator) gateHold(ch change.Change) bool {
+func (c *Coordinator) gateHold(ch rowchange.Change) bool {
 	c.gateMu.Lock()
 	defer c.gateMu.Unlock()
 	if !c.gateOn || ch.Table != c.gateTgt {
@@ -583,7 +589,7 @@ func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 		return nil
 	}
 	// One batch, InWindow-tagged: the worker deletes each key from the
-	// chunk's window (the live version won) and applies the change.
+	// chunk's window (the live version won) and applies the rowchange.
 	meta := &pb.BatchMeta{
 		Table:  tgt,
 		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
@@ -724,8 +730,8 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	return c.closeWindow(ctx)
 }
 
-// batchMeta derives the wire window tag from one change.
-func batchMeta(ch change.Change) *pb.BatchMeta {
+// batchMeta derives the wire window tag from one rowchange.
+func batchMeta(ch rowchange.Change) *pb.BatchMeta {
 	m := &pb.BatchMeta{Table: ch.Table, LowPos: ch.Position, HighPos: ch.Position}
 	if ch.Window != nil {
 		m.Window = &pb.WindowTag{
@@ -742,7 +748,7 @@ func batchMeta(ch change.Change) *pb.BatchMeta {
 // budget blocks here — the backpressure that stalls the pump and, through
 // it, the reader. The charge is released when the worker's Ack covers the
 // batch's position (onAck).
-func (c *Coordinator) enqueueBatch(ctx context.Context, rows []change.Change, meta *pb.BatchMeta) error {
+func (c *Coordinator) enqueueBatch(ctx context.Context, rows []rowchange.Change, meta *pb.BatchMeta) error {
 	w, ok := c.route[meta.Table]
 	if !ok {
 		return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
@@ -1186,4 +1192,40 @@ func tableNames(refs []source.TableRef) []string {
 		out[i] = r.Source
 	}
 	return out
+}
+
+// changesFromReader pulls columnar batches from a reader and decodes them
+// back to changes. QUARANTINE: the coordinator's per-change pump still
+// consumes changes; dies when it consumes batches directly (M4).
+func changesFromReader(ctx context.Context, rdr source.Reader) (<-chan rowchange.Change, <-chan error) {
+	out := make(chan rowchange.Change, 1024)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		for {
+			b, err := rdr.Next(ctx)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if b == nil {
+				errCh <- nil
+				return
+			}
+			rows, _, derr := transport.DecodeBatch(b.Record, nil, nil)
+			b.Release()
+			if derr != nil {
+				errCh <- derr
+				return
+			}
+			for _, ch := range rows {
+				select {
+				case out <- ch:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, errCh
 }

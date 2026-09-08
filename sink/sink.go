@@ -1,5 +1,5 @@
 // Package sink defines the destination catalog contract. A sink consumes
-// core.Schema and commits change.Batch; it knows nothing about any source.
+// core.Schema and commits rowchange.Batch; it knows nothing about any source.
 // The contract is composed of small capability interfaces; the driver
 // registry resolves a spec's sink into a concrete Sink.
 package sink
@@ -7,8 +7,8 @@ package sink
 import (
 	"context"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 )
 
 // Config is everything a sink needs, in neutral terms. Driver-specific
@@ -21,7 +21,7 @@ type Config struct {
 }
 
 // TableWriter commits one table's batches. The CDC position travels inside
-// change.Batch.Position (a serialized position string), and implementations
+// dataplane.Batch.Watermark (a serialized position string), and implementations
 // MUST honour the invariant below — it is correctness, not style:
 //
 // The position must never advance past durably written data. How each sink
@@ -38,7 +38,7 @@ type TableWriter interface {
 	// Commit writes the collapsed batch and the position. A batch that
 	// fails must leave the table untouched — a partially applied batch is
 	// indistinguishable from data loss on resume.
-	Commit(ctx context.Context, b change.Batch) error
+	Commit(ctx context.Context, b *dataplane.Batch) error
 
 	Close() error
 }
@@ -52,7 +52,7 @@ type TableWriter interface {
 // truth about what it is. Sinks with mode-agnostic tables (Iceberg) may
 // ignore it.
 type Ensurer interface {
-	EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy, mode change.WriteMode) error
+	EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy, mode dataplane.WriteMode) error
 }
 
 // Writer opens the per-table committer. The primary key, cast plan and

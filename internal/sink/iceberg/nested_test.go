@@ -6,8 +6,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 func compositeDataSchema() *arrow.Schema {
@@ -30,14 +30,14 @@ func TestDataRecordComposite(t *testing.T) {
 		metaByName: map[string]core.MetadataColumn{},
 		cast:       core.CastPolicy{},
 	}
-	rows := []change.Change{
-		{Op: change.OpInsert, After: map[string]any{
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, After: map[string]any{
 			"id":    int64(1),
 			"cust":  map[string]any{"name": "ana", "age": int64(30)},
 			"tags":  []any{"a", "b"},
 			"attrs": map[string]any{"x": int64(1)},
 		}},
-		{Op: change.OpInsert, After: map[string]any{
+		{Op: rowchange.OpInsert, After: map[string]any{
 			"id":    int64(2),
 			"cust":  map[string]any{"name": "bob", "age": int64(40)},
 			"tags":  []any{},
@@ -94,8 +94,8 @@ func TestDataRecordComposite(t *testing.T) {
 // children.
 func TestDataRecordCompositeNulls(t *testing.T) {
 	w := &TableWriter{dataSchema: compositeDataSchema(), metaByName: map[string]core.MetadataColumn{}, cast: core.CastPolicy{}}
-	rows := []change.Change{
-		{Op: change.OpInsert, After: map[string]any{"id": int64(1), "cust": nil, "tags": nil, "attrs": nil}},
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(1), "cust": nil, "tags": nil, "attrs": nil}},
 	}
 	rec, err := w.dataRecord(rows)
 	if err != nil {

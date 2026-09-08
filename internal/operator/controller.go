@@ -242,7 +242,7 @@ func (r *CoordinatorReconciler) ensure(ctx context.Context, desired client.Objec
 		return err
 	}
 	// Immutable fields must survive the update: the Service cluster IP is
-	// assigned once, and the StatefulSet selector/serviceName cannot change.
+	// assigned once, and the StatefulSet selector/serviceName cannot rowchange.
 	switch d := desired.(type) {
 	case *corev1.Service:
 		e := existing.(*corev1.Service)

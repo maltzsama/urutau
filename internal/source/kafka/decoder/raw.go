@@ -7,7 +7,7 @@
 package decoder
 
 import (
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -17,12 +17,12 @@ import (
 // record of the fact.
 type Raw struct{}
 
-func (d *Raw) Decode(r *kgo.Record) ([]change.Change, error) {
-	c := change.Change{
-		Op:    change.OpInsert,
+func (d *Raw) Decode(r *kgo.Record) ([]rowchange.Change, error) {
+	c := rowchange.Change{
+		Op:    rowchange.OpInsert,
 		After: map[string]any{"payload": rawValue(r.Value)},
 	}
-	return []change.Change{c}, nil
+	return []rowchange.Change{c}, nil
 }
 
 // rawValue carries a nil value as a NULL payload (tombstone) rather than an

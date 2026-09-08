@@ -8,9 +8,10 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
@@ -105,7 +106,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan change.Change, 1024)
+	out := make(chan rowchange.Change, 1024)
 	rdr, err := New(ctx, Config{
 		Addr:      conn.Addr(),
 		User:      conn.User,
@@ -118,7 +119,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if err != nil {
 		return nil, err
 	}
-	return stream{Reader: rdr, out: out}, nil
+	return stream{Reader: rdr, out: out, Puller: sourcepull.New(out)}, nil
 }
 
 // InitialPosition returns the master's executed GTID set — the same query
@@ -137,20 +138,22 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 }
 
 // stream adapts the concrete canal reader to the Reader contract, carrying
-// the change channel the concrete reader writes into.
+// the change channel the concrete reader writes into and the pull-based
+// Next surface (QUARANTINE: bridges changes into batches).
 type stream struct {
 	*Reader
-	out chan change.Change
+	out chan rowchange.Change
+	*sourcepull.Puller
 }
 
-// Stream begins the stream at the given GTID set.
-func (s stream) Stream(ctx context.Context, from position.Position) (<-chan change.Change, <-chan error) {
-	errCh := make(chan error, 1)
+// Start begins the stream at the given GTID set.
+func (s stream) Start(ctx context.Context, from position.Position) error {
 	g, ok := from.(*position.GTID)
 	if !ok {
-		errCh <- fmt.Errorf("mysql: start position must be a GTID set, got %T", from)
-		return s.out, errCh
+		return fmt.Errorf("mysql: start position must be a GTID set, got %T", from)
 	}
+	errCh := make(chan error, 1)
+	s.SetErr(errCh)
 	go func() { errCh <- s.StartFromGTID(ctx, g) }()
-	return s.out, errCh
+	return nil
 }

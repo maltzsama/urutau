@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/internal/runner"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -16,10 +15,6 @@ import (
 // public contracts, yet the collapsed runner boots and drives them, and the
 // seeded changes reach the sink's committer.
 func TestExternalPluginDrivesPipeline(t *testing.T) {
-	seedRows = []change.Change{
-		{Op: change.OpInsert, Table: "raw.t", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}},
-		{Op: change.OpInsert, Table: "raw.t", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}},
-	}
 	*committed = *newRecords()
 
 	s := &spec.Spec{

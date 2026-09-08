@@ -1,6 +1,6 @@
 // Package source.mysql implements the MySQL replication source on top of
 // go-mysql/canal: a single binlog reader that decodes row events into
-// change.Change, positions them at their transaction GTID, and exposes the
+// rowchange.Change, positions them at their transaction GTID, and exposes the
 // synced and master positions for the DBLog watermark logic.
 package mysql
 
@@ -18,8 +18,8 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/schema"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 )
 
@@ -43,7 +43,7 @@ type Config struct {
 type Reader struct {
 	cfg     Config
 	canal   *canal.Canal
-	out     chan<- change.Change
+	out     chan<- rowchange.Change
 	bySrc   map[string]TableRef // "db.table" → ref (PK + target)
 	mu      sync.Mutex
 	curSet  *position.GTID // accumulated GTID set through the current transaction
@@ -91,7 +91,7 @@ func (r *Reader) ClearWindow() {
 }
 
 // New builds the reader but does not start it.
-func New(ctx context.Context, cfg Config, out chan<- change.Change) (*Reader, error) {
+func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -245,13 +245,13 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	pos := r.curGTID
 	txn := r.curTxn
 	r.winMu.Lock()
-	var win *change.Window
+	var win *rowchange.Window
 	// Only events strictly past the low watermark are InWindow: an event at
 	// or before low is already reflected in the chunk SELECT (or in an
 	// earlier chunk), so tagging it would resurrect a stale value. A missing
 	// watermark falls back to tagging everything — over-tagging is safe.
 	if r.winOpen && (r.winLow == nil || txn == nil || !r.winLow.Contains(txn)) {
-		win = &change.Window{ChunkID: r.winChunk, InWindow: true}
+		win = &rowchange.Window{ChunkID: r.winChunk, InWindow: true}
 	}
 	r.winMu.Unlock()
 	r.mu.Unlock()
@@ -264,20 +264,20 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	switch e.Action {
 	case canal.InsertAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, change.OpInsert, row, nil, pos)
+			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos)
 			c.Window = win
 			r.out <- c
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, change.OpDelete, row, nil, pos)
+			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos)
 			c.Window = win
 			r.out <- c
 		}
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
-			c := r.decode(ref, e.Table, change.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
+			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
 			c.Window = win
 			r.out <- c
 		}
@@ -295,10 +295,10 @@ func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replic
 	return nil
 }
 
-// decode maps one row (in table column order) to a change. key is built from
+// decode maps one row (in table column order) to a rowchange. key is built from
 // the spec primary key columns, in spec order.
-func (r *Reader) decode(ref TableRef, tbl *schema.Table, op change.Op, after, before []any, pos string) change.Change {
-	c := change.Change{
+func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string) rowchange.Change {
+	c := rowchange.Change{
 		Op:       op,
 		Table:    ref.Target,
 		Position: pos,
@@ -315,7 +315,7 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op change.Op, after, be
 	}
 	c.Key = key
 
-	if op == change.OpDelete {
+	if op == rowchange.OpDelete {
 		if before != nil {
 			c.Before = rowToMap(tbl, before)
 		}

@@ -10,8 +10,8 @@ import (
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/sink"
 )
@@ -82,7 +82,7 @@ func (s *Sink) ident(target string) (tableIdent, error) {
 // drift surfaces as a write error and pauses the pipeline, per the
 // pause-and-alert policy. The cast plan is already baked into the resolved
 // schema's types, so there is nothing to re-derive here.
-func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, _ core.CastPolicy, mode change.WriteMode) error {
+func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, _ core.CastPolicy, mode dataplane.WriteMode) error {
 	ident, err := s.ident(ref.Target)
 	if err != nil {
 		return err

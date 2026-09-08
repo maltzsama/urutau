@@ -16,8 +16,8 @@ import (
 
 	gocb "github.com/couchbase/gocb/v2"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/sink"
 )
@@ -210,12 +210,12 @@ func validateSchema(schema core.Schema, meta []core.MetadataColumn) error {
 // precedent: append-mode tables need a primary key because a document
 // cannot be addressed without one, and no field may claim the reserved
 // metadata sub-object name.
-func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, _ []string, _ core.CastPolicy, mode change.WriteMode) error {
+func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, _ []string, _ core.CastPolicy, mode dataplane.WriteMode) error {
 	scope, coll, err := s.ident(ref.Target)
 	if err != nil {
 		return err
 	}
-	if mode == change.AppendMode && len(ref.PrimaryKey) == 0 {
+	if mode == dataplane.AppendMode && len(ref.PrimaryKey) == 0 {
 		return fmt.Errorf("couchbase: append table %s requires a primary key — documents are addressed by key", ref.Target)
 	}
 	if err := validateSchema(schema, nil); err != nil {

@@ -20,10 +20,11 @@ import (
 	"time"
 
 	gocb "github.com/couchbase/gocb/v2"
-
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -165,11 +166,24 @@ func cbWriter(t *testing.T, ctx context.Context, s sink.Sink, ref core.TableRef,
 	return w
 }
 
-func cbRow(id int64, v, pos string) change.Batch {
-	return change.Batch{
-		Table: "cb_orders", Position: pos, Mode: change.UpsertMode,
-		Upserts: []change.Change{{
-			Op: change.OpInsert, Key: []any{id},
+// toDPBatch wraps a rowchange.Batch into a *dataplane.Batch via the transport bridge.
+// QUARANTINE: dies when tests consume RecordBatch directly.
+func toDPBatch(b rowchange.Batch) *dataplane.Batch {
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+	}, PrimaryKey: []string{"id"}}
+	dpb, err := dpint.BatchFromChangeBatch(b, cs)
+	if err != nil {
+		panic(err)
+	}
+	return dpb
+}
+func cbRow(id int64, v, pos string) rowchange.Batch {
+	return rowchange.Batch{
+		Table: "cb_orders", Position: pos, Mode: rowchange.UpsertMode,
+		Upserts: []rowchange.Change{{
+			Op: rowchange.OpInsert, Key: []any{id},
 			After:    map[string]any{"id": id, "v": v},
 			IngestTS: time.Now(),
 		}},
@@ -189,15 +203,15 @@ func TestCouchbaseSinkUpsertAndResume(t *testing.T) {
 	s := cbSink(t, ctx, "")
 	defer func() { _ = s.Close() }()
 	schema, ref := cbOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
-	if err := w.Commit(ctx, cbRow(1, "a", "0/1")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(1, "a", "0/1"))); err != nil {
 		t.Fatalf("commit 1: %v", err)
 	}
-	if err := w.Commit(ctx, cbRow(1, "a2", "0/2")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(1, "a2", "0/2"))); err != nil {
 		t.Fatalf("commit 2: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_orders", "[1]")
@@ -228,25 +242,25 @@ func TestCouchbaseSinkDelete(t *testing.T) {
 	s := cbSink(t, ctx, "")
 	defer func() { _ = s.Close() }()
 	schema, ref := cbOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
-	if err := w.Commit(ctx, cbRow(9, "x", "0/1")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(9, "x", "0/1"))); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	del := change.Batch{
-		Table: "cb_orders", Position: "0/2", Mode: change.UpsertMode,
-		Deletes: []change.Change{{Op: change.OpDelete, Key: []any{int64(9)}}},
+	del := rowchange.Batch{
+		Table: "cb_orders", Position: "0/2", Mode: rowchange.UpsertMode,
+		Deletes: []rowchange.Change{{Op: rowchange.OpDelete, Key: []any{int64(9)}}},
 	}
-	if err := w.Commit(ctx, del); err != nil {
+	if err := w.Commit(ctx, toDPBatch(del)); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, ok := cbDoc(t, b, "cb_orders", "[9]"); ok {
 		t.Fatal("document survived its delete")
 	}
-	if err := w.Commit(ctx, del); err != nil {
+	if err := w.Commit(ctx, toDPBatch(del)); err != nil {
 		t.Fatalf("replayed delete: %v", err)
 	}
 }
@@ -266,12 +280,12 @@ func TestCouchbaseSinkFastRecovery(t *testing.T) {
 	s := cbSink(t, ctx, "")
 	defer func() { _ = s.Close() }()
 	schema, ref := cbOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
-	if err := w.Commit(ctx, cbRow(1, "a", "0/1")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(1, "a", "0/1"))); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	// Simulate the crash between data and control write.
@@ -283,7 +297,7 @@ func TestCouchbaseSinkFastRecovery(t *testing.T) {
 	}
 	// Restart: same batch again.
 	w2 := cbWriter(t, ctx, s, ref, nil)
-	if err := w2.Commit(ctx, cbRow(1, "a", "0/1")); err != nil {
+	if err := w2.Commit(ctx, toDPBatch(cbRow(1, "a", "0/1"))); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_orders", "[1]")
@@ -311,19 +325,19 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	schema, ref := cbOrdersSchema()
 	ref.Target = "cb_atomic"
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
-	bad := change.Batch{
-		Table: ref.Target, Position: "0/1", Mode: change.UpsertMode,
-		Upserts: []change.Change{
-			{Op: change.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
-			{Op: change.OpInsert, Key: []any{strings.Repeat("x", 300)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
+	bad := rowchange.Batch{
+		Table: ref.Target, Position: "0/1", Mode: rowchange.UpsertMode,
+		Upserts: []rowchange.Change{
+			{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
+			{Op: rowchange.OpInsert, Key: []any{strings.Repeat("x", 300)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
 		},
 	}
-	if err := w.Commit(ctx, bad); err == nil {
+	if err := w.Commit(ctx, toDPBatch(bad)); err == nil {
 		t.Fatal("oversized key must fail the batch")
 	}
 	if _, ok := cbDoc(t, b, "cb_atomic", "[1]"); ok {
@@ -333,14 +347,14 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 		t.Fatal("position advanced on a rolled-back transaction")
 	}
 
-	good := change.Batch{
-		Table: ref.Target, Position: "0/2", Mode: change.UpsertMode,
-		Upserts: []change.Change{
-			{Op: change.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
-			{Op: change.OpInsert, Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
+	good := rowchange.Batch{
+		Table: ref.Target, Position: "0/2", Mode: rowchange.UpsertMode,
+		Upserts: []rowchange.Change{
+			{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
+			{Op: rowchange.OpInsert, Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
 		},
 	}
-	if err := w.Commit(ctx, good); err != nil {
+	if err := w.Commit(ctx, toDPBatch(good)); err != nil {
 		t.Fatalf("atomic commit: %v", err)
 	}
 	if _, ok := cbDoc(t, b, "cb_atomic", "[2]"); !ok {
@@ -365,7 +379,7 @@ func TestCouchbaseSinkAppendRequiresPK(t *testing.T) {
 		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
 	}}
 	ref := core.TableRef{Source: "src.events", Target: "cb_nopk"}
-	err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.AppendMode)
+	err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.AppendMode)
 	if err == nil || !strings.Contains(err.Error(), "primary key") {
 		t.Fatalf("append without PK: want primary-key error, got %v", err)
 	}
@@ -390,14 +404,14 @@ func TestCouchbaseSinkNestedTypes(t *testing.T) {
 		{Name: "tags", Type: core.ColumnType{Kind: core.KindList, Elem: &core.ColumnType{Kind: core.KindString}}},
 	}}
 	ref := core.TableRef{Source: "src.users", Target: "cb_nested", PrimaryKey: []string{"id"}}
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
-	batch := change.Batch{
-		Table: ref.Target, Position: "0/1", Mode: change.UpsertMode,
-		Upserts: []change.Change{{
-			Op: change.OpInsert, Key: []any{int64(1)},
+	batch := rowchange.Batch{
+		Table: ref.Target, Position: "0/1", Mode: rowchange.UpsertMode,
+		Upserts: []rowchange.Change{{
+			Op: rowchange.OpInsert, Key: []any{int64(1)},
 			After: map[string]any{
 				"id":   int64(1),
 				"addr": map[string]any{"city": "Curitiba"},
@@ -406,7 +420,7 @@ func TestCouchbaseSinkNestedTypes(t *testing.T) {
 			IngestTS: time.Now(),
 		}},
 	}
-	if err := w.Commit(ctx, batch); err != nil {
+	if err := w.Commit(ctx, toDPBatch(batch)); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_nested", "[1]")
@@ -441,19 +455,19 @@ func TestCouchbaseSinkMetadataSubObject(t *testing.T) {
 		{Name: "cdc_op", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
 	}}
 	ref := core.TableRef{Source: "src.orders", Target: "cb_meta", PrimaryKey: []string{"id"}}
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, []core.MetadataColumn{{From: core.MetaOp, As: "cdc_op"}})
-	batch := change.Batch{
-		Table: ref.Target, Position: "0/1", Mode: change.UpsertMode,
-		Upserts: []change.Change{{
-			Op: change.OpInsert, Key: []any{int64(1)},
+	batch := rowchange.Batch{
+		Table: ref.Target, Position: "0/1", Mode: rowchange.UpsertMode,
+		Upserts: []rowchange.Change{{
+			Op: rowchange.OpInsert, Key: []any{int64(1)},
 			After:    map[string]any{"id": int64(1), "op": "DATA", "cdc_op": "DATA"},
 			IngestTS: time.Now(),
 		}},
 	}
-	if err := w.Commit(ctx, batch); err != nil {
+	if err := w.Commit(ctx, toDPBatch(batch)); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_meta", "[1]")
@@ -484,12 +498,12 @@ func TestCouchbaseSinkDurabilityMajority(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	schema, ref := cbOrdersSchema()
 	ref.Target = "cb_durable"
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 	for i := int64(1); i <= 5; i++ {
-		if err := w.Commit(ctx, cbRow(i, fmt.Sprintf("v%d", i), fmt.Sprintf("0/%d", i))); err != nil {
+		if err := w.Commit(ctx, toDPBatch(cbRow(i, fmt.Sprintf("v%d", i), fmt.Sprintf("0/%d", i)))); err != nil {
 			t.Fatalf("durable commit %d: %v", i, err)
 		}
 	}
@@ -505,7 +519,7 @@ func TestCouchbaseSinkPropertiesRoundTrip(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	schema, ref := cbOrdersSchema()
 	ref.Target = "cb_props"
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	if err := s.SetProperties(ctx, ref, map[string]string{"cdc.snapshot.state": "in_progress"}); err != nil {

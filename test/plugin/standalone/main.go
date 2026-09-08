@@ -9,10 +9,12 @@ package main
 import (
 	"context"
 	"strconv"
-	"sync"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -67,21 +69,53 @@ func (pluginSource) ParsePosition(s string) (position.Position, error) {
 	return pluginPos(n), nil
 }
 
-func (pluginSource) Open(_ context.Context, _ []source.TableRef) (source.Reader, error) {
-	return &pluginReader{out: make(chan change.Change, 100)}, nil
+func (pluginSource) Open(_ context.Context, refs []source.TableRef) (source.Reader, error) {
+	return &pluginReader{batch: pluginSeedBatch(refs)}, nil
 }
 
 type pluginReader struct {
-	out chan change.Change
+	batch *dataplane.Batch
+	sent  bool
 }
 
-func (r *pluginReader) Stream(ctx context.Context, _ position.Position) (<-chan change.Change, <-chan error) {
-	errCh := make(chan error, 1)
-	go func() {
-		<-ctx.Done()
-		errCh <- ctx.Err()
-	}()
-	return r.out, errCh
+func (r *pluginReader) Start(context.Context, position.Position) error { return nil }
+
+func (r *pluginReader) Next(ctx context.Context) (*dataplane.Batch, error) {
+	if !r.sent {
+		r.sent = true
+		return r.batch, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// pluginSeedBatch builds a two-row wire batch (test-only).
+func pluginSeedBatch(refs []source.TableRef) *dataplane.Batch {
+	target := "raw.t"
+	if len(refs) > 0 {
+		target = refs[0].Target
+	}
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "v", Type: arrow.BinaryTypes.String},
+		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
+		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+	}, nil)
+	bb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	for i, v := range []string{"a", "b"} {
+		bb.Field(0).(*array.Int64Builder).Append(int64(i + 1))
+		bb.Field(1).(*array.StringBuilder).Append(v)
+		bb.Field(2).(*array.Uint8Builder).Append(0) // insert
+		bb.Field(3).(*array.StringBuilder).Append("p")
+		bb.Field(4).(*array.TimestampBuilder).AppendNull()
+		bb.Field(5).(*array.TimestampBuilder).AppendNull()
+		bb.Field(6).(*array.BooleanBuilder).Append(false)
+	}
+	rec := bb.NewRecordBatch()
+	return &dataplane.Batch{Table: target, Record: rec, Watermark: []byte("p2")}
 }
 
 func (r *pluginReader) Synced() position.Position                         { return pluginPos(0) }
@@ -111,26 +145,23 @@ func (p pluginPos) Compare(o position.Position) int {
 
 // ── Sink ─────────────────────────────────────────────────────────────
 
-type pluginRecords struct {
-	mu      sync.Mutex
-	batches []change.Batch
-}
+type pluginRecords struct{}
 
 func newPluginRecords() *pluginRecords {
 	return &pluginRecords{}
 }
 
-func (r *pluginRecords) commit(b change.Batch) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.batches = append(r.batches, b)
+func (r *pluginRecords) commit(b *dataplane.Batch) {
+	// QUARANTINE: bridge — accepts *dataplane.Batch but stores nothing yet.
+	// Dies when the plugin sink consumes RecordBatch directly.
+	_ = b
 }
 
 type pluginSink struct {
 	records *pluginRecords
 }
 
-func (s *pluginSink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, change.WriteMode) error {
+func (s *pluginSink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, dataplane.WriteMode) error {
 	return nil
 }
 
@@ -151,7 +182,7 @@ type pluginWriter struct {
 	s *pluginSink
 }
 
-func (w *pluginWriter) Commit(_ context.Context, b change.Batch) error {
+func (w *pluginWriter) Commit(_ context.Context, b *dataplane.Batch) error {
 	w.s.records.commit(b)
 	return nil
 }

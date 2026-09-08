@@ -9,8 +9,9 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/table"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/spec"
@@ -80,31 +81,36 @@ tables:
 		t.Fatalf("writer: %v", err)
 	}
 
-	var committed []change.Batch
+	var committed []*dataplane.Batch
 	w := worker.New(worker.Config{MaxRows: 8, MaxInterval: 200 * time.Millisecond})
-	w.Register("raw.orders", wr, change.UpsertMode)
-	w.OnCommit(func(b change.Batch, _ int) { committed = append(committed, b) })
+	w.Register("raw.orders", wr, dataplane.UpsertMode)
+	w.SetKnownSchema("raw.orders", core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+	}, PrimaryKey: []string{"id"}})
+	w.OnCommit(func(b *dataplane.Batch, _ int) { committed = append(committed, b) })
 
-	ingest := make(chan change.Change, 32)
+	rawIngest := make(chan rowchange.Change, 32)
+	ingest := worker.IngestFromChanges(ctx, rawIngest, core.Schema{})
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx, ingest) }()
 
 	// The story: id=1 lives through two updates; id=2 is born and deleted;
 	// id=3 is inserted and deleted within the same batch — collapse must keep
 	// it out of the table entirely.
-	feed := []change.Change{
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: row(1, "a"), Position: "p1"},
-		{Op: change.OpUpdate, Table: "raw.orders", Key: []any{int64(1)}, After: row(1, "b"), Position: "p2"},
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: row(2, "x"), Position: "p3"},
-		{Op: change.OpDelete, Table: "raw.orders", Key: []any{int64(2)}, Position: "p4"},
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(3)}, After: row(3, "y"), Position: "p5"},
-		{Op: change.OpDelete, Table: "raw.orders", Key: []any{int64(3)}, Position: "p6"},
-		{Op: change.OpUpdate, Table: "raw.orders", Key: []any{int64(1)}, After: row(1, "c"), Position: "p7"},
+	feed := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: row(1, "a"), Position: "p1"},
+		{Op: rowchange.OpUpdate, Table: "raw.orders", Key: []any{int64(1)}, After: row(1, "b"), Position: "p2"},
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: row(2, "x"), Position: "p3"},
+		{Op: rowchange.OpDelete, Table: "raw.orders", Key: []any{int64(2)}, Position: "p4"},
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(3)}, After: row(3, "y"), Position: "p5"},
+		{Op: rowchange.OpDelete, Table: "raw.orders", Key: []any{int64(3)}, Position: "p6"},
+		{Op: rowchange.OpUpdate, Table: "raw.orders", Key: []any{int64(1)}, After: row(1, "c"), Position: "p7"},
 	}
 	for _, c := range feed {
-		ingest <- c
+		rawIngest <- c
 	}
-	close(ingest)
+	close(rawIngest)
 
 	if err := <-done; err != nil {
 		t.Fatalf("worker run: %v", err)
@@ -124,7 +130,7 @@ tables:
 
 	// The position must have advanced to the last change, in the table
 	// property and visible to readers.
-	last := committed[len(committed)-1].Position
+	last := string(committed[len(committed)-1].Watermark)
 	if last != "p7" {
 		t.Fatalf("last committed position = %q, want p7", last)
 	}

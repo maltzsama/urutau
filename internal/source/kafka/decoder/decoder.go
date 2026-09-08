@@ -4,7 +4,7 @@
 package decoder
 
 import (
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -14,5 +14,5 @@ import (
 // produce multiple changes (e.g. a debezium outbox envelope wrapping a
 // batch).
 type Decoder interface {
-	Decode(record *kgo.Record) ([]change.Change, error)
+	Decode(record *kgo.Record) ([]rowchange.Change, error)
 }

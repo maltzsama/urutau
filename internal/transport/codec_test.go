@@ -6,8 +6,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
@@ -22,19 +22,19 @@ func TestCodecRoundTrip(t *testing.T) {
 		PrimaryKey: []string{"id"},
 	}
 
-	rows := []change.Change{
+	rows := []rowchange.Change{
 		{
-			Op: change.OpInsert, Table: "raw.orders",
+			Op: rowchange.OpInsert, Table: "raw.orders",
 			After:    map[string]any{"id": int64(42), "v": "hello", "amount": 1.5, "active": true},
 			Position: "0/1A",
 		},
 		{
-			Op: change.OpUpdate, Table: "raw.orders",
+			Op: rowchange.OpUpdate, Table: "raw.orders",
 			After:    map[string]any{"id": int64(7), "v": "new"},
 			Position: "0/1B",
 		},
 		{
-			Op: change.OpDelete, Table: "raw.orders",
+			Op: rowchange.OpDelete, Table: "raw.orders",
 			After:    map[string]any{"id": int64(2), "v": nil},
 			Position: "0/1C",
 		},
@@ -115,9 +115,9 @@ func TestCodecLargeInt64(t *testing.T) {
 	}
 
 	bigID := int64(9007199254740993) // 2^53 + 1
-	rows := []change.Change{
+	rows := []rowchange.Change{
 		{
-			Op: change.OpInsert, Table: "t",
+			Op: rowchange.OpInsert, Table: "t",
 			After:    map[string]any{"id": bigID},
 			Position: "p1",
 		},
@@ -160,9 +160,9 @@ func TestCodecDecimal(t *testing.T) {
 		PrimaryKey: []string{},
 	}
 
-	rows := []change.Change{
+	rows := []rowchange.Change{
 		{
-			Op: change.OpInsert, Table: "t",
+			Op: rowchange.OpInsert, Table: "t",
 			After:    map[string]any{"price": "12345678.90"},
 			Position: "p1",
 		},
@@ -208,8 +208,8 @@ func TestCodecDeleteKeyOnly(t *testing.T) {
 		},
 		PrimaryKey: []string{"id"},
 	}
-	rows := []change.Change{
-		{Op: change.OpDelete, Table: "raw.orders", Key: []any{int64(2)}, Position: "p1"},
+	rows := []rowchange.Change{
+		{Op: rowchange.OpDelete, Table: "raw.orders", Key: []any{int64(2)}, Position: "p1"},
 	}
 	meta := &pb.BatchMeta{Table: "raw.orders", HighPos: "p1"}
 
@@ -251,8 +251,8 @@ func TestCodecPartialBeforeBackfillsKey(t *testing.T) {
 		},
 		PrimaryKey: []string{"id"},
 	}
-	rows := []change.Change{
-		{Op: change.OpDelete, Table: "t", Key: []any{int64(9)},
+	rows := []rowchange.Change{
+		{Op: rowchange.OpDelete, Table: "t", Key: []any{int64(9)},
 			Before:   map[string]any{"v": "old"}, // no id — partial image
 			Position: "p1"},
 	}
