@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -194,10 +196,10 @@ func runExternalPlugins(ctx context.Context, s *spec.Spec, sourceBin, sinkBin st
 
 func generateToken() string {
 	b := make([]byte, 32)
-	for i := range b {
-		b[i] = "abcdefghijklmnopqrstuvwxyz0123456789"[time.Now().UnixNano()%36]
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand: " + err.Error())
 	}
-	return string(b)
+	return base64.URLEncoding.EncodeToString(b)
 }
 
 func versionCmd() *cobra.Command {
