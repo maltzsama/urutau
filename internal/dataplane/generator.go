@@ -32,7 +32,7 @@ func baseSchema() *arrow.Schema {
 		{Name: "active", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
 	}, nil)
 }
 
@@ -113,8 +113,8 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 		pos := fmt.Sprintf("pos-%04d", i)
 		bb.Field(6).(*array.StringBuilder).Append(pos)
 
-		// __commit_ts
-		ts := timeFromMicro(int64(i))
+		// __commit_ts (nanoseconds per M2a decision)
+		ts := timeFromNano(int64(i))
 		bb.Field(7).(*array.TimestampBuilder).AppendTime(ts)
 	}
 
@@ -133,9 +133,9 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 	}
 }
 
-// timeFromMicro creates a UTC timestamp at the given microsecond offset from epoch.
-func timeFromMicro(us int64) time.Time {
-	return time.Date(2026, 1, 1, 0, 0, 0, int(us)*1000, time.UTC)
+// timeFromNano creates a UTC timestamp at the given nanosecond offset from epoch.
+func timeFromNano(ns int64) time.Time {
+	return time.Date(2026, 1, 1, 0, 0, 0, int(ns), time.UTC)
 }
 
 // --- Named adversarial scenarios ---

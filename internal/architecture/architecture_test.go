@@ -93,6 +93,7 @@ func TestContractsArePluginSafe(t *testing.T) {
 		"github.com/maltzsama/urutau/change",
 		"github.com/maltzsama/urutau/position",
 		"github.com/maltzsama/urutau/spec",
+		"github.com/maltzsama/urutau/dataplane",
 	} {
 		d := directImports(t, pkg)
 		for imp := range d {

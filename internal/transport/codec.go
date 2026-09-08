@@ -197,7 +197,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 		c.Position = posCol.Value(i)
 		tsCol, _ := rec.Column(numDataCols + 2).(*array.Timestamp)
 		if !tsCol.IsNull(i) {
-			c.CommitTS = tsCol.Value(i).ToTime(arrow.Microsecond)
+			c.CommitTS = tsCol.Value(i).ToTime(arrow.Nanosecond)
 		}
 		ingestCol, _ := rec.Column(numDataCols + 3).(*array.Timestamp)
 		if !ingestCol.IsNull(i) {

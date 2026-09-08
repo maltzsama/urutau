@@ -68,7 +68,7 @@ func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
 	fields = append(fields,
 		arrow.Field{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		arrow.Field{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		arrow.Field{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		arrow.Field{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
 		arrow.Field{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
 		arrow.Field{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	)
