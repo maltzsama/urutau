@@ -1,0 +1,226 @@
+package plugin
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/plugin/client"
+	"github.com/maltzsama/urutau/internal/plugin/contract"
+	"github.com/maltzsama/urutau/sink"
+)
+
+// SinkAdapter wraps a Flight client as a sink.Sink. It translates the
+// internal change.Batch into Arrow records and writes them via DoPut,
+// then calls Flush to guarantee durability.
+type SinkAdapter struct {
+	client *client.Client
+	alloc  memory.Allocator
+	logger *slog.Logger
+	mu     sync.Mutex
+	closed bool
+}
+
+// NewSinkAdapter creates a sink adapter over a connected Flight client.
+func NewSinkAdapter(c *client.Client, logger *slog.Logger) *SinkAdapter {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &SinkAdapter{
+		client: c,
+		alloc:  memory.NewGoAllocator(),
+		logger: logger,
+	}
+}
+
+// EnsureTable is a no-op for external plugins. The plugin manages its
+// own schema internally.
+func (a *SinkAdapter) EnsureTable(_ context.Context, _ core.TableRef, _ core.Schema, _ []string, _ core.CastPolicy, _ change.WriteMode) error {
+	return nil
+}
+
+// Writer returns a table writer that streams records via DoPut.
+func (a *SinkAdapter) Writer(_ context.Context, ref core.TableRef, _ core.CastPolicy, _ []core.MetadataColumn) (sink.TableWriter, error) {
+	return &sinkWriter{
+		client: a.client,
+		alloc:  a.alloc,
+		table:  ref.Target,
+		logger: a.logger,
+	}, nil
+}
+
+// Position returns empty — external plugins manage their own positions.
+func (a *SinkAdapter) Position(_ context.Context, _ core.TableRef) (string, error) {
+	return "", nil
+}
+
+// SetProperties is a no-op for external plugins.
+func (a *SinkAdapter) SetProperties(_ context.Context, _ core.TableRef, _ map[string]string) error {
+	return nil
+}
+
+// Properties returns an empty map for external plugins.
+func (a *SinkAdapter) Properties(_ context.Context, _ core.TableRef) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
+// Close releases the Flight client connection.
+func (a *SinkAdapter) Close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return nil
+	}
+	a.closed = true
+	return a.client.Close()
+}
+
+// sinkWriter implements sink.TableWriter over Flight DoPut.
+type sinkWriter struct {
+	client *client.Client
+	alloc  memory.Allocator
+	table  string
+	logger *slog.Logger
+	mu     sync.Mutex
+	closed bool
+}
+
+// Commit converts the change.Batch into Arrow records and sends them via
+// DoPut, then calls Flush to guarantee durability (contract §10).
+func (w *sinkWriter) Commit(ctx context.Context, b change.Batch) error {
+	records := batchToRecords(b, w.alloc)
+	if len(records) == 0 {
+		return nil
+	}
+
+	// Build the Arrow schema from the first record's schema.
+	schema := records[0].Schema()
+
+	desc := contract.DoPutRequest{
+		Mode:  "write",
+		Table: w.table,
+	}
+
+	if err := w.client.DoPut(ctx, desc, schema, records); err != nil {
+		for _, r := range records {
+			r.Release()
+		}
+		return fmt.Errorf("doPut: %w", err)
+	}
+
+	// Flush to guarantee durability (contract §10).
+	if err := w.client.Flush(ctx); err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
+
+	for _, r := range records {
+		r.Release()
+	}
+	return nil
+}
+
+// Close is a no-op; the writer has no state to release.
+func (w *sinkWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	return nil
+}
+
+// batchToRecords converts a change.Batch into Arrow record batches.
+// Each upsert becomes a record with op="c" or op="u", each delete
+// becomes op="d".
+func batchToRecords(b change.Batch, alloc memory.Allocator) []arrow.RecordBatch {
+	total := len(b.Upserts) + len(b.Deletes)
+	if total == 0 {
+		return nil
+	}
+
+	// Collect all column names from the batch.
+	colNames := collectColumns(b)
+	if len(colNames) == 0 {
+		return nil
+	}
+
+	// Build Arrow schema: op + columns + offset + ts_source.
+	fields := make([]arrow.Field, 0, len(colNames)+3)
+	fields = append(fields, arrow.Field{Name: "op", Type: arrow.BinaryTypes.String, Nullable: false})
+	for _, name := range colNames {
+		fields = append(fields, arrow.Field{Name: name, Type: arrow.BinaryTypes.String, Nullable: true})
+	}
+	fields = append(fields, arrow.Field{Name: "offset", Type: arrow.BinaryTypes.Binary, Nullable: false})
+	fields = append(fields, arrow.Field{Name: "ts_source", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true})
+	arrowSchema := arrow.NewSchema(fields, nil)
+
+	// Build one record per change.
+	bb := array.NewRecordBuilder(alloc, arrowSchema)
+	defer bb.Release()
+
+	for _, u := range b.Upserts {
+		appendChange(bb, "c", u, colNames, b.Position)
+	}
+	for _, d := range b.Deletes {
+		appendChange(bb, "d", d, colNames, b.Position)
+	}
+
+	rec := bb.NewRecordBatch()
+	return []arrow.RecordBatch{rec}
+}
+
+func appendChange(bb *array.RecordBuilder, op string, chg change.Change, colNames []string, position string) {
+	bb.Field(0).(*array.StringBuilder).Append(op)
+	for _, name := range colNames {
+		val := resolveColumn(chg, name)
+		if val == nil {
+			bb.Field(1).(*array.StringBuilder).AppendNull()
+		} else {
+			bb.Field(1).(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+		}
+	}
+	bb.Field(len(colNames) + 1).(*array.BinaryBuilder).Append([]byte(position))
+	bb.Field(len(colNames) + 2).(*array.TimestampBuilder).Append(arrow.Timestamp(time.Now().UTC().UnixMicro()))
+}
+
+func resolveColumn(chg change.Change, name string) any {
+	if chg.After != nil {
+		if v, ok := chg.After[name]; ok {
+			return v
+		}
+	}
+	if chg.Before != nil {
+		if v, ok := chg.Before[name]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
+func collectColumns(b change.Batch) []string {
+	seen := make(map[string]bool)
+	for _, u := range b.Upserts {
+		for k := range u.After {
+			if !seen[k] {
+				seen[k] = true
+			}
+		}
+	}
+	for _, d := range b.Deletes {
+		for k := range d.Before {
+			if !seen[k] {
+				seen[k] = true
+			}
+		}
+	}
+	cols := make([]string, 0, len(seen))
+	for k := range seen {
+		cols = append(cols, k)
+	}
+	return cols
+}
