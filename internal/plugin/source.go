@@ -77,6 +77,7 @@ func NewSourceAdapter(c *client.Client, src spec.Source, logger *slog.Logger) *S
 
 // Introspect resolves one spec table into its ref, schema, and warnings.
 // For external plugins, schema comes from GetFlightInfo in snapshot mode.
+// Validates that declared primary key columns exist in the returned schema.
 func (a *SourceAdapter) Introspect(ctx context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
 	info, err := a.client.GetFlightInfo(ctx, contract.GetFlightInfoRequest{
 		Table: t.Source,
@@ -90,6 +91,21 @@ func (a *SourceAdapter) Introspect(ctx context.Context, t spec.Table) (core.Tabl
 		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("deserialize schema: %w", err)
 	}
 	schema := arrowToCoreSchema(arrowSchema)
+
+	// Validate PK columns exist in the schema.
+	for _, pk := range t.PrimaryKey {
+		found := false
+		for _, c := range schema.Columns {
+			if c.Name == pk {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("introspect %s: primary key column %q not in plugin schema", t.Source, pk)
+		}
+	}
+
 	ref := core.TableRef{
 		Source:     t.Source,
 		Target:     t.Target,
@@ -176,29 +192,35 @@ func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from 
 		return fmt.Errorf("no endpoint in FlightInfo")
 	}
 
-	stream, err := r.client.DoGet(ctx, &flight.Ticket{Ticket: info.Endpoint[0].Ticket.Ticket})
-	if err != nil {
-		return err
-	}
-
-	// Read the CDC schema from the stream, then read batches.
-	var arrowSchema *arrow.Schema
-	for {
-		fd, err := stream.Recv()
+	// Consume all endpoints (contract allows partitioned data).
+	for _, ep := range info.Endpoint {
+		stream, err := r.client.DoGet(ctx, &flight.Ticket{Ticket: ep.Ticket.Ticket})
 		if err != nil {
-			return fmt.Errorf("recv schema: %w", err)
+			return err
 		}
-		if len(fd.DataHeader) > 0 {
-			schema, err := flight.DeserializeSchema(fd.DataHeader, r.alloc)
+
+		// Read the CDC schema from the stream, then read batches.
+		var arrowSchema *arrow.Schema
+		for {
+			fd, err := stream.Recv()
 			if err != nil {
-				return fmt.Errorf("deserialize schema: %w", err)
+				return fmt.Errorf("recv schema: %w", err)
 			}
-			arrowSchema = schema
-			break
+			if len(fd.DataHeader) > 0 {
+				schema, err := flight.DeserializeSchema(fd.DataHeader, r.alloc)
+				if err != nil {
+					return fmt.Errorf("deserialize schema: %w", err)
+				}
+				arrowSchema = schema
+				break
+			}
+		}
+
+		if err := r.readBatches(stream, arrowSchema, ref, out); err != nil {
+			return err
 		}
 	}
-
-	return r.readBatches(stream, arrowSchema, ref, out)
+	return nil
 }
 
 func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arrowSchema *arrow.Schema, ref core.TableRef, out chan<- change.Change) error {
