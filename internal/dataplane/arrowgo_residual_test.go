@@ -33,7 +33,7 @@ import (
 //
 // Run always — no env var, no skip. This is a sentinel, not a repro.
 //
-// Upstream: https://github.com/apache/arrow-go/issues/XXXX
+// Upstream: https://github.com/maltzsama/urutau/issues/40
 // (compute: kernel-internal buffers allocated via ctx allocator are never released)
 func TestArrowGoKernelResidual(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
