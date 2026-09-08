@@ -10,6 +10,9 @@ import (
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
+// kernelAlloc is defined in collapse_test.go — a plain allocator for
+// tests that exercise compute kernels.
+
 // eqChange mirrors a row for order-sensitive comparison.
 type eqChange struct {
 	ID  int64
@@ -61,11 +64,10 @@ func extractOpCol(b *dataplane.Batch) []uint8 {
 // produces the same row-level classification as iterating the batch
 // row-by-row and checking __op.
 func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 
 	for seed := range 100 {
 		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
-		defer b.Release()
 
 		// Row-path: classify by __op in iteration order
 		opVals := extractOpCol(b)
@@ -92,6 +94,7 @@ func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
 		// Columnar path
 		colIns, colDel, colUpd, err := dataplane.SplitByOp(context.Background(), alloc, b)
 		if err != nil {
+			b.Release()
 			t.Fatalf("seed %d: SplitByOp: %v", seed, err)
 		}
 		colInsSlice := batchToRowSlice(colIns)
@@ -108,6 +111,18 @@ func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
 		if !sliceEqual(rowUpd, colUpdSlice) {
 			t.Errorf("seed %d: updates mismatch: row=%d, col=%d", seed, len(rowUpd), len(colUpdSlice))
 		}
+
+		// Release everything inside the iteration — no defer-in-loop.
+		b.Release()
+		if colIns != nil {
+			colIns.Release()
+		}
+		if colDel != nil {
+			colDel.Release()
+		}
+		if colUpd != nil {
+			colUpd.Release()
+		}
 	}
 }
 
@@ -115,7 +130,7 @@ func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
 // columnar Collapse produces the same result as change.Collapse (the
 // production row-side reference).
 func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 
 	for seed := range 100 {
 		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{
@@ -123,7 +138,6 @@ func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 			PKDomain:  10, // force duplicate PKs
 			Allocator: alloc,
 		})
-		defer b.Release()
 
 		// Row-path reference: change.Collapse (production code)
 		changes := batchToChanges(b)
@@ -132,6 +146,7 @@ func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 		// Columnar path
 		colUps, colDel, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 		if err != nil {
+			b.Release()
 			t.Fatalf("seed %d: Collapse: %v", seed, err)
 		}
 		colUpsSlice := batchToRowSlice(colUps)
@@ -148,19 +163,27 @@ func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 		if !sliceEqual(rowDel, colDelSlice) {
 			t.Errorf("seed %d: deletes mismatch: row=%d, col=%d", seed, len(rowDel), len(colDelSlice))
 		}
+
+		// Release everything inside the iteration.
+		b.Release()
+		if colUps != nil {
+			colUps.Release()
+		}
+		if colDel != nil {
+			colDel.Release()
+		}
 	}
 }
 
 // TestEquivalence_FilterPredicate_MatchesRowPath verifies that
 // EvaluatePredicate matches row-by-row filtering.
 func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 
 	for seed := range 100 {
 		// PKDomain=5 with NumRows=25 → ~5 rows per PK → multi-row matches
 		// with mixed ops. This makes order comparison meaningful.
 		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 25, PKDomain: 5, Allocator: alloc})
-		defer b.Release()
 
 		idCol := b.Record.Column(0).(*array.Int64)
 		target := idCol.Value(seed % 5) // pick from 1..5 to guarantee a match
@@ -191,12 +214,14 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 			Value:  target,
 		})
 		if err != nil {
+			b.Release()
 			t.Fatalf("seed %d: EvaluatePredicate: %v", seed, err)
 		}
-		defer mask.Release()
 
 		ins, del, upd, err := dataplane.Filter(context.Background(), alloc, b, mask)
 		if err != nil {
+			mask.Release()
+			b.Release()
 			t.Fatalf("seed %d: Filter: %v", seed, err)
 		}
 
@@ -210,13 +235,26 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 		if !sliceEqual(rowDel, batchToRowSlice(del)) {
 			t.Errorf("seed %d: deletes mismatch: row=%d, col=%d (target=%d)", seed, len(rowDel), len(batchToRowSlice(del)), target)
 		}
+
+		// Release everything inside the iteration.
+		b.Release()
+		mask.Release()
+		if ins != nil {
+			ins.Release()
+		}
+		if del != nil {
+			del.Release()
+		}
+		if upd != nil {
+			upd.Release()
+		}
 	}
 }
 
 // TestEquivalence_CollapseInsertAfterDelete verifies that an
 // insert-after-delete ends up as an upsert (not a delete).
 func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
@@ -250,7 +288,7 @@ func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 // TestEquivalence_DeleteLast verifies that a PK whose last operation
 // is DELETE ends up in deletes, not upserts.
 func TestEquivalence_DeleteLast(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
@@ -278,7 +316,7 @@ func TestEquivalence_DeleteLast(t *testing.T) {
 // TestEquivalence_CompositeKey verifies that two distinct composite
 // PKs survive collapse as separate rows.
 func TestEquivalence_CompositeKey(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
@@ -304,7 +342,7 @@ func TestEquivalence_CompositeKey(t *testing.T) {
 // TestEquivalence_Int64Overflow verifies that int64 values outside
 // float64 precision survive with exact values.
 func TestEquivalence_Int64Overflow(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 

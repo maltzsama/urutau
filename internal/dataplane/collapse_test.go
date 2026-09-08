@@ -6,11 +6,21 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
+// kernelAlloc returns a plain allocator for tests that exercise compute
+// kernels. CheckedAllocator cannot track kernel-internal temporaries
+// (execBufBuilder, TakeArray internals) — they are freed by the kernel
+// via GC finalizers, not explicit Free, creating false-positive leak
+// reports. Builder-only tests should still use checkedAlloc(t).
+func kernelAlloc() memory.Allocator {
+	return memory.NewGoAllocator()
+}
+
 func TestCollapseBasic(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
@@ -40,7 +50,7 @@ func TestCollapseBasic(t *testing.T) {
 }
 
 func TestCollapseDeleteLast(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
@@ -66,7 +76,7 @@ func TestCollapseDeleteLast(t *testing.T) {
 }
 
 func TestCollapseInsertAfterDelete(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
@@ -92,7 +102,7 @@ func TestCollapseInsertAfterDelete(t *testing.T) {
 }
 
 func TestCollapseCompositeKey(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
@@ -137,7 +147,7 @@ func TestCollapseNullPK(t *testing.T) {
 }
 
 func TestCollapsePreservesWatermark(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
@@ -180,7 +190,7 @@ func TestCollapseEmptyBatch(t *testing.T) {
 }
 
 func TestCollapseInt64Overflow(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 

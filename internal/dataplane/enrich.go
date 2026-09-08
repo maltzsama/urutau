@@ -21,7 +21,7 @@ type CastPolicy map[string]arrow.DataType
 // OWNERSHIP: the input batch is NOT Released. The caller owns both input
 // and output. Columns from the input are Retained for the output; cast
 // columns are newly allocated. Input always exits valid.
-func Cast(ctx context.Context, _ memory.Allocator, batch *Batch, policy CastPolicy) (*Batch, error) {
+func Cast(ctx context.Context, alloc memory.Allocator, batch *Batch, policy CastPolicy) (*Batch, error) {
 	if len(policy) == 0 || batch.Record == nil || batch.Record.NumRows() == 0 {
 		return batch, nil
 	}
@@ -31,6 +31,7 @@ func Cast(ctx context.Context, _ memory.Allocator, batch *Batch, policy CastPoli
 	cols := make([]arrow.Array, ncols)
 	fields := make([]arrow.Field, ncols)
 	castCount := 0
+	kctx := allocCtx(ctx, alloc)
 
 	// Retain source columns — NewRecordBatch takes ownership, we must
 	// not release them afterwards.
@@ -46,7 +47,7 @@ func Cast(ctx context.Context, _ memory.Allocator, batch *Batch, policy CastPoli
 			continue
 		}
 
-		castResult, err := compute.CastToType(ctx, col, targetType)
+		castResult, err := compute.CastToType(kctx, col, targetType)
 		if err != nil {
 			if castResult != nil {
 				castResult.Release()

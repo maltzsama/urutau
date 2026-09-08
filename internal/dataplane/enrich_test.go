@@ -11,7 +11,7 @@ import (
 )
 
 func TestCastIntToString(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
@@ -32,7 +32,7 @@ func TestCastIntToString(t *testing.T) {
 }
 
 func TestCastPreservesNonCastColumns(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
@@ -64,7 +64,7 @@ func TestCastEmptyPolicy(t *testing.T) {
 }
 
 func TestCastPreservesWatermark(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
@@ -84,7 +84,7 @@ func TestCastPreservesWatermark(t *testing.T) {
 }
 
 func TestCastNoOpSameType(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
@@ -101,7 +101,7 @@ func TestCastNoOpSameType(t *testing.T) {
 }
 
 func TestCastPreservesNullability(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
@@ -236,7 +236,7 @@ func TestAddMetadataEmptyBatch(t *testing.T) {
 }
 
 func TestCastInt64OverflowPreserved(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 

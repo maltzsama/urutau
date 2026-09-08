@@ -9,7 +9,7 @@ import (
 )
 
 func TestSplitByOp(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
 	defer b.Release()
 
@@ -38,7 +38,7 @@ func TestSplitByOp(t *testing.T) {
 }
 
 func TestSplitByOpWatermarkPreserved(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
@@ -61,7 +61,7 @@ func TestSplitByOpWatermarkPreserved(t *testing.T) {
 }
 
 func TestSplitByOpEachRowClassified(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(7, dataplane.GeneratorOpts{NumRows: 30, Allocator: alloc})
 	defer b.Release()
 
@@ -157,7 +157,7 @@ func TestEvaluatePredicateNullCoalesce(t *testing.T) {
 }
 
 func TestFilterWithMask(t *testing.T) {
-	alloc := checkedAlloc(t)
+	alloc := kernelAlloc()
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, PKDomain: 10, Allocator: alloc})
 	defer b.Release()
 
