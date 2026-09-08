@@ -14,14 +14,11 @@ import (
 
 // GeneratorOpts configures batch generation.
 type GeneratorOpts struct {
-	Seed           int64
-	NumRows        int
-	PKColumns      []string         // column names to use as PK; nil = ["id"]
-	PKDomain       int              // number of distinct PKs; 0 = NumRows (all unique)
-	CompositeTypes bool             // include Struct/List/Map columns in schema
-	IncludeNullPK  bool             // true = one row with null PK (PR 41 error test)
-	DeleteAnyPos   bool             // true = deletes can appear at any position
-	Allocator      memory.Allocator // if nil, GoAllocator is used
+	NumRows          int
+	PKDomain         int              // distinct PKs; 0 = max(1, NumRows/3) — duplicates by default
+	DeletesOnlyAtEnd bool             // true = deletes only at last row; false (default) = deletes at any position
+	IncludeNullPK    bool             // true = one row with null PK
+	Allocator        memory.Allocator // if nil, GoAllocator is used
 }
 
 // baseSchema returns the fixed part of the generator schema.
@@ -44,12 +41,9 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 	if opts.NumRows <= 0 {
 		opts.NumRows = 10
 	}
-	if len(opts.PKColumns) == 0 {
-		opts.PKColumns = []string{"id"}
-	}
 	pkDomain := opts.PKDomain
 	if pkDomain <= 0 {
-		pkDomain = opts.NumRows
+		pkDomain = max(1, opts.NumRows/3)
 	}
 
 	alloc := opts.Allocator
@@ -61,44 +55,59 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 	schema := baseSchema()
 	bb := array.NewRecordBuilder(alloc, schema)
 
+	// Track last value per PK for __before_val (real before-image).
+	lastVal := make(map[int64]string)
+
 	for i := range opts.NumRows {
 		// id: modulo PKDomain for duplicates, or null if IncludeNullPK and first row
+		var id int64
 		if opts.IncludeNullPK && i == 0 {
 			bb.Field(0).(*array.Int64Builder).AppendNull()
+			id = -1 // sentinel for null PK
 		} else {
-			bb.Field(0).(*array.Int64Builder).Append(int64((i % pkDomain) + 1))
+			id = int64((i % pkDomain) + 1)
+			bb.Field(0).(*array.Int64Builder).Append(id)
 		}
 
 		// val: random string
-		bb.Field(1).(*array.StringBuilder).Append(fmt.Sprintf("val-%d", rng.IntN(100)))
+		val := fmt.Sprintf("val-%d", rng.IntN(100))
+		bb.Field(1).(*array.StringBuilder).Append(val)
 
-		// __before_val: null for inserts, the "old" val for updates
-		bb.Field(2).(*array.StringBuilder).AppendNull()
+		// __op: mix of inserts, updates, and deletes
+		op := uint8(OpInsert)
+		if opts.DeletesOnlyAtEnd {
+			if i == opts.NumRows-1 && rng.IntN(3) == 0 {
+				op = OpDelete
+			} else if i > 0 && rng.IntN(4) == 0 {
+				op = OpUpdate
+			}
+		} else {
+			if rng.IntN(5) == 0 {
+				op = OpDelete
+			} else if i > 0 && rng.IntN(3) == 0 {
+				op = OpUpdate
+			}
+		}
+		bb.Field(5).(*array.Uint8Builder).Append(op)
+
+		// __before_val: last known val for this PK (real before-image for
+		// updates/deletes), null for inserts.
+		if id >= 0 {
+			if before, ok := lastVal[id]; ok && op != OpInsert {
+				bb.Field(2).(*array.StringBuilder).Append(before)
+			} else {
+				bb.Field(2).(*array.StringBuilder).AppendNull()
+			}
+			lastVal[id] = val
+		} else {
+			bb.Field(2).(*array.StringBuilder).AppendNull()
+		}
 
 		// amount: random float
 		bb.Field(3).(*array.Float64Builder).Append(rng.Float64() * 1000)
 
 		// active: random bool
 		bb.Field(4).(*array.BooleanBuilder).Append(rng.IntN(2) == 0)
-
-		// __op: mix of inserts, updates, and deletes
-		op := uint8(0) // insert
-		if opts.DeleteAnyPos {
-			// Delete at any position with some probability
-			if rng.IntN(5) == 0 {
-				op = 2 // delete
-			} else if i > 0 && rng.IntN(3) == 0 {
-				op = 1 // update
-			}
-		} else {
-			// Original behavior: delete only at last row sometimes
-			if i == opts.NumRows-1 && rng.IntN(3) == 0 {
-				op = 2 // delete
-			} else if i > 0 && rng.IntN(4) == 0 {
-				op = 1 // update
-			}
-		}
-		bb.Field(5).(*array.Uint8Builder).Append(op)
 
 		// __pos: monotonically increasing within batch (§3.3 precondition)
 		pos := fmt.Sprintf("pos-%04d", i)
@@ -244,8 +253,8 @@ func AdversarialInt64Overflow(seed int64, alloc memory.Allocator) *Batch {
 	return &Batch{Table: "adv_int64_overflow", Record: rec, Watermark: []byte("pos-0002")}
 }
 
-// AdversarialNullBefore produces a batch with null __before_* payload
-// columns (Kleene/null semantics test).
+// AdversarialNullBefore produces a batch with null __before_val payload
+// column (Kleene/null semantics test).
 func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
@@ -253,6 +262,7 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "val", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "__before_val", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
 	}, nil)
@@ -260,13 +270,15 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.StringBuilder).AppendNull()
-	bb.Field(2).(*array.Uint8Builder).Append(1)
-	bb.Field(3).(*array.StringBuilder).Append("pos-0001")
+	bb.Field(2).(*array.StringBuilder).AppendNull()
+	bb.Field(3).(*array.Uint8Builder).Append(1)
+	bb.Field(4).(*array.StringBuilder).Append("pos-0001")
 
 	bb.Field(0).(*array.Int64Builder).Append(2)
 	bb.Field(1).(*array.StringBuilder).Append("hello")
-	bb.Field(2).(*array.Uint8Builder).Append(0)
-	bb.Field(3).(*array.StringBuilder).Append("pos-0002")
+	bb.Field(2).(*array.StringBuilder).AppendNull()
+	bb.Field(3).(*array.Uint8Builder).Append(0)
+	bb.Field(4).(*array.StringBuilder).Append("pos-0002")
 
 	rec := bb.NewRecordBatch()
 	bb.Release()

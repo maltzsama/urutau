@@ -119,10 +119,9 @@ func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 
 	for seed := range 100 {
 		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{
-			NumRows:      30,
-			PKDomain:     10, // force duplicate PKs
-			DeleteAnyPos: true,
-			Allocator:    alloc,
+			NumRows:   30,
+			PKDomain:  10, // force duplicate PKs
+			Allocator: alloc,
 		})
 		defer b.Release()
 
@@ -158,7 +157,7 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
-		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 25, Allocator: alloc})
+		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 25, PKDomain: 25, Allocator: alloc})
 		defer b.Release()
 
 		idCol := b.Record.Column(0).(*array.Int64)

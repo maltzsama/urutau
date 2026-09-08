@@ -104,7 +104,7 @@ func TestSplitByOpEachRowClassified(t *testing.T) {
 
 func TestEvaluatePredicateEqual(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, PKDomain: 20, Allocator: alloc})
 	defer b.Release()
 
 	idCol := b.Record.Column(0).(*array.Int64)
@@ -158,7 +158,7 @@ func TestEvaluatePredicateNullCoalesce(t *testing.T) {
 
 func TestFilterWithMask(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, PKDomain: 10, Allocator: alloc})
 	defer b.Release()
 
 	mask, err := dataplane.EvaluatePredicate(context.Background(), alloc, b, dataplane.Predicate{

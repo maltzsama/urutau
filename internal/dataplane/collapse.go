@@ -110,6 +110,9 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 
 	// 7. Split into upserts and deletes by __op.
 	opIdx := colIndex(batch.Record.Schema(), "__op")
+	if opIdx < 0 {
+		return nil, nil, fmt.Errorf("dataplane: collapse: __op column not found")
+	}
 	opArr, ok := collapsed.Column(opIdx).(*array.Uint8)
 	if !ok {
 		return nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))

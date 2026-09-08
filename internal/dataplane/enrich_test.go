@@ -112,10 +112,24 @@ func TestCastPreservesNullability(t *testing.T) {
 	}
 	defer out.Release()
 
-	// id was Nullable: false — cast should preserve that
 	idField := out.Record.Schema().Field(0)
 	if idField.Nullable {
 		t.Error("expected id Nullable: false preserved after cast")
+	}
+}
+
+func TestCastPolicyMatchesNothing(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
+	defer b.Release()
+
+	out, err := dataplane.Cast(context.Background(), alloc, b,
+		dataplane.CastPolicy{"nope": arrow.PrimitiveTypes.Int64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != b {
+		t.Error("expected same batch")
 	}
 }
 
@@ -139,7 +153,6 @@ func TestAddMetadataColumns(t *testing.T) {
 
 	schema := out.Record.Schema()
 
-	// __commit_ts should already exist in the batch (from generator)
 	idx := -1
 	for i := range schema.NumFields() {
 		if schema.Field(i).Name == "__commit_ts" {
@@ -151,7 +164,6 @@ func TestAddMetadataColumns(t *testing.T) {
 		t.Fatal("__commit_ts column not found")
 	}
 
-	// __ingest_ts should be added
 	foundIngest := false
 	for i := range schema.NumFields() {
 		if schema.Field(i).Name == "__ingest_ts" {

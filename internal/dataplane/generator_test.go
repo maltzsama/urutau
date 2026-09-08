@@ -7,23 +7,42 @@ import (
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
+// opCol extracts the __op column as []uint8 from a batch.
+func opCol(b *dataplane.Batch) []uint8 {
+	if b == nil || b.Record == nil {
+		return nil
+	}
+	for i := range b.Record.Schema().NumFields() {
+		if b.Record.Schema().Field(i).Name == "__op" {
+			col := b.Record.Column(i).(*array.Uint8)
+			vals := make([]uint8, col.Len())
+			for j := range col.Len() {
+				vals[j] = col.Value(j)
+			}
+			return vals
+		}
+	}
+	return nil
+}
+
+// fieldIndex finds a column index by name. Panics if not found (test only).
+func fieldIndex(t *testing.T, b *dataplane.Batch, name string) int {
+	t.Helper()
+	for i := range b.Record.Schema().NumFields() {
+		if b.Record.Schema().Field(i).Name == name {
+			return i
+		}
+	}
+	t.Fatalf("column %q not found", name)
+	return -1
+}
+
 func TestGeneratorWatermarkIsLastRowPos(t *testing.T) {
 	alloc := checkedAlloc(t)
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
 	defer b.Release()
 
-	schema := b.Record.Schema()
-	posIdx := -1
-	for i := range schema.NumFields() {
-		if schema.Field(i).Name == "__pos" {
-			posIdx = i
-			break
-		}
-	}
-	if posIdx < 0 {
-		t.Fatal("__pos column not found")
-	}
-
+	posIdx := fieldIndex(t, b, "__pos")
 	posArr := b.Record.Column(posIdx).(*array.String)
 	lastPos := posArr.Value(int(b.Record.NumRows() - 1))
 	if string(b.Watermark) != lastPos {
@@ -41,7 +60,6 @@ func TestGeneratorSchemaCoherent(t *testing.T) {
 		t.Fatal("nil schema")
 	}
 
-	// Must have at least: id, val, __before_val, amount, active, __op, __pos, __commit_ts
 	required := []string{"id", "val", "__before_val", "amount", "active", "__op", "__pos", "__commit_ts"}
 	for _, name := range required {
 		found := false
@@ -79,14 +97,7 @@ func TestGeneratorPosMonotonic(t *testing.T) {
 	b := dataplane.GenerateBatch(99, dataplane.GeneratorOpts{NumRows: 30, Allocator: alloc})
 	defer b.Release()
 
-	schema := b.Record.Schema()
-	posIdx := -1
-	for i := range schema.NumFields() {
-		if schema.Field(i).Name == "__pos" {
-			posIdx = i
-			break
-		}
-	}
+	posIdx := fieldIndex(t, b, "__pos")
 	posArr := b.Record.Column(posIdx).(*array.String)
 	for i := 1; i < int(posArr.Len()); i++ {
 		if posArr.Value(i) <= posArr.Value(i-1) {
@@ -117,7 +128,8 @@ func TestGeneratorDeleteLast(t *testing.T) {
 	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
-	opCol := b.Record.Column(1).(*array.Uint8)
+	opIdx := fieldIndex(t, b, "__op")
+	opCol := b.Record.Column(opIdx).(*array.Uint8)
 	if opCol.Value(int(b.Record.NumRows()-1)) != 2 {
 		t.Error("last row should be DELETE (op=2)")
 	}
@@ -128,7 +140,8 @@ func TestGeneratorInsertAfterDelete(t *testing.T) {
 	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
-	opCol := b.Record.Column(1).(*array.Uint8)
+	opIdx := fieldIndex(t, b, "__op")
+	opCol := b.Record.Column(opIdx).(*array.Uint8)
 	if opCol.Value(0) != 2 {
 		t.Error("row 0 should be DELETE")
 	}
@@ -167,6 +180,12 @@ func TestGeneratorNullBefore(t *testing.T) {
 	}
 	if valCol.Value(1) != "hello" {
 		t.Errorf("row 1 val = %q, want hello", valCol.Value(1))
+	}
+
+	// __before_val should be present in the schema
+	beforeIdx := fieldIndex(t, b, "__before_val")
+	if beforeIdx < 0 {
+		t.Fatal("__before_val column not found in schema")
 	}
 }
 
@@ -229,7 +248,6 @@ func TestGeneratorDuplicatePKDomain(t *testing.T) {
 	})
 	defer b.Release()
 
-	// With PKDomain=5, IDs should be 1..5 repeating
 	idCol := b.Record.Column(0).(*array.Int64)
 	seen := make(map[int64]bool)
 	for i := range int(idCol.Len()) {
@@ -241,5 +259,75 @@ func TestGeneratorDuplicatePKDomain(t *testing.T) {
 	}
 	if len(seen) != 5 {
 		t.Errorf("expected 5 distinct PKs, got %d", len(seen))
+	}
+}
+
+func TestGeneratorDefaultPKDomain(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 9, Allocator: alloc})
+	defer b.Release()
+
+	// Default PKDomain = max(1, 9/3) = 3 → IDs 1..3 repeating
+	idCol := b.Record.Column(0).(*array.Int64)
+	seen := make(map[int64]bool)
+	for i := range int(idCol.Len()) {
+		seen[idCol.Value(i)] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("expected 3 distinct PKs with default domain, got %d", len(seen))
+	}
+}
+
+func TestGeneratorBeforeValReal(t *testing.T) {
+	alloc := checkedAlloc(t)
+	// Use DeletesOnlyAtEnd=true so we get predictable inserts/updates
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{
+		NumRows:          10,
+		DeletesOnlyAtEnd: true,
+		PKDomain:         3, // 3 distinct PKs → updates after first occurrence
+		Allocator:        alloc,
+	})
+	defer b.Release()
+
+	beforeIdx := fieldIndex(t, b, "__before_val")
+	idIdx := fieldIndex(t, b, "id")
+
+	idCol := b.Record.Column(idIdx).(*array.Int64)
+	beforeCol := b.Record.Column(beforeIdx).(*array.String)
+	opArr := opCol(b)
+
+	// Track seen PKs — first occurrence of each PK must have null __before_val
+	seenPKs := make(map[int64]bool)
+	nrows := int(b.Record.NumRows())
+	for i := 0; i < nrows; i++ {
+		id := idCol.Value(i)
+		op := opArr[i]
+		if !seenPKs[id] {
+			// First occurrence: __before_val must be null (insert)
+			if !beforeCol.IsNull(i) {
+				t.Errorf("row %d: first occurrence of PK %d has non-null __before_val %q", i, id, beforeCol.Value(i))
+			}
+			seenPKs[id] = true
+		} else if op != 0 {
+			// Subsequent non-insert: __before_val must be non-null
+			if beforeCol.IsNull(i) {
+				t.Errorf("row %d: update/delete of PK %d has null __before_val", i, id)
+			}
+		}
+	}
+}
+
+func TestGeneratorDeletesAnyPosition(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{
+		NumRows:   10,
+		Allocator: alloc,
+	})
+	defer b.Release()
+
+	// With DeletesOnlyAtEnd=false (default), deletes can appear anywhere.
+	// Just verify the batch has the right number of rows.
+	if b.Record.NumRows() != 10 {
+		t.Errorf("expected 10 rows, got %d", b.Record.NumRows())
 	}
 }

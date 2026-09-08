@@ -23,7 +23,8 @@ import "github.com/apache/arrow-go/v18/arrow"
 type Batch struct {
 	Table string
 	// Record is the CR-021 wire schema: data columns in schema order,
-	// followed by __op, __pos, __commit_ts, __ingest_ts, __snapshot.
+	// followed by __op, __pos, __commit_ts. System columns __ingest_ts,
+	// __snapshot, and __phase are injected by AddMetadata (not on wire).
 	Record arrow.RecordBatch
 	// Watermark is __pos of the LAST row as received — the commit point.
 	// Captured at RECEIVE time, before any transform (CR-069 §3.3).

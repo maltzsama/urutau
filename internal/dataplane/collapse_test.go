@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
@@ -202,5 +203,26 @@ func TestCollapseInt64Overflow(t *testing.T) {
 		if bigCol.Value(0) != (int64(1)<<53)+1 {
 			t.Errorf("int64 overflow: got %d, want %d", bigCol.Value(0), (int64(1)<<53)+1)
 		}
+	}
+}
+
+func TestCollapseMissingOpColumn(t *testing.T) {
+	alloc := checkedAlloc(t)
+
+	// Build a batch without __op — should error, not panic.
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+	}, nil)
+	bb := array.NewRecordBuilder(alloc, schema)
+	bb.Field(0).(*array.Int64Builder).Append(1)
+	bb.Field(0).(*array.Int64Builder).Append(1)
+	rec := bb.NewRecordBatch()
+	bb.Release()
+	nobatch := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
+	defer nobatch.Release()
+
+	_, _, err := dataplane.Collapse(context.Background(), alloc, nobatch, []string{"id"})
+	if err == nil {
+		t.Fatal("expected error for missing __op column")
 	}
 }

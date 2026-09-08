@@ -62,6 +62,14 @@ func Cast(ctx context.Context, _ memory.Allocator, batch *Batch, policy CastPoli
 	}
 
 	if castCount == 0 {
+		// No columns matched the policy — release the Retains from the
+		// passthrough loop; the early return skips the record that would
+		// own them.
+		for _, c := range cols {
+			if c != nil {
+				c.Release()
+			}
+		}
 		return batch, nil
 	}
 
