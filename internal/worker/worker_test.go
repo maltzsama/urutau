@@ -10,6 +10,7 @@ import (
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 )
@@ -79,20 +80,56 @@ func runWorker(t *testing.T, cfg Config, targets []string, committers map[string
 	w := New(cfg)
 	for _, target := range targets {
 		w.RegisterCommitter(target, committers[target], change.UpsertMode)
-		w.SetKnownSchema(target, core.Schema{
-			Columns: []core.Column{
-				{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-				{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
-			},
-			PrimaryKey: []string{"id"},
-		})
+		w.SetKnownSchema(target, testSchema())
 	}
-	ingest := make(chan change.Change, len(changes)+1)
+	raw := make(chan change.Change, len(changes)+1)
 	for _, c := range changes {
-		ingest <- c
+		raw <- c
 	}
-	close(ingest)
+	close(raw)
+	ingest := IngestFromChanges(context.Background(), raw, testSchema())
 	return w.Run(context.Background(), ingest)
+}
+
+// testSchema is the id/v schema used across worker tests.
+func testSchema() core.Schema {
+	return core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+}
+
+// toIngest wraps one change into an Ingest (bridging to a batch), or a
+// window marker into Ingest with Win set.
+func toIngest(t *testing.T, c change.Change) Ingest {
+	t.Helper()
+	cb := change.Batch{Table: c.Table, Upserts: []change.Change{c}, Mode: change.UpsertMode}
+	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
+	if err != nil {
+		t.Fatalf("toIngest: %v", err)
+	}
+	if c.Window != nil {
+		if c.Window.Closes {
+			return Ingest{Table: c.Table, Win: c.Window, Position: c.Position}
+		}
+		// InWindow is DATA + a routing tag; the batch must survive.
+		return Ingest{Table: c.Table, Batch: dpb, Win: c.Window}
+	}
+	return Ingest{Table: c.Table, Batch: dpb}
+}
+
+// toWindow bridges window rows into a batch for AddWindowRows.
+func toWindow(t *testing.T, target string, rows []change.Change) *dataplane.Batch {
+	t.Helper()
+	cb := change.Batch{Table: target, Upserts: rows, Mode: change.AppendMode}
+	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
+	if err != nil {
+		t.Fatalf("toWindow: %v", err)
+	}
+	return dpb
 }
 
 func TestFlushOnCloseCollapses(t *testing.T) {
@@ -145,11 +182,12 @@ func TestFlushByMaxRows(t *testing.T) {
 func TestFlushByInterval(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: 30 * time.Millisecond})
-	w.RegisterCommitter("t", fc, change.UpsertMode)
+	regTable(t, w, "t", fc, change.UpsertMode)
 
 	ingest := make(chan change.Change, 2)
+	dpIngest := IngestFromChanges(context.Background(), ingest, testSchema())
 	done := make(chan error, 1)
-	go func() { done <- w.Run(context.Background(), ingest) }()
+	go func() { done <- w.Run(context.Background(), dpIngest) }()
 
 	ingest <- chg("t", change.OpInsert, 1, "a", "p1")
 	time.Sleep(120 * time.Millisecond) // interval fires while channel stays open

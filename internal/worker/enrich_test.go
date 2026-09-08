@@ -70,7 +70,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",
 			After: map[string]any{"id": int64(1), "v": "a", "user_ref": int64(7)}}
 		close(ingest)
-		if err := w.Run(context.Background(), ingest); err != nil {
+		if err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema())); err != nil {
 			t.Fatalf("run: %v", err)
 		}
 		if len(fc.batches) != 1 || len(fc.batches[0].Upserts) != 1 {
@@ -97,7 +97,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",
 			After: map[string]any{"id": int64(1), "v": "a", "user_ref": int64(99)}} // miss
 		close(ingest)
-		if err := w.Run(context.Background(), ingest); err != nil {
+		if err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema())); err != nil {
 			t.Fatalf("run: %v", err)
 		}
 		if len(fc.batches) != 0 {

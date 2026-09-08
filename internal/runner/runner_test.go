@@ -79,11 +79,12 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 		PrimaryKey: []string{"id"},
 	})
 
-	ingest := make(chan change.Change, 64)
+	rawIngest := make(chan change.Change, 64)
 	done := make(chan error, 1)
+	ingest := worker.IngestFromChanges(context.Background(), rawIngest, core.Schema{})
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
-	r := newRelay(ingest, w)
+	r := newRelay(rawIngest, w)
 	out := make(chan change.Change, 64)
 	relayDone := make(chan struct{})
 	go func() {
@@ -121,7 +122,7 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	// closing ingest can never race an in-flight write.
 	close(out)
 	<-relayDone
-	close(ingest)
+	close(rawIngest)
 	if err := <-done; err != nil {
 		t.Fatalf("worker run: %v", err)
 	}

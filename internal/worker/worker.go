@@ -18,6 +18,7 @@ import (
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 )
 
@@ -53,7 +54,7 @@ type tablePipeline struct {
 	target    string
 	committer sink.TableWriter
 	mode      change.WriteMode
-	ch        chan change.Change
+	ch        chan Ingest
 
 	// appendDropDeletes implements onDelete: skip — every DELETE in an
 	// append-only table is dropped (counted) instead of appended from its
@@ -125,6 +126,17 @@ type readyBatch struct {
 	rows    int // rows fed into the batcher for this flush
 	upserts int // surviving upsert rows
 	deletes int // equality-delete rows
+}
+
+// Ingest is one unit the worker consumes: a columnar batch plus optional
+// window routing tags set by the demux (four-readers rule: routing lives
+// at the port, consumed here, never on the record). A Closes marker carries
+// no batch — only Win and Position (window rows adopt the position).
+type Ingest struct {
+	Table    string
+	Batch    *dataplane.Batch
+	Win      *change.Window
+	Position string
 }
 
 // New builds a worker; register tables before Run.
@@ -209,7 +221,7 @@ func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) 
 		target:         target,
 		committer:      c,
 		mode:           mode,
-		ch:             make(chan change.Change, 1024),
+		ch:             make(chan Ingest, 1024),
 		readyCh:        make(chan readyBatch, 1),
 		windows:        map[uint32]map[string]change.Change{},
 		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
@@ -222,10 +234,17 @@ func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) 
 // its Closes marker: a live event tagged InWindow discards its key (the live
 // version wins). Chunks are independent — a previous chunk may still be
 // draining while a new one opens.
-func (w *Worker) AddWindowRows(target string, chunkID uint32, rows []change.Change) error {
+//
+// QUARANTINE: the batch is decoded to rows for the window map; dies when the
+// worker consumes Batch directly (M4).
+func (w *Worker) AddWindowRows(target string, chunkID uint32, batch *dataplane.Batch) error {
 	p, ok := w.tables[target]
 	if !ok {
 		return fmt.Errorf("worker: window rows for unregistered table %s", target)
+	}
+	rows, err := decodeToChanges(batch, p.knownSchema.PrimaryKey)
+	if err != nil {
+		return fmt.Errorf("worker: window rows %s: %w", target, err)
 	}
 	p.winMu.Lock()
 	defer p.winMu.Unlock()
@@ -367,7 +386,7 @@ func (w *Worker) OnSchemaDrift(f func(SchemaDrift)) {
 // every pipeline has flushed its remainder. A commit failure is terminal:
 // the worker stops — a failed batch is never skipped, because skipping
 // would let later batches advance the position past uncommitted data.
-func (w *Worker) Run(ctx context.Context, ingest <-chan change.Change) error {
+func (w *Worker) Run(ctx context.Context, ingest <-chan Ingest) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -383,8 +402,12 @@ func (w *Worker) Run(ctx context.Context, ingest <-chan change.Change) error {
 
 	// Router: dispatch by target table, then close pipelines so they flush.
 	go func() {
-		for c := range ingest {
-			p, ok := w.tables[c.Table]
+		for ing := range ingest {
+			table := ing.Table
+			if ing.Batch != nil {
+				table = ing.Batch.Table
+			}
+			p, ok := w.tables[table]
 			if !ok {
 				// A change for an unregistered table is a routing bug
 				// upstream; dropping it silently would lose data. Cancel the
@@ -393,7 +416,7 @@ func (w *Worker) Run(ctx context.Context, ingest <-chan change.Change) error {
 				return
 			}
 			select {
-			case p.ch <- c:
+			case p.ch <- ing:
 			case <-ctx.Done():
 				return
 			}
@@ -561,6 +584,13 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					// before image. A delete with NO before image (Kafka
 					// tombstone, source without the image) must never write
 					// an all-null row: it is dropped and counted instead.
+					// QUARANTINE: after the bridge round-trip the image lives in
+					// After (the wire has no __before_* columns yet); dies in M4.
+					// Only treat it as an image when it carries non-PK columns —
+					// an image-less delete projects only its key onto the wire.
+					if len(c.Before) == 0 && hasNonPKValue(c.After, p.knownSchema.PrimaryKey) {
+						c.Before = c.After
+					}
 					if len(c.Before) == 0 {
 						p.droppedDeletes.Add(1)
 						if w.metrics != nil {
@@ -654,34 +684,61 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 
 	for {
 		select {
-		case c, ok := <-p.ch:
+		case ing, ok := <-p.ch:
 			if !ok {
 				return flush()
 			}
-			// A live event during the snapshot marks its PK as touched:
-			// the snapshot row for that key must take the safe upsert path,
-			// never a pure append. The DBLog window only deduplicates events
-			// that arrive while the covering chunk is open — events that
-			// landed before their chunk was read would otherwise duplicate
-			// the row. Closes markers carry no key and skip this.
-			if !c.Snapshot && c.Key != nil {
-				p.snapshotMu.Lock()
-				if p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil {
-					p.bootstrapGuard.AddString(change.KeyString(c.Key))
-				}
-				p.snapshotMu.Unlock()
-			}
-			// DBLog window application, design 3.4: an InWindow event is itself a
-			// real change — it removes its snapshot row from the owning
-			// chunk's window (the live version wins) and is then appended
-			// normally. The coordinator tags gated live events with the
-			// chunk that was draining when they were released, which need
-			// not be the chunk that contains the row, so the delete scans
-			// every open window. The chunk's Closes marker flushes what
-			// remains as inserts; markers for unknown chunks are stale.
-			if c.Window != nil {
+			// Closes marker: emit the chunk's remaining window rows.
+			if ing.Win != nil && ing.Win.Closes {
 				p.winMu.Lock()
-				if c.Window.InWindow {
+				win := p.windows[ing.Win.ChunkID]
+				if win != nil {
+					for _, row := range win {
+						row.Position = ing.Position
+						buf = append(buf, row)
+					}
+					delete(p.windows, ing.Win.ChunkID)
+				}
+				p.winMu.Unlock()
+				continue // the Closes marker is not a data row
+			}
+			if ing.Batch == nil {
+				continue
+			}
+			// Decode the columnar batch to rows for per-row processing.
+			// QUARANTINE: dies when the worker consumes Batch directly (M4).
+			rows, err := decodeToChanges(ing.Batch, p.knownSchema.PrimaryKey)
+			if err != nil {
+				return fmt.Errorf("worker: table %s: decode: %w", p.target, err)
+			}
+
+			for i := range rows {
+				c := &rows[i]
+				if ing.Win != nil && ing.Win.InWindow {
+					c.Window = &change.Window{ChunkID: ing.Win.ChunkID, InWindow: true}
+				}
+				// A live event during the snapshot marks its PK as touched:
+				// the snapshot row for that key must take the safe upsert path,
+				// never a pure append. The DBLog window only deduplicates events
+				// that arrive while the covering chunk is open — events that
+				// landed before their chunk was read would otherwise duplicate
+				// the row. Closes markers carry no key and skip this.
+				if !c.Snapshot && c.Key != nil {
+					p.snapshotMu.Lock()
+					if p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil {
+						p.bootstrapGuard.AddString(change.KeyString(c.Key))
+					}
+					p.snapshotMu.Unlock()
+				}
+				// DBLog window application, design 3.4: an InWindow event is itself a
+				// real change — it removes its snapshot row from the owning
+				// chunk's window (the live version wins) and is then appended
+				// normally. The coordinator tags gated live events with the
+				// chunk that was draining when they were released, which need
+				// not be the chunk that contains the row, so the delete scans
+				// every open window.
+				if c.Window != nil && c.Window.InWindow {
+					p.winMu.Lock()
 					k := change.KeyString(c.Key)
 					for _, win := range p.windows {
 						if _, hit := win[k]; hit {
@@ -689,65 +746,55 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 							p.dropped++
 						}
 					}
-				}
-				win := p.windows[c.Window.ChunkID]
-				if c.Window.Closes {
-					if win != nil {
-						for _, row := range win {
-							row.Position = c.Position
-							buf = append(buf, row)
-						}
-						delete(p.windows, c.Window.ChunkID)
-					}
 					p.winMu.Unlock()
-					continue // the Closes marker is not a data row
 				}
-				p.winMu.Unlock()
-			}
-			// Schema drift: a column that appears in the data but was not
-			// known at introspection means the source schema moved under the
-			// pipeline. Writing the row would corrupt the target (unknown
-			// column) or silently drop data, so the change is refused and
-			// the pipeline stops — restart only after the spec declares the
-			// column. The check is recursive: a field added inside a struct
-			// column is the same class of event as a top-level ADD COLUMN,
-			// reported with its full path. Reported once per path.
-			if len(p.knownSchema.Columns) > 0 && c.After != nil {
-				if d, hit := checkDrift(c.After, p.knownSchema); hit {
-					p.snapshotMu.Lock()
-					first := !p.driftReported[d.Column]
-					p.driftReported[d.Column] = true
-					p.snapshotMu.Unlock()
-					if first && w.schemaDrift != nil {
-						w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
+				// Schema drift: a column that appears in the data but was not
+				// known at introspection means the source schema moved under the
+				// pipeline. Writing the row would corrupt the target (unknown
+				// column) or silently drop data, so the change is refused and
+				// the pipeline stops — restart only after the spec declares the
+				// column. The check is recursive: a field added inside a struct
+				// column is the same class of event as a top-level ADD COLUMN,
+				// reported with its full path. Reported once per path.
+				if len(p.knownSchema.Columns) > 0 && c.After != nil {
+					if d, hit := checkDrift(c.After, p.knownSchema); hit {
+						p.snapshotMu.Lock()
+						first := !p.driftReported[d.Column]
+						p.driftReported[d.Column] = true
+						p.snapshotMu.Unlock()
+						if first && w.schemaDrift != nil {
+							w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
+						}
+						return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
 					}
-					return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
 				}
-			}
-			// Enrichment runs after the drift check (reference columns are
-			// not source columns — they must not trip drift) and before
-			// buffering, so a dropped event never enters the batch and a
-			// drained cold-start queue keeps its FIFO order.
-			if p.enricher != nil && c.After != nil {
-				enriched, err := p.enricher.Enrich([]change.Change{c})
-				if err != nil {
-					return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
+				// Enrichment runs after the drift check (reference columns are
+				// not source columns — they must not trip drift) and before
+				// buffering, so a dropped event never enters the batch and a
+				// drained cold-start queue keeps its FIFO order.
+				if p.enricher != nil && c.After != nil {
+					enriched, err := p.enricher.Enrich([]change.Change{*c})
+					if err != nil {
+						return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
+					}
+					p.enrichDropped.Add(int64(1 - len(enriched)))
+					buf = append(buf, enriched...)
+					if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
+						if err := flush(); err != nil {
+							return err
+						}
+					}
+					continue
 				}
-				p.enrichDropped.Add(int64(1 - len(enriched)))
-				buf = append(buf, enriched...)
+				buf = append(buf, *c)
 				if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
 					if err := flush(); err != nil {
 						return err
 					}
 				}
-				continue
 			}
-			buf = append(buf, c)
-			if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
-				if err := flush(); err != nil {
-					return err
-				}
-			}
+			// The demux handed us the batch; we own it and decoded it.
+			ing.Batch.Release()
 		case <-ticker.C:
 			if err := flush(); err != nil {
 				return err
@@ -838,4 +885,117 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		SnapshotState:   a.SnapshotState,
 		SnapshotPending: a.SnapshotPending,
 	}, nil
+}
+
+// decodeToChanges decodes a columnar batch back to row-oriented changes.
+// QUARANTINE: dies when the worker consumes Batch directly (M4).
+func decodeToChanges(b *dataplane.Batch, pk []string) ([]change.Change, error) {
+	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
+		return nil, nil
+	}
+	rows, _, err := transport.DecodeBatch(b.Record, nil, pk)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// IngestFromChanges wraps a change-oriented channel into Ingest batches,
+// bridging accumulated changes via the transport. Buffers per table so a
+// batch never mixes tables (the wire schema is per-table). Window markers
+// pass through as Ingest with Win set.
+// QUARANTINE: dies when sources produce Arrow directly (M4).
+func IngestFromChanges(ctx context.Context, changes <-chan change.Change, schema core.Schema) <-chan Ingest {
+	out := make(chan Ingest, 64)
+	go func() {
+		defer close(out)
+		bufs := map[string][]change.Change{}
+		flush := func() {
+			for table, buf := range bufs {
+				if len(buf) == 0 {
+					continue
+				}
+				cb := change.Batch{Table: table, Upserts: buf, Mode: change.UpsertMode}
+				dpb, err := dpint.BatchFromChangeBatch(cb, schema)
+				if err != nil {
+					bufs[table] = bufs[table][:0] // QUARANTINE: drop on bridge error; dies in M4
+					continue
+				}
+				select {
+				case out <- Ingest{Table: table, Batch: dpb}:
+				case <-ctx.Done():
+					return
+				}
+				bufs[table] = bufs[table][:0]
+			}
+		}
+		// A short ticker keeps data flowing to the worker so its MaxInterval
+		// cadence still governs commits; the 100-change threshold covers high
+		// volume. QUARANTINE: dies when sources produce Arrow directly (M4).
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case c, ok := <-changes:
+				if !ok {
+					flush()
+					return
+				}
+				if c.Window != nil {
+					flush()
+					if c.Window.Closes {
+						select {
+						case out <- Ingest{Table: c.Table, Win: c.Window, Position: c.Position}:
+						case <-ctx.Done():
+							return
+						}
+						continue
+					}
+					// InWindow is DATA + a routing tag; the batch must survive.
+					cb := change.Batch{Table: c.Table, Upserts: []change.Change{c}, Mode: change.UpsertMode}
+					dpb, err := dpint.BatchFromChangeBatch(cb, schema)
+					if err != nil {
+						continue
+					}
+					select {
+					case out <- Ingest{Table: c.Table, Batch: dpb, Win: c.Window}:
+					case <-ctx.Done():
+						return
+					}
+					continue
+				}
+				bufs[c.Table] = append(bufs[c.Table], c)
+				if len(bufs[c.Table]) >= 100 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// hasNonPKValue reports whether the row image carries a value in a non-PK
+// column. Used to distinguish a real delete image from a key-only projection
+// after the bridge round-trip (QUARANTINE).
+func hasNonPKValue(row map[string]any, pk []string) bool {
+	for name, v := range row {
+		if v == nil {
+			continue
+		}
+		isPK := false
+		for _, p := range pk {
+			if p == name {
+				isPK = true
+				break
+			}
+		}
+		if !isPK {
+			return true
+		}
+	}
+	return false
 }

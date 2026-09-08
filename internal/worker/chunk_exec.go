@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
@@ -126,9 +128,15 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return fmt.Errorf("worker: chunk %d scan: %w", req.ChunkId, err)
 	}
 
-	if err := x.w.AddWindowRows(ta.TargetTable, req.ChunkId, rows); err != nil {
+	cb := change.Batch{Table: ta.TargetTable, Upserts: rows, Mode: change.AppendMode}
+	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
+	if err != nil {
+		return fmt.Errorf("worker: chunk %d bridge: %w", req.ChunkId, err)
+	}
+	if err := x.w.AddWindowRows(ta.TargetTable, req.ChunkId, dpb); err != nil {
 		return err
 	}
+	dpb.Release()
 	return x.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_ChunkReady{ChunkReady: &pb.ChunkReady{
 		Table:           req.Table,
 		ChunkId:         req.ChunkId,

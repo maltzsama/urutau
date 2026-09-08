@@ -16,6 +16,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/snapshot"
@@ -102,7 +103,18 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 }
 
 func (r *relay) AddWindowRows(target string, chunkID uint32, rows []change.Change) error {
-	return r.window.AddWindowRows(target, chunkID, rows)
+	// QUARANTINE: bridge rows to a batch for the worker's window entry; dies
+	// when sources produce Arrow directly (M4).
+	cb := change.Batch{Table: target, Upserts: rows, Mode: change.AppendMode}
+	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
+	if err != nil {
+		return err
+	}
+	if err := r.window.AddWindowRows(target, chunkID, dpb); err != nil {
+		return err
+	}
+	dpb.Release()
+	return nil
 }
 
 // GateOn starts buffering the table's live events for a chunk SELECT in
@@ -467,8 +479,11 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}
 	}
 
-	// Worker + ingest channel.
-	ingest := make(chan change.Change, 1024)
+	// Worker + ingest channel. The source still produces changes; they are
+	// wrapped into columnar Ingest batches at the worker boundary (QUARANTINE:
+	// dies when sources produce Arrow directly, M4).
+	rawIngest := make(chan change.Change, 1024)
+	ingest := worker.IngestFromChanges(ctx, rawIngest, core.Schema{})
 	w := worker.New(worker.Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
 	for target, wr := range writers {
 		mode := modes[target]
@@ -603,7 +618,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	// Stream: the reader emits changes on a channel the relay consumes; the
 	// terminal-error channel surfaces a dead stream.
 	ch, streamErr := rdr.Stream(ctx, start)
-	router := newRelay(ingest, w)
+	router := newRelay(rawIngest, w)
 	routerDone := make(chan error, 1)
 	go func() { routerDone <- router.run(ctx, ch) }()
 

@@ -90,7 +90,8 @@ tables:
 	}, PrimaryKey: []string{"id"}})
 	w.OnCommit(func(b *dataplane.Batch, _ int) { committed = append(committed, b) })
 
-	ingest := make(chan change.Change, 32)
+	rawIngest := make(chan change.Change, 32)
+	ingest := worker.IngestFromChanges(ctx, rawIngest, core.Schema{})
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx, ingest) }()
 
@@ -107,9 +108,9 @@ tables:
 		{Op: change.OpUpdate, Table: "raw.orders", Key: []any{int64(1)}, After: row(1, "c"), Position: "p7"},
 	}
 	for _, c := range feed {
-		ingest <- c
+		rawIngest <- c
 	}
-	close(ingest)
+	close(rawIngest)
 
 	if err := <-done; err != nil {
 		t.Fatalf("worker run: %v", err)
