@@ -15,15 +15,26 @@ import (
 // fixes its kernel-internal allocation leak (exec.(*KernelCtx).Allocate,
 // array.(*bufferBuilder).resize, array.(*builder).init — v18.7.0).
 //
-// GREEN (residual > 0): the limitation still exists. Our tests use
-// kernelAlloc (plain GoAllocator) for kernel-calling operators; our
-// builders are leak-asserted via checkedAlloc.
+// GREEN (residual > 0): the limitation still exists. Our tests use a single
+// tier: checkedAlloc(t) with AssertSize(t, 0) on cleanup. Builder
+// allocations are fully asserted; kernel-internal allocations leak from
+// the default allocator (invisible to CheckedAllocator).
 //
-// RED (residual == 0): arrow-go fixed it. UPGRADE: delete the
-// kernelAlloc split, thread checkedAlloc via compute.WithAllocator in
-// all tests. The two-tier allocation discipline becomes one tier.
+// RED (residual == 0): arrow-go fixed it. UPGRADE: thread checkedAlloc
+// via compute.WithAllocator in all kernel-calling tests. Builder + kernel
+// become one assertable tier.
+//
+// Decisions pinned here (§1):
+//   - Builder-side: fully asserted via checkedAlloc(t) + AssertSize.
+//   - Kernel-side: invisible by proven limitation (768 bytes residual).
+//   - Composite cast: pass-through only (no type conversion).
+//   - Null semantics: coalesce null → false (NOT Kleene).
+//   - Watermark: []byte (opaque, no deserialization).
 //
 // Run always — no env var, no skip. This is a sentinel, not a repro.
+//
+// Upstream: https://github.com/apache/arrow-go/issues/XXXX
+// (compute: kernel-internal buffers allocated via ctx allocator are never released)
 func TestArrowGoKernelResidual(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
 	ctx := compute.WithAllocator(context.Background(), alloc)
@@ -54,6 +65,6 @@ func TestArrowGoKernelResidual(t *testing.T) {
 
 	if alloc.CurrentAlloc() == 0 {
 		t.Error("arrow-go kernel internals no longer leak — UPGRADE TIME: " +
-			"delete the kernelAlloc split, thread checkedAlloc via compute.WithAllocator everywhere")
+			"thread checkedAlloc via compute.WithAllocator in all kernel-calling tests")
 	}
 }
