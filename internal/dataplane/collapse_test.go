@@ -11,10 +11,18 @@ import (
 )
 
 // kernelAlloc returns a plain allocator for tests that exercise compute
-// kernels. CheckedAllocator cannot track kernel-internal temporaries
-// (execBufBuilder, TakeArray internals) — they are freed by the kernel
-// via GC finalizers, not explicit Free, creating false-positive leak
-// reports. Builder-only tests should still use checkedAlloc(t).
+// kernels through our operators (which thread allocCtx).
+//
+// arrow-go v18.7.0 compute kernels allocate internal buffers via the
+// allocator passed through context (KernelCtx.Allocate, bufferBuilder.resize,
+// builder.init). These internal buffers are never freed by explicit Release
+// inside arrow-go — they are a confirmed leak in the arrow-go compute
+// package, not a GC timing issue. Verified by TestAllocatorThreadingExperiment
+// (pinned, isolated).
+//
+// Tests using kernelAlloc verify correctness via value assertions (row
+// counts, schema, watermark, data values). Builder-only tests should
+// still use checkedAlloc(t) — our builders DO balance Allocate/Free.
 func kernelAlloc() memory.Allocator {
 	return memory.NewGoAllocator()
 }
