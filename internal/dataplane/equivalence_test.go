@@ -157,23 +157,30 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
-		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 25, PKDomain: 25, Allocator: alloc})
+		// PKDomain=5 with NumRows=25 → ~5 rows per PK → multi-row matches
+		// with mixed ops. This makes order comparison meaningful.
+		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 25, PKDomain: 5, Allocator: alloc})
 		defer b.Release()
 
 		idCol := b.Record.Column(0).(*array.Int64)
-		target := idCol.Value(seed % int(idCol.Len()))
+		target := idCol.Value(seed % 5) // pick from 1..5 to guarantee a match
 
-		// Row-path: filter by id == target, preserving order
-		var rowSet []eqChange
+		// Row-path: classify by __op, filter by id == target
+		valCol := b.Record.Column(1).(*array.String)
+		opVals := extractOpCol(b)
+		var rowIns, rowUpd, rowDel []eqChange
 		for i := range int(idCol.Len()) {
-			if idCol.Value(i) == target {
-				valCol := b.Record.Column(1).(*array.String)
-				opVals := extractOpCol(b)
-				rowSet = append(rowSet, eqChange{
-					ID:  idCol.Value(i),
-					Val: valCol.Value(i),
-					Op:  opVals[i],
-				})
+			if idCol.Value(i) != target {
+				continue
+			}
+			ec := eqChange{ID: idCol.Value(i), Val: valCol.Value(i), Op: opVals[i]}
+			switch opVals[i] {
+			case 0:
+				rowIns = append(rowIns, ec)
+			case 1:
+				rowUpd = append(rowUpd, ec)
+			case 2:
+				rowDel = append(rowDel, ec)
 			}
 		}
 
@@ -192,14 +199,16 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("seed %d: Filter: %v", seed, err)
 		}
-		// Concatenate in order: inserts, updates, deletes (same order as row path)
-		var colAll []eqChange
-		colAll = append(colAll, batchToRowSlice(ins)...)
-		colAll = append(colAll, batchToRowSlice(upd)...)
-		colAll = append(colAll, batchToRowSlice(del)...)
 
-		if !sliceEqual(rowSet, colAll) {
-			t.Errorf("seed %d: filtered mismatch: row=%d, col=%d (target=%d)", seed, len(rowSet), len(colAll), target)
+		// Compare per class — each class preserves original order within it
+		if !sliceEqual(rowIns, batchToRowSlice(ins)) {
+			t.Errorf("seed %d: inserts mismatch: row=%d, col=%d (target=%d)", seed, len(rowIns), len(batchToRowSlice(ins)), target)
+		}
+		if !sliceEqual(rowUpd, batchToRowSlice(upd)) {
+			t.Errorf("seed %d: updates mismatch: row=%d, col=%d (target=%d)", seed, len(rowUpd), len(batchToRowSlice(upd)), target)
+		}
+		if !sliceEqual(rowDel, batchToRowSlice(del)) {
+			t.Errorf("seed %d: deletes mismatch: row=%d, col=%d (target=%d)", seed, len(rowDel), len(batchToRowSlice(del)), target)
 		}
 	}
 }

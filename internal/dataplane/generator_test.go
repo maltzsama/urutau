@@ -226,16 +226,21 @@ func TestGeneratorNullPK(t *testing.T) {
 	}
 }
 
-func TestBatchWatermarkImmutable(t *testing.T) {
-	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
-	defer b.Release()
-
-	wm := make([]byte, len(b.Watermark))
-	copy(wm, b.Watermark)
-
-	if string(b.Watermark) != string(wm) {
-		t.Errorf("Watermark changed: was %q, now %q", wm, b.Watermark)
+func TestGeneratorDeletesMidBatch(t *testing.T) {
+	found := false
+	for seed := range 50 {
+		alloc := checkedAlloc(t)
+		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 30, Allocator: alloc})
+		ops := opCol(b)
+		for i := 0; i < len(ops)-1; i++ { // exclude last row
+			if ops[i] == 2 {
+				found = true
+			}
+		}
+		b.Release()
+	}
+	if !found {
+		t.Error("no mid-batch delete across 50 seeds — hardest collapse case never generated")
 	}
 }
 
@@ -314,20 +319,5 @@ func TestGeneratorBeforeValReal(t *testing.T) {
 				t.Errorf("row %d: update/delete of PK %d has null __before_val", i, id)
 			}
 		}
-	}
-}
-
-func TestGeneratorDeletesAnyPosition(t *testing.T) {
-	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{
-		NumRows:   10,
-		Allocator: alloc,
-	})
-	defer b.Release()
-
-	// With DeletesOnlyAtEnd=false (default), deletes can appear anywhere.
-	// Just verify the batch has the right number of rows.
-	if b.Record.NumRows() != 10 {
-		t.Errorf("expected 10 rows, got %d", b.Record.NumRows())
 	}
 }

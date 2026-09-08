@@ -178,6 +178,10 @@ func TestAddMetadataColumns(t *testing.T) {
 	if out.Record.NumRows() != 5 {
 		t.Errorf("expected 5 rows, got %d", out.Record.NumRows())
 	}
+
+	if string(out.Watermark) != string(b.Watermark) {
+		t.Errorf("Watermark changed: %q -> %q", b.Watermark, out.Watermark)
+	}
 }
 
 func TestAddMetadataSnapshotPhase(t *testing.T) {
@@ -249,5 +253,47 @@ func TestCastInt64OverflowPreserved(t *testing.T) {
 		if len(val) == 0 {
 			t.Errorf("row %d: empty string after cast", i)
 		}
+	}
+}
+
+func TestCastStructReturnsError(t *testing.T) {
+	alloc := checkedAlloc(t)
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "s", Type: arrow.StructOf(arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int64}), Nullable: true},
+	}, nil)
+	bb := array.NewRecordBuilder(alloc, schema)
+	bb.Field(0).(*array.StructBuilder).Append(true)
+	bb.Field(0).(*array.StructBuilder).FieldBuilder(0).(*array.Int64Builder).Append(1)
+	rec := bb.NewRecordBatch()
+	bb.Release()
+	defer rec.Release()
+
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
+	_, err := dataplane.Cast(context.Background(), alloc, b, dataplane.CastPolicy{
+		"s": &arrow.StringType{},
+	})
+	if err == nil {
+		t.Error("expected error for struct → string cast")
+	}
+}
+
+func TestCastListReturnsError(t *testing.T) {
+	alloc := checkedAlloc(t)
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "lst", Type: arrow.ListOf(arrow.PrimitiveTypes.Int64), Nullable: true},
+	}, nil)
+	bb := array.NewRecordBuilder(alloc, schema)
+	bb.Field(0).(*array.ListBuilder).Append(true)
+	bb.Field(0).(*array.ListBuilder).ValueBuilder().(*array.Int64Builder).Append(1)
+	rec := bb.NewRecordBatch()
+	bb.Release()
+	defer rec.Release()
+
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
+	_, err := dataplane.Cast(context.Background(), alloc, b, dataplane.CastPolicy{
+		"lst": &arrow.StringType{},
+	})
+	if err == nil {
+		t.Error("expected error for list → string cast")
 	}
 }
