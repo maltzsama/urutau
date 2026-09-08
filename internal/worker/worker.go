@@ -173,13 +173,13 @@ func (w *Worker) RegisterCommitter(target string, c sink.TableWriter, mode chang
 // dropped (declared skip, or a record with no before image).
 func (w *Worker) OnDroppedDelete(f OnDroppedDelete) { w.onDroppedDelete = f }
 
-// Enricher rewrites a change's row with reference-table columns before it
-// is buffered. Drop reports an inner-join miss: the event's only effect is
-// its absence, and the batch position advances past it. Implemented by
-// internal/enrich.Stage; the interface keeps the worker free of the
-// reference-join machinery.
+// Enricher rewrites a columnar batch with reference-table columns before it
+// is buffered. The seam is columnar (CR-069 §3.4): *dataplane.Batch in,
+// *dataplane.Batch out. A nil output means every row was dropped by an inner
+// join. Implemented by internal/enrich.Stage; the interface keeps the worker
+// free of the reference-join machinery.
 type Enricher interface {
-	Enrich(changes []change.Change) ([]change.Change, error)
+	EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error)
 }
 
 // SetEnricher installs the enrichment stage for a target table. Nil (the
@@ -603,12 +603,29 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					}
 					c.After = c.Before
 					if p.enricher != nil {
-						enriched, err := p.enricher.Enrich([]change.Change{c})
+						// QUARANTINE: enrich the rewritten delete as a single-row
+						// batch through the columnar seam; dies when the join
+						// becomes columnar.
+						dpb, err := dpint.BatchFromChangeBatch(change.Batch{Table: p.target, Upserts: []change.Change{c}, Mode: change.AppendMode}, p.knownSchema)
+						if err != nil {
+							return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
+						}
+						enriched, err := p.enricher.EnrichBatch(dpb)
+						dpb.Release()
 						if err != nil {
 							return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
 						}
-						p.enrichDropped.Add(int64(1 - len(enriched)))
-						upserts = append(upserts, enriched...)
+						if enriched == nil {
+							p.enrichDropped.Add(1)
+							continue
+						}
+						enrichedRows, derr := decodeToChanges(enriched, p.knownSchema.PrimaryKey)
+						enriched.Release()
+						if derr != nil {
+							return fmt.Errorf("worker: table %s: decode: %w", p.target, derr)
+						}
+						p.enrichDropped.Add(int64(1 - len(enrichedRows)))
+						upserts = append(upserts, enrichedRows...)
 						continue
 					}
 				}
@@ -705,11 +722,54 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			if ing.Batch == nil {
 				continue
 			}
+			// Drift check runs on the SOURCE rows first — enrich adds reference
+			// columns that must not trip drift. QUARANTINE: decodes the batch;
+			// dies when the worker consumes Batch directly (M4).
+			if len(p.knownSchema.Columns) > 0 {
+				srcRows, derr := decodeToChanges(ing.Batch, p.knownSchema.PrimaryKey)
+				if derr != nil {
+					return fmt.Errorf("worker: table %s: decode: %w", p.target, derr)
+				}
+				for i := range srcRows {
+					c := &srcRows[i]
+					if c.After != nil {
+						if d, hit := checkDrift(c.After, p.knownSchema); hit {
+							p.snapshotMu.Lock()
+							first := !p.driftReported[d.Column]
+							p.driftReported[d.Column] = true
+							p.snapshotMu.Unlock()
+							if first && w.schemaDrift != nil {
+								w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
+							}
+							return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
+						}
+					}
+				}
+			}
+			// Enrich the whole batch (columnar seam), then decode.
+			batch := ing.Batch
+			if p.enricher != nil {
+				enriched, err := p.enricher.EnrichBatch(batch)
+				if err != nil {
+					return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
+				}
+				if enriched == nil {
+					// Every row was dropped by an inner join.
+					p.enrichDropped.Add(int64(batch.Record.NumRows()))
+					batch.Release()
+					continue
+				}
+				batch = enriched
+			}
 			// Decode the columnar batch to rows for per-row processing.
 			// QUARANTINE: dies when the worker consumes Batch directly (M4).
-			rows, err := decodeToChanges(ing.Batch, p.knownSchema.PrimaryKey)
+			rows, err := decodeToChanges(batch, p.knownSchema.PrimaryKey)
 			if err != nil {
+				batch.Release()
 				return fmt.Errorf("worker: table %s: decode: %w", p.target, err)
+			}
+			if p.enricher != nil && len(rows) < int(batch.Record.NumRows()) {
+				p.enrichDropped.Add(int64(batch.Record.NumRows() - int64(len(rows))))
 			}
 
 			for i := range rows {
@@ -748,44 +808,6 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					}
 					p.winMu.Unlock()
 				}
-				// Schema drift: a column that appears in the data but was not
-				// known at introspection means the source schema moved under the
-				// pipeline. Writing the row would corrupt the target (unknown
-				// column) or silently drop data, so the change is refused and
-				// the pipeline stops — restart only after the spec declares the
-				// column. The check is recursive: a field added inside a struct
-				// column is the same class of event as a top-level ADD COLUMN,
-				// reported with its full path. Reported once per path.
-				if len(p.knownSchema.Columns) > 0 && c.After != nil {
-					if d, hit := checkDrift(c.After, p.knownSchema); hit {
-						p.snapshotMu.Lock()
-						first := !p.driftReported[d.Column]
-						p.driftReported[d.Column] = true
-						p.snapshotMu.Unlock()
-						if first && w.schemaDrift != nil {
-							w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
-						}
-						return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
-					}
-				}
-				// Enrichment runs after the drift check (reference columns are
-				// not source columns — they must not trip drift) and before
-				// buffering, so a dropped event never enters the batch and a
-				// drained cold-start queue keeps its FIFO order.
-				if p.enricher != nil && c.After != nil {
-					enriched, err := p.enricher.Enrich([]change.Change{*c})
-					if err != nil {
-						return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
-					}
-					p.enrichDropped.Add(int64(1 - len(enriched)))
-					buf = append(buf, enriched...)
-					if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
-						if err := flush(); err != nil {
-							return err
-						}
-					}
-					continue
-				}
 				buf = append(buf, *c)
 				if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
 					if err := flush(); err != nil {
@@ -793,8 +815,12 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					}
 				}
 			}
-			// The demux handed us the batch; we own it and decoded it.
-			ing.Batch.Release()
+			// The demux handed us the batch; we own it and decoded it. The
+			// enriched batch (if any) is separate and also owned.
+			batch.Release()
+			if batch != ing.Batch {
+				ing.Batch.Release()
+			}
 		case <-ticker.C:
 			if err := flush(); err != nil {
 				return err
