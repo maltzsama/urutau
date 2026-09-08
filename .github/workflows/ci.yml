@@ -28,6 +28,7 @@ jobs:
 
       - name: Cache golangci-lint
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.cache/golangci-lint
@@ -38,6 +39,7 @@ jobs:
 
       - name: Cache buf
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.cache/buf
@@ -76,6 +78,7 @@ jobs:
 
       - name: Cache envtest assets
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: ~/.cache/setup-envtest
           key: ${{ runner.os }}-envtest-v1-${{ hashFiles('Makefile', 'go.mod') }}

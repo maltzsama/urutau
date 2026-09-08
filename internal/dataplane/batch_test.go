@@ -25,32 +25,29 @@ func newTestRecord(t *testing.T, alloc memory.Allocator) arrow.RecordBatch {
 }
 
 func TestReleaseNilRecord(t *testing.T) {
-	b := &dataplane.Batch{Table: "t", Watermark: "w"}
+	b := &dataplane.Batch{Table: "t", Watermark: []byte("w")}
 	b.Release()
 }
 
 func TestReleaseFreesRecord(t *testing.T) {
-	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	alloc := checkedAlloc(t)
 	rec := newTestRecord(t, alloc)
 
-	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: "w"}
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 	b.Release()
 
 	if b.Record != nil {
 		t.Fatal("Record not nil after Release")
 	}
-	alloc.AssertSize(t, 0)
 }
 
 func TestReleaseIdempotent(t *testing.T) {
-	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	alloc := checkedAlloc(t)
 	rec := newTestRecord(t, alloc)
 
-	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: "w"}
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 	b.Release()
 	b.Release()
-
-	alloc.AssertSize(t, 0)
 }
 
 func TestBatchTable(t *testing.T) {
@@ -58,52 +55,34 @@ func TestBatchTable(t *testing.T) {
 	rec := newTestRecord(t, alloc)
 	defer rec.Release()
 
-	b := &dataplane.Batch{Table: "orders", Record: rec, Watermark: "offset-42"}
+	b := &dataplane.Batch{Table: "orders", Record: rec, Watermark: []byte("offset-42")}
 	if b.Table != "orders" {
 		t.Errorf("Table = %q, want orders", b.Table)
 	}
-	if b.Watermark != "offset-42" {
-		t.Errorf("Watermark = %v, want offset-42", b.Watermark)
-	}
-}
-
-func TestBatchWatermarkTypes(t *testing.T) {
-	alloc := memory.NewGoAllocator()
-	rec := newTestRecord(t, alloc)
-	defer rec.Release()
-
-	for _, wm := range []any{"gtid-1", []byte{0x01, 0x02}, int64(999)} {
-		b := &dataplane.Batch{Table: "t", Record: rec, Watermark: wm}
-		if b.Watermark == nil {
-			t.Errorf("Watermark nil for %T", wm)
-		}
+	if string(b.Watermark) != "offset-42" {
+		t.Errorf("Watermark = %q, want offset-42", b.Watermark)
 	}
 }
 
 func TestBatchOwnershipTransfer(t *testing.T) {
-	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	alloc := checkedAlloc(t)
 	rec := newTestRecord(t, alloc)
 
 	producer := func() *dataplane.Batch {
-		return &dataplane.Batch{Table: "t", Record: rec, Watermark: "w"}
+		return &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 	}
 
 	b := producer()
 	b.Release()
-
-	alloc.AssertSize(t, 0)
 }
 
 func TestBatchRetainBeforeEscape(t *testing.T) {
-	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	alloc := checkedAlloc(t)
 	rec := newTestRecord(t, alloc)
 
-	// Simulate: flight reader reuses buffer. Retain before the batch
-	// escapes the read loop (CR-069 §1.2).
 	rec.Retain()
-	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: "w"}
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 
-	// Reader releases its copy.
 	rec.Release()
 
 	if b.Record.NumRows() != 1 {
@@ -111,5 +90,4 @@ func TestBatchRetainBeforeEscape(t *testing.T) {
 	}
 
 	b.Release()
-	alloc.AssertSize(t, 0)
 }
