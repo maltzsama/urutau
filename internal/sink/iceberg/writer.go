@@ -22,7 +22,6 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // ErrCommitExhausted marks a terminal commit failure: retries against the
@@ -135,64 +134,46 @@ func (w *TableWriter) Close() error { return nil }
 // QUARANTINE: the RecordBatch→change.Batch unpack is a bridge that dies
 // when the Iceberg sink consumes RecordBatch directly (commit 3/4).
 func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
-	// Unpack the columnar batch back to row-oriented changes.
-	// QUARANTINE: this bridge dies in commit 3/4.
-	cb, err := w.unpackBatch(b)
+	// Split the batch into upsert rows and delete rows by __op (columnar).
+	// The append path is fully columnar (projectRecord); the equality-delete
+	// keys are extracted for iceberg-go, whose API takes keys — the §4.1
+	// library boundary, not a data-path materialization.
+	upsertBatch, deleteBatch, err := splitByOp(ctx, b)
 	if err != nil {
-		return fmt.Errorf("iceberg: unpack: %w", err)
+		return err
+	}
+	if upsertBatch != nil {
+		defer upsertBatch.Release()
+	}
+	if deleteBatch != nil {
+		defer deleteBatch.Release()
 	}
 
-	hasUpserts := len(cb.Upserts) > 0
-	if cb.Mode == change.UpsertMode {
-		keys := append(collectKeys(cb.Upserts), collectKeys(cb.Deletes)...)
+	pos := string(b.Watermark)
+	if b.Mode == change.UpsertMode {
+		// Equality-delete the PKs of ALL rows (upserts delete their older
+		// versions, deletes are the last word).
+		keys, err := extractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
+		if err != nil {
+			return err
+		}
 		if len(keys) > 0 {
-			pos := ""
-			if !hasUpserts {
-				pos = cb.Position
+			// Position goes on the delete only when it IS the last commit.
+			delPos := ""
+			if upsertBatch == nil || upsertBatch.Record.NumRows() == 0 {
+				delPos = pos
 			}
-			if err := w.commitDeletes(ctx, keys, pos, cb.SnapshotState, cb.SnapshotPending); err != nil {
+			if err := w.commitDeletes(ctx, keys, delPos, b.SnapshotState, b.SnapshotPending); err != nil {
 				return err
 			}
 		}
 	}
-	if hasUpserts {
-		if err := w.commitAppend(ctx, cb); err != nil {
+	if upsertBatch != nil && upsertBatch.Record.NumRows() > 0 {
+		if err := w.commitAppend(ctx, upsertBatch, pos, b.SnapshotState, b.SnapshotPending); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// unpackBatch converts a columnar dataplane.Batch back to a row-oriented
-// change.Batch. QUARANTINE: dies when the Iceberg sink consumes RecordBatch
-// directly (commit 3/4).
-func (w *TableWriter) unpackBatch(b *dataplane.Batch) (change.Batch, error) {
-	if b.Record == nil || b.Record.NumRows() == 0 {
-		return change.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
-	}
-
-	rows, _, err := transport.DecodeBatch(b.Record, nil, w.delCols)
-	if err != nil {
-		return change.Batch{}, err
-	}
-
-	var upserts, deletes []change.Change
-	for _, r := range rows {
-		switch r.Op {
-		case change.OpDelete:
-			deletes = append(deletes, r)
-		default:
-			upserts = append(upserts, r)
-		}
-	}
-
-	return change.Batch{
-		Table:    b.Table,
-		Upserts:  upserts,
-		Deletes:  deletes,
-		Position: string(b.Watermark),
-		Mode:     b.Mode,
-	}, nil
 }
 
 func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos string, snapshotState string, snapshotPending []uint32) error {
@@ -282,8 +263,9 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	return fmt.Errorf("%w: delete commit on %v: %v", ErrCommitExhausted, w.ident, lastErr)
 }
 
-func (w *TableWriter) commitAppend(ctx context.Context, b change.Batch) error {
-	rec, err := w.dataRecord(b.Upserts)
+func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos string, snapshotState string, snapshotPending []uint32) error {
+	// Columnar projection: data columns retained/cast, metadata built.
+	rec, err := w.projectRecord(ctx, b)
 	if err != nil {
 		return err
 	}
@@ -292,12 +274,12 @@ func (w *TableWriter) commitAppend(ctx context.Context, b change.Batch) error {
 	defer at.Release()
 
 	// Build properties with snapshot state when present.
-	p := props(b.Position)
-	if b.SnapshotState != "" {
-		p["cdc.snapshot.state"] = b.SnapshotState
+	p := props(pos)
+	if snapshotState != "" {
+		p["cdc.snapshot.state"] = snapshotState
 	}
-	if b.SnapshotPending != nil {
-		p["cdc.snapshot.pending"] = snapshot.EncodePending(b.SnapshotPending)
+	if snapshotPending != nil {
+		p["cdc.snapshot.pending"] = snapshot.EncodePending(snapshotPending)
 	}
 
 	var lastErr error
@@ -464,14 +446,6 @@ func props(pos string) iceberg.Properties {
 	return iceberg.Properties{"cdc.position": pos}
 }
 
-func collectKeys(cs []change.Change) [][]any {
-	keys := make([][]any, 0, len(cs))
-	for _, c := range cs {
-		keys = append(keys, c.Key)
-	}
-	return keys
-}
-
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -544,6 +518,9 @@ func (w *TableWriter) deleteRecord(keys [][]any) (arrow.RecordBatch, error) {
 }
 
 // dataRecord builds one arrow record from the surviving rows.
+// QUARANTINE: row-based projection, kept only for test verification of the
+// projection logic. The production path uses projectRecord (columnar).
+// Deleted in commit 8.
 func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, error) {
 	b := array.NewRecordBuilder(memory.DefaultAllocator, w.dataSchema)
 	defer b.Release()
@@ -565,6 +542,8 @@ func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, er
 
 // project resolves a change's source columns (applying casts) and metadata
 // columns into a flat map matching the dataSchema field names.
+// QUARANTINE: row-based, kept for test verification; the production path is
+// projectRecord (columnar). Deleted in commit 8.
 func (w *TableWriter) project(c change.Change) (map[string]any, error) {
 	out := make(map[string]any, len(w.dataSchema.Fields()))
 	for _, f := range w.dataSchema.Fields() {
