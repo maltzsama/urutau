@@ -89,12 +89,37 @@ func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arro
 	return inserts, deletes, updates, nil
 }
 
-// Predicate is a simple column predicate for EvaluatePredicate.
-// Supported ops: "=", "!=".
+// Side determines which column version a predicate evaluates against.
+type Side uint8
+
+const (
+	// AfterSide evaluates over the data column (default).
+	AfterSide Side = iota
+	// BeforeSide evaluates over "__before_" + Column.
+	BeforeSide
+)
+
+// Predicate is a simple column predicate for EvaluatePredicate and
+// TransitionMatrix. Supported ops: "=", "!=".
 type Predicate struct {
 	Column string
 	Op     string
 	Value  any
+	Side   Side
+}
+
+// resolveColumn returns the column index for a predicate, resolving
+// the side (AfterSide → Column, BeforeSide → __before_ + Column).
+// Returns error if the column is not found — no silent fallback.
+func resolveColumn(schema *arrow.Schema, p Predicate) (int, error) {
+	name := p.Column
+	if p.Side == BeforeSide {
+		name = "__before_" + p.Column
+	}
+	if idx := colIndex(schema, name); idx >= 0 {
+		return idx, nil
+	}
+	return 0, fmt.Errorf("dataplane: transition: column %q not found", name)
 }
 
 // EvaluatePredicate builds a boolean mask from a predicate over the
@@ -104,9 +129,9 @@ func EvaluatePredicate(ctx context.Context, alloc memory.Allocator, batch *Batch
 	if batch.Record == nil {
 		return nil, fmt.Errorf("dataplane: nil record")
 	}
-	idx := colIndex(batch.Record.Schema(), pred.Column)
-	if idx < 0 {
-		return nil, fmt.Errorf("dataplane: column %q not found", pred.Column)
+	idx, err := resolveColumn(batch.Record.Schema(), pred)
+	if err != nil {
+		return nil, err
 	}
 	col := batch.Record.Column(idx)
 	return evaluateColPredicate(ctx, alloc, col, pred)
@@ -298,4 +323,141 @@ func colIndex(schema *arrow.Schema, name string) int {
 		}
 	}
 	return -1
+}
+
+// evalAll evaluates a list of predicates and ANDs their masks into a
+// single boolean mask. Empty predicates → all-true mask (pass-through).
+func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []Predicate) (arrow.Array, error) {
+	nrows := int(batch.Record.NumRows())
+	if len(preds) == 0 {
+		bb := array.NewBooleanBuilder(alloc)
+		defer bb.Release()
+		for range nrows {
+			bb.Append(true)
+		}
+		return bb.NewBooleanArray(), nil
+	}
+
+	var combined arrow.Array
+	for i, p := range preds {
+		mask, err := EvaluatePredicate(ctx, alloc, batch, p)
+		if err != nil {
+			if combined != nil {
+				combined.Release()
+			}
+			return nil, fmt.Errorf("dataplane: transition: predicate %d: %w", i, err)
+		}
+		if combined == nil {
+			combined = mask
+			continue
+		}
+		// AND: combined = combined AND mask
+		bb := array.NewBooleanBuilder(alloc)
+		defer bb.Release()
+		cArr := combined.(*array.Boolean)
+		mArr := mask.(*array.Boolean)
+		for j := range cArr.Len() {
+			bb.Append(cArr.Value(j) && mArr.Value(j))
+		}
+		mask.Release()
+		combined.Release()
+		combined = bb.NewBooleanArray()
+	}
+	return combined, nil
+}
+
+// TransitionMatrix classifies rows into insert/delete/update based on
+// before and after predicate evaluation (CR-069 §3.1).
+//
+// Quadrants (before_pass × after_pass):
+//
+//	insert  = !before & after  → row enters (upsert)
+//	delete  =  before & !after → row leaves (equality delete)
+//	update  =  before & after  → upsert (normal)
+//	neither = !before & !after → dropped, not in any output
+//
+// Null → false (coalesce, same as predicate evaluation).
+// Empty predicate lists → pass-through (everything passes).
+// __op does NOT participate — quadrants are the write decision;
+// op is CDC semantics.
+func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
+	before, after []Predicate) (inserts, deletes, updates *Batch, err error) {
+
+	if batch.Record == nil || batch.Record.NumRows() == 0 {
+		return nil, nil, nil, nil
+	}
+	nrows := int(batch.Record.NumRows())
+
+	beforePass, err := evalAll(ctx, alloc, batch, before)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer beforePass.Release()
+
+	afterPass, err := evalAll(ctx, alloc, batch, after)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer afterPass.Release()
+
+	bp := beforePass.(*array.Boolean)
+	ap := afterPass.(*array.Boolean)
+
+	// Build the three quadrant masks.
+	insMask := array.NewBooleanBuilder(alloc)
+	delMask := array.NewBooleanBuilder(alloc)
+	updMask := array.NewBooleanBuilder(alloc)
+	defer insMask.Release()
+	defer delMask.Release()
+	defer updMask.Release()
+
+	for i := range nrows {
+		b := bp.Value(i)
+		a := ap.Value(i)
+		insMask.Append(!b && a) // insert: !before & after
+		delMask.Append(b && !a) // delete: before & !after
+		updMask.Append(b && a)  // update: before & after
+	}
+
+	insBool := insMask.NewBooleanArray()
+	delBool := delMask.NewBooleanArray()
+	updBool := updMask.NewBooleanArray()
+	defer insBool.Release()
+	defer delBool.Release()
+	defer updBool.Release()
+
+	filterOpts := compute.DefaultFilterOptions()
+
+	filteredInserts, err := compute.FilterRecordBatch(ctx, batch.Record, insBool, filterOpts)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("dataplane: transition filter inserts: %w", err)
+	}
+	filteredDeletes, err := compute.FilterRecordBatch(ctx, batch.Record, delBool, filterOpts)
+	if err != nil {
+		filteredInserts.Release()
+		return nil, nil, nil, fmt.Errorf("dataplane: transition filter deletes: %w", err)
+	}
+	filteredUpdates, err := compute.FilterRecordBatch(ctx, batch.Record, updBool, filterOpts)
+	if err != nil {
+		filteredInserts.Release()
+		filteredDeletes.Release()
+		return nil, nil, nil, fmt.Errorf("dataplane: transition filter updates: %w", err)
+	}
+
+	if filteredInserts.NumRows() > 0 {
+		inserts = &Batch{Table: batch.Table, Record: filteredInserts, Watermark: batch.Watermark}
+	} else {
+		filteredInserts.Release()
+	}
+	if filteredDeletes.NumRows() > 0 {
+		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark}
+	} else {
+		filteredDeletes.Release()
+	}
+	if filteredUpdates.NumRows() > 0 {
+		updates = &Batch{Table: batch.Table, Record: filteredUpdates, Watermark: batch.Watermark}
+	} else {
+		filteredUpdates.Release()
+	}
+	return inserts, deletes, updates, nil
 }
