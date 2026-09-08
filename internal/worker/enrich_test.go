@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
@@ -58,7 +59,12 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		_, st := build(t, "left")
 		fc := &fakeCommitter{}
 		w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-		w.RegisterCommitter("t", fc, change.UpsertMode)
+		regTable(t, w, "t", fc, change.UpsertMode)
+		w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}},
+		}, PrimaryKey: []string{"id"}})
 		w.SetEnricher("t", st)
 		ingest := make(chan change.Change, 2)
 		ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",
@@ -80,7 +86,12 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		_, st := build(t, "inner")
 		fc := &fakeCommitter{}
 		w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-		w.RegisterCommitter("t", fc, change.UpsertMode)
+		regTable(t, w, "t", fc, change.UpsertMode)
+		w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}},
+		}, PrimaryKey: []string{"id"}})
 		w.SetEnricher("t", st)
 		ingest := make(chan change.Change, 2)
 		ingest <- change.Change{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, Position: "p1",

@@ -19,6 +19,7 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -273,14 +274,14 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
 	defer chunks.Close()
 
-	w.OnCommit(func(b change.Batch, rows int) {
+	w.OnCommit(func(b *dataplane.Batch, rows int) {
 		if cfg.FaultStopAck {
 			return
 		}
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
 			Table:    b.Table,
 			Epoch:    assign.Epoch,
-			Position: b.Position,
+			Position: string(b.Watermark),
 			Rows:     uint64(rows),
 		}}})
 	})

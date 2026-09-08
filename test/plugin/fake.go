@@ -8,7 +8,11 @@ package plugin
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
@@ -64,9 +68,72 @@ func newRecords() *records {
 }
 
 func (r *records) commit(b *dataplane.Batch) {
-	// QUARANTINE: bridge — accepts *dataplane.Batch but stores nothing yet.
-	// Dies when the plugin sink consumes RecordBatch directly.
-	_ = b
+	if b == nil || b.Record == nil {
+		return
+	}
+	schema := b.Record.Schema()
+	opIdx := -1
+	dataIdx := make(map[string]int)
+	for i := range schema.NumFields() {
+		name := schema.Field(i).Name
+		switch name {
+		case "__op":
+			opIdx = i
+		default:
+			if !strings.HasPrefix(name, "__") {
+				dataIdx[name] = i
+			}
+		}
+	}
+	n := int(b.Record.NumRows())
+	upserts := make([]change.Change, 0, n)
+	deletes := make([]change.Change, 0, n)
+	for row := 0; row < n; row++ {
+		c := change.Change{Table: b.Table, After: make(map[string]any, len(dataIdx))}
+		if opIdx >= 0 {
+			if oc, ok := b.Record.Column(opIdx).(*array.Uint8); ok && oc.Value(row) == uint8(change.OpDelete) {
+				c.Op = change.OpDelete
+			}
+		}
+		for name, ci := range dataIdx {
+			col := b.Record.Column(ci)
+			if col.IsNull(row) {
+				continue
+			}
+			v := arrowValue(col, row)
+			c.After[name] = v
+			if name == "id" {
+				c.Key = []any{v}
+			}
+		}
+		if c.Op == change.OpDelete {
+			deletes = append(deletes, c)
+		} else {
+			upserts = append(upserts, c)
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.upserts[b.Table] = append(r.upserts[b.Table], upserts...)
+	r.deletes[b.Table] = append(r.deletes[b.Table], deletes...)
+}
+
+// arrowValue reads a scalar Arrow value at row.
+func arrowValue(col arrow.Array, row int) any {
+	switch c := col.(type) {
+	case *array.Int64:
+		return c.Value(row)
+	case *array.Int32:
+		return c.Value(row)
+	case *array.String:
+		return c.Value(row)
+	case *array.Boolean:
+		return c.Value(row)
+	case *array.Float64:
+		return c.Value(row)
+	default:
+		return nil
+	}
 }
 
 func (r *records) rows(target string) []change.Change {

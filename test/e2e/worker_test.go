@@ -11,6 +11,7 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/spec"
@@ -80,10 +81,14 @@ tables:
 		t.Fatalf("writer: %v", err)
 	}
 
-	var committed []change.Batch
+	var committed []*dataplane.Batch
 	w := worker.New(worker.Config{MaxRows: 8, MaxInterval: 200 * time.Millisecond})
 	w.Register("raw.orders", wr, change.UpsertMode)
-	w.OnCommit(func(b change.Batch, _ int) { committed = append(committed, b) })
+	w.SetKnownSchema("raw.orders", core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+	}, PrimaryKey: []string{"id"}})
+	w.OnCommit(func(b *dataplane.Batch, _ int) { committed = append(committed, b) })
 
 	ingest := make(chan change.Change, 32)
 	done := make(chan error, 1)
@@ -124,7 +129,7 @@ tables:
 
 	// The position must have advanced to the last change, in the table
 	// property and visible to readers.
-	last := committed[len(committed)-1].Position
+	last := string(committed[len(committed)-1].Watermark)
 	if last != "p7" {
 		t.Fatalf("last committed position = %q, want p7", last)
 	}

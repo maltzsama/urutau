@@ -386,6 +386,6 @@ func (w *tableWriter) unpackBatch(b *dataplane.Batch) (change.Batch, error) {
 		Upserts:  upserts,
 		Deletes:  deletes,
 		Position: string(b.Watermark),
-		Mode:     change.UpsertMode,
+		Mode:     b.Mode,
 	}, nil
 }

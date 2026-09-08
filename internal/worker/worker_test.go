@@ -27,20 +27,23 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	defer f.mu.Unlock()
 	i := len(f.batches)
 	if b.Record == nil || b.Record.NumRows() == 0 {
-		f.batches = append(f.batches, change.Batch{Table: b.Table, Position: string(b.Watermark)})
+		f.batches = append(f.batches, change.Batch{Table: b.Table, Position: string(b.Watermark), Mode: b.Mode})
 	} else {
 		rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
-		var upserts, deletes []change.Change
-		for _, r := range rows {
-			if r.Op == change.OpDelete {
-				deletes = append(deletes, r)
-			} else {
-				upserts = append(upserts, r)
+		if b.Mode == change.AppendMode {
+			// Append: every row is an upsert (deletes already rewritten/dropped).
+			f.batches = append(f.batches, change.Batch{Table: b.Table, Upserts: rows, Position: string(b.Watermark), Mode: b.Mode})
+		} else {
+			var upserts, deletes []change.Change
+			for _, r := range rows {
+				if r.Op == change.OpDelete {
+					deletes = append(deletes, r)
+				} else {
+					upserts = append(upserts, r)
+				}
 			}
+			f.batches = append(f.batches, change.Batch{Table: b.Table, Upserts: upserts, Deletes: deletes, Position: string(b.Watermark), Mode: b.Mode})
 		}
-		f.batches = append(f.batches, change.Batch{
-			Table: b.Table, Upserts: upserts, Deletes: deletes, Position: string(b.Watermark), Mode: change.UpsertMode,
-		})
 	}
 	if f.failAt != nil && f.failAt[i] {
 		return errors.New("boom")
@@ -54,6 +57,21 @@ func chg(table string, op change.Op, id int64, v, pos string) change.Change {
 		c.After = map[string]any{"id": id, "v": v}
 	}
 	return c
+}
+
+// regTable registers a table with the id/v schema (tests). The worker's
+// columnar collapse needs the PK; tests that set up workers manually must
+// use this instead of bare RegisterCommitter.
+func regTable(t *testing.T, w *Worker, target string, c sink.TableWriter, mode change.WriteMode) {
+	t.Helper()
+	w.RegisterCommitter(target, c, mode)
+	w.SetKnownSchema(target, core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	})
 }
 
 func runWorker(t *testing.T, cfg Config, targets []string, committers map[string]sink.TableWriter, changes []change.Change) error {

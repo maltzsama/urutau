@@ -257,5 +257,6 @@ func (w *sinkWriter) unpackBatch(b *dataplane.Batch) (change.Batch, error) {
 		Upserts:  upserts,
 		Deletes:  deletes,
 		Position: string(b.Watermark),
+		Mode:     b.Mode,
 	}, nil
 }

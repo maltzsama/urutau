@@ -14,6 +14,7 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
@@ -518,17 +519,18 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 			"table": table, "position": pos,
 		})
 	})
-	w.OnCommit(func(b change.Batch, rows int) {
+	w.OnCommit(func(b *dataplane.Batch, rows int) {
+		up, del := worker.CountOps(b)
 		log.Info("commit", "table", b.Table, "rows", rows,
-			"upserts", len(b.Upserts), "deletes", len(b.Deletes), "position", b.Position)
+			"upserts", up, "deletes", del, "position", string(b.Watermark))
 		r.emit(eventlog.KindCommit, map[string]any{
 			"table": b.Table, "rows": rows,
-			"upserts": len(b.Upserts), "deletes": len(b.Deletes), "position": b.Position,
+			"upserts": up, "deletes": del, "position": string(b.Watermark),
 		})
 		// A garbage position string never advances the confirmed point.
-		p, err := src.ParsePosition(b.Position)
+		p, err := src.ParsePosition(string(b.Watermark))
 		if err != nil {
-			log.Warn("runner: commit position parse", "table", b.Table, "position", b.Position, "err", err)
+			log.Warn("runner: commit position parse", "table", b.Table, "position", string(b.Watermark), "err", err)
 			return
 		}
 		r.updateCommitted(b.Table, p)

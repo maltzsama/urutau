@@ -8,9 +8,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/snapshot"
@@ -29,7 +33,7 @@ type Config struct {
 }
 
 // OnCommit observes successful commits (bookkeeping, tests).
-type OnCommit func(b change.Batch, rows int)
+type OnCommit func(b *dataplane.Batch, rows int)
 
 // OnDroppedDelete observes a DELETE that append-only dropped: either the
 // table declared onDelete: skip, or onDelete: record could not because the
@@ -117,8 +121,10 @@ type tablePipeline struct {
 
 // readyBatch is a collapsed batch ready for commit.
 type readyBatch struct {
-	batch change.Batch
-	rows  int
+	batch   *dataplane.Batch
+	rows    int // rows fed into the batcher for this flush
+	upserts int // surviving upsert rows
+	deletes int // equality-delete rows
 }
 
 // New builds a worker; register tables before Run.
@@ -427,32 +433,26 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 }
 
 // runCommitter reads prepared batches and commits them serially.
-// QUARANTINE: the change.Batch -> *dataplane.Batch bridge dies when the
-// worker produces Batch directly (commit 3/4).
+// The batch is already columnar; the committer hands it straight to the
+// sink (commit 3 — the worker's main path produces dataplane.Batch).
 func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 	for rb := range p.readyCh {
 		start := time.Now()
-		// Bridge: convert change.Batch -> *dataplane.Batch.
-		// QUARANTINE: dies in commit 3/4.
-		dpb, err := dpint.BatchFromChangeBatch(rb.batch, p.knownSchema)
-		if err != nil {
-			return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
+		if w.onCommit != nil {
+			w.onCommit(rb.batch, rb.rows)
 		}
-		if err := p.committer.Commit(ctx, dpb); err != nil {
-			dpb.Release()
+		if err := p.committer.Commit(ctx, rb.batch); err != nil {
+			rb.batch.Release()
 			if w.metrics != nil {
 				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
 			}
 			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
 		}
-		dpb.Release()
+		rb.batch.Release()
 		if w.metrics != nil {
 			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
-			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(len(rb.batch.Upserts)))
-			w.metrics.EqualityDeletes.WithLabelValues(p.target, "upsert").Add(float64(len(rb.batch.Deletes)))
-		}
-		if w.onCommit != nil {
-			w.onCommit(rb.batch, rb.rows)
+			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(rb.upserts))
+			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(rb.deletes))
 		}
 	}
 	return nil
@@ -470,12 +470,15 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			return nil
 		}
 		pos := buf[len(buf)-1].Position
+		rows := len(buf)
 
 		// During snapshot phase, separate snapshot lines into two groups:
 		// untouched PKs (pure append, no delete) and touched PKs (upsert
 		// with delete). This eliminates equality deletes for the initial
 		// backfill on an empty table. A resumed snapshot skips this path
 		// entirely (see snapshotResumed).
+		// QUARANTINE: this partition path stays row-based until the sources
+		// produce Arrow (M4); only the normal upsert path is columnar.
 		p.snapshotMu.Lock()
 		inSnapshot := p.snapshotState == string(snapshot.StateInProgress)
 		guard := p.bootstrapGuard
@@ -483,9 +486,6 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		p.snapshotMu.Unlock()
 
 		if inSnapshot && !resumed && p.mode == change.UpsertMode {
-			// Partition: untouched snapshot lines go as pure append;
-			// everything else (live events + touched snapshot lines)
-			// goes as normal upsert.
 			var untouched []change.Change
 			var rest []change.Change
 			for _, c := range buf {
@@ -495,48 +495,43 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					rest = append(rest, c)
 				}
 			}
-			// The position travels only on the LAST commit: when an upsert
-			// batch follows, the append batch advances nothing — otherwise a
-			// crash between the two commits would resume past the not-yet-
-			// committed live events. When there is no upsert batch, the
-			// append is the last commit and carries the position.
 			appendPos := pos
 			if len(rest) > 0 {
 				appendPos = ""
 			}
 			if len(untouched) > 0 {
-				ab := change.Batch{
-					Table:    p.target,
-					Upserts:  untouched,
-					Position: appendPos,
-					Mode:     change.AppendMode,
-				}
+				ab := change.Batch{Table: p.target, Upserts: untouched, Position: appendPos, Mode: change.AppendMode}
 				p.snapshotMu.Lock()
 				ab.SnapshotState = p.snapshotState
 				ab.SnapshotPending = p.snapshotPending
 				p.snapshotMu.Unlock()
+				dpb, err := dpint.BatchFromChangeBatch(ab, p.knownSchema)
+				if err != nil {
+					return fmt.Errorf("worker: table %s: bridge append: %w", p.target, err)
+				}
+				dpb.SnapshotState = ab.SnapshotState
+				dpb.SnapshotPending = ab.SnapshotPending
 				select {
-				case p.readyCh <- readyBatch{batch: ab, rows: len(untouched)}:
+				case p.readyCh <- readyBatch{batch: dpb, rows: len(untouched), upserts: len(untouched)}:
 				case <-ctx.Done():
 					return ctx.Err()
 				}
 			}
-			// Send rest as normal upsert batch.
 			if len(rest) > 0 {
 				collapsed := change.Collapse(rest)
-				b := change.Batch{
-					Table:    p.target,
-					Upserts:  collapsed.Upserts,
-					Deletes:  collapsed.Deletes,
-					Position: pos,
-					Mode:     change.UpsertMode,
-				}
+				b := change.Batch{Table: p.target, Upserts: collapsed.Upserts, Deletes: collapsed.Deletes, Position: pos, Mode: change.UpsertMode}
 				p.snapshotMu.Lock()
 				b.SnapshotState = p.snapshotState
 				b.SnapshotPending = p.snapshotPending
 				p.snapshotMu.Unlock()
+				dpb, err := dpint.BatchFromChangeBatch(b, p.knownSchema)
+				if err != nil {
+					return fmt.Errorf("worker: table %s: bridge rest: %w", p.target, err)
+				}
+				dpb.SnapshotState = b.SnapshotState
+				dpb.SnapshotPending = b.SnapshotPending
 				select {
-				case p.readyCh <- readyBatch{batch: b, rows: len(rest)}:
+				case p.readyCh <- readyBatch{batch: dpb, rows: len(rest), upserts: len(collapsed.Upserts), deletes: len(collapsed.Deletes)}:
 				case <-ctx.Done():
 					return ctx.Err()
 				}
@@ -545,7 +540,6 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			return nil
 		}
 
-		var b change.Batch
 		switch p.mode {
 		case change.AppendMode:
 			upserts := make([]change.Change, 0, len(buf))
@@ -578,8 +572,6 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 						continue
 					}
 					c.After = c.Before
-					// A rewritten delete is a full row: it is enriched like
-					// any other, and an inner miss drops it here.
 					if p.enricher != nil {
 						enriched, err := p.enricher.Enrich([]change.Change{c})
 						if err != nil {
@@ -592,35 +584,72 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				}
 				upserts = append(upserts, c)
 			}
-			b = change.Batch{
-				Table:    p.target,
-				Upserts:  upserts,
-				Position: pos,
-				Mode:     change.AppendMode,
+			b := change.Batch{Table: p.target, Upserts: upserts, Position: pos, Mode: change.AppendMode}
+			p.snapshotMu.Lock()
+			b.SnapshotState = p.snapshotState
+			b.SnapshotPending = p.snapshotPending
+			p.snapshotMu.Unlock()
+			dpb, err := dpint.BatchFromChangeBatch(b, p.knownSchema)
+			if err != nil {
+				return fmt.Errorf("worker: table %s: bridge append: %w", p.target, err)
 			}
+			dpb.SnapshotState = b.SnapshotState
+			dpb.SnapshotPending = b.SnapshotPending
+			select {
+			case p.readyCh <- readyBatch{batch: dpb, rows: rows, upserts: len(upserts)}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			buf = buf[:0]
+			return nil
 		default:
-			collapsed := change.Collapse(buf)
-			b = change.Batch{
-				Table:    p.target,
-				Upserts:  collapsed.Upserts,
-				Deletes:  collapsed.Deletes,
-				Position: pos,
-				Mode:     change.UpsertMode,
+			// Columnar upsert path: bridge the accumulated changes to a
+			// dataplane.Batch and collapse columnar (CR-069 §3.2). The
+			// collapsed upserts/deletes are merged back into ONE batch —
+			// the sink commits a single batch per flush, and the position
+			// must never separate from its data (two commits would advance
+			// past uncommitted upserts on a crash between them).
+			cb := change.Batch{Table: p.target, Upserts: buf, Position: pos, Mode: change.UpsertMode}
+			dpb, err := dpint.BatchFromChangeBatch(cb, p.knownSchema)
+			if err != nil {
+				return fmt.Errorf("worker: table %s: bridge upsert: %w", p.target, err)
 			}
+			p.snapshotMu.Lock()
+			dpb.SnapshotState = p.snapshotState
+			dpb.SnapshotPending = p.snapshotPending
+			p.snapshotMu.Unlock()
+			upCount, delCount := 0, 0
+			upserts, deletes, err := dpint.Collapse(ctx, nil, dpb, p.knownSchema.PrimaryKey)
+			dpb.Release()
+			if err != nil {
+				return fmt.Errorf("worker: table %s: collapse: %w", p.target, err)
+			}
+			if upserts != nil {
+				upCount = int(upserts.Record.NumRows())
+			}
+			if deletes != nil {
+				delCount = int(deletes.Record.NumRows())
+			}
+			combined, err := mergeBatches(upserts, deletes, nil)
+			if upserts != nil {
+				upserts.Release()
+			}
+			if deletes != nil {
+				deletes.Release()
+			}
+			if err != nil {
+				return fmt.Errorf("worker: table %s: merge: %w", p.target, err)
+			}
+			if combined != nil {
+				select {
+				case p.readyCh <- readyBatch{batch: combined, rows: rows, upserts: upCount, deletes: delCount}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			buf = buf[:0]
+			return nil
 		}
-		// Attach snapshot state so it is persisted atomically with position.
-		p.snapshotMu.Lock()
-		b.SnapshotState = p.snapshotState
-		b.SnapshotPending = p.snapshotPending
-		p.snapshotMu.Unlock()
-		rows := len(buf)
-		buf = buf[:0]
-		select {
-		case p.readyCh <- readyBatch{batch: b, rows: rows}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		return nil
 	}
 
 	for {
@@ -727,4 +756,86 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// countOps returns the number of upsert and delete rows in a batch by
+// scanning its __op column. Used by OnCommit observers for bookkeeping.
+func CountOps(b *dataplane.Batch) (upserts, deletes int) {
+	if b == nil || b.Record == nil {
+		return 0, 0
+	}
+	opIdx := -1
+	schema := b.Record.Schema()
+	for i := range schema.NumFields() {
+		if schema.Field(i).Name == "__op" {
+			opIdx = i
+			break
+		}
+	}
+	if opIdx < 0 {
+		return int(b.Record.NumRows()), 0
+	}
+	opCol, ok := b.Record.Column(opIdx).(*array.Uint8)
+	if !ok {
+		return int(b.Record.NumRows()), 0
+	}
+	for i := range opCol.Len() {
+		if opCol.Value(i) == uint8(change.OpDelete) {
+			deletes++
+		} else {
+			upserts++
+		}
+	}
+	return upserts, deletes
+}
+
+// mergeBatches concatenates two same-schema batches (upserts + deletes)
+// into a single batch. Returns nil when both inputs are empty. The caller
+// owns the input batches; they are NOT released here.
+func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Batch, error) {
+	// Ownership: the returned batch ALWAYS holds its own retained refs.
+	// The caller owns a and b and releases them after this call. Never
+	// return an input pointer directly — the caller's Release would free
+	// the returned batch's record.
+	if a == nil || a.Record == nil || a.Record.NumRows() == 0 {
+		if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
+			return nil, nil
+		}
+		b.Record.Retain()
+		return &dataplane.Batch{Table: b.Table, Record: b.Record, Watermark: b.Watermark,
+			SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending}, nil
+	}
+	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
+		a.Record.Retain()
+		return &dataplane.Batch{Table: a.Table, Record: a.Record, Watermark: a.Watermark,
+			SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending}, nil
+	}
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
+	schema := a.Record.Schema()
+	ncols := int(schema.NumFields())
+	nrows := a.Record.NumRows() + b.Record.NumRows()
+	cols := make([]arrow.Array, ncols)
+	for i := range ncols {
+		cat, err := array.Concatenate([]arrow.Array{a.Record.Column(i), b.Record.Column(i)}, alloc)
+		if err != nil {
+			for j := range i {
+				cols[j].Release()
+			}
+			return nil, err
+		}
+		cols[i] = cat
+	}
+	rec := array.NewRecordBatch(schema, cols, nrows)
+	for _, c := range cols {
+		c.Release()
+	}
+	return &dataplane.Batch{
+		Table:           a.Table,
+		Record:          rec,
+		Watermark:       a.Watermark,
+		SnapshotState:   a.SnapshotState,
+		SnapshotPending: a.SnapshotPending,
+	}, nil
 }

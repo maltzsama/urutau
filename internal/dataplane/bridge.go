@@ -34,13 +34,14 @@ func BatchFromChangeBatch(b change.Batch, cs core.Schema) (*Batch, error) {
 	all = append(all, b.Upserts...)
 	all = append(all, b.Deletes...)
 	if len(all) == 0 {
-		return &Batch{Table: b.Table, Watermark: []byte(b.Position)}, nil
+		return &Batch{Table: b.Table, Watermark: []byte(b.Position), Mode: b.Mode}, nil
 	}
 
-	// If no schema provided, infer from the changes.
-	if len(cs.Columns) == 0 {
-		cs = schemaFromChanges(all)
-	}
+	// Schema: known schema, plus any columns the changes carry that the
+	// known schema lacks (enriched columns, e.g. join output). Enrichment
+	// adds columns after registration, so the known schema alone would
+	// drop them on the wire.
+	cs = mergeSchema(all, cs)
 
 	meta := &pb.BatchMeta{
 		Table:   b.Table,
@@ -71,6 +72,7 @@ func BatchFromChangeBatch(b change.Batch, cs core.Schema) (*Batch, error) {
 		Table:           b.Table,
 		Record:          rec,
 		Watermark:       []byte(b.Position),
+		Mode:            b.Mode,
 		SnapshotState:   b.SnapshotState,
 		SnapshotPending: b.SnapshotPending,
 	}, nil
@@ -121,4 +123,25 @@ func goTypeToCore(v any) core.ColumnType {
 	default:
 		return core.ColumnType{Kind: core.KindString}
 	}
+}
+
+// mergeSchema returns the known schema extended with any columns present in
+// the changes but missing from it (enriched columns). When the known schema
+// is empty, infers entirely from the changes.
+func mergeSchema(changes []change.Change, cs core.Schema) core.Schema {
+	if len(cs.Columns) == 0 {
+		return schemaFromChanges(changes)
+	}
+	has := make(map[string]bool, len(cs.Columns))
+	for _, c := range cs.Columns {
+		has[c.Name] = true
+	}
+	inferred := schemaFromChanges(changes)
+	for _, col := range inferred.Columns {
+		if !has[col.Name] {
+			cs.Columns = append(cs.Columns, col)
+			has[col.Name] = true
+		}
+	}
+	return cs
 }
