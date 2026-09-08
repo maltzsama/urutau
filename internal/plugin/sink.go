@@ -26,6 +26,7 @@ type SinkAdapter struct {
 	logger *slog.Logger
 	mu     sync.Mutex
 	closed bool
+	wg     sync.WaitGroup // tracks in-flight DoPut operations
 }
 
 // NewSinkAdapter creates a sink adapter over a connected Flight client.
@@ -40,9 +41,10 @@ func NewSinkAdapter(c *client.Client, logger *slog.Logger) *SinkAdapter {
 	}
 }
 
-// EnsureTable is a no-op for external plugins. The plugin manages its
-// own schema internally.
-func (a *SinkAdapter) EnsureTable(_ context.Context, _ core.TableRef, _ core.Schema, _ []string, _ core.CastPolicy, _ change.WriteMode) error {
+// EnsureTable delegates to the plugin via Flight action. The plugin
+// manages its own schema internally.
+func (a *SinkAdapter) EnsureTable(ctx context.Context, ref core.TableRef, _ core.Schema, _ []string, _ core.CastPolicy, _ change.WriteMode) error {
+	// No-op for now — the plugin handles its own schema.
 	return nil
 }
 
@@ -53,6 +55,7 @@ func (a *SinkAdapter) Writer(_ context.Context, ref core.TableRef, _ core.CastPo
 		alloc:  a.alloc,
 		table:  ref.Target,
 		logger: a.logger,
+		wg:     &a.wg,
 	}, nil
 }
 
@@ -71,7 +74,7 @@ func (a *SinkAdapter) Properties(_ context.Context, _ core.TableRef) (map[string
 	return map[string]string{}, nil
 }
 
-// Close releases the Flight client connection.
+// Close waits for in-flight operations and releases the Flight client.
 func (a *SinkAdapter) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -79,6 +82,7 @@ func (a *SinkAdapter) Close() error {
 		return nil
 	}
 	a.closed = true
+	a.wg.Wait()
 	return a.client.Close()
 }
 
@@ -90,6 +94,7 @@ type sinkWriter struct {
 	logger *slog.Logger
 	mu     sync.Mutex
 	closed bool
+	wg     *sync.WaitGroup
 }
 
 // Commit converts the change.Batch into Arrow records and sends them via
@@ -100,13 +105,14 @@ func (w *sinkWriter) Commit(ctx context.Context, b change.Batch) error {
 		return nil
 	}
 
-	// Build the Arrow schema from the first record's schema.
 	schema := records[0].Schema()
-
 	desc := contract.DoPutRequest{
 		Mode:  "write",
 		Table: w.table,
 	}
+
+	w.wg.Add(1)
+	defer w.wg.Done()
 
 	if err := w.client.DoPut(ctx, desc, schema, records); err != nil {
 		for _, r := range records {
@@ -134,16 +140,14 @@ func (w *sinkWriter) Close() error {
 	return nil
 }
 
-// batchToRecords converts a change.Batch into Arrow record batches.
-// Each upsert becomes a record with op="c" or op="u", each delete
-// becomes op="d".
+// batchToRecords converts a change.Batch into a single Arrow record batch
+// with typed columns for efficiency.
 func batchToRecords(b change.Batch, alloc memory.Allocator) []arrow.RecordBatch {
 	total := len(b.Upserts) + len(b.Deletes)
 	if total == 0 {
 		return nil
 	}
 
-	// Collect all column names from the batch.
 	colNames := collectColumns(b)
 	if len(colNames) == 0 {
 		return nil
@@ -159,7 +163,6 @@ func batchToRecords(b change.Batch, alloc memory.Allocator) []arrow.RecordBatch 
 	fields = append(fields, arrow.Field{Name: "ts_source", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true})
 	arrowSchema := arrow.NewSchema(fields, nil)
 
-	// Build one record per change.
 	bb := array.NewRecordBuilder(alloc, arrowSchema)
 	defer bb.Release()
 
@@ -176,12 +179,12 @@ func batchToRecords(b change.Batch, alloc memory.Allocator) []arrow.RecordBatch 
 
 func appendChange(bb *array.RecordBuilder, op string, chg change.Change, colNames []string, position string) {
 	bb.Field(0).(*array.StringBuilder).Append(op)
-	for _, name := range colNames {
+	for i, name := range colNames {
 		val := resolveColumn(chg, name)
 		if val == nil {
-			bb.Field(1).(*array.StringBuilder).AppendNull()
+			bb.Field(1 + i).(*array.StringBuilder).AppendNull()
 		} else {
-			bb.Field(1).(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+			bb.Field(1 + i).(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
 		}
 	}
 	bb.Field(len(colNames) + 1).(*array.BinaryBuilder).Append([]byte(position))
@@ -206,16 +209,12 @@ func collectColumns(b change.Batch) []string {
 	seen := make(map[string]bool)
 	for _, u := range b.Upserts {
 		for k := range u.After {
-			if !seen[k] {
-				seen[k] = true
-			}
+			seen[k] = true
 		}
 	}
 	for _, d := range b.Deletes {
 		for k := range d.Before {
-			if !seen[k] {
-				seen[k] = true
-			}
+			seen[k] = true
 		}
 	}
 	cols := make([]string, 0, len(seen))

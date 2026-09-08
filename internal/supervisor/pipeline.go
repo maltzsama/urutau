@@ -18,6 +18,9 @@ type PipelineSupervisor struct {
 	sink   *StageSupervisor
 	logger *slog.Logger
 	stages []*StageSupervisor
+
+	readyOnce sync.Once
+	ready     chan struct{} // closed when both stages are connected
 }
 
 // PipelineConfig carries the complete configuration for a pipeline's
@@ -40,6 +43,7 @@ func NewPipelineSupervisor(cfg PipelineConfig, logger *slog.Logger) *PipelineSup
 		sink:   snk,
 		logger: logger,
 		stages: []*StageSupervisor{src, snk},
+		ready:  make(chan struct{}),
 	}
 }
 
@@ -54,6 +58,9 @@ func (p *PipelineSupervisor) Sink() *StageSupervisor { return p.sink }
 func (p *PipelineSupervisor) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Start readiness monitor.
+	go p.monitorReady(ctx)
 
 	// Start all stages concurrently.
 	errCh := make(chan error, len(p.stages))
@@ -71,10 +78,8 @@ func (p *PipelineSupervisor) Run(ctx context.Context) error {
 			if firstErr == nil {
 				firstErr = err
 			}
-			// Cancel context to stop all other stages.
 			cancel()
 		case <-ctx.Done():
-			// Context was cancelled externally.
 		}
 	}
 
@@ -84,6 +89,25 @@ func (p *PipelineSupervisor) Run(ctx context.Context) error {
 	p.shutdownAll(shutdownCtx)
 
 	return firstErr
+}
+
+// monitorReady watches both stages and closes the ready channel once
+// both have a connected client.
+func (p *PipelineSupervisor) monitorReady(ctx context.Context) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if p.source.Stage() != nil && p.source.Stage().Client != nil &&
+				p.sink.Stage() != nil && p.sink.Stage().Client != nil {
+				p.readyOnce.Do(func() { close(p.ready) })
+				return
+			}
+		}
+	}
 }
 
 // shutdownAll stops all stages. Errors are logged but do not propagate.
@@ -139,6 +163,7 @@ type StageHealth struct {
 }
 
 // Health returns the current health of all stages.
+// A stage is considered healthy if it has been started and has not died.
 func (p *PipelineSupervisor) Health() StageHealth {
 	return StageHealth{
 		SourceHealthy: p.source.Stage() != nil && p.source.DeadErr() == nil,
@@ -151,17 +176,10 @@ func (p *PipelineSupervisor) Health() StageHealth {
 // WaitForReady blocks until both source and sink stages are connected,
 // or returns an error if the context is cancelled.
 func (p *PipelineSupervisor) WaitForReady(ctx context.Context) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if p.source.Stage() != nil && p.source.Stage().Client != nil &&
-				p.sink.Stage() != nil && p.sink.Stage().Client != nil {
-				return nil
-			}
-		}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.ready:
+		return nil
 	}
 }
