@@ -1,7 +1,7 @@
-// Package dataplane — bridge from change.Batch to *dataplane.Batch.
+// Package dataplane — bridge from rowchange.Batch to *dataplane.Batch.
 //
 // QUARANTINE: this file is a TRANSITION adapter. It converts the old
-// row-oriented change.Batch into a columnar dataplane.Batch using the
+// row-oriented rowchange.Batch into a columnar dataplane.Batch using the
 // transport's EncodeBatch (typed, tested). The round-trip through IPC
 // serialization is intentional: it reuses existing tested code instead
 // of hand-rolling a new builder (lesson from ghost commit e273866c).
@@ -16,25 +16,26 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	publicdp "github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
-// BatchFromChangeBatch converts a row-oriented change.Batch into a
+// BatchFromChangeBatch converts a row-oriented rowchange.Batch into a
 // columnar dataplane.Batch via the transport's EncodeBatch. The RecordBatch
 // carries the wire schema (data + __op + __pos + __commit_ts + __ingest_ts
 // + __snapshot). The caller owns the returned Batch.
 //
 // QUARANTINE: dies in commit 3/4 when the worker produces Batch directly.
-func BatchFromChangeBatch(b change.Batch, cs core.Schema) (*Batch, error) {
+func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 	// Merge upserts and deletes into a single ordered slice.
-	all := make([]change.Change, 0, len(b.Upserts)+len(b.Deletes))
+	all := make([]rowchange.Change, 0, len(b.Upserts)+len(b.Deletes))
 	all = append(all, b.Upserts...)
 	all = append(all, b.Deletes...)
 	if len(all) == 0 {
-		return &Batch{Table: b.Table, Watermark: []byte(b.Position), Mode: b.Mode}, nil
+		return &Batch{Table: b.Table, Watermark: []byte(b.Position), Mode: publicdp.WriteMode(b.Mode)}, nil
 	}
 
 	// Schema: known schema, plus any columns the changes carry that the
@@ -72,7 +73,7 @@ func BatchFromChangeBatch(b change.Batch, cs core.Schema) (*Batch, error) {
 		Table:           b.Table,
 		Record:          rec,
 		Watermark:       []byte(b.Position),
-		Mode:            b.Mode,
+		Mode:            publicdp.WriteMode(b.Mode),
 		SnapshotState:   b.SnapshotState,
 		SnapshotPending: b.SnapshotPending,
 	}, nil
@@ -80,7 +81,7 @@ func BatchFromChangeBatch(b change.Batch, cs core.Schema) (*Batch, error) {
 
 // schemaFromChanges infers a core.Schema from the changes' After/Before maps.
 // QUARANTINE: dies in commit 3/4.
-func schemaFromChanges(changes []change.Change) core.Schema {
+func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	seen := make(map[string]core.ColumnType)
 	for _, c := range changes {
 		src := c.After
@@ -128,7 +129,7 @@ func goTypeToCore(v any) core.ColumnType {
 // mergeSchema returns the known schema extended with any columns present in
 // the changes but missing from it (enriched columns). When the known schema
 // is empty, infers entirely from the changes.
-func mergeSchema(changes []change.Change, cs core.Schema) core.Schema {
+func mergeSchema(changes []rowchange.Change, cs core.Schema) core.Schema {
 	if len(cs.Columns) == 0 {
 		return schemaFromChanges(changes)
 	}

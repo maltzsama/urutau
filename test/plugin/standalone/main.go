@@ -13,7 +13,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
@@ -70,32 +69,32 @@ func (pluginSource) ParsePosition(s string) (position.Position, error) {
 	return pluginPos(n), nil
 }
 
-func (pluginSource) Open(_ context.Context, _ []source.TableRef) (source.Reader, error) {
-	return &pluginReader{out: make(chan change.Change, 100)}, nil
+func (pluginSource) Open(_ context.Context, refs []source.TableRef) (source.Reader, error) {
+	return &pluginReader{batch: pluginSeedBatch(refs)}, nil
 }
 
 type pluginReader struct {
-	out chan change.Change
+	batch *dataplane.Batch
+	sent  bool
 }
 
-func (r *pluginReader) Start(ctx context.Context, _ position.Position) error {
-	return nil
-}
+func (r *pluginReader) Start(context.Context, position.Position) error { return nil }
 
 func (r *pluginReader) Next(ctx context.Context) (*dataplane.Batch, error) {
-	select {
-	case c, ok := <-r.out:
-		if !ok {
-			return nil, nil
-		}
-		return pluginChangeToBatch(c), nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if !r.sent {
+		r.sent = true
+		return r.batch, nil
 	}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
-// pluginChangeToBatch builds a single-row wire batch (test-only).
-func pluginChangeToBatch(c change.Change) *dataplane.Batch {
+// pluginSeedBatch builds a two-row wire batch (test-only).
+func pluginSeedBatch(refs []source.TableRef) *dataplane.Batch {
+	target := "raw.t"
+	if len(refs) > 0 {
+		target = refs[0].Target
+	}
 	schema := arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "v", Type: arrow.BinaryTypes.String},
@@ -106,15 +105,17 @@ func pluginChangeToBatch(c change.Change) *dataplane.Batch {
 		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	}, nil)
 	bb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
-	bb.Field(0).(*array.Int64Builder).Append(c.After["id"].(int64))
-	bb.Field(1).(*array.StringBuilder).Append(c.After["v"].(string))
-	bb.Field(2).(*array.Uint8Builder).Append(uint8(c.Op))
-	bb.Field(3).(*array.StringBuilder).Append(c.Position)
-	bb.Field(4).(*array.TimestampBuilder).AppendNull()
-	bb.Field(5).(*array.TimestampBuilder).AppendNull()
-	bb.Field(6).(*array.BooleanBuilder).Append(c.Snapshot)
+	for i, v := range []string{"a", "b"} {
+		bb.Field(0).(*array.Int64Builder).Append(int64(i + 1))
+		bb.Field(1).(*array.StringBuilder).Append(v)
+		bb.Field(2).(*array.Uint8Builder).Append(0) // insert
+		bb.Field(3).(*array.StringBuilder).Append("p")
+		bb.Field(4).(*array.TimestampBuilder).AppendNull()
+		bb.Field(5).(*array.TimestampBuilder).AppendNull()
+		bb.Field(6).(*array.BooleanBuilder).Append(false)
+	}
 	rec := bb.NewRecordBatch()
-	return &dataplane.Batch{Table: c.Table, Record: rec, Watermark: []byte(c.Position)}
+	return &dataplane.Batch{Table: target, Record: rec, Watermark: []byte("p2")}
 }
 
 func (r *pluginReader) Synced() position.Position                         { return pluginPos(0) }
@@ -160,7 +161,7 @@ type pluginSink struct {
 	records *pluginRecords
 }
 
-func (s *pluginSink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, change.WriteMode) error {
+func (s *pluginSink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, dataplane.WriteMode) error {
 	return nil
 }
 

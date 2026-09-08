@@ -7,9 +7,9 @@ import (
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
@@ -124,7 +124,7 @@ func (w *tableWriter) nextSeq() uint64 {
 // as tombstones. Atomic if — and only if — every row lands in the same
 // partition, which is why the default table has no PARTITION BY.
 //
-// QUARANTINE: the RecordBatch→change.Batch unpack is a bridge that dies
+// QUARANTINE: the RecordBatch→rowchange.Batch unpack is a bridge that dies
 // when the ClickHouse sink consumes RecordBatch directly.
 func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// Unpack the columnar batch back to row-oriented changes.
@@ -141,7 +141,7 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		cols[i] = make([]any, 0, n)
 	}
 
-	emit := func(c change.Change, isDeleted bool) error {
+	emit := func(c rowchange.Change, isDeleted bool) error {
 		proj, err := w.project(c, isDeleted, cb.Position, seq)
 		if err != nil {
 			return err
@@ -198,7 +198,7 @@ func (w *tableWriter) Close() error { return nil }
 // the change header; a tombstone carries only its key. The technical values
 // (position/seq/is_deleted) travel under reserved keys — the commit
 // coordinate is the BATCH's position, the one thing resume may trust.
-func (w *tableWriter) project(c change.Change, isDeleted bool, batchPos string, seq uint64) (map[string]any, error) {
+func (w *tableWriter) project(c rowchange.Change, isDeleted bool, batchPos string, seq uint64) (map[string]any, error) {
 	out := make(map[string]any, len(w.cols))
 	out[positionKey] = batchPos
 	out[seqKey] = seq
@@ -290,9 +290,9 @@ const (
 	deletedKey  = "\x00is_deleted"
 )
 
-// metaValue resolves one metadata key to its concrete value for a change.
+// metaValue resolves one metadata key to its concrete value for a rowchange.
 // Mirrors the Iceberg sink's projection — same keys, same nil semantics.
-func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, error) {
+func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (any, error) {
 	switch key {
 	case core.MetaOp:
 		return c.Op.String(), nil
@@ -359,33 +359,33 @@ func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, 
 }
 
 // unpackBatch converts a columnar dataplane.Batch back to a row-oriented
-// change.Batch. QUARANTINE: dies when the ClickHouse sink consumes
+// rowchange.Batch. QUARANTINE: dies when the ClickHouse sink consumes
 // RecordBatch directly.
-func (w *tableWriter) unpackBatch(b *dataplane.Batch) (change.Batch, error) {
+func (w *tableWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
 	if b.Record == nil || b.Record.NumRows() == 0 {
-		return change.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
+		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
 	}
 
 	rows, _, err := transport.DecodeBatch(b.Record, nil, w.pk)
 	if err != nil {
-		return change.Batch{}, err
+		return rowchange.Batch{}, err
 	}
 
-	var upserts, deletes []change.Change
+	var upserts, deletes []rowchange.Change
 	for _, r := range rows {
 		switch r.Op {
-		case change.OpDelete:
+		case rowchange.OpDelete:
 			deletes = append(deletes, r)
 		default:
 			upserts = append(upserts, r)
 		}
 	}
 
-	return change.Batch{
+	return rowchange.Batch{
 		Table:    b.Table,
 		Upserts:  upserts,
 		Deletes:  deletes,
 		Position: string(b.Watermark),
-		Mode:     b.Mode,
+		Mode:     rowchange.WriteMode(b.Mode),
 	}, nil
 }

@@ -25,10 +25,20 @@
 // Physical sinks truncate __commit_ts as needed (Iceberg µs).
 package dataplane
 
-import (
-	"github.com/apache/arrow-go/v18/arrow"
+import "github.com/apache/arrow-go/v18/arrow"
 
-	"github.com/maltzsama/urutau/change"
+// WriteMode selects the write shape a batch serves: upsert
+// (equality-delete capable) or append (plain log, deletes already
+// rewritten/dropped by the worker). The sink must know it to apply the
+// right write path.
+type WriteMode uint8
+
+const (
+	// UpsertMode collapses batches per-key and applies equality deletes.
+	UpsertMode WriteMode = iota
+	// AppendMode passes every change through without collapse; deletes
+	// arrive as rows carrying the operation.
+	AppendMode
 )
 
 // Batch is the unit of work on the data plane: one table, one
@@ -60,7 +70,7 @@ type Batch struct {
 	// Mode is the write shape this batch serves: upsert (equality-delete
 	// capable) or append (plain log, deletes already rewritten/dropped by
 	// the worker). The sink must know it to apply the right write path.
-	Mode change.WriteMode
+	Mode WriteMode
 
 	// SnapshotState is the resumable-backfill state machine value
 	// ("not_started", "in_progress", "complete"). Traveled with the

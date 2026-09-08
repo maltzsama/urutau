@@ -18,9 +18,9 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
@@ -131,7 +131,7 @@ func (w *TableWriter) Close() error { return nil }
 // the position has not advanced. Resume reprocesses the batch: deletes are
 // idempotent, appends rewrite. Converges without loss.
 //
-// QUARANTINE: the RecordBatch→change.Batch unpack is a bridge that dies
+// QUARANTINE: the RecordBatch→rowchange.Batch unpack is a bridge that dies
 // when the Iceberg sink consumes RecordBatch directly (commit 3/4).
 func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// Split the batch into upsert rows and delete rows by __op (columnar).
@@ -150,7 +150,7 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	}
 
 	pos := string(b.Watermark)
-	if b.Mode == change.UpsertMode {
+	if b.Mode == dataplane.UpsertMode {
 		// Equality-delete the PKs of ALL rows (upserts delete their older
 		// versions, deletes are the last word).
 		keys, err := extractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
@@ -521,7 +521,7 @@ func (w *TableWriter) deleteRecord(keys [][]any) (arrow.RecordBatch, error) {
 // QUARANTINE: row-based projection, kept only for test verification of the
 // projection logic. The production path uses projectRecord (columnar).
 // Deleted in commit 8.
-func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, error) {
+func (w *TableWriter) dataRecord(upserts []rowchange.Change) (arrow.RecordBatch, error) {
 	b := array.NewRecordBuilder(memory.DefaultAllocator, w.dataSchema)
 	defer b.Release()
 	for i, field := range w.dataSchema.Fields() {
@@ -544,7 +544,7 @@ func (w *TableWriter) dataRecord(upserts []change.Change) (arrow.RecordBatch, er
 // columns into a flat map matching the dataSchema field names.
 // QUARANTINE: row-based, kept for test verification; the production path is
 // projectRecord (columnar). Deleted in commit 8.
-func (w *TableWriter) project(c change.Change) (map[string]any, error) {
+func (w *TableWriter) project(c rowchange.Change) (map[string]any, error) {
 	out := make(map[string]any, len(w.dataSchema.Fields()))
 	for _, f := range w.dataSchema.Fields() {
 		if m, ok := w.metaByName[f.Name]; ok {
@@ -572,8 +572,8 @@ func (w *TableWriter) project(c change.Change) (map[string]any, error) {
 	return out, nil
 }
 
-// metaValue resolves one metadata key to its concrete value for a change.
-func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, error) {
+// metaValue resolves one metadata key to its concrete value for a rowchange.
+func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (any, error) {
 	switch key {
 	case core.MetaOp:
 		return c.Op.String(), nil

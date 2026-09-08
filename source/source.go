@@ -1,5 +1,5 @@
 // Package source defines the replication source contract. A source maps its
-// native types into core.Schema and streams row changes into change.Change;
+// native types into core.Schema and streams row changes into rowchange.Change;
 // it knows nothing about any sink. The contract is deliberately small: a
 // source implements a handful of focused interfaces, and the driver registry
 // resolves a spec's source kind into a concrete Source. Orchestration

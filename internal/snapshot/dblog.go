@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
@@ -39,7 +39,7 @@ type Relay interface {
 	// resume point.
 	Release(table string, chunkID uint32, at position.Position)
 	// AddWindowRows feeds the chunk SELECT result into the worker's window.
-	AddWindowRows(target string, chunkID uint32, rows []change.Change) error
+	AddWindowRows(target string, chunkID uint32, rows []rowchange.Change) error
 	// GateOn starts buffering the table's live events while its chunk
 	// SELECT is in flight; GateFlush releases them InWindow-tagged, only
 	// after AddWindowRows has populated the window. This is the ordering the
@@ -195,16 +195,16 @@ func SnapshotTable(
 
 // scanChunk runs the chunk SELECT and wraps each row as an insert carrying
 // the low watermark position. Keys come from the source PK columns.
-func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, target string, low position.Position) ([]change.Change, error) {
+func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, target string, low position.Position) ([]rowchange.Change, error) {
 	pk := src.PK()
-	var rows []change.Change
+	var rows []rowchange.Change
 	err := src.Scan(ctx, ch, func(row map[string]any) error {
 		key := make([]any, 0, len(pk))
 		for _, col := range pk {
 			key = append(key, row[col])
 		}
-		rows = append(rows, change.Change{
-			Op:       change.OpInsert,
+		rows = append(rows, rowchange.Change{
+			Op:       rowchange.OpInsert,
 			Table:    target,
 			Key:      key,
 			After:    row,

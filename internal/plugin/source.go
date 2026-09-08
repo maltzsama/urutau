@@ -17,11 +17,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/plugin/client"
 	"github.com/maltzsama/urutau/internal/plugin/contract"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -56,7 +56,7 @@ func (p StringPosition) Contains(other position.Position) bool {
 
 // SourceAdapter wraps a Flight client as a source.Source. It speaks the
 // external plugin contract (GetFlightInfo + DoGet) and translates the
-// Arrow CDC record stream into change.Change events.
+// Arrow CDC record stream into rowchange.Change events.
 type SourceAdapter struct {
 	client *client.Client
 	spec   spec.Source
@@ -132,7 +132,7 @@ func (a *SourceAdapter) ParsePosition(s string) (position.Position, error) {
 // mode to get the schema and then starts streaming via DoGet.
 func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.Reader, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	out := make(chan change.Change, 256)
+	out := make(chan rowchange.Change, 256)
 	r := &sourceReader{
 		client: a.client,
 		alloc:  a.alloc,
@@ -154,7 +154,7 @@ type sourceReader struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	logger   *slog.Logger
-	out      chan change.Change
+	out      chan rowchange.Change
 	puller   *sourcepull.Puller
 	position StringPosition
 	mu       sync.Mutex
@@ -180,7 +180,7 @@ func (r *sourceReader) Next(ctx context.Context) (*dataplane.Batch, error) {
 	return r.puller.Next(ctx)
 }
 
-func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from position.Position, out chan<- change.Change) error {
+func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from position.Position, out chan<- rowchange.Change) error {
 	var fromOffset string
 	if from != nil {
 		fromOffset = from.String()
@@ -230,7 +230,7 @@ func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from 
 	return nil
 }
 
-func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arrowSchema *arrow.Schema, ref core.TableRef, out chan<- change.Change) error {
+func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arrowSchema *arrow.Schema, ref core.TableRef, out chan<- rowchange.Change) error {
 	for {
 		fd, err := stream.Recv()
 		if err != nil {
@@ -295,9 +295,9 @@ func (r *sourceReader) OpenWindow(_ context.Context, _ uint32) {}
 func (r *sourceReader) ClearWindow() {}
 
 // cdcRecordToChanges translates one Arrow CDC record batch into change events.
-func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.TableRef) []change.Change {
+func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.TableRef) []rowchange.Change {
 	nrows := int(rec.NumRows())
-	changes := make([]change.Change, 0, nrows)
+	changes := make([]rowchange.Change, 0, nrows)
 
 	opIdx := columnIndex(arrowSchema, "op")
 	beforeIdx := columnIndex(arrowSchema, "before")
@@ -315,14 +315,14 @@ func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref co
 			commitTS = time.UnixMicro(int64(v)).UTC()
 		}
 
-		var chg change.Change
+		var chg rowchange.Change
 		switch op {
 		case string(contract.OpInsert):
-			chg.Op = change.OpInsert
+			chg.Op = rowchange.OpInsert
 		case string(contract.OpUpdate):
-			chg.Op = change.OpUpdate
+			chg.Op = rowchange.OpUpdate
 		case string(contract.OpDelete):
-			chg.Op = change.OpDelete
+			chg.Op = rowchange.OpDelete
 		default:
 			continue
 		}

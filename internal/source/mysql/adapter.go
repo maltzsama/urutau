@@ -8,9 +8,9 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -106,7 +106,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan change.Change, 1024)
+	out := make(chan rowchange.Change, 1024)
 	rdr, err := New(ctx, Config{
 		Addr:      conn.Addr(),
 		User:      conn.User,
@@ -142,7 +142,7 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 // Next surface (QUARANTINE: bridges changes into batches).
 type stream struct {
 	*Reader
-	out chan change.Change
+	out chan rowchange.Change
 	*sourcepull.Puller
 }
 

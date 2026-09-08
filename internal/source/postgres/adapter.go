@@ -8,9 +8,9 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -101,7 +101,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if slot == "" {
 		return nil, fmt.Errorf("postgres: source requires slotName")
 	}
-	out := make(chan change.Change, 1024)
+	out := make(chan rowchange.Change, 1024)
 	rdr, err := New(ctx, Config{
 		URI:      a.spec.Source.URI,
 		DB:       a.db,
@@ -130,7 +130,7 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 // stream adapts the concrete pgoutput reader to the Reader contract.
 type stream struct {
 	*Reader
-	out chan change.Change
+	out chan rowchange.Change
 	*sourcepull.Puller
 }
 

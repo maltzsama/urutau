@@ -13,9 +13,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // projectRecord maps a batch's wire Record into the Iceberg data schema.
@@ -269,7 +269,7 @@ func splitByOp(ctx context.Context, b *dataplane.Batch) (upserts, deletes *datap
 	up := array.NewBooleanBuilder(memory.DefaultAllocator)
 	del := array.NewBooleanBuilder(memory.DefaultAllocator)
 	for i := range opCol.Len() {
-		isDel := opCol.Value(i) == uint8(change.OpDelete)
+		isDel := opCol.Value(i) == uint8(rowchange.OpDelete)
 		up.Append(!isDel)
 		del.Append(isDel)
 	}

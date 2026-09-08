@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // reservedField is the document field the sink owns for its metadata
@@ -20,7 +20,7 @@ const reservedField = "_urutau"
 // and the type oracle — a KindUUID lands as a hyphenated string rather than
 // raw base64, a KindDecimal keeps its canonical text form, and everything
 // else serializes to its natural JSON.
-func (p *tablePlan) buildDoc(c change.Change) (map[string]any, map[string]any, error) {
+func (p *tablePlan) buildDoc(c rowchange.Change) (map[string]any, map[string]any, error) {
 	data := make(map[string]any, len(p.schema.Columns))
 	meta := make(map[string]any, len(p.meta))
 	for _, col := range p.schema.Columns {
@@ -96,10 +96,10 @@ func jsonValue(v any) (any, error) {
 	}
 }
 
-// metaValue resolves one metadata key to its concrete value for a change.
+// metaValue resolves one metadata key to its concrete value for a rowchange.
 // Mirrors the ClickHouse and Iceberg projections — same keys, same nil
 // semantics. Time values stay time.Time: encoding/json renders RFC3339.
-func metaValue(key core.MetadataKey, c change.Change, sourceTable string) (any, error) {
+func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (any, error) {
 	switch key {
 	case core.MetaOp:
 		return c.Op.String(), nil

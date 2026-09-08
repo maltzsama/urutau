@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -38,20 +38,20 @@ type DebeziumJSON struct {
 }
 
 // Decode implements Decoder.
-func (d *DebeziumJSON) Decode(record *kgo.Record) ([]change.Change, error) {
+func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 	var env debeziumEnvelope
 	if err := json.Unmarshal(record.Value, &env); err != nil {
 		return nil, fmt.Errorf("debezium-json: unmarshal: %w", err)
 	}
 
-	var op change.Op
+	var op rowchange.Op
 	switch env.Op {
 	case "c", "r":
-		op = change.OpInsert
+		op = rowchange.OpInsert
 	case "u":
-		op = change.OpUpdate
+		op = rowchange.OpUpdate
 	case "d":
-		op = change.OpDelete
+		op = rowchange.OpDelete
 	default:
 		return nil, nil // skip non-CDC operations (t, etc.)
 	}
@@ -81,7 +81,7 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]change.Change, error) {
 
 	// Build key from the after image (create/update) or before image (delete).
 	keyImage := after
-	if op == change.OpDelete {
+	if op == rowchange.OpDelete {
 		keyImage = before
 	}
 
@@ -91,7 +91,7 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]change.Change, error) {
 		offset: record.Offset,
 	}
 
-	c := change.Change{
+	c := rowchange.Change{
 		Op:       op,
 		Table:    target,
 		After:    after,
@@ -108,7 +108,7 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]change.Change, error) {
 	}
 
 	_ = pos // stored in the change's position field via the reader
-	return []change.Change{c}, nil
+	return []rowchange.Change{c}, nil
 }
 
 func (d *DebeziumJSON) resolveTable(topic []byte, env debeziumEnvelope) string {
@@ -144,7 +144,7 @@ func extractKey(m map[string]any) []any {
 // into a map key, and the sink's equality deletes index the tuple by
 // primary-key column — so a shuffled tuple duplicates rows and deletes the
 // wrong ones.
-func OrderKey(c *change.Change, pk []string) {
+func OrderKey(c *rowchange.Change, pk []string) {
 	if c == nil || len(pk) == 0 {
 		return
 	}

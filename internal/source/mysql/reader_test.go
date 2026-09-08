@@ -7,7 +7,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/schema"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 )
 
@@ -27,7 +27,7 @@ func ordersTable() *schema.Table {
 
 var ordersRef = TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}
 
-func newTestReader(out chan<- change.Change) *Reader {
+func newTestReader(out chan<- rowchange.Change) *Reader {
 	return &Reader{out: out, bySrc: map[string]TableRef{"shop.orders": ordersRef}}
 }
 
@@ -36,9 +36,9 @@ func TestDecodeInsert(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, change.OpInsert, row, nil, "u:1-3")
+	c := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3")
 
-	if c.Op != change.OpInsert || c.Table != "raw.orders" || c.Position != "u:1-3" {
+	if c.Op != rowchange.OpInsert || c.Table != "raw.orders" || c.Position != "u:1-3" {
 		t.Fatalf("change = %+v", c)
 	}
 	if len(c.Key) != 1 || c.Key[0] != int64(7) {
@@ -60,9 +60,9 @@ func TestDecodeDeleteKeepsBeforeOnly(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, change.OpDelete, row, nil, "u:1-4")
+	c := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4")
 
-	if c.Op != change.OpDelete {
+	if c.Op != rowchange.OpDelete {
 		t.Fatalf("op = %v", c.Op)
 	}
 	if c.After != nil {
@@ -79,7 +79,7 @@ func TestDecodeUpdateCarriesBeforeAndAfter(t *testing.T) {
 	before := []any{int64(7), []byte("old"), 1.0}
 	after := []any{int64(7), []byte("new"), 2.0}
 
-	c := r.decode(ordersRef, tbl, change.OpUpdate, after, before, "u:1-5")
+	c := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5")
 
 	if c.After["v"] != "new" || c.Before["v"] != "old" {
 		t.Fatalf("update before/after = %v / %v", c.Before, c.After)
@@ -90,7 +90,7 @@ func TestDecodeUpdateCarriesBeforeAndAfter(t *testing.T) {
 }
 
 func TestOnRowRoutesDecodeAndPosition(t *testing.T) {
-	out := make(chan change.Change, 8)
+	out := make(chan rowchange.Change, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:1-9"
 
@@ -109,7 +109,7 @@ func TestOnRowRoutesDecodeAndPosition(t *testing.T) {
 
 	for i, wantID := range []int64{1, 2} {
 		c := <-out
-		if c.Op != change.OpInsert || c.Table != "raw.orders" {
+		if c.Op != rowchange.OpInsert || c.Table != "raw.orders" {
 			t.Fatalf("row %d: %+v", i, c)
 		}
 		if c.Key[0] != wantID || c.Position != "u:1-9" {
@@ -119,7 +119,7 @@ func TestOnRowRoutesDecodeAndPosition(t *testing.T) {
 }
 
 func TestOnRowUpdatePairsAndUnregisteredTable(t *testing.T) {
-	out := make(chan change.Change, 8)
+	out := make(chan rowchange.Change, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:2-2"
 
@@ -135,7 +135,7 @@ func TestOnRowUpdatePairsAndUnregisteredTable(t *testing.T) {
 		t.Fatalf("OnRow: %v", err)
 	}
 	c := <-out
-	if c.Op != change.OpUpdate || c.Before["v"] != "old" || c.After["v"] != "new" {
+	if c.Op != rowchange.OpUpdate || c.Before["v"] != "old" || c.After["v"] != "new" {
 		t.Fatalf("update change = %+v", c)
 	}
 
@@ -174,7 +174,7 @@ func TestOnGTIDAccumulatesCumulativeSet(t *testing.T) {
 // before the watermark is already reflected in the chunk SELECT and must not
 // be tagged, or the snapshot row would be discarded for a stale value.
 func TestOnRowWindowTagsOnlyPastLowWatermark(t *testing.T) {
-	out := make(chan change.Change, 8)
+	out := make(chan rowchange.Change, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:1-9"
 	low := position.MustGTID(readerTestUUID + ":1-5")

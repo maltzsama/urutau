@@ -5,7 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // TestWindowSnapshotSingleBatch drives one DBLog window through the batcher:
@@ -17,13 +18,13 @@ import (
 func TestWindowSnapshotSingleBatch(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	regTable(t, w, "raw.orders", fc, change.UpsertMode)
+	regTable(t, w, "raw.orders", fc, dataplane.UpsertMode)
 
 	// chunk rows: id=1 v=a (stale), id=2 v=x (stable), id=3 v=y (stable)
-	snap := []change.Change{
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: "p0"},
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "x"}, Position: "p0"},
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(3)}, After: map[string]any{"id": int64(3), "v": "y"}, Position: "p0"},
+	snap := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: "p0"},
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "x"}, Position: "p0"},
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(3)}, After: map[string]any{"id": int64(3), "v": "y"}, Position: "p0"},
 	}
 	if err := w.AddWindowRows("raw.orders", 7, toWindow(t, "raw.orders", snap)); err != nil {
 		t.Fatalf("AddWindowRows: %v", err)
@@ -34,16 +35,16 @@ func TestWindowSnapshotSingleBatch(t *testing.T) {
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
 	// live UPDATE of id=1 inside the window: must discard the stale v=a row.
-	ingest <- toIngest(t, change.Change{
-		Op: change.OpUpdate, Table: "raw.orders", Key: []any{int64(1)},
+	ingest <- toIngest(t, rowchange.Change{
+		Op: rowchange.OpUpdate, Table: "raw.orders", Key: []any{int64(1)},
 		After:    map[string]any{"id": int64(1), "v": "b"},
 		Position: "p1",
-		Window:   &change.Window{ChunkID: 7, InWindow: true},
+		Window:   &rowchange.Window{ChunkID: 7, InWindow: true},
 	})
 	// Closes: emits the remaining window rows (id=2, id=3) as inserts.
-	ingest <- toIngest(t, change.Change{
+	ingest <- toIngest(t, rowchange.Change{
 		Table: "raw.orders", Position: "p2",
-		Window: &change.Window{ChunkID: 7, Closes: true},
+		Window: &rowchange.Window{ChunkID: 7, Closes: true},
 	})
 	close(ingest)
 	if err := <-done; err != nil {
@@ -74,22 +75,22 @@ func TestWindowSnapshotSingleBatch(t *testing.T) {
 func TestWindowLiveDeleteWins(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	regTable(t, w, "t", fc, change.UpsertMode)
+	regTable(t, w, "t", fc, dataplane.UpsertMode)
 
-	_ = w.AddWindowRows("t", 1, toWindow(t, "t", []change.Change{
-		{Op: change.OpInsert, Table: "t", Key: []any{int64(9)}, After: map[string]any{"id": int64(9), "v": "s"}, Position: "p0"},
+	_ = w.AddWindowRows("t", 1, toWindow(t, "t", []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", Key: []any{int64(9)}, After: map[string]any{"id": int64(9), "v": "s"}, Position: "p0"},
 	}))
 
 	ingest := make(chan Ingest, 8)
 	done := make(chan error, 1)
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
-	ingest <- toIngest(t, change.Change{
-		Op: change.OpDelete, Table: "t", Key: []any{int64(9)}, Position: "p1",
-		Window: &change.Window{ChunkID: 1, InWindow: true},
+	ingest <- toIngest(t, rowchange.Change{
+		Op: rowchange.OpDelete, Table: "t", Key: []any{int64(9)}, Position: "p1",
+		Window: &rowchange.Window{ChunkID: 1, InWindow: true},
 	})
-	ingest <- toIngest(t, change.Change{
-		Table: "t", Position: "p2", Window: &change.Window{ChunkID: 1, Closes: true},
+	ingest <- toIngest(t, rowchange.Change{
+		Table: "t", Position: "p2", Window: &rowchange.Window{ChunkID: 1, Closes: true},
 	})
 	close(ingest)
 	if err := <-done; err != nil {
@@ -113,18 +114,18 @@ func TestWindowLiveDeleteWins(t *testing.T) {
 func TestWindowNoEventsClosesEmitsAll(t *testing.T) {
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	regTable(t, w, "t", fc, change.UpsertMode)
+	regTable(t, w, "t", fc, dataplane.UpsertMode)
 
-	_ = w.AddWindowRows("t", 1, toWindow(t, "t", []change.Change{
-		{Op: change.OpInsert, Table: "t", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: "p0"},
-		{Op: change.OpInsert, Table: "t", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}, Position: "p0"},
+	_ = w.AddWindowRows("t", 1, toWindow(t, "t", []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: "p0"},
+		{Op: rowchange.OpInsert, Table: "t", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}, Position: "p0"},
 	}))
 
 	ingest := make(chan Ingest, 8)
 	done := make(chan error, 1)
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
-	ingest <- toIngest(t, change.Change{Table: "t", Position: "p5", Window: &change.Window{ChunkID: 1, Closes: true}})
+	ingest <- toIngest(t, rowchange.Change{Table: "t", Position: "p5", Window: &rowchange.Window{ChunkID: 1, Closes: true}})
 	close(ingest)
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)

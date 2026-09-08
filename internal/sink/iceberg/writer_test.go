@@ -7,8 +7,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // testWriter builds a TableWriter directly with hand-constructed arrow
@@ -36,7 +36,7 @@ func testWriter() *TableWriter {
 // column projects as NULL rather than failing.
 func TestProjectColumnsAndMetadata(t *testing.T) {
 	w := testWriter()
-	c := change.Change{Op: change.OpUpdate, After: map[string]any{"id": int64(7), "v": "x"}}
+	c := rowchange.Change{Op: rowchange.OpUpdate, After: map[string]any{"id": int64(7), "v": "x"}}
 	out, err := w.project(c)
 	if err != nil {
 		t.Fatalf("project: %v", err)
@@ -48,7 +48,7 @@ func TestProjectColumnsAndMetadata(t *testing.T) {
 		t.Fatalf("_op = %v, want update", out["_op"])
 	}
 	// A change missing a declared column yields NULL for that column.
-	sparse := change.Change{Op: change.OpInsert, After: map[string]any{"id": int64(1)}}
+	sparse := rowchange.Change{Op: rowchange.OpInsert, After: map[string]any{"id": int64(1)}}
 	out, err = w.project(sparse)
 	if err != nil {
 		t.Fatalf("project sparse: %v", err)
@@ -72,7 +72,7 @@ func TestProjectAppliesCast(t *testing.T) {
 		cast:       cp,
 		metaByName: map[string]core.MetadataColumn{},
 	}
-	c := change.Change{After: map[string]any{"id": int64(1), "v": []byte{0xde, 0xad}}}
+	c := rowchange.Change{After: map[string]any{"id": int64(1), "v": []byte{0xde, 0xad}}}
 	out, err := w.project(c)
 	if err != nil {
 		t.Fatalf("project: %v", err)
@@ -85,9 +85,9 @@ func TestProjectAppliesCast(t *testing.T) {
 // dataRecord materializes rows into a typed record, including metadata.
 func TestDataRecord(t *testing.T) {
 	w := testWriter()
-	rows := []change.Change{
-		{Op: change.OpInsert, After: map[string]any{"id": int64(1), "v": "a"}},
-		{Op: change.OpInsert, After: map[string]any{"id": int64(2), "v": "b"}},
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(1), "v": "a"}},
+		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(2), "v": "b"}},
 	}
 	rec, err := w.dataRecord(rows)
 	if err != nil {

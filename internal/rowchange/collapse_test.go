@@ -1,4 +1,4 @@
-package change
+package rowchange
 
 import (
 	"reflect"

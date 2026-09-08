@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // eqChange mirrors a row for order-sensitive comparison.
@@ -124,7 +124,7 @@ func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
 }
 
 // TestEquivalence_Collapse_MatchesChangeCollapse verifies that the
-// columnar Collapse produces the same result as change.Collapse (the
+// columnar Collapse produces the same result as rowchange.Collapse (the
 // production row-side reference).
 func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 	alloc := checkedAlloc(t)
@@ -136,9 +136,9 @@ func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 			Allocator: alloc,
 		})
 
-		// Row-path reference: change.Collapse (production code)
+		// Row-path reference: rowchange.Collapse (production code)
 		changes := batchToChanges(b)
-		rowCollapsed := change.Collapse(changes)
+		rowCollapsed := rowchange.Collapse(changes)
 
 		// Columnar path
 		colUps, colDel, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -388,9 +388,9 @@ func sliceEqual(a, b []eqChange) bool {
 	return true
 }
 
-// batchToChanges converts a dataplane.Batch to []change.Change for use
-// with change.Collapse (the production row-side reference).
-func batchToChanges(b *dataplane.Batch) []change.Change {
+// batchToChanges converts a dataplane.Batch to []rowchange.Change for use
+// with rowchange.Collapse (the production row-side reference).
+func batchToChanges(b *dataplane.Batch) []rowchange.Change {
 	if b == nil || b.Record == nil {
 		return nil
 	}
@@ -405,10 +405,10 @@ func batchToChanges(b *dataplane.Batch) []change.Change {
 			break
 		}
 	}
-	changes := make([]change.Change, nrows)
+	changes := make([]rowchange.Change, nrows)
 	for i := range nrows {
-		changes[i] = change.Change{
-			Op:       change.Op(opVals[i]),
+		changes[i] = rowchange.Change{
+			Op:       rowchange.Op(opVals[i]),
 			Table:    b.Table,
 			Key:      []any{idCol.Value(i)},
 			After:    map[string]any{"id": idCol.Value(i), "val": valCol.Value(i)},
@@ -419,7 +419,7 @@ func batchToChanges(b *dataplane.Batch) []change.Change {
 }
 
 // changesToUpserts extracts upserts from a Collapsed as eqChange slices.
-func changesToUpserts(c change.Collapsed) []eqChange {
+func changesToUpserts(c rowchange.Collapsed) []eqChange {
 	out := make([]eqChange, len(c.Upserts))
 	for i, ch := range c.Upserts {
 		out[i] = eqChange{
@@ -432,7 +432,7 @@ func changesToUpserts(c change.Collapsed) []eqChange {
 }
 
 // changesToDeletes extracts deletes from a Collapsed as eqChange slices.
-func changesToDeletes(c change.Collapsed) []eqChange {
+func changesToDeletes(c rowchange.Collapsed) []eqChange {
 	out := make([]eqChange, len(c.Deletes))
 	for i, ch := range c.Deletes {
 		out[i] = eqChange{

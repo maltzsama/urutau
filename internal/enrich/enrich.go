@@ -30,7 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -127,7 +127,7 @@ type dest struct {
 
 // buffered is an event parked by a cold-start buffer.
 type buffered struct {
-	c      change.Change
+	c      rowchange.Change
 	next   int // reference index the event still has to pass
 	queued time.Time
 }
@@ -405,8 +405,8 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 // events that survived: joined, miss-marked, or drained from a cold-start
 // buffer. Dropped events (inner miss, drop policy) vanish — dropping IS
 // their effect, and the batch position advances past them.
-func (s *Stage) Enrich(changes []change.Change) ([]change.Change, error) {
-	out := make([]change.Change, 0, len(changes))
+func (s *Stage) Enrich(changes []rowchange.Change) ([]rowchange.Change, error) {
+	out := make([]rowchange.Change, 0, len(changes))
 	// Release cold-start queues first: FIFO order beats the new traffic.
 	for i, rj := range s.refs {
 		for _, b := range rj.takeDrained() {
@@ -437,7 +437,7 @@ func (s *Stage) Enrich(changes []change.Change) ([]change.Change, error) {
 }
 
 // applyFrom pushes one change through references starting at i.
-func (s *Stage) applyFrom(i int, c change.Change, out *[]change.Change) {
+func (s *Stage) applyFrom(i int, c rowchange.Change, out *[]rowchange.Change) {
 	for ; i < len(s.refs); i++ {
 		rj := s.refs[i]
 		switch rj.apply(&c) {
@@ -459,7 +459,7 @@ func (s *Stage) applyFrom(i int, c change.Change, out *[]change.Change) {
 
 // forceMiss joins a change against reference i as a miss (whatever the
 // event was, it will not be matched) and continues downstream.
-func (s *Stage) forceMiss(i int, c change.Change, out *[]change.Change) {
+func (s *Stage) forceMiss(i int, c rowchange.Change, out *[]rowchange.Change) {
 	if c.After == nil {
 		return // nothing to enrich; a key-only delete just vanishes
 	}
@@ -479,13 +479,13 @@ func (s *Stage) forceMiss(i int, c change.Change, out *[]change.Change) {
 // enqueue parks a change in a cold-start buffer, evacuating the oldest
 // when MaxEvents is exceeded. An evacuated change follows the join type —
 // the buffer's bounds are a latency/memory contract, not a third policy.
-func (s *Stage) enqueue(rj *refJoin, at int, c change.Change, out *[]change.Change) {
+func (s *Stage) enqueue(rj *refJoin, at int, c rowchange.Change, out *[]rowchange.Change) {
 	rj.mu.Lock()
 	max := rj.cfg.BufferLimits.MaxEvents
 	if max <= 0 {
 		max = defaultMaxEvents
 	}
-	var evicted []change.Change
+	var evicted []rowchange.Change
 	for max > 0 && len(rj.queue) >= max {
 		evicted = append(evicted, rj.queue[0].c)
 		rj.queue = rj.queue[1:]
@@ -510,7 +510,7 @@ const (
 )
 
 // apply joins one change against this reference, mutating After in place.
-func (rj *refJoin) apply(c *change.Change) applyResult {
+func (rj *refJoin) apply(c *rowchange.Change) applyResult {
 	snap := rj.snap.Load() // lock-free read
 
 	if snap == nil || !snap.hot {
@@ -537,7 +537,7 @@ func (rj *refJoin) apply(c *change.Change) applyResult {
 // event with NULL reference columns and marks it; an inner join drops it.
 // That grammar is the ONLY miss policy — cold start, eviction and expiry
 // all route through it.
-func (rj *refJoin) join(c *change.Change, row map[string]any, dests []dest, star bool) applyResult {
+func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest, star bool) applyResult {
 	if row == nil {
 		rj.misses.Add(1)
 		if rj.metrics != nil {
@@ -623,6 +623,6 @@ func joinKey(v any) string {
 	case float64:
 		return "f:" + strconv.FormatFloat(t, 'g', -1, 64)
 	default:
-		return change.KeyString([]any{v})
+		return rowchange.KeyString([]any{v})
 	}
 }

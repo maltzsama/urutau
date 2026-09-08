@@ -17,11 +17,11 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/enrich"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
@@ -192,7 +192,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		cs.PrimaryKey = ta.PrimaryKey
 		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey}
 		if ta.CreateIfNotExists {
-			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}
@@ -200,7 +200,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
-		w.Register(ta.TargetTable, writer, change.UpsertMode)
+		w.Register(ta.TargetTable, writer, dataplane.UpsertMode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
 		// The drift check knows the assigned canonical schema — with its
 		// types, so a field added inside a struct column is caught too.
@@ -557,13 +557,13 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		b.Release()
 		return r.sendIngest(Ingest{
 			Table:    meta.Table,
-			Win:      &change.Window{Closes: true, ChunkID: meta.Window.ChunkId},
+			Win:      &rowchange.Window{Closes: true, ChunkID: meta.Window.ChunkId},
 			Position: meta.LowPos,
 		})
 	default:
-		var win *change.Window
+		var win *rowchange.Window
 		if meta.Window != nil && meta.Window.InWindow {
-			win = &change.Window{InWindow: true, ChunkID: meta.Window.ChunkId}
+			win = &rowchange.Window{InWindow: true, ChunkID: meta.Window.ChunkId}
 		}
 		return r.sendIngest(Ingest{Table: meta.Table, Batch: b, Win: win})
 	}

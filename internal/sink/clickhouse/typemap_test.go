@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 )
 
 func upsertSchema() (core.Schema, core.TableRef) {
@@ -22,7 +22,7 @@ func upsertSchema() (core.Schema, core.TableRef) {
 
 func TestBuildDDLUpsert(t *testing.T) {
 	schema, ref := upsertSchema()
-	ddl, err := buildDDL(tableIdent{db: "lakehouse", table: "orders"}, ref, schema, nil, change.UpsertMode)
+	ddl, err := buildDDL(tableIdent{db: "lakehouse", table: "orders"}, ref, schema, nil, dataplane.UpsertMode)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestBuildDDLUpsert(t *testing.T) {
 func TestBuildDDLAppend(t *testing.T) {
 	schema, ref := upsertSchema()
 	ref.PrimaryKey = nil // append tables need no key
-	ddl, err := buildDDL(tableIdent{db: "lakehouse", table: "events"}, ref, schema, nil, change.AppendMode)
+	ddl, err := buildDDL(tableIdent{db: "lakehouse", table: "events"}, ref, schema, nil, dataplane.AppendMode)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestBuildDDLAppend(t *testing.T) {
 func TestBuildDDLPartitionByOptIn(t *testing.T) {
 	schema, ref := upsertSchema()
 	ddl, err := buildDDL(tableIdent{db: "lakehouse", table: "orders"}, ref, schema,
-		[]string{"toYYYYMMDD(ingest_ts)"}, change.UpsertMode)
+		[]string{"toYYYYMMDD(ingest_ts)"}, dataplane.UpsertMode)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestBuildDDLReservedNames(t *testing.T) {
 	schema, ref := upsertSchema()
 	for _, name := range []string{"position", "seq", "is_deleted"} {
 		schema.Columns = append(schema.Columns, core.Column{Name: name, Type: core.ColumnType{Kind: core.KindString, Nullable: true}})
-		if _, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, change.UpsertMode); err == nil {
+		if _, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, dataplane.UpsertMode); err == nil {
 			t.Errorf("column %q: want reserved-name error", name)
 		}
 		schema.Columns = schema.Columns[:len(schema.Columns)-1]
@@ -95,7 +95,7 @@ func TestBuildDDLReservedNames(t *testing.T) {
 func TestBuildDDLUpsertRequiresPK(t *testing.T) {
 	schema, ref := upsertSchema()
 	ref.PrimaryKey = nil
-	if _, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, change.UpsertMode); err == nil {
+	if _, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, dataplane.UpsertMode); err == nil {
 		t.Fatal("upsert without a primary key: want error")
 	}
 }
@@ -103,7 +103,7 @@ func TestBuildDDLUpsertRequiresPK(t *testing.T) {
 func TestBuildDDLUnknownPKColumn(t *testing.T) {
 	schema, ref := upsertSchema()
 	ref.PrimaryKey = []string{"nope"}
-	if _, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, change.UpsertMode); err == nil {
+	if _, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, dataplane.UpsertMode); err == nil {
 		t.Fatal("pk column outside the schema: want error")
 	}
 }
@@ -115,7 +115,7 @@ func TestBuildDDLNestedUnsupported(t *testing.T) {
 		{Name: "tags", Type: core.ColumnType{Kind: core.KindList, Elem: &core.ColumnType{Kind: core.KindString}}},
 	}}
 	ref := core.TableRef{Target: "orders", PrimaryKey: []string{"tags"}}
-	ddl, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, change.AppendMode)
+	ddl, err := buildDDL(tableIdent{db: "d", table: "t"}, ref, schema, nil, dataplane.AppendMode)
 	if err != nil {
 		t.Fatalf("nested list: unexpected error: %v", err)
 	}

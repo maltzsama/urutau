@@ -1,17 +1,17 @@
 // Package sourcepull adapts a push-based change channel into the pull-based
 // source.Reader.Next surface, bridging changes into columnar batches.
 //
-// QUARANTINE: the source decoders still produce change.Change; Next bridges
+// QUARANTINE: the source decoders still produce rowchange.Change; Next bridges
 // them into batches. Dies when sources build Arrow directly (M4).
 package sourcepull
 
 import (
 	"context"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 const batchTarget = 100
@@ -20,13 +20,13 @@ const batchTarget = 100
 // the pull-based Next surface. The concrete source calls Start to launch
 // its decoder and wire the error channel.
 type Puller struct {
-	ch    <-chan change.Change
+	ch    <-chan rowchange.Change
 	errCh <-chan error
-	buf   []change.Change
+	buf   []rowchange.Change
 }
 
 // New builds a puller over the decoder's change channel.
-func New(ch <-chan change.Change) *Puller {
+func New(ch <-chan rowchange.Change) *Puller {
 	return &Puller{ch: ch}
 }
 
@@ -119,7 +119,7 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	if len(p.buf) == 0 {
 		return nil, nil
 	}
-	cb := change.Batch{Table: p.buf[0].Table, Upserts: p.buf, Mode: change.UpsertMode}
+	cb := rowchange.Batch{Table: p.buf[0].Table, Upserts: p.buf, Mode: rowchange.UpsertMode}
 	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
 	p.buf = nil
 	if err != nil {

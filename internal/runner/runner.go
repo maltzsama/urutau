@@ -12,13 +12,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
@@ -98,14 +98,14 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 	r.ingest <- worker.Ingest{
 		Table:    table,
 		Position: at.String(),
-		Win:      &change.Window{ChunkID: chunkID, Closes: true},
+		Win:      &rowchange.Window{ChunkID: chunkID, Closes: true},
 	}
 }
 
-func (r *relay) AddWindowRows(target string, chunkID uint32, rows []change.Change) error {
+func (r *relay) AddWindowRows(target string, chunkID uint32, rows []rowchange.Change) error {
 	// QUARANTINE: bridge rows to a batch for the worker's window entry; dies
 	// when sources produce Arrow directly (M4).
-	cb := change.Batch{Table: target, Upserts: rows, Mode: change.AppendMode}
+	cb := rowchange.Batch{Table: target, Upserts: rows, Mode: rowchange.WriteMode(dataplane.AppendMode)}
 	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
 	if err != nil {
 		return err
@@ -179,7 +179,7 @@ func (r *relay) drainGate(ctx context.Context) (bool, error) {
 
 	for _, b := range buf {
 		select {
-		case r.ingest <- worker.Ingest{Table: b.Table, Batch: b, Win: &change.Window{ChunkID: chunkID, InWindow: true}}:
+		case r.ingest <- worker.Ingest{Table: b.Table, Batch: b, Win: &rowchange.Window{ChunkID: chunkID, InWindow: true}}:
 		case <-ctx.Done():
 			return true, ctx.Err()
 		}
@@ -491,7 +491,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	// shape is resolved once: the sink's DDL (where the engine is chosen)
 	// and the worker's collapse must agree on it.
 	writers := make(map[string]sink.TableWriter, len(refs))
-	modes := make(map[string]change.WriteMode, len(refs))
+	modes := make(map[string]dataplane.WriteMode, len(refs))
 	for _, ref := range refs {
 		t := specBySource[ref.Source]
 		cast, _ := core.ParseCastPolicy(t.Cast)
@@ -521,7 +521,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 	for target, wr := range writers {
 		mode := modes[target]
 		w.Register(target, wr, mode)
-		if mode == change.AppendMode && specByTarget[target].OnDelete == spec.OnDeleteSkip {
+		if mode == dataplane.AppendMode && specByTarget[target].OnDelete == spec.OnDeleteSkip {
 			w.SetDropDeletes(target, true)
 		}
 		// The drift check knows the introspected canonical schema (with its

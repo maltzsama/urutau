@@ -16,10 +16,10 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/source/kafka/decoder"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
@@ -154,7 +154,7 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	r := &Reader{
 		client:      client,
 		dec:         dec,
-		out:         make(chan change.Change, 1024),
+		out:         make(chan rowchange.Change, 1024),
 		logger:      s.Rt.Logger,
 		refBySource: refBySource,
 		synced:      &position.Offsets{},
@@ -189,7 +189,7 @@ func (s Source) ParsePosition(pos string) (position.Position, error) {
 type Reader struct {
 	client *kgo.Client
 	dec    decoder.Decoder
-	out    chan change.Change
+	out    chan rowchange.Change
 	puller *sourcepull.Puller
 	logger *slog.Logger
 	// refBySource resolves a decoded source (envelope source or topic) to
@@ -308,8 +308,8 @@ func (r *Reader) consume(ctx context.Context) error {
 // transport metadata columns (stream, shard, sequence, msg_ts, msg_key,
 // headers). Headers serialize to JSON because the canonical type system has
 // no map yet.
-func transportOf(rec *kgo.Record) *change.Transport {
-	t := &change.Transport{
+func transportOf(rec *kgo.Record) *rowchange.Transport {
+	t := &rowchange.Transport{
 		Stream: rec.Topic,
 		Shard:  strconv.Itoa(int(rec.Partition)),
 		Seq:    strconv.FormatInt(rec.Offset, 10),

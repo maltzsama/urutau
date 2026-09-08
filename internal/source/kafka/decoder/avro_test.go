@@ -10,7 +10,7 @@ import (
 	"github.com/hamba/avro/v2"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // fakeRegistry serves schemas by id and counts fetches.
@@ -101,7 +101,7 @@ func TestAvroDecodeNestedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(changes) != 1 || changes[0].Op != change.OpInsert {
+	if len(changes) != 1 || changes[0].Op != rowchange.OpInsert {
 		t.Fatalf("changes = %+v, want one insert", changes)
 	}
 	after := changes[0].After

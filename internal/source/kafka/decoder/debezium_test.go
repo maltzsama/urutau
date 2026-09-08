@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -142,8 +142,8 @@ func TestDebeziumJSONCustomTableMapping(t *testing.T) {
 // in the declared primary-key order: downstream consumers treat the key as
 // positional (collapse map keys, equality-delete tuples).
 func TestOrderKeyCompositeInsert(t *testing.T) {
-	c := &change.Change{
-		Op:    change.OpInsert,
+	c := &rowchange.Change{
+		Op:    rowchange.OpInsert,
 		After: map[string]any{"tenant": "t1", "id": float64(7), "v": "x"},
 	}
 	OrderKey(c, []string{"tenant", "id"})
@@ -153,8 +153,8 @@ func TestOrderKeyCompositeInsert(t *testing.T) {
 }
 
 func TestOrderKeyDeleteReadsBefore(t *testing.T) {
-	c := &change.Change{
-		Op:     change.OpDelete,
+	c := &rowchange.Change{
+		Op:     rowchange.OpDelete,
 		Before: map[string]any{"tenant": "t1", "id": float64(7)},
 	}
 	OrderKey(c, []string{"tenant", "id"})
@@ -165,13 +165,13 @@ func TestOrderKeyDeleteReadsBefore(t *testing.T) {
 
 func TestOrderKeyNoopCases(t *testing.T) {
 	// No declared PK: leave the tuple alone.
-	c := &change.Change{After: map[string]any{"id": float64(1)}, Key: []any{"raw"}}
+	c := &rowchange.Change{After: map[string]any{"id": float64(1)}, Key: []any{"raw"}}
 	OrderKey(c, nil)
 	if c.Key[0] != "raw" {
 		t.Fatalf("key = %v, want untouched", c.Key)
 	}
 	// No row image: nothing to read from.
-	d := &change.Change{Op: change.OpDelete, Key: []any{"raw"}}
+	d := &rowchange.Change{Op: rowchange.OpDelete, Key: []any{"raw"}}
 	OrderKey(d, []string{"id"})
 	if d.Key[0] != "raw" {
 		t.Fatalf("key = %v, want untouched", d.Key)

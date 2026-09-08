@@ -6,8 +6,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 )
 
 // tableIdent names one table: database + name, both ClickHouse identifiers.
@@ -43,8 +43,8 @@ var reserved = map[string]bool{"position": true, "seq": true, "is_deleted": true
 // ClickHouse expressions) trades that away for pruning — a batch crossing a
 // partition boundary commits as multiple parts and is no longer all-or-
 // nothing. That property must stay documented, never implied.
-func buildDDL(ident tableIdent, ref core.TableRef, schema core.Schema, partitionBy []string, mode change.WriteMode) (string, error) {
-	upsert := mode != change.AppendMode
+func buildDDL(ident tableIdent, ref core.TableRef, schema core.Schema, partitionBy []string, mode dataplane.WriteMode) (string, error) {
+	upsert := mode != dataplane.AppendMode
 
 	byName := make(map[string]core.Column, len(schema.Columns))
 	for _, c := range schema.Columns {

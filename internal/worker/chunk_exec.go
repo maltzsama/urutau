@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
@@ -108,14 +108,14 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return err
 	}
 
-	rows := make([]change.Change, 0, x.chunkSz)
+	rows := make([]rowchange.Change, 0, x.chunkSz)
 	err = chunker.Scan(ctx, source.Chunk{Low: low, High: high}, func(row map[string]any) error {
 		key := make([]any, 0, len(ta.PrimaryKey))
 		for _, col := range ta.PrimaryKey {
 			key = append(key, row[col])
 		}
-		rows = append(rows, change.Change{
-			Op:       change.OpInsert,
+		rows = append(rows, rowchange.Change{
+			Op:       rowchange.OpInsert,
 			Table:    ta.TargetTable,
 			Key:      key,
 			After:    row,
@@ -128,7 +128,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return fmt.Errorf("worker: chunk %d scan: %w", req.ChunkId, err)
 	}
 
-	cb := change.Batch{Table: ta.TargetTable, Upserts: rows, Mode: change.AppendMode}
+	cb := rowchange.Batch{Table: ta.TargetTable, Upserts: rows, Mode: rowchange.AppendMode}
 	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
 	if err != nil {
 		return fmt.Errorf("worker: chunk %d bridge: %w", req.ChunkId, err)

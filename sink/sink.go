@@ -1,5 +1,5 @@
 // Package sink defines the destination catalog contract. A sink consumes
-// core.Schema and commits change.Batch; it knows nothing about any source.
+// core.Schema and commits rowchange.Batch; it knows nothing about any source.
 // The contract is composed of small capability interfaces; the driver
 // registry resolves a spec's sink into a concrete Sink.
 package sink
@@ -7,7 +7,6 @@ package sink
 import (
 	"context"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 )
@@ -53,7 +52,7 @@ type TableWriter interface {
 // truth about what it is. Sinks with mode-agnostic tables (Iceberg) may
 // ignore it.
 type Ensurer interface {
-	EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy, mode change.WriteMode) error
+	EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy, mode dataplane.WriteMode) error
 }
 
 // Writer opens the per-table committer. The primary key, cast plan and

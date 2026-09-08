@@ -15,8 +15,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
@@ -24,7 +24,7 @@ import (
 // record) and marshals meta for the FlightData app_metadata. The schema
 // is derived from the canonical core.Schema: data columns are typed,
 // metadata columns (__op, __pos, etc.) are appended at the end.
-func EncodeBatch(rows []change.Change, cs core.Schema, meta *pb.BatchMeta) (body, metaBytes []byte, err error) {
+func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta) (body, metaBytes []byte, err error) {
 	metaBytes, err = proto.Marshal(meta)
 	if err != nil {
 		return nil, nil, fmt.Errorf("transport: marshal batch meta: %w", err)
@@ -128,7 +128,7 @@ func EncodeBatch(rows []change.Change, cs core.Schema, meta *pb.BatchMeta) (body
 // does not carry the key separately — the sink's equality deletes need it,
 // and an empty key would make every commit fail on arity. Pass nil only for
 // batches whose consumer never commits (tests).
-func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) ([]change.Change, *pb.BatchMeta, error) {
+func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) ([]rowchange.Change, *pb.BatchMeta, error) {
 	meta := &pb.BatchMeta{}
 	if err := proto.Unmarshal(metaBytes, meta); err != nil {
 		return nil, nil, fmt.Errorf("transport: unmarshal batch meta: %w", err)
@@ -160,9 +160,9 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 		keyCols = append(keyCols, idx)
 	}
 
-	rows := make([]change.Change, 0, rec.NumRows())
+	rows := make([]rowchange.Change, 0, rec.NumRows())
 	for i := 0; i < int(rec.NumRows()); i++ {
-		c := change.Change{
+		c := rowchange.Change{
 			Table:    meta.Table,
 			IngestTS: time.Now(), // fallback when the wire column is null
 		}
@@ -192,7 +192,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 
 		// Metadata columns (last 5, fixed positions).
 		opCol, _ := rec.Column(numDataCols).(*array.Uint8)
-		c.Op = change.Op(opCol.Value(i))
+		c.Op = rowchange.Op(opCol.Value(i))
 		posCol, _ := rec.Column(numDataCols + 1).(*array.String)
 		c.Position = posCol.Value(i)
 		tsCol, _ := rec.Column(numDataCols + 2).(*array.Timestamp)

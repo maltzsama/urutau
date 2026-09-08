@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -98,17 +99,17 @@ func TestClickHouseSinkUpsertAndResume(t *testing.T) {
 	chDrop(t, db, "ch_orders")
 
 	schema, ref := chOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := chWriter(t, ctx, s, ref, chMeta)
 	defer func() { _ = w.Close() }()
 
-	row := func(id int64, v, pos string) change.Batch {
-		return change.Batch{
+	row := func(id int64, v, pos string) rowchange.Batch {
+		return rowchange.Batch{
 			Table: ref.Target, Position: pos,
-			Upserts: []change.Change{{
-				Op: change.OpInsert, Table: ref.Target, Key: []any{id},
+			Upserts: []rowchange.Change{{
+				Op: rowchange.OpInsert, Table: ref.Target, Key: []any{id},
 				After: map[string]any{"id": id, "v": v}, IngestTS: time.Now(),
 			}},
 		}
@@ -159,26 +160,26 @@ func TestClickHouseSinkDelete(t *testing.T) {
 	chDrop(t, db, "ch_orders")
 
 	schema, ref := chOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := chWriter(t, ctx, s, ref, chMeta)
 	defer func() { _ = w.Close() }()
 
-	commit := func(b change.Batch) {
+	commit := func(b rowchange.Batch) {
 		t.Helper()
 		if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 	}
-	commit(change.Batch{
+	commit(rowchange.Batch{
 		Table: ref.Target, Position: "0/1",
-		Upserts: []change.Change{{Op: change.OpInsert, Table: ref.Target, Key: []any{int64(7)},
+		Upserts: []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(7)},
 			After: map[string]any{"id": int64(7), "v": "doomed"}, IngestTS: time.Now()}},
 	})
-	commit(change.Batch{
+	commit(rowchange.Batch{
 		Table: ref.Target, Position: "0/2",
-		Deletes: []change.Change{{Op: change.OpDelete, Table: ref.Target, Key: []any{int64(7)}}},
+		Deletes: []rowchange.Change{{Op: rowchange.OpDelete, Table: ref.Target, Key: []any{int64(7)}}},
 	})
 
 	if got := chQueryInt(t, db, "SELECT count() FROM lakehouse.ch_orders FINAL WHERE id = 7"); got != 0 {
@@ -214,15 +215,15 @@ func TestClickHouseSinkAppendMode(t *testing.T) {
 	chDrop(t, db, "ch_orders")
 
 	schema, ref := chOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.AppendMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.AppendMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := chWriter(t, ctx, s, ref, chMeta)
 	defer func() { _ = w.Close() }()
 
 	for i, pos := range []string{"0/1", "0/2"} {
-		b := change.Batch{Table: ref.Target, Position: pos, Mode: change.AppendMode}
-		b.Upserts = []change.Change{{Op: change.OpInsert, Table: ref.Target, Key: nil,
+		b := rowchange.Batch{Table: ref.Target, Position: pos, Mode: rowchange.AppendMode}
+		b.Upserts = []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: nil,
 			After: map[string]any{"id": int64(i + 1), "v": fmt.Sprintf("row-%d", i+1)}, IngestTS: time.Now()}}
 		if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 			t.Fatalf("commit %d: %v", i+1, err)
@@ -253,7 +254,7 @@ func TestClickHouseSinkProgressRoundTrip(t *testing.T) {
 	defer func() { _ = s.Close() }()
 
 	schema, ref := chOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	props := map[string]string{
@@ -296,19 +297,19 @@ func TestClickHouseSinkFailedBatchIsAtomic(t *testing.T) {
 		{Name: "amount", Type: core.ColumnType{Kind: core.KindDecimal, Precision: 4, Scale: 2, Nullable: true}},
 	}}
 	ref := core.TableRef{Source: "src.payments", Target: "lakehouse.ch_atomic", PrimaryKey: []string{"id"}}
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := chWriter(t, ctx, s, ref, nil)
 	defer func() { _ = w.Close() }()
 
-	b := change.Batch{Table: ref.Target, Position: "0/1",
-		Upserts: []change.Change{
-			{Op: change.OpInsert, Table: ref.Target, Key: []any{int64(1)},
+	b := rowchange.Batch{Table: ref.Target, Position: "0/1",
+		Upserts: []rowchange.Change{
+			{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(1)},
 				After: map[string]any{"id": int64(1), "amount": "12.34"}, IngestTS: time.Now()},
 			// A structured object cannot be a decimal: coerce fails on this
 			// row, after the good row is already buffered in the batch.
-			{Op: change.OpInsert, Table: ref.Target, Key: []any{int64(2)},
+			{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(2)},
 				After: map[string]any{"id": int64(2), "amount": map[string]any{"bad": true}}, IngestTS: time.Now()},
 		}}
 	if err := w.Commit(ctx, toDPBatch(b)); err == nil {
@@ -335,14 +336,14 @@ func TestClickHouseSinkControlWithoutFinal(t *testing.T) {
 	chDrop(t, db, "ch_orders")
 
 	schema, ref := chOrdersSchema()
-	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, change.UpsertMode); err != nil {
+	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := chWriter(t, ctx, s, ref, chMeta)
 	defer func() { _ = w.Close() }()
 
-	b := change.Batch{Table: ref.Target, Position: "0/1",
-		Upserts: []change.Change{{Op: change.OpInsert, Table: ref.Target, Key: []any{int64(9)},
+	b := rowchange.Batch{Table: ref.Target, Position: "0/1",
+		Upserts: []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(9)},
 			After: map[string]any{"id": int64(9), "v": "v1"}, IngestTS: time.Now()}}}
 	if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 		t.Fatalf("commit: %v", err)

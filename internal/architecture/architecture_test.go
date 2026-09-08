@@ -90,7 +90,7 @@ func TestContractsArePluginSafe(t *testing.T) {
 		"github.com/maltzsama/urutau/sink",
 		"github.com/maltzsama/urutau/driver",
 		"github.com/maltzsama/urutau/core",
-		"github.com/maltzsama/urutau/change",
+		"github.com/maltzsama/urutau/internal/rowchange",
 		"github.com/maltzsama/urutau/position",
 		"github.com/maltzsama/urutau/spec",
 		"github.com/maltzsama/urutau/dataplane",

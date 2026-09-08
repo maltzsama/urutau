@@ -12,11 +12,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bits-and-blooms/bloom/v3"
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/observability"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
@@ -53,7 +53,7 @@ type Worker struct {
 type tablePipeline struct {
 	target    string
 	committer sink.TableWriter
-	mode      change.WriteMode
+	mode      dataplane.WriteMode
 	ch        chan Ingest
 
 	// appendDropDeletes implements onDelete: skip — every DELETE in an
@@ -83,7 +83,7 @@ type tablePipeline struct {
 	// buffered release. Guarded by winMu: the runner (snapshot orchestrator)
 	// populates windows while the batcher goroutine consumes events.
 	winMu   sync.Mutex
-	windows map[uint32]map[string]change.Change
+	windows map[uint32]map[string]rowchange.Change
 	dropped int64
 
 	// Snapshot state for resumable backfill. The snapshot state machine
@@ -135,7 +135,7 @@ type readyBatch struct {
 type Ingest struct {
 	Table    string
 	Batch    *dataplane.Batch
-	Win      *change.Window
+	Win      *rowchange.Window
 	Position string
 }
 
@@ -159,13 +159,13 @@ func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
 // sink.TableWriter implementation — the worker knows nothing about the sink.
 // The mode controls whether batches are collapsed (upsert) or
 // passed through (append).
-func (w *Worker) Register(target string, c sink.TableWriter, mode change.WriteMode) {
+func (w *Worker) Register(target string, c sink.TableWriter, mode dataplane.WriteMode) {
 	w.tables[target] = newTablePipeline(target, c, mode)
 }
 
 // RegisterCommitter wires a writer to a target table (test helper; same
 // contract as Register).
-func (w *Worker) RegisterCommitter(target string, c sink.TableWriter, mode change.WriteMode) {
+func (w *Worker) RegisterCommitter(target string, c sink.TableWriter, mode dataplane.WriteMode) {
 	w.tables[target] = newTablePipeline(target, c, mode)
 }
 
@@ -216,14 +216,14 @@ func (w *Worker) DroppedDeletes(target string) int64 {
 	return 0
 }
 
-func newTablePipeline(target string, c sink.TableWriter, mode change.WriteMode) *tablePipeline {
+func newTablePipeline(target string, c sink.TableWriter, mode dataplane.WriteMode) *tablePipeline {
 	return &tablePipeline{
 		target:         target,
 		committer:      c,
 		mode:           mode,
 		ch:             make(chan Ingest, 1024),
 		readyCh:        make(chan readyBatch, 1),
-		windows:        map[uint32]map[string]change.Change{},
+		windows:        map[uint32]map[string]rowchange.Change{},
 		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
 		driftReported:  map[string]bool{},
 	}
@@ -250,11 +250,11 @@ func (w *Worker) AddWindowRows(target string, chunkID uint32, batch *dataplane.B
 	defer p.winMu.Unlock()
 	win, ok := p.windows[chunkID]
 	if !ok {
-		win = make(map[string]change.Change, len(rows))
+		win = make(map[string]rowchange.Change, len(rows))
 		p.windows[chunkID] = win
 	}
 	for _, r := range rows {
-		win[change.KeyString(r.Key)] = r
+		win[rowchange.KeyString(r.Key)] = r
 	}
 	return nil
 }
@@ -484,7 +484,7 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 // runBatcher collects changes, collapses them, and sends ready batches to
 // the committer. When the channel closes, the committer drains and exits.
 func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
-	var buf []change.Change
+	var buf []rowchange.Change
 	ticker := time.NewTicker(w.cfg.MaxInterval)
 	defer ticker.Stop()
 
@@ -508,11 +508,11 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		resumed := p.snapshotResumed
 		p.snapshotMu.Unlock()
 
-		if inSnapshot && !resumed && p.mode == change.UpsertMode {
-			var untouched []change.Change
-			var rest []change.Change
+		if inSnapshot && !resumed && p.mode == dataplane.UpsertMode {
+			var untouched []rowchange.Change
+			var rest []rowchange.Change
 			for _, c := range buf {
-				if c.Snapshot && !guard.TestAndAddString(change.KeyString(c.Key)) {
+				if c.Snapshot && !guard.TestAndAddString(rowchange.KeyString(c.Key)) {
 					untouched = append(untouched, c)
 				} else {
 					rest = append(rest, c)
@@ -523,7 +523,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				appendPos = ""
 			}
 			if len(untouched) > 0 {
-				ab := change.Batch{Table: p.target, Upserts: untouched, Position: appendPos, Mode: change.AppendMode}
+				ab := rowchange.Batch{Table: p.target, Upserts: untouched, Position: appendPos, Mode: rowchange.WriteMode(dataplane.AppendMode)}
 				p.snapshotMu.Lock()
 				ab.SnapshotState = p.snapshotState
 				ab.SnapshotPending = p.snapshotPending
@@ -541,8 +541,8 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				}
 			}
 			if len(rest) > 0 {
-				collapsed := change.Collapse(rest)
-				b := change.Batch{Table: p.target, Upserts: collapsed.Upserts, Deletes: collapsed.Deletes, Position: pos, Mode: change.UpsertMode}
+				collapsed := rowchange.Collapse(rest)
+				b := rowchange.Batch{Table: p.target, Upserts: collapsed.Upserts, Deletes: collapsed.Deletes, Position: pos, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
 				p.snapshotMu.Lock()
 				b.SnapshotState = p.snapshotState
 				b.SnapshotPending = p.snapshotPending
@@ -564,10 +564,10 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		}
 
 		switch p.mode {
-		case change.AppendMode:
-			upserts := make([]change.Change, 0, len(buf))
+		case dataplane.AppendMode:
+			upserts := make([]rowchange.Change, 0, len(buf))
 			for _, c := range buf {
-				if c.Op == change.OpDelete {
+				if c.Op == rowchange.OpDelete {
 					// onDelete: skip — the delete is a fact only its absence
 					// records. Drop and count.
 					if p.appendDropDeletes {
@@ -606,7 +606,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 						// QUARANTINE: enrich the rewritten delete as a single-row
 						// batch through the columnar seam; dies when the join
 						// becomes columnar.
-						dpb, err := dpint.BatchFromChangeBatch(change.Batch{Table: p.target, Upserts: []change.Change{c}, Mode: change.AppendMode}, p.knownSchema)
+						dpb, err := dpint.BatchFromChangeBatch(rowchange.Batch{Table: p.target, Upserts: []rowchange.Change{c}, Mode: rowchange.WriteMode(dataplane.AppendMode)}, p.knownSchema)
 						if err != nil {
 							return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
 						}
@@ -631,7 +631,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				}
 				upserts = append(upserts, c)
 			}
-			b := change.Batch{Table: p.target, Upserts: upserts, Position: pos, Mode: change.AppendMode}
+			b := rowchange.Batch{Table: p.target, Upserts: upserts, Position: pos, Mode: rowchange.WriteMode(dataplane.AppendMode)}
 			p.snapshotMu.Lock()
 			b.SnapshotState = p.snapshotState
 			b.SnapshotPending = p.snapshotPending
@@ -656,7 +656,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// the sink commits a single batch per flush, and the position
 			// must never separate from its data (two commits would advance
 			// past uncommitted upserts on a crash between them).
-			cb := change.Batch{Table: p.target, Upserts: buf, Position: pos, Mode: change.UpsertMode}
+			cb := rowchange.Batch{Table: p.target, Upserts: buf, Position: pos, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
 			dpb, err := dpint.BatchFromChangeBatch(cb, p.knownSchema)
 			if err != nil {
 				return fmt.Errorf("worker: table %s: bridge upsert: %w", p.target, err)
@@ -775,7 +775,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			for i := range rows {
 				c := &rows[i]
 				if ing.Win != nil && ing.Win.InWindow {
-					c.Window = &change.Window{ChunkID: ing.Win.ChunkID, InWindow: true}
+					c.Window = &rowchange.Window{ChunkID: ing.Win.ChunkID, InWindow: true}
 				}
 				// A live event during the snapshot marks its PK as touched:
 				// the snapshot row for that key must take the safe upsert path,
@@ -786,7 +786,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				if !c.Snapshot && c.Key != nil {
 					p.snapshotMu.Lock()
 					if p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil {
-						p.bootstrapGuard.AddString(change.KeyString(c.Key))
+						p.bootstrapGuard.AddString(rowchange.KeyString(c.Key))
 					}
 					p.snapshotMu.Unlock()
 				}
@@ -799,7 +799,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				// every open window.
 				if c.Window != nil && c.Window.InWindow {
 					p.winMu.Lock()
-					k := change.KeyString(c.Key)
+					k := rowchange.KeyString(c.Key)
 					for _, win := range p.windows {
 						if _, hit := win[k]; hit {
 							delete(win, k)
@@ -853,7 +853,7 @@ func CountOps(b *dataplane.Batch) (upserts, deletes int) {
 		return int(b.Record.NumRows()), 0
 	}
 	for i := range opCol.Len() {
-		if opCol.Value(i) == uint8(change.OpDelete) {
+		if opCol.Value(i) == uint8(rowchange.OpDelete) {
 			deletes++
 		} else {
 			upserts++
@@ -915,7 +915,7 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 
 // decodeToChanges decodes a columnar batch back to row-oriented changes.
 // QUARANTINE: dies when the worker consumes Batch directly (M4).
-func decodeToChanges(b *dataplane.Batch, pk []string) ([]change.Change, error) {
+func decodeToChanges(b *dataplane.Batch, pk []string) ([]rowchange.Change, error) {
 	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
 		return nil, nil
 	}
@@ -931,17 +931,17 @@ func decodeToChanges(b *dataplane.Batch, pk []string) ([]change.Change, error) {
 // batch never mixes tables (the wire schema is per-table). Window markers
 // pass through as Ingest with Win set.
 // QUARANTINE: dies when sources produce Arrow directly (M4).
-func IngestFromChanges(ctx context.Context, changes <-chan change.Change, schema core.Schema) <-chan Ingest {
+func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, schema core.Schema) <-chan Ingest {
 	out := make(chan Ingest, 64)
 	go func() {
 		defer close(out)
-		bufs := map[string][]change.Change{}
+		bufs := map[string][]rowchange.Change{}
 		flush := func() {
 			for table, buf := range bufs {
 				if len(buf) == 0 {
 					continue
 				}
-				cb := change.Batch{Table: table, Upserts: buf, Mode: change.UpsertMode}
+				cb := rowchange.Batch{Table: table, Upserts: buf, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
 				dpb, err := dpint.BatchFromChangeBatch(cb, schema)
 				if err != nil {
 					bufs[table] = bufs[table][:0] // QUARANTINE: drop on bridge error; dies in M4
@@ -978,7 +978,7 @@ func IngestFromChanges(ctx context.Context, changes <-chan change.Change, schema
 						continue
 					}
 					// InWindow is DATA + a routing tag; the batch must survive.
-					cb := change.Batch{Table: c.Table, Upserts: []change.Change{c}, Mode: change.UpsertMode}
+					cb := rowchange.Batch{Table: c.Table, Upserts: []rowchange.Change{c}, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
 					dpb, err := dpint.BatchFromChangeBatch(cb, schema)
 					if err != nil {
 						continue

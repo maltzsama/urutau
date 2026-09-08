@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
@@ -20,29 +20,29 @@ const runnerTestUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
 // gateCommitter records committed batches.
 type gateCommitter struct {
 	mu      sync.Mutex
-	batches []change.Batch
+	batches []rowchange.Batch
 }
 
 func (c *gateCommitter) Close() error { return nil }
 func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
-	// Unpack to change.Batch for test assertions.
+	// Unpack to rowchange.Batch for test assertions.
 	// QUARANTINE: bridge that dies when tests consume RecordBatch directly.
 	if b.Record == nil || b.Record.NumRows() == 0 {
 		c.mu.Lock()
-		c.batches = append(c.batches, change.Batch{Table: b.Table, Position: string(b.Watermark), Mode: b.Mode})
+		c.batches = append(c.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode)})
 		c.mu.Unlock()
 		return nil
 	}
 	rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
-	var upserts []change.Change
+	var upserts []rowchange.Change
 	for _, r := range rows {
-		if r.Op != change.OpDelete {
+		if r.Op != rowchange.OpDelete {
 			upserts = append(upserts, r)
 		}
 	}
 	c.mu.Lock()
-	c.batches = append(c.batches, change.Batch{
-		Table: b.Table, Upserts: upserts, Position: string(b.Watermark), Mode: b.Mode,
+	c.batches = append(c.batches, rowchange.Batch{
+		Table: b.Table, Upserts: upserts, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode),
 	})
 	c.mu.Unlock()
 	return nil
@@ -71,7 +71,7 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	at := position.MustGTID(runnerTestUUID + ":1-9")
 	committer := &gateCommitter{}
 	w := worker.New(worker.Config{MaxRows: 100, MaxInterval: time.Hour})
-	w.RegisterCommitter("raw.orders", committer, change.UpsertMode)
+	w.RegisterCommitter("raw.orders", committer, dataplane.UpsertMode)
 	w.SetKnownSchema("raw.orders", core.Schema{
 		Columns: []core.Column{
 			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
@@ -85,7 +85,7 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
 	r := newRelay(ingest, w)
-	out := make(chan change.Change, 64)
+	out := make(chan rowchange.Change, 64)
 	pr := &pullTestReader{Puller: sourcepull.New(out)}
 	relayDone := make(chan struct{})
 	go func() {
@@ -98,19 +98,19 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 
 	// A live UPDATE of id=1 decoded during the SELECT: the reader tags it
 	// InWindow, but the relay must hold it until the window is populated.
-	out <- change.Change{
-		Op:       change.OpUpdate,
+	out <- rowchange.Change{
+		Op:       rowchange.OpUpdate,
 		Table:    "raw.orders",
 		Key:      []any{int64(1)},
 		After:    map[string]any{"id": int64(1), "v": "live"},
 		Position: at.String(),
-		Window:   &change.Window{ChunkID: 0, InWindow: true},
+		Window:   &rowchange.Window{ChunkID: 0, InWindow: true},
 	}
 
 	// The chunk SELECT lands: id=1 is stale (v=a), id=2 stable (v=x).
-	if err := r.AddWindowRows("raw.orders", 0, []change.Change{
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: at.String()},
-		{Op: change.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "x"}, Position: at.String()},
+	if err := r.AddWindowRows("raw.orders", 0, []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: at.String()},
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "x"}, Position: at.String()},
 	}); err != nil {
 		t.Fatalf("AddWindowRows: %v", err)
 	}

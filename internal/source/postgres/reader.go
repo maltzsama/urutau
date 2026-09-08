@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
-	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
@@ -54,19 +54,19 @@ type relEntry struct {
 }
 
 // Reader wraps one logical-decoding connection and decodes pgoutput row
-// changes into change.Change, positioned at their commit LSN.
+// changes into rowchange.Change, positioned at their commit LSN.
 type Reader struct {
 	cfg     Config
 	db      *sql.DB
 	conn    *pgx.Conn
-	out     chan<- change.Change
+	out     chan<- rowchange.Change
 	bySrc   map[string]source.TableRef // "schema.table" → ref (PK + target)
 	states  map[string]*TableState     // "schema.table" → introspected state
 	relByID map[uint32]relEntry        // relation id → state, from Relation messages
 
 	// Transaction buffer: rows stream inside a transaction before its
 	// commit LSN is known, so they accumulate and flush at Commit.
-	txn []*change.Change
+	txn []*rowchange.Change
 
 	// curLSN is the current transaction's final (commit) LSN, from the Begin
 	// message. The DBLog window uses it to tag only transactions committed
@@ -95,7 +95,7 @@ type Reader struct {
 // New introspects the tables, performs the server-side setup (replica
 // identity, publication, slot), and opens the replication connection —
 // but does not start streaming.
-func New(ctx context.Context, cfg Config, out chan<- change.Change) (*Reader, error) {
+func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -406,7 +406,7 @@ func (r *Reader) handleInsert(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	r.enqueue(entry, change.OpInsert, row, nil)
+	r.enqueue(entry, rowchange.OpInsert, row, nil)
 	return nil
 }
 
@@ -430,7 +430,7 @@ func (r *Reader) handleUpdate(payload []byte) error {
 			return err
 		}
 	}
-	r.enqueue(entry, change.OpUpdate, row, before)
+	r.enqueue(entry, rowchange.OpUpdate, row, before)
 	return nil
 }
 
@@ -452,21 +452,21 @@ func (r *Reader) handleDelete(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	r.enqueue(entry, change.OpDelete, nil, before)
+	r.enqueue(entry, rowchange.OpDelete, nil, before)
 	return nil
 }
 
 // enqueue decodes one row change into the transaction buffer. The window
 // tag is applied here — at decode time — while the commit position is
 // only stamped at Commit, when the LSN is known.
-func (r *Reader) enqueue(entry relEntry, op change.Op, after, before map[string]any) {
-	c := change.Change{
+func (r *Reader) enqueue(entry relEntry, op rowchange.Op, after, before map[string]any) {
+	c := rowchange.Change{
 		Op:       op,
 		Table:    entry.ref.Target,
 		IngestTS: time.Now(),
 	}
 	switch op {
-	case change.OpDelete:
+	case rowchange.OpDelete:
 		c.Before = before
 		c.Key = keyFrom(entry.state, entry.ref, before)
 	default:
@@ -558,7 +558,7 @@ func (r *Reader) confirmedLSN() position.LSN {
 	return *lsn
 }
 
-func (r *Reader) currentWindow() *change.Window {
+func (r *Reader) currentWindow() *rowchange.Window {
 	r.winMu.Lock()
 	defer r.winMu.Unlock()
 	if !r.winOpen {
@@ -573,7 +573,7 @@ func (r *Reader) currentWindow() *change.Window {
 	if r.winLow != nil && r.curLSN <= *r.winLow {
 		return nil
 	}
-	return &change.Window{ChunkID: r.winChunk, InWindow: true}
+	return &rowchange.Window{ChunkID: r.winChunk, InWindow: true}
 }
 
 // keyFrom builds the key tuple from the PK columns, in spec order.
