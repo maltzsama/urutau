@@ -9,10 +9,11 @@ import (
 )
 
 func TestCollapseBasic(t *testing.T) {
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -32,18 +33,17 @@ func TestCollapseBasic(t *testing.T) {
 	if dels != nil {
 		total += int(dels.Record.NumRows())
 	}
-	// Seed 1, 10 rows: IDs range from 1-10, but some may collide depending on
-	// the generator. Collapse should keep exactly 1 row per unique PK.
 	if total < 1 || total > 10 {
 		t.Errorf("unexpected collapsed row count %d", total)
 	}
 }
 
 func TestCollapseDeleteLast(t *testing.T) {
-	b := dataplane.AdversarialDeleteLast(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -56,7 +56,6 @@ func TestCollapseDeleteLast(t *testing.T) {
 		}
 	}()
 
-	// PK=1 last op is DELETE → should be in deletes, not upserts
 	if ups != nil {
 		t.Errorf("expected no upserts for delete-last, got %d", ups.Record.NumRows())
 	}
@@ -66,10 +65,11 @@ func TestCollapseDeleteLast(t *testing.T) {
 }
 
 func TestCollapseInsertAfterDelete(t *testing.T) {
-	b := dataplane.AdversarialInsertAfterDelete(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -82,7 +82,6 @@ func TestCollapseInsertAfterDelete(t *testing.T) {
 		}
 	}()
 
-	// Last occurrence is INSERT → should be in upserts
 	if ups == nil || ups.Record.NumRows() != 1 {
 		t.Errorf("expected 1 upsert for reinsert, got %v", ups)
 	}
@@ -92,10 +91,11 @@ func TestCollapseInsertAfterDelete(t *testing.T) {
 }
 
 func TestCollapseCompositeKey(t *testing.T) {
-	b := dataplane.AdversarialCompositeKey(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), b, []string{"pk1", "pk2"})
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -108,7 +108,6 @@ func TestCollapseCompositeKey(t *testing.T) {
 		}
 	}()
 
-	// Two distinct PKs → both should survive
 	total := 0
 	if ups != nil {
 		total += int(ups.Record.NumRows())
@@ -122,23 +121,26 @@ func TestCollapseCompositeKey(t *testing.T) {
 }
 
 func TestCollapseNullPK(t *testing.T) {
+	alloc := checkedAlloc(t)
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{
 		NumRows:       3,
 		IncludeNullPK: true,
+		Allocator:     alloc,
 	})
 	defer b.Release()
 
-	_, _, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	_, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err == nil {
 		t.Fatal("expected error for null PK")
 	}
 }
 
 func TestCollapsePreservesWatermark(t *testing.T) {
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
-	ups, _, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -154,15 +156,15 @@ func TestCollapsePreservesWatermark(t *testing.T) {
 }
 
 func TestCollapseEmptyBatch(t *testing.T) {
-	// Build a zero-row batch
-	rb := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 1})
+	alloc := checkedAlloc(t)
+	rb := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 1, Allocator: alloc})
 	defer rb.Release()
 	empty := rb.Record.NewSlice(0, 0)
 	defer empty.Release()
 
 	b := &dataplane.Batch{Table: rb.Table, Record: empty, Watermark: rb.Watermark}
 
-	ups, dels, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -177,10 +179,11 @@ func TestCollapseEmptyBatch(t *testing.T) {
 }
 
 func TestCollapseInt64Overflow(t *testing.T) {
-	b := dataplane.AdversarialInt64Overflow(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 
-	ups, _, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -194,7 +197,6 @@ func TestCollapseInt64Overflow(t *testing.T) {
 		t.Errorf("expected 2 upserts for 2 distinct int64 PKs, got %v", ups)
 	}
 
-	// Verify int64 values preserved
 	if ups != nil {
 		bigCol := ups.Record.Column(1).(*array.Int64)
 		if bigCol.Value(0) != (int64(1)<<53)+1 {

@@ -8,7 +8,8 @@ import (
 )
 
 func TestGeneratorWatermarkIsLastRowPos(t *testing.T) {
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
 	defer b.Release()
 
 	schema := b.Record.Schema()
@@ -31,7 +32,8 @@ func TestGeneratorWatermarkIsLastRowPos(t *testing.T) {
 }
 
 func TestGeneratorSchemaCoherent(t *testing.T) {
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 5})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
 	schema := b.Record.Schema()
@@ -39,8 +41,8 @@ func TestGeneratorSchemaCoherent(t *testing.T) {
 		t.Fatal("nil schema")
 	}
 
-	// Must have at least: id, val, amount, active, __op, __pos, __commit_ts
-	required := []string{"id", "val", "amount", "active", "__op", "__pos", "__commit_ts"}
+	// Must have at least: id, val, __before_val, amount, active, __op, __pos, __commit_ts
+	required := []string{"id", "val", "__before_val", "amount", "active", "__op", "__pos", "__commit_ts"}
 	for _, name := range required {
 		found := false
 		for i := range schema.NumFields() {
@@ -56,9 +58,11 @@ func TestGeneratorSchemaCoherent(t *testing.T) {
 }
 
 func TestGeneratorPKNotNull(t *testing.T) {
+	alloc := checkedAlloc(t)
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{
 		NumRows:       10,
 		IncludeNullPK: false,
+		Allocator:     alloc,
 	})
 	defer b.Release()
 
@@ -71,7 +75,8 @@ func TestGeneratorPKNotNull(t *testing.T) {
 }
 
 func TestGeneratorPosMonotonic(t *testing.T) {
-	b := dataplane.GenerateBatch(99, dataplane.GeneratorOpts{NumRows: 30})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(99, dataplane.GeneratorOpts{NumRows: 30, Allocator: alloc})
 	defer b.Release()
 
 	schema := b.Record.Schema()
@@ -92,7 +97,8 @@ func TestGeneratorPosMonotonic(t *testing.T) {
 }
 
 func TestGeneratorInt64Overflow(t *testing.T) {
-	b := dataplane.AdversarialInt64Overflow(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 
 	idCol := b.Record.Column(0).(*array.Int64)
@@ -107,7 +113,8 @@ func TestGeneratorInt64Overflow(t *testing.T) {
 }
 
 func TestGeneratorDeleteLast(t *testing.T) {
-	b := dataplane.AdversarialDeleteLast(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
 	opCol := b.Record.Column(1).(*array.Uint8)
@@ -117,7 +124,8 @@ func TestGeneratorDeleteLast(t *testing.T) {
 }
 
 func TestGeneratorInsertAfterDelete(t *testing.T) {
-	b := dataplane.AdversarialInsertAfterDelete(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
 	opCol := b.Record.Column(1).(*array.Uint8)
@@ -130,28 +138,27 @@ func TestGeneratorInsertAfterDelete(t *testing.T) {
 }
 
 func TestGeneratorCompositeKeyDistinct(t *testing.T) {
-	b := dataplane.AdversarialCompositeKey(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
 	pk1 := b.Record.Column(0).(*array.String)
 	pk2 := b.Record.Column(1).(*array.String)
 
-	// The naive concat collides: "ab"+"c" == "a"+"bc" == "abc"
-	// This is exactly why CR-069 §3.2 uses length-prefixed encoding.
 	naive0 := pk1.Value(0) + pk2.Value(0)
 	naive1 := pk1.Value(1) + pk2.Value(1)
 	if naive0 != naive1 {
 		t.Skip("naive concat doesn't collide — adversarial case not triggered")
 	}
 
-	// But the tuples ARE distinct
 	if pk1.Value(0) == pk1.Value(1) && pk2.Value(0) == pk2.Value(1) {
 		t.Error("composite key tuples must be distinct")
 	}
 }
 
 func TestGeneratorNullBefore(t *testing.T) {
-	b := dataplane.AdversarialNullBefore(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialNullBefore(0, alloc)
 	defer b.Release()
 
 	valCol := b.Record.Column(1).(*array.String)
@@ -164,11 +171,18 @@ func TestGeneratorNullBefore(t *testing.T) {
 }
 
 func TestEncodeKeyDistinct(t *testing.T) {
-	b := dataplane.AdversarialCompositeKey(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
-	key0 := dataplane.EncodeKey(b.Record, 0, []string{"pk1", "pk2"})
-	key1 := dataplane.EncodeKey(b.Record, 1, []string{"pk1", "pk2"})
+	key0, err := dataplane.EncodeKey(b.Record, 0, []string{"pk1", "pk2"})
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+	key1, err := dataplane.EncodeKey(b.Record, 1, []string{"pk1", "pk2"})
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
 
 	if string(key0) == string(key1) {
 		t.Errorf("encoded keys must differ: %x vs %x", key0, key1)
@@ -176,9 +190,11 @@ func TestEncodeKeyDistinct(t *testing.T) {
 }
 
 func TestGeneratorNullPK(t *testing.T) {
+	alloc := checkedAlloc(t)
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{
 		NumRows:       3,
 		IncludeNullPK: true,
+		Allocator:     alloc,
 	})
 	defer b.Release()
 
@@ -192,14 +208,38 @@ func TestGeneratorNullPK(t *testing.T) {
 }
 
 func TestBatchWatermarkImmutable(t *testing.T) {
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
 	wm := make([]byte, len(b.Watermark))
 	copy(wm, b.Watermark)
 
-	// Simulate: nothing changes the watermark
 	if string(b.Watermark) != string(wm) {
 		t.Errorf("Watermark changed: was %q, now %q", wm, b.Watermark)
+	}
+}
+
+func TestGeneratorDuplicatePKDomain(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{
+		NumRows:   20,
+		PKDomain:  5,
+		Allocator: alloc,
+	})
+	defer b.Release()
+
+	// With PKDomain=5, IDs should be 1..5 repeating
+	idCol := b.Record.Column(0).(*array.Int64)
+	seen := make(map[int64]bool)
+	for i := range int(idCol.Len()) {
+		v := idCol.Value(i)
+		if v < 1 || v > 5 {
+			t.Errorf("row %d: id=%d outside PKDomain [1,5]", i, v)
+		}
+		seen[v] = true
+	}
+	if len(seen) != 5 {
+		t.Errorf("expected 5 distinct PKs, got %d", len(seen))
 	}
 }

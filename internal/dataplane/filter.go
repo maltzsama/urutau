@@ -22,15 +22,9 @@ const (
 // same length as the batch. Watermark and Table are preserved on every
 // output — transforms never move them (CR-069 §3.3).
 //
-// mask semantics (CR-069 §3.1 transition matrix, simplified for M1):
-//
-//	delete_mask = mask AND (__op == 2)
-//	insert_mask = mask AND (__op == 0)
-//	update_mask = mask AND (__op == 1)
-//
 // Rows that don't pass the mask are dropped entirely. The three output
 // batches are independent; each may be nil if empty.
-func Filter(ctx context.Context, batch *Batch, mask arrow.Array) (inserts, deletes, updates *Batch, err error) {
+func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arrow.Array) (inserts, deletes, updates *Batch, err error) {
 	if batch.Record == nil {
 		return nil, nil, nil, nil
 	}
@@ -39,15 +33,23 @@ func Filter(ctx context.Context, batch *Batch, mask arrow.Array) (inserts, delet
 		return nil, nil, nil, fmt.Errorf("dataplane: filter mask length %d != batch rows %d", mask.Len(), nrows)
 	}
 
+	boolMask, ok := mask.(*array.Boolean)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("dataplane: filter mask type %T, want *array.Boolean", mask)
+	}
+
 	opIdx := colIndex(batch.Record.Schema(), "__op")
 	if opIdx < 0 {
 		return nil, nil, nil, fmt.Errorf("dataplane: __op column not found")
 	}
-	opCol := batch.Record.Column(opIdx).(*array.Uint8)
+	opCol, ok := batch.Record.Column(opIdx).(*array.Uint8)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", batch.Record.Column(opIdx))
+	}
 
-	delMask := buildOpMask(ctx, opCol, OpDelete, mask)
-	insMask := buildOpMask(ctx, opCol, OpInsert, mask)
-	updMask := buildOpMask(ctx, opCol, OpUpdate, mask)
+	delMask := buildOpMask(alloc, opCol, OpDelete, boolMask)
+	insMask := buildOpMask(alloc, opCol, OpInsert, boolMask)
+	updMask := buildOpMask(alloc, opCol, OpUpdate, boolMask)
 	defer delMask.Release()
 	defer insMask.Release()
 	defer updMask.Release()
@@ -88,18 +90,18 @@ func Filter(ctx context.Context, batch *Batch, mask arrow.Array) (inserts, delet
 	return inserts, deletes, updates, nil
 }
 
-// FilterByPredicate evaluates a simple column predicate and returns a
-// boolean mask. Supported predicates: column name, operator, value.
+// Predicate is a simple column predicate for EvaluatePredicate.
+// Supported ops: "=", "!=".
 type Predicate struct {
 	Column string
-	Op     string // "=", "!=", ">", "<", ">=", "<="
+	Op     string
 	Value  any
 }
 
 // EvaluatePredicate builds a boolean mask from a predicate over the
 // batch's columns. Null values are treated as false (coalesce — matches
 // the row-oriented path, NOT Kleene semantics).
-func EvaluatePredicate(ctx context.Context, batch *Batch, pred Predicate) (arrow.Array, error) {
+func EvaluatePredicate(ctx context.Context, alloc memory.Allocator, batch *Batch, pred Predicate) (arrow.Array, error) {
 	if batch.Record == nil {
 		return nil, fmt.Errorf("dataplane: nil record")
 	}
@@ -108,41 +110,53 @@ func EvaluatePredicate(ctx context.Context, batch *Batch, pred Predicate) (arrow
 		return nil, fmt.Errorf("dataplane: column %q not found", pred.Column)
 	}
 	col := batch.Record.Column(idx)
-	return evaluateColPredicate(ctx, col, pred)
+	return evaluateColPredicate(ctx, alloc, col, pred)
 }
 
-func evaluateColPredicate(ctx context.Context, col arrow.Array, pred Predicate) (arrow.Array, error) {
+func evaluateColPredicate(ctx context.Context, alloc memory.Allocator, col arrow.Array, pred Predicate) (arrow.Array, error) {
 	n := col.Len()
 	switch pred.Op {
 	case "=":
-		return compareEqual(ctx, col, pred.Value, n)
+		return compareEqual(ctx, alloc, col, pred.Value, n)
 	case "!=":
-		eq, err := compareEqual(ctx, col, pred.Value, n)
+		eq, err := compareEqual(ctx, alloc, col, pred.Value, n)
 		if err != nil {
 			return nil, err
 		}
 		defer eq.Release()
-		return invertBool(ctx, eq)
+		return invertBool(alloc, eq)
 	default:
-		return nil, fmt.Errorf("dataplane: unsupported predicate op %q", pred.Op)
+		return nil, fmt.Errorf("dataplane: unsupported predicate op %q (supported: \"=\", \"!=\")", pred.Op)
 	}
 }
 
-func compareEqual(ctx context.Context, col arrow.Array, val any, n int) (arrow.Array, error) {
+func compareEqual(_ context.Context, alloc memory.Allocator, col arrow.Array, val any, n int) (arrow.Array, error) {
 	switch a := col.(type) {
 	case *array.Int64:
-		return compareInt64Eq(a, val.(int64), n), nil
+		v, ok := val.(int64)
+		if !ok {
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want int64 for column of type Int64", val)
+		}
+		return compareInt64Eq(alloc, a, v, n), nil
 	case *array.String:
-		return compareStringEq(a, val.(string), n), nil
+		v, ok := val.(string)
+		if !ok {
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want string for column of type String", val)
+		}
+		return compareStringEq(alloc, a, v, n), nil
 	case *array.Boolean:
-		return compareBoolEq(a, val.(bool), n), nil
+		v, ok := val.(bool)
+		if !ok {
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want bool for column of type Boolean", val)
+		}
+		return compareBoolEq(alloc, a, v, n), nil
 	default:
 		return nil, fmt.Errorf("dataplane: unsupported column type %T for equality predicate", col)
 	}
 }
 
-func compareInt64Eq(col *array.Int64, val int64, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(memoryAllocator())
+func compareInt64Eq(alloc memory.Allocator, col *array.Int64, val int64, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
 	defer bb.Release()
 	for i := range n {
 		if col.IsNull(i) {
@@ -154,8 +168,8 @@ func compareInt64Eq(col *array.Int64, val int64, n int) arrow.Array {
 	return bb.NewBooleanArray()
 }
 
-func compareStringEq(col *array.String, val string, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(memoryAllocator())
+func compareStringEq(alloc memory.Allocator, col *array.String, val string, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
 	defer bb.Release()
 	for i := range n {
 		if col.IsNull(i) {
@@ -167,8 +181,8 @@ func compareStringEq(col *array.String, val string, n int) arrow.Array {
 	return bb.NewBooleanArray()
 }
 
-func compareBoolEq(col *array.Boolean, val bool, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(memoryAllocator())
+func compareBoolEq(alloc memory.Allocator, col *array.Boolean, val bool, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
 	defer bb.Release()
 	for i := range n {
 		if col.IsNull(i) {
@@ -180,9 +194,12 @@ func compareBoolEq(col *array.Boolean, val bool, n int) arrow.Array {
 	return bb.NewBooleanArray()
 }
 
-func invertBool(ctx context.Context, col arrow.Array) (arrow.Array, error) {
-	b := col.(*array.Boolean)
-	bb := array.NewBooleanBuilder(memoryAllocator())
+func invertBool(alloc memory.Allocator, col arrow.Array) (arrow.Array, error) {
+	b, ok := col.(*array.Boolean)
+	if !ok {
+		return nil, fmt.Errorf("dataplane: invertBool: type %T, want *array.Boolean", col)
+	}
+	bb := array.NewBooleanBuilder(alloc)
 	defer bb.Release()
 	for i := range b.Len() {
 		bb.Append(!b.Value(i))
@@ -192,13 +209,13 @@ func invertBool(ctx context.Context, col arrow.Array) (arrow.Array, error) {
 
 // buildOpMask creates a boolean mask that is true only where the __op
 // column equals the given value AND the input mask is true.
-func buildOpMask(ctx context.Context, opCol *array.Uint8, opVal uint8, mask arrow.Array) arrow.Array {
+func buildOpMask(alloc memory.Allocator, opCol *array.Uint8, opVal uint8, mask *array.Boolean) arrow.Array {
 	n := opCol.Len()
-	bb := array.NewBooleanBuilder(memoryAllocator())
+	bb := array.NewBooleanBuilder(alloc)
 	defer bb.Release()
 	for i := range n {
 		opMatch := opCol.Value(i) == opVal
-		maskPass := mask.(*array.Boolean).Value(i)
+		maskPass := mask.Value(i)
 		bb.Append(opMatch && maskPass)
 	}
 	return bb.NewBooleanArray()
@@ -207,9 +224,9 @@ func buildOpMask(ctx context.Context, opCol *array.Uint8, opVal uint8, mask arro
 // TransitionMask builds a boolean mask from the __op column for a
 // specific operation type. No input filter mask — all rows of that op
 // type pass. Used when splitting a batch by operation without filtering.
-func TransitionMask(opCol *array.Uint8, opVal uint8) arrow.Array {
+func TransitionMask(alloc memory.Allocator, opCol *array.Uint8, opVal uint8) arrow.Array {
 	n := opCol.Len()
-	bb := array.NewBooleanBuilder(memoryAllocator())
+	bb := array.NewBooleanBuilder(alloc)
 	defer bb.Release()
 	for i := range n {
 		bb.Append(opCol.Value(i) == opVal)
@@ -220,7 +237,7 @@ func TransitionMask(opCol *array.Uint8, opVal uint8) arrow.Array {
 // SplitByOp splits a batch into inserts, deletes, and updates using the
 // __op column. Every row goes to exactly one output. Watermark and Table
 // are preserved. Empty outputs are nil (not empty batches).
-func SplitByOp(ctx context.Context, batch *Batch) (inserts, deletes, updates *Batch, err error) {
+func SplitByOp(ctx context.Context, alloc memory.Allocator, batch *Batch) (inserts, deletes, updates *Batch, err error) {
 	if batch.Record == nil {
 		return nil, nil, nil, nil
 	}
@@ -228,11 +245,14 @@ func SplitByOp(ctx context.Context, batch *Batch) (inserts, deletes, updates *Ba
 	if opIdx < 0 {
 		return nil, nil, nil, fmt.Errorf("dataplane: __op column not found")
 	}
-	opCol := batch.Record.Column(opIdx).(*array.Uint8)
+	opCol, ok := batch.Record.Column(opIdx).(*array.Uint8)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", batch.Record.Column(opIdx))
+	}
 
-	insMask := TransitionMask(opCol, OpInsert)
-	delMask := TransitionMask(opCol, OpDelete)
-	updMask := TransitionMask(opCol, OpUpdate)
+	insMask := TransitionMask(alloc, opCol, OpInsert)
+	delMask := TransitionMask(alloc, opCol, OpDelete)
+	updMask := TransitionMask(alloc, opCol, OpUpdate)
 	defer insMask.Release()
 	defer delMask.Release()
 	defer updMask.Release()
@@ -280,8 +300,4 @@ func colIndex(schema *arrow.Schema, name string) int {
 		}
 	}
 	return -1
-}
-
-func memoryAllocator() memory.Allocator {
-	return memory.NewGoAllocator()
 }

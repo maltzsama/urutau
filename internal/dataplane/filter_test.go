@@ -10,10 +10,10 @@ import (
 
 func TestSplitByOp(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20})
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
 	defer b.Release()
 
-	ins, del, upd, err := dataplane.SplitByOp(context.Background(), b)
+	ins, del, upd, err := dataplane.SplitByOp(context.Background(), alloc, b)
 	if err != nil {
 		t.Fatalf("SplitByOp: %v", err)
 	}
@@ -35,15 +35,14 @@ func TestSplitByOp(t *testing.T) {
 	if total != int(b.Record.NumRows()) {
 		t.Errorf("total rows %d != batch rows %d", total, b.Record.NumRows())
 	}
-
-	_ = alloc // leak check via t.Cleanup
 }
 
 func TestSplitByOpWatermarkPreserved(t *testing.T) {
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
-	ins, del, upd, err := dataplane.SplitByOp(context.Background(), b)
+	ins, del, upd, err := dataplane.SplitByOp(context.Background(), alloc, b)
 	if err != nil {
 		t.Fatalf("SplitByOp: %v", err)
 	}
@@ -62,10 +61,11 @@ func TestSplitByOpWatermarkPreserved(t *testing.T) {
 }
 
 func TestSplitByOpEachRowClassified(t *testing.T) {
-	b := dataplane.GenerateBatch(7, dataplane.GeneratorOpts{NumRows: 30})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(7, dataplane.GeneratorOpts{NumRows: 30, Allocator: alloc})
 	defer b.Release()
 
-	ins, del, upd, err := dataplane.SplitByOp(context.Background(), b)
+	ins, del, upd, err := dataplane.SplitByOp(context.Background(), alloc, b)
 	if err != nil {
 		t.Fatalf("SplitByOp: %v", err)
 	}
@@ -103,14 +103,14 @@ func TestSplitByOpEachRowClassified(t *testing.T) {
 }
 
 func TestEvaluatePredicateEqual(t *testing.T) {
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
 	defer b.Release()
 
-	// Find an existing id value
 	idCol := b.Record.Column(0).(*array.Int64)
 	target := idCol.Value(5)
 
-	mask, err := dataplane.EvaluatePredicate(context.Background(), b, dataplane.Predicate{
+	mask, err := dataplane.EvaluatePredicate(context.Background(), alloc, b, dataplane.Predicate{
 		Column: "id",
 		Op:     "=",
 		Value:  target,
@@ -133,11 +133,11 @@ func TestEvaluatePredicateEqual(t *testing.T) {
 }
 
 func TestEvaluatePredicateNullCoalesce(t *testing.T) {
-	b := dataplane.AdversarialNullBefore(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialNullBefore(0, alloc)
 	defer b.Release()
 
-	// val column: row 0 is null, row 1 is "hello"
-	mask, err := dataplane.EvaluatePredicate(context.Background(), b, dataplane.Predicate{
+	mask, err := dataplane.EvaluatePredicate(context.Background(), alloc, b, dataplane.Predicate{
 		Column: "val",
 		Op:     "=",
 		Value:  "hello",
@@ -148,7 +148,6 @@ func TestEvaluatePredicateNullCoalesce(t *testing.T) {
 	defer mask.Release()
 
 	boolMask := mask.(*array.Boolean)
-	// null row → false (coalesce), "hello" row → true
 	if boolMask.Value(0) {
 		t.Error("null row should be false (coalesce)")
 	}
@@ -158,11 +157,11 @@ func TestEvaluatePredicateNullCoalesce(t *testing.T) {
 }
 
 func TestFilterWithMask(t *testing.T) {
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10})
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
-	// Build mask: keep first 5 rows
-	mask, err := dataplane.EvaluatePredicate(context.Background(), b, dataplane.Predicate{
+	mask, err := dataplane.EvaluatePredicate(context.Background(), alloc, b, dataplane.Predicate{
 		Column: "id",
 		Op:     "=",
 		Value:  int64(1),
@@ -172,7 +171,7 @@ func TestFilterWithMask(t *testing.T) {
 	}
 	defer mask.Release()
 
-	ins, del, upd, err := dataplane.Filter(context.Background(), b, mask)
+	ins, del, upd, err := dataplane.Filter(context.Background(), alloc, b, mask)
 	if err != nil {
 		t.Fatalf("Filter: %v", err)
 	}
@@ -204,12 +203,29 @@ func TestFilterWithMask(t *testing.T) {
 }
 
 func TestFilterNilBatch(t *testing.T) {
+	alloc := checkedAlloc(t)
 	b := &dataplane.Batch{Table: "t", Watermark: []byte("w")}
-	ins, del, upd, err := dataplane.Filter(context.Background(), b, nil)
+	ins, del, upd, err := dataplane.Filter(context.Background(), alloc, b, nil)
 	if err != nil {
 		t.Fatalf("Filter nil batch: %v", err)
 	}
 	if ins != nil || del != nil || upd != nil {
 		t.Error("expected nil outputs for nil batch")
+	}
+}
+
+func TestPredicateTypeMismatch(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
+	defer b.Release()
+
+	// Pass int64 value to String column — should error, not panic
+	_, err := dataplane.EvaluatePredicate(context.Background(), alloc, b, dataplane.Predicate{
+		Column: "val",
+		Op:     "=",
+		Value:  int64(42),
+	})
+	if err == nil {
+		t.Fatal("expected error for type mismatch")
 	}
 }

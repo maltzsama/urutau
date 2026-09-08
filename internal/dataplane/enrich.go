@@ -8,54 +8,56 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // CastPolicy maps column names to Arrow target types.
-// This is the columnar equivalent of core.CastPolicy for the Arrow-native
-// path. Each column is cast independently via compute.CastToType.
 type CastPolicy map[string]arrow.DataType
 
 // Cast applies per-column type widening to a batch. Columns not in the
 // policy are passed through unchanged. Cast errors (incompatible types)
 // surface as errors — no silent truncation.
 //
-// The batch is modified in place (new columns replace old via schema
-// replacement). The original batch is NOT Released — the caller owns
-// the returned batch.
-func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) {
+// OWNERSHIP: the input batch is NOT Released. The caller owns both input
+// and output. Columns from the input are Retained for the output; cast
+// columns are newly allocated. Input always exits valid.
+func Cast(ctx context.Context, _ memory.Allocator, batch *Batch, policy CastPolicy) (*Batch, error) {
 	if len(policy) == 0 || batch.Record == nil || batch.Record.NumRows() == 0 {
 		return batch, nil
 	}
 
 	nrows := batch.Record.NumRows()
-	cols := make([]arrow.Array, batch.Record.NumCols())
-	fields := make([]arrow.Field, batch.Record.NumCols())
+	ncols := int(batch.Record.NumCols())
+	cols := make([]arrow.Array, ncols)
+	fields := make([]arrow.Field, ncols)
 	castCount := 0
 
-	for i := range int(batch.Record.NumCols()) {
+	// Retain source columns — NewRecordBatch takes ownership, we must
+	// not release them afterwards.
+	for i := range ncols {
 		col := batch.Record.Column(i)
 		name := batch.Record.ColumnName(i)
 
 		targetType, needsCast := policy[name]
 		if !needsCast {
+			col.Retain()
 			cols[i] = col
-			fields[i] = arrow.Field{Name: name, Type: col.DataType(), Nullable: true}
+			fields[i] = batch.Record.Schema().Field(i)
 			continue
 		}
 
 		castResult, err := compute.CastToType(ctx, col, targetType)
 		if err != nil {
-			// Release any columns we already cast.
+			if castResult != nil {
+				castResult.Release()
+			}
 			for j := range i {
-				if j != i {
-					cols[j].Release()
-				}
+				cols[j].Release()
 			}
 			return nil, fmt.Errorf("dataplane: cast %q: %w", name, err)
 		}
-		col.Release()
 		cols[i] = castResult
-		fields[i] = arrow.Field{Name: name, Type: targetType, Nullable: true}
+		fields[i] = arrow.Field{Name: name, Type: targetType, Nullable: batch.Record.Schema().Field(i).Nullable}
 		castCount++
 	}
 
@@ -64,11 +66,9 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 	}
 
 	schema := arrow.NewSchema(fields, nil)
-	schemaFields := make([]arrow.ArrayData, len(cols))
-	for i, c := range cols {
-		schemaFields[i] = c.Data()
-	}
-	newRecord := newRecordBatchFromData(schema, schemaFields, int(nrows))
+	newRecord := array.NewRecordBatch(schema, cols, int64(nrows))
+	// NewRecordBatch retains each col but does NOT consume our ref.
+	// Release our refs now; the record holds its own retained refs.
 	for _, c := range cols {
 		c.Release()
 	}
@@ -82,32 +82,29 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 
 // MetadataColumns are the system columns injected by the metadata stage.
 type MetadataColumns struct {
-	CommitTS  time.Time
-	IngestTS  time.Time
-	Snapshot  bool
-	Phase     string // "live" or "snapshot"
+	CommitTS time.Time
+	IngestTS time.Time
+	Snapshot bool
 }
 
-// AddMetadata injects system columns (__commit_ts, __ingest_ts, __snapshot,
-// __phase) into the batch. These are always nullable Int64 (epoch millis
-// for timestamps) or Boolean/Utf8 for snapshot/phase.
-func AddMetadata(ctx context.Context, batch *Batch, meta MetadataColumns) (*Batch, error) {
+// AddMetadata injects system columns (__ingest_ts, __snapshot, __phase)
+// into the batch. The __commit_ts column is projected from the existing
+// wire schema (CR-069 §3.6: project, don't compute, what already exists).
+//
+// OWNERSHIP: the input batch is NOT Released. Input always exits valid.
+func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta MetadataColumns) (*Batch, error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil || batch.Record.NumRows() == 0 {
 		return batch, nil
 	}
 
 	nrows := int(batch.Record.NumRows())
-	alloc := memoryAllocator()
 	tmpl := batch.Record
 
-	// __commit_ts (Int64, epoch millis)
-	ct := array.NewInt64Builder(alloc)
-	defer ct.Release()
-	for range nrows {
-		ct.Append(meta.CommitTS.UnixMilli())
-	}
-	ctArr := ct.NewInt64Array()
-	defer ctArr.Release()
+	// Check if __commit_ts already exists — if so, project it; if not, add it.
+	hasCommitTS := colIndex(tmpl.Schema(), "__commit_ts") >= 0
 
 	// __ingest_ts (Int64, epoch millis)
 	it := array.NewInt64Builder(alloc)
@@ -116,7 +113,6 @@ func AddMetadata(ctx context.Context, batch *Batch, meta MetadataColumns) (*Batc
 		it.Append(meta.IngestTS.UnixMilli())
 	}
 	itArr := it.NewInt64Array()
-	defer itArr.Release()
 
 	// __snapshot (Boolean)
 	sb := array.NewBooleanBuilder(alloc)
@@ -125,9 +121,8 @@ func AddMetadata(ctx context.Context, batch *Batch, meta MetadataColumns) (*Batc
 		sb.Append(meta.Snapshot)
 	}
 	sbArr := sb.NewBooleanArray()
-	defer sbArr.Release()
 
-	// __phase (Utf8)
+	// __phase (Utf8) — derived from Snapshot, not from MetadataColumns.Phase.
 	pb := array.NewStringBuilder(alloc)
 	defer pb.Release()
 	phase := "live"
@@ -138,50 +133,51 @@ func AddMetadata(ctx context.Context, batch *Batch, meta MetadataColumns) (*Batc
 		pb.Append(phase)
 	}
 	pbArr := pb.NewStringArray()
-	defer pbArr.Release()
 
-	// Build new schema with system columns appended.
+	// Build new schema: original fields + system columns not yet present.
 	srcFields := tmpl.Schema().Fields()
-	newFields := make([]arrow.Field, 0, len(srcFields)+4)
+	extraFields := []arrow.Field{
+		{Name: "__ingest_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
+		{Name: "__phase", Type: &arrow.StringType{}, Nullable: true},
+	}
+	if !hasCommitTS {
+		extraFields = append([]arrow.Field{
+			{Name: "__commit_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		}, extraFields...)
+	}
+	newFields := make([]arrow.Field, 0, len(srcFields)+len(extraFields))
 	newFields = append(newFields, srcFields...)
-	newFields = append(newFields,
-		arrow.Field{Name: "__commit_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		arrow.Field{Name: "__ingest_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		arrow.Field{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
-		arrow.Field{Name: "__phase", Type: &arrow.StringType{}, Nullable: true},
-	)
+	newFields = append(newFields, extraFields...)
 	newSchema := arrow.NewSchema(newFields, nil)
 
-	// Build new columns slice: original + 4 system columns.
-	cols := make([]arrow.Array, 0, len(srcFields)+4)
+	// Build columns: Retain original columns + append new ones.
+	cols := make([]arrow.Array, 0, len(srcFields)+len(extraFields))
 	for i := range len(srcFields) {
+		tmpl.Column(i).Retain()
 		cols = append(cols, tmpl.Column(i))
 	}
-	cols = append(cols, ctArr, itArr, sbArr, pbArr)
-
-	fieldData := make([]arrow.ArrayData, len(cols))
-	for i, c := range cols {
-		fieldData[i] = c.Data()
+	if !hasCommitTS {
+		// __commit_ts (Int64, epoch millis) — only add if not already in wire schema.
+		ct := array.NewInt64Builder(alloc)
+		defer ct.Release()
+		for range nrows {
+			ct.Append(meta.CommitTS.UnixMilli())
+		}
+		cols = append(cols, ct.NewInt64Array())
 	}
-	newRecord := newRecordBatchFromData(newSchema, fieldData, nrows)
+	cols = append(cols, itArr, sbArr, pbArr)
+
+	newRecord := array.NewRecordBatch(newSchema, cols, int64(nrows))
+	// NewRecordBatch retains each col but does NOT consume our ref.
+	// Release our refs now; the record holds its own retained refs.
+	for _, c := range cols {
+		c.Release()
+	}
 
 	return &Batch{
 		Table:     batch.Table,
 		Record:    newRecord,
 		Watermark: batch.Watermark,
 	}, nil
-}
-
-// newRecordBatchFromData builds a RecordBatch from schema + column arrays.
-// Caller must release the returned RecordBatch.
-func newRecordBatchFromData(schema *arrow.Schema, fieldData []arrow.ArrayData, nrows int) arrow.RecordBatch {
-	cols := make([]arrow.Array, len(fieldData))
-	for i, d := range fieldData {
-		cols[i] = array.MakeFromData(d)
-	}
-	rb := array.NewRecordBatch(schema, cols, int64(nrows))
-	for _, c := range cols {
-		c.Release()
-	}
-	return rb
 }

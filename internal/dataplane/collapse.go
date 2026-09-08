@@ -2,7 +2,6 @@ package dataplane
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -18,26 +17,39 @@ import (
 // key columns. Naive concat ("ab"+"c" == "a"+"bc") collides.
 //
 // Null in a PK column is a source contract violation → error.
-func Collapse(ctx context.Context, batch *Batch, pkCols []string) (upserts, deletes *Batch, err error) {
+func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols []string) (upserts, deletes *Batch, err error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil || batch.Record.NumRows() == 0 {
 		return nil, nil, nil
 	}
 
 	nrows := int(batch.Record.NumRows())
 
+	// Resolve PK column indices ONCE before the scan.
+	pkIdxs := make([]int, len(pkCols))
+	for i, col := range pkCols {
+		idx := colIndex(batch.Record.Schema(), col)
+		if idx < 0 {
+			return nil, nil, fmt.Errorf("dataplane: collapse: PK column %q not found", col)
+		}
+		pkIdxs[i] = idx
+	}
+
 	// 1. Build exact keys and check for null PKs.
 	keys := make([][]byte, nrows)
 	for row := range nrows {
-		for _, col := range pkCols {
-			idx := colIndex(batch.Record.Schema(), col)
-			if idx < 0 {
-				return nil, nil, fmt.Errorf("dataplane: collapse: PK column %q not found", col)
-			}
+		for i, idx := range pkIdxs {
 			if batch.Record.Column(idx).IsNull(row) {
-				return nil, nil, fmt.Errorf("dataplane: collapse: null in PK column %q at row %d", col, row)
+				return nil, nil, fmt.Errorf("dataplane: collapse: null in PK column %q at row %d", pkCols[i], row)
 			}
 		}
-		keys[row] = EncodeKey(batch.Record, row, pkCols)
+		key, err := EncodeKey(batch.Record, row, pkCols)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dataplane: collapse: %w", err)
+		}
+		keys[row] = key
 	}
 
 	// 2. Map-based scan: last occurrence wins per group, first-appearance
@@ -66,7 +78,6 @@ func Collapse(ctx context.Context, batch *Batch, pkCols []string) (upserts, dele
 	}
 
 	// 4. Build an index array for Take.
-	alloc := memory.NewGoAllocator()
 	idxBuilder := array.NewInt32Builder(alloc)
 	defer idxBuilder.Release()
 	for _, idx := range winnerIndices {
@@ -80,13 +91,18 @@ func Collapse(ctx context.Context, batch *Batch, pkCols []string) (upserts, dele
 	for i := range int(batch.Record.NumCols()) {
 		taken, err := compute.TakeArray(ctx, batch.Record.Column(i), idxArr)
 		if err != nil {
+			// Release already-taken columns.
+			for j := range i {
+				cols[j].Release()
+			}
 			return nil, nil, fmt.Errorf("dataplane: collapse take col %d: %w", i, err)
 		}
 		cols[i] = taken
 	}
 
 	// 6. Build the collapsed RecordBatch.
-	collapsed := array.NewRecordBatch(batch.Record.Schema(), cols, int64(len(winnerIndices)))
+	schema := batch.Record.Schema()
+	collapsed := array.NewRecordBatch(schema, cols, int64(len(winnerIndices)))
 	for _, c := range cols {
 		c.Release()
 	}
@@ -94,10 +110,10 @@ func Collapse(ctx context.Context, batch *Batch, pkCols []string) (upserts, dele
 
 	// 7. Split into upserts and deletes by __op.
 	opIdx := colIndex(batch.Record.Schema(), "__op")
-	if opIdx < 0 {
-		return nil, nil, fmt.Errorf("dataplane: __op column not found")
+	opArr, ok := collapsed.Column(opIdx).(*array.Uint8)
+	if !ok {
+		return nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))
 	}
-	opArr := collapsed.Column(opIdx).(*array.Uint8)
 
 	insUpdMask := array.NewBooleanBuilder(alloc)
 	defer insUpdMask.Release()
@@ -105,10 +121,8 @@ func Collapse(ctx context.Context, batch *Batch, pkCols []string) (upserts, dele
 	defer delMask.Release()
 	for i := range opArr.Len() {
 		op := opArr.Value(i)
-		isInsertOrUpdate := op == OpInsert || op == OpUpdate
-		isDelete := op == OpDelete
-		insUpdMask.Append(isInsertOrUpdate)
-		delMask.Append(isDelete)
+		insUpdMask.Append(op == OpInsert || op == OpUpdate)
+		delMask.Append(op == OpDelete)
 	}
 
 	filterOpts := compute.DefaultFilterOptions()
@@ -139,10 +153,4 @@ func Collapse(ctx context.Context, batch *Batch, pkCols []string) (upserts, dele
 		filteredDeletes.Release()
 	}
 	return upserts, deletes, nil
-}
-
-func encodeKeyLen(val string) []byte {
-	var buf [4]byte
-	binary.LittleEndian.PutUint32(buf[:], uint32(len(val)))
-	return buf[:]
 }

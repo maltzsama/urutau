@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
@@ -16,22 +17,44 @@ type eqChange struct {
 	Op  uint8
 }
 
-func batchToRowSet(b *dataplane.Batch) map[eqChange]bool {
-	set := make(map[eqChange]bool)
+// batchToRowSlice extracts rows in order from a batch.
+func batchToRowSlice(b *dataplane.Batch) []eqChange {
 	if b == nil || b.Record == nil {
-		return set
+		return nil
 	}
 	idCol := b.Record.Column(0).(*array.Int64)
 	valCol := b.Record.Column(1).(*array.String)
-	opCol := b.Record.Column(4).(*array.Uint8)
+	opCol := extractOpCol(b)
+	if opCol == nil {
+		return nil
+	}
+	rows := make([]eqChange, int(idCol.Len()))
 	for i := range int(idCol.Len()) {
-		set[eqChange{
+		rows[i] = eqChange{
 			ID:  idCol.Value(i),
 			Val: valCol.Value(i),
-			Op:  opCol.Value(i),
-		}] = true
+			Op:  opCol[i],
+		}
 	}
-	return set
+	return rows
+}
+
+// extractOpCol extracts the __op column values as a slice.
+func extractOpCol(b *dataplane.Batch) []uint8 {
+	if b == nil || b.Record == nil {
+		return nil
+	}
+	for i := range b.Record.Schema().NumFields() {
+		if b.Record.Schema().Field(i).Name == "__op" {
+			col := b.Record.Column(i).(*array.Uint8)
+			vals := make([]uint8, col.Len())
+			for j := range col.Len() {
+				vals[j] = col.Value(j)
+			}
+			return vals
+		}
+	}
+	return nil
 }
 
 // TestEquivalence_SplitByOp_MatchesRowPath verifies that SplitByOp
@@ -41,22 +64,22 @@ func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
 	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
-		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 20})
+		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
 		defer b.Release()
 
-		// Row-path classification
-		opCol := b.Record.Column(4).(*array.Uint8)
+		// Row-path: classify by __op in iteration order
+		opVals := extractOpCol(b)
 		idCol := b.Record.Column(0).(*array.Int64)
 		valCol := b.Record.Column(1).(*array.String)
 
 		var rowIns, rowDel, rowUpd []eqChange
-		for i := range opCol.Len() {
+		for i := range opVals {
 			ec := eqChange{
 				ID:  idCol.Value(i),
 				Val: valCol.Value(i),
-				Op:  opCol.Value(i),
+				Op:  opVals[i],
 			}
-			switch opCol.Value(i) {
+			switch opVals[i] {
 			case 0:
 				rowIns = append(rowIns, ec)
 			case 2:
@@ -67,112 +90,66 @@ func TestEquivalence_SplitByOp_MatchesRowPath(t *testing.T) {
 		}
 
 		// Columnar path
-		colIns, colDel, colUpd, err := dataplane.SplitByOp(context.Background(), b)
+		colIns, colDel, colUpd, err := dataplane.SplitByOp(context.Background(), alloc, b)
 		if err != nil {
 			t.Fatalf("seed %d: SplitByOp: %v", seed, err)
 		}
-		colInsSet := batchToRowSet(colIns)
-		colDelSet := batchToRowSet(colDel)
-		colUpdSet := batchToRowSet(colUpd)
+		colInsSlice := batchToRowSlice(colIns)
+		colDelSlice := batchToRowSlice(colDel)
+		colUpdSlice := batchToRowSlice(colUpd)
 
-		if len(rowIns) != len(colInsSet) {
-			t.Errorf("seed %d: inserts: row=%d, col=%d", seed, len(rowIns), len(colInsSet))
+		// Order-sensitive comparison (slice, not set)
+		if !sliceEqual(rowIns, colInsSlice) {
+			t.Errorf("seed %d: inserts mismatch: row=%d, col=%d", seed, len(rowIns), len(colInsSlice))
 		}
-		for _, ec := range rowIns {
-			if !colInsSet[ec] {
-				t.Errorf("seed %d: row insert %v not in columnar set", seed, ec)
-			}
+		if !sliceEqual(rowDel, colDelSlice) {
+			t.Errorf("seed %d: deletes mismatch: row=%d, col=%d", seed, len(rowDel), len(colDelSlice))
 		}
-		if len(rowDel) != len(colDelSet) {
-			t.Errorf("seed %d: deletes: row=%d, col=%d", seed, len(rowDel), len(colDelSet))
-		}
-		for _, ec := range rowDel {
-			if !colDelSet[ec] {
-				t.Errorf("seed %d: row delete %v not in columnar set", seed, ec)
-			}
-		}
-		if len(rowUpd) != len(colUpdSet) {
-			t.Errorf("seed %d: updates: row=%d, col=%d", seed, len(rowUpd), len(colUpdSet))
-		}
-		for _, ec := range rowUpd {
-			if !colUpdSet[ec] {
-				t.Errorf("seed %d: row update %v not in columnar set", seed, ec)
-			}
+		if !sliceEqual(rowUpd, colUpdSlice) {
+			t.Errorf("seed %d: updates mismatch: row=%d, col=%d", seed, len(rowUpd), len(colUpdSlice))
 		}
 	}
-	_ = alloc
 }
 
-// TestEquivalence_Collapse_MatchesRowPath verifies that Collapse
-// produces the same surviving rows as a row-by-row last-occurrence map.
-func TestEquivalence_Collapse_MatchesRowPath(t *testing.T) {
+// TestEquivalence_Collapse_MatchesChangeCollapse verifies that the
+// columnar Collapse produces the same result as change.Collapse (the
+// production row-side reference).
+func TestEquivalence_Collapse_MatchesChangeCollapse(t *testing.T) {
 	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
-		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 30})
+		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{
+			NumRows:      30,
+			PKDomain:     10, // force duplicate PKs
+			DeleteAnyPos: true,
+			Allocator:    alloc,
+		})
 		defer b.Release()
 
-		idCol := b.Record.Column(0).(*array.Int64)
-		valCol := b.Record.Column(1).(*array.String)
-		opCol := b.Record.Column(4).(*array.Uint8)
-
-		// Row-path collapse: last occurrence per PK wins
-		type rowInfo struct {
-			id  int64
-			val string
-			op  uint8
-		}
-		groupOrder := make(map[int64]bool)
-		var groupOrderList []int64
-		lastSeen := make(map[int64]rowInfo)
-
-		for i := range int(idCol.Len()) {
-			k := idCol.Value(i)
-			r := rowInfo{id: idCol.Value(i), val: valCol.Value(i), op: opCol.Value(i)}
-			if !groupOrder[k] {
-				groupOrder[k] = true
-				groupOrderList = append(groupOrderList, k)
-			}
-			lastSeen[k] = r
-		}
-
-		var rowUps, rowDel []eqChange
-		for _, k := range groupOrderList {
-			r := lastSeen[k]
-			ec := eqChange{ID: r.id, Val: r.val, Op: r.op}
-			if r.op == 2 {
-				rowDel = append(rowDel, ec)
-			} else {
-				rowUps = append(rowUps, ec)
-			}
-		}
+		// Row-path reference: change.Collapse (production code)
+		changes := batchToChanges(b)
+		rowCollapsed := change.Collapse(changes)
 
 		// Columnar path
-		colUps, colDel, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+		colUps, colDel, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 		if err != nil {
 			t.Fatalf("seed %d: Collapse: %v", seed, err)
 		}
-		colUpsSet := batchToRowSet(colUps)
-		colDelSet := batchToRowSet(colDel)
+		colUpsSlice := batchToRowSlice(colUps)
+		colDelSlice := batchToRowSlice(colDel)
 
-		if len(rowUps) != len(colUpsSet) {
-			t.Errorf("seed %d: upserts: row=%d, col=%d", seed, len(rowUps), len(colUpsSet))
+		// Compare upserts: order-sensitive
+		rowUps := changesToUpserts(rowCollapsed)
+		if !sliceEqual(rowUps, colUpsSlice) {
+			t.Errorf("seed %d: upserts mismatch: row=%d, col=%d", seed, len(rowUps), len(colUpsSlice))
 		}
-		for _, ec := range rowUps {
-			if !colUpsSet[ec] {
-				t.Errorf("seed %d: row upsert %v not in columnar set", seed, ec)
-			}
-		}
-		if len(rowDel) != len(colDelSet) {
-			t.Errorf("seed %d: deletes: row=%d, col=%d", seed, len(rowDel), len(colDelSet))
-		}
-		for _, ec := range rowDel {
-			if !colDelSet[ec] {
-				t.Errorf("seed %d: row delete %v not in columnar set", seed, ec)
-			}
+
+		// Compare deletes: order-sensitive
+		rowDel := changesToDeletes(rowCollapsed)
+		if !sliceEqual(rowDel, colDelSlice) {
+			t.Errorf("seed %d: deletes mismatch: row=%d, col=%d", seed, len(rowDel), len(colDelSlice))
 		}
 	}
-	_ = alloc
 }
 
 // TestEquivalence_FilterPredicate_MatchesRowPath verifies that
@@ -181,30 +158,28 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 	alloc := checkedAlloc(t)
 
 	for seed := range 100 {
-		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 25})
+		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 25, Allocator: alloc})
 		defer b.Release()
 
 		idCol := b.Record.Column(0).(*array.Int64)
-		valCol := b.Record.Column(1).(*array.String)
-		opCol := b.Record.Column(4).(*array.Uint8)
-
-		// Pick a predicate value from the data
 		target := idCol.Value(seed % int(idCol.Len()))
 
-		// Row-path: filter by id == target
+		// Row-path: filter by id == target, preserving order
 		var rowSet []eqChange
 		for i := range int(idCol.Len()) {
 			if idCol.Value(i) == target {
+				valCol := b.Record.Column(1).(*array.String)
+				opVals := extractOpCol(b)
 				rowSet = append(rowSet, eqChange{
 					ID:  idCol.Value(i),
 					Val: valCol.Value(i),
-					Op:  opCol.Value(i),
+					Op:  opVals[i],
 				})
 			}
 		}
 
 		// Columnar path
-		mask, err := dataplane.EvaluatePredicate(context.Background(), b, dataplane.Predicate{
+		mask, err := dataplane.EvaluatePredicate(context.Background(), alloc, b, dataplane.Predicate{
 			Column: "id",
 			Op:     "=",
 			Value:  target,
@@ -214,37 +189,30 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 		}
 		defer mask.Release()
 
-		ins, del, upd, err := dataplane.Filter(context.Background(), b, mask)
+		ins, del, upd, err := dataplane.Filter(context.Background(), alloc, b, mask)
 		if err != nil {
 			t.Fatalf("seed %d: Filter: %v", seed, err)
 		}
-		colSet := batchToRowSet(ins)
-		for k := range batchToRowSet(del) {
-			colSet[k] = true
-		}
-		for k := range batchToRowSet(upd) {
-			colSet[k] = true
-		}
+		// Concatenate in order: inserts, updates, deletes (same order as row path)
+		var colAll []eqChange
+		colAll = append(colAll, batchToRowSlice(ins)...)
+		colAll = append(colAll, batchToRowSlice(upd)...)
+		colAll = append(colAll, batchToRowSlice(del)...)
 
-		if len(rowSet) != len(colSet) {
-			t.Errorf("seed %d: filtered: row=%d, col=%d (target=%d)", seed, len(rowSet), len(colSet), target)
-		}
-		for _, ec := range rowSet {
-			if !colSet[ec] {
-				t.Errorf("seed %d: row filtered %v not in columnar set", seed, ec)
-			}
+		if !sliceEqual(rowSet, colAll) {
+			t.Errorf("seed %d: filtered mismatch: row=%d, col=%d (target=%d)", seed, len(rowSet), len(colAll), target)
 		}
 	}
-	_ = alloc
 }
 
 // TestEquivalence_CollapseInsertAfterDelete verifies that an
 // insert-after-delete ends up as an upsert (not a delete).
 func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
-	b := dataplane.AdversarialInsertAfterDelete(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -264,20 +232,9 @@ func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 		t.Errorf("expected 0 deletes, got %d", dels.Record.NumRows())
 	}
 	if ups != nil {
-		// Find __op by name
-		opIdx := -1
-		for i := range ups.Record.Schema().NumFields() {
-			if ups.Record.Schema().Field(i).Name == "__op" {
-				opIdx = i
-				break
-			}
-		}
-		if opIdx < 0 {
-			t.Fatal("__op not found in upsert schema")
-		}
-		opCol := ups.Record.Column(opIdx).(*array.Uint8)
-		if opCol.Value(0) != 0 {
-			t.Errorf("expected op=insert (0), got %d", opCol.Value(0))
+		opVals := extractOpCol(ups)
+		if len(opVals) > 0 && opVals[0] != 0 {
+			t.Errorf("expected op=insert (0), got %d", opVals[0])
 		}
 	}
 }
@@ -285,10 +242,11 @@ func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 // TestEquivalence_DeleteLast verifies that a PK whose last operation
 // is DELETE ends up in deletes, not upserts.
 func TestEquivalence_DeleteLast(t *testing.T) {
-	b := dataplane.AdversarialDeleteLast(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialDeleteLast(0, alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -312,10 +270,11 @@ func TestEquivalence_DeleteLast(t *testing.T) {
 // TestEquivalence_CompositeKey verifies that two distinct composite
 // PKs survive collapse as separate rows.
 func TestEquivalence_CompositeKey(t *testing.T) {
-	b := dataplane.AdversarialCompositeKey(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
-	ups, _, err := dataplane.Collapse(context.Background(), b, []string{"pk1", "pk2"})
+	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -337,10 +296,11 @@ func TestEquivalence_CompositeKey(t *testing.T) {
 // TestEquivalence_Int64Overflow verifies that int64 values outside
 // float64 precision survive with exact values.
 func TestEquivalence_Int64Overflow(t *testing.T) {
-	b := dataplane.AdversarialInt64Overflow(0)
+	alloc := checkedAlloc(t)
+	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 
-	ups, _, err := dataplane.Collapse(context.Background(), b, []string{"id"})
+	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -354,7 +314,6 @@ func TestEquivalence_Int64Overflow(t *testing.T) {
 		t.Fatalf("expected 2 upserts, got %v", ups)
 	}
 
-	// Check the 'big' column (index 1) for exact overflow preservation
 	bigCol := ups.Record.Column(1).(*array.Int64)
 	got := map[int64]bool{
 		bigCol.Value(0): true,
@@ -369,4 +328,75 @@ func TestEquivalence_Int64Overflow(t *testing.T) {
 	if !got[want2] {
 		t.Errorf("missing int64 overflow value %d", want2)
 	}
+}
+
+// ── helpers ────────────────────────────────────────────────────────
+
+// sliceEqual compares two eqChange slices element-by-element (order-sensitive).
+func sliceEqual(a, b []eqChange) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// batchToChanges converts a dataplane.Batch to []change.Change for use
+// with change.Collapse (the production row-side reference).
+func batchToChanges(b *dataplane.Batch) []change.Change {
+	if b == nil || b.Record == nil {
+		return nil
+	}
+	nrows := int(b.Record.NumRows())
+	idCol := b.Record.Column(0).(*array.Int64)
+	valCol := b.Record.Column(1).(*array.String)
+	opVals := extractOpCol(b)
+	posCol := -1
+	for i := range b.Record.Schema().NumFields() {
+		if b.Record.Schema().Field(i).Name == "__pos" {
+			posCol = i
+			break
+		}
+	}
+	changes := make([]change.Change, nrows)
+	for i := range nrows {
+		changes[i] = change.Change{
+			Op:       change.Op(opVals[i]),
+			Table:    b.Table,
+			Key:      []any{idCol.Value(i)},
+			After:    map[string]any{"id": idCol.Value(i), "val": valCol.Value(i)},
+			Position: b.Record.Column(posCol).(*array.String).Value(i),
+		}
+	}
+	return changes
+}
+
+// changesToUpserts extracts upserts from a Collapsed as eqChange slices.
+func changesToUpserts(c change.Collapsed) []eqChange {
+	out := make([]eqChange, len(c.Upserts))
+	for i, ch := range c.Upserts {
+		out[i] = eqChange{
+			ID:  ch.Key[0].(int64),
+			Val: ch.After["val"].(string),
+			Op:  uint8(ch.Op),
+		}
+	}
+	return out
+}
+
+// changesToDeletes extracts deletes from a Collapsed as eqChange slices.
+func changesToDeletes(c change.Collapsed) []eqChange {
+	out := make([]eqChange, len(c.Deletes))
+	for i, ch := range c.Deletes {
+		out[i] = eqChange{
+			ID:  ch.Key[0].(int64),
+			Val: ch.After["val"].(string),
+			Op:  uint8(ch.Op),
+		}
+	}
+	return out
 }
