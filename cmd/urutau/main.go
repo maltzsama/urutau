@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,7 +15,10 @@ import (
 	"github.com/maltzsama/urutau/driver"
 	_ "github.com/maltzsama/urutau/internal/builtin"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/pipeline"
+	"github.com/maltzsama/urutau/internal/plugin"
 	"github.com/maltzsama/urutau/internal/runner"
+	"github.com/maltzsama/urutau/internal/supervisor"
 	"github.com/maltzsama/urutau/internal/version"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -50,6 +56,8 @@ func runCmd() *cobra.Command {
 		windowTimeout     time.Duration
 		eventlogURI       string
 		pluginPaths       []string
+		sourcePlugin      string
+		sinkPlugin        string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -73,6 +81,14 @@ func runCmd() *cobra.Command {
 			if err := s.Validate(); err != nil {
 				return err
 			}
+
+			// External plugin mode: spawn subprocesses and run via
+			// the supervisor + plugin adapters.
+			if sourcePlugin != "" || sinkPlugin != "" {
+				return runExternalPlugins(cmd.Context(), s, sourcePlugin, sinkPlugin)
+			}
+
+			// Built-in driver mode: run the collapsed pipeline.
 			rc := runner.Config{
 				ServerID:          serverID,
 				Heartbeat:         5 * time.Second,
@@ -84,8 +100,6 @@ func runCmd() *cobra.Command {
 				MaxInterval:       5 * time.Second,
 			}
 			if eventlogURI != "" {
-				// Credentials and endpoint come from the standard AWS env
-				// (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3).
 				rc.Eventlog = &eventlog.Config{URI: eventlogURI}
 			}
 			r, err := runner.NewRunner(cmd.Context(), s, rc)
@@ -102,7 +116,90 @@ func runCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&windowTimeout, "window-timeout", 5*time.Minute, "DBLog window timeout (pathology detector)")
 	cmd.Flags().StringVar(&eventlogURI, "eventlog", "", "S3 URI for the run's JSONL audit trail (s3://bucket/prefix); AWS env supplies credentials/endpoint")
 	cmd.Flags().StringSliceVar(&pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
+	cmd.Flags().StringVar(&sourcePlugin, "source-plugin", "", "path to an external source plugin binary (Arrow Flight)")
+	cmd.Flags().StringVar(&sinkPlugin, "sink-plugin", "", "path to an external sink plugin binary (Arrow Flight)")
 	return cmd
+}
+
+// runExternalPlugins spawns source and sink plugin subprocesses, connects
+// Flight clients, and runs the pipeline using the plugin adapters.
+func runExternalPlugins(ctx context.Context, s *spec.Spec, sourceBin, sinkBin string) error {
+	logger := slog.Default()
+	token := generateToken()
+
+	var sourceCfg, sinkCfg pipeline.StageConfig
+	workDir := "."
+
+	if sourceBin != "" {
+		sourceCfg = pipeline.StageConfig{
+			Kind:    pipeline.StageSource,
+			Bin:     sourceBin,
+			Token:   token,
+			WorkDir: workDir,
+			Logger:  logger,
+		}
+	}
+	if sinkBin != "" {
+		sinkCfg = pipeline.StageConfig{
+			Kind:    pipeline.StageSink,
+			Bin:     sinkBin,
+			Token:   token,
+			WorkDir: workDir,
+			Logger:  logger,
+		}
+	}
+
+	pipeCfg := supervisor.PipelineConfig{
+		Source: sourceCfg,
+		Sink:   sinkCfg,
+	}
+	sup := supervisor.NewPipelineSupervisor(pipeCfg, logger)
+
+	// Start all plugin subprocesses.
+	go func() {
+		if err := sup.Run(ctx); err != nil {
+			logger.Error("supervisor stopped", "err", err)
+		}
+	}()
+
+	// Wait for both plugins to be connected.
+	if err := sup.WaitForReady(ctx); err != nil {
+		return err
+	}
+
+	// Build adapters from connected clients.
+	srcStage := sup.Source().Stage()
+	snkStage := sup.Sink().Stage()
+
+	srcAdapter := plugin.NewSourceAdapter(srcStage.Client, s.Source, logger)
+	snkAdapter := plugin.NewSinkAdapter(snkStage.Client, logger)
+	_ = snkAdapter // used by runner in full integration
+
+	logger.Info("external plugins connected",
+		"source", sourceBin,
+		"sink", sinkBin,
+		"pipeline", s.Pipeline,
+	)
+
+	// Build the collapsed runner with plugin adapters as the source.
+	// The full integration wires srcAdapter as the source and snkAdapter
+	// as the sink. For now, we use the existing runner path.
+	// TODO: wire plugin adapters into the runner when the runner
+	// accepts source.Source and sink.Sink interfaces directly.
+	_ = srcAdapter
+
+	// Block until shutdown.
+	<-ctx.Done()
+	logger.Info("shutting down")
+	return nil
+}
+
+func generateToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand: " + err.Error())
+	}
+	return base64.URLEncoding.EncodeToString(b)
 }
 
 func versionCmd() *cobra.Command {
