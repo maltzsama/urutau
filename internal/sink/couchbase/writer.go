@@ -9,6 +9,8 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // maxKeyLen is Couchbase's document ID ceiling. A primary key tuple that
@@ -94,11 +96,55 @@ func docKey(c change.Change) (string, error) {
 // Commit writes one collapsed batch. See the type comment for the two
 // sequencing modes; Batch.Mode needs no branch here — append-mode batches
 // arrive with upserts only (the worker rewrote or dropped the deletes).
-func (w *tableWriter) Commit(ctx context.Context, b change.Batch) error {
-	if w.txns != nil {
-		return w.commitAtomic(ctx, b)
+//
+// QUARANTINE: the RecordBatch→change.Batch unpack is a bridge that dies
+// when the Couchbase sink consumes RecordBatch directly.
+func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
+	// Unpack the columnar batch back to row-oriented changes.
+	// QUARANTINE: this bridge dies when the Couchbase sink consumes RecordBatch directly.
+	cb, err := w.unpackBatch(b)
+	if err != nil {
+		return fmt.Errorf("couchbase: unpack: %w", err)
 	}
-	return w.commitFast(ctx, b)
+
+	if w.txns != nil {
+		return w.commitAtomic(ctx, cb)
+	}
+	return w.commitFast(ctx, cb)
+}
+
+// unpackBatch converts a columnar dataplane.Batch back to a row-oriented
+// change.Batch. QUARANTINE: dies when the Couchbase sink consumes
+// RecordBatch directly.
+func (w *tableWriter) unpackBatch(b *dataplane.Batch) (change.Batch, error) {
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		return change.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
+	}
+
+	rows, _, err := transport.DecodeBatch(b.Record, nil, w.plan.pk)
+	if err != nil {
+		return change.Batch{}, err
+	}
+
+	var upserts, deletes []change.Change
+	for _, r := range rows {
+		switch r.Op {
+		case change.OpDelete:
+			deletes = append(deletes, r)
+		default:
+			upserts = append(upserts, r)
+		}
+	}
+
+	return change.Batch{
+		Table:           b.Table,
+		Upserts:         upserts,
+		Deletes:         deletes,
+		Position:        string(b.Watermark),
+		Mode:            change.UpsertMode,
+		SnapshotState:   b.SnapshotState,
+		SnapshotPending: b.SnapshotPending,
+	}, nil
 }
 
 // commitFast is the default path: every data mutation durably placed, then

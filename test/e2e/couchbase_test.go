@@ -20,10 +20,11 @@ import (
 	"time"
 
 	gocb "github.com/couchbase/gocb/v2"
-
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -165,6 +166,19 @@ func cbWriter(t *testing.T, ctx context.Context, s sink.Sink, ref core.TableRef,
 	return w
 }
 
+// toDPBatch wraps a change.Batch into a *dataplane.Batch via the transport bridge.
+// QUARANTINE: dies when tests consume RecordBatch directly.
+func toDPBatch(b change.Batch) *dataplane.Batch {
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+	}, PrimaryKey: []string{"id"}}
+	dpb, err := dpint.BatchFromChangeBatch(b, cs)
+	if err != nil {
+		panic(err)
+	}
+	return dpb
+}
 func cbRow(id int64, v, pos string) change.Batch {
 	return change.Batch{
 		Table: "cb_orders", Position: pos, Mode: change.UpsertMode,
@@ -194,10 +208,10 @@ func TestCouchbaseSinkUpsertAndResume(t *testing.T) {
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
-	if err := w.Commit(ctx, cbRow(1, "a", "0/1")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(1, "a", "0/1"))); err != nil {
 		t.Fatalf("commit 1: %v", err)
 	}
-	if err := w.Commit(ctx, cbRow(1, "a2", "0/2")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(1, "a2", "0/2"))); err != nil {
 		t.Fatalf("commit 2: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_orders", "[1]")
@@ -233,20 +247,20 @@ func TestCouchbaseSinkDelete(t *testing.T) {
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
-	if err := w.Commit(ctx, cbRow(9, "x", "0/1")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(9, "x", "0/1"))); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	del := change.Batch{
 		Table: "cb_orders", Position: "0/2", Mode: change.UpsertMode,
 		Deletes: []change.Change{{Op: change.OpDelete, Key: []any{int64(9)}}},
 	}
-	if err := w.Commit(ctx, del); err != nil {
+	if err := w.Commit(ctx, toDPBatch(del)); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, ok := cbDoc(t, b, "cb_orders", "[9]"); ok {
 		t.Fatal("document survived its delete")
 	}
-	if err := w.Commit(ctx, del); err != nil {
+	if err := w.Commit(ctx, toDPBatch(del)); err != nil {
 		t.Fatalf("replayed delete: %v", err)
 	}
 }
@@ -271,7 +285,7 @@ func TestCouchbaseSinkFastRecovery(t *testing.T) {
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
-	if err := w.Commit(ctx, cbRow(1, "a", "0/1")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(cbRow(1, "a", "0/1"))); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	// Simulate the crash between data and control write.
@@ -283,7 +297,7 @@ func TestCouchbaseSinkFastRecovery(t *testing.T) {
 	}
 	// Restart: same batch again.
 	w2 := cbWriter(t, ctx, s, ref, nil)
-	if err := w2.Commit(ctx, cbRow(1, "a", "0/1")); err != nil {
+	if err := w2.Commit(ctx, toDPBatch(cbRow(1, "a", "0/1"))); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_orders", "[1]")
@@ -323,7 +337,7 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 			{Op: change.OpInsert, Key: []any{strings.Repeat("x", 300)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
 		},
 	}
-	if err := w.Commit(ctx, bad); err == nil {
+	if err := w.Commit(ctx, toDPBatch(bad)); err == nil {
 		t.Fatal("oversized key must fail the batch")
 	}
 	if _, ok := cbDoc(t, b, "cb_atomic", "[1]"); ok {
@@ -340,7 +354,7 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 			{Op: change.OpInsert, Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
 		},
 	}
-	if err := w.Commit(ctx, good); err != nil {
+	if err := w.Commit(ctx, toDPBatch(good)); err != nil {
 		t.Fatalf("atomic commit: %v", err)
 	}
 	if _, ok := cbDoc(t, b, "cb_atomic", "[2]"); !ok {
@@ -406,7 +420,7 @@ func TestCouchbaseSinkNestedTypes(t *testing.T) {
 			IngestTS: time.Now(),
 		}},
 	}
-	if err := w.Commit(ctx, batch); err != nil {
+	if err := w.Commit(ctx, toDPBatch(batch)); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_nested", "[1]")
@@ -453,7 +467,7 @@ func TestCouchbaseSinkMetadataSubObject(t *testing.T) {
 			IngestTS: time.Now(),
 		}},
 	}
-	if err := w.Commit(ctx, batch); err != nil {
+	if err := w.Commit(ctx, toDPBatch(batch)); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_meta", "[1]")
@@ -489,7 +503,7 @@ func TestCouchbaseSinkDurabilityMajority(t *testing.T) {
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 	for i := int64(1); i <= 5; i++ {
-		if err := w.Commit(ctx, cbRow(i, fmt.Sprintf("v%d", i), fmt.Sprintf("0/%d", i))); err != nil {
+		if err := w.Commit(ctx, toDPBatch(cbRow(i, fmt.Sprintf("v%d", i), fmt.Sprintf("0/%d", i)))); err != nil {
 			t.Fatalf("durable commit %d: %v", i, err)
 		}
 	}

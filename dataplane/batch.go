@@ -52,6 +52,16 @@ type Batch struct {
 	// snapshot-completion, stored outside the data plane (state
 	// store / properties).
 	Watermark []byte
+
+	// SnapshotState is the resumable-backfill state machine value
+	// ("not_started", "in_progress", "complete"). Traveled with the
+	// batch so the sink can persist it atomically with the position.
+	// Empty when the table is not in snapshot phase.
+	SnapshotState string
+	// SnapshotPending lists chunk IDs still to process. Persisted
+	// atomically with position so a crash resumes from the right
+	// chunk. Nil when not in snapshot phase.
+	SnapshotPending []uint32
 }
 
 // Release frees the Arrow buffers held by the Record. Safe to call on a

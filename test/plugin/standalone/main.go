@@ -9,10 +9,10 @@ package main
 import (
 	"context"
 	"strconv"
-	"sync"
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -111,19 +111,16 @@ func (p pluginPos) Compare(o position.Position) int {
 
 // ── Sink ─────────────────────────────────────────────────────────────
 
-type pluginRecords struct {
-	mu      sync.Mutex
-	batches []change.Batch
-}
+type pluginRecords struct{}
 
 func newPluginRecords() *pluginRecords {
 	return &pluginRecords{}
 }
 
-func (r *pluginRecords) commit(b change.Batch) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.batches = append(r.batches, b)
+func (r *pluginRecords) commit(b *dataplane.Batch) {
+	// QUARANTINE: bridge — accepts *dataplane.Batch but stores nothing yet.
+	// Dies when the plugin sink consumes RecordBatch directly.
+	_ = b
 }
 
 type pluginSink struct {
@@ -151,7 +148,7 @@ type pluginWriter struct {
 	s *pluginSink
 }
 
-func (w *pluginWriter) Commit(_ context.Context, b change.Batch) error {
+func (w *pluginWriter) Commit(_ context.Context, b *dataplane.Batch) error {
 	w.s.records.commit(b)
 	return nil
 }

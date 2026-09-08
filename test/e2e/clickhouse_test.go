@@ -113,10 +113,10 @@ func TestClickHouseSinkUpsertAndResume(t *testing.T) {
 			}},
 		}
 	}
-	if err := w.Commit(ctx, row(1, "a", "0/1")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(row(1, "a", "0/1"))); err != nil {
 		t.Fatalf("commit 1: %v", err)
 	}
-	if err := w.Commit(ctx, row(2, "b", "0/2")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(row(2, "b", "0/2"))); err != nil {
 		t.Fatalf("commit 2: %v", err)
 	}
 	if got := chQueryInt(t, db, "SELECT count() FROM lakehouse.ch_orders FINAL"); got != 2 {
@@ -124,7 +124,7 @@ func TestClickHouseSinkUpsertAndResume(t *testing.T) {
 	}
 
 	// Update the same PK: collapsed batch, one row, newest value wins.
-	if err := w.Commit(ctx, row(1, "a2", "0/3")); err != nil {
+	if err := w.Commit(ctx, toDPBatch(row(1, "a2", "0/3"))); err != nil {
 		t.Fatalf("commit update: %v", err)
 	}
 	var v string
@@ -167,7 +167,7 @@ func TestClickHouseSinkDelete(t *testing.T) {
 
 	commit := func(b change.Batch) {
 		t.Helper()
-		if err := w.Commit(ctx, b); err != nil {
+		if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 	}
@@ -224,7 +224,7 @@ func TestClickHouseSinkAppendMode(t *testing.T) {
 		b := change.Batch{Table: ref.Target, Position: pos, Mode: change.AppendMode}
 		b.Upserts = []change.Change{{Op: change.OpInsert, Table: ref.Target, Key: nil,
 			After: map[string]any{"id": int64(i + 1), "v": fmt.Sprintf("row-%d", i+1)}, IngestTS: time.Now()}}
-		if err := w.Commit(ctx, b); err != nil {
+		if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 			t.Fatalf("commit %d: %v", i+1, err)
 		}
 	}
@@ -311,7 +311,7 @@ func TestClickHouseSinkFailedBatchIsAtomic(t *testing.T) {
 			{Op: change.OpInsert, Table: ref.Target, Key: []any{int64(2)},
 				After: map[string]any{"id": int64(2), "amount": map[string]any{"bad": true}}, IngestTS: time.Now()},
 		}}
-	if err := w.Commit(ctx, b); err == nil {
+	if err := w.Commit(ctx, toDPBatch(b)); err == nil {
 		t.Fatal("batch with a non-encodable decimal: want error")
 	}
 	if got := chQueryInt(t, db, "SELECT count() FROM lakehouse.ch_atomic FINAL"); got != 0 {
@@ -344,7 +344,7 @@ func TestClickHouseSinkControlWithoutFinal(t *testing.T) {
 	b := change.Batch{Table: ref.Target, Position: "0/1",
 		Upserts: []change.Change{{Op: change.OpInsert, Table: ref.Target, Key: []any{int64(9)},
 			After: map[string]any{"id": int64(9), "v": "v1"}, IngestTS: time.Now()}}}
-	if err := w.Commit(ctx, b); err != nil {
+	if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 )
 
 // Config is everything a sink needs, in neutral terms. Driver-specific
@@ -21,7 +22,7 @@ type Config struct {
 }
 
 // TableWriter commits one table's batches. The CDC position travels inside
-// change.Batch.Position (a serialized position string), and implementations
+// dataplane.Batch.Watermark (a serialized position string), and implementations
 // MUST honour the invariant below — it is correctness, not style:
 //
 // The position must never advance past durably written data. How each sink
@@ -38,7 +39,7 @@ type TableWriter interface {
 	// Commit writes the collapsed batch and the position. A batch that
 	// fails must leave the table untouched — a partially applied batch is
 	// indistinguishable from data loss on resume.
-	Commit(ctx context.Context, b change.Batch) error
+	Commit(ctx context.Context, b *dataplane.Batch) error
 
 	Close() error
 }

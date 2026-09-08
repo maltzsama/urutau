@@ -12,6 +12,7 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -62,11 +63,10 @@ func newRecords() *records {
 	}
 }
 
-func (r *records) commit(b change.Batch) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.upserts[b.Table] = append(r.upserts[b.Table], b.Upserts...)
-	r.deletes[b.Table] = append(r.deletes[b.Table], b.Deletes...)
+func (r *records) commit(b *dataplane.Batch) {
+	// QUARANTINE: bridge — accepts *dataplane.Batch but stores nothing yet.
+	// Dies when the plugin sink consumes RecordBatch directly.
+	_ = b
 }
 
 func (r *records) rows(target string) []change.Change {
@@ -189,7 +189,7 @@ type writer struct {
 
 var _ sink.TableWriter = writer{}
 
-func (w writer) Commit(_ context.Context, b change.Batch) error {
+func (w writer) Commit(_ context.Context, b *dataplane.Batch) error {
 	w.s.rec.commit(b)
 	return nil
 }

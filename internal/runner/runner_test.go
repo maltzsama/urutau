@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
 )
@@ -20,9 +23,26 @@ type gateCommitter struct {
 }
 
 func (c *gateCommitter) Close() error { return nil }
-func (c *gateCommitter) Commit(_ context.Context, b change.Batch) error {
+func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
+	// Unpack to change.Batch for test assertions.
+	// QUARANTINE: bridge that dies when tests consume RecordBatch directly.
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		c.mu.Lock()
+		c.batches = append(c.batches, change.Batch{Table: b.Table, Position: string(b.Watermark)})
+		c.mu.Unlock()
+		return nil
+	}
+	rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
+	var upserts []change.Change
+	for _, r := range rows {
+		if r.Op != change.OpDelete {
+			upserts = append(upserts, r)
+		}
+	}
 	c.mu.Lock()
-	c.batches = append(c.batches, b)
+	c.batches = append(c.batches, change.Batch{
+		Table: b.Table, Upserts: upserts, Position: string(b.Watermark), Mode: change.UpsertMode,
+	})
 	c.mu.Unlock()
 	return nil
 }
@@ -51,6 +71,13 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	committer := &gateCommitter{}
 	w := worker.New(worker.Config{MaxRows: 100, MaxInterval: time.Hour})
 	w.RegisterCommitter("raw.orders", committer, change.UpsertMode)
+	w.SetKnownSchema("raw.orders", core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	})
 
 	ingest := make(chan change.Change, 64)
 	done := make(chan error, 1)

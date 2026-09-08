@@ -20,7 +20,9 @@ import (
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // ErrCommitExhausted marks a terminal commit failure: retries against the
@@ -129,27 +131,68 @@ func (w *TableWriter) Close() error { return nil }
 // batch temporarily absent (old rows deleted, new rows not yet written) but
 // the position has not advanced. Resume reprocesses the batch: deletes are
 // idempotent, appends rewrite. Converges without loss.
-func (w *TableWriter) Commit(ctx context.Context, b change.Batch) error {
-	hasUpserts := len(b.Upserts) > 0
-	if b.Mode == change.UpsertMode {
-		keys := append(collectKeys(b.Upserts), collectKeys(b.Deletes)...)
+//
+// QUARANTINE: the RecordBatch→change.Batch unpack is a bridge that dies
+// when the Iceberg sink consumes RecordBatch directly (commit 3/4).
+func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
+	// Unpack the columnar batch back to row-oriented changes.
+	// QUARANTINE: this bridge dies in commit 3/4.
+	cb, err := w.unpackBatch(b)
+	if err != nil {
+		return fmt.Errorf("iceberg: unpack: %w", err)
+	}
+
+	hasUpserts := len(cb.Upserts) > 0
+	if cb.Mode == change.UpsertMode {
+		keys := append(collectKeys(cb.Upserts), collectKeys(cb.Deletes)...)
 		if len(keys) > 0 {
-			// Position goes on delete only when it IS the last commit.
 			pos := ""
 			if !hasUpserts {
-				pos = b.Position
+				pos = cb.Position
 			}
-			if err := w.commitDeletes(ctx, keys, pos, b.SnapshotState, b.SnapshotPending); err != nil {
+			if err := w.commitDeletes(ctx, keys, pos, cb.SnapshotState, cb.SnapshotPending); err != nil {
 				return err
 			}
 		}
 	}
 	if hasUpserts {
-		if err := w.commitAppend(ctx, b); err != nil {
+		if err := w.commitAppend(ctx, cb); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// unpackBatch converts a columnar dataplane.Batch back to a row-oriented
+// change.Batch. QUARANTINE: dies when the Iceberg sink consumes RecordBatch
+// directly (commit 3/4).
+func (w *TableWriter) unpackBatch(b *dataplane.Batch) (change.Batch, error) {
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		return change.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
+	}
+
+	rows, _, err := transport.DecodeBatch(b.Record, nil, w.delCols)
+	if err != nil {
+		return change.Batch{}, err
+	}
+
+	var upserts, deletes []change.Change
+	for _, r := range rows {
+		switch r.Op {
+		case change.OpDelete:
+			deletes = append(deletes, r)
+		default:
+			upserts = append(upserts, r)
+		}
+	}
+
+	return change.Batch{
+		Table:    b.Table,
+		Upserts:  upserts,
+		Deletes:  deletes,
+		Position: string(b.Watermark),
+		Mode:     change.UpsertMode,
+	}, nil
 }
 
 func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos string, snapshotState string, snapshotPending []uint32) error {

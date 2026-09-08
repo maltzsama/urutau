@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/change"
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 )
 
@@ -19,11 +22,26 @@ type fakeCommitter struct {
 
 func (f *fakeCommitter) Close() error { return nil }
 
-func (f *fakeCommitter) Commit(_ context.Context, b change.Batch) error {
+func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	i := len(f.batches)
-	f.batches = append(f.batches, b)
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		f.batches = append(f.batches, change.Batch{Table: b.Table, Position: string(b.Watermark)})
+	} else {
+		rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
+		var upserts, deletes []change.Change
+		for _, r := range rows {
+			if r.Op == change.OpDelete {
+				deletes = append(deletes, r)
+			} else {
+				upserts = append(upserts, r)
+			}
+		}
+		f.batches = append(f.batches, change.Batch{
+			Table: b.Table, Upserts: upserts, Deletes: deletes, Position: string(b.Watermark), Mode: change.UpsertMode,
+		})
+	}
 	if f.failAt != nil && f.failAt[i] {
 		return errors.New("boom")
 	}
@@ -43,6 +61,13 @@ func runWorker(t *testing.T, cfg Config, targets []string, committers map[string
 	w := New(cfg)
 	for _, target := range targets {
 		w.RegisterCommitter(target, committers[target], change.UpsertMode)
+		w.SetKnownSchema(target, core.Schema{
+			Columns: []core.Column{
+				{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+				{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+			},
+			PrimaryKey: []string{"id"},
+		})
 	}
 	ingest := make(chan change.Change, len(changes)+1)
 	for _, c := range changes {
@@ -166,7 +191,7 @@ func TestCommitsAreSerializedPerTable(t *testing.T) {
 	var mu sync.Mutex
 	inFlight := 0
 	overlapped := false
-	slow := CommitterFunc(func(context.Context, change.Batch) error {
+	slow := CommitterFunc(func(context.Context, *dataplane.Batch) error {
 		mu.Lock()
 		inFlight++
 		if inFlight > 1 {
@@ -193,8 +218,8 @@ func TestCommitsAreSerializedPerTable(t *testing.T) {
 	}
 }
 
-type CommitterFunc func(context.Context, change.Batch) error
+type CommitterFunc func(context.Context, *dataplane.Batch) error
 
 func (f CommitterFunc) Close() error { return nil }
 
-func (f CommitterFunc) Commit(ctx context.Context, b change.Batch) error { return f(ctx, b) }
+func (f CommitterFunc) Commit(ctx context.Context, b *dataplane.Batch) error { return f(ctx, b) }

@@ -11,6 +11,7 @@ import (
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/sink"
@@ -426,19 +427,29 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 }
 
 // runCommitter reads prepared batches and commits them serially.
+// QUARANTINE: the change.Batch -> *dataplane.Batch bridge dies when the
+// worker produces Batch directly (commit 3/4).
 func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 	for rb := range p.readyCh {
 		start := time.Now()
-		if err := p.committer.Commit(ctx, rb.batch); err != nil {
+		// Bridge: convert change.Batch -> *dataplane.Batch.
+		// QUARANTINE: dies in commit 3/4.
+		dpb, err := dpint.BatchFromChangeBatch(rb.batch, p.knownSchema)
+		if err != nil {
+			return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
+		}
+		if err := p.committer.Commit(ctx, dpb); err != nil {
+			dpb.Release()
 			if w.metrics != nil {
 				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
 			}
 			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
 		}
+		dpb.Release()
 		if w.metrics != nil {
 			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
 			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(len(rb.batch.Upserts)))
-			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(len(rb.batch.Deletes)))
+			w.metrics.EqualityDeletes.WithLabelValues(p.target, "upsert").Add(float64(len(rb.batch.Deletes)))
 		}
 		if w.onCommit != nil {
 			w.onCommit(rb.batch, rb.rows)
