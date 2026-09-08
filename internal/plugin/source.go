@@ -19,8 +19,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/plugin/client"
 	"github.com/maltzsama/urutau/internal/plugin/contract"
+	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
@@ -130,6 +132,7 @@ func (a *SourceAdapter) ParsePosition(s string) (position.Position, error) {
 // mode to get the schema and then starts streaming via DoGet.
 func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.Reader, error) {
 	ctx, cancel := context.WithCancel(ctx)
+	out := make(chan change.Change, 256)
 	r := &sourceReader{
 		client: a.client,
 		alloc:  a.alloc,
@@ -137,6 +140,8 @@ func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.
 		ctx:    ctx,
 		cancel: cancel,
 		logger: a.logger,
+		out:    out,
+		puller: sourcepull.New(out),
 	}
 	return r, nil
 }
@@ -149,28 +154,30 @@ type sourceReader struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	logger   *slog.Logger
+	out      chan change.Change
+	puller   *sourcepull.Puller
 	position StringPosition
 	mu       sync.Mutex
 	setConf  func() position.Position
 }
 
-func (r *sourceReader) Stream(ctx context.Context, from position.Position) (<-chan change.Change, <-chan error) {
-	ch := make(chan change.Change, 256)
+func (r *sourceReader) Start(ctx context.Context, from position.Position) error {
 	errCh := make(chan error, 1)
-
+	r.puller.SetErr(errCh)
 	go func() {
-		defer close(ch)
-		defer close(errCh)
-
+		defer close(r.out)
 		for _, ref := range r.refs {
-			if err := r.streamTable(ctx, ref, from, ch); err != nil {
+			if err := r.streamTable(ctx, ref, from, r.out); err != nil {
 				errCh <- fmt.Errorf("stream %s: %w", ref.Source, err)
 				return
 			}
 		}
 	}()
+	return nil
+}
 
-	return ch, errCh
+func (r *sourceReader) Next(ctx context.Context) (*dataplane.Batch, error) {
+	return r.puller.Next(ctx)
 }
 
 func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from position.Position, out chan<- change.Change) error {

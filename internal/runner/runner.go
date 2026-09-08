@@ -69,7 +69,7 @@ func Run(ctx context.Context, s *spec.Spec, cfg Config) error {
 // AddWindowRows populates the worker window — the ordering the window proof
 // needs (a live event must never deduplicate against an empty window).
 type relay struct {
-	ingest   chan<- change.Change
+	ingest   chan<- worker.Ingest
 	window   *worker.Worker
 	flushReq chan chan struct{}
 
@@ -77,12 +77,12 @@ type relay struct {
 	gateOn       bool
 	gateTgt      string
 	gateChk      uint32
-	gateBuf      []change.Change
+	gateBuf      []*dataplane.Batch
 	flushGate    bool
 	gateFlushReq chan chan struct{}
 }
 
-func newRelay(ingest chan<- change.Change, window *worker.Worker) *relay {
+func newRelay(ingest chan<- worker.Ingest, window *worker.Worker) *relay {
 	return &relay{
 		ingest:       ingest,
 		window:       window,
@@ -95,10 +95,10 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 	req := make(chan struct{})
 	r.flushReq <- req
 	<-req
-	r.ingest <- change.Change{
+	r.ingest <- worker.Ingest{
 		Table:    table,
 		Position: at.String(),
-		Window:   &change.Window{ChunkID: chunkID, Closes: true},
+		Win:      &change.Window{ChunkID: chunkID, Closes: true},
 	}
 }
 
@@ -142,13 +142,20 @@ func (r *relay) GateFlush() {
 }
 
 // gate buffers an event when the gate is on for its table.
-func (r *relay) gate(c change.Change) bool {
+// gatedCount returns how many batches are buffered by the gate.
+func (r *relay) gatedCount() int {
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
-	if !r.gateOn || c.Table != r.gateTgt {
+	return len(r.gateBuf)
+}
+
+func (r *relay) gate(b *dataplane.Batch) bool {
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	if !r.gateOn || b.Table != r.gateTgt {
 		return false
 	}
-	r.gateBuf = append(r.gateBuf, c)
+	r.gateBuf = append(r.gateBuf, b)
 	return true
 }
 
@@ -170,14 +177,9 @@ func (r *relay) drainGate(ctx context.Context) (bool, error) {
 	r.flushGate = false
 	r.gateMu.Unlock()
 
-	for _, c := range buf {
-		if c.Window == nil {
-			c.Window = &change.Window{ChunkID: chunkID, InWindow: true}
-		} else {
-			c.Window.ChunkID = chunkID
-		}
+	for _, b := range buf {
 		select {
-		case r.ingest <- c:
+		case r.ingest <- worker.Ingest{Table: b.Table, Batch: b, Win: &change.Window{ChunkID: chunkID, InWindow: true}}:
 		case <-ctx.Done():
 			return true, ctx.Err()
 		}
@@ -185,33 +187,49 @@ func (r *relay) drainGate(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// run routes reader events into the worker's ingest channel.
-func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
+// run pulls columnar batches from the reader and routes them into the
+// worker's ingest channel, gating them during a chunk SELECT (ordering the
+// window proof needs: a live event must never deduplicate against an empty
+// window). Release drains decoded events ahead of the Closes marker.
+func (r *relay) run(ctx context.Context, rdr source.Reader) error {
+	batchCh := make(chan *dataplane.Batch, 16)
+	go func() {
+		defer close(batchCh)
+		for {
+			b, err := rdr.Next(ctx)
+			if err != nil {
+				return
+			}
+			if b == nil {
+				return
+			}
+			select {
+			case batchCh <- b:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	for {
-		// The gate buffer is drained before any select: the pump is the
-		// only writer to ingest, so a gated table's older events can never
-		// be overtaken by its later ones.
 		if flushed, err := r.drainGate(ctx); err != nil {
 			return err
 		} else if flushed {
 			continue
 		}
 		select {
-		case c, ok := <-out:
+		case b, ok := <-batchCh:
 			if !ok {
-				// A gate flush may be pending (GateFlush raced this select):
-				// flush it before exiting so buffered events are never
-				// dropped.
 				if _, err := r.drainGate(ctx); err != nil {
 					return err
 				}
 				return nil
 			}
-			if r.gate(c) {
+			if r.gate(b) {
 				continue
 			}
 			select {
-			case r.ingest <- c:
+			case r.ingest <- worker.Ingest{Table: b.Table, Batch: b}:
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -220,21 +238,38 @@ func (r *relay) run(ctx context.Context, out <-chan change.Change) error {
 		drain:
 			for {
 				select {
-				case c, ok := <-out:
+				case b, ok := <-batchCh:
 					if !ok {
 						break drain
 					}
-					if r.gate(c) {
+					if r.gate(b) {
 						continue
 					}
 					select {
-					case r.ingest <- c:
+					case r.ingest <- worker.Ingest{Table: b.Table, Batch: b}:
 					case <-ctx.Done():
 						close(req)
 						return ctx.Err()
 					}
 				default:
-					break drain
+					// give the puller a beat to flush its buffer
+					select {
+					case b, ok := <-batchCh:
+						if !ok {
+							break drain
+						}
+						if r.gate(b) {
+							continue
+						}
+						select {
+						case r.ingest <- worker.Ingest{Table: b.Table, Batch: b}:
+						case <-ctx.Done():
+							close(req)
+							return ctx.Err()
+						}
+					default:
+						break drain
+					}
 				}
 			}
 			close(req)
@@ -343,13 +378,13 @@ func resumeOrNone(p position.Position) string {
 // Runner wraps the collapsed pipeline and exposes metrics like
 // dropped rows by window (proof of caught-up state).
 type Runner struct {
-	w                                *worker.Worker
-	enrichStages                     []*enrich.Stage
-	log                              *slog.Logger
-	ev                               *eventlog.Run
-	rdr                              source.Reader
-	closeQuery                       func()
-	streamErr, workerErr, routerDone <-chan error
+	w                     *worker.Worker
+	enrichStages          []*enrich.Stage
+	log                   *slog.Logger
+	ev                    *eventlog.Run
+	rdr                   source.Reader
+	closeQuery            func()
+	workerErr, routerDone <-chan error
 
 	// committedPositions tracks the latest durably-committed position per
 	// target table. The minimum across tables is the confirmed position
@@ -479,11 +514,9 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}
 	}
 
-	// Worker + ingest channel. The source still produces changes; they are
-	// wrapped into columnar Ingest batches at the worker boundary (QUARANTINE:
-	// dies when sources produce Arrow directly, M4).
-	rawIngest := make(chan change.Change, 1024)
-	ingest := worker.IngestFromChanges(ctx, rawIngest, core.Schema{})
+	// Worker + ingest channel: the relay feeds columnar Ingest batches
+	// pulled from the source's pull-based reader (M4).
+	ingest := make(chan worker.Ingest, 1024)
 	w := worker.New(worker.Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval})
 	for target, wr := range writers {
 		mode := modes[target]
@@ -615,12 +648,13 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}
 	}
 
-	// Stream: the reader emits changes on a channel the relay consumes; the
-	// terminal-error channel surfaces a dead stream.
-	ch, streamErr := rdr.Stream(ctx, start)
-	router := newRelay(rawIngest, w)
+	// Pull: the reader is pull-based; the relay starts it and routes batches.
+	if err := rdr.Start(ctx, start); err != nil {
+		return nil, fmt.Errorf("runner: start stream: %w", err)
+	}
+	router := newRelay(ingest, w)
 	routerDone := make(chan error, 1)
-	go func() { routerDone <- router.run(ctx, ch) }()
+	go func() { routerDone <- router.run(ctx, rdr) }()
 
 	// Snapshot phase: DBLog for tables with no committed position. Skip
 	// when the source does not support snapshot (e.g. Kafka).
@@ -717,7 +751,6 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}
 	}
 
-	r.streamErr = streamErr
 	r.workerErr = workerErr
 	r.routerDone = routerDone
 
@@ -750,8 +783,7 @@ func (r *Runner) run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-r.streamErr:
-			return fmt.Errorf("runner: stream: %w", err)
+
 		case err := <-r.workerErr:
 			return fmt.Errorf("runner: worker: %w", err)
 		case err := <-r.routerDone:

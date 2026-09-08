@@ -9,6 +9,7 @@ import (
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
@@ -79,16 +80,16 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 		PrimaryKey: []string{"id"},
 	})
 
-	rawIngest := make(chan change.Change, 64)
+	ingest := make(chan worker.Ingest, 64)
 	done := make(chan error, 1)
-	ingest := worker.IngestFromChanges(context.Background(), rawIngest, core.Schema{})
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
-	r := newRelay(rawIngest, w)
+	r := newRelay(ingest, w)
 	out := make(chan change.Change, 64)
+	pr := &pullTestReader{Puller: sourcepull.New(out)}
 	relayDone := make(chan struct{})
 	go func() {
-		_ = r.run(context.Background(), out)
+		_ = r.run(context.Background(), pr)
 		close(relayDone)
 	}()
 
@@ -114,7 +115,15 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 		t.Fatalf("AddWindowRows: %v", err)
 	}
 
-	// Release the gated live event, then close the chunk.
+	// Release the gated live event, then close the chunk. The pull-based
+	// relay bridges asynchronously; wait until the event is gated.
+	deadline := time.Now().Add(2 * time.Second)
+	for r.gatedCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if r.gatedCount() == 0 {
+		t.Fatal("live event never reached the gate")
+	}
 	r.GateFlush()
 	r.Release("raw.orders", 0, at)
 
@@ -122,7 +131,7 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	// closing ingest can never race an in-flight write.
 	close(out)
 	<-relayDone
-	close(rawIngest)
+	close(ingest)
 	if err := <-done; err != nil {
 		t.Fatalf("worker run: %v", err)
 	}
@@ -171,3 +180,17 @@ func TestConfirmedPositionEmptyIsNil(t *testing.T) {
 		t.Fatal("confirmed = non-nil with no commits, want nil")
 	}
 }
+
+// pullTestReader adapts a change channel to the pull-based Reader contract
+// for relay tests.
+type pullTestReader struct {
+	*sourcepull.Puller
+}
+
+func (p *pullTestReader) Start(context.Context, position.Position) error    { return nil }
+func (p *pullTestReader) Synced() position.Position                         { return nil }
+func (p *pullTestReader) Master(context.Context) (position.Position, error) { return nil, nil }
+func (p *pullTestReader) OpenWindow(context.Context, uint32)                {}
+func (p *pullTestReader) ClearWindow()                                      {}
+func (p *pullTestReader) Close()                                            {}
+func (p *pullTestReader) SetConfirmed(func() position.Position)             {}

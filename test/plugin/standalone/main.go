@@ -10,6 +10,9 @@ import (
 	"context"
 	"strconv"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
@@ -75,13 +78,43 @@ type pluginReader struct {
 	out chan change.Change
 }
 
-func (r *pluginReader) Stream(ctx context.Context, _ position.Position) (<-chan change.Change, <-chan error) {
-	errCh := make(chan error, 1)
-	go func() {
-		<-ctx.Done()
-		errCh <- ctx.Err()
-	}()
-	return r.out, errCh
+func (r *pluginReader) Start(ctx context.Context, _ position.Position) error {
+	return nil
+}
+
+func (r *pluginReader) Next(ctx context.Context) (*dataplane.Batch, error) {
+	select {
+	case c, ok := <-r.out:
+		if !ok {
+			return nil, nil
+		}
+		return pluginChangeToBatch(c), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// pluginChangeToBatch builds a single-row wire batch (test-only).
+func pluginChangeToBatch(c change.Change) *dataplane.Batch {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "v", Type: arrow.BinaryTypes.String},
+		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
+		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+	}, nil)
+	bb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	bb.Field(0).(*array.Int64Builder).Append(c.After["id"].(int64))
+	bb.Field(1).(*array.StringBuilder).Append(c.After["v"].(string))
+	bb.Field(2).(*array.Uint8Builder).Append(uint8(c.Op))
+	bb.Field(3).(*array.StringBuilder).Append(c.Position)
+	bb.Field(4).(*array.TimestampBuilder).AppendNull()
+	bb.Field(5).(*array.TimestampBuilder).AppendNull()
+	bb.Field(6).(*array.BooleanBuilder).Append(c.Snapshot)
+	rec := bb.NewRecordBatch()
+	return &dataplane.Batch{Table: c.Table, Record: rec, Watermark: []byte(c.Position)}
 }
 
 func (r *pluginReader) Synced() position.Position                         { return pluginPos(0) }

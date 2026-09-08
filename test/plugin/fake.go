@@ -13,6 +13,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
@@ -200,23 +201,56 @@ type reader struct {
 
 var _ source.Reader = reader{}
 
-// Stream emits the seeded rows, then holds open until ctx is cancelled —
-// the same shape a real source's stream has.
-func (r reader) Stream(ctx context.Context, _ position.Position) (<-chan change.Change, <-chan error) {
-	errCh := make(chan error, 1)
+// Start seeds the rows, then holds the stream open until ctx is cancelled.
+func (r reader) Start(ctx context.Context, _ position.Position) error {
 	go func() {
 		for _, c := range seedRows {
 			select {
 			case r.out <- c:
 			case <-ctx.Done():
-				errCh <- ctx.Err()
 				return
 			}
 		}
 		<-ctx.Done()
-		errCh <- ctx.Err()
 	}()
-	return r.out, errCh
+	return nil
+}
+
+// Next reads one seeded change and builds a single-row columnar batch.
+func (r reader) Next(ctx context.Context) (*dataplane.Batch, error) {
+	select {
+	case c, ok := <-r.out:
+		if !ok {
+			return nil, nil
+		}
+		return changeToBatch(c), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// changeToBatch builds a single-row wire batch from a change (test-only;
+// the fake cannot import internal/ so it builds Arrow directly).
+func changeToBatch(c change.Change) *dataplane.Batch {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "v", Type: arrow.BinaryTypes.String},
+		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
+		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+	}, nil)
+	bb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	bb.Field(0).(*array.Int64Builder).Append(c.After["id"].(int64))
+	bb.Field(1).(*array.StringBuilder).Append(c.After["v"].(string))
+	bb.Field(2).(*array.Uint8Builder).Append(uint8(c.Op))
+	bb.Field(3).(*array.StringBuilder).Append(c.Position)
+	bb.Field(4).(*array.TimestampBuilder).AppendNull()
+	bb.Field(5).(*array.TimestampBuilder).AppendNull()
+	bb.Field(6).(*array.BooleanBuilder).Append(c.Snapshot)
+	rec := bb.NewRecordBatch()
+	return &dataplane.Batch{Table: c.Table, Record: rec, Watermark: []byte(c.Position)}
 }
 
 func (r reader) Synced() position.Position                         { return fakePos(0) }

@@ -11,6 +11,7 @@ import (
 	"github.com/maltzsama/urutau/change"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
@@ -130,16 +131,17 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 type stream struct {
 	*Reader
 	out chan change.Change
+	*sourcepull.Puller
 }
 
-// Stream begins the stream at the given LSN.
-func (s stream) Stream(ctx context.Context, from position.Position) (<-chan change.Change, <-chan error) {
-	errCh := make(chan error, 1)
+// Start begins the stream at the given LSN.
+func (s stream) Start(ctx context.Context, from position.Position) error {
 	l, ok := from.(*position.LSN)
 	if !ok {
-		errCh <- fmt.Errorf("postgres: start position must be an LSN, got %T", from)
-		return s.out, errCh
+		return fmt.Errorf("postgres: start position must be an LSN, got %T", from)
 	}
+	errCh := make(chan error, 1)
+	s.SetErr(errCh)
 	go func() { errCh <- s.StartFromLSN(ctx, l) }()
-	return s.out, errCh
+	return nil
 }

@@ -386,7 +386,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		start = m
 	}
-	out, streamErr := rdr.Stream(ctx, start)
+	if err := rdr.Start(ctx, start); err != nil {
+		return fmt.Errorf("coordinator: start stream: %w", err)
+	}
+	// QUARANTINE: the pull-based reader is decoded back to changes for the
+	// coordinator's per-change pump; dies when the coordinator consumes
+	// batches directly (M4).
+	out, streamErr := changesFromReader(ctx, rdr)
 
 	// Pump: every decoded change becomes one Flight batch. The FIFO queue
 	// preserves the wire ordering the window protocol needs, so the
@@ -1186,4 +1192,40 @@ func tableNames(refs []source.TableRef) []string {
 		out[i] = r.Source
 	}
 	return out
+}
+
+// changesFromReader pulls columnar batches from a reader and decodes them
+// back to changes. QUARANTINE: the coordinator's per-change pump still
+// consumes changes; dies when it consumes batches directly (M4).
+func changesFromReader(ctx context.Context, rdr source.Reader) (<-chan change.Change, <-chan error) {
+	out := make(chan change.Change, 1024)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		for {
+			b, err := rdr.Next(ctx)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if b == nil {
+				errCh <- nil
+				return
+			}
+			rows, _, derr := transport.DecodeBatch(b.Record, nil, nil)
+			b.Release()
+			if derr != nil {
+				errCh <- derr
+				return
+			}
+			for _, ch := range rows {
+				select {
+				case out <- ch:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, errCh
 }
