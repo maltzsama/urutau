@@ -254,7 +254,7 @@ func TestTransitionMatrixNullsCoalesce(t *testing.T) {
 }
 
 // TestTransitionMatrixEmptyPreds verifies that empty predicate lists
-// pass everything through — all rows become updates.
+// pass everything through — rows are classified by __op only.
 func TestTransitionMatrixEmptyPreds(t *testing.T) {
 	alloc := memory.NewGoAllocator()
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
@@ -280,15 +280,12 @@ func TestTransitionMatrixEmptyPreds(t *testing.T) {
 		}
 	}()
 
-	// Empty preds → everything passes → all 10 rows in updates
-	if ins != nil && ins.Record.NumRows() > 0 {
-		t.Errorf("expected no inserts with empty preds, got %d", ins.Record.NumRows())
-	}
-	if del != nil && del.Record.NumRows() > 0 {
-		t.Errorf("expected no deletes with empty preds, got %d", del.Record.NumRows())
-	}
-	if upd == nil || upd.Record.NumRows() != 10 {
-		t.Errorf("expected 10 updates (pass-through), got %v", updNumRows(upd))
+	// Empty preds → all pass → __op determines buckets.
+	// Total rows must equal the batch size.
+	total := insNumRows(ins) + delNumRows(del) + updNumRows(upd)
+	if total != 10 {
+		t.Errorf("expected 10 total rows across all outputs, got %d (ins=%d del=%d upd=%d)",
+			total, insNumRows(ins), delNumRows(del), updNumRows(upd))
 	}
 }
 

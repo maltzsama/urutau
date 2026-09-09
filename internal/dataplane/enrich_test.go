@@ -203,11 +203,11 @@ func TestAddMetadataSnapshotPhase(t *testing.T) {
 
 	schema := out.Record.Schema()
 	for i := range schema.NumFields() {
-		if schema.Field(i).Name == "__snapshot" {
+		if schema.Field(i).Name == "__phase" {
 			col := out.Record.Column(i)
 			for j := range col.Len() {
-				if !col.(*array.Boolean).Value(j) {
-					t.Errorf("row %d: expected __snapshot=true", j)
+				if col.(*array.String).Value(j) != "snapshot" {
+					t.Errorf("row %d: expected __phase=\"snapshot\", got %q", j, col.(*array.String).Value(j))
 				}
 			}
 			break

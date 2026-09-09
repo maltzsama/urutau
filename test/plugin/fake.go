@@ -237,7 +237,7 @@ func seedBatch(target string) *dataplane.Batch {
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
 		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
 		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	}, nil)
 	bb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
