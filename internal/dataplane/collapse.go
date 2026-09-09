@@ -37,44 +37,49 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 		pkIdxs[i] = idx
 	}
 
-	// 1. Build exact keys and check for null PKs.
+	// 1. Build exact keys — EncodeKey is the authority for null PKs and
+	// column validity; indices resolved once (M-9).
 	keys := make([][]byte, nrows)
 	for row := range nrows {
-		for i, idx := range pkIdxs {
-			if batch.Record.Column(idx).IsNull(row) {
-				return nil, nil, fmt.Errorf("dataplane: collapse: null in PK column %q at row %d", pkCols[i], row)
-			}
-		}
-		key, err := EncodeKey(batch.Record, row, pkCols)
+		key, err := EncodeKey(batch.Record, row, pkIdxs, pkCols)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dataplane: collapse: %w", err)
 		}
 		keys[row] = key
 	}
 
-	// 2. Map-based scan: last occurrence wins per group, first-appearance
-	// order for emission. O(n), no hashing, no collision risk.
-	type groupInfo struct {
-		winnerRow int
+	// 2. Validate __op on the original batch before Take — invalid ops
+	// in losing rows would otherwise be silently dropped.
+	opIdxOrig := colIndex(batch.Record.Schema(), "__op")
+	if opIdxOrig < 0 {
+		return nil, nil, fmt.Errorf("dataplane: collapse: __op column not found")
 	}
-	groups := make(map[string]*groupInfo, nrows)
+	opColOrig, ok := batch.Record.Column(opIdxOrig).(*array.Uint8)
+	if !ok {
+		return nil, nil, fmt.Errorf("dataplane: collapse: __op column type %T, want *array.Uint8", batch.Record.Column(opIdxOrig))
+	}
+	if err := validateOpColumn(opColOrig); err != nil {
+		return nil, nil, err
+	}
+
+	// 3. Map-based scan: last occurrence wins per group, first-appearance
+	// order for emission. O(n), no hashing, no collision risk.
+	// groups maps key → winning row (M-9: no groupInfo struct).
+	groups := make(map[string]int, nrows)
 	var groupOrder []string
 
 	for row, key := range keys {
 		k := string(key)
-		g, exists := groups[k]
-		if !exists {
+		if _, exists := groups[k]; !exists {
 			groupOrder = append(groupOrder, k)
-			groups[k] = &groupInfo{winnerRow: row}
-		} else {
-			g.winnerRow = row // last occurrence always wins
 		}
+		groups[k] = row // last occurrence always wins
 	}
 
-	// 3. Collect winner indices in first-appearance order.
+	// 4. Collect winner indices in first-appearance order.
 	winnerIndices := make([]int32, 0, len(groupOrder))
 	for _, k := range groupOrder {
-		winnerIndices = append(winnerIndices, int32(groups[k].winnerRow))
+		winnerIndices = append(winnerIndices, int32(groups[k]))
 	}
 
 	// 4. Build an index array for Take.
@@ -115,7 +120,7 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	}
 	opArr, ok := collapsed.Column(opIdx).(*array.Uint8)
 	if !ok {
-		return nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))
+		return nil, nil, fmt.Errorf("dataplane: collapse: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))
 	}
 
 	insUpdMask := array.NewBooleanBuilder(alloc)
@@ -146,12 +151,12 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	}
 
 	if filteredUpserts.NumRows() > 0 {
-		upserts = &Batch{Table: batch.Table, Record: filteredUpserts, Watermark: batch.Watermark, Mode: batch.Mode}
+		upserts = &Batch{Table: batch.Table, Record: filteredUpserts, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredUpserts.Release()
 	}
 	if filteredDeletes.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode}
+		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredDeletes.Release()
 	}

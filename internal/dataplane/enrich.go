@@ -2,28 +2,70 @@ package dataplane
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
-	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
-// CastPolicy maps column names to Arrow target types.
-type CastPolicy map[string]arrow.DataType
+// CastPolicy maps column names to canonical cast targets (W-1/D-4): the
+// core matrix is the POLICY — it vetoes before any kernel runs — and the
+// arrow kernel is the single EXECUTOR.
+type CastPolicy map[string]core.CastTarget
 
-// Cast applies per-column type widening to a batch. Columns not in the
-// policy are passed through unchanged. Cast errors (incompatible types)
-// surface as errors — no silent truncation.
+// Cast applies per-column casts to a batch. Columns not in the policy are
+// passed through unchanged.
+//
+// Gate: every policy entry is validated against the batch's CURRENT
+// canonical type via core.CheckCast — the matrix, not the arrow kernel,
+// decides what is allowed (a narrowing arrow could technically do is
+// still an error). A policy column missing from the batch is an error.
+//
+// Execution families: numeric/temporal/string via compute.CastToType with
+// the target from transport.KindToArrow; binary → string(hex|base64) via a
+// per-value kernel (arrow has none); composite → string is an explicit
+// error (the matrix allows it, the columnar executor does not exist yet —
+// honest lie over silent dump); timestamp → timestamptz requires
+// assume_utc and yields a warning.
 //
 // OWNERSHIP: the input batch is NOT Released. The caller owns both input
-// and output. Columns from the input are Retained for the output; cast
-// columns are newly allocated. Input always exits valid.
-func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) {
+// and output. Input always exits valid.
+func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, []core.Warning, error) {
 	if len(policy) == 0 || batch.Record == nil || batch.Record.NumRows() == 0 {
-		return batch, nil
+		return batch, nil, nil
+	}
+
+	// Current canonical types of the batch's DATA columns (metadata
+	// columns are skipped by SchemaFromArrow — they are never cast).
+	current, err := transport.SchemaFromArrow(batch.Record.Schema())
+	if err != nil {
+		return nil, nil, fmt.Errorf("dataplane: cast: input schema: %w", err)
+	}
+	srcType := make(map[string]core.ColumnType, len(current.Columns))
+	for _, c := range current.Columns {
+		srcType[c.Name] = c.Type
+	}
+
+	// 1. GATE — the matrix vetoes here, before any kernel.
+	var warns []core.Warning
+	for name, target := range policy {
+		from, ok := srcType[name]
+		if !ok {
+			return nil, nil, fmt.Errorf("dataplane: cast: column %q does not exist", name)
+		}
+		if err := core.CheckCast(from, target); err != nil {
+			return nil, nil, fmt.Errorf("dataplane: cast %q: %w", name, err)
+		}
+		if w := core.CastWarning(from.Kind, target); w != "" {
+			warns = append(warns, core.Warning{Message: fmt.Sprintf("dataplane: cast %q: %s", name, w)})
+		}
 	}
 
 	nrows := batch.Record.NumRows()
@@ -32,13 +74,11 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 	fields := make([]arrow.Field, ncols)
 	castCount := 0
 
-	// Retain source columns — NewRecordBatch takes ownership, we must
-	// not release them afterwards.
 	for i := range ncols {
 		col := batch.Record.Column(i)
 		name := batch.Record.ColumnName(i)
 
-		targetType, needsCast := policy[name]
+		target, needsCast := policy[name]
 		if !needsCast {
 			col.Retain()
 			cols[i] = col
@@ -46,18 +86,20 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 			continue
 		}
 
-		castResult, err := compute.CastToType(ctx, col, targetType)
+		castResult, err := castColumn(ctx, col, srcType[name], target)
 		if err != nil {
 			if castResult != nil {
 				castResult.Release()
 			}
 			for j := range i {
-				cols[j].Release()
+				if cols[j] != nil {
+					cols[j].Release()
+				}
 			}
-			return nil, fmt.Errorf("dataplane: cast %q: %w", name, err)
+			return nil, nil, fmt.Errorf("dataplane: cast %q: %w", name, err)
 		}
 		cols[i] = castResult
-		fields[i] = arrow.Field{Name: name, Type: targetType, Nullable: batch.Record.Schema().Field(i).Nullable}
+		fields[i] = arrow.Field{Name: name, Type: castResult.DataType(), Nullable: batch.Record.Schema().Field(i).Nullable}
 		castCount++
 	}
 
@@ -70,7 +112,7 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 				c.Release()
 			}
 		}
-		return batch, nil
+		return batch, warns, nil
 	}
 
 	schema := arrow.NewSchema(fields, nil)
@@ -82,25 +124,90 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 	}
 
 	return &Batch{
-		Table:     batch.Table,
-		Record:    newRecord,
-		Watermark: batch.Watermark,
-	}, nil
+		Table:           batch.Table,
+		Record:          newRecord,
+		Watermark:       batch.Watermark,
+		Mode:            batch.Mode,
+		SnapshotState:   batch.SnapshotState,
+		SnapshotPending: batch.SnapshotPending,
+	}, warns, nil
 }
 
-// MetadataColumns are the system columns injected by the metadata stage.
-type MetadataColumns struct {
-	CommitTS time.Time
-	IngestTS time.Time
-	Snapshot bool
+// castColumn executes one cast on one column (W-1 step 3).
+func castColumn(ctx context.Context, col arrow.Array, from core.ColumnType, target core.CastTarget) (arrow.Array, error) {
+	switch target.Type.Kind {
+	case core.KindString:
+		switch from.Kind {
+		case core.KindBinary, core.KindUUID, core.KindFixedBinary:
+			// Custom kernel: arrow has no hex/base64 encode.
+			return encodeBinaryToString(col, from.Kind, target.Encoding)
+		case core.KindStruct, core.KindList, core.KindMap:
+			return nil, fmt.Errorf("cast composite-to-string awaits a columnar executor (CR-069) — declare a native type or drop the cast")
+		}
+	case core.KindTimestampTZ:
+		// assume_utc semantics are policy (validated by the matrix); the
+		// kernel only retags the type — never shifts the value.
+		return compute.CastToType(ctx, col, &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"})
+	}
+	at, err := transport.KindToArrow(target.Type)
+	if err != nil {
+		return nil, err
+	}
+	return compute.CastToType(ctx, col, at)
 }
 
-// AddMetadata injects system columns (__ingest_ts, __snapshot, __phase)
-// into the batch. The __commit_ts column is projected from the existing
-// wire schema (CR-069 §3.6: project, don't compute, what already exists).
+// encodeBinaryToString renders binary-family values as hex or base64 text.
+func encodeBinaryToString(col arrow.Array, from core.Kind, encoding string) (arrow.Array, error) {
+	switch encoding {
+	case "hex", "base64":
+	default:
+		return nil, fmt.Errorf("binary → string is ambiguous; declare string(hex) or string(base64)")
+	}
+	bld := array.NewStringBuilder(memory.NewGoAllocator())
+	defer bld.Release()
+	appendText := func(b []byte) {
+		if encoding == "hex" {
+			bld.Append(hex.EncodeToString(b))
+		} else {
+			bld.Append(base64.StdEncoding.EncodeToString(b))
+		}
+	}
+	switch a := col.(type) {
+	case *array.Binary:
+		for i := range a.Len() {
+			if a.IsNull(i) {
+				bld.AppendNull()
+				continue
+			}
+			appendText(a.Value(i))
+		}
+	case *array.FixedSizeBinary:
+		for i := range a.Len() {
+			if a.IsNull(i) {
+				bld.AppendNull()
+				continue
+			}
+			appendText(a.Value(i))
+		}
+	default:
+		return nil, fmt.Errorf("encodeBinaryToString: tipo fonte inesperado %T", col)
+	}
+	_ = from
+	return bld.NewStringArray(), nil
+}
+
+// AddMetadata injects the __phase system column into the batch. The
+// __commit_ts, __ingest_ts, __snapshot columns are expected on the wire
+// (CoreSchemaToArrow emits them) — AddMetadata does NOT re-add them.
+// Valid phases: "live", "snapshot".
 //
 // OWNERSHIP: the input batch is NOT Released. Input always exits valid.
-func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta MetadataColumns) (*Batch, error) {
+func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, phase string) (*Batch, error) {
+	switch phase {
+	case "live", "snapshot":
+	default:
+		return nil, fmt.Errorf("dataplane: addmetadata: phase %q unknown (want live | snapshot)", phase)
+	}
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -108,84 +215,54 @@ func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta
 		return batch, nil
 	}
 
+	// Validate that the wire schema carries the 5 metadata columns.
+	for _, w := range []string{"__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot"} {
+		if colIndex(batch.Record.Schema(), w) < 0 {
+			return nil, fmt.Errorf("dataplane: addmetadata: %q missing — wire-schema batch required", w)
+		}
+	}
+	// Idempotent: __phase already present → no-op.
+	if colIndex(batch.Record.Schema(), "__phase") >= 0 {
+		return batch, nil
+	}
+
 	nrows := int(batch.Record.NumRows())
 	tmpl := batch.Record
 
-	// Check if __commit_ts already exists — if so, project it; if not, add it.
-	hasCommitTS := colIndex(tmpl.Schema(), "__commit_ts") >= 0
-
-	// __ingest_ts (Int64, epoch millis)
-	it := array.NewInt64Builder(alloc)
-	defer it.Release()
-	for range nrows {
-		it.Append(meta.IngestTS.UnixMilli())
-	}
-	itArr := it.NewInt64Array()
-
-	// __snapshot (Boolean)
-	sb := array.NewBooleanBuilder(alloc)
-	defer sb.Release()
-	for range nrows {
-		sb.Append(meta.Snapshot)
-	}
-	sbArr := sb.NewBooleanArray()
-
-	// __phase (Utf8) — derived from Snapshot, not from MetadataColumns.Phase.
+	// __phase (Utf8) — caller-provided phase.
 	pb := array.NewStringBuilder(alloc)
 	defer pb.Release()
-	phase := "live"
-	if meta.Snapshot {
-		phase = "snapshot"
-	}
 	for range nrows {
 		pb.Append(phase)
 	}
 	pbArr := pb.NewStringArray()
 
-	// Build new schema: original fields + system columns not yet present.
+	// Build new schema: original fields + __phase.
 	srcFields := tmpl.Schema().Fields()
-	extraFields := []arrow.Field{
-		{Name: "__ingest_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
-		{Name: "__phase", Type: &arrow.StringType{}, Nullable: true},
-	}
-	if !hasCommitTS {
-		extraFields = append([]arrow.Field{
-			{Name: "__commit_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		}, extraFields...)
-	}
-	newFields := make([]arrow.Field, 0, len(srcFields)+len(extraFields))
+	newFields := make([]arrow.Field, 0, len(srcFields)+1)
 	newFields = append(newFields, srcFields...)
-	newFields = append(newFields, extraFields...)
+	newFields = append(newFields, arrow.Field{Name: "__phase", Type: &arrow.StringType{}, Nullable: true})
 	newSchema := arrow.NewSchema(newFields, nil)
 
-	// Build columns: Retain original columns + append new ones.
-	cols := make([]arrow.Array, 0, len(srcFields)+len(extraFields))
+	// Build columns: Retain original columns + append __phase.
+	cols := make([]arrow.Array, 0, len(srcFields)+1)
 	for i := range len(srcFields) {
 		tmpl.Column(i).Retain()
 		cols = append(cols, tmpl.Column(i))
 	}
-	if !hasCommitTS {
-		// __commit_ts (Int64, epoch millis) — only add if not already in wire schema.
-		ct := array.NewInt64Builder(alloc)
-		defer ct.Release()
-		for range nrows {
-			ct.Append(meta.CommitTS.UnixMilli())
-		}
-		cols = append(cols, ct.NewInt64Array())
-	}
-	cols = append(cols, itArr, sbArr, pbArr)
+	cols = append(cols, pbArr)
 
 	newRecord := array.NewRecordBatch(newSchema, cols, int64(nrows))
-	// NewRecordBatch retains each col but does NOT consume our ref.
-	// Release our refs now; the record holds its own retained refs.
 	for _, c := range cols {
 		c.Release()
 	}
 
 	return &Batch{
-		Table:     batch.Table,
-		Record:    newRecord,
-		Watermark: batch.Watermark,
+		Table:           batch.Table,
+		Record:          newRecord,
+		Watermark:       batch.Watermark,
+		Mode:            batch.Mode,
+		SnapshotState:   batch.SnapshotState,
+		SnapshotPending: batch.SnapshotPending,
 	}, nil
 }

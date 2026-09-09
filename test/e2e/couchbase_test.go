@@ -182,7 +182,7 @@ func toDPBatch(b rowchange.Batch) *dataplane.Batch {
 func cbRow(id int64, v, pos string) rowchange.Batch {
 	return rowchange.Batch{
 		Table: "cb_orders", Position: pos, Mode: rowchange.UpsertMode,
-		Upserts: []rowchange.Change{{
+		Changes: []rowchange.Change{{
 			Op: rowchange.OpInsert, Key: []any{id},
 			After:    map[string]any{"id": id, "v": v},
 			IngestTS: time.Now(),
@@ -252,7 +252,7 @@ func TestCouchbaseSinkDelete(t *testing.T) {
 	}
 	del := rowchange.Batch{
 		Table: "cb_orders", Position: "0/2", Mode: rowchange.UpsertMode,
-		Deletes: []rowchange.Change{{Op: rowchange.OpDelete, Key: []any{int64(9)}}},
+		Changes: []rowchange.Change{{Op: rowchange.OpDelete, Key: []any{int64(9)}}},
 	}
 	if err := w.Commit(ctx, toDPBatch(del)); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -332,7 +332,7 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 
 	bad := rowchange.Batch{
 		Table: ref.Target, Position: "0/1", Mode: rowchange.UpsertMode,
-		Upserts: []rowchange.Change{
+		Changes: []rowchange.Change{
 			{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
 			{Op: rowchange.OpInsert, Key: []any{strings.Repeat("x", 300)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
 		},
@@ -349,7 +349,7 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 
 	good := rowchange.Batch{
 		Table: ref.Target, Position: "0/2", Mode: rowchange.UpsertMode,
-		Upserts: []rowchange.Change{
+		Changes: []rowchange.Change{
 			{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
 			{Op: rowchange.OpInsert, Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
 		},
@@ -410,7 +410,7 @@ func TestCouchbaseSinkNestedTypes(t *testing.T) {
 	w := cbWriter(t, ctx, s, ref, nil)
 	batch := rowchange.Batch{
 		Table: ref.Target, Position: "0/1", Mode: rowchange.UpsertMode,
-		Upserts: []rowchange.Change{{
+		Changes: []rowchange.Change{{
 			Op: rowchange.OpInsert, Key: []any{int64(1)},
 			After: map[string]any{
 				"id":   int64(1),
@@ -461,7 +461,7 @@ func TestCouchbaseSinkMetadataSubObject(t *testing.T) {
 	w := cbWriter(t, ctx, s, ref, []core.MetadataColumn{{From: core.MetaOp, As: "cdc_op"}})
 	batch := rowchange.Batch{
 		Table: ref.Target, Position: "0/1", Mode: rowchange.UpsertMode,
-		Upserts: []rowchange.Change{{
+		Changes: []rowchange.Change{{
 			Op: rowchange.OpInsert, Key: []any{int64(1)},
 			After:    map[string]any{"id": int64(1), "op": "DATA", "cdc_op": "DATA"},
 			IngestTS: time.Now(),

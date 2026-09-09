@@ -34,6 +34,21 @@ func (o Op) String() string {
 // in table-spec order; After is nil for deletes and Before is only carried
 // when needed (mutable-column filters). Position is the source coordinate
 // (GTID | LSN) the event came from; CommitTS is the source commit timestamp.
+//
+// DELETE IMAGE CONTRACT (RV-11): a delete's row image lives in Before when
+// the change comes from an in-process source decoder, and in After when the
+// change was decoded from the wire — the wire carries the before image in
+// the flat columns (CR-021), so DecodeBatch fills After and leaves Before
+// nil. Consumers selecting the delete image must handle BOTH: prefer
+// Before when non-empty, else After. Two consumers assuming one location
+// produced mirrored data-loss bugs (enrich #4, sink.go RV-02).
+//
+// Value contract (row universe): Arrow has no Go-exact float16/float32
+// value type in map[string]any, so a Float32 column DECODES as float64
+// (promotion, M-3). Re-encoding a promoted value back into a Float32
+// column is accepted WITHOUT a precision guard (C-7): the round-trip of
+// the column depends on it. Float64 columns keep the exact-precision
+// guard for integer sources.
 type Change struct {
 	Op       Op
 	Table    string // target table ("namespace.name")
@@ -86,31 +101,35 @@ type Window struct {
 }
 
 // Collapsed is the reduced state of a batch after per-key collapse: the last
-// operation for each key wins.
+// operation for each key wins, winners keep first-appearance order (D-6).
 type Collapsed struct {
-	// Upserts holds the surviving rows: the last operation per key is an
-	// insert or an update, so the row must exist with its final value and
-	// older versions must be equality-deleted by the sink.
-	Upserts []Change
-
-	// Deletes holds keys whose last operation is a delete: equality delete
-	// only — a data row must never be emitted for them, since a delete file
-	// committed together with the data it means to remove is unreliable
-	// across Iceberg implementations (see the spike finding).
-	Deletes []Change
+	// Changes holds the surviving rows in first-appearance order. A key
+	// whose last operation is a delete appears here AS a delete (equality
+	// delete only — a data row must never be emitted for it, since a delete
+	// file committed together with the data it means to remove is
+	// unreliable across Iceberg implementations, see the spike finding).
+	Changes []Change
 }
 
-// Keys returns every primary key in the batch: upserts (whose older versions
-// must be deleted) followed by pure deletes.
+// Keys returns every primary key in the batch, in collapse order.
 func (c Collapsed) Keys() [][]any {
-	keys := make([][]any, 0, len(c.Upserts)+len(c.Deletes))
-	for _, u := range c.Upserts {
-		keys = append(keys, u.Key)
-	}
-	for _, d := range c.Deletes {
-		keys = append(keys, d.Key)
+	keys := make([][]any, 0, len(c.Changes))
+	for _, ch := range c.Changes {
+		keys = append(keys, ch.Key)
 	}
 	return keys
+}
+
+// Count returns (upserts, deletes) — winners split by final operation.
+func (c Collapsed) Count() (upserts, deletes int) {
+	for _, ch := range c.Changes {
+		if ch.Op == OpDelete {
+			deletes++
+		} else {
+			upserts++
+		}
+	}
+	return upserts, deletes
 }
 
 // WriteMode controls how the worker and writer handle a batch.
@@ -124,12 +143,16 @@ const (
 	AppendMode
 )
 
-// Batch is the unit handed to a committer: the collapsed changes of one
-// table plus the source position reached when the batch closed.
+// Batch is the unit handed to a committer: the changes of one table plus
+// the source position reached when the batch closed.
+//
+// D-6: Changes holds ONE slice in ARRIVAL order — order is the input of
+// last-write-wins. Splitting into upsert/delete buckets before the wire
+// reorders a delete after a later insert of the same key and resurrects
+// the row (T-13). Consumers that need the split call ByOp().
 type Batch struct {
 	Table    string
-	Upserts  []Change
-	Deletes  []Change
+	Changes  []Change
 	Position string
 	Mode     WriteMode
 	// SnapshotState is the durable snapshot state machine for resumable
@@ -137,6 +160,20 @@ type Batch struct {
 	// position.
 	SnapshotState   string
 	SnapshotPending []uint32 // chunk IDs still pending after this batch
+}
+
+// ByOp partitions the batch's changes by operation, preserving arrival
+// order within each partition. Derived view — never written back.
+func (b Batch) ByOp() (upserts, deletes []Change) {
+	for _, c := range b.Changes {
+		switch c.Op {
+		case OpDelete:
+			deletes = append(deletes, c)
+		case OpInsert, OpUpdate:
+			upserts = append(upserts, c)
+		}
+	}
+	return upserts, deletes
 }
 
 // ToDataplaneMode maps a row-layer write mode to the public data-plane enum.

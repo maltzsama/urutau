@@ -74,10 +74,10 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		if err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema())); err != nil {
 			t.Fatalf("run: %v", err)
 		}
-		if len(fc.batches) != 1 || len(fc.batches[0].Upserts) != 1 {
+		if len(fc.batches) != 1 || len(fc.batches[0].Changes) != 1 {
 			t.Fatalf("batches: %+v", fc.batches)
 		}
-		row := fc.batches[0].Upserts[0]
+		row := fc.batches[0].Changes[0]
 		if row.After["users.name"] != "ana" {
 			t.Fatalf("row not enriched: %v", row.After)
 		}
@@ -120,10 +120,10 @@ func TestWorkerWithoutEnricherUnchanged(t *testing.T) {
 		}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if len(fc.batches) != 1 || len(fc.batches[0].Upserts) != 1 {
+	if len(fc.batches) != 1 || len(fc.batches[0].Changes) != 1 {
 		t.Fatalf("baseline changed: %+v", fc.batches)
 	}
-	if fc.batches[0].Upserts[0].After["name"] != nil {
+	if fc.batches[0].Changes[0].After["name"] != nil {
 		t.Fatal("unexpected enrichment without an enricher")
 	}
 }

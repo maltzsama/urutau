@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -24,7 +25,14 @@ const (
 //
 // Rows that don't pass the mask are dropped entirely. The three output
 // batches are independent; each may be nil if empty.
+//
+// Mask nulls coalesce to false (M-14): a null mask bit never passes a
+// row, so an absent predicate value drops the row rather than admitting
+// it by accident.
 func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arrow.Array) (inserts, deletes, updates *Batch, err error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil {
 		return nil, nil, nil, nil
 	}
@@ -44,7 +52,10 @@ func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arro
 	}
 	opCol, ok := batch.Record.Column(opIdx).(*array.Uint8)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", batch.Record.Column(opIdx))
+		return nil, nil, nil, fmt.Errorf("dataplane: filter __op column type %T, want *array.Uint8", batch.Record.Column(opIdx))
+	}
+	if err := validateOpColumn(opCol); err != nil {
+		return nil, nil, nil, err
 	}
 
 	delMask := buildOpMask(alloc, opCol, OpDelete, boolMask)
@@ -72,17 +83,17 @@ func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arro
 	}
 
 	if filteredDelete.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDelete, Watermark: batch.Watermark, Mode: batch.Mode}
+		deletes = &Batch{Table: batch.Table, Record: filteredDelete, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredDelete.Release()
 	}
 	if filteredInsert.NumRows() > 0 {
-		inserts = &Batch{Table: batch.Table, Record: filteredInsert, Watermark: batch.Watermark, Mode: batch.Mode}
+		inserts = &Batch{Table: batch.Table, Record: filteredInsert, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredInsert.Release()
 	}
 	if filteredUpdate.NumRows() > 0 {
-		updates = &Batch{Table: batch.Table, Record: filteredUpdate, Watermark: batch.Watermark, Mode: batch.Mode}
+		updates = &Batch{Table: batch.Table, Record: filteredUpdate, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredUpdate.Release()
 	}
@@ -116,16 +127,20 @@ func resolveColumn(schema *arrow.Schema, p Predicate) (int, error) {
 	if p.Side == BeforeSide {
 		name = "__before_" + p.Column
 	}
-	if idx := colIndex(schema, name); idx >= 0 {
-		return idx, nil
+	idx := colIndex(schema, name)
+	if idx < 0 {
+		return -1, fmt.Errorf("dataplane: transition: column %q not found", name)
 	}
-	return 0, fmt.Errorf("dataplane: transition: column %q not found", name)
+	return idx, nil
 }
 
 // EvaluatePredicate builds a boolean mask from a predicate over the
 // batch's columns. Null values are treated as false (coalesce — matches
 // the row-oriented path, NOT Kleene semantics).
 func EvaluatePredicate(ctx context.Context, alloc memory.Allocator, batch *Batch, pred Predicate) (arrow.Array, error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil {
 		return nil, fmt.Errorf("dataplane: nil record")
 	}
@@ -156,12 +171,39 @@ func evaluateColPredicate(ctx context.Context, alloc memory.Allocator, col arrow
 
 func compareEqual(_ context.Context, alloc memory.Allocator, col arrow.Array, val any, n int) (arrow.Array, error) {
 	switch a := col.(type) {
+	case *array.Int32:
+		switch v := val.(type) {
+		case int32:
+			return compareInt32Eq(alloc, a, v, n), nil
+		case int64:
+			if v < math.MinInt32 || v > math.MaxInt32 {
+				return nil, fmt.Errorf("dataplane: predicate value %d out of range for Int32", v)
+			}
+			return compareInt32Eq(alloc, a, int32(v), n), nil
+		default:
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want int32/int64 for column of type Int32", val)
+		}
 	case *array.Int64:
 		v, ok := val.(int64)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want int64 for column of type Int64", val)
 		}
 		return compareInt64Eq(alloc, a, v, n), nil
+	case *array.Uint64:
+		v, ok := val.(uint64)
+		if !ok {
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want uint64 for column of type Uint64", val)
+		}
+		return compareUint64Eq(alloc, a, v, n), nil
+	case *array.Float64:
+		v, ok := val.(float64)
+		if !ok {
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want float64 for column of type Float64", val)
+		}
+		if math.IsNaN(v) {
+			return nil, fmt.Errorf("dataplane: NaN predicate matches nothing (documented)")
+		}
+		return compareFloat64Eq(alloc, a, v, n), nil
 	case *array.String:
 		v, ok := val.(string)
 		if !ok {
@@ -174,6 +216,18 @@ func compareEqual(_ context.Context, alloc memory.Allocator, col arrow.Array, va
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want bool for column of type Boolean", val)
 		}
 		return compareBoolEq(alloc, a, v, n), nil
+	case *array.Date32:
+		v, ok := val.(int32)
+		if !ok {
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want int32 (days) for column of type Date32", val)
+		}
+		return compareDate32Eq(alloc, a, v, n), nil
+	case *array.Time64:
+		v, ok := val.(int64)
+		if !ok {
+			return nil, fmt.Errorf("dataplane: predicate value type %T, want int64 (micros) for column of type Time64", val)
+		}
+		return compareTime64Eq(alloc, a, v, n), nil
 	default:
 		return nil, fmt.Errorf("dataplane: unsupported column type %T for equality predicate", col)
 	}
@@ -218,6 +272,71 @@ func compareBoolEq(alloc memory.Allocator, col *array.Boolean, val bool, n int) 
 	return bb.NewBooleanArray()
 }
 
+func compareInt32Eq(alloc memory.Allocator, col *array.Int32, val int32, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
+	defer bb.Release()
+	for i := range n {
+		if col.IsNull(i) {
+			bb.Append(false)
+		} else {
+			bb.Append(col.Value(i) == val)
+		}
+	}
+	return bb.NewBooleanArray()
+}
+
+func compareUint64Eq(alloc memory.Allocator, col *array.Uint64, val uint64, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
+	defer bb.Release()
+	for i := range n {
+		if col.IsNull(i) {
+			bb.Append(false)
+		} else {
+			bb.Append(col.Value(i) == val)
+		}
+	}
+	return bb.NewBooleanArray()
+}
+
+func compareFloat64Eq(alloc memory.Allocator, col *array.Float64, val float64, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
+	defer bb.Release()
+	for i := range n {
+		if col.IsNull(i) {
+			bb.Append(false)
+		} else {
+			bb.Append(col.Value(i) == val)
+		}
+	}
+	return bb.NewBooleanArray()
+}
+
+func compareDate32Eq(alloc memory.Allocator, col *array.Date32, val int32, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
+	defer bb.Release()
+	for i := range n {
+		if col.IsNull(i) {
+			bb.Append(false)
+		} else {
+			bb.Append(int32(col.Value(i)) == val)
+		}
+	}
+	return bb.NewBooleanArray()
+}
+
+func compareTime64Eq(alloc memory.Allocator, col *array.Time64, val int64, n int) arrow.Array {
+	bb := array.NewBooleanBuilder(alloc)
+	defer bb.Release()
+	for i := range n {
+		if col.IsNull(i) {
+			bb.Append(false)
+		} else {
+			bb.Append(int64(col.Value(i)) == val)
+		}
+	}
+	return bb.NewBooleanArray()
+}
+
 func invertBool(alloc memory.Allocator, col arrow.Array) (arrow.Array, error) {
 	b, ok := col.(*array.Boolean)
 	if !ok {
@@ -239,7 +358,8 @@ func buildOpMask(alloc memory.Allocator, opCol *array.Uint8, opVal uint8, mask *
 	defer bb.Release()
 	for i := range n {
 		opMatch := opCol.Value(i) == opVal
-		maskPass := mask.Value(i)
+		// Null mask bit → false (M-14): explicit, not a buffer accident.
+		maskPass := mask.IsValid(i) && mask.Value(i)
 		bb.Append(opMatch && maskPass)
 	}
 	return bb.NewBooleanArray()
@@ -262,6 +382,9 @@ func TransitionMask(alloc memory.Allocator, opCol *array.Uint8, opVal uint8) arr
 // __op column. Every row goes to exactly one output. Watermark and Table
 // are preserved. Empty outputs are nil (not empty batches).
 func SplitByOp(ctx context.Context, alloc memory.Allocator, batch *Batch) (inserts, deletes, updates *Batch, err error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil {
 		return nil, nil, nil, nil
 	}
@@ -272,6 +395,9 @@ func SplitByOp(ctx context.Context, alloc memory.Allocator, batch *Batch) (inser
 	opCol, ok := batch.Record.Column(opIdx).(*array.Uint8)
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", batch.Record.Column(opIdx))
+	}
+	if err := validateOpColumn(opCol); err != nil {
+		return nil, nil, nil, err
 	}
 
 	insMask := TransitionMask(alloc, opCol, OpInsert)
@@ -299,17 +425,17 @@ func SplitByOp(ctx context.Context, alloc memory.Allocator, batch *Batch) (inser
 	}
 
 	if filteredIns.NumRows() > 0 {
-		inserts = &Batch{Table: batch.Table, Record: filteredIns, Watermark: batch.Watermark, Mode: batch.Mode}
+		inserts = &Batch{Table: batch.Table, Record: filteredIns, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredIns.Release()
 	}
 	if filteredDel.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDel, Watermark: batch.Watermark, Mode: batch.Mode}
+		deletes = &Batch{Table: batch.Table, Record: filteredDel, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredDel.Release()
 	}
 	if filteredUpd.NumRows() > 0 {
-		updates = &Batch{Table: batch.Table, Record: filteredUpd, Watermark: batch.Watermark, Mode: batch.Mode}
+		updates = &Batch{Table: batch.Table, Record: filteredUpd, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredUpd.Release()
 	}
@@ -325,17 +451,32 @@ func colIndex(schema *arrow.Schema, name string) int {
 	return -1
 }
 
+// validateOpColumn checks that every value in the __op column is a known
+// operation (Insert=0, Update=1, Delete=2). Unknown values cause an
+// immediate error — they would silently vanish in SplitByOp/Filter.
+func validateOpColumn(opCol *array.Uint8) error {
+	for i := range opCol.Len() {
+		switch opCol.Value(i) {
+		case OpInsert, OpUpdate, OpDelete:
+		default:
+			return fmt.Errorf("dataplane: invalid __op %d at row %d", opCol.Value(i), i)
+		}
+	}
+	return nil
+}
+
 // evalAll evaluates a list of predicates and ANDs their masks into a
 // single boolean mask. Empty predicates → all-true mask (pass-through).
 func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []Predicate) (arrow.Array, error) {
 	nrows := int(batch.Record.NumRows())
 	if len(preds) == 0 {
 		bb := array.NewBooleanBuilder(alloc)
-		defer bb.Release()
 		for range nrows {
 			bb.Append(true)
 		}
-		return bb.NewBooleanArray(), nil
+		arr := bb.NewBooleanArray()
+		bb.Release() // explicit, not deferred — buffers live in arr now
+		return arr, nil
 	}
 
 	var combined arrow.Array
@@ -353,7 +494,6 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 		}
 		// AND: combined = combined AND mask
 		bb := array.NewBooleanBuilder(alloc)
-		defer bb.Release()
 		cArr := combined.(*array.Boolean)
 		mArr := mask.(*array.Boolean)
 		for j := range cArr.Len() {
@@ -362,6 +502,7 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 		mask.Release()
 		combined.Release()
 		combined = bb.NewBooleanArray()
+		bb.Release() // explicit, not deferred — safe inside the loop
 	}
 	return combined, nil
 }
@@ -382,7 +523,9 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 // op is CDC semantics.
 func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
 	before, after []Predicate) (inserts, deletes, updates *Batch, err error) {
-
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil || batch.Record.NumRows() == 0 {
 		return nil, nil, nil, nil
 	}
@@ -403,6 +546,19 @@ func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
 	bp := beforePass.(*array.Boolean)
 	ap := afterPass.(*array.Boolean)
 
+	// W-2: __op defines existence; predicates define membership.
+	opIdx := colIndex(batch.Record.Schema(), "__op")
+	if opIdx < 0 {
+		return nil, nil, nil, fmt.Errorf("dataplane: transition: __op column not found")
+	}
+	opCol, ok := batch.Record.Column(opIdx).(*array.Uint8)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("dataplane: transition: __op %T, want *array.Uint8", batch.Record.Column(opIdx))
+	}
+	if err := validateOpColumn(opCol); err != nil {
+		return nil, nil, nil, err
+	}
+
 	// Build the three quadrant masks.
 	insMask := array.NewBooleanBuilder(alloc)
 	delMask := array.NewBooleanBuilder(alloc)
@@ -412,11 +568,11 @@ func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
 	defer updMask.Release()
 
 	for i := range nrows {
-		b := bp.Value(i)
-		a := ap.Value(i)
-		insMask.Append(!b && a) // insert: !before & after
-		delMask.Append(b && !a) // delete: before & !after
-		updMask.Append(b && a)  // update: before & after
+		a := ap.Value(i) && opCol.Value(i) != OpDelete // exists after?
+		b := bp.Value(i) && opCol.Value(i) != OpInsert // existed before?
+		insMask.Append(!b && a)
+		delMask.Append(b && !a)
+		updMask.Append(b && a)
 	}
 
 	insBool := insMask.NewBooleanArray()
@@ -445,17 +601,17 @@ func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
 	}
 
 	if filteredInserts.NumRows() > 0 {
-		inserts = &Batch{Table: batch.Table, Record: filteredInserts, Watermark: batch.Watermark, Mode: batch.Mode}
+		inserts = &Batch{Table: batch.Table, Record: filteredInserts, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredInserts.Release()
 	}
 	if filteredDeletes.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode}
+		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredDeletes.Release()
 	}
 	if filteredUpdates.NumRows() > 0 {
-		updates = &Batch{Table: batch.Table, Record: filteredUpdates, Watermark: batch.Watermark, Mode: batch.Mode}
+		updates = &Batch{Table: batch.Table, Record: filteredUpdates, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredUpdates.Release()
 	}

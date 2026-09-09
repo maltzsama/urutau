@@ -96,8 +96,16 @@ jobs:
       # Requires: test: go test -race -count=1 ./... in the Makefile.
       # The concurrency tests (heartbeat, pumps, MVCC, watchdog) are
       # theater without the race detector.
+      # -count=1 disables test caching (cached runs hide flaky service
+      # interactions); -covermode=atomic is the only mode sound under -race.
       - name: Test
-        run: make test
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
 
       - name: Build (host)
         run: make build

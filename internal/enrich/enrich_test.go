@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
+
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -73,8 +75,7 @@ func newTestStage(t *testing.T, cfg spec.Enrich, rows []map[string]any) (*Stage,
 }
 
 func (rj *refJoin) isHot() bool {
-	snap := rj.snap.Load()
-	return snap != nil && snap.hot
+	return rj.snap.Load() != nil
 }
 
 func (s *Stage) applyOne(t *testing.T, c rowchange.Change) ([]rowchange.Change, error) {
@@ -254,7 +255,7 @@ func TestBufferMaxWaitExpires(t *testing.T) {
 	// Pretend the reference went hot with an empty drain list... no: the
 	// real path flips hot in refresh; simulate by flipping manually.
 	img, dests, star, _ := buildImage(s.refs[0], usersRows())
-	s.refs[0].snap.Store(&snapshot{hot: true, image: img, dests: dests, star: star})
+	s.refs[0].snap.Store(&snapshot{image: img, dests: dests, star: star})
 	s.refs[0].mu.Lock()
 	s.refs[0].pendingDrain = s.refs[0].queue
 	s.refs[0].queue = nil
@@ -694,5 +695,284 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 	// Source columns remain unprefixed.
 	if out[0].After["id"] != int64(1) {
 		t.Fatalf("source id overwritten: %v", out[0].After)
+	}
+}
+
+// pollUntil asserts cond() becomes true within the deadline (RV-09):
+// fixed sleeps wait instead of establishing state, so a slow CI runner
+// observes a mid-transition stage and flakes.
+func pollUntil(t *testing.T, deadline time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	for start := time.Now(); time.Since(start) < deadline; time.Sleep(time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatal(msg)
+}
+
+// --- audit fixes: enrich.go ------------------------------------------------
+
+func TestFirstErrClearedOnSuccess(t *testing.T) {
+	// Build stage manually so we can fail the FIRST load (before hot).
+	// Use a fast refresh so the second load happens promptly.
+	fl := &fakeLoader{rows: nil, err: errors.New("db down")}
+	cfg := refCfg(nil)
+	cfg.Refresh = "10ms"
+	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := s.UseLoader("users", fl); err != nil {
+		t.Fatalf("use loader: %v", err)
+	}
+	s.Start(context.Background())
+	defer s.Stop()
+	// First load fails -> snap is nil -> firstErr is set.
+	pollUntil(t, 2*time.Second, func() bool {
+		_, err := s.Enrich(nil)
+		return err != nil
+	}, "expected sticky error before first success")
+
+	// Fix the loader; the next refresh tick clears firstErr (audit #1).
+	fl.SetErr(nil)
+	fl.SetRows(usersRows())
+	pollUntil(t, 2*time.Second, func() bool {
+		_, err := s.Enrich(nil)
+		return err == nil
+	}, "firstErr not cleared after success")
+}
+
+func TestEmptyRefGoesHot(t *testing.T) {
+	s, _ := newTestStage(t, refCfg(nil), []map[string]any{}) // legitimately empty
+	if !s.refs[0].isHot() {
+		t.Fatal("empty reference should go hot (audit #3)")
+	}
+	out, err := s.applyOne(t, rowchange.Change{
+		After: map[string]any{"user_ref": int64(1), "v": "x"},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !out[0].EnrichMiss {
+		t.Fatal("all joins must miss against empty image")
+	}
+}
+
+func TestDeleteBypassAllPolicies(t *testing.T) {
+	// Production deletes NEVER arrive with After == nil: DecodeBatch
+	// always allocates the map and the encode side backfills the join key.
+	// The bypass guard is therefore Op == OpDelete (After == nil is kept
+	// only as a defensive check for in-process changes). All three shapes
+	// below must survive every policy.
+	//
+	// Shape 1: wire-format delete (After allocated) vs coldDrop — the drop
+	// policy must not eat the tombstone before the first successful load.
+	s, _ := newTestStage(t, refCfg(func(c *spec.Enrich) { c.OnColdStart = "drop" }), usersRows())
+	out, err := s.applyOne(t, rowchange.Change{
+		Op:     rowchange.OpDelete,
+		After:  map[string]any{"user_ref": int64(1)}, // wire: allocated, key backfilled
+		Before: map[string]any{"id": int64(1)},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatal("wire-format delete must bypass cold drop (audit #4)")
+	}
+
+	// Shape 2: wire-format delete + inner join + hot miss — an inner miss
+	// drops events; deletes must bypass.
+	innerCfg := refCfg(func(c *spec.Enrich) { c.JoinType = "inner" })
+	si, _ := newTestStage(t, innerCfg, usersRows())
+	out, err = si.applyOne(t, rowchange.Change{
+		Op:     rowchange.OpDelete,
+		After:  map[string]any{"user_ref": int64(99)}, // no match in ref
+		Before: map[string]any{"id": int64(99)},
+	})
+	if err != nil {
+		t.Fatalf("apply inner: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatal("delete must bypass inner-join miss")
+	}
+
+	// Shape 3: defensive in-process tombstone (After nil) — still survives.
+	out, err = s.applyOne(t, rowchange.Change{
+		Op:     rowchange.OpDelete,
+		After:  nil,
+		Before: map[string]any{"id": int64(1)},
+	})
+	if err != nil {
+		t.Fatalf("apply tombstone: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatal("nil-After tombstone must bypass cold drop")
+	}
+}
+
+func TestNullJoinKeyMiss(t *testing.T) {
+	s, _ := newTestStage(t, refCfg(nil), usersRows())
+	out, err := s.applyOne(t, rowchange.Change{
+		After: map[string]any{"user_ref": nil, "v": "x"},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !out[0].EnrichMiss {
+		t.Fatal("NULL join key must miss, not match \"nil\" (audit #7)")
+	}
+}
+
+func TestStickyErrAtStart(t *testing.T) {
+	// Build stage manually so the first load fails (before hot).
+	fl := &fakeLoader{rows: nil, err: errors.New("broken")}
+	s, err := New([]spec.Enrich{refCfg(nil)}, []string{"id", "user_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := s.UseLoader("users", fl); err != nil {
+		t.Fatalf("use loader: %v", err)
+	}
+	s.Start(context.Background())
+	defer s.Stop()
+	// The failing first load installs the sticky error; poll for it.
+	pollUntil(t, 2*time.Second, func() bool {
+		_, err := s.Enrich([]rowchange.Change{{After: map[string]any{"user_ref": int64(1)}}})
+		return err != nil
+	}, "sticky error must block Enrich at top (audit #8)")
+}
+
+func TestJoinTypeValidation(t *testing.T) {
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.JoinType = "cross" })}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("unknown join_type must be rejected at boot (audit #10)")
+	}
+}
+
+func TestMaxWaitValidation(t *testing.T) {
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "not-a-duration" })}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("invalid maxWait must be rejected at boot (audit #10)")
+	}
+}
+
+func TestMaxEventsValidation(t *testing.T) {
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxEvents = -1 })}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("negative maxEvents must be rejected at boot (audit #10)")
+	}
+}
+
+func TestDestCollisionRejected(t *testing.T) {
+	// Two columns project to the same destination name via overlapping "as".
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"*"}
+		c.As = map[string]string{"users.name": "collided", "users.tier": "collided"}
+	})}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("two renames to the same destination must be rejected (audit #11)")
+	}
+}
+
+func TestCrossRefDefaultCollisionRejected(t *testing.T) {
+	// RV-07: ref A selects "name" (default destination "users.name"); ref B
+	// renames onto "users.name" — the rename silently overwrites A's
+	// projection. Both directions must be rejected at boot.
+	refA := refCfg(func(c *spec.Enrich) { c.Table = "users" })
+	refB := refCfg(func(c *spec.Enrich) {
+		c.Table = "orders"
+		c.Select = []string{"id"}
+		c.As = map[string]string{"orders.id": "users.name"}
+	})
+	if _, err := New([]spec.Enrich{refA, refB}, []string{"user_ref", "v"}, nil); err == nil {
+		t.Fatal("rename onto another ref's default destination must be rejected")
+	}
+
+	// Reverse order: a default projecting onto a name already claimed by
+	// another ref's rename must also collide. refC (users, select name)
+	// defaults to destination "users.name" — claimed above by refB's rename.
+	refC := refCfg(func(c *spec.Enrich) {
+		c.Table = "users"
+		c.Select = []string{"name"}
+	})
+	if _, err := New([]spec.Enrich{refB, refC}, []string{"user_ref", "v"}, nil); err == nil {
+		t.Fatal("default projecting over another ref's rename must be rejected")
+	}
+}
+
+func TestMySQLConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    string
+		check func(t *testing.T, cfg *mysql.Config)
+		err   bool
+	}{
+		{
+			name: "explicit port",
+			in:   "mysql://u:p@myhost:3307/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.User != "u" || cfg.Passwd != "p" || cfg.Addr != "myhost:3307" || cfg.DBName != "mydb" {
+					t.Fatalf("cfg = %q/%q@%s/%s", cfg.User, cfg.Passwd, cfg.Addr, cfg.DBName)
+				}
+			},
+		},
+		{
+			name: "default port",
+			in:   "mysql://u:p@myhost/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.Addr != "myhost:3306" {
+					t.Fatalf("addr = %q, want myhost:3306", cfg.Addr)
+				}
+			},
+		},
+		{
+			name: "parseTime on",
+			in:   "mysql://u:p@myhost/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if !cfg.ParseTime {
+					t.Fatal("ParseTime must stay on (DATETIME -> time.Time)")
+				}
+			},
+		},
+		{
+			name: "password with DSN delimiters survives decoded",
+			in:   "mysql://u:p%2Fass%3Fx%40y@myhost/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.Passwd != "p/ass?x@y" {
+					t.Fatalf("passwd = %q, want %q", cfg.Passwd, "p/ass?x@y")
+				}
+			},
+		},
+		{
+			name: "query params carried through",
+			in:   "mysql://u:p@myhost/mydb?timeout=10s&charset=utf8mb4",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.Params["timeout"] != "10s" || cfg.Params["charset"] != "utf8mb4" {
+					t.Fatalf("params = %v, want timeout+charset", cfg.Params)
+				}
+			},
+		},
+		{
+			name: "missing db is an error",
+			in:   "mysql://u:p@myhost/",
+			err:  true,
+		},
+		{
+			name: "wrong scheme is an error",
+			in:   "postgres://u:p@myhost/mydb",
+			err:  true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := mysqlConfig(tc.in)
+			if (err != nil) != tc.err {
+				t.Fatalf("err=%v, wantErr=%v", err, tc.err)
+			}
+			if err == nil && tc.check != nil {
+				tc.check(t, cfg)
+			}
+		})
 	}
 }

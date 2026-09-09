@@ -62,8 +62,8 @@ func TestSnapshotPartitionPositionOnlyOnLastCommit(t *testing.T) {
 	if ab.Position != "" {
 		t.Fatalf("append batch position = %q, want empty (upsert batch commits last)", ab.Position)
 	}
-	if len(ab.Upserts) != 1 || ab.Upserts[0].Key[0] != int64(1) {
-		t.Fatalf("append batch rows = %+v, want snapshot id=1 only", ab.Upserts)
+	if len(batchUpserts(ab)) != 1 || batchUpserts(ab)[0].Key[0] != int64(1) {
+		t.Fatalf("append batch rows = %+v, want snapshot id=1 only", batchUpserts(ab))
 	}
 	if ub.Mode != rowchange.UpsertMode || ub.Position != "p3" {
 		t.Fatalf("upsert batch = mode %v pos %q, want upsert at p3", ub.Mode, ub.Position)
@@ -104,15 +104,15 @@ func TestBootstrapGuardTracksLiveKeys(t *testing.T) {
 		t.Fatalf("batches = %d, want append + upsert", len(batches))
 	}
 	ab, ub := batches[0], batches[1]
-	if len(ab.Upserts) != 1 || ab.Upserts[0].Key[0] != int64(6) {
-		t.Fatalf("append batch = %+v, want only the untouched key 6", ab.Upserts)
+	if len(batchUpserts(ab)) != 1 || batchUpserts(ab)[0].Key[0] != int64(6) {
+		t.Fatalf("append batch = %+v, want only the untouched key 6", batchUpserts(ab))
 	}
 	// Key 5 must take the upsert path (collapse keeps the last version —
 	// the snapshot re-read the updated row — and it carries an equality
 	// delete). The critical assertion is that it is NOT in the append
 	// batch above.
 	found := false
-	for _, u := range ub.Upserts {
+	for _, u := range batchUpserts(ub) {
 		if u.Key[0] == int64(5) {
 			found = true
 		}
@@ -198,8 +198,8 @@ func TestResumedSnapshotUsesUpsertPath(t *testing.T) {
 	if b.Mode != rowchange.UpsertMode {
 		t.Fatalf("mode = %v, want upsert on a resumed snapshot", b.Mode)
 	}
-	if len(b.Upserts) != 2 || b.Position != "low" {
-		t.Fatalf("upserts = %d pos %q, want 2 rows at low", len(b.Upserts), b.Position)
+	if len(batchUpserts(b)) != 2 || b.Position != "low" {
+		t.Fatalf("upserts = %d pos %q, want 2 rows at low", len(batchUpserts(b)), b.Position)
 	}
 }
 
@@ -232,8 +232,10 @@ func TestAppendModeDeleteHandling(t *testing.T) {
 		t.Fatalf("batches = %d, want 1", len(fc.batches))
 	}
 	b := fc.batches[0]
-	if len(b.Upserts) != 2 {
-		t.Fatalf("upserts = %d, want 2 (insert + recorded delete) — no all-null row", len(b.Upserts))
+	// AppendMode: every surviving change becomes a row — the insert plus
+	// the before-image delete rewritten as a row carrying op=delete.
+	if len(b.Changes) != 2 {
+		t.Fatalf("rows = %d, want 2 (insert + recorded delete) — no all-null row", len(b.Changes))
 	}
 	if len(dropped) != 1 || dropped[0] != "p3" {
 		t.Fatalf("dropped = %v, want [p3]", dropped)
@@ -259,8 +261,8 @@ func TestAppendModeOnDeleteSkip(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	b := fc.batches[0]
-	if len(b.Upserts) != 1 {
-		t.Fatalf("upserts = %d, want 1 — skip drops even a before-image delete", len(b.Upserts))
+	if len(batchUpserts(b)) != 1 {
+		t.Fatalf("upserts = %d, want 1 — skip drops even a before-image delete", len(batchUpserts(b)))
 	}
 	if w.DroppedDeletes("t") != 1 {
 		t.Fatalf("DroppedDeletes = %d, want 1", w.DroppedDeletes("t"))
@@ -364,15 +366,15 @@ func TestWorkerRegimeBoundaryRowColumnar(t *testing.T) {
 	if ab.Mode != rowchange.AppendMode {
 		t.Fatalf("batch 0 mode = %v, want append", ab.Mode)
 	}
-	if len(ab.Upserts) != 1 || ab.Upserts[0].Key[0] != int64(2) || ab.Upserts[0].After["v"] != "s2" {
-		t.Fatalf("append batch = %+v, want [2:s2]", ab.Upserts)
+	if len(batchUpserts(ab)) != 1 || batchUpserts(ab)[0].Key[0] != int64(2) || batchUpserts(ab)[0].After["v"] != "s2" {
+		t.Fatalf("append batch = %+v, want [2:s2]", batchUpserts(ab))
 	}
 
 	if ub.Mode != rowchange.UpsertMode {
 		t.Fatalf("batch 1 mode = %v, want upsert", ub.Mode)
 	}
 	got := map[int64]string{}
-	for _, u := range ub.Upserts {
+	for _, u := range batchUpserts(ub) {
 		got[u.Key[0].(int64)] = u.After["v"].(string)
 	}
 	if got[1] != "live" {
@@ -381,7 +383,7 @@ func TestWorkerRegimeBoundaryRowColumnar(t *testing.T) {
 	if got[3] != "new" {
 		t.Fatalf("PK 3 must survive, got %q", got[3])
 	}
-	if len(ub.Deletes) != 1 || ub.Deletes[0].Key[0] != int64(4) {
-		t.Fatalf("deletes = %+v, want [4]", ub.Deletes)
+	if len(batchDeletes(ub)) != 1 || batchDeletes(ub)[0].Key[0] != int64(4) {
+		t.Fatalf("deletes = %+v, want [4]", batchDeletes(ub))
 	}
 }

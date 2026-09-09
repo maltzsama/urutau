@@ -909,7 +909,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, rows []rowchange.Change,
 			break
 		}
 	}
-	body, metaBytes, err := transport.EncodeBatch(rows, cs, meta)
+	body, metaBytes, err := transport.EncodeBatch(rows, cs, meta, nil)
 	if err != nil {
 		return err
 	}
@@ -1469,15 +1469,15 @@ func changesFromReader(ctx context.Context, rdr source.Reader) (<-chan rowchange
 				return
 			}
 			table := b.Table
-			rows, _, derr := transport.DecodeBatch(b.Record, nil, nil)
+			rows, derr := transport.DecodeBatch(b.Record, table, nil)
 			b.Release()
 			if derr != nil {
 				errCh <- derr
 				return
 			}
 			for _, ch := range rows {
-				// DecodeBatch with no wire meta leaves Table empty; the batch
-				// carries the sink-side target name the route and gate key on.
+				// DecodeBatch already stamps Table, but re-assert the
+				// sink-side target name the route and gate key on.
 				ch.Table = table
 				select {
 				case out <- ch:

@@ -25,15 +25,9 @@ func Collapse(changes []Change) Collapsed {
 		last[k] = c
 	}
 
-	var out Collapsed
+	out := Collapsed{Changes: make([]Change, 0, len(changes))}
 	for _, k := range order {
-		c := last[k]
-		switch c.Op {
-		case OpInsert, OpUpdate:
-			out.Upserts = append(out.Upserts, c)
-		case OpDelete:
-			out.Deletes = append(out.Deletes, c)
-		}
+		out.Changes = append(out.Changes, last[k])
 	}
 	return out
 }

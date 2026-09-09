@@ -22,6 +22,9 @@ import (
 func EncodeTableSchema(cs core.Schema) ([]byte, error) {
 	fields := make([]arrow.Field, 0, len(cs.Columns))
 	for _, col := range cs.Columns {
+		if isReservedColumnName(col.Name) {
+			return nil, fmt.Errorf("transport: schema: column %q is reserved (wire metadata)", col.Name)
+		}
 		af, err := columnToArrowField(col)
 		if err != nil {
 			return nil, fmt.Errorf("transport: schema: column %q: %w", col.Name, err)
@@ -44,7 +47,10 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 		if isMetadataColumn(f.Name) {
 			continue
 		}
-		ct := fieldTypeToCore(f)
+		ct, err := fieldTypeToCore(f)
+		if err != nil {
+			return core.Schema{}, fmt.Errorf("transport: schema field %q: %w", f.Name, err)
+		}
 		ct.Nullable = f.Nullable
 		cs.Columns = append(cs.Columns, core.Column{Name: f.Name, Type: ct})
 	}
@@ -53,9 +59,12 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 
 // EncodeBounds serializes chunk bounds as a one-or-two-row Arrow record:
 // row 0 is the low tuple, row 1 the high tuple (absent for the open-high
-// last chunk; a nil low produces an empty record). Column types are
+// last chunk; nil low with non-nil high is an error). Column types are
 // inferred from the values — the PK tuple's native types survive the wire.
 func EncodeBounds(low, high []any) ([]byte, error) {
+	if low == nil && high != nil {
+		return nil, fmt.Errorf("transport: bounds: nil low with non-nil high is not representable (row 0 is the low slot)")
+	}
 	width := len(low)
 	if high != nil && len(high) > width {
 		width = len(high)
@@ -76,6 +85,20 @@ func EncodeBounds(low, high []any) ([]byte, error) {
 	bldrs := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	defer bldrs.Release()
 
+	// normalizeBound widens unsigned 32-bit values to int64 in step with
+	// inferArrowType's type choice (RV-05): type AND value must normalize
+	// together or appendTypedValue sees a uint32 against an int64 target.
+	normalizeBound := func(v any) any {
+		switch t := v.(type) {
+		case uint32:
+			return int64(t)
+		case uint:
+			return int64(t)
+		default:
+			return v
+		}
+	}
+
 	rows := make([][]any, 0, 2)
 	if low != nil {
 		rows = append(rows, low)
@@ -87,9 +110,13 @@ func EncodeBounds(low, high []any) ([]byte, error) {
 		for j := 0; j < width; j++ {
 			var v any
 			if j < len(rows[i]) {
-				v = rows[i][j]
+				v = normalizeBound(rows[i][j])
 			}
-			if err := appendTypedValue(bldrs.Field(j), arrowTypeToCore(types[j]), v); err != nil {
+			ct, err := arrowTypeToCore(types[j])
+			if err != nil {
+				return nil, fmt.Errorf("transport: bounds col %d: %w", j, err)
+			}
+			if err := appendTypedValue(bldrs.Field(j), ct, v); err != nil {
 				return nil, fmt.Errorf("transport: bounds row %d col %d: %w", i, j, err)
 			}
 		}
@@ -116,11 +143,19 @@ func DecodeBounds(b []byte) ([][]any, error) {
 	defer rec.Release()
 
 	schema := rec.Schema()
+	rowTypes := make([]core.ColumnType, rec.NumCols())
+	for j := 0; j < int(rec.NumCols()); j++ {
+		ct, err := arrowTypeToCore(schema.Field(j).Type)
+		if err != nil {
+			return nil, fmt.Errorf("transport: bounds col %d: %w", j, err)
+		}
+		rowTypes[j] = ct
+	}
 	rows := make([][]any, 0, rec.NumRows())
 	for i := 0; i < int(rec.NumRows()); i++ {
 		tuple := make([]any, rec.NumCols())
 		for j := 0; j < int(rec.NumCols()); j++ {
-			v, err := readTypedValue(rec.Column(j), arrowTypeToCore(schema.Field(j).Type), i)
+			v, err := readTypedValue(rec.Column(j), rowTypes[j], i)
 			if err != nil {
 				return nil, fmt.Errorf("transport: bounds row %d col %d: %w", i, j, err)
 			}
@@ -184,11 +219,14 @@ func inferArrowType(v any) (arrow.DataType, error) {
 		return arrow.PrimitiveTypes.Int64, nil
 	case int:
 		return arrow.PrimitiveTypes.Int64, nil
-	case uint32:
-		return arrow.PrimitiveTypes.Uint32, nil
+	// Bounds are PK tuples: unsigned values normalize to the signed
+	// widening type at the SOURCE (RV-05) so both encode and decode only
+	// ever speak types the canonical codec understands. uint64 keeps its
+	// own type — the full-range unsigned space has no lossless signed
+	// widening.
+	case uint32, uint:
+		return arrow.PrimitiveTypes.Int64, nil
 	case uint64:
-		return arrow.PrimitiveTypes.Uint64, nil
-	case uint:
 		return arrow.PrimitiveTypes.Uint64, nil
 	case float32:
 		return arrow.PrimitiveTypes.Float32, nil

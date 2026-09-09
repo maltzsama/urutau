@@ -33,7 +33,7 @@ func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 		c.mu.Unlock()
 		return nil
 	}
-	rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
+	rows, _ := transport.DecodeBatch(b.Record, b.Table, []string{"id"})
 	var upserts []rowchange.Change
 	for _, r := range rows {
 		if r.Op != rowchange.OpDelete {
@@ -42,7 +42,7 @@ func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	}
 	c.mu.Lock()
 	c.batches = append(c.batches, rowchange.Batch{
-		Table: b.Table, Upserts: upserts, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode),
+		Table: b.Table, Changes: upserts, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode),
 	})
 	c.mu.Unlock()
 	return nil
@@ -53,7 +53,10 @@ func (c *gateCommitter) upsert(id int64) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, b := range c.batches {
-		for _, u := range b.Upserts {
+		for _, u := range b.Changes {
+			if u.Op == rowchange.OpDelete {
+				continue
+			}
 			if len(u.Key) == 1 && u.Key[0] == id {
 				return u.After["v"].(string), true
 			}

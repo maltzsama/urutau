@@ -151,7 +151,7 @@ func (w *sinkWriter) Close() error {
 // batchToRecords converts a rowchange.Batch into a single Arrow record batch
 // with typed columns for efficiency.
 func batchToRecords(b rowchange.Batch, alloc memory.Allocator) []arrow.RecordBatch {
-	total := len(b.Upserts) + len(b.Deletes)
+	total := len(b.Changes)
 	if total == 0 {
 		return nil
 	}
@@ -174,11 +174,12 @@ func batchToRecords(b rowchange.Batch, alloc memory.Allocator) []arrow.RecordBat
 	bb := array.NewRecordBuilder(alloc, arrowSchema)
 	defer bb.Release()
 
-	for _, u := range b.Upserts {
-		appendChange(bb, "c", u, colNames, b.Position)
-	}
-	for _, d := range b.Deletes {
-		appendChange(bb, "d", d, colNames, b.Position)
+	for _, c := range b.Changes {
+		op := "c"
+		if c.Op == rowchange.OpDelete {
+			op = "d"
+		}
+		appendChange(bb, op, c, colNames, b.Position)
 	}
 
 	rec := bb.NewRecordBatch()
@@ -215,13 +216,16 @@ func resolveColumn(chg rowchange.Change, name string) any {
 
 func collectColumns(b rowchange.Batch) []string {
 	seen := make(map[string]bool)
-	for _, u := range b.Upserts {
-		for k := range u.After {
-			seen[k] = true
+	for _, c := range b.Changes {
+		// DELETE IMAGE CONTRACT (RV-02/RV-11): wire-decoded deletes carry
+		// their image in After (flat = before image per CR-021; Before is
+		// nil). Only prefer Before when a source decoder actually filled
+		// it — otherwise the delete projects zero columns.
+		src := c.After
+		if c.Op == rowchange.OpDelete && len(c.Before) > 0 {
+			src = c.Before
 		}
-	}
-	for _, d := range b.Deletes {
-		for k := range d.Before {
+		for k := range src {
 			seen[k] = true
 		}
 	}
@@ -239,23 +243,13 @@ func (w *sinkWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
 	if b.Record == nil || b.Record.NumRows() == 0 {
 		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
 	}
-	rows, _, err := transport.DecodeBatch(b.Record, nil, nil)
+	rows, err := transport.DecodeBatch(b.Record, b.Table, nil)
 	if err != nil {
 		return rowchange.Batch{}, err
 	}
-	var upserts, deletes []rowchange.Change
-	for _, r := range rows {
-		switch r.Op {
-		case rowchange.OpDelete:
-			deletes = append(deletes, r)
-		default:
-			upserts = append(upserts, r)
-		}
-	}
 	return rowchange.Batch{
 		Table:    b.Table,
-		Upserts:  upserts,
-		Deletes:  deletes,
+		Changes:  rows,
 		Position: string(b.Watermark),
 		Mode:     rowchange.ToRowMode(b.Mode),
 	}, nil

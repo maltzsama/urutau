@@ -105,7 +105,7 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 func (r *relay) AddWindowRows(target string, chunkID uint32, rows []rowchange.Change) error {
 	// QUARANTINE: bridge rows to a batch for the worker's window entry; dies
 	// when sources produce Arrow directly (M4).
-	cb := rowchange.Batch{Table: target, Upserts: rows, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
+	cb := rowchange.Batch{Table: target, Changes: rows, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
 	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
 	if err != nil {
 		return err

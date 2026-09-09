@@ -121,25 +121,14 @@ func (w *tableWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
 		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
 	}
 
-	rows, _, err := transport.DecodeBatch(b.Record, nil, w.plan.pk)
+	rows, err := transport.DecodeBatch(b.Record, b.Table, w.plan.pk)
 	if err != nil {
 		return rowchange.Batch{}, err
 	}
 
-	var upserts, deletes []rowchange.Change
-	for _, r := range rows {
-		switch r.Op {
-		case rowchange.OpDelete:
-			deletes = append(deletes, r)
-		default:
-			upserts = append(upserts, r)
-		}
-	}
-
 	return rowchange.Batch{
 		Table:           b.Table,
-		Upserts:         upserts,
-		Deletes:         deletes,
+		Changes:         rows,
 		Position:        string(b.Watermark),
 		Mode:            rowchange.UpsertMode,
 		SnapshotState:   b.SnapshotState,
@@ -182,12 +171,19 @@ func (w *tableWriter) commitAtomic(ctx context.Context, b rowchange.Batch) error
 // metadata sub-object), one remove per deleted key. A not-found remove is
 // success — the replay story re-runs deletes that already landed.
 func applyData(ctx context.Context, kv kvStore, plan *tablePlan, b rowchange.Batch) error {
-	for _, u := range b.Upserts {
-		key, err := docKey(u)
+	for _, c := range b.Changes {
+		key, err := docKey(c)
 		if err != nil {
 			return err
 		}
-		data, meta, err := plan.buildDoc(u)
+		if c.Op == rowchange.OpDelete {
+			err = kv.remove(ctx, key)
+			if err == nil || errors.Is(err, errNotFound) {
+				continue
+			}
+			return fmt.Errorf("remove key %s: %w", key, err)
+		}
+		data, meta, err := plan.buildDoc(c)
 		if err != nil {
 			return fmt.Errorf("upsert key %s: %w", key, err)
 		}
@@ -197,17 +193,6 @@ func applyData(ctx context.Context, kv kvStore, plan *tablePlan, b rowchange.Bat
 		if err := kv.upsert(ctx, key, data); err != nil {
 			return fmt.Errorf("upsert key %s: %w", key, err)
 		}
-	}
-	for _, d := range b.Deletes {
-		key, err := docKey(d)
-		if err != nil {
-			return err
-		}
-		err = kv.remove(ctx, key)
-		if err == nil || errors.Is(err, errNotFound) {
-			continue
-		}
-		return fmt.Errorf("remove key %s: %w", key, err)
 	}
 	return nil
 }

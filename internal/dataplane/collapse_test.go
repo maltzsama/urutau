@@ -41,7 +41,7 @@ func TestCollapseBasic(t *testing.T) {
 
 func TestCollapseDeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialDeleteLast(0, alloc)
+	b := dataplane.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -67,7 +67,7 @@ func TestCollapseDeleteLast(t *testing.T) {
 
 func TestCollapseInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
+	b := dataplane.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -93,7 +93,7 @@ func TestCollapseInsertAfterDelete(t *testing.T) {
 
 func TestCollapseCompositeKey(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(0, alloc)
+	b := dataplane.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
@@ -181,7 +181,7 @@ func TestCollapseEmptyBatch(t *testing.T) {
 
 func TestCollapseInt64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInt64Overflow(0, alloc)
+	b := dataplane.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})

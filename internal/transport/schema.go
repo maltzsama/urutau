@@ -36,13 +36,14 @@ func fieldMetadata(ct core.ColumnType) arrow.Metadata {
 
 // fieldTypeToCore reconstructs the canonical type of a wire field, honoring
 // extension metadata (uuid, json) before falling back to the raw Arrow type.
-func fieldTypeToCore(f arrow.Field) core.ColumnType {
+// Unmappable Arrow types are an error (M-1) — no silent string fallback.
+func fieldTypeToCore(f arrow.Field) (core.ColumnType, error) {
 	if v, ok := f.Metadata.GetValue(extNameKey); ok {
 		switch v {
 		case extUUID:
-			return core.ColumnType{Kind: core.KindUUID}
+			return core.ColumnType{Kind: core.KindUUID}, nil
 		case extJSON:
-			return core.ColumnType{Kind: core.KindJSON}
+			return core.ColumnType{Kind: core.KindJSON}, nil
 		}
 	}
 	return arrowTypeToCore(f.Type)
@@ -55,8 +56,11 @@ func fieldTypeToCore(f arrow.Field) core.ColumnType {
 func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
 	fields := make([]arrow.Field, 0, len(cs.Columns)+5)
 
-	// Data columns: typed per core.Kind.
+	// Data columns: typed per core.Kind. Reject reserved names.
 	for _, col := range cs.Columns {
+		if isReservedColumnName(col.Name) {
+			return nil, fmt.Errorf("transport: column %q is reserved (wire metadata)", col.Name)
+		}
 		af, err := columnToArrowField(col)
 		if err != nil {
 			return nil, fmt.Errorf("transport: column %q: %w", col.Name, err)
@@ -64,14 +68,8 @@ func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
 		fields = append(fields, af)
 	}
 
-	// Metadata columns: always nullable, appended at the end.
-	fields = append(fields,
-		arrow.Field{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		arrow.Field{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		arrow.Field{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		arrow.Field{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
-		arrow.Field{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
-	)
+	// Metadata columns: always non-nullable (except timestamps), appended at the end.
+	fields = append(fields, WireMetadataFields()...)
 
 	return arrow.NewSchema(fields, nil), nil
 }
@@ -96,6 +94,14 @@ func columnToArrowField(col core.Column) (arrow.Field, error) {
 // kindToArrow maps a canonical ColumnType to its Arrow type. Scalars map to
 // primitives; composite kinds recurse. Element and value nullability are
 // carried on the child field where Arrow supports it.
+// KindToArrow maps a canonical ColumnType to its Arrow type. Exported for
+// the dataplane cast executor (W-1/D-4): the matrix is the policy, arrow
+// is the single executor, so the target type must come from the same
+// mapping CoreSchemaToArrow uses.
+func KindToArrow(ct core.ColumnType) (arrow.DataType, error) {
+	return kindToArrow(ct)
+}
+
 func kindToArrow(ct core.ColumnType) (arrow.DataType, error) {
 	switch ct.Kind {
 	case core.KindStruct:
@@ -178,9 +184,9 @@ func kindToArrowScalar(ct core.ColumnType) (arrow.DataType, error) {
 		}
 		return &arrow.FixedSizeBinaryType{ByteWidth: ct.FixedSize}, nil
 	case core.KindDate:
-		return arrow.PrimitiveTypes.Int32, nil // days since epoch, stored as int32
+		return arrow.FixedWidthTypes.Date32, nil
 	case core.KindTime:
-		return arrow.PrimitiveTypes.Int64, nil // micros since midnight
+		return arrow.FixedWidthTypes.Time64us, nil
 	case core.KindTimestamp:
 		return &arrow.TimestampType{Unit: arrow.Microsecond}, nil
 	case core.KindTimestampTZ:
@@ -195,8 +201,55 @@ func kindToArrowScalar(ct core.ColumnType) (arrow.DataType, error) {
 // isMetadataColumn returns true for the fixed metadata column names.
 func isMetadataColumn(name string) bool {
 	switch name {
-	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot":
+	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot", "__phase":
 		return true
 	}
 	return false
+}
+
+// isReservedColumnName returns true for column names that travel on the
+// wire as system columns. User data columns must not use these names.
+func isReservedColumnName(name string) bool {
+	switch name {
+	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot", "__phase":
+		return true
+	}
+	return false
+}
+
+// WireMetadataFields returns the 5 metadata fields appended to every
+// batch wire schema. Exported so the generator can emit the same fields
+// without duplicating the list (H-12).
+func WireMetadataFields() []arrow.Field {
+	return []arrow.Field{
+		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
+		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+	}
+}
+
+// SchemaFromArrow reconstructs a core.Schema from a typed Arrow schema.
+// Data columns (non-metadata) appear in schema order; metadata columns
+// (__op, __pos, __commit_ts, __ingest_ts, __snapshot) are excluded —
+// they travel outside the core schema.
+func SchemaFromArrow(as *arrow.Schema) (core.Schema, error) {
+	cols := make([]core.Column, 0, as.NumFields())
+	for i := range as.NumFields() {
+		f := as.Field(i)
+		if isMetadataColumn(f.Name) {
+			continue
+		}
+		ct, err := fieldTypeToCore(f)
+		if err != nil {
+			return core.Schema{}, fmt.Errorf("transport: schema field %q: %w", f.Name, err)
+		}
+		ct.Nullable = f.Nullable
+		cols = append(cols, core.Column{
+			Name: f.Name,
+			Type: ct,
+		})
+	}
+	return core.Schema{Columns: cols}, nil
 }

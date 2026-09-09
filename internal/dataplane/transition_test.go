@@ -216,7 +216,7 @@ func TestTransitionMatrixMissingBeforeColumn(t *testing.T) {
 // values coalesce to false (same as predicate evaluation).
 func TestTransitionMatrixNullsCoalesce(t *testing.T) {
 	alloc := memory.NewGoAllocator()
-	b := dataplane.AdversarialNullBefore(0, alloc)
+	b := dataplane.AdversarialNullBefore(alloc)
 	defer b.Release()
 
 	// BeforeSide predicate: __before_val == "hello"
@@ -254,7 +254,7 @@ func TestTransitionMatrixNullsCoalesce(t *testing.T) {
 }
 
 // TestTransitionMatrixEmptyPreds verifies that empty predicate lists
-// pass everything through — all rows become updates.
+// pass everything through — rows are classified by __op only.
 func TestTransitionMatrixEmptyPreds(t *testing.T) {
 	alloc := memory.NewGoAllocator()
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
@@ -280,15 +280,40 @@ func TestTransitionMatrixEmptyPreds(t *testing.T) {
 		}
 	}()
 
-	// Empty preds → everything passes → all 10 rows in updates
-	if ins != nil && ins.Record.NumRows() > 0 {
-		t.Errorf("expected no inserts with empty preds, got %d", ins.Record.NumRows())
+	// Empty preds → all pass → __op determines buckets. The per-bucket
+	// counts must match the source batch's per-op distribution exactly —
+	// a total-only assert would hide rows silently vanishing from one
+	// bucket while another over-counts.
+	var wantIns, wantDel, wantUpd int
+	opIdx := -1
+	for i := range b.Record.Schema().NumFields() {
+		if b.Record.Schema().Field(i).Name == "__op" {
+			opIdx = i
+			break
+		}
 	}
-	if del != nil && del.Record.NumRows() > 0 {
-		t.Errorf("expected no deletes with empty preds, got %d", del.Record.NumRows())
+	if opIdx < 0 {
+		t.Fatal("__op column not found")
 	}
-	if upd == nil || upd.Record.NumRows() != 10 {
-		t.Errorf("expected 10 updates (pass-through), got %v", updNumRows(upd))
+	opCol := b.Record.Column(opIdx).(*array.Uint8)
+	for i := range opCol.Len() {
+		switch opCol.Value(i) {
+		case uint8(dataplane.OpInsert):
+			wantIns++
+		case uint8(dataplane.OpDelete):
+			wantDel++
+		case uint8(dataplane.OpUpdate):
+			wantUpd++
+		}
+	}
+	if got := insNumRows(ins); got != wantIns {
+		t.Errorf("inserts = %d, want %d (per-op distribution)", got, wantIns)
+	}
+	if got := delNumRows(del); got != wantDel {
+		t.Errorf("deletes = %d, want %d (per-op distribution)", got, wantDel)
+	}
+	if got := updNumRows(upd); got != wantUpd {
+		t.Errorf("updates = %d, want %d (per-op distribution)", got, wantUpd)
 	}
 }
 

@@ -13,6 +13,8 @@ package dataplane
 import (
 	"bytes"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
@@ -29,10 +31,8 @@ import (
 //
 // QUARANTINE: dies in commit 3/4 when the worker produces Batch directly.
 func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
-	// Merge upserts and deletes into a single ordered slice.
-	all := make([]rowchange.Change, 0, len(b.Upserts)+len(b.Deletes))
-	all = append(all, b.Upserts...)
-	all = append(all, b.Deletes...)
+	// D-6: the batch's single arrival-ordered slice IS the wire order.
+	all := b.Changes
 	if len(all) == 0 {
 		return &Batch{Table: b.Table, Watermark: []byte(b.Position), Mode: rowchange.ToDataplaneMode(b.Mode)}, nil
 	}
@@ -40,15 +40,32 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 	// Schema: known schema, plus any columns the changes carry that the
 	// known schema lacks (enriched columns, e.g. join output). Enrichment
 	// adds columns after registration, so the known schema alone would
-	// drop them on the wire.
+	// drop them on the wire. When cs is empty (cold path — first bridge
+	// call before schema registration), schemaFromChanges infers from
+	// the row values.
 	cs = mergeSchema(all, cs)
+
+	// C-8 fail-fast: deletes without a PK produce orphaned NULL tuples in
+	// the sink. The enrich path cannot reconstitute a key from After (it
+	// may be nil or empty). When PK is empty the pump must not send deletes.
+	if len(cs.PrimaryKey) == 0 {
+		nDeletes := 0
+		for _, c := range all {
+			if c.Op == rowchange.OpDelete {
+				nDeletes++
+			}
+		}
+		if nDeletes > 0 {
+			return nil, fmt.Errorf("dataplane: batch %q has %d delete(s) but schema has no PrimaryKey — deletes would become orphaned NULLs in the sink", b.Table, nDeletes)
+		}
+	}
 
 	meta := &pb.BatchMeta{
 		Table:   b.Table,
 		HighPos: b.Position,
 	}
 
-	body, _, err := transport.EncodeBatch(all, cs, meta)
+	body, _, err := transport.EncodeBatch(all, cs, meta, nil)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: encode: %w", err)
 	}
@@ -79,6 +96,7 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 }
 
 // schemaFromChanges infers a core.Schema from the changes' After/Before maps.
+// Columns are sorted by name for deterministic output.
 // QUARANTINE: dies in commit 3/4.
 func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	seen := make(map[string]core.ColumnType)
@@ -95,8 +113,13 @@ func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	}
 	cols := make([]core.Column, 0, len(seen))
 	for k, ct := range seen {
+		// Nullable: an enriched (left-join miss) column legitimately holds
+		// NULL, and any inferred column may be absent from some changes —
+		// re-encoding against a NOT NULL assumption would fail.
+		ct.Nullable = true
 		cols = append(cols, core.Column{Name: k, Type: ct})
 	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })
 	return core.Schema{Columns: cols}
 }
 
@@ -106,7 +129,9 @@ func goTypeToCore(v any) core.ColumnType {
 	switch v.(type) {
 	case bool:
 		return core.ColumnType{Kind: core.KindBool}
-	case int, int32:
+	case int:
+		return core.ColumnType{Kind: core.KindInt64} // int is 64-bit on 64-bit platforms
+	case int32:
 		return core.ColumnType{Kind: core.KindInt32}
 	case int64:
 		return core.ColumnType{Kind: core.KindInt64}
@@ -120,14 +145,16 @@ func goTypeToCore(v any) core.ColumnType {
 		return core.ColumnType{Kind: core.KindString}
 	case []byte:
 		return core.ColumnType{Kind: core.KindBinary}
+	case time.Time:
+		return core.ColumnType{Kind: core.KindTimestampTZ}
 	default:
-		return core.ColumnType{Kind: core.KindString}
+		return core.ColumnType{Kind: core.KindString} // QUARANTINE: unknown → string
 	}
 }
 
 // mergeSchema returns the known schema extended with any columns present in
-// the changes but missing from it (enriched columns). When the known schema
-// is empty, infers entirely from the changes.
+// the changes but missing from it (enriched columns, e.g. join output).
+// Does NOT mutate the incoming cs — returns a new Schema.
 func mergeSchema(changes []rowchange.Change, cs core.Schema) core.Schema {
 	if len(cs.Columns) == 0 {
 		return schemaFromChanges(changes)
@@ -136,12 +163,14 @@ func mergeSchema(changes []rowchange.Change, cs core.Schema) core.Schema {
 	for _, c := range cs.Columns {
 		has[c.Name] = true
 	}
+	merged := make([]core.Column, len(cs.Columns))
+	copy(merged, cs.Columns)
 	inferred := schemaFromChanges(changes)
 	for _, col := range inferred.Columns {
 		if !has[col.Name] {
-			cs.Columns = append(cs.Columns, col)
+			merged = append(merged, col)
 			has[col.Name] = true
 		}
 	}
-	return cs
+	return core.Schema{Columns: merged, PrimaryKey: cs.PrimaryKey}
 }

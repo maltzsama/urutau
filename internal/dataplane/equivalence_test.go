@@ -252,7 +252,7 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 // insert-after-delete ends up as an upsert (not a delete).
 func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
+	b := dataplane.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -286,7 +286,7 @@ func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 // is DELETE ends up in deletes, not upserts.
 func TestEquivalence_DeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialDeleteLast(0, alloc)
+	b := dataplane.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -314,7 +314,7 @@ func TestEquivalence_DeleteLast(t *testing.T) {
 // PKs survive collapse as separate rows.
 func TestEquivalence_CompositeKey(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(0, alloc)
+	b := dataplane.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
@@ -340,7 +340,7 @@ func TestEquivalence_CompositeKey(t *testing.T) {
 // float64 precision survive with exact values.
 func TestEquivalence_Int64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInt64Overflow(0, alloc)
+	b := dataplane.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -420,26 +420,24 @@ func batchToChanges(b *dataplane.Batch) []rowchange.Change {
 
 // changesToUpserts extracts upserts from a Collapsed as eqChange slices.
 func changesToUpserts(c rowchange.Collapsed) []eqChange {
-	out := make([]eqChange, len(c.Upserts))
-	for i, ch := range c.Upserts {
-		out[i] = eqChange{
-			ID:  ch.Key[0].(int64),
-			Val: ch.After["val"].(string),
-			Op:  uint8(ch.Op),
+	var out []eqChange
+	for _, ch := range c.Changes {
+		if ch.Op == rowchange.OpDelete {
+			continue
 		}
+		out = append(out, eqChange{ID: ch.Key[0].(int64), Val: ch.After["val"].(string), Op: uint8(ch.Op)})
 	}
 	return out
 }
 
 // changesToDeletes extracts deletes from a Collapsed as eqChange slices.
 func changesToDeletes(c rowchange.Collapsed) []eqChange {
-	out := make([]eqChange, len(c.Deletes))
-	for i, ch := range c.Deletes {
-		out[i] = eqChange{
-			ID:  ch.Key[0].(int64),
-			Val: ch.After["val"].(string),
-			Op:  uint8(ch.Op),
+	var out []eqChange
+	for _, ch := range c.Changes {
+		if ch.Op != rowchange.OpDelete {
+			continue
 		}
+		out = append(out, eqChange{ID: ch.Key[0].(int64), Val: ch.After["val"].(string), Op: uint8(ch.Op)})
 	}
 	return out
 }
