@@ -1,6 +1,8 @@
 package core
 
 import (
+	"math"
+	"strings"
 	"testing"
 )
 
@@ -245,5 +247,124 @@ func TestResolveSchemaCastPreservesNullable(t *testing.T) {
 				t.Fatalf("note = %+v, want nullable string (cast changed kind, kept nullability)", c.Type)
 			}
 		}
+	}
+}
+
+// ── Audit regressions: decimal integrity, key validation, uint64 ──────
+
+// float32 → decimal: the matrix allowed it but the converter lacked a
+// float32 case — every value failed at runtime after plan validation.
+func TestConvertFloat32ToDecimal(t *testing.T) {
+	got, err := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 10, Scale: 2}}.Convert(float32(3.14))
+	if err != nil {
+		t.Fatalf("Convert(float32 → decimal) unexpected error: %v", err)
+	}
+	if got != "3.14" {
+		t.Errorf("Convert(float32 → decimal) = %v, want 3.14", got)
+	}
+}
+
+// NaN and ±Inf have no decimal text; the converter must reject them.
+func TestConvertNonFiniteToDecimal(t *testing.T) {
+	target := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 10, Scale: 2}}
+	if _, err := target.Convert(math.NaN()); err == nil {
+		t.Error("Convert(NaN → decimal) should error")
+	}
+	if _, err := target.Convert(math.Inf(1)); err == nil {
+		t.Error("Convert(+Inf → decimal) should error")
+	}
+}
+
+// int64 → decimal(4,2) overflows: 4-2 = 2 integer digits cannot hold a
+// 3-digit value. The converter must reject it, not truncate.
+func TestConvertDecimalPrecisionOverflow(t *testing.T) {
+	// decimal(4,2) holds 2 integer digits. 12345 renders as "123.45" —
+	// 3 integer digits overflow.
+	target := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 4, Scale: 2}}
+	if _, err := target.Convert(int64(12345)); err == nil {
+		t.Error("Convert(int64 12345 → decimal(4,2)) should error (3 integer digits > 2)")
+	}
+	// 123 renders as "1.23" (scale absorbs two digits) — fits.
+	if _, err := target.Convert(int64(123)); err != nil {
+		t.Errorf("Convert(int64 123 → decimal(4,2)) should pass: %v", err)
+	}
+	// 123456 → decimal(6,1) renders "12345.6" — 5 integer digits fits; the
+	// 7th would not. Use a value that overflows: 1234567 → "123456.7".
+	t61 := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 6, Scale: 1}}
+	if _, err := t61.Convert(int64(1234567)); err == nil {
+		t.Error("Convert(int64 1234567 → decimal(6,1)) should error (6 integer digits > 5)")
+	}
+}
+
+// string → decimal passthrough (KindUnknown bypass) must validate the text.
+func TestConvertStringToDecimalValidates(t *testing.T) {
+	target := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 10, Scale: 2}}
+	if _, err := target.Convert("12.345"); err == nil {
+		t.Error("Convert(\"12.345\" → decimal(10,2)) should error (3 fraction digits > scale 2)")
+	}
+	if _, err := target.Convert("not-a-number"); err == nil {
+		t.Error("Convert(\"not-a-number\" → decimal) should error")
+	}
+	if _, err := target.Convert("12.34"); err != nil {
+		t.Errorf("Convert(\"12.34\" → decimal(10,2)) should pass: %v", err)
+	}
+}
+
+// decimal(p,s) with scale > precision is invalid and must fail at parse.
+func TestParseCastTargetScaleExceedsPrecision(t *testing.T) {
+	if _, err := ParseCastTarget("decimal(4,10)"); err == nil {
+		t.Error("ParseCastTarget(\"decimal(4,10)\") should error (scale > precision)")
+	}
+}
+
+// uint64 → string was missing from the "to string always" matrix, and
+// ParseCastTarget rejected "uint64" — breaking the String() round-trip.
+func TestUInt64CastSupport(t *testing.T) {
+	if err := CheckCast(ColumnType{Kind: KindUInt64}, CastTarget{Type: ColumnType{Kind: KindString}}); err != nil {
+		t.Errorf("CheckCast(uint64 → string) should be allowed (to string always): %v", err)
+	}
+	got, err := CastTarget{Type: ColumnType{Kind: KindString}}.Convert(uint64(42))
+	if err != nil || got != "42" {
+		t.Errorf("Convert(uint64 → string) = %v, %v; want 42", got, err)
+	}
+	tgt, err := ParseCastTarget("uint64")
+	if err != nil || tgt.Type.Kind != KindUInt64 {
+		t.Errorf("ParseCastTarget(\"uint64\") = %+v, %v; want KindUInt64", tgt, err)
+	}
+}
+
+// A cast key that names no source column is a typo that would silently
+// no-op — the pipeline would carry the wrong type forever.
+func TestResolveRejectsUnknownCastKey(t *testing.T) {
+	src := Schema{Columns: []Column{{Name: "amount", Type: ColumnType{Kind: KindInt32}}}}
+	policy := CastPolicy{Columns: map[string]CastTarget{
+		"amout": {Type: ColumnType{Kind: KindInt64}}, // typo
+	}}
+	if _, _, err := policy.Resolve(src); err == nil {
+		t.Error("Resolve with a cast key not in the schema should error")
+	}
+}
+
+// A cast on a primary-key column changes the key's type — surface a warning.
+func TestResolveWarnsOnPKCast(t *testing.T) {
+	src := Schema{
+		Columns:    []Column{{Name: "id", Type: ColumnType{Kind: KindInt64}}},
+		PrimaryKey: []string{"id"},
+	}
+	policy := CastPolicy{Columns: map[string]CastTarget{
+		"id": {Type: ColumnType{Kind: KindString}},
+	}}
+	_, warns, err := policy.Resolve(src)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w.Message, "primary-key column") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Resolve should warn about a cast on a primary-key column, got %v", warns)
 	}
 }

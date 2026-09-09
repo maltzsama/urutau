@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"regexp"
 	"strconv"
@@ -89,6 +90,8 @@ func ParseCastTarget(s string) (CastTarget, error) {
 		return CastTarget{Type: ColumnType{Kind: KindInt32}}, nil
 	case "int64":
 		return CastTarget{Type: ColumnType{Kind: KindInt64}}, nil
+	case "uint64":
+		return CastTarget{Type: ColumnType{Kind: KindUInt64}}, nil
 	case "float32":
 		return CastTarget{Type: ColumnType{Kind: KindFloat32}}, nil
 	case "float64":
@@ -126,6 +129,9 @@ func parseDecimalArgs(args string) (precision, scale int, err error) {
 	if err != nil || scale < 0 {
 		return 0, 0, fmt.Errorf("core: decimal cast scale %q invalid", s)
 	}
+	if scale > precision {
+		return 0, 0, fmt.Errorf("core: decimal cast scale %d exceeds precision %d", scale, precision)
+	}
 	return precision, scale, nil
 }
 
@@ -143,7 +149,7 @@ func CheckCast(from ColumnType, to CastTarget) error {
 	switch to.Type.Kind {
 	case KindString:
 		switch from.Kind {
-		case KindBool, KindInt32, KindInt64, KindFloat32, KindFloat64,
+		case KindBool, KindInt32, KindInt64, KindUInt64, KindFloat32, KindFloat64,
 			KindDecimal, KindString, KindDate, KindTime, KindTimestamp,
 			KindTimestampTZ, KindUUID, KindJSON:
 			return nil
@@ -259,7 +265,7 @@ func (t CastTarget) Convert(v any) (any, error) {
 	case KindFloat64:
 		return castToFloat64(v)
 	case KindDecimal:
-		return castToDecimal(v, t.Type.Scale)
+		return castToDecimal(v, t.Type.Precision, t.Type.Scale)
 	case KindUUID:
 		return castToUUID(v)
 	case KindJSON:
@@ -287,6 +293,8 @@ func castToString(v any, enc string) (any, error) {
 		return strconv.FormatInt(int64(t), 10), nil
 	case int64:
 		return strconv.FormatInt(t, 10), nil
+	case uint64:
+		return strconv.FormatUint(t, 10), nil
 	case float32:
 		return strconv.FormatFloat(float64(t), 'f', -1, 32), nil
 	case float64:
@@ -354,24 +362,96 @@ func castToFloat64(v any) (any, error) {
 }
 
 // castToDecimal renders an integral or float value as decimal text with the
-// target scale.
-func castToDecimal(v any, scale int) (any, error) {
+// target precision and scale. Non-finite floats are rejected (NaN/±Inf have
+// no decimal text). Every rendered value is checked against the declared
+// precision — an overflow is an error, not silent truncation. A string
+// passthrough (only reachable via the KindUnknown bypass) is validated the
+// same way.
+func castToDecimal(v any, precision, scale int) (any, error) {
 	switch t := v.(type) {
 	case nil:
 		return nil, nil
 	case int:
-		return decimalText(big.NewInt(int64(t)), scale), nil
+		return decimalChecked(big.NewInt(int64(t)), precision, scale)
 	case int32:
-		return decimalText(big.NewInt(int64(t)), scale), nil
+		return decimalChecked(big.NewInt(int64(t)), precision, scale)
 	case int64:
-		return decimalText(big.NewInt(t), scale), nil
+		return decimalChecked(big.NewInt(t), precision, scale)
+	case float32:
+		if err := checkFinite(float64(t)); err != nil {
+			return nil, err
+		}
+		return floatTextChecked(float64(t), precision, scale)
 	case float64:
-		return decimalFloatText(t, scale), nil
+		if err := checkFinite(t); err != nil {
+			return nil, err
+		}
+		return floatTextChecked(t, precision, scale)
 	case string:
+		if err := checkDecimalText(t, precision, scale); err != nil {
+			return nil, err
+		}
 		return t, nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to decimal", v)
 	}
+}
+
+// checkFinite rejects NaN and ±Inf, which have no decimal text.
+func checkFinite(f float64) error {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return fmt.Errorf("core: cannot cast non-finite float %v to decimal", f)
+	}
+	return nil
+}
+
+// decimalChecked renders an integral value and validates it against the
+// declared precision/scale.
+func decimalChecked(n *big.Int, precision, scale int) (string, error) {
+	s := decimalText(n, scale)
+	if err := checkDecimalText(s, precision, scale); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// floatTextChecked renders a float value and validates it against the
+// declared precision/scale.
+func floatTextChecked(f float64, precision, scale int) (string, error) {
+	s := decimalFloatText(f, scale)
+	if err := checkDecimalText(s, precision, scale); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// decimalTextRe matches a decimal literal: optional sign, integer digits,
+// optional fraction.
+var decimalTextRe = regexp.MustCompile(`^[+-]?\d+(?:\.\d+)?$`)
+
+// checkDecimalText validates a decimal text against precision and scale: at
+// most (precision - scale) integer digits and at most scale fraction digits.
+// Non-numeric text and overflow are errors.
+func checkDecimalText(s string, precision, scale int) error {
+	if !decimalTextRe.MatchString(s) {
+		return fmt.Errorf("core: %q is not a valid decimal text", s)
+	}
+	body := s
+	if body[0] == '+' || body[0] == '-' {
+		body = body[1:]
+	}
+	intPart := body
+	fracPart := ""
+	if i := strings.IndexByte(body, '.'); i >= 0 {
+		intPart, fracPart = body[:i], body[i+1:]
+	}
+	if len(fracPart) > scale {
+		return fmt.Errorf("core: %q has %d fraction digits, decimal scale is %d", s, len(fracPart), scale)
+	}
+	if len(intPart) > precision-scale {
+		return fmt.Errorf("core: %q exceeds decimal precision %d (scale %d)", s, precision, scale)
+	}
+	return nil
 }
 
 func decimalText(n *big.Int, scale int) string {
@@ -526,6 +606,10 @@ func (p CastPolicy) Target(name string) (CastTarget, bool) {
 func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 	out := Schema{PrimaryKey: append([]string(nil), src.PrimaryKey...)}
 	var warns []Warning
+	srcHas := make(map[string]bool, len(src.Columns))
+	for _, col := range src.Columns {
+		srcHas[col.Name] = true
+	}
 	for _, col := range src.Columns {
 		target, hasCast := p.Target(col.Name)
 		if col.Type.Kind == KindUnknown && !hasCast {
@@ -548,6 +632,9 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 		if w := CastWarning(col.Type.Kind, target); w != "" {
 			warns = append(warns, Warning{Message: fmt.Sprintf("core: column %q: %s", col.Name, w)})
 		}
+		if inPrimaryKey(col.Name, src.PrimaryKey) {
+			warns = append(warns, Warning{Message: fmt.Sprintf("core: cast on primary-key column %q changes the key type", col.Name)})
+		}
 		// The cast changes the type, never the nullability: a nullable
 		// source column must stay nullable in the sink schema, or a
 		// legitimate NULL would violate the typed Arrow schema downstream.
@@ -555,7 +642,24 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 		tt.Nullable = col.Type.Nullable
 		out.Columns = append(out.Columns, Column{Name: col.Name, Type: tt})
 	}
+	// Reject cast keys that name no source column: a typo would silently
+	// no-op and the pipeline would carry the wrong type forever.
+	for name := range p.Columns {
+		if !srcHas[name] {
+			return Schema{}, nil, fmt.Errorf("core: cast column %q is not in the source schema", name)
+		}
+	}
 	return out, warns, nil
+}
+
+// inPrimaryKey reports whether name is a member of the key list.
+func inPrimaryKey(name string, pk []string) bool {
+	for _, k := range pk {
+		if k == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveSchema applies the cast policy and appends the declared metadata
@@ -574,6 +678,12 @@ func ResolveSchema(src Schema, cast CastPolicy, meta []MetadataColumn) (Schema, 
 	}
 	seen := map[string]bool{}
 	for _, m := range meta {
+		if m.As == "" {
+			return Schema{}, nil, fmt.Errorf("core: metadata column: destination name is empty")
+		}
+		if !validMetadataKey(m.From) {
+			return Schema{}, nil, fmt.Errorf("core: metadata column %q: unknown metadata key %q (the catalog is closed)", m.As, m.From)
+		}
 		if srcNames[m.As] {
 			return Schema{}, nil, fmt.Errorf("core: metadata column %q collides with a source column", m.As)
 		}
