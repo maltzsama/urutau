@@ -82,10 +82,10 @@ func newTableWriter(kv kvStore, txns txRunner, plan *tablePlan, now func() time.
 // ("1" vs 1 vs 1.0), and never merges adjacent elements — the collision
 // rules the worker's own keyString exists for. Data keys start with "[",
 // so they cannot collide with the control document's "_urutau::" prefix.
-func docKey(c rowchange.Change) (string, error) {
-	b, err := json.Marshal(c.Key)
+func docKey(key []any) (string, error) {
+	b, err := json.Marshal(key)
 	if err != nil {
-		return "", fmt.Errorf("couchbase: encode key %v: %w", c.Key, err)
+		return "", fmt.Errorf("couchbase: encode key %v: %w", key, err)
 	}
 	if len(b) > maxKeyLen {
 		return "", fmt.Errorf("couchbase: key %s exceeds %d bytes (%d) — shorten the primary key", b, maxKeyLen, len(b))
@@ -96,73 +96,61 @@ func docKey(c rowchange.Change) (string, error) {
 // Commit writes one collapsed batch. See the type comment for the two
 // sequencing modes; Batch.Mode needs no branch here — append-mode batches
 // arrive with upserts only (the worker rewrote or dropped the deletes).
-//
-// QUARANTINE: the RecordBatch→rowchange.Batch unpack is a bridge that dies
-// when the Couchbase sink consumes RecordBatch directly.
+// Column-oriented: the reader validates the wire schema once and the
+// commit paths read per-row values straight from the record — no
+// rowchange intermediate.
 func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
-	// Unpack the columnar batch back to row-oriented changes.
-	// QUARANTINE: this bridge dies when the Couchbase sink consumes RecordBatch directly.
-	cb, err := w.unpackBatch(b)
+	reader, err := transport.NewBatchReader(b.Record, w.plan.pk)
 	if err != nil {
-		return fmt.Errorf("couchbase: unpack: %w", err)
+		return fmt.Errorf("couchbase: %w", err)
+	}
+	info := batchInfo{
+		Position:        string(b.Watermark),
+		SnapshotState:   b.SnapshotState,
+		SnapshotPending: b.SnapshotPending,
 	}
 
 	if w.txns != nil {
-		return w.commitAtomic(ctx, cb)
+		return w.commitAtomic(ctx, reader, info)
 	}
-	return w.commitFast(ctx, cb)
+	return w.commitFast(ctx, reader, info)
 }
 
-// unpackBatch converts a columnar dataplane.Batch back to a row-oriented
-// rowchange.Batch. QUARANTINE: dies when the Couchbase sink consumes
-// RecordBatch directly.
-func (w *tableWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
-	if b.Record == nil || b.Record.NumRows() == 0 {
-		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
-	}
-
-	rows, err := transport.DecodeBatch(b.Record, b.Table, w.plan.pk)
-	if err != nil {
-		return rowchange.Batch{}, err
-	}
-
-	return rowchange.Batch{
-		Table:           b.Table,
-		Changes:         rows,
-		Position:        string(b.Watermark),
-		Mode:            rowchange.UpsertMode,
-		SnapshotState:   b.SnapshotState,
-		SnapshotPending: b.SnapshotPending,
-	}, nil
+// batchInfo carries the batch-level control metadata the commit paths
+// persist with the data: the position and the resumable-backfill state.
+type batchInfo struct {
+	Position        string
+	SnapshotState   string
+	SnapshotPending []uint32
 }
 
 // commitFast is the default path: every data mutation durably placed, then
 // the control document. The control read-modify-write preserves properties
 // the snapshot orchestrator recorded between commits.
-func (w *tableWriter) commitFast(ctx context.Context, b rowchange.Batch) error {
-	if err := applyData(ctx, w.kv, w.plan, b); err != nil {
+func (w *tableWriter) commitFast(ctx context.Context, r *transport.BatchReader, info batchInfo) error {
+	if err := applyData(ctx, w.kv, w.plan, r); err != nil {
 		return err
 	}
 	prev, err := readControl(ctx, w.kv)
 	if err != nil {
 		return err
 	}
-	return w.kv.upsert(ctx, controlKey, controlWrite(prev, b, w.now()))
+	return w.kv.upsert(ctx, controlKey, controlWrite(prev, info, w.now()))
 }
 
 // commitAtomic runs the whole batch — data documents AND the control
 // document — inside one distributed transaction. A failure anywhere rolls
 // everything back; the position can never separate from its data.
-func (w *tableWriter) commitAtomic(ctx context.Context, b rowchange.Batch) error {
+func (w *tableWriter) commitAtomic(ctx context.Context, r *transport.BatchReader, info batchInfo) error {
 	return w.txns.run(ctx, func(tx kvStore) error {
-		if err := applyData(ctx, tx, w.plan, b); err != nil {
+		if err := applyData(ctx, tx, w.plan, r); err != nil {
 			return err
 		}
 		prev, err := readControl(ctx, tx)
 		if err != nil {
 			return err
 		}
-		return tx.upsert(ctx, controlKey, controlWrite(prev, b, w.now()))
+		return tx.upsert(ctx, controlKey, controlWrite(prev, info, w.now()))
 	})
 }
 
@@ -170,20 +158,20 @@ func (w *tableWriter) commitAtomic(ctx context.Context, b rowchange.Batch) error
 // upsert per surviving row (document = data fields + reserved "_urutau"
 // metadata sub-object), one remove per deleted key. A not-found remove is
 // success — the replay story re-runs deletes that already landed.
-func applyData(ctx context.Context, kv kvStore, plan *tablePlan, b rowchange.Batch) error {
-	for _, c := range b.Changes {
-		key, err := docKey(c)
+func applyData(ctx context.Context, kv kvStore, plan *tablePlan, r *transport.BatchReader) error {
+	for i := range r.NumRows() {
+		key, err := docKey(r.Key(i))
 		if err != nil {
 			return err
 		}
-		if c.Op == rowchange.OpDelete {
+		if r.Op(i) == rowchange.OpDelete {
 			err = kv.remove(ctx, key)
 			if err == nil || errors.Is(err, errNotFound) {
 				continue
 			}
 			return fmt.Errorf("remove key %s: %w", key, err)
 		}
-		data, meta, err := plan.buildDoc(c)
+		data, meta, err := plan.buildDoc(r, i)
 		if err != nil {
 			return fmt.Errorf("upsert key %s: %w", key, err)
 		}

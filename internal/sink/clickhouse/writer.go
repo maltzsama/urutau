@@ -124,56 +124,45 @@ func (w *tableWriter) nextSeq() uint64 {
 // as tombstones. Atomic if — and only if — every row lands in the same
 // partition, which is why the default table has no PARTITION BY.
 //
-// QUARANTINE: the RecordBatch→rowchange.Batch unpack is a bridge that dies
-// when the ClickHouse sink consumes RecordBatch directly.
+// Column-oriented: the record is consumed through the BatchReader with
+// per-column resolvers bound once per commit — no rowchange intermediate,
+// no per-row projection maps.
 func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
-	// Unpack the columnar batch back to row-oriented changes.
-	// QUARANTINE: this bridge dies when the ClickHouse sink consumes RecordBatch directly.
-	cb, err := w.unpackBatch(b)
+	reader, err := transport.NewBatchReader(b.Record, w.pk)
 	if err != nil {
-		return fmt.Errorf("clickhouse: unpack: %w", err)
+		return fmt.Errorf("clickhouse: %w", err)
+	}
+	resolvers, err := w.bindResolvers(reader)
+	if err != nil {
+		return err
 	}
 
 	seq := w.nextSeq()
-	n := len(cb.Changes)
-	cols := make([][]any, len(w.cols))
-	for i := range cols {
-		cols[i] = make([]any, 0, n)
-	}
-
-	emit := func(c rowchange.Change, isDeleted bool) error {
-		proj, err := w.project(c, isDeleted, cb.Position, seq)
-		if err != nil {
-			return err
-		}
-		for i, col := range w.cols {
-			v, err := w.valueFor(col, proj)
-			if err != nil {
-				return fmt.Errorf("row key %v column %q: %w", c.Key, col.name, err)
-			}
-			cols[i] = append(cols[i], v)
-		}
-		return nil
-	}
-	for _, c := range cb.Changes {
-		if err := emit(c, c.Op == rowchange.OpDelete); err != nil {
-			return err
-		}
-	}
-
+	batchPos := string(b.Watermark)
 	batch, err := w.conn.PrepareBatch(ctx, "INSERT INTO "+w.quoted)
 	if err != nil {
 		return fmt.Errorf("prepare %s: %w", w.quoted, err)
 	}
-	for i := range cols {
-		col := batch.Column(i)
-		for _, v := range cols[i] {
+	for i := range reader.NumRows() {
+		isDeleted := reader.Op(i) == rowchange.OpDelete
+		row := clickhouseRowMetaOf(reader, i)
+		for si, col := range w.cols {
+			v, err := resolvers[si](reader, i, isDeleted, batchPos, seq, row)
+			if err != nil {
+				_ = batch.Abort()
+				return fmt.Errorf("row %d column %q: %w", i, col.name, err)
+			}
+			v, err = w.valueOf(col, v)
+			if err != nil {
+				_ = batch.Abort()
+				return fmt.Errorf("row %d column %q: %w", i, col.name, err)
+			}
 			// AppendRow (not Append): the per-value tolerant converter —
 			// Append expects a whole typed slice, AppendRow accepts the
 			// canonical Go values coerce() produces, nil included.
-			if err := col.AppendRow(v); err != nil {
+			if err := batch.Column(si).AppendRow(v); err != nil {
 				_ = batch.Abort()
-				return fmt.Errorf("append %s column %q: %w", w.quoted, w.cols[i].name, err)
+				return fmt.Errorf("append %s column %q: %w", w.quoted, col.name, err)
 			}
 		}
 	}
@@ -188,76 +177,87 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 // owns the pool and its lifecycle.
 func (w *tableWriter) Close() error { return nil }
 
-// project resolves one change into column-name → encoded-ready value. Data
-// columns come from After through the cast plan; metadata columns come from
-// the change header; a tombstone carries only its key. The technical values
-// (position/seq/is_deleted) travel under reserved keys — the commit
-// coordinate is the BATCH's position, the one thing resume may trust.
-func (w *tableWriter) project(c rowchange.Change, isDeleted bool, batchPos string, seq uint64) (map[string]any, error) {
-	out := make(map[string]any, len(w.cols))
-	out[positionKey] = batchPos
-	out[seqKey] = seq
-	out[deletedKey] = isDeleted
-	if isDeleted {
-		for i, k := range w.pk {
-			if i < len(c.Key) {
-				out[k] = c.Key[i]
+// colResolver is the per-target-column value source, bound once per commit
+// against the record schema. The old project()/valueFor() pair built a
+// per-row map first and re-keyed it per column; the resolver reads the
+// value straight from the record.
+type colResolver func(r *transport.BatchReader, i int, isDeleted bool, batchPos string, seq uint64, row chRowMeta) (any, error)
+
+// bindResolvers maps every target column to its value source. Binding once
+// per commit keeps the row loop allocation-free.
+func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, error) {
+	resolvers := make([]colResolver, len(w.cols))
+	for i, col := range w.cols {
+		name := col.name
+		switch name {
+		case "position":
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, batchPos string, _ uint64, _ chRowMeta) (any, error) {
+				return batchPos, nil
 			}
+			continue
+		case "seq":
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, seq uint64, _ chRowMeta) (any, error) {
+				return seq, nil
+			}
+			continue
+		case "is_deleted":
+			resolvers[i] = func(_ *transport.BatchReader, _ int, isDeleted bool, _ string, _ uint64, _ chRowMeta) (any, error) {
+				if isDeleted {
+					return uint8(1), nil
+				}
+				return uint8(0), nil
+			}
+			continue
 		}
-		return out, nil
+		if m, ok := w.metaByName[name]; ok {
+			key := m.From
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, _ uint64, row chRowMeta) (any, error) {
+				v, err := metaValue(key, row, w.sourceTable)
+				if err != nil {
+					return nil, fmt.Errorf("metadata %q: %w", name, err)
+				}
+				return v, nil
+			}
+			continue
+		}
+		if !r.HasColumn(name) {
+			// A target column the stream does not carry: nil per the
+			// nullability rules, identical to the old absent-key path.
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, _ uint64, _ chRowMeta) (any, error) {
+				return nil, nil
+			}
+			continue
+		}
+		var target *core.CastTarget
+		if ct, ok := w.cast.Target(name); ok {
+			t := ct
+			target = &t
+		}
+		colName := name
+		resolvers[i] = func(r *transport.BatchReader, i int, _ bool, _ string, _ uint64, _ chRowMeta) (any, error) {
+			v, ok := r.Value(colName, i)
+			if !ok {
+				return nil, nil
+			}
+			if target != nil {
+				cv, err := target.Convert(v)
+				if err != nil {
+					return nil, fmt.Errorf("column %q: %w", colName, err)
+				}
+				v = cv
+			}
+			return v, nil
+		}
 	}
-	for _, col := range w.cols {
-		if reserved[col.name] {
-			continue
-		}
-		if m, ok := w.metaByName[col.name]; ok {
-			v, err := metaValue(m.From, c, w.sourceTable)
-			if err != nil {
-				return nil, fmt.Errorf("metadata %q: %w", col.name, err)
-			}
-			out[col.name] = v
-			continue
-		}
-		v, ok := c.After[col.name]
-		if !ok {
-			continue
-		}
-		if ct, ok := w.cast.Target(col.name); ok {
-			cv, err := ct.Convert(v)
-			if err != nil {
-				return nil, fmt.Errorf("column %q: %w", col.name, err)
-			}
-			v = cv
-		}
-		out[col.name] = v
-	}
-	return out, nil
+	return resolvers, nil
 }
 
-// valueFor picks one column's encoded value for a projected row: the
-// technical columns are the mechanism (position = the batch's commit
-// coordinate, seq the version ordering, is_deleted the tombstone mark).
-func (w *tableWriter) valueFor(col column, proj map[string]any) (any, error) {
-	switch col.name {
-	case "position":
-		s, ok := proj[positionKey].(string)
-		if !ok {
-			return nil, fmt.Errorf("clickhouse: position column is not string: %T", proj[positionKey])
-		}
-		return s, nil
-	case "seq":
-		u, ok := proj[seqKey].(uint64)
-		if !ok {
-			return nil, fmt.Errorf("clickhouse: seq column is not uint64: %T", proj[seqKey])
-		}
-		return u, nil
-	case "is_deleted":
-		if proj[deletedKey] == true {
-			return uint8(1), nil
-		}
-		return uint8(0), nil
-	}
-	v, err := coerce(col.base, proj[col.name])
+// valueOf applies the nullability/zero rules for one resolved value. A nil
+// on a non-nullable key is malformed input, not a fillable hole: zeroing it
+// would silently rewrite history onto key zero. Non-key columns may still
+// zero — tombstones carry only their key by design.
+func (w *tableWriter) valueOf(col column, v any) (any, error) {
+	v, err := coerce(col.base, v)
 	if err != nil {
 		return nil, err
 	}
@@ -265,16 +265,34 @@ func (w *tableWriter) valueFor(col column, proj map[string]any) (any, error) {
 		if col.nullable {
 			return nil, nil
 		}
-		// A non-nullable key receiving nil is malformed input, not a
-		// fillable hole: zeroing it would silently rewrite history onto
-		// key zero. Non-key columns may still zero — tombstones carry
-		// only their key by design.
 		if col.pk {
 			return nil, fmt.Errorf("null value in primary key column")
 		}
 		return zeroOf(col.base), nil
 	}
 	return v, nil
+}
+
+// chRowMeta is the per-row metadata view the metadata resolvers need.
+type chRowMeta struct {
+	Op         rowchange.Op
+	Position   string
+	CommitTS   time.Time
+	IngestTS   time.Time
+	Snapshot   bool
+	EnrichMiss bool
+}
+
+func clickhouseRowMetaOf(r *transport.BatchReader, i int) chRowMeta {
+	commitTS, _ := r.CommitTS(i)
+	ingestTS, _ := r.IngestTS(i)
+	return chRowMeta{
+		Op:       r.Op(i),
+		Position: r.Position(i),
+		CommitTS: commitTS,
+		IngestTS: ingestTS,
+		Snapshot: r.Snapshot(i),
+	}
 }
 
 // Keys project() uses to hand the technical values to valueFor without
@@ -287,7 +305,7 @@ const (
 
 // metaValue resolves one metadata key to its concrete value for a rowchange.
 // Mirrors the Iceberg sink's projection — same keys, same nil semantics.
-func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (any, error) {
+func metaValue(key core.MetadataKey, c chRowMeta, sourceTable string) (any, error) {
 	switch key {
 	case core.MetaOp:
 		return c.Op.String(), nil
@@ -311,38 +329,21 @@ func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (an
 		}
 		return "stream", nil
 	case core.MetaStream:
-		if c.Transport != nil && c.Transport.Stream != "" {
-			return c.Transport.Stream, nil
-		}
-		return sourceTable, nil // CDC: the source table IS the stream
+		// Wire path: no transport envelope; the source table IS the stream.
+		return sourceTable, nil
 	case core.MetaShard:
-		if c.Transport == nil || c.Transport.Shard == "" {
-			return nil, nil
-		}
-		return c.Transport.Shard, nil
+		return nil, nil
 	case core.MetaSeq:
-		if c.Transport != nil && c.Transport.Seq != "" {
-			return c.Transport.Seq, nil
-		}
 		if c.Position == "" {
 			return nil, nil
 		}
 		return c.Position, nil // CDC: the event coordinate (GTID/LSN)
 	case core.MetaMsgTS:
-		if c.Transport == nil || c.Transport.MsgTS.IsZero() {
-			return nil, nil
-		}
-		return c.Transport.MsgTS, nil
+		return nil, nil
 	case core.MetaMsgKey:
-		if c.Transport == nil {
-			return nil, nil
-		}
-		return c.Transport.MsgKey, nil
+		return nil, nil
 	case core.MetaHeaders:
-		if c.Transport == nil || c.Transport.Headers == "" {
-			return nil, nil
-		}
-		return c.Transport.Headers, nil
+		return nil, nil
 	case core.MetaEnrichMiss:
 		if c.EnrichMiss {
 			return true, nil
@@ -353,23 +354,4 @@ func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (an
 	}
 }
 
-// unpackBatch converts a columnar dataplane.Batch back to a row-oriented
-// rowchange.Batch. QUARANTINE: dies when the ClickHouse sink consumes
-// RecordBatch directly.
-func (w *tableWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
-	if b.Record == nil || b.Record.NumRows() == 0 {
-		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
-	}
 
-	rows, err := transport.DecodeBatch(b.Record, b.Table, w.pk)
-	if err != nil {
-		return rowchange.Batch{}, err
-	}
-
-	return rowchange.Batch{
-		Table:    b.Table,
-		Changes:  rows,
-		Position: string(b.Watermark),
-		Mode:     rowchange.ToRowMode(b.Mode),
-	}, nil
-}

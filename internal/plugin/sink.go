@@ -99,16 +99,17 @@ type sinkWriter struct {
 	wg     *sync.WaitGroup
 }
 
-// Commit converts the rowchange.Batch into Arrow records and sends them via
+// Commit re-projects the batch's RecordBatch into the plugin's record
+// shape (op + stringified columns + offset + ts_source) and sends it via
 // DoPut, then calls Flush to guarantee durability (contract §10).
+// The record is consumed column-oriented (BatchReader): no rowchange
+// intermediate, no per-row maps.
 func (w *sinkWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
-	// Unpack: decode RecordBatch back to changes for the existing writer.
-	// QUARANTINE: this bridge dies when the plugin sink consumes RecordBatch directly.
-	cb, err := w.unpackBatch(b)
+	reader, err := transport.NewBatchReader(b.Record, nil)
 	if err != nil {
-		return fmt.Errorf("plugin sink: unpack: %w", err)
+		return fmt.Errorf("plugin sink: %w", err)
 	}
-	records := batchToRecords(cb, w.alloc)
+	records := recordsFromReader(reader, w.alloc)
 	if len(records) == 0 {
 		return nil
 	}
@@ -148,18 +149,17 @@ func (w *sinkWriter) Close() error {
 	return nil
 }
 
-// batchToRecords converts a rowchange.Batch into a single Arrow record batch
-// with typed columns for efficiency.
-func batchToRecords(b rowchange.Batch, alloc memory.Allocator) []arrow.RecordBatch {
-	total := len(b.Changes)
-	if total == 0 {
+// recordsFromReader re-projects a wire record into the plugin's record
+// shape: op ("c"/"d"), every data column stringified (the plugin sink
+// carries opaque strings), offset (the row's source coordinate), and
+// ts_source (write instant). Column order follows the record's own schema
+// order — deterministic, no map iteration.
+func recordsFromReader(r *transport.BatchReader, alloc memory.Allocator) []arrow.RecordBatch {
+	n := r.NumRows()
+	if n == 0 {
 		return nil
 	}
-
-	colNames := collectColumns(b)
-	if len(colNames) == 0 {
-		return nil
-	}
+	colNames := r.DataColumns()
 
 	// Build Arrow schema: op + columns + offset + ts_source.
 	fields := make([]arrow.Field, 0, len(colNames)+3)
@@ -174,83 +174,24 @@ func batchToRecords(b rowchange.Batch, alloc memory.Allocator) []arrow.RecordBat
 	bb := array.NewRecordBuilder(alloc, arrowSchema)
 	defer bb.Release()
 
-	for _, c := range b.Changes {
+	for i := range n {
 		op := "c"
-		if c.Op == rowchange.OpDelete {
+		if r.Op(i) == rowchange.OpDelete {
 			op = "d"
 		}
-		appendChange(bb, op, c, colNames, b.Position)
+		bb.Field(0).(*array.StringBuilder).Append(op)
+		for ci, name := range colNames {
+			v, ok := r.Value(name, i)
+			if !ok || v == nil {
+				bb.Field(1 + ci).(*array.StringBuilder).AppendNull()
+			} else {
+				bb.Field(1 + ci).(*array.StringBuilder).Append(fmt.Sprintf("%v", v))
+			}
+		}
+		bb.Field(len(colNames) + 1).(*array.BinaryBuilder).Append([]byte(r.Position(i)))
+		bb.Field(len(colNames) + 2).(*array.TimestampBuilder).Append(arrow.Timestamp(time.Now().UTC().UnixMicro()))
 	}
 
 	rec := bb.NewRecordBatch()
 	return []arrow.RecordBatch{rec}
-}
-
-func appendChange(bb *array.RecordBuilder, op string, chg rowchange.Change, colNames []string, position string) {
-	bb.Field(0).(*array.StringBuilder).Append(op)
-	for i, name := range colNames {
-		val := resolveColumn(chg, name)
-		if val == nil {
-			bb.Field(1 + i).(*array.StringBuilder).AppendNull()
-		} else {
-			bb.Field(1 + i).(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
-		}
-	}
-	bb.Field(len(colNames) + 1).(*array.BinaryBuilder).Append([]byte(position))
-	bb.Field(len(colNames) + 2).(*array.TimestampBuilder).Append(arrow.Timestamp(time.Now().UTC().UnixMicro()))
-}
-
-func resolveColumn(chg rowchange.Change, name string) any {
-	if chg.After != nil {
-		if v, ok := chg.After[name]; ok {
-			return v
-		}
-	}
-	if chg.Before != nil {
-		if v, ok := chg.Before[name]; ok {
-			return v
-		}
-	}
-	return nil
-}
-
-func collectColumns(b rowchange.Batch) []string {
-	seen := make(map[string]bool)
-	for _, c := range b.Changes {
-		// DELETE IMAGE CONTRACT (RV-02/RV-11): wire-decoded deletes carry
-		// their image in After (flat = before image per CR-021; Before is
-		// nil). Only prefer Before when a source decoder actually filled
-		// it — otherwise the delete projects zero columns.
-		src := c.After
-		if c.Op == rowchange.OpDelete && len(c.Before) > 0 {
-			src = c.Before
-		}
-		for k := range src {
-			seen[k] = true
-		}
-	}
-	cols := make([]string, 0, len(seen))
-	for k := range seen {
-		cols = append(cols, k)
-	}
-	return cols
-}
-
-// unpackBatch converts a columnar dataplane.Batch back to a row-oriented
-// rowchange.Batch. QUARANTINE: dies when the plugin sink consumes RecordBatch
-// directly.
-func (w *sinkWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
-	if b.Record == nil || b.Record.NumRows() == 0 {
-		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
-	}
-	rows, err := transport.DecodeBatch(b.Record, b.Table, nil)
-	if err != nil {
-		return rowchange.Batch{}, err
-	}
-	return rowchange.Batch{
-		Table:    b.Table,
-		Changes:  rows,
-		Position: string(b.Watermark),
-		Mode:     rowchange.ToRowMode(b.Mode),
-	}, nil
 }

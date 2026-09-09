@@ -10,10 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // fakeKV is an in-memory kvStore with JSON fidelity: documents round-trip
@@ -373,11 +377,11 @@ func TestDocKeyRules(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ka, err := docKey(rowchange.Change{Key: tc.a})
+			ka, err := docKey(tc.a)
 			if err != nil {
 				t.Fatalf("key a: %v", err)
 			}
-			kb, err := docKey(rowchange.Change{Key: tc.b})
+			kb, err := docKey(tc.b)
 			if err != nil {
 				t.Fatalf("key b: %v", err)
 			}
@@ -390,7 +394,7 @@ func TestDocKeyRules(t *testing.T) {
 		})
 	}
 	long := rowchange.Change{Key: []any{strings.Repeat("x", maxKeyLen)}}
-	if _, err := docKey(long); err == nil {
+	if _, err := docKey(long.Key); err == nil {
 		t.Fatal("oversized key accepted")
 	}
 }
@@ -400,10 +404,11 @@ func TestDocKeyRules(t *testing.T) {
 // canonical text, nested composites recursive, cast plan applied before
 // serialization.
 func TestBuildDocValueForms(t *testing.T) {
+	alloc := memory.NewGoAllocator()
 	p := &tablePlan{
 		schema: core.Schema{Columns: []core.Column{
 			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-			{Name: "uid", Type: core.ColumnType{Kind: core.KindUUID}},
+			{Name: "uid", Type: core.ColumnType{Kind: core.KindString}},
 			{Name: "amount", Type: core.ColumnType{Kind: core.KindDecimal, Precision: 10, Scale: 2}},
 			{Name: "addr", Type: core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
 				{Name: "city", Type: core.ColumnType{Kind: core.KindString}},
@@ -414,51 +419,78 @@ func TestBuildDocValueForms(t *testing.T) {
 		}},
 		sourceTable: "src.orders",
 	}
-	c := rowchange.Change{
-		Op:  rowchange.OpInsert,
-		Key: []any{int64(1)},
-		After: map[string]any{
-			"id":     int64(1),
-			"uid":    "018f6a1e-7d3f-7aa1-bb3a-5f3f5e6a7b8c", // UUID arrives as string after cast
-			"amount": "123.45",
-			"addr":   map[string]any{"city": "Curitiba"},
-			"tags":   []any{"a", "b"},
-			"vm":     map[string]any{"k": int64(3)},
-		},
+	// Build a wire record carrying the row: the wire forms are exactly
+	// what the codec decodes — decimal as Decimal128, uuid as string,
+	// composites as arrow struct/list/map.
+	data, err := transport.CoreSchemaToArrow(p.schema)
+	if err != nil {
+		t.Fatalf("schema: %v", err)
 	}
-	data, meta, err := p.buildDoc(c)
+	bld := array.NewRecordBuilder(alloc, data)
+	defer bld.Release()
+	bld.Field(0).(*array.Int64Builder).Append(1)
+	bld.Field(1).(*array.StringBuilder).Append("018f6a1e-7d3f-7aa1-bb3a-5f3f5e6a7b8c") // UUID arrives as string after cast
+	if err := bld.Field(2).(*array.Decimal128Builder).AppendValueFromString("123.45"); err != nil {
+		t.Fatalf("decimal: %v", err)
+	}
+	sb := bld.Field(3).(*array.StructBuilder)
+	sb.Append(true)
+	sb.FieldBuilder(0).(*array.StringBuilder).Append("Curitiba")
+	lb := bld.Field(4).(*array.ListBuilder)
+	lb.Append(true)
+	for _, s := range []string{"a", "b"} {
+		lb.ValueBuilder().(*array.StringBuilder).Append(s)
+	}
+	mb := bld.Field(5).(*array.MapBuilder)
+	mb.Append(true)
+	mb.KeyBuilder().(*array.StringBuilder).Append("k")
+	mb.ItemBuilder().(*array.Int64Builder).Append(3)
+	bld.Field(6).(*array.StringBuilder).Append("hi")
+	for i := 7; i < int(data.NumFields()); i++ {
+		bld.Field(i).AppendNull()
+	}
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+
+	reader, err := transport.NewBatchReader(rec, []string{"id"})
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	data0, meta, err := p.buildDoc(reader, 0)
 	if err != nil {
 		t.Fatalf("buildDoc: %v", err)
 	}
+	_ = data0
 	if len(meta) != 0 {
 		t.Fatalf("unexpected metadata: %v", meta)
 	}
-	if data["uid"] != "018f6a1e-7d3f-7aa1-bb3a-5f3f5e6a7b8c" {
-		t.Fatalf("uuid = %v, want hyphenated form", data["uid"])
+	if data0["uid"] != "018f6a1e-7d3f-7aa1-bb3a-5f3f5e6a7b8c" {
+		t.Fatalf("uuid = %v, want hyphenated form", data0["uid"])
 	}
-	if data["amount"] != "123.45" {
-		t.Fatalf("decimal = %v, want canonical text", data["amount"])
+	if data0["amount"] != "123.45" {
+		t.Fatalf("decimal = %v, want canonical text", data0["amount"])
 	}
-	addr, ok := data["addr"].(map[string]any)
+	addr, ok := data0["addr"].(map[string]any)
 	if !ok || addr["city"] != "Curitiba" {
-		t.Fatalf("nested struct = %v", data["addr"])
+		t.Fatalf("nested struct = %v", data0["addr"])
 	}
-	tags, ok := data["tags"].([]any)
+	tags, ok := data0["tags"].([]any)
 	if !ok || len(tags) != 2 {
-		t.Fatalf("nested list = %v", data["tags"])
+		t.Fatalf("nested list = %v", data0["tags"])
 	}
-	if !reflect.DeepEqual(data["vm"], map[string]any{"k": int64(3)}) {
-		t.Fatalf("nested map = %v", data["vm"])
+	if !reflect.DeepEqual(data0["vm"], map[string]any{"k": int64(3)}) {
+		t.Fatalf("nested map = %v", data0["vm"])
 	}
 
-	// Cast applies before serialization: decimal ← string stays exact.
+	// Cast applies before serialization: decimal to string stays exact
+	// text even though the wire already delivers canonical text.
 	p.cast, _ = core.ParseCastPolicy(map[string]string{"amount": "string"})
-	data, _, err = p.buildDoc(c)
+	data0, _, err = p.buildDoc(reader, 0)
 	if err != nil {
 		t.Fatalf("buildDoc cast: %v", err)
 	}
-	if data["amount"] != "123.45" {
-		t.Fatalf("cast amount = %v", data["amount"])
+	if data0["amount"] != "123.45" {
+		t.Fatalf("cast amount = %v", data0["amount"])
 	}
 }
 

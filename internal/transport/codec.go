@@ -621,6 +621,86 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 			return bytes.Clone(a.Value(i)), nil
 		}
 		return castErr()
+	case core.KindStruct:
+		a, ok := col.(*array.Struct)
+		if !ok {
+			return castErr()
+		}
+		st := a.DataType().(*arrow.StructType)
+		out := make(map[string]any, st.NumFields())
+		for f := range st.NumFields() {
+			if a.Field(f).IsNull(i) {
+				continue
+			}
+			ct, err := fieldTypeToCore(st.Field(f))
+			if err != nil {
+				return nil, fmt.Errorf("struct field %q: %w", st.Field(f).Name, err)
+			}
+			fv, err := readTypedValue(a.Field(f), ct, i)
+			if err != nil {
+				return nil, fmt.Errorf("struct field %q: %w", st.Field(f).Name, err)
+			}
+			out[st.Field(f).Name] = fv
+		}
+		return out, nil
+	case core.KindList:
+		a, ok := col.(*array.List)
+		if !ok {
+			return castErr()
+		}
+		ef := a.DataType().(*arrow.ListType).ElemField()
+		ect, err := fieldTypeToCore(ef)
+		if err != nil {
+			return nil, fmt.Errorf("list elem: %w", err)
+		}
+		s, e := a.ValueOffsets(i)
+		items := a.ListValues()
+		out := make([]any, 0, e-s)
+		for j := s; j < e; j++ {
+			if items.IsNull(int(j)) {
+				out = append(out, nil)
+				continue
+			}
+			ev, err := readTypedValue(items, ect, int(j))
+			if err != nil {
+				return nil, fmt.Errorf("list element %d: %w", j-s, err)
+			}
+			out = append(out, ev)
+		}
+		return out, nil
+	case core.KindMap:
+		a, ok := col.(*array.Map)
+		if !ok {
+			return castErr()
+		}
+		mt := a.DataType().(*arrow.MapType)
+		kct, err := fieldTypeToCore(mt.KeyField())
+		if err != nil {
+			return nil, fmt.Errorf("map key: %w", err)
+		}
+		vct, err := fieldTypeToCore(mt.ItemField())
+		if err != nil {
+			return nil, fmt.Errorf("map value: %w", err)
+		}
+		s, e := a.ValueOffsets(i)
+		out := make(map[string]any, e-s)
+		for j := s; j < e; j++ {
+			kv, err := readTypedValue(a.Keys(), kct, int(j))
+			if err != nil {
+				return nil, fmt.Errorf("map key %d: %w", j-s, err)
+			}
+			ks := fmt.Sprintf("%v", kv)
+			if a.Items().IsNull(int(j)) {
+				out[ks] = nil
+				continue
+			}
+			vv, err := readTypedValue(a.Items(), vct, int(j))
+			if err != nil {
+				return nil, fmt.Errorf("map value %q: %w", ks, err)
+			}
+			out[ks] = vv
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unsupported kind %s", ct.Kind)
 	}

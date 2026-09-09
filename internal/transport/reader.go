@@ -59,6 +59,11 @@ func NewBatchReader(rec arrow.RecordBatch, primaryKey []string) (*BatchReader, e
 		snapIdx:   numDataCols + 4,
 	}
 	for j := 0; j < numDataCols; j++ {
+		ct, err := fieldTypeToCore(schema.Field(j))
+		if err != nil {
+			return nil, fmt.Errorf("transport: column %d: %w", j, err)
+		}
+		br.colTypes[j] = ct
 		br.dataIndex[schema.Field(j).Name] = j
 	}
 	for _, name := range primaryKey {
@@ -156,6 +161,15 @@ func (r *BatchReader) Key(i int) []any {
 		key[k] = v
 	}
 	return key
+}
+
+// DataColumns returns the data column names in record order.
+func (r *BatchReader) DataColumns() []string {
+	names := make([]string, len(r.colTypes))
+	for i := range r.colTypes {
+		names[i] = r.rec.Schema().Field(i).Name
+	}
+	return names
 }
 
 // HasColumn reports whether a data column with the given name exists.
