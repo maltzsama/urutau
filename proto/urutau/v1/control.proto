@@ -98,6 +98,8 @@ message TableAssignment {
   bool      create_if_not_exists = 7;
   bytes     schema_arrow         = 8;  // table schema as Arrow IPC (data columns); the coordinator owns introspection
   repeated EnrichRef enrich      = 9;  // broadcast reference joins, applied in order
+  bytes     cast_policy          = 10; // JSON core.CastPolicy — writes must apply the same overrides as the coordinator's DDL
+  bytes     metadata             = 11; // JSON []core.MetadataColumn — pipeline metadata columns land in the target
 }
 
 message BatchConfig {

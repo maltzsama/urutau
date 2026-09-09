@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -191,16 +192,33 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		cs.PrimaryKey = ta.PrimaryKey
 		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey}
+		// The write shape arrives with the assignment: the coordinator's DDL
+		// and this worker's writes must agree on the cast policy, the
+		// metadata columns, and the write mode — a hardcoded UPSERT or empty
+		// cast here silently diverged append tables and cast overrides
+		// (audit #8/#10).
+		cast, err := decodeCastPolicy(ta)
+		if err != nil {
+			return err
+		}
+		meta, err := decodeMetadata(ta)
+		if err != nil {
+			return err
+		}
+		mode := dataplane.UpsertMode
+		if ta.WriteMode == pb.WriteMode_WRITE_MODE_APPEND {
+			mode = dataplane.AppendMode
+		}
 		if ta.CreateIfNotExists {
-			if err := snk.EnsureTable(ctx, ref, cs, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
+			if err := snk.EnsureTable(ctx, ref, cs, nil, cast, mode); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
 			}
 		}
-		writer, err := snk.Writer(ctx, ref, core.CastPolicy{}, nil)
+		writer, err := snk.Writer(ctx, ref, cast, meta)
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
-		w.Register(ta.TargetTable, writer, dataplane.UpsertMode)
+		w.Register(ta.TargetTable, writer, mode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
 		// The drift check knows the assigned canonical schema — with its
 		// types, so a field added inside a struct column is caught too.
@@ -596,4 +614,29 @@ func committedStrings(m map[string]position.Position) map[string]string {
 		out[k] = v.String()
 	}
 	return out
+}
+
+// decodeCastPolicy rebuilds the cast policy the coordinator shipped as JSON.
+func decodeCastPolicy(ta *pb.TableAssignment) (core.CastPolicy, error) {
+	if len(ta.CastPolicy) == 0 {
+		return core.CastPolicy{}, nil
+	}
+	var cast core.CastPolicy
+	if err := json.Unmarshal(ta.CastPolicy, &cast); err != nil {
+		return core.CastPolicy{}, fmt.Errorf("worker: cast %s: %w", ta.TargetTable, err)
+	}
+	return cast, nil
+}
+
+// decodeMetadata rebuilds the metadata columns the coordinator shipped as
+// JSON.
+func decodeMetadata(ta *pb.TableAssignment) ([]core.MetadataColumn, error) {
+	if len(ta.Metadata) == 0 {
+		return nil, nil
+	}
+	var meta []core.MetadataColumn
+	if err := json.Unmarshal(ta.Metadata, &meta); err != nil {
+		return nil, fmt.Errorf("worker: metadata %s: %w", ta.TargetTable, err)
+	}
+	return meta, nil
 }

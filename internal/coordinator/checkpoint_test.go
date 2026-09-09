@@ -1,8 +1,18 @@
 package coordinator
 
 import (
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/maltzsama/urutau/position"
 )
@@ -148,4 +158,56 @@ func TestCheckpointKeyFormat(t *testing.T) {
 	if key2 != want2 {
 		t.Fatalf("key = %q, want %q", key2, want2)
 	}
+}
+
+// TestCheckpointMarkCleanOnlyOnSuccess covers audit #12: a failed PutObject
+// must leave the index dirty, or a persistent S3 outage would clear the
+// dirty flag for an upload that never happened and stop checkpoints forever.
+func TestCheckpointMarkCleanOnlyOnSuccess(t *testing.T) {
+	var fail atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cp := &checkpoint{
+		interval: 10 * time.Millisecond,
+		bucket:   "b",
+		prefix:   "",
+		client: s3.NewFromConfig(aws.Config{}, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(srv.URL)
+			o.UsePathStyle = true
+			o.Region = "us-east-1"
+			o.Retryer = aws.NopRetryer{}
+			o.Credentials = credentials.NewStaticCredentialsProvider("k", "s", "")
+		}),
+	}
+	idx := newPositionIndex("run")
+	idx.add(inflightBatch{id: 1, table: "t", bytes: 10})
+	index := map[string]*positionIndex{"w": idx}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { cp.run(ctx, "run", index, slog.Default()); close(done) }()
+
+	fail.Store(true)
+	time.Sleep(80 * time.Millisecond)
+	if !idx.Dirty() {
+		t.Fatal("index must stay dirty while uploads fail")
+	}
+	fail.Store(false)
+	deadline := time.Now().Add(2 * time.Second)
+	for idx.Dirty() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if idx.Dirty() {
+		t.Fatal("index must clear once an upload succeeds")
+	}
+	cancel()
+	<-done
 }

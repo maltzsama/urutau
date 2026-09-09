@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -86,14 +87,20 @@ func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*po
 				}
 				key := strings.TrimPrefix(c.prefix+"/", "/") + runID + "/" + worker + "/manifest.json"
 				putCtx, cancel := context.WithTimeout(ctx, putTimeout)
-				if _, err := c.client.PutObject(putCtx, &s3.PutObjectInput{
+				_, err = c.client.PutObject(putCtx, &s3.PutObjectInput{
 					Bucket: aws.String(c.bucket),
 					Key:    aws.String(key),
-					Body:   strings.NewReader(string(body)),
-				}); err != nil {
-					log.Warn("checkpoint: put", "run", runID, "worker", worker, "key", key, "err", err)
-				}
+					Body:   bytes.NewReader(body),
+				})
 				cancel()
+				if err != nil {
+					log.Warn("checkpoint: put", "run", runID, "worker", worker, "key", key, "err", err)
+					// The index stays dirty: MarkClean only on success, or a
+					// persistent S3 outage stops checkpoints forever — the
+					// dirty flag would be cleared for an upload that never
+					// happened (audit #12).
+					continue
+				}
 				idx.MarkClean()
 			}
 		}
