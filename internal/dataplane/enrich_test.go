@@ -251,7 +251,7 @@ func TestAddMetadataEmptyBatch(t *testing.T) {
 
 func TestCastInt64OverflowPreserved(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInt64Overflow(0, alloc)
+	b := dataplane.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	policy := dataplane.CastPolicy{"id": {Type: core.ColumnType{Kind: core.KindString}}}

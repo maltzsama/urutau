@@ -216,7 +216,7 @@ func TestTransitionMatrixMissingBeforeColumn(t *testing.T) {
 // values coalesce to false (same as predicate evaluation).
 func TestTransitionMatrixNullsCoalesce(t *testing.T) {
 	alloc := memory.NewGoAllocator()
-	b := dataplane.AdversarialNullBefore(0, alloc)
+	b := dataplane.AdversarialNullBefore(alloc)
 	defer b.Release()
 
 	// BeforeSide predicate: __before_val == "hello"

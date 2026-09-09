@@ -7,6 +7,8 @@ import (
 	"math/rand/v2"
 	"time"
 
+	publicdp "github.com/maltzsama/urutau/dataplane"
+
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -115,7 +117,7 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 		bb.Field(6).(*array.StringBuilder).Append(pos)
 
 		// __commit_ts (nanoseconds per M2a decision)
-		ts := timeFromNano(int64(i))
+		ts := timeFromNsOffset(int64(i))
 		bb.Field(7).(*array.TimestampBuilder).AppendTime(ts)
 
 		// __ingest_ts (microseconds — same as commit for test purposes)
@@ -137,11 +139,14 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 		Table:     "test_table",
 		Record:    rec,
 		Watermark: watermark,
+		Mode:      publicdp.UpsertMode,
 	}
 }
 
 // timeFromNano creates a UTC timestamp at the given nanosecond offset from epoch.
-func timeFromNano(ns int64) time.Time {
+// timeFromNsOffset builds a UTC instant from a nanosecond offset
+// over a fixed 2026 epoch — deterministic timestamps for generated rows.
+func timeFromNsOffset(ns int64) time.Time {
 	return time.Date(2026, 1, 1, 0, 0, 0, int(ns), time.UTC)
 }
 
@@ -149,7 +154,7 @@ func timeFromNano(ns int64) time.Time {
 
 // AdversarialCompositeKey produces a batch where naive key concatenation
 // would collide: ("ab","c") vs ("a","bc").
-func AdversarialCompositeKey(seed int64, alloc memory.Allocator) *Batch {
+func AdversarialCompositeKey(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -185,11 +190,11 @@ func AdversarialCompositeKey(seed int64, alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_composite_key", Record: rec, Watermark: []byte("pos-0002")}
+	return &Batch{Table: "adv_composite_key", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // AdversarialDeleteLast produces a batch whose last row is a DELETE.
-func AdversarialDeleteLast(seed int64, alloc memory.Allocator) *Batch {
+func AdversarialDeleteLast(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -219,12 +224,12 @@ func AdversarialDeleteLast(seed int64, alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_delete_last", Record: rec, Watermark: []byte("pos-0002")}
+	return &Batch{Table: "adv_delete_last", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // AdversarialInsertAfterDelete produces a batch where a row is inserted
 // after being deleted in the same batch.
-func AdversarialInsertAfterDelete(seed int64, alloc memory.Allocator) *Batch {
+func AdversarialInsertAfterDelete(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -254,12 +259,12 @@ func AdversarialInsertAfterDelete(seed int64, alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_insert_after_delete", Record: rec, Watermark: []byte("pos-0002")}
+	return &Batch{Table: "adv_insert_after_delete", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // AdversarialInt64Overflow produces a batch with int64 values > 2^53
 // that would be corrupted by JSON float64 (CR-021 regression test).
-func AdversarialInt64Overflow(seed int64, alloc memory.Allocator) *Batch {
+func AdversarialInt64Overflow(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -293,12 +298,13 @@ func AdversarialInt64Overflow(seed int64, alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_int64_overflow", Record: rec, Watermark: []byte("pos-0002")}
+	return &Batch{Table: "adv_int64_overflow", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
-// AdversarialNullBefore produces a batch with null __before_val payload
-// column (Kleene/null semantics test).
-func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
+// AdversarialNullBefore produces a batch with null val/__before_val cells.
+// Predicate evaluation over these nulls COALESCES to false — the point is
+// the coalesce rule, not Kleene logic: a null never passes a predicate.
+func AdversarialNullBefore(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -334,7 +340,7 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_null_before", Record: rec, Watermark: []byte("pos-0002")}
+	return &Batch{Table: "adv_null_before", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // EncodeKey encodes a composite key as type-tagged binary payload concat —

@@ -52,7 +52,7 @@ func TestCodecRoundTrip(t *testing.T) {
 		Window: &pb.WindowTag{ChunkId: 3, Snapshot: true},
 	}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, metaBytes, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestCodecLargeInt64(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestCodecDecimal(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestCodecDeleteKeyOnly(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "raw.orders", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestCodecPartialBeforeBackfillsKey(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -340,7 +340,7 @@ func TestCodecKindCoverageMatrix(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -433,7 +433,7 @@ func TestCodecBinaryLifetimeAfterRelease(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -506,7 +506,7 @@ func TestCodecAddMetadataNoDuplicates(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -556,7 +556,7 @@ func TestCodecCompositeKeyTypesRoundTrip(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -601,7 +601,7 @@ func TestCodecDecodeRejectsPostAddMetadataRecord(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, _, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta, nil)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -659,7 +659,7 @@ func TestCodecReservedNamesRejected(t *testing.T) {
 			{Op: rowchange.OpInsert, Table: "t", After: map[string]any{name: "val"}, Position: "p1"},
 		}
 		meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
-		_, _, err := EncodeBatch(rows, schema, meta)
+		_, _, err := EncodeBatch(rows, schema, meta, nil)
 		if err == nil {
 			t.Errorf("reserved name %q should be rejected", name)
 		}

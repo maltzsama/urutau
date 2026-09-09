@@ -25,7 +25,10 @@ import (
 // record) and marshals meta for the FlightData app_metadata. The schema
 // is derived from the canonical core.Schema: data columns are typed,
 // metadata columns (__op, __pos, etc.) are appended at the end.
-func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta) (body, metaBytes []byte, err error) {
+// EncodeBatch encodes row-oriented changes into an Arrow IPC record body
+// plus the BatchMeta frame (FlightData.app_metadata). A nil alloc falls
+// back to the default allocator (M-5).
+func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta, alloc memory.Allocator) (body, metaBytes []byte, err error) {
 	metaBytes, err = proto.Marshal(meta)
 	if err != nil {
 		return nil, nil, fmt.Errorf("transport: marshal batch meta: %w", err)
@@ -36,7 +39,10 @@ func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta) (b
 		return nil, nil, err
 	}
 
-	bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	if alloc == nil {
+		alloc = memory.DefaultAllocator
+	}
+	bld := array.NewRecordBuilder(alloc, schema)
 	defer bld.Release()
 
 	numDataCols := len(cs.Columns)
@@ -106,7 +112,13 @@ func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta) (b
 		} else {
 			bld.Field(numDataCols + 2).(*array.TimestampBuilder).AppendTime(r.CommitTS)
 		}
-		bld.Field(numDataCols + 3).(*array.TimestampBuilder).AppendTime(r.IngestTS)
+		if r.IngestTS.IsZero() {
+			// Parity with CommitTS (M-4): a zero timestamp means "not
+			// set" — it must not masquerade as a real instant on the wire.
+			bld.Field(numDataCols + 3).AppendNull()
+		} else {
+			bld.Field(numDataCols + 3).(*array.TimestampBuilder).AppendTime(r.IngestTS)
+		}
 		bld.Field(numDataCols + 4).(*array.BooleanBuilder).Append(r.Snapshot)
 	}
 
@@ -205,9 +217,12 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 
 	rows := make([]rowchange.Change, 0, rec.NumRows())
 	for i := 0; i < int(rec.NumRows()); i++ {
+		// No wall-clock fallback (M-4): an absent __ingest_ts stays a zero
+		// time. IngestTS is measured upstream where the event entered the
+		// pipeline; a decode-time stamp would silently re-age replayed
+		// rows and corrupt lag metrics.
 		c := rowchange.Change{
-			Table:    table,
-			IngestTS: time.Now(), // fallback when the wire column is null
+			Table: table,
 		}
 
 		// Data columns → After map.

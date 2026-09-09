@@ -909,7 +909,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, rows []rowchange.Change,
 			break
 		}
 	}
-	body, metaBytes, err := transport.EncodeBatch(rows, cs, meta)
+	body, metaBytes, err := transport.EncodeBatch(rows, cs, meta, nil)
 	if err != nil {
 		return err
 	}

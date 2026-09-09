@@ -34,6 +34,13 @@ func (o Op) String() string {
 // in table-spec order; After is nil for deletes and Before is only carried
 // when needed (mutable-column filters). Position is the source coordinate
 // (GTID | LSN) the event came from; CommitTS is the source commit timestamp.
+//
+// Value contract (row universe): Arrow has no Go-exact float16/float32
+// value type in map[string]any, so a Float32 column DECODES as float64
+// (promotion, M-3). Re-encoding a promoted value back into a Float32
+// column is accepted WITHOUT a precision guard (C-7): the round-trip of
+// the column depends on it. Float64 columns keep the exact-precision
+// guard for integer sources.
 type Change struct {
 	Op       Op
 	Table    string // target table ("namespace.name")

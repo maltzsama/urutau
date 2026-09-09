@@ -65,7 +65,7 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 		HighPos: b.Position,
 	}
 
-	body, _, err := transport.EncodeBatch(all, cs, meta)
+	body, _, err := transport.EncodeBatch(all, cs, meta, nil)
 	if err != nil {
 		return nil, fmt.Errorf("bridge: encode: %w", err)
 	}

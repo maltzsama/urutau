@@ -134,7 +134,7 @@ func TestEvaluatePredicateEqual(t *testing.T) {
 
 func TestEvaluatePredicateNullCoalesce(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialNullBefore(0, alloc)
+	b := dataplane.AdversarialNullBefore(alloc)
 	defer b.Release()
 
 	mask, err := dataplane.EvaluatePredicate(context.Background(), alloc, b, dataplane.Predicate{

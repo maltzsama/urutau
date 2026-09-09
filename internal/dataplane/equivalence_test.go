@@ -252,7 +252,7 @@ func TestEquivalence_FilterPredicate_MatchesRowPath(t *testing.T) {
 // insert-after-delete ends up as an upsert (not a delete).
 func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
+	b := dataplane.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -286,7 +286,7 @@ func TestEquivalence_CollapseInsertAfterDelete(t *testing.T) {
 // is DELETE ends up in deletes, not upserts.
 func TestEquivalence_DeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialDeleteLast(0, alloc)
+	b := dataplane.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -314,7 +314,7 @@ func TestEquivalence_DeleteLast(t *testing.T) {
 // PKs survive collapse as separate rows.
 func TestEquivalence_CompositeKey(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(0, alloc)
+	b := dataplane.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
@@ -340,7 +340,7 @@ func TestEquivalence_CompositeKey(t *testing.T) {
 // float64 precision survive with exact values.
 func TestEquivalence_Int64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInt64Overflow(0, alloc)
+	b := dataplane.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})

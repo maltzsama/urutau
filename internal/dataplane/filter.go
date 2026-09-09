@@ -25,7 +25,14 @@ const (
 //
 // Rows that don't pass the mask are dropped entirely. The three output
 // batches are independent; each may be nil if empty.
+//
+// Mask nulls coalesce to false (M-14): a null mask bit never passes a
+// row, so an absent predicate value drops the row rather than admitting
+// it by accident.
 func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arrow.Array) (inserts, deletes, updates *Batch, err error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil {
 		return nil, nil, nil, nil
 	}
@@ -131,6 +138,9 @@ func resolveColumn(schema *arrow.Schema, p Predicate) (int, error) {
 // batch's columns. Null values are treated as false (coalesce — matches
 // the row-oriented path, NOT Kleene semantics).
 func EvaluatePredicate(ctx context.Context, alloc memory.Allocator, batch *Batch, pred Predicate) (arrow.Array, error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil {
 		return nil, fmt.Errorf("dataplane: nil record")
 	}
@@ -348,7 +358,8 @@ func buildOpMask(alloc memory.Allocator, opCol *array.Uint8, opVal uint8, mask *
 	defer bb.Release()
 	for i := range n {
 		opMatch := opCol.Value(i) == opVal
-		maskPass := mask.Value(i)
+		// Null mask bit → false (M-14): explicit, not a buffer accident.
+		maskPass := mask.IsValid(i) && mask.Value(i)
 		bb.Append(opMatch && maskPass)
 	}
 	return bb.NewBooleanArray()
@@ -371,6 +382,9 @@ func TransitionMask(alloc memory.Allocator, opCol *array.Uint8, opVal uint8) arr
 // __op column. Every row goes to exactly one output. Watermark and Table
 // are preserved. Empty outputs are nil (not empty batches).
 func SplitByOp(ctx context.Context, alloc memory.Allocator, batch *Batch) (inserts, deletes, updates *Batch, err error) {
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil {
 		return nil, nil, nil, nil
 	}
@@ -509,7 +523,9 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 // op is CDC semantics.
 func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
 	before, after []Predicate) (inserts, deletes, updates *Batch, err error) {
-
+	if alloc == nil {
+		alloc = memory.NewGoAllocator()
+	}
 	if batch.Record == nil || batch.Record.NumRows() == 0 {
 		return nil, nil, nil, nil
 	}

@@ -112,7 +112,7 @@ func TestGeneratorPosMonotonic(t *testing.T) {
 
 func TestGeneratorInt64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInt64Overflow(0, alloc)
+	b := dataplane.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	idCol := b.Record.Column(0).(*array.Int64)
@@ -128,7 +128,7 @@ func TestGeneratorInt64Overflow(t *testing.T) {
 
 func TestGeneratorDeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialDeleteLast(0, alloc)
+	b := dataplane.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
 	opIdx := fieldIndex(t, b, "__op")
@@ -140,7 +140,7 @@ func TestGeneratorDeleteLast(t *testing.T) {
 
 func TestGeneratorInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInsertAfterDelete(0, alloc)
+	b := dataplane.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
 	opIdx := fieldIndex(t, b, "__op")
@@ -155,7 +155,7 @@ func TestGeneratorInsertAfterDelete(t *testing.T) {
 
 func TestGeneratorCompositeKeyDistinct(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(0, alloc)
+	b := dataplane.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	pk1 := b.Record.Column(0).(*array.String)
@@ -174,7 +174,7 @@ func TestGeneratorCompositeKeyDistinct(t *testing.T) {
 
 func TestGeneratorNullBefore(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialNullBefore(0, alloc)
+	b := dataplane.AdversarialNullBefore(alloc)
 	defer b.Release()
 
 	valCol := b.Record.Column(1).(*array.String)
@@ -194,7 +194,7 @@ func TestGeneratorNullBefore(t *testing.T) {
 
 func TestEncodeKeyDistinct(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(0, alloc)
+	b := dataplane.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	key0, err := dataplane.EncodeKey(b.Record, 0, []int{0, 1}, []string{"pk1", "pk2"})
