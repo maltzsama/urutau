@@ -45,7 +45,10 @@ func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arro
 	}
 	opCol, ok := batch.Record.Column(opIdx).(*array.Uint8)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", batch.Record.Column(opIdx))
+		return nil, nil, nil, fmt.Errorf("dataplane: filter __op column type %T, want *array.Uint8", batch.Record.Column(opIdx))
+	}
+	if err := validateOpColumn(opCol); err != nil {
+		return nil, nil, nil, err
 	}
 
 	delMask := buildOpMask(alloc, opCol, OpDelete, boolMask)

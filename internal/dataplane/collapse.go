@@ -52,7 +52,21 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 		keys[row] = key
 	}
 
-	// 2. Map-based scan: last occurrence wins per group, first-appearance
+	// 2. Validate __op on the original batch before Take — invalid ops
+	// in losing rows would otherwise be silently dropped.
+	opIdxOrig := colIndex(batch.Record.Schema(), "__op")
+	if opIdxOrig < 0 {
+		return nil, nil, fmt.Errorf("dataplane: collapse: __op column not found")
+	}
+	opColOrig, ok := batch.Record.Column(opIdxOrig).(*array.Uint8)
+	if !ok {
+		return nil, nil, fmt.Errorf("dataplane: collapse: __op column type %T, want *array.Uint8", batch.Record.Column(opIdxOrig))
+	}
+	if err := validateOpColumn(opColOrig); err != nil {
+		return nil, nil, err
+	}
+
+	// 3. Map-based scan: last occurrence wins per group, first-appearance
 	// order for emission. O(n), no hashing, no collision risk.
 	type groupInfo struct {
 		winnerRow int
@@ -115,10 +129,7 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	}
 	opArr, ok := collapsed.Column(opIdx).(*array.Uint8)
 	if !ok {
-		return nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))
-	}
-	if err := validateOpColumn(opArr); err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("dataplane: collapse: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))
 	}
 
 	insUpdMask := array.NewBooleanBuilder(alloc)
