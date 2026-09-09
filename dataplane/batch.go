@@ -34,8 +34,12 @@ import "github.com/apache/arrow-go/v18/arrow"
 type WriteMode uint8
 
 const (
+	// ModeUnset is the zero value — invalid. A batch must carry an explicit
+	// mode; a zero value silently defaulting to upsert would corrupt write
+	// semantics. Sinks reject it.
+	ModeUnset WriteMode = iota
 	// UpsertMode collapses batches per-key and applies equality deletes.
-	UpsertMode WriteMode = iota
+	UpsertMode
 	// AppendMode passes every change through without collapse; deletes
 	// arrive as rows carrying the operation.
 	AppendMode
@@ -44,10 +48,18 @@ const (
 // Batch is the unit of work on the data plane: one table, one
 // RecordBatch in the wire schema, plus checkpoint bookkeeping.
 //
+// DO NOT COPY: a Batch holds a reference-counted arrow.RecordBatch.
+// Copying the struct (b2 := *b) shares the Record; calling Release on both
+// double-decrements the refcount and frees memory in use. Batches must be
+// passed and returned as pointers, and ownership transferred once.
+//
 // Single-table is a precondition: PK semantics are table-scoped;
 // collapse over a mixed-table batch is a bug. The wire schema is
 // per-table, so this is structural.
 type Batch struct {
+	// Table is the SINK-side target name (e.g. "raw.orders"), the identity
+	// the worker routes on and the sink writes to. core.TableRef splits the
+	// source/target pair; this is the target half.
 	Table string
 	// Record is the wire schema: data columns in schema order,
 	// followed by __op, __pos, __commit_ts. System columns
@@ -84,10 +96,12 @@ type Batch struct {
 }
 
 // Release frees the Arrow buffers held by the Record. Safe to call on a
-// nil Record (no-op). The caller must not use the Batch after Release.
+// nil Batch or nil Record (no-op). The caller must not use the Batch after
+// Release.
 func (b *Batch) Release() {
-	if b.Record != nil {
-		b.Record.Release()
-		b.Record = nil
+	if b == nil || b.Record == nil {
+		return
 	}
+	b.Record.Release()
+	b.Record = nil
 }

@@ -72,17 +72,17 @@ func Filter(ctx context.Context, alloc memory.Allocator, batch *Batch, mask arro
 	}
 
 	if filteredDelete.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDelete, Watermark: batch.Watermark}
+		deletes = &Batch{Table: batch.Table, Record: filteredDelete, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredDelete.Release()
 	}
 	if filteredInsert.NumRows() > 0 {
-		inserts = &Batch{Table: batch.Table, Record: filteredInsert, Watermark: batch.Watermark}
+		inserts = &Batch{Table: batch.Table, Record: filteredInsert, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredInsert.Release()
 	}
 	if filteredUpdate.NumRows() > 0 {
-		updates = &Batch{Table: batch.Table, Record: filteredUpdate, Watermark: batch.Watermark}
+		updates = &Batch{Table: batch.Table, Record: filteredUpdate, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredUpdate.Release()
 	}
@@ -299,17 +299,17 @@ func SplitByOp(ctx context.Context, alloc memory.Allocator, batch *Batch) (inser
 	}
 
 	if filteredIns.NumRows() > 0 {
-		inserts = &Batch{Table: batch.Table, Record: filteredIns, Watermark: batch.Watermark}
+		inserts = &Batch{Table: batch.Table, Record: filteredIns, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredIns.Release()
 	}
 	if filteredDel.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDel, Watermark: batch.Watermark}
+		deletes = &Batch{Table: batch.Table, Record: filteredDel, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredDel.Release()
 	}
 	if filteredUpd.NumRows() > 0 {
-		updates = &Batch{Table: batch.Table, Record: filteredUpd, Watermark: batch.Watermark}
+		updates = &Batch{Table: batch.Table, Record: filteredUpd, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredUpd.Release()
 	}
@@ -445,17 +445,17 @@ func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
 	}
 
 	if filteredInserts.NumRows() > 0 {
-		inserts = &Batch{Table: batch.Table, Record: filteredInserts, Watermark: batch.Watermark}
+		inserts = &Batch{Table: batch.Table, Record: filteredInserts, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredInserts.Release()
 	}
 	if filteredDeletes.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark}
+		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredDeletes.Release()
 	}
 	if filteredUpdates.NumRows() > 0 {
-		updates = &Batch{Table: batch.Table, Record: filteredUpdates, Watermark: batch.Watermark}
+		updates = &Batch{Table: batch.Table, Record: filteredUpdates, Watermark: batch.Watermark, Mode: batch.Mode}
 	} else {
 		filteredUpdates.Release()
 	}

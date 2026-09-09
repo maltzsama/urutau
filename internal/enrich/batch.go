@@ -37,7 +37,7 @@ func (s *Stage) EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error) {
 	if len(enriched) == 0 {
 		return nil, nil // inner joins dropped everything
 	}
-	cb := rowchange.Batch{Table: b.Table, Upserts: enriched, Mode: rowchange.WriteMode(b.Mode)}
+	cb := rowchange.Batch{Table: b.Table, Upserts: enriched, Mode: rowchange.ToRowMode(b.Mode)}
 	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
 	if err != nil {
 		return nil, fmt.Errorf("enrich: re-encode: %w", err)
