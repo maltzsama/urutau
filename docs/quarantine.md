@@ -32,36 +32,27 @@ dropped — never silently extended.
 
 ## Sequence
 
-### G0 — coordinator live-stream pump at batch granularity — DATE 2026-09-12
-Coordinator points (2 of the TREND). The pump today decodes each source
-batch back to rows (`changesFromReader`, one goroutine) and re-encodes
-**one row per Flight batch** (`enqueueBatch([]change, ...)`), also paying a
-per-change budget acquire and a per-row in-flight index entry. Batch-
-native: consume `source.Reader.Next()` batches directly, gate them whole
-during snapshot windows, serialize each once.
+### G0 — coordinator live-stream pump at batch granularity — DONE (2026-09-09)
+Coordinator points (2 of the TREND), closed in the G0 commit. The pump
+decoded each source batch back to rows (`changesFromReader`) and re-encoded
+**one row per Flight batch**. Batch-native: `sourceBatches` forwards the
+reader's batches whole; `enqueueBatch` serializes each once via
+`transport.EncodeRecord`; the snapshot gate holds raw batches with explicit
+Release discipline. #9 propagation preserved on the batch path.
+Granularity-insensitivity test added (worker writes identical rows fed as
+one / two / per-change batches). **TREND 23 → 21, TOTAL 29 → 27.**
 
-Design constraints (audited):
-- the batch is single-table (a pre-existing invariant the current
-  per-row re-stamp also depends on — unchanged, not newly assumed);
-- `meta.HighPos` = last row's `__pos` (BatchReader) — ack truncation is
-  `high <= ackPos`, so per-batch high stays compatible with `onAck`;
-- **error propagation (#9) must NOT regress**: pump death surfaces on the
-  terminal plane (`terminate` / the stream channel `run()` selects on),
-  never `Warn + return` into a silent wedge. #9's fix landed in `b23947f`;
-  G0 preserves and re-verifies it on the batch path;
-- the snapshot gate stays OPEN for a whole table snapshot; `flushWindow`
-  drains per chunk FIFO. Gate now holds batches (raw, pre-encode);
-- **granularity-insensitivity test** (the invariant G0 depends on): the
-  worker must not care about batch size — same logical stream at two
-  granularities → identical sink writes. This test exists as part of G0.
-
-**Kills:** coordinator `changesFromReader` + per-change pump + one-row
-encode. Net TREND −2.
-
-### G0.5 — runner snapshot relay batch-native — DATE 2026-09-15
-`runner.go` (1 of TREND): the relay's `AddWindowRows([]rowchange.Change)`
-bridges rows→batch for the worker's window entry. Accept a batch instead.
-Second, smaller proving field for the same shape.
+### G0.5 — runner snapshot relay — RE-HOMED into G2.3 + G1 (query source)
+`runner.go` (1 of TREND). DISCOVERED DURING G0: the relay's rows→batch
+bridge feeds `worker.AddWindowRows`, which decodes the batch back to rows
+for the window map — a DOUBLE round-trip whose two ends (relay encode,
+worker window decode) are each coupled to the query source (`scanChunk`,
+`src.Scan(row-map callback)` — a G1 producer) and to columnar window
+storage (G2.3). There is no independent small step: removing the relay's
+bridge without making windows columnar merely moves the decode. Re-homed:
+the point closes when G2.3 lands (windows as stored batch) with the query
+source producing the chunk batch (G1). Recorded here so the runner point is
+not silently claimed by a token rename.
 
 ### G2 — worker batcher M4 — the big one — DATE 2026-09-26
 `worker.go` (11) + `bridge.go` (5) + `enrich/batch.go` seam (1). The
