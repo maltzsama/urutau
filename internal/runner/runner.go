@@ -624,6 +624,18 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		closeStages()
 		return nil, err
 	}
+	// A source that can take the resolved schema (optional interface) gets
+	// it now so the source boundary gates on drift and encodes stable
+	// batches, keyed by the TARGET the changes are addressed to.
+	if si, ok := rdr.(source.SchemaSetter); ok {
+		byTarget := make(map[string]core.Schema, len(refs))
+		for _, t := range s.Tables {
+			if cs, ok := canonical[t.Source]; ok {
+				byTarget[t.Target] = cs
+			}
+		}
+		si.SetSourceSchemas(byTarget)
+	}
 	r.rdr = rdr
 	rdr.SetConfirmed(r.confirmedPosition)
 

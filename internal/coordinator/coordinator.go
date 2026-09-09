@@ -407,6 +407,19 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	defer rdr.Close()
+	// A source that can take the resolved schema (optional interface) gets
+	// it now: the source boundary then gates on drift against the native
+	// shape and encodes stable batches. Keyed by the TARGET the changes are
+	// addressed to.
+	if si, ok := rdr.(source.SchemaSetter); ok {
+		byTarget := make(map[string]core.Schema, len(refs))
+		for _, ref := range refs {
+			if cs, ok := c.canonical[ref.Source]; ok {
+				byTarget[ref.Target] = cs
+			}
+		}
+		si.SetSourceSchemas(byTarget)
+	}
 	// The slot's confirmed point tracks the minimum position workers have
 	// durably committed (their Acks), never the decode position — otherwise
 	// a crash between decode and commit would lose the in-flight window.

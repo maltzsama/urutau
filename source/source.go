@@ -135,6 +135,15 @@ type Streamer interface {
 	Open(ctx context.Context, refs []TableRef) (Reader, error)
 }
 
+// SchemaSetter is an optional Reader capability: the coordinator/runner
+// holds the RESOLVED canonical schema (spec-declared for stream sources,
+// cast-applied) and injects it after Open. The source boundary then gates
+// on drift against the native row shape and encodes stable batches —
+// never per-drain inference.
+type SchemaSetter interface {
+	SetSourceSchemas(schemas map[string]core.Schema)
+}
+
 // Positioner resolves the stream start position: the first-boot start and
 // the codec for a stored cdc.position.
 type Positioner interface {
