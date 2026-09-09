@@ -24,6 +24,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/maltzsama/urutau/core"
@@ -31,7 +32,6 @@ import (
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/observability"
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -140,7 +140,10 @@ type Coordinator struct {
 	gateMu  sync.Mutex
 	gateOn  bool
 	gateTgt string
-	gateBuf []rowchange.Change
+	// gateBuf holds source batches (live changes) while their table's
+	// snapshot window is open. Raw pre-encode batches: released by
+	// flushWindow/closeWindow after they are queued.
+	gateBuf []*dataplane.Batch
 	// gateDrain wakes a pump blocked on a full gate when flushWindow/
 	// closeWindow drains it (audit #5: the gate was the only buffer without
 	// a structural bound).
@@ -420,14 +423,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err := rdr.Start(ctx, start); err != nil {
 		return fmt.Errorf("coordinator: start stream: %w", err)
 	}
-	// QUARANTINE: the pull-based reader is decoded back to changes for the
-	// coordinator's per-change pump; dies when the coordinator consumes
-	// batches directly (M4).
-	out, streamErr := changesFromReader(ctx, rdr)
-
-	// Pump: every decoded change becomes one Flight batch. The FIFO queue
-	// preserves the wire ordering the window protocol needs, so the
-	// in-process flushReq drain disappears.
+	// Batch-native pump (G0/M4): the reader's batches are forwarded whole
+	// and serialized once per batch — no decode back to changes, no
+	// per-change one-row Flight batch. The FIFO queue preserves the wire
+	// ordering the window protocol needs.
+	out, streamErr := sourceBatches(ctx, rdr)
 	go c.pump(ctx, out)
 
 	// The snapshot runs in its own goroutine: run's terminal select must
@@ -639,20 +639,21 @@ func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error
 // open (gateOn), events of the gated table are buffered instead — released
 // InWindow-tagged by flushWindow after the worker confirms ChunkReady. Other
 // tables flow freely.
-func (c *Coordinator) pump(ctx context.Context, out <-chan rowchange.Change) {
+func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 	for {
 		select {
-		case ch, ok := <-out:
+		case b, ok := <-out:
 			if !ok {
 				return
 			}
 			if c.metrics != nil {
 				c.metrics.EventsDecoded.Inc()
 			}
-			if c.gateHold(ctx, ch) {
+			if c.gateHold(ctx, b) {
 				continue
 			}
-			if err := c.enqueueBatch(ctx, []rowchange.Change{ch}, batchMeta(ch)); err != nil {
+			// enqueueBatch takes ownership of b (serializes + releases).
+			if err := c.enqueueBatch(ctx, b, nil); err != nil {
 				c.log.Warn("coordinator: enqueue failed", "err", err)
 				// A pump death is a real failure: the reader stalls behind the
 				// closed out channel and the coordinator stays "alive" doing
@@ -672,17 +673,20 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan rowchange.Change) {
 	}
 }
 
-// gateMaxEvents bounds one snapshot window's held live events. Beyond it the
-// pump blocks until flushWindow drains — the gate's structural backpressure
-// (audit #5). Tuned to a few minutes of a busy table at ~10k/s.
-const gateMaxEvents = 65536
+// gateMaxEvents bounds one snapshot window's held live batches. Beyond it
+// the pump blocks until flushWindow drains — the gate's structural
+// backpressure (audit #5). Tuned to a few minutes of a busy table at
+// ~10k/s; batches are source-sized (≤ batchTarget rows), so the row volume
+// held is bounded by gateMaxEvents × batchTarget.
+const gateMaxEvents = 1024
 
-// gateHold buffers an event when a window is open for its table. A full
+// gateHold buffers a batch when a window is open for its table. A full
 // gate blocks the pump until the snapshot drains it, instead of growing the
-// buffer without bound.
-func (c *Coordinator) gateHold(ctx context.Context, ch rowchange.Change) bool {
+// buffer without bound. Ownership: when gateHold returns true the batch is
+// in the gate and released by flushWindow/closeWindow.
+func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 	c.gateMu.Lock()
-	if !c.gateOn || ch.Table != c.gateTgt {
+	if !c.gateOn || b.Table != c.gateTgt {
 		c.gateMu.Unlock()
 		return false
 	}
@@ -698,11 +702,11 @@ func (c *Coordinator) gateHold(ctx context.Context, ch rowchange.Change) bool {
 	c.gateMu.Lock()
 	// Re-check after the wait: the gate may have drained, closed, or the
 	// table changed while the pump was asleep.
-	if !c.gateOn || ch.Table != c.gateTgt {
+	if !c.gateOn || b.Table != c.gateTgt {
 		c.gateMu.Unlock()
 		return false
 	}
-	c.gateBuf = append(c.gateBuf, ch)
+	c.gateBuf = append(c.gateBuf, b)
 	c.gateMu.Unlock()
 	return true
 }
@@ -720,8 +724,9 @@ func (c *Coordinator) openWindow(target string) {
 	c.gateMu.Unlock()
 }
 
-// flushWindow drains the gated events collected since the last drain,
-// InWindow-tagged for the given chunk, then returns (gate stays open).
+// flushWindow drains the gated batches collected since the last drain,
+// each InWindow-tagged for the given chunk, then returns (gate stays open).
+// Batch ownership transfers to enqueueBatch per drain.
 func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 	c.gateMu.Lock()
 	buf, tgt := c.gateBuf, c.gateTgt
@@ -730,19 +735,22 @@ func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
 
-	if len(buf) == 0 {
-		return nil
-	}
-	// One batch, InWindow-tagged: the worker deletes each key from the
-	// chunk's window (the live version won) and applies the rowchange.
 	meta := &pb.BatchMeta{
 		Table:  tgt,
 		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
 	}
-	return c.enqueueBatch(ctx, buf, meta)
+	for i, b := range buf {
+		if err := c.enqueueBatch(ctx, b, meta); err != nil {
+			for _, rest := range buf[i+1:] {
+				rest.Release()
+			}
+			return err
+		}
+	}
+	return nil
 }
 
-// closeWindow releases any remaining gated events (post-last-chunk) and
+// closeWindow releases any remaining gated batches (post-last-chunk) and
 // closes the gate. The trailing events are ordinary live changes: no window
 // tag.
 func (c *Coordinator) closeWindow(ctx context.Context) error {
@@ -753,10 +761,16 @@ func (c *Coordinator) closeWindow(ctx context.Context) error {
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
 
-	if len(buf) == 0 {
-		return nil
+	meta := &pb.BatchMeta{Table: tgt}
+	for i, b := range buf {
+		if err := c.enqueueBatch(ctx, b, meta); err != nil {
+			for _, rest := range buf[i+1:] {
+				rest.Release()
+			}
+			return err
+		}
 	}
-	return c.enqueueBatch(ctx, buf, &pb.BatchMeta{Table: tgt})
+	return nil
 }
 
 // recordConfirmed stores a table's latest durably-committed position and
@@ -877,41 +891,77 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	return c.closeWindow(ctx)
 }
 
-// batchMeta derives the wire window tag from one rowchange.
-func batchMeta(ch rowchange.Change) *pb.BatchMeta {
-	m := &pb.BatchMeta{Table: ch.Table, LowPos: ch.Position, HighPos: ch.Position}
-	if ch.Window != nil {
-		m.Window = &pb.WindowTag{
-			InWindow: ch.Window.InWindow,
-			Closes:   ch.Window.Closes,
-			ChunkId:  ch.Window.ChunkID,
-		}
+// enqueueBatch queues ONE serialized batch on a worker's Flight stream and
+// charges its share of the global flow budget. A full budget blocks here —
+// the backpressure that stalls the pump and, through it, the reader. The
+// charge is released when the worker's Ack covers the batch's position
+// (onAck).
+//
+// Two shapes:
+//   - b != nil: a source batch, serialized ONCE as-is (no per-row re-encode).
+//     meta may be nil (plain live) or carry a window tag. Table and the
+//     commit position are derived from the batch when the meta lacks them.
+//     OWNERSHIP: enqueueBatch always releases b on every exit.
+//   - b == nil: a marker batch (window Closes) — an empty record whose meta
+//     carries the position and the window tag.
+func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta *pb.BatchMeta) error {
+	if b != nil {
+		defer b.Release()
 	}
-	return m
-}
-
-// enqueueBatch encodes rows, charges the worker's share of the global flow
-// budget, and queues the serialized batch on its Flight stream. A full
-// budget blocks here — the backpressure that stalls the pump and, through
-// it, the reader. The charge is released when the worker's Ack covers the
-// batch's position (onAck).
-func (c *Coordinator) enqueueBatch(ctx context.Context, rows []rowchange.Change, meta *pb.BatchMeta) error {
+	if meta == nil {
+		meta = &pb.BatchMeta{}
+	}
 	w, ok := c.route[meta.Table]
 	if !ok {
-		return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
-	}
-	meta.BatchId = c.batchSeq.Add(1)
-	// Resolve the canonical schema for typed wire encoding.
-	var cs core.Schema
-	for _, ref := range c.refs {
-		if ref.Target == meta.Table {
-			cs = c.canonical[ref.Source]
-			break
+		if b != nil {
+			meta.Table = b.Table
+		}
+		w, ok = c.route[meta.Table]
+		if !ok {
+			return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
 		}
 	}
-	body, metaBytes, err := transport.EncodeBatch(rows, cs, meta, nil)
-	if err != nil {
-		return err
+	meta.BatchId = c.batchSeq.Add(1)
+
+	var body []byte
+	var metaBytes []byte
+	var err error
+	if b == nil {
+		// Resolve the canonical schema for typed wire encoding of the
+		// zero-row marker record.
+		var cs core.Schema
+		for _, ref := range c.refs {
+			if ref.Target == meta.Table {
+				cs = c.canonical[ref.Source]
+				break
+			}
+		}
+		body, metaBytes, err = transport.EncodeBatch(nil, cs, meta, nil)
+		if err != nil {
+			return err
+		}
+	} else {
+		// The batch already carries the wire schema (data + metadata
+		// columns); serialize it whole. The commit position is the last
+		// row's __pos — ack truncation frees the batch once the worker
+		// commits at or past it.
+		if meta.HighPos == "" {
+			reader, rerr := transport.NewBatchReader(b.Record, nil)
+			if rerr != nil {
+				return rerr
+			}
+			if reader.NumRows() > 0 {
+				meta.HighPos = reader.Position(reader.NumRows() - 1)
+			}
+		}
+		body, err = transport.EncodeRecord(b.Record)
+		if err != nil {
+			return err
+		}
+		metaBytes, err = proto.Marshal(meta)
+		if err != nil {
+			return fmt.Errorf("coordinator: marshal batch meta: %w", err)
+		}
 	}
 	n := int64(len(body) + len(metaBytes))
 	if err := c.budget.acquire(ctx, w.name, n); err != nil {
@@ -1450,11 +1500,11 @@ func tableNames(refs []source.TableRef) []string {
 	return out
 }
 
-// changesFromReader pulls columnar batches from a reader and decodes them
-// back to changes. QUARANTINE: the coordinator's per-change pump still
-// consumes changes; dies when it consumes batches directly (M4).
-func changesFromReader(ctx context.Context, rdr source.Reader) (<-chan rowchange.Change, <-chan error) {
-	out := make(chan rowchange.Change, 1024)
+// sourceBatches forwards the reader's columnar batches to the pump — no
+// decode, no per-row hop (G0/M4). Ownership: each batch moves to the pump,
+// which gates, serializes and releases it.
+func sourceBatches(ctx context.Context, rdr source.Reader) (<-chan *dataplane.Batch, <-chan error) {
+	out := make(chan *dataplane.Batch, 16)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(out)
@@ -1468,22 +1518,11 @@ func changesFromReader(ctx context.Context, rdr source.Reader) (<-chan rowchange
 				errCh <- nil
 				return
 			}
-			table := b.Table
-			rows, derr := transport.DecodeBatch(b.Record, table, nil)
-			b.Release()
-			if derr != nil {
-				errCh <- derr
+			select {
+			case out <- b:
+			case <-ctx.Done():
+				b.Release()
 				return
-			}
-			for _, ch := range rows {
-				// DecodeBatch already stamps Table, but re-assert the
-				// sink-side target name the route and gate key on.
-				ch.Table = table
-				select {
-				case out <- ch:
-				case <-ctx.Done():
-					return
-				}
 			}
 		}
 	}()

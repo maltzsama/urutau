@@ -6,6 +6,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // reservedField is the document field the sink owns for its metadata
@@ -20,12 +21,17 @@ const reservedField = "_urutau"
 // and the type oracle — a KindUUID lands as a hyphenated string rather than
 // raw base64, a KindDecimal keeps its canonical text form, and everything
 // else serializes to its natural JSON.
-func (p *tablePlan) buildDoc(c rowchange.Change) (map[string]any, map[string]any, error) {
+// buildDoc renders one upserted row as the document body: data fields at
+// the top level, pipeline metadata under the reserved "_urutau" sub-object.
+// The row is read column-oriented from the wire record (BatchReader) — no
+// rowchange intermediate.
+func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, map[string]any, error) {
 	data := make(map[string]any, len(p.schema.Columns))
 	meta := make(map[string]any, len(p.meta))
+	row := rowMetaOf(r, i)
 	for _, col := range p.schema.Columns {
 		if m, ok := p.meta[col.Name]; ok {
-			v, err := metaValue(m.From, c, p.sourceTable)
+			v, err := metaValue(m.From, row, p.sourceTable)
 			if err != nil {
 				return nil, nil, fmt.Errorf("metadata %q: %w", col.Name, err)
 			}
@@ -36,7 +42,7 @@ func (p *tablePlan) buildDoc(c rowchange.Change) (map[string]any, map[string]any
 			meta[col.Name] = jv
 			continue
 		}
-		v, ok := c.After[col.Name]
+		v, ok := r.Value(col.Name, i)
 		if !ok {
 			continue
 		}
@@ -54,6 +60,30 @@ func (p *tablePlan) buildDoc(c rowchange.Change) (map[string]any, map[string]any
 		data[col.Name] = jv
 	}
 	return data, meta, nil
+}
+
+// rowMeta is the per-row metadata view metaValue needs, read straight from
+// the wire record. Transport-envelope fields (stream/shard/headers) are nil
+// on the wire path: their fallback semantics are unchanged.
+type rowMeta struct {
+	Op         rowchange.Op
+	Position   string
+	CommitTS   time.Time
+	IngestTS   time.Time
+	Snapshot   bool
+	EnrichMiss bool
+}
+
+func rowMetaOf(r *transport.BatchReader, i int) rowMeta {
+	commitTS, _ := r.CommitTS(i)
+	ingestTS, _ := r.IngestTS(i)
+	return rowMeta{
+		Op:       r.Op(i),
+		Position: r.Position(i),
+		CommitTS: commitTS,
+		IngestTS: ingestTS,
+		Snapshot: r.Snapshot(i),
+	}
 }
 
 // jsonValue converts a canonical Go value into its JSON document form.
@@ -99,7 +129,7 @@ func jsonValue(v any) (any, error) {
 // metaValue resolves one metadata key to its concrete value for a rowchange.
 // Mirrors the ClickHouse and Iceberg projections — same keys, same nil
 // semantics. Time values stay time.Time: encoding/json renders RFC3339.
-func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (any, error) {
+func metaValue(key core.MetadataKey, c rowMeta, sourceTable string) (any, error) {
 	switch key {
 	case core.MetaOp:
 		return c.Op.String(), nil
@@ -109,6 +139,9 @@ func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (an
 		}
 		return c.CommitTS, nil
 	case core.MetaIngestTS:
+		if c.IngestTS.IsZero() {
+			return nil, nil
+		}
 		return c.IngestTS, nil
 	case core.MetaPosition:
 		if c.Position == "" {
@@ -123,38 +156,21 @@ func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (an
 		}
 		return "stream", nil
 	case core.MetaStream:
-		if c.Transport != nil && c.Transport.Stream != "" {
-			return c.Transport.Stream, nil
-		}
-		return sourceTable, nil // CDC: the source table IS the stream
+		// Wire path: no transport envelope; the source table IS the stream.
+		return sourceTable, nil
 	case core.MetaShard:
-		if c.Transport == nil || c.Transport.Shard == "" {
-			return nil, nil
-		}
-		return c.Transport.Shard, nil
+		return nil, nil
 	case core.MetaSeq:
-		if c.Transport != nil && c.Transport.Seq != "" {
-			return c.Transport.Seq, nil
-		}
 		if c.Position == "" {
 			return nil, nil
 		}
 		return c.Position, nil // CDC: the event coordinate (GTID/LSN)
 	case core.MetaMsgTS:
-		if c.Transport == nil || c.Transport.MsgTS.IsZero() {
-			return nil, nil
-		}
-		return c.Transport.MsgTS, nil
+		return nil, nil
 	case core.MetaMsgKey:
-		if c.Transport == nil {
-			return nil, nil
-		}
-		return c.Transport.MsgKey, nil
+		return nil, nil
 	case core.MetaHeaders:
-		if c.Transport == nil || c.Transport.Headers == "" {
-			return nil, nil
-		}
-		return c.Transport.Headers, nil
+		return nil, nil
 	case core.MetaEnrichMiss:
 		if c.EnrichMiss {
 			return true, nil

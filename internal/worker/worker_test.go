@@ -73,13 +73,12 @@ func runWorker(t *testing.T, cfg Config, targets []string, committers map[string
 		w.RegisterCommitter(target, committers[target], dataplane.UpsertMode)
 		w.SetKnownSchema(target, testSchema())
 	}
-	raw := make(chan rowchange.Change, len(changes)+1)
-	for _, c := range changes {
-		raw <- c
+	ing := make(chan Ingest, len(changes)+1)
+	for _, in := range ingestFromChanges(t, changes) {
+		ing <- in
 	}
-	close(raw)
-	ingest := IngestFromChanges(context.Background(), raw, testSchema())
-	return w.Run(context.Background(), ingest)
+	close(ing)
+	return w.Run(context.Background(), ing)
 }
 
 // testSchema is the id/v schema used across worker tests.
@@ -110,6 +109,30 @@ func toIngest(t *testing.T, c rowchange.Change) Ingest {
 		return Ingest{Table: c.Table, Batch: dpb, Win: c.Window}
 	}
 	return Ingest{Table: c.Table, Batch: dpb}
+}
+
+// chanIngest returns a filled-and-closed Ingest channel for w.Run.
+func chanIngest(t *testing.T, ingests []Ingest) chan Ingest {
+	t.Helper()
+	ing := make(chan Ingest, len(ingests))
+	for _, in := range ingests {
+		ing <- in
+	}
+	close(ing)
+	return ing
+}
+
+// ingestFromChanges bridges a change list into per-change Ingest batches
+// (one row per batch — the worker is granularity-insensitive, see
+// granularity_test.go, so this is a faithful test feed). Window markers
+// pass through as Ingest with Win set.
+func ingestFromChanges(t *testing.T, changes []rowchange.Change) []Ingest {
+	t.Helper()
+	out := make([]Ingest, 0, len(changes))
+	for _, c := range changes {
+		out = append(out, toIngest(t, c))
+	}
+	return out
 }
 
 // toWindow bridges window rows into a batch for AddWindowRows.

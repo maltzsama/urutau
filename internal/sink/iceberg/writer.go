@@ -20,7 +20,6 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
@@ -130,9 +129,6 @@ func (w *TableWriter) Close() error { return nil }
 // batch temporarily absent (old rows deleted, new rows not yet written) but
 // the position has not advanced. Resume reprocesses the batch: deletes are
 // idempotent, appends rewrite. Converges without loss.
-//
-// QUARANTINE: the RecordBatch→rowchange.Batch unpack is a bridge that dies
-// when the Iceberg sink consumes RecordBatch directly (commit 3/4).
 func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// Split the batch into upsert rows and delete rows by __op (columnar).
 	// The append path is fully columnar (projectRecord); the equality-delete
@@ -517,136 +513,6 @@ func (w *TableWriter) deleteRecord(keys [][]any) (arrow.RecordBatch, error) {
 	return b.NewRecordBatch(), nil
 }
 
-// dataRecord builds one arrow record from the surviving rows.
-// QUARANTINE: row-based projection, kept only for test verification of the
-// projection logic. The production path uses projectRecord (columnar).
-// Deleted in commit 8.
-func (w *TableWriter) dataRecord(upserts []rowchange.Change) (arrow.RecordBatch, error) {
-	b := array.NewRecordBuilder(memory.DefaultAllocator, w.dataSchema)
-	defer b.Release()
-	for i, field := range w.dataSchema.Fields() {
-		values := make([]any, len(upserts))
-		for j, c := range upserts {
-			proj, err := w.project(c)
-			if err != nil {
-				return nil, err
-			}
-			values[j] = proj[field.Name]
-		}
-		if err := appendColumn(b.Field(i), field, values); err != nil {
-			return nil, err
-		}
-	}
-	return b.NewRecordBatch(), nil
-}
-
-// project resolves a change's source columns (applying casts) and metadata
-// columns into a flat map matching the dataSchema field names.
-// QUARANTINE: row-based, kept for test verification; the production path is
-// projectRecord (columnar). Deleted in commit 8.
-func (w *TableWriter) project(c rowchange.Change) (map[string]any, error) {
-	out := make(map[string]any, len(w.dataSchema.Fields()))
-	for _, f := range w.dataSchema.Fields() {
-		if m, ok := w.metaByName[f.Name]; ok {
-			v, err := metaValue(m.From, c, w.sourceTable)
-			if err != nil {
-				return nil, fmt.Errorf("iceberg: metadata %q: %w", f.Name, err)
-			}
-			out[f.Name] = v
-			continue
-		}
-		v, ok := c.After[f.Name]
-		if !ok {
-			out[f.Name] = nil
-			continue
-		}
-		if ct, ok := w.cast.Target(f.Name); ok {
-			cv, err := ct.Convert(v)
-			if err != nil {
-				return nil, fmt.Errorf("iceberg: column %q: %w", f.Name, err)
-			}
-			v = cv
-		}
-		out[f.Name] = v
-	}
-	return out, nil
-}
-
-// metaValue resolves one metadata key to its concrete value for a rowchange.
-func metaValue(key core.MetadataKey, c rowchange.Change, sourceTable string) (any, error) {
-	switch key {
-	case core.MetaOp:
-		return c.Op.String(), nil
-	case core.MetaCommitTS:
-		if c.CommitTS.IsZero() {
-			return nil, nil
-		}
-		return c.CommitTS, nil
-	case core.MetaIngestTS:
-		return c.IngestTS, nil
-	case core.MetaPosition:
-		if c.Position == "" {
-			return nil, nil
-		}
-		return c.Position, nil
-	case core.MetaSourceTable:
-		return sourceTable, nil
-	case core.MetaPhase:
-		if c.Snapshot {
-			return "snapshot", nil
-		}
-		return "stream", nil
-	case core.MetaStream:
-		if c.Transport != nil && c.Transport.Stream != "" {
-			return c.Transport.Stream, nil
-		}
-		return sourceTable, nil // CDC: the source table IS the stream
-	case core.MetaShard:
-		if c.Transport == nil || c.Transport.Shard == "" {
-			return nil, nil
-		}
-		return c.Transport.Shard, nil
-	case core.MetaSeq:
-		if c.Transport != nil && c.Transport.Seq != "" {
-			return c.Transport.Seq, nil
-		}
-		if c.Position == "" {
-			return nil, nil
-		}
-		return c.Position, nil // CDC: the event coordinate (GTID/LSN)
-	case core.MetaMsgTS:
-		if c.Transport == nil || c.Transport.MsgTS.IsZero() {
-			return nil, nil
-		}
-		return c.Transport.MsgTS, nil
-	case core.MetaMsgKey:
-		if c.Transport == nil {
-			return nil, nil
-		}
-		return c.Transport.MsgKey, nil
-	case core.MetaHeaders:
-		if c.Transport == nil || c.Transport.Headers == "" {
-			return nil, nil
-		}
-		return c.Transport.Headers, nil
-	case core.MetaEnrichMiss:
-		if c.EnrichMiss {
-			return true, nil
-		}
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("unknown metadata key %q", key)
-	}
-}
-
-// appendColumn appends a column of values into its builder. Composite
-// columns (struct/list/map) dispatch to the recursive nested path; scalar
-// columns convert each value against the concrete builder type. Numeric
-// coercion is schema-directed, not silent: the Iceberg column type is
-// authoritative, and JSON-based wire formats cannot distinguish whole
-// floats from ints, so int64 may arrive for a double column and vice versa.
-// Temporal, decimal, uuid and json values arrive as their canonical text and
-// are parsed at the column boundary.
 func appendColumn(builder array.Builder, field arrow.Field, values []any) error {
 	switch builder.(type) {
 	case *array.StructBuilder, *array.ListBuilder, *array.MapBuilder:

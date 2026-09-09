@@ -18,11 +18,13 @@ import (
 // without PK (C-8 fail-fast) — without it, any enriched batch containing a
 // delete errors out.
 //
-// QUARANTINE: the join itself is still row-based — the batch is decoded to
-// rows, joined, and re-encoded. This establishes the columnar seam so the
-// worker can consume batches; the join becomes truly columnar (CR-069 §3.4)
-// when the rowchange.Batch bridge dies. The extra round-trip is the price of
-// the seam during the transition.
+// The join itself is row-based BY DESIGN until the columnar broadcast join
+// lands (CR-069 §3.4): the batch is decoded to rows, joined, and re-encoded.
+// The worker consumes the seam's output columnar; the extra round-trip is
+// the deliberate price until CR-069 replaces the join kernel. Not dead code
+// and not transitional-pending-M4 — M4 passed with the worker columnar and
+// this seam remained, so the deferral is to the columnar JOIN, not to the
+// columnar worker.
 //
 // OWNERSHIP: the input batch is NOT released; the caller owns it. Returns
 // nil when inner joins dropped every row.

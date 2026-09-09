@@ -159,40 +159,15 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 	}
 
 	schema := rec.Schema()
-	numCols := int(rec.NumCols())
-	if numCols < 5 {
-		return nil, fmt.Errorf("transport: batch has %d columns — wire schema requires >= 5", numCols)
-	}
-	numDataCols := numCols - 5 // subtract metadata columns
-
-	// Validate the trailing 5 columns by name and type — before the row
-	// loop, so comma-ok casts below are safe assertions.
-	want := []arrow.Field{
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8},
-		{Name: "__pos", Type: arrow.BinaryTypes.String},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean},
-	}
-	for k, w := range want {
-		f := schema.Field(numDataCols + k)
-		if f.Name != w.Name || !arrow.TypeEqual(f.Type, w.Type) {
-			return nil, fmt.Errorf(
-				"transport: column %d: want %s, got %s(%s) — not wire schema",
-				numDataCols+k, w.Name, f.Name, f.Type)
-		}
+	numDataCols, err := validateWireSchema(schema)
+	if err != nil {
+		return nil, err
 	}
 
 	// Pre-resolve core types for each data column from the Arrow schema,
 	// honoring extension metadata (uuid/json) so the Kind survives the wire.
 	colTypes := make([]core.ColumnType, numDataCols)
 	for j := 0; j < numDataCols; j++ {
-		if name := schema.Field(j).Name; isMetadataColumn(name) {
-			// A reserved name in the data region means the record was
-			// produced post-AddMetadata (__phase appended) — decoding it
-			// would silently turn the phase into a data column.
-			return nil, fmt.Errorf("transport: column %d %q is reserved in the data region — post-AddMetadata batch is not decodable", j, name)
-		}
 		ct, err := fieldTypeToCore(schema.Field(j))
 		if err != nil {
 			return nil, fmt.Errorf("transport: column %d: %w", j, err)
@@ -561,6 +536,71 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		default:
 			return fmt.Errorf("want []byte for fixed binary, got %T", v)
 		}
+	case core.KindStruct:
+		// Canonical Go form: map[string]any keyed by field name. A field
+		// absent from the map appends null.
+		sb, ok := bld.(*array.StructBuilder)
+		if !ok {
+			return fmt.Errorf("want struct builder, got %T", bld)
+		}
+		fields := make(map[string]int, len(ct.Fields))
+		for j, f := range ct.Fields {
+			fields[f.Name] = j
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("want map[string]any for struct, got %T", v)
+		}
+		sb.Append(true)
+		for j, f := range ct.Fields {
+			fv, present := m[f.Name]
+			if !present {
+				sb.FieldBuilder(j).AppendNull()
+				continue
+			}
+			if err := appendTypedValue(sb.FieldBuilder(j), f.Type, fv); err != nil {
+				return fmt.Errorf("struct field %q: %w", f.Name, err)
+			}
+		}
+	case core.KindList:
+		lb, ok := bld.(*array.ListBuilder)
+		if !ok {
+			return fmt.Errorf("want list builder, got %T", bld)
+		}
+		if ct.Elem == nil {
+			return fmt.Errorf("list element type is nil")
+		}
+		items, ok := v.([]any)
+		if !ok {
+			return fmt.Errorf("want []any for list, got %T", v)
+		}
+		lb.Append(true)
+		for _, iv := range items {
+			if err := appendTypedValue(lb.ValueBuilder(), *ct.Elem, iv); err != nil {
+				return fmt.Errorf("list element: %w", err)
+			}
+		}
+	case core.KindMap:
+		mb, ok := bld.(*array.MapBuilder)
+		if !ok {
+			return fmt.Errorf("want map builder, got %T", bld)
+		}
+		if ct.KeyType == nil || ct.ValueType == nil {
+			return fmt.Errorf("map key/value types are nil")
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("want map[string]any for map, got %T", v)
+		}
+		mb.Append(true)
+		for k, mv := range m {
+			if err := appendTypedValue(mb.KeyBuilder(), *ct.KeyType, k); err != nil {
+				return fmt.Errorf("map key %q: %w", k, err)
+			}
+			if err := appendTypedValue(mb.ItemBuilder(), *ct.ValueType, mv); err != nil {
+				return fmt.Errorf("map value %q: %w", k, err)
+			}
+		}
 	default:
 		return fmt.Errorf("unsupported kind %s", ct.Kind)
 	}
@@ -646,6 +686,86 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 			return bytes.Clone(a.Value(i)), nil
 		}
 		return castErr()
+	case core.KindStruct:
+		a, ok := col.(*array.Struct)
+		if !ok {
+			return castErr()
+		}
+		st := a.DataType().(*arrow.StructType)
+		out := make(map[string]any, st.NumFields())
+		for f := range st.NumFields() {
+			if a.Field(f).IsNull(i) {
+				continue
+			}
+			ct, err := fieldTypeToCore(st.Field(f))
+			if err != nil {
+				return nil, fmt.Errorf("struct field %q: %w", st.Field(f).Name, err)
+			}
+			fv, err := readTypedValue(a.Field(f), ct, i)
+			if err != nil {
+				return nil, fmt.Errorf("struct field %q: %w", st.Field(f).Name, err)
+			}
+			out[st.Field(f).Name] = fv
+		}
+		return out, nil
+	case core.KindList:
+		a, ok := col.(*array.List)
+		if !ok {
+			return castErr()
+		}
+		ef := a.DataType().(*arrow.ListType).ElemField()
+		ect, err := fieldTypeToCore(ef)
+		if err != nil {
+			return nil, fmt.Errorf("list elem: %w", err)
+		}
+		s, e := a.ValueOffsets(i)
+		items := a.ListValues()
+		out := make([]any, 0, e-s)
+		for j := s; j < e; j++ {
+			if items.IsNull(int(j)) {
+				out = append(out, nil)
+				continue
+			}
+			ev, err := readTypedValue(items, ect, int(j))
+			if err != nil {
+				return nil, fmt.Errorf("list element %d: %w", j-s, err)
+			}
+			out = append(out, ev)
+		}
+		return out, nil
+	case core.KindMap:
+		a, ok := col.(*array.Map)
+		if !ok {
+			return castErr()
+		}
+		mt := a.DataType().(*arrow.MapType)
+		kct, err := fieldTypeToCore(mt.KeyField())
+		if err != nil {
+			return nil, fmt.Errorf("map key: %w", err)
+		}
+		vct, err := fieldTypeToCore(mt.ItemField())
+		if err != nil {
+			return nil, fmt.Errorf("map value: %w", err)
+		}
+		s, e := a.ValueOffsets(i)
+		out := make(map[string]any, e-s)
+		for j := s; j < e; j++ {
+			kv, err := readTypedValue(a.Keys(), kct, int(j))
+			if err != nil {
+				return nil, fmt.Errorf("map key %d: %w", j-s, err)
+			}
+			ks := fmt.Sprintf("%v", kv)
+			if a.Items().IsNull(int(j)) {
+				out[ks] = nil
+				continue
+			}
+			vv, err := readTypedValue(a.Items(), vct, int(j))
+			if err != nil {
+				return nil, fmt.Errorf("map value %q: %w", ks, err)
+			}
+			out[ks] = vv
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unsupported kind %s", ct.Kind)
 	}

@@ -30,12 +30,12 @@ func runSnapshotWorker(t *testing.T, state string, pending []uint32, changes []r
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
 	regTable(t, w, "t", fc, dataplane.UpsertMode)
 	w.SetSnapshotState("t", state, pending)
-	ingest := make(chan rowchange.Change, len(changes)+1)
-	for _, c := range changes {
-		ingest <- c
+	ing := make(chan Ingest, len(changes)+1)
+	for _, in := range ingestFromChanges(t, changes) {
+		ing <- in
 	}
-	close(ingest)
-	err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema()))
+	close(ing)
+	err := w.Run(context.Background(), ing)
 	return fc.batches, err
 }
 
@@ -150,13 +150,12 @@ func TestSchemaDriftIsTerminal(t *testing.T) {
 	}})
 	w.OnSchemaDrift(func(d SchemaDrift) { drifts = append(drifts, d) })
 
-	ingest := make(chan rowchange.Change, 8)
-	ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{1},
-		After: map[string]any{"id": int64(1), "extra": "x"}, Position: "p1"}
-	ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{2},
-		After: map[string]any{"id": int64(2), "extra": "y", "other": "z"}, Position: "p2"}
-	close(ingest)
-	err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema()))
+	err := w.Run(context.Background(), chanIngest(t, ingestFromChanges(t, []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", Key: []any{1},
+			After: map[string]any{"id": int64(1), "extra": "x"}, Position: "p1"},
+		{Op: rowchange.OpInsert, Table: "t", Key: []any{2},
+			After: map[string]any{"id": int64(2), "extra": "y", "other": "z"}, Position: "p2"},
+	})))
 	if err == nil || !strings.Contains(err.Error(), "schema drift") {
 		t.Fatalf("err = %v, want terminal schema-drift error", err)
 	}
@@ -273,11 +272,13 @@ func TestAppendModeOnDeleteSkip(t *testing.T) {
 // top-level ADD COLUMN: the table pauses and the drift reports the full
 // dotted path (address.complement), not just the top-level column.
 func TestSchemaDriftRecursiveStruct(t *testing.T) {
-	// SKIPPED during the bridge period (commit 4): the rowchange.Batch ->
-	// *dataplane.Batch bridge cannot encode composite columns, so the
-	// struct-carrying batch is dropped before the drift check runs.
-	// Passes when the bridge dies and sources produce Arrow directly (M4).
-	t.Skip("bridge cannot encode composite columns (QUARANTINE, dies in M4)")
+	// GATED on M4: the row->batch bridge encodes against the KNOWN schema,
+	// so an extra nested field ("complement") is silently dropped at encode
+	// and the drift is undetectable by the time the worker decodes the
+	// batch. Only source-native batches (sources producing Arrow directly)
+	// carry the source's own shape for the drift check to see. The nested
+	// drift LOGIC is unit-tested directly in checkDriftNested.
+	t.Skip("nested drift is undetectable through the known-schema bridge (QUARANTINE, dies in M4)")
 
 	var drifts []SchemaDrift
 	fc := &fakeCommitter{}
@@ -309,11 +310,11 @@ func TestSchemaDriftRecursiveStruct(t *testing.T) {
 
 // A conforming nested value (no new fields) passes through untouched.
 func TestSchemaDriftRecursiveStructConforms(t *testing.T) {
-	// SKIPPED during the bridge period (commit 3): the rowchange.Batch ->
-	// *dataplane.Batch bridge round-trips through transport.EncodeBatch,
-	// which cannot encode composite (struct) columns. This test passes
-	// when the bridge dies and sources produce Arrow directly (M4).
-	t.Skip("bridge cannot encode composite columns (QUARANTINE, dies in M4)")
+	// GATED on M4 for the same reason as TestSchemaDriftRecursiveStruct:
+	// the bridge encode against the known schema cannot carry a nested
+	// shape worth conforming to; source-native batches close this.
+	t.Skip("nested drift is undetectable through the known-schema bridge (QUARANTINE, dies in M4)")
+
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
 	regTable(t, w, "t", fc, dataplane.UpsertMode)

@@ -1,11 +1,15 @@
 package plugin
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 )
 
@@ -107,27 +111,40 @@ func TestExtractPK(t *testing.T) {
 	}
 }
 
-func TestCollectColumns(t *testing.T) {
-	b := batchWithColumns(t, "a", "b", "c")
-	cols := collectColumns(b)
-	if len(cols) != 3 {
-		t.Errorf("collectColumns = %v, want 3 columns", cols)
-	}
-}
-
-func TestBatchToRecords(t *testing.T) {
+func TestRecordsFromReader(t *testing.T) {
 	alloc := memory.NewGoAllocator()
-	b := rowchange.Batch{
-		Table:    "test",
-		Position: "pos123",
-		Changes: []rowchange.Change{
-			{Op: rowchange.OpInsert, Table: "test", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "name": "alice"}},
-			{Op: rowchange.OpUpdate, Table: "test", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "name": "bob"}},
-			{Op: rowchange.OpDelete, Table: "test", Key: []any{int64(3)}, Before: map[string]any{"id": int64(3), "name": "charlie"}},
-		},
+	// A wire-schema record: insert, update, delete — the delete carries
+	// its image in the flat columns (DELETE IMAGE CONTRACT).
+	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "name", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+	}, PrimaryKey: []string{"id"}})
+	if err != nil {
+		t.Fatalf("schema: %v", err)
 	}
+	bld := array.NewRecordBuilder(alloc, data)
+	defer bld.Release()
 
-	records := batchToRecords(b, alloc)
+	appendRow := func(op rowchange.Op, id int64, name string) {
+		bld.Field(0).(*array.Int64Builder).Append(id)
+		bld.Field(1).(*array.StringBuilder).Append(name)
+		bld.Field(2).(*array.Uint8Builder).Append(uint8(op))
+		bld.Field(3).(*array.StringBuilder).Append("pos" + fmt.Sprint(id))
+		bld.Field(4).(*array.TimestampBuilder).Append(0)
+		bld.Field(5).(*array.TimestampBuilder).Append(0)
+		bld.Field(6).(*array.BooleanBuilder).Append(false)
+	}
+	appendRow(rowchange.OpInsert, 1, "alice")
+	appendRow(rowchange.OpUpdate, 2, "bob")
+	appendRow(rowchange.OpDelete, 3, "charlie")
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+
+	reader, err := transport.NewBatchReader(rec, []string{"id"})
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	records := recordsFromReader(reader, alloc)
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(records))
 	}
@@ -139,6 +156,18 @@ func TestBatchToRecords(t *testing.T) {
 	if records[0].NumCols() != 5 { // op, id, name, offset, ts_source
 		t.Errorf("expected 5 cols, got %d", records[0].NumCols())
 	}
+	ops := records[0].Column(0).(*array.String)
+	if ops.Value(0) != "c" || ops.Value(1) != "c" || ops.Value(2) != "d" {
+		t.Errorf("op column = %q,%q,%q, want c,c,d", ops.Value(0), ops.Value(1), ops.Value(2))
+	}
+	names := records[0].Column(2).(*array.String)
+	if names.Value(0) != "alice" {
+		t.Errorf("name = %q, want alice", names.Value(0))
+	}
+	offsets := records[0].Column(3).(*array.Binary)
+	if string(offsets.Value(2)) != "pos3" {
+		t.Errorf("delete offset = %q, want pos3", offsets.Value(2))
+	}
 }
 
 func mustArrowSchema(t *testing.T) *arrow.Schema {
@@ -148,17 +177,6 @@ func mustArrowSchema(t *testing.T) *arrow.Schema {
 		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "active", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
 	}, nil)
-}
-
-func batchWithColumns(t *testing.T, cols ...string) rowchange.Batch {
-	t.Helper()
-	b := rowchange.Batch{Table: "test"}
-	for _, c := range cols {
-		b.Changes = append(b.Changes, rowchange.Change{
-			After: map[string]any{c: "val"},
-		})
-	}
-	return b
 }
 
 // TestStringPositionOpaqueOffsetsNotOrdered is the regression for the

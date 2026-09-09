@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
@@ -36,18 +35,18 @@ type controlDoc struct {
 // single-insert-per-partition rule. Existing properties are preserved:
 // the control document is the merge point of the commit path and the
 // snapshot orchestrator's SetProperties calls.
-func controlWrite(prev *controlDoc, b rowchange.Batch, now time.Time) *controlDoc {
+func controlWrite(prev *controlDoc, info batchInfo, now time.Time) *controlDoc {
 	ctrl := &controlDoc{Properties: map[string]string{}}
 	if prev != nil && prev.Properties != nil {
 		ctrl.Properties = prev.Properties
 	}
-	ctrl.Position = b.Position
+	ctrl.Position = info.Position
 	ctrl.UpdatedAt = now
-	if b.SnapshotState != "" {
-		ctrl.Properties[snapshot.PropSnapshotState] = b.SnapshotState
+	if info.SnapshotState != "" {
+		ctrl.Properties[snapshot.PropSnapshotState] = info.SnapshotState
 	}
-	if b.SnapshotPending != nil {
-		ctrl.Properties[snapshot.PropSnapshotPending] = snapshot.EncodePending(b.SnapshotPending)
+	if info.SnapshotPending != nil {
+		ctrl.Properties[snapshot.PropSnapshotPending] = snapshot.EncodePending(info.SnapshotPending)
 	}
 	return ctrl
 }

@@ -103,17 +103,17 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 }
 
 func (r *relay) AddWindowRows(target string, chunkID uint32, rows []rowchange.Change) error {
-	// QUARANTINE: bridge rows to a batch for the worker's window entry; dies
-	// when sources produce Arrow directly (M4).
+	// Encode against the introspected schema (the worker's known schema),
+	// never a per-batch inference.
 	cb := rowchange.Batch{Table: target, Changes: rows, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
-	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
+	dpb, err := dpint.BatchFromChangeBatch(cb, r.window.KnownSchema(target))
 	if err != nil {
 		return err
 	}
+	// The worker window takes ownership of the batch.
 	if err := r.window.AddWindowRows(target, chunkID, dpb); err != nil {
 		return err
 	}
-	dpb.Release()
 	return nil
 }
 

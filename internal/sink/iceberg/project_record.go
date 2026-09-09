@@ -16,6 +16,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // projectRecord maps a batch's wire Record into the Iceberg data schema.
@@ -31,6 +32,12 @@ func (w *TableWriter) projectRecord(ctx context.Context, b *dataplane.Batch) (ar
 	fields := w.dataSchema.Fields()
 	cols := make([]arrow.Array, len(fields))
 
+	// Canonical per-row reads power the cast path; built once per batch.
+	reader, err := transport.NewBatchReader(src, nil)
+	if err != nil {
+		return nil, fmt.Errorf("iceberg: %w", err)
+	}
+
 	for i, f := range fields {
 		if m, ok := w.metaByName[f.Name]; ok {
 			col, err := w.buildMetaColumn(src, m.From, nrows)
@@ -41,7 +48,7 @@ func (w *TableWriter) projectRecord(ctx context.Context, b *dataplane.Batch) (ar
 			cols[i] = col
 			continue
 		}
-		col, err := w.projectDataColumn(ctx, src, f)
+		col, err := w.projectDataColumn(ctx, reader, src, f)
 		if err != nil {
 			releaseCols(cols, i)
 			return nil, fmt.Errorf("iceberg: column %q: %w", f.Name, err)
@@ -57,8 +64,12 @@ func (w *TableWriter) projectRecord(ctx context.Context, b *dataplane.Batch) (ar
 }
 
 // projectDataColumn retains a source column when the type matches the
-// target field, otherwise casts columnar to the target type.
-func (w *TableWriter) projectDataColumn(ctx context.Context, src arrow.RecordBatch, field arrow.Field) (arrow.Array, error) {
+// target field, casts columnar otherwise. A declared cast policy takes
+// precedence and is applied VALUE-level: encodings like hex/base64 and the
+// uuid canonical form are value transformations the arrow kernel cannot
+// express. The row-based path always applied the cast; the columnar path
+// silently skipped it until the test-verification helpers caught it.
+func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.BatchReader, src arrow.RecordBatch, field arrow.Field) (arrow.Array, error) {
 	idx := -1
 	for i := range src.Schema().NumFields() {
 		if src.Schema().Field(i).Name == field.Name {
@@ -70,6 +81,29 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, src arrow.RecordBat
 		return nullColumn(field.Type, src.NumRows()), nil
 	}
 	col := src.Column(idx)
+
+	if ct, ok := w.cast.Target(field.Name); ok {
+		bld := array.NewBuilder(memory.DefaultAllocator, field.Type)
+		defer bld.Release()
+		values := make([]any, reader.NumRows())
+		for i := range reader.NumRows() {
+			v, ok := reader.Value(field.Name, i)
+			if !ok || v == nil {
+				values[i] = nil
+				continue
+			}
+			cv, err := ct.Convert(v)
+			if err != nil {
+				return nil, fmt.Errorf("value %d: %w", i, err)
+			}
+			values[i] = cv
+		}
+		if err := appendColumn(bld, field, values); err != nil {
+			return nil, err
+		}
+		return bld.NewArray(), nil
+	}
+
 	if arrow.TypeEqual(col.DataType(), field.Type) {
 		col.Retain()
 		return col, nil

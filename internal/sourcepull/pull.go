@@ -1,8 +1,13 @@
 // Package sourcepull adapts a push-based change channel into the pull-based
 // source.Reader.Next surface, bridging changes into columnar batches.
 //
-// QUARANTINE: the source decoders still produce rowchange.Change; Next bridges
-// them into batches. Dies when sources build Arrow directly (M4).
+// The decoders emit rowchange.Change (binlog/JSON events are row-shaped);
+// Next bridges them into wire batches. A source that can introspect its
+// tables supplies the canonical schemas via SetSchemas so batches encode
+// against a STABLE schema — never a per-batch inference that drifts when a
+// drain happens to omit a sparse column. Without schemas, makeBatch falls
+// back to inference for schema-less producers (their resolved schema is
+// owned upstream; see quarantine plan G1).
 package sourcepull
 
 import (
@@ -20,14 +25,22 @@ const batchTarget = 100
 // the pull-based Next surface. The concrete source calls Start to launch
 // its decoder and wire the error channel.
 type Puller struct {
-	ch    <-chan rowchange.Change
-	errCh <-chan error
-	buf   []rowchange.Change
+	ch      <-chan rowchange.Change
+	errCh   <-chan error
+	buf     []rowchange.Change
+	schemas map[string]core.Schema // target table -> canonical schema
 }
 
 // New builds a puller over the decoder's change channel.
 func New(ch <-chan rowchange.Change) *Puller {
 	return &Puller{ch: ch}
+}
+
+// SetSchemas installs the canonical schema per target table so makeBatch
+// encodes against a stable shape instead of per-drain inference. Call before
+// Next.
+func (p *Puller) SetSchemas(schemas map[string]core.Schema) {
+	p.schemas = schemas
 }
 
 // SetErr installs the decoder's terminal-error channel.
@@ -120,7 +133,8 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 		return nil, nil
 	}
 	cb := rowchange.Batch{Table: p.buf[0].Table, Changes: p.buf, Mode: rowchange.UpsertMode}
-	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
+	cs := p.schemas[p.buf[0].Table]
+	dpb, err := dpint.BatchFromChangeBatch(cb, cs)
 	p.buf = nil
 	if err != nil {
 		return nil, err
