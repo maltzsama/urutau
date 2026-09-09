@@ -273,11 +273,13 @@ func TestAppendModeOnDeleteSkip(t *testing.T) {
 // top-level ADD COLUMN: the table pauses and the drift reports the full
 // dotted path (address.complement), not just the top-level column.
 func TestSchemaDriftRecursiveStruct(t *testing.T) {
-	// SKIPPED during the bridge period (commit 4): the rowchange.Batch ->
-	// *dataplane.Batch bridge cannot encode composite columns, so the
-	// struct-carrying batch is dropped before the drift check runs.
-	// Passes when the bridge dies and sources produce Arrow directly (M4).
-	t.Skip("bridge cannot encode composite columns (QUARANTINE, dies in M4)")
+	// GATED on M4: the row->batch bridge encodes against the KNOWN schema,
+	// so an extra nested field ("complement") is silently dropped at encode
+	// and the drift is undetectable by the time the worker decodes the
+	// batch. Only source-native batches (sources producing Arrow directly)
+	// carry the source's own shape for the drift check to see. The nested
+	// drift LOGIC is unit-tested directly in checkDriftNested.
+	t.Skip("nested drift is undetectable through the known-schema bridge (QUARANTINE, dies in M4)")
 
 	var drifts []SchemaDrift
 	fc := &fakeCommitter{}
@@ -309,11 +311,11 @@ func TestSchemaDriftRecursiveStruct(t *testing.T) {
 
 // A conforming nested value (no new fields) passes through untouched.
 func TestSchemaDriftRecursiveStructConforms(t *testing.T) {
-	// SKIPPED during the bridge period (commit 3): the rowchange.Batch ->
-	// *dataplane.Batch bridge round-trips through transport.EncodeBatch,
-	// which cannot encode composite (struct) columns. This test passes
-	// when the bridge dies and sources produce Arrow directly (M4).
-	t.Skip("bridge cannot encode composite columns (QUARANTINE, dies in M4)")
+	// GATED on M4 for the same reason as TestSchemaDriftRecursiveStruct:
+	// the bridge encode against the known schema cannot carry a nested
+	// shape worth conforming to; source-native batches close this.
+	t.Skip("nested drift is undetectable through the known-schema bridge (QUARANTINE, dies in M4)")
+
 	fc := &fakeCommitter{}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
 	regTable(t, w, "t", fc, dataplane.UpsertMode)

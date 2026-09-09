@@ -536,6 +536,71 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		default:
 			return fmt.Errorf("want []byte for fixed binary, got %T", v)
 		}
+	case core.KindStruct:
+		// Canonical Go form: map[string]any keyed by field name. A field
+		// absent from the map appends null.
+		sb, ok := bld.(*array.StructBuilder)
+		if !ok {
+			return fmt.Errorf("want struct builder, got %T", bld)
+		}
+		fields := make(map[string]int, len(ct.Fields))
+		for j, f := range ct.Fields {
+			fields[f.Name] = j
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("want map[string]any for struct, got %T", v)
+		}
+		sb.Append(true)
+		for j, f := range ct.Fields {
+			fv, present := m[f.Name]
+			if !present {
+				sb.FieldBuilder(j).AppendNull()
+				continue
+			}
+			if err := appendTypedValue(sb.FieldBuilder(j), f.Type, fv); err != nil {
+				return fmt.Errorf("struct field %q: %w", f.Name, err)
+			}
+		}
+	case core.KindList:
+		lb, ok := bld.(*array.ListBuilder)
+		if !ok {
+			return fmt.Errorf("want list builder, got %T", bld)
+		}
+		if ct.Elem == nil {
+			return fmt.Errorf("list element type is nil")
+		}
+		items, ok := v.([]any)
+		if !ok {
+			return fmt.Errorf("want []any for list, got %T", v)
+		}
+		lb.Append(true)
+		for _, iv := range items {
+			if err := appendTypedValue(lb.ValueBuilder(), *ct.Elem, iv); err != nil {
+				return fmt.Errorf("list element: %w", err)
+			}
+		}
+	case core.KindMap:
+		mb, ok := bld.(*array.MapBuilder)
+		if !ok {
+			return fmt.Errorf("want map builder, got %T", bld)
+		}
+		if ct.KeyType == nil || ct.ValueType == nil {
+			return fmt.Errorf("map key/value types are nil")
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("want map[string]any for map, got %T", v)
+		}
+		mb.Append(true)
+		for k, mv := range m {
+			if err := appendTypedValue(mb.KeyBuilder(), *ct.KeyType, k); err != nil {
+				return fmt.Errorf("map key %q: %w", k, err)
+			}
+			if err := appendTypedValue(mb.ItemBuilder(), *ct.ValueType, mv); err != nil {
+				return fmt.Errorf("map value %q: %w", k, err)
+			}
+		}
 	default:
 		return fmt.Errorf("unsupported kind %s", ct.Kind)
 	}
