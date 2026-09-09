@@ -68,3 +68,52 @@ func TestUnknownSinkTypeSuggestsBlankImport(t *testing.T) {
 		}
 	}
 }
+
+// ── Audit regressions: duplicate/empty registration, negative, nil ─────
+
+// A plugin must not silently hijack a builtin kind — duplicate registration
+// is an error.
+func TestRegisterDuplicateRejected(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+
+	capFn := func(*spec.Spec, source.Runtime) (source.Source, error) { return nil, nil }
+	if err := RegisterSource("dup", source.Capabilities{}, capFn); err != nil {
+		t.Fatalf("first RegisterSource: %v", err)
+	}
+	if err := RegisterSource("dup", source.Capabilities{}, capFn); err == nil {
+		t.Error("duplicate RegisterSource must error")
+	}
+	if err := RegisterSink("dup", func(context.Context, sink.Config) (sink.Sink, error) { return nil, nil }); err != nil {
+		t.Fatalf("first RegisterSink: %v", err)
+	}
+	if err := RegisterSink("dup", func(context.Context, sink.Config) (sink.Sink, error) { return nil, nil }); err == nil {
+		t.Error("duplicate RegisterSink must error")
+	}
+}
+
+// Empty kinds are misconfigurations, not a legible default.
+func TestRegisterEmptyKindRejected(t *testing.T) {
+	resetRegistry()
+	t.Cleanup(resetRegistry)
+	if err := RegisterSource("", source.Capabilities{}, func(*spec.Spec, source.Runtime) (source.Source, error) { return nil, nil }); err == nil {
+		t.Error("RegisterSource with empty kind must error")
+	}
+	if err := RegisterSink("", func(context.Context, sink.Config) (sink.Sink, error) { return nil, nil }); err == nil {
+		t.Error("RegisterSink with empty type must error")
+	}
+}
+
+// A negative chunk ceiling is nonsense; reject it.
+func TestValidateParallelismNegative(t *testing.T) {
+	if err := ValidateParallelism("mysql", -1); err == nil {
+		t.Error("ValidateParallelism with negative chunks must error")
+	}
+}
+
+// OpenSource is public; it must not panic on a nil spec.
+func TestOpenSourceNilSpec(t *testing.T) {
+	if _, err := OpenSource(nil, source.Runtime{}); err == nil {
+		t.Error("OpenSource(nil) must error, not panic")
+	}
+}

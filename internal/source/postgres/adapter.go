@@ -39,13 +39,16 @@ func capabilities() source.Capabilities {
 }
 
 func init() {
-	driver.RegisterSource("postgres", capabilities(), func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
+	factory := func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
 		db, err := sql.Open("pgx", s.Source.URI)
 		if err != nil {
 			return nil, err
 		}
 		return Source{spec: s, rt: rt, db: db}, nil
-	})
+	}
+	if err := driver.RegisterSource("postgres", capabilities(), factory); err != nil {
+		panic(err)
+	}
 }
 
 var _ source.Source = Source{}

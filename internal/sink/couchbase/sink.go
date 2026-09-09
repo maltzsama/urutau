@@ -62,11 +62,11 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	if cfg.Namespace == "" {
 		return nil, errors.New("couchbase: sink.namespace (bucket) is required")
 	}
-	user, pass := cfg.Options["client_id"], cfg.Options["client_secret"]
+	user, pass := cfg.Options[driver.OptClientID], cfg.Options[driver.OptClientSecret]
 	if user == "" || pass == "" {
 		return nil, errors.New("couchbase: sink.clientId and sink.clientSecret are required (cluster credentials)")
 	}
-	atomic, err := parseCommitMode(cfg.Options["commit_mode"])
+	atomic, err := parseCommitMode(cfg.Options[driver.OptCommitMode])
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +94,7 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 		plans:      map[string]core.Schema{},
 		now:        time.Now,
 	}
-	if sc := cfg.Options["scope"]; sc != "" {
+	if sc := cfg.Options[driver.OptScope]; sc != "" {
 		s.scope = sc
 	}
 	if atomic {
@@ -435,7 +435,10 @@ func (a *txAttempt) get(ctx context.Context, id string, out any) (bool, error) {
 }
 
 func init() {
-	driver.RegisterSink("couchbase", func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
+	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
 		return Open(ctx, cfg)
-	})
+	}
+	if err := driver.RegisterSink("couchbase", factory); err != nil {
+		panic(err)
+	}
 }

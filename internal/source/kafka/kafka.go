@@ -47,9 +47,12 @@ func capabilities() source.Capabilities {
 }
 
 func init() {
-	driver.RegisterSource("kafka", capabilities(), func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
+	factory := func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
 		return Source{Spec: s, Rt: rt}, nil
-	})
+	}
+	if err := driver.RegisterSource("kafka", capabilities(), factory); err != nil {
+		panic(err)
+	}
 }
 
 var _ source.Source = Source{}

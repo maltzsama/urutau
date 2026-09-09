@@ -27,17 +27,16 @@ func main() {}
 // Init is the plugin entry point. It registers a source and sink with the
 // driver registry. Called by driver.LoadPlugin after plugin.Open.
 func Init() error {
-	driver.RegisterSource("plugin_demo", source.Capabilities{
+	if err := driver.RegisterSource("plugin_demo", source.Capabilities{
 		Stream: true,
 	}, func(*spec.Spec, source.Runtime) (source.Source, error) {
 		return &pluginSource{}, nil
-	})
-
-	driver.RegisterSink("plugin_demo", func(context.Context, sink.Config) (sink.Sink, error) {
+	}); err != nil {
+		return err
+	}
+	return driver.RegisterSink("plugin_demo", func(context.Context, sink.Config) (sink.Sink, error) {
 		return &pluginSink{records: newPluginRecords()}, nil
 	})
-
-	return nil
 }
 
 // ── Source ───────────────────────────────────────────────────────────

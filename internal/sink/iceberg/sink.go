@@ -26,10 +26,10 @@ type Sink struct {
 func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	cat, err := NewCatalog(ctx, Config{
 		URI:          cfg.URI,
-		Warehouse:    cfg.Options["warehouse"],
-		ClientID:     cfg.Options["client_id"],
-		ClientSecret: cfg.Options["client_secret"],
-		Scope:        cfg.Options["scope"],
+		Warehouse:    cfg.Options[driver.OptWarehouse],
+		ClientID:     cfg.Options[driver.OptClientID],
+		ClientSecret: cfg.Options[driver.OptClientSecret],
+		Scope:        cfg.Options[driver.OptScope],
 	})
 	if err != nil {
 		return nil, err
@@ -90,7 +90,10 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 func (s *Sink) Close() error { return nil }
 
 func init() {
-	driver.RegisterSink(driver.DefaultSinkType, func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
+	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
 		return Open(ctx, cfg)
-	})
+	}
+	if err := driver.RegisterSink(driver.DefaultSinkType, factory); err != nil {
+		panic(err)
+	}
 }
