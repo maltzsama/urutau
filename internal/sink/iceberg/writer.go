@@ -129,7 +129,6 @@ func (w *TableWriter) Close() error { return nil }
 // batch temporarily absent (old rows deleted, new rows not yet written) but
 // the position has not advanced. Resume reprocesses the batch: deletes are
 // idempotent, appends rewrite. Converges without loss.
-//
 func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// Split the batch into upsert rows and delete rows by __op (columnar).
 	// The append path is fully columnar (projectRecord); the equality-delete

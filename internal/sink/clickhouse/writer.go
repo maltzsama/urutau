@@ -295,16 +295,7 @@ func clickhouseRowMetaOf(r *transport.BatchReader, i int) chRowMeta {
 	}
 }
 
-// Keys project() uses to hand the technical values to valueFor without
-// colliding with user column names.
-const (
-	positionKey = "\x00position"
-	seqKey      = "\x00seq"
-	deletedKey  = "\x00is_deleted"
-)
-
-// metaValue resolves one metadata key to its concrete value for a rowchange.
-// Mirrors the Iceberg sink's projection — same keys, same nil semantics.
+// metaValue resolves one metadata key to its concrete value for a row.
 func metaValue(key core.MetadataKey, c chRowMeta, sourceTable string) (any, error) {
 	switch key {
 	case core.MetaOp:
@@ -353,5 +344,3 @@ func metaValue(key core.MetadataKey, c chRowMeta, sourceTable string) (any, erro
 		return nil, fmt.Errorf("unknown metadata key %q", key)
 	}
 }
-
-

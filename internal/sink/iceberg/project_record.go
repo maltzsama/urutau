@@ -15,8 +15,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // projectRecord maps a batch's wire Record into the Iceberg data schema.
