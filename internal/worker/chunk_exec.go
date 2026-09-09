@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -128,8 +127,11 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return fmt.Errorf("worker: chunk %d scan: %w", req.ChunkId, err)
 	}
 
+	// Encode against the introspected schema (the worker's known schema for
+	// this target), never a per-batch inference: window rows must carry the
+	// stable table shape the sink expects.
 	cb := rowchange.Batch{Table: ta.TargetTable, Changes: rows, Mode: rowchange.AppendMode}
-	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
+	dpb, err := dpint.BatchFromChangeBatch(cb, x.w.KnownSchema(ta.TargetTable))
 	if err != nil {
 		return fmt.Errorf("worker: chunk %d bridge: %w", req.ChunkId, err)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -320,6 +321,17 @@ func (w *Worker) SetKnownSchema(target string, schema core.Schema) {
 		return
 	}
 	p.knownSchema = schema
+}
+
+// KnownSchema returns the canonical schema registered for a target table
+// (empty when unset or unknown). Snapshot batch builders use it so window
+// rows encode against the introspected shape, never a per-batch inference.
+func (w *Worker) KnownSchema(target string) core.Schema {
+	p := w.tables[target]
+	if p == nil {
+		return core.Schema{}
+	}
+	return p.knownSchema
 }
 
 // checkDrift compares an incoming row's columns against the known schema,
@@ -1004,10 +1016,20 @@ func lastRowPos(b *dataplane.Batch) string {
 }
 
 // concatBatches concatenates the row lists of the given batches, in order,
-// into one owned batch. The input batches are NOT released.
+// into one owned batch. The input batches are NOT released. All batches must
+// share the same record schema (columns in the same order) — a source that
+// emits schema-varying batches (per-drain inference) fails loud here instead
+// of corrupting column alignment.
 func concatBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
 	if len(bs) == 0 {
 		return nil, nil
+	}
+	first := bs[0].Record.Schema()
+	for _, b := range bs[1:] {
+		sch := b.Record.Schema()
+		if !sameSchema(sch, first) {
+			return nil, fmt.Errorf("worker: concat: schema mismatch: %s vs %s (source batches must share a stable schema)", colsOf(sch), colsOf(first))
+		}
 	}
 	acc, err := mergeBatches(bs[0], nil, nil)
 	if err != nil {
@@ -1022,6 +1044,28 @@ func concatBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
 		acc = next
 	}
 	return acc, nil
+}
+
+// sameSchema reports field-for-field equality (names, types, order).
+func sameSchema(a, b *arrow.Schema) bool {
+	if a.NumFields() != b.NumFields() {
+		return false
+	}
+	for i := range a.NumFields() {
+		af, bf := a.Field(i), b.Field(i)
+		if af.Name != bf.Name || !arrow.TypeEqual(af.Type, bf.Type) {
+			return false
+		}
+	}
+	return true
+}
+
+func colsOf(s *arrow.Schema) string {
+	names := make([]string, s.NumFields())
+	for i := range s.NumFields() {
+		names[i] = s.Field(i).Name
+	}
+	return strings.Join(names, ",")
 }
 
 // selectRows returns a new owned batch holding the rows at the given
