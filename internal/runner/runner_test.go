@@ -25,8 +25,8 @@ type gateCommitter struct {
 
 func (c *gateCommitter) Close() error { return nil }
 func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
-	// Unpack to rowchange.Batch for test assertions.
-	// QUARANTINE: bridge that dies when tests consume RecordBatch directly.
+	// Decode to rowchange for row-shaped assertions — a test read path, not
+	// a production bridge.
 	if b.Record == nil || b.Record.NumRows() == 0 {
 		c.mu.Lock()
 		c.batches = append(c.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})

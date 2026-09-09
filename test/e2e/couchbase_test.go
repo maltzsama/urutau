@@ -166,8 +166,8 @@ func cbWriter(t *testing.T, ctx context.Context, s sink.Sink, ref core.TableRef,
 	return w
 }
 
-// toDPBatch wraps a rowchange.Batch into a *dataplane.Batch via the transport bridge.
-// QUARANTINE: dies when tests consume RecordBatch directly.
+// toDPBatch encodes a rowchange.Batch into a wire batch via the transport
+// encoder — the same encoder sources and the coordinator use.
 func toDPBatch(b rowchange.Batch) *dataplane.Batch {
 	cs := core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},

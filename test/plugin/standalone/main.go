@@ -151,8 +151,9 @@ func newPluginRecords() *pluginRecords {
 }
 
 func (r *pluginRecords) commit(b *dataplane.Batch) {
-	// QUARANTINE: bridge — accepts *dataplane.Batch but stores nothing yet.
-	// Dies when the plugin sink consumes RecordBatch directly.
+	// Compile-only example: this standalone demonstrates the sink contract
+	// shape; the real plugin sink (internal/plugin/sink.go) commits the
+	// RecordBatch columnar. Nothing is stored here on purpose.
 	_ = b
 }
 
