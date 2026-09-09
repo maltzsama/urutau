@@ -753,6 +753,8 @@ type TableAssignment struct {
 	CreateIfNotExists bool                   `protobuf:"varint,7,opt,name=create_if_not_exists,json=createIfNotExists,proto3" json:"create_if_not_exists,omitempty"`
 	SchemaArrow       []byte                 `protobuf:"bytes,8,opt,name=schema_arrow,json=schemaArrow,proto3" json:"schema_arrow,omitempty"` // table schema as Arrow IPC (data columns); the coordinator owns introspection
 	Enrich            []*EnrichRef           `protobuf:"bytes,9,rep,name=enrich,proto3" json:"enrich,omitempty"`                              // broadcast reference joins, applied in order
+	CastPolicy        []byte                 `protobuf:"bytes,10,opt,name=cast_policy,json=castPolicy,proto3" json:"cast_policy,omitempty"`   // JSON core.CastPolicy — writes must apply the same overrides as the coordinator's DDL
+	Metadata          []byte                 `protobuf:"bytes,11,opt,name=metadata,proto3" json:"metadata,omitempty"`                         // JSON []core.MetadataColumn — pipeline metadata columns land in the target
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -846,6 +848,20 @@ func (x *TableAssignment) GetSchemaArrow() []byte {
 func (x *TableAssignment) GetEnrich() []*EnrichRef {
 	if x != nil {
 		return x.Enrich
+	}
+	return nil
+}
+
+func (x *TableAssignment) GetCastPolicy() []byte {
+	if x != nil {
+		return x.CastPolicy
+	}
+	return nil
+}
+
+func (x *TableAssignment) GetMetadata() []byte {
+	if x != nil {
+		return x.Metadata
 	}
 	return nil
 }
@@ -1703,7 +1719,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a5\n" +
 	"\aAsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf9\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb6\x03\n" +
 	"\x0fTableAssignment\x12!\n" +
 	"\fsource_table\x18\x01 \x01(\tR\vsourceTable\x12!\n" +
 	"\ftarget_table\x18\x02 \x01(\tR\vtargetTable\x123\n" +
@@ -1715,7 +1731,11 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x0einclude_before\x18\x06 \x01(\bR\rincludeBefore\x12/\n" +
 	"\x14create_if_not_exists\x18\a \x01(\bR\x11createIfNotExists\x12!\n" +
 	"\fschema_arrow\x18\b \x01(\fR\vschemaArrow\x12,\n" +
-	"\x06enrich\x18\t \x03(\v2\x14.urutau.v1.EnrichRefR\x06enrich\"h\n" +
+	"\x06enrich\x18\t \x03(\v2\x14.urutau.v1.EnrichRefR\x06enrich\x12\x1f\n" +
+	"\vcast_policy\x18\n" +
+	" \x01(\fR\n" +
+	"castPolicy\x12\x1a\n" +
+	"\bmetadata\x18\v \x01(\fR\bmetadata\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
 	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xda\x02\n" +

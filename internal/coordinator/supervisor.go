@@ -109,16 +109,27 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	}
 
 	var stale []string
+	// Lock order: c.mu first, then s.mu. Session takes c.mu and calls
+	// noteAttach (s.mu) afterwards, so tick must never hold s.mu while
+	// taking c.mu — the two orders would deadlock (audit #3).
+	s.c.mu.Lock()
+	type attachProbe struct {
+		name     string
+		attached bool
+	}
+	probes := make([]attachProbe, 0, len(s.c.workers))
+	for name, w := range s.c.workers {
+		probes = append(probes, attachProbe{name: name, attached: w.attached})
+	}
+	s.c.mu.Unlock()
+
 	s.mu.Lock()
-	for worker, w := range s.c.workers {
-		s.c.mu.Lock()
-		attached := w.attached
-		s.c.mu.Unlock()
-		at, ok := s.lastAck[worker]
+	for _, p := range probes {
+		at, ok := s.lastAck[p.name]
 		// A reset worker that never reattached keeps the job in crashloop;
 		// an attached worker that never acked is just as stale.
-		if s.pending[worker] || (attached && (!ok || now.Sub(at) > ack)) {
-			stale = append(stale, worker)
+		if s.pending[p.name] || (p.attached && (!ok || now.Sub(at) > ack)) {
+			stale = append(stale, p.name)
 		}
 	}
 	s.mu.Unlock()
