@@ -410,10 +410,44 @@ func (r *Runner) emit(kind string, fields map[string]any) {
 // position. It returns once snapshots are done and the stream is live; Run
 // then blocks until cancellation or a terminal error. Resources are owned
 // by the Runner and released when Run returns.
-func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err error) {
+// NewRunner opens the source and sink through the driver registry — the
+// runner consumes only the contracts, never a concrete implementation.
+func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	src, err := driver.OpenSource(s, source.Runtime{
+		ServerID:  cfg.ServerID,
+		Heartbeat: cfg.Heartbeat,
+		Logger:    cfg.Logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	snk, err := driver.OpenSink(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	// The parallel-chunk setting may not exceed the ceiling the source
+	// driver declares — fail fast at boot, not mid-snapshot.
+	if err := driver.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
+	}
+	return newRunner(ctx, s, cfg, src, snk)
+}
+
+// NewRunnerWithAdapters runs the pipeline over already-open source/sink
+// adapters — the external plugin path. The adapters implement the public
+// source.Source / sink.Sink contracts; the caller owns parallelism
+// validation (a plugin source declares no registry ceiling).
+func NewRunnerWithAdapters(ctx context.Context, s *spec.Spec, cfg Config, src source.Source, snk sink.Sink) (*Runner, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return newRunner(ctx, s, cfg, src, snk)
+}
+
+func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source, snk sink.Sink) (r *Runner, err error) {
 	log := cfg.Logger
 
 	// Audit trail first: job_started marks the boot, and a startup failure
@@ -436,30 +470,12 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (r *Runner, err er
 		}()
 	}
 
-	// Open the source and sink through the driver registry — the runner
-	// consumes only the contracts, never a concrete implementation.
-	src, err := driver.OpenSource(s, source.Runtime{
-		ServerID:  cfg.ServerID,
-		Heartbeat: cfg.Heartbeat,
-		Logger:    log,
-	})
-	if err != nil {
-		return nil, err
-	}
-	snk, err := driver.OpenSink(ctx, s)
-	if err != nil {
-		return nil, err
-	}
+	// A startup failure must release the sink (the adapters path owns it).
 	defer func() {
 		if r == nil {
 			_ = snk.Close()
 		}
 	}()
-	// The parallel-chunk setting may not exceed the ceiling the source
-	// driver declares — fail fast at boot, not mid-snapshot.
-	if err := driver.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
-		return nil, fmt.Errorf("runner: %w", err)
-	}
 
 	// The SQL surface (chunked snapshot SELECTs) is optional: a stream source
 	// (kafka) has no query connection. The source owns that connection; the
