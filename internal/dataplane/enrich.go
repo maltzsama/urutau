@@ -3,7 +3,6 @@ package dataplane
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -91,19 +90,18 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 	}, nil
 }
 
-// MetadataColumns are the system columns injected by the metadata stage.
-type MetadataColumns struct {
-	CommitTS time.Time
-	IngestTS time.Time
-	Snapshot bool
-}
-
 // AddMetadata injects the __phase system column into the batch. The
 // __commit_ts, __ingest_ts, __snapshot columns are expected on the wire
 // (CoreSchemaToArrow emits them) — AddMetadata does NOT re-add them.
+// Valid phases: "live", "snapshot".
 //
 // OWNERSHIP: the input batch is NOT Released. Input always exits valid.
-func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta MetadataColumns) (*Batch, error) {
+func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, phase string) (*Batch, error) {
+	switch phase {
+	case "live", "snapshot":
+	default:
+		return nil, fmt.Errorf("dataplane: addmetadata: phase %q unknown (want live | snapshot)", phase)
+	}
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -125,13 +123,9 @@ func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta
 	nrows := int(batch.Record.NumRows())
 	tmpl := batch.Record
 
-	// __phase (Utf8) — derived from Snapshot.
+	// __phase (Utf8) — caller-provided phase.
 	pb := array.NewStringBuilder(alloc)
 	defer pb.Release()
-	phase := "live"
-	if meta.Snapshot {
-		phase = "snapshot"
-	}
 	for range nrows {
 		pb.Append(phase)
 	}

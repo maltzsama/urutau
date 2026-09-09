@@ -3,7 +3,6 @@ package dataplane_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -138,14 +137,7 @@ func TestAddMetadataColumns(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	ts := time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC)
-	meta := dataplane.MetadataColumns{
-		CommitTS: ts,
-		IngestTS: ts.Add(200 * time.Millisecond),
-		Snapshot: false,
-	}
-
-	out, err := dataplane.AddMetadata(context.Background(), alloc, b, meta)
+	out, err := dataplane.AddMetadata(context.Background(), alloc, b, "live")
 	if err != nil {
 		t.Fatalf("AddMetadata: %v", err)
 	}
@@ -182,6 +174,36 @@ func TestAddMetadataColumns(t *testing.T) {
 	if string(out.Watermark) != string(b.Watermark) {
 		t.Errorf("Watermark changed: %q -> %q", b.Watermark, out.Watermark)
 	}
+
+	// T-6: AddMetadata is idempotent — a second call must NOT append a
+	// second __phase, and __ingest_ts must still be a Timestamp column.
+	out2, err := dataplane.AddMetadata(context.Background(), alloc, out, "live")
+	if err != nil {
+		t.Fatalf("AddMetadata #2: %v", err)
+	}
+	defer out2.Release()
+	if out2.Record.Schema() != out.Record.Schema() {
+		t.Fatal("second AddMetadata must be a no-op (same schema pointer)")
+	}
+	phaseCount := 0
+	for i := range schema.NumFields() {
+		if schema.Field(i).Name == "__phase" {
+			phaseCount++
+		}
+	}
+	if phaseCount != 1 {
+		t.Errorf("__phase count = %d, want 1", phaseCount)
+	}
+	// __ingest_ts must still be a Timestamp(Microsecond, UTC) column.
+	for i := range schema.NumFields() {
+		f := schema.Field(i)
+		if f.Name == "__ingest_ts" {
+			ts, isTs := f.Type.(*arrow.TimestampType)
+			if !isTs || ts.Unit != arrow.Microsecond || ts.TimeZone != "UTC" {
+				t.Errorf("__ingest_ts type = %v, want Timestamp(Microsecond, UTC)", f.Type)
+			}
+		}
+	}
 }
 
 func TestAddMetadataSnapshotPhase(t *testing.T) {
@@ -189,13 +211,7 @@ func TestAddMetadataSnapshotPhase(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 3, Allocator: alloc})
 	defer b.Release()
 
-	meta := dataplane.MetadataColumns{
-		CommitTS: time.Now(),
-		IngestTS: time.Now(),
-		Snapshot: true,
-	}
-
-	out, err := dataplane.AddMetadata(context.Background(), alloc, b, meta)
+	out, err := dataplane.AddMetadata(context.Background(), alloc, b, "snapshot")
 	if err != nil {
 		t.Fatalf("AddMetadata: %v", err)
 	}
@@ -223,10 +239,7 @@ func TestAddMetadataEmptyBatch(t *testing.T) {
 	defer rb.Release()
 	b2 := &dataplane.Batch{Table: b.Table, Record: rb, Watermark: b.Watermark}
 
-	out, err := dataplane.AddMetadata(context.Background(), alloc, b2, dataplane.MetadataColumns{
-		CommitTS: time.Now(),
-		IngestTS: time.Now(),
-	})
+	out, err := dataplane.AddMetadata(context.Background(), alloc, b2, "live")
 	if err != nil {
 		t.Fatalf("AddMetadata: %v", err)
 	}

@@ -47,6 +47,13 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 	// the row values.
 	cs = mergeSchema(all, cs)
 
+	// C-8 fail-fast: deletes without a PK produce orphaned NULL tuples in
+	// the sink. The enrich path cannot reconstitute a key from After (it
+	// may be nil or empty). When PK is empty the pump must not send deletes.
+	if len(cs.PrimaryKey) == 0 && len(b.Deletes) > 0 {
+		return nil, fmt.Errorf("dataplane: batch %q has %d delete(s) but schema has no PrimaryKey — deletes would become orphaned NULLs in the sink", b.Table, len(b.Deletes))
+	}
+
 	meta := &pb.BatchMeta{
 		Table:   b.Table,
 		HighPos: b.Position,
@@ -100,6 +107,10 @@ func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	}
 	cols := make([]core.Column, 0, len(seen))
 	for k, ct := range seen {
+		// Nullable: an enriched (left-join miss) column legitimately holds
+		// NULL, and any inferred column may be absent from some changes —
+		// re-encoding against a NOT NULL assumption would fail.
+		ct.Nullable = true
 		cols = append(cols, core.Column{Name: k, Type: ct})
 	}
 	sort.Slice(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })

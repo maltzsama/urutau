@@ -280,12 +280,40 @@ func TestTransitionMatrixEmptyPreds(t *testing.T) {
 		}
 	}()
 
-	// Empty preds → all pass → __op determines buckets.
-	// Total rows must equal the batch size.
-	total := insNumRows(ins) + delNumRows(del) + updNumRows(upd)
-	if total != 10 {
-		t.Errorf("expected 10 total rows across all outputs, got %d (ins=%d del=%d upd=%d)",
-			total, insNumRows(ins), delNumRows(del), updNumRows(upd))
+	// Empty preds → all pass → __op determines buckets. The per-bucket
+	// counts must match the source batch's per-op distribution exactly —
+	// a total-only assert would hide rows silently vanishing from one
+	// bucket while another over-counts.
+	var wantIns, wantDel, wantUpd int
+	opIdx := -1
+	for i := range b.Record.Schema().NumFields() {
+		if b.Record.Schema().Field(i).Name == "__op" {
+			opIdx = i
+			break
+		}
+	}
+	if opIdx < 0 {
+		t.Fatal("__op column not found")
+	}
+	opCol := b.Record.Column(opIdx).(*array.Uint8)
+	for i := range opCol.Len() {
+		switch opCol.Value(i) {
+		case uint8(dataplane.OpInsert):
+			wantIns++
+		case uint8(dataplane.OpDelete):
+			wantDel++
+		case uint8(dataplane.OpUpdate):
+			wantUpd++
+		}
+	}
+	if got := insNumRows(ins); got != wantIns {
+		t.Errorf("inserts = %d, want %d (per-op distribution)", got, wantIns)
+	}
+	if got := delNumRows(del); got != wantDel {
+		t.Errorf("deletes = %d, want %d (per-op distribution)", got, wantDel)
+	}
+	if got := updNumRows(upd); got != wantUpd {
+		t.Errorf("updates = %d, want %d (per-op distribution)", got, wantUpd)
 	}
 }
 
