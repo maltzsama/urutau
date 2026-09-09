@@ -37,7 +37,7 @@ func NewSQLLoader(uri, query string) (Loader, error) {
 			return nil, fmt.Errorf("enrich: reference uri: %w", err)
 		}
 		dsn = d
-	case len(uri) >= 11 && (uri[:11] == "postgres://" || uri[:14] == "postgresql://"):
+	case strings.HasPrefix(uri, "postgres://") || strings.HasPrefix(uri, "postgresql://"):
 		driver = "pgx"
 		dsn = uri // pgx accepts postgres:// URIs natively
 	default:
