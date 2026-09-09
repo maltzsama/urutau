@@ -457,11 +457,12 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 	nrows := int(batch.Record.NumRows())
 	if len(preds) == 0 {
 		bb := array.NewBooleanBuilder(alloc)
-		defer bb.Release()
 		for range nrows {
 			bb.Append(true)
 		}
-		return bb.NewBooleanArray(), nil
+		arr := bb.NewBooleanArray()
+		bb.Release() // explicit, not deferred — buffers live in arr now
+		return arr, nil
 	}
 
 	var combined arrow.Array
@@ -479,7 +480,6 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 		}
 		// AND: combined = combined AND mask
 		bb := array.NewBooleanBuilder(alloc)
-		defer bb.Release()
 		cArr := combined.(*array.Boolean)
 		mArr := mask.(*array.Boolean)
 		for j := range cArr.Len() {
@@ -488,6 +488,7 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 		mask.Release()
 		combined.Release()
 		combined = bb.NewBooleanArray()
+		bb.Release() // explicit, not deferred — safe inside the loop
 	}
 	return combined, nil
 }
