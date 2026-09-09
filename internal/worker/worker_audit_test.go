@@ -30,12 +30,12 @@ func runSnapshotWorker(t *testing.T, state string, pending []uint32, changes []r
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
 	regTable(t, w, "t", fc, dataplane.UpsertMode)
 	w.SetSnapshotState("t", state, pending)
-	ingest := make(chan rowchange.Change, len(changes)+1)
-	for _, c := range changes {
-		ingest <- c
+	ing := make(chan Ingest, len(changes)+1)
+	for _, in := range ingestFromChanges(t, changes) {
+		ing <- in
 	}
-	close(ingest)
-	err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema()))
+	close(ing)
+	err := w.Run(context.Background(), ing)
 	return fc.batches, err
 }
 
@@ -150,13 +150,12 @@ func TestSchemaDriftIsTerminal(t *testing.T) {
 	}})
 	w.OnSchemaDrift(func(d SchemaDrift) { drifts = append(drifts, d) })
 
-	ingest := make(chan rowchange.Change, 8)
-	ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{1},
-		After: map[string]any{"id": int64(1), "extra": "x"}, Position: "p1"}
-	ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{2},
-		After: map[string]any{"id": int64(2), "extra": "y", "other": "z"}, Position: "p2"}
-	close(ingest)
-	err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema()))
+	err := w.Run(context.Background(), chanIngest(t, ingestFromChanges(t, []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", Key: []any{1},
+			After: map[string]any{"id": int64(1), "extra": "x"}, Position: "p1"},
+		{Op: rowchange.OpInsert, Table: "t", Key: []any{2},
+			After: map[string]any{"id": int64(2), "extra": "y", "other": "z"}, Position: "p2"},
+	})))
 	if err == nil || !strings.Contains(err.Error(), "schema drift") {
 		t.Fatalf("err = %v, want terminal schema-drift error", err)
 	}

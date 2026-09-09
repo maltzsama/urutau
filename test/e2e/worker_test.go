@@ -11,11 +11,47 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/spec"
 )
+
+// localIngestFromChanges is the e2e feed mirror for the worker's former
+// row batcher (removed in G2): bridge each change into an Ingest batch.
+// The worker is granularity-insensitive, so per-change batches are faithful.
+func localIngestFromChanges(ctx context.Context, changes <-chan rowchange.Change) <-chan worker.Ingest {
+	out := make(chan worker.Ingest, 64)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case c, ok := <-changes:
+				if !ok {
+					return
+				}
+				cb := rowchange.Batch{Table: c.Table, Changes: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
+				dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
+				if err != nil {
+					continue
+				}
+				var win *rowchange.Window
+				if c.Window != nil && c.Window.InWindow {
+					win = &rowchange.Window{ChunkID: c.Window.ChunkID, InWindow: true}
+				}
+				select {
+				case out <- worker.Ingest{Table: c.Table, Batch: dpb, Win: win}:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
 
 // TestWorkerEndToEnd drives the collapsed worker with synthetic changes
 // loaded from the inline YAML authoring format and proves the final state by
@@ -91,7 +127,7 @@ tables:
 	w.OnCommit(func(b *dataplane.Batch, _ int) { committed = append(committed, b) })
 
 	rawIngest := make(chan rowchange.Change, 32)
-	ingest := worker.IngestFromChanges(ctx, rawIngest, core.Schema{})
+	ingest := localIngestFromChanges(ctx, rawIngest)
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx, ingest) }()
 
