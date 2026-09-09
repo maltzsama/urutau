@@ -82,9 +82,12 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, error) 
 	}
 
 	return &Batch{
-		Table:     batch.Table,
-		Record:    newRecord,
-		Watermark: batch.Watermark,
+		Table:           batch.Table,
+		Record:          newRecord,
+		Watermark:       batch.Watermark,
+		Mode:            batch.Mode,
+		SnapshotState:   batch.SnapshotState,
+		SnapshotPending: batch.SnapshotPending,
 	}, nil
 }
 
@@ -95,9 +98,9 @@ type MetadataColumns struct {
 	Snapshot bool
 }
 
-// AddMetadata injects system columns (__ingest_ts, __snapshot, __phase)
-// into the batch. The __commit_ts column is projected from the existing
-// wire schema (CR-069 §3.6: project, don't compute, what already exists).
+// AddMetadata injects the __phase system column into the batch. The
+// __commit_ts, __ingest_ts, __snapshot columns are expected on the wire
+// (CoreSchemaToArrow emits them) — AddMetadata does NOT re-add them.
 //
 // OWNERSHIP: the input batch is NOT Released. Input always exits valid.
 func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta MetadataColumns) (*Batch, error) {
@@ -108,29 +111,21 @@ func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta
 		return batch, nil
 	}
 
+	// Validate that the wire schema carries the 5 metadata columns.
+	for _, w := range []string{"__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot"} {
+		if colIndex(batch.Record.Schema(), w) < 0 {
+			return nil, fmt.Errorf("dataplane: addmetadata: %q ausente — requer batch wire-schema", w)
+		}
+	}
+	// Idempotent: __phase already present → no-op.
+	if colIndex(batch.Record.Schema(), "__phase") >= 0 {
+		return batch, nil
+	}
+
 	nrows := int(batch.Record.NumRows())
 	tmpl := batch.Record
 
-	// Check if __commit_ts already exists — if so, project it; if not, add it.
-	hasCommitTS := colIndex(tmpl.Schema(), "__commit_ts") >= 0
-
-	// __ingest_ts (Int64, epoch millis)
-	it := array.NewInt64Builder(alloc)
-	defer it.Release()
-	for range nrows {
-		it.Append(meta.IngestTS.UnixMilli())
-	}
-	itArr := it.NewInt64Array()
-
-	// __snapshot (Boolean)
-	sb := array.NewBooleanBuilder(alloc)
-	defer sb.Release()
-	for range nrows {
-		sb.Append(meta.Snapshot)
-	}
-	sbArr := sb.NewBooleanArray()
-
-	// __phase (Utf8) — derived from Snapshot, not from MetadataColumns.Phase.
+	// __phase (Utf8) — derived from Snapshot.
 	pb := array.NewStringBuilder(alloc)
 	defer pb.Release()
 	phase := "live"
@@ -142,50 +137,32 @@ func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, meta
 	}
 	pbArr := pb.NewStringArray()
 
-	// Build new schema: original fields + system columns not yet present.
+	// Build new schema: original fields + __phase.
 	srcFields := tmpl.Schema().Fields()
-	extraFields := []arrow.Field{
-		{Name: "__ingest_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
-		{Name: "__phase", Type: &arrow.StringType{}, Nullable: true},
-	}
-	if !hasCommitTS {
-		extraFields = append([]arrow.Field{
-			{Name: "__commit_ts", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		}, extraFields...)
-	}
-	newFields := make([]arrow.Field, 0, len(srcFields)+len(extraFields))
+	newFields := make([]arrow.Field, 0, len(srcFields)+1)
 	newFields = append(newFields, srcFields...)
-	newFields = append(newFields, extraFields...)
+	newFields = append(newFields, arrow.Field{Name: "__phase", Type: &arrow.StringType{}, Nullable: true})
 	newSchema := arrow.NewSchema(newFields, nil)
 
-	// Build columns: Retain original columns + append new ones.
-	cols := make([]arrow.Array, 0, len(srcFields)+len(extraFields))
+	// Build columns: Retain original columns + append __phase.
+	cols := make([]arrow.Array, 0, len(srcFields)+1)
 	for i := range len(srcFields) {
 		tmpl.Column(i).Retain()
 		cols = append(cols, tmpl.Column(i))
 	}
-	if !hasCommitTS {
-		// __commit_ts (Int64, epoch millis) — only add if not already in wire schema.
-		ct := array.NewInt64Builder(alloc)
-		defer ct.Release()
-		for range nrows {
-			ct.Append(meta.CommitTS.UnixMilli())
-		}
-		cols = append(cols, ct.NewInt64Array())
-	}
-	cols = append(cols, itArr, sbArr, pbArr)
+	cols = append(cols, pbArr)
 
 	newRecord := array.NewRecordBatch(newSchema, cols, int64(nrows))
-	// NewRecordBatch retains each col but does NOT consume our ref.
-	// Release our refs now; the record holds its own retained refs.
 	for _, c := range cols {
 		c.Release()
 	}
 
 	return &Batch{
-		Table:     batch.Table,
-		Record:    newRecord,
-		Watermark: batch.Watermark,
+		Table:           batch.Table,
+		Record:          newRecord,
+		Watermark:       batch.Watermark,
+		Mode:            batch.Mode,
+		SnapshotState:   batch.SnapshotState,
+		SnapshotPending: batch.SnapshotPending,
 	}, nil
 }

@@ -117,6 +117,9 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	if !ok {
 		return nil, nil, fmt.Errorf("dataplane: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))
 	}
+	if err := validateOpColumn(opArr); err != nil {
+		return nil, nil, err
+	}
 
 	insUpdMask := array.NewBooleanBuilder(alloc)
 	defer insUpdMask.Release()
@@ -146,12 +149,12 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	}
 
 	if filteredUpserts.NumRows() > 0 {
-		upserts = &Batch{Table: batch.Table, Record: filteredUpserts, Watermark: batch.Watermark, Mode: batch.Mode}
+		upserts = &Batch{Table: batch.Table, Record: filteredUpserts, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredUpserts.Release()
 	}
 	if filteredDeletes.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode}
+		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending}
 	} else {
 		filteredDeletes.Release()
 	}
