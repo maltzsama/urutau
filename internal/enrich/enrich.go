@@ -148,6 +148,9 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 	if s.log == nil {
 		s.log = slog.Default()
 	}
+	// Cross-ref destination collision: two different refs projecting to
+	// the same destination name silently overwrite each other.
+	seenDests := make(map[string]string) // destination → first ref table
 	for _, cfg := range cfgs {
 		if len(cfg.On) != 1 {
 			return nil, fmt.Errorf("enrich: reference %q: on: exactly one join pair is supported today", cfg.Table)
@@ -208,6 +211,11 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 				return nil, fmt.Errorf("enrich: reference %q: two renames project to the same destination %q", cfg.Table, as)
 			}
 			seenAs[as] = true
+			// Cross-ref collision: another ref already claims this destination.
+			if firstRef, exists := seenDests[as]; exists {
+				return nil, fmt.Errorf("enrich: destination %q is claimed by reference %q and also by reference %q", as, firstRef, cfg.Table)
+			}
+			seenDests[as] = cfg.Table
 		}
 		switch cfg.OnColdStart {
 		case "", "buffer":
@@ -577,12 +585,14 @@ const (
 
 // apply joins one change against this reference, mutating After in place.
 func (rj *refJoin) apply(c *rowchange.Change) applyResult {
-	// A key-only delete (tombstone) carries nothing to enrich and does not
-	// depend on the reference: bypass EVERY policy — cold drop/pass/buffer
-	// and inner-miss alike — so the delete reaches the sink. Dropping it
-	// anywhere (park+evict, coldDrop, inner miss) left the row behind in
-	// the sink (audit #4).
-	if c.After == nil {
+	// A delete bypasses EVERY policy — cold drop/pass/buffer and
+	// inner-miss alike — so the delete reaches the sink. Dropping it
+	// anywhere (park+evict, coldDrop, inner miss) left the row behind
+	// in the sink (audit #4). Production deletes always carry After
+	// (DecodeBatch allocates the map; PK is backfilled on encode), so
+	// OpDelete is the authoritative guard — After == nil is defensive
+	// only for in-process changes that never crossed the wire.
+	if c.Op == rowchange.OpDelete || c.After == nil {
 		return applied
 	}
 	snap := rj.snap.Load() // lock-free read
@@ -612,6 +622,14 @@ func (rj *refJoin) apply(c *rowchange.Change) applyResult {
 // event with NULL reference columns and marks it; an inner join drops it.
 // That grammar is the ONLY miss policy — cold start, eviction and expiry
 // all route through it.
+// join merges one matched (or missed) reference row into the change.
+//
+// NOTE on empty references (hot with zero rows): buildImage returns dests
+// == nil for an empty image, so the left-join miss path appends NO columns
+// — not even NULLs. The enriched row therefore distinguishes "reference
+// empty/missed" (key absent) from "matched with NULL value" (key present,
+// nil). Downstream consumers must treat a missing enriched key as NULL, or
+// declare the join NOT NULL-able in the sink schema deliberately.
 func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest) applyResult {
 	if row == nil {
 		rj.misses.Add(1)

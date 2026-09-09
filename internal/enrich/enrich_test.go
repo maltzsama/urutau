@@ -744,18 +744,54 @@ func TestEmptyRefGoesHot(t *testing.T) {
 }
 
 func TestDeleteBypassAllPolicies(t *testing.T) {
-	// coldDrop would normally drop the event, but deletes bypass everything.
+	// Production deletes NEVER arrive with After == nil: DecodeBatch
+	// always allocates the map and the encode side backfills the join key.
+	// The bypass guard is therefore Op == OpDelete (After == nil is kept
+	// only as a defensive check for in-process changes). All three shapes
+	// below must survive every policy.
+	//
+	// Shape 1: wire-format delete (After allocated) vs coldDrop — the drop
+	// policy must not eat the tombstone before the first successful load.
 	s, _ := newTestStage(t, refCfg(func(c *spec.Enrich) { c.OnColdStart = "drop" }), usersRows())
 	out, err := s.applyOne(t, rowchange.Change{
 		Op:     rowchange.OpDelete,
-		After:  nil, // tombstone — no data, no join key
+		After:  map[string]any{"user_ref": int64(1)}, // wire: allocated, key backfilled
 		Before: map[string]any{"id": int64(1)},
 	})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if len(out) != 1 {
-		t.Fatal("tombstone must bypass cold drop (audit #4)")
+		t.Fatal("wire-format delete must bypass cold drop (audit #4)")
+	}
+
+	// Shape 2: wire-format delete + inner join + hot miss — an inner miss
+	// drops events; deletes must bypass.
+	innerCfg := refCfg(func(c *spec.Enrich) { c.JoinType = "inner" })
+	si, _ := newTestStage(t, innerCfg, usersRows())
+	out, err = si.applyOne(t, rowchange.Change{
+		Op:     rowchange.OpDelete,
+		After:  map[string]any{"user_ref": int64(99)}, // no match in ref
+		Before: map[string]any{"id": int64(99)},
+	})
+	if err != nil {
+		t.Fatalf("apply inner: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatal("delete must bypass inner-join miss")
+	}
+
+	// Shape 3: defensive in-process tombstone (After nil) — still survives.
+	out, err = s.applyOne(t, rowchange.Change{
+		Op:     rowchange.OpDelete,
+		After:  nil,
+		Before: map[string]any{"id": int64(1)},
+	})
+	if err != nil {
+		t.Fatalf("apply tombstone: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatal("nil-After tombstone must bypass cold drop")
 	}
 }
 
