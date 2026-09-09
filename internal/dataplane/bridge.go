@@ -1,13 +1,17 @@
-// Package dataplane — bridge from rowchange.Batch to *dataplane.Batch.
+// Package dataplane — the row-to-wire encoder at the CDC decoder boundary.
 //
-// QUARANTINE: this file is a TRANSITION adapter. It converts the old
-// row-oriented rowchange.Batch into a columnar dataplane.Batch using the
-// transport's EncodeBatch (typed, tested). The round-trip through IPC
-// serialization is intentional: it reuses existing tested code instead
-// of hand-rolling a new builder (lesson from ghost commit e273866c).
+// BatchFromChangeBatch converts a rowchange.Batch (the CDC decoders' output
+// — binlog/JSON events are row-shaped) into a columnar wire batch via the
+// transport's EncodeBatch (typed, tested). The IPC round-trip reuses tested
+// code instead of a hand-rolled builder. The worker is fully columnar since
+// commit a6cd459 (it no longer calls this); the encoder survives here
+// because the row universe ends at the source decoders, not in the worker.
 //
-// This bridge DIES when the worker switches to columnar (commit 3/4).
-// Do not add logic here — it is temporary by design.
+// Callers encode against the introspected schema when it is reachable (the
+// snapshot builders use the worker's known schema; the enrich seam carries
+// its own). schemaFromChanges is the FALLBACK for schema-less row producers
+// (the live CDC puller), which upstream owns the resolved schema for —
+// sources gain it when the reader contract carries it (quarantine plan G1).
 package dataplane
 
 import (
@@ -24,12 +28,13 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
-// BatchFromChangeBatch converts a row-oriented rowchange.Batch into a
-// columnar dataplane.Batch via the transport's EncodeBatch. The RecordBatch
-// carries the wire schema (data + __op + __pos + __commit_ts + __ingest_ts
-// + __snapshot). The caller owns the returned Batch.
+// BatchFromChangeBatch converts a rowchange.Batch into a columnar
+// dataplane.Batch via the transport's EncodeBatch. The RecordBatch carries
+// the wire schema (data + __op + __pos + __commit_ts + __ingest_ts +
+// __snapshot). The caller owns the returned Batch.
 //
-// QUARANTINE: dies in commit 3/4 when the worker produces Batch directly.
+// cs is the canonical schema to encode against; an empty cs falls back to
+// per-batch inference (schemaFromChanges) for schema-less row producers.
 func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 	// D-6: the batch's single arrival-ordered slice IS the wire order.
 	all := b.Changes
@@ -96,8 +101,9 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 }
 
 // schemaFromChanges infers a core.Schema from the changes' After/Before maps.
-// Columns are sorted by name for deterministic output.
-// QUARANTINE: dies in commit 3/4.
+// Columns are sorted by name for deterministic output. Fallback for
+// schema-less row producers (the live CDC puller); the resolved schema is
+// owned upstream and should ride the reader contract (quarantine plan G1).
 func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	seen := make(map[string]core.ColumnType)
 	for _, c := range changes {
@@ -123,8 +129,7 @@ func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	return core.Schema{Columns: cols}
 }
 
-// goTypeToCore maps a Go value to a core.ColumnType.
-// QUARANTINE: dies in commit 3/4.
+// goTypeToCore maps a Go value to a core.ColumnType for schema inference.
 func goTypeToCore(v any) core.ColumnType {
 	switch v.(type) {
 	case bool:
@@ -148,7 +153,7 @@ func goTypeToCore(v any) core.ColumnType {
 	case time.Time:
 		return core.ColumnType{Kind: core.KindTimestampTZ}
 	default:
-		return core.ColumnType{Kind: core.KindString} // QUARANTINE: unknown → string
+		return core.ColumnType{Kind: core.KindString} // inference fallback: unknown value type
 	}
 }
 
