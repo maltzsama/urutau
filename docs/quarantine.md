@@ -15,10 +15,10 @@
 Two named commands, ONE number each. A number that cannot be reproduced by
 a pinned command is not a metric.
 
-| # | Command | @ `bbb1c34` | Role |
+| # | Command | @ `a6cd459` | Role |
 |---|---|---|---|
-| 1 — **TOTAL** | `grep -rn "QUARANTINE" --include="*.go" internal/ cmd/ test/ \| wc -l` | **29** | the whole tree |
-| 2 — **TREND** | `grep -rn "QUARANTINE" --include="*.go" internal/ \| grep -vE "_test\.go:" \| wc -l` | **23** | production-only — must FALL cycle over cycle |
+| 1 — **TOTAL** | `grep -rn "QUARANTINE" --include="*.go" internal/ cmd/ test/ \| wc -l` | **16** | the whole tree |
+| 2 — **TREND** | `grep -rn "QUARANTINE" --include="*.go" internal/ \| grep -vE "_test\.go:" \| wc -l` | **10** | production-only — must FALL cycle over cycle |
 
 G5 (test-side "shadows": `worker_audit_test` 2, `runner_test` 1,
 `architecture_test` 1, `test/e2e/couchbase_test` 1, `test/plugin/standalone`
@@ -108,8 +108,26 @@ through the known-schema bridge), `runner_test` (1), `architecture_test`
 | `internal/coordinator/coordinator.go` | 2 |
 | `internal/sourcepull/pull.go`, `source/mysql`, `source/kafka`, `runner`, `enrich/batch` | 1 each |
 
+### G2 — worker batcher M4 — DONE (2026-09-09)
+The full columnar batcher landed (commit a6cd459): windows store the
+snapshot batch + touched set (no decode), flush is columnar (mask
+partition, collapse, append delete-image filter), enrich runs on the whole
+batch, drift is schema-based. All 8 worker.go points gone; the worker is
+fully columnar. G2.0's oracle was the pre-existing batcher equivalence
+suite (window dedup, bootstrap, partition, regime boundary), kept green
+throughout.
+
+## Remaining
+
+| File | TREND | Owner |
+|---|---|---|
+| `dataplane/bridge.go` | 5 | G1 — row-to-wire encoder now used ONLY at source boundaries; dies when CDC sources build Arrow natively |
+| `enrich/batch.go` | 1 | CR-069 §3.4 — columnar join (explicit defer) |
+| `runner.go` relay | 1 | G1 — query-source (scanChunk) producing the chunk batch |
+| `sourcepull`, `source/mysql`, `source/kafka` | 3 | G1 — decoders build Arrow natively |
+
 ## Rule
 
-TREND **23 @ `bbb1c34`** must FALL. Every PR cites its group and the two
+TREND **10 @ `a6cd459`** must FALL. Every PR cites its group and the two
 pinned numbers before/after. If TREND rises, the milestone is not being
 worked — the group definition gets re-evaluated, not the count relabeled.
