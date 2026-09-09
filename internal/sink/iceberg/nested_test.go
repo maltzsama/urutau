@@ -1,13 +1,16 @@
 package iceberg
 
 import (
+	"context"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 func compositeDataSchema() *arrow.Schema {
@@ -18,35 +21,85 @@ func compositeDataSchema() *arrow.Schema {
 			arrow.Field{Name: "age", Type: arrow.PrimitiveTypes.Int64},
 		)},
 		{Name: "tags", Type: arrow.ListOfNonNullable(arrow.BinaryTypes.String)},
-		{Name: "attrs", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int64)},
+		// Non-nullable items: mirrors what CoreSchemaToArrow emits for a
+		// map whose core ValueType is non-nullable, so projection retains
+		// the wire column zero-copy.
+		{Name: "attrs", Type: arrow.MapOfFields(
+			arrow.Field{Name: "key", Type: arrow.BinaryTypes.String, Nullable: false},
+			arrow.Field{Name: "value", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		)},
 	}, nil)
 }
 
-// dataRecord materializes composite values (struct/list/map as nested
-// map[string]any / []any) into the typed arrow record.
-func TestDataRecordComposite(t *testing.T) {
+// compositeWireBatch builds a wire-schema batch carrying two composite
+// rows (struct/list/map filled on row 0, empty on row 1).
+func compositeWireBatch(t *testing.T) *dataplane.Batch {
+	t.Helper()
+	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "cust", Type: core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
+			{Name: "name", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "age", Type: core.ColumnType{Kind: core.KindInt64}},
+		}}},
+		{Name: "tags", Type: core.ColumnType{Kind: core.KindList, Elem: &core.ColumnType{Kind: core.KindString}}},
+		{Name: "attrs", Type: core.ColumnType{Kind: core.KindMap, KeyType: &core.ColumnType{Kind: core.KindString}, ValueType: &core.ColumnType{Kind: core.KindInt64}}},
+	}})
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, data)
+	defer bld.Release()
+
+	fillMeta := func() {
+		for j := 5; j < int(data.NumFields()); j++ {
+			bld.Field(j).AppendNull()
+		}
+	}
+	// row 0: id=1, cust={ana,30}, tags=[a b], attrs={x:1}
+	bld.Field(0).(*array.Int64Builder).Append(1)
+	sb := bld.Field(1).(*array.StructBuilder)
+	sb.Append(true)
+	sb.FieldBuilder(0).(*array.StringBuilder).Append("ana")
+	sb.FieldBuilder(1).(*array.Int64Builder).Append(30)
+	lb := bld.Field(2).(*array.ListBuilder)
+	lb.Append(true)
+	for _, s := range []string{"a", "b"} {
+		lb.ValueBuilder().(*array.StringBuilder).Append(s)
+	}
+	mb := bld.Field(3).(*array.MapBuilder)
+	mb.Append(true)
+	mb.KeyBuilder().(*array.StringBuilder).Append("x")
+	mb.ItemBuilder().(*array.Int64Builder).Append(1)
+	bld.Field(4).AppendNull()
+	fillMeta()
+
+	// row 1: id=2, cust={bob,40}, tags=[], attrs={}
+	bld.Field(0).(*array.Int64Builder).Append(2)
+	sb.Append(true)
+	sb.FieldBuilder(0).(*array.StringBuilder).Append("bob")
+	sb.FieldBuilder(1).(*array.Int64Builder).Append(40)
+	lb.Append(true)
+	mb.Append(true)
+	bld.Field(4).AppendNull()
+	fillMeta()
+
+	rec := bld.NewRecordBatch()
+	return &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w"), Mode: dataplane.UpsertMode}
+}
+
+// Composite columns survive the columnar projection intact: matching types
+// are retained zero-copy, nested structure and emptiness included.
+func TestProjectRecordComposite(t *testing.T) {
 	w := &TableWriter{
 		dataSchema: compositeDataSchema(),
 		metaByName: map[string]core.MetadataColumn{},
 		cast:       core.CastPolicy{},
 	}
-	rows := []rowchange.Change{
-		{Op: rowchange.OpInsert, After: map[string]any{
-			"id":    int64(1),
-			"cust":  map[string]any{"name": "ana", "age": int64(30)},
-			"tags":  []any{"a", "b"},
-			"attrs": map[string]any{"x": int64(1)},
-		}},
-		{Op: rowchange.OpInsert, After: map[string]any{
-			"id":    int64(2),
-			"cust":  map[string]any{"name": "bob", "age": int64(40)},
-			"tags":  []any{},
-			"attrs": map[string]any{},
-		}},
-	}
-	rec, err := w.dataRecord(rows)
+	b := compositeWireBatch(t)
+	defer b.Release()
+	rec, err := w.projectRecord(context.Background(), b)
 	if err != nil {
-		t.Fatalf("dataRecord: %v", err)
+		t.Fatalf("projectRecord: %v", err)
 	}
 	defer rec.Release()
 	if rec.NumRows() != 2 {
@@ -90,16 +143,47 @@ func TestDataRecordComposite(t *testing.T) {
 	}
 }
 
-// A whole composite column may be null per row; only the non-null rows build
-// children.
-func TestDataRecordCompositeNulls(t *testing.T) {
-	w := &TableWriter{dataSchema: compositeDataSchema(), metaByName: map[string]core.MetadataColumn{}, cast: core.CastPolicy{}}
-	rows := []rowchange.Change{
-		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(1), "cust": nil, "tags": nil, "attrs": nil}},
-	}
-	rec, err := w.dataRecord(rows)
+// A whole composite column may be null per row; the projection preserves
+// the row-level null.
+func TestProjectRecordCompositeNulls(t *testing.T) {
+	w := &TableWriter{dataSchema: arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "cust", Type: arrow.StructOf(arrow.Field{Name: "name", Type: arrow.BinaryTypes.String})},
+		{Name: "tags", Type: arrow.ListOfNonNullable(arrow.BinaryTypes.String)},
+		{Name: "attrs", Type: arrow.MapOfFields(
+			arrow.Field{Name: "key", Type: arrow.BinaryTypes.String, Nullable: false},
+			arrow.Field{Name: "value", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		)},
+	}, nil), metaByName: map[string]core.MetadataColumn{}, cast: core.CastPolicy{}}
+	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "cust", Type: core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
+			{Name: "name", Type: core.ColumnType{Kind: core.KindString}},
+		}}},
+		{Name: "tags", Type: core.ColumnType{Kind: core.KindList, Elem: &core.ColumnType{Kind: core.KindString}}},
+		{Name: "attrs", Type: core.ColumnType{Kind: core.KindMap, KeyType: &core.ColumnType{Kind: core.KindString}, ValueType: &core.ColumnType{Kind: core.KindInt64}}},
+	}})
 	if err != nil {
-		t.Fatalf("dataRecord: %v", err)
+		t.Fatalf("schema: %v", err)
+	}
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, data)
+	defer bld.Release()
+	bld.Field(0).(*array.Int64Builder).Append(1)
+	for j := 1; j < 4; j++ {
+		bld.Field(j).AppendNull()
+	}
+	bld.Field(4).(*array.Uint8Builder).Append(0) // __op
+	bld.Field(5).(*array.StringBuilder).Append("p")
+	for j := 6; j < int(data.NumFields()); j++ {
+		bld.Field(j).AppendNull()
+	}
+	rec2 := bld.NewRecordBatch()
+	defer rec2.Release()
+	b := &dataplane.Batch{Table: "t", Record: rec2, Watermark: []byte("w"), Mode: dataplane.UpsertMode}
+	defer b.Release()
+	rec, err := w.projectRecord(context.Background(), b)
+	if err != nil {
+		t.Fatalf("projectRecord: %v", err)
 	}
 	defer rec.Release()
 	if rec.Column(1).IsNull(0) != true {

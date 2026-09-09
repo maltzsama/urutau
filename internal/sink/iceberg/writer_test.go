@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"context"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -8,12 +9,14 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // testWriter builds a TableWriter directly with hand-constructed arrow
-// schemas and a cast policy — no catalog, so the pure data path (project,
-// dataRecord, deleteRecord) is testable in isolation.
+// schemas and a cast policy — no catalog, so the projection path
+// (projectRecord) is testable in isolation.
 func testWriter() *TableWriter {
 	return &TableWriter{
 		dataSchema: arrow.NewSchema([]arrow.Field{
@@ -32,33 +35,67 @@ func testWriter() *TableWriter {
 	}
 }
 
-// project fills source columns and metadata columns; a missing source
+// wireBatch builds a wire-schema batch from (id, v, op) triples.
+func wireBatch(t *testing.T, rows ...[3]any) *dataplane.Batch {
+	t.Helper()
+	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+	}})
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, data)
+	defer bld.Release()
+	for _, r := range rows {
+		id := r[0].(int64)
+		bld.Field(0).(*array.Int64Builder).Append(id)
+		if r[1] == nil {
+			bld.Field(1).(*array.StringBuilder).AppendNull()
+		} else {
+			bld.Field(1).(*array.StringBuilder).Append(r[1].(string))
+		}
+		bld.Field(2).(*array.Uint8Builder).Append(uint8(r[2].(rowchange.Op)))
+		bld.Field(3).(*array.StringBuilder).Append("p")
+		bld.Field(4).AppendNull()
+		bld.Field(5).AppendNull()
+		bld.Field(6).(*array.BooleanBuilder).Append(false)
+	}
+	rec := bld.NewRecordBatch()
+	return &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p"), Mode: dataplane.UpsertMode}
+}
+
+// projectRecord fills source columns and metadata columns; a missing source
 // column projects as NULL rather than failing.
 func TestProjectColumnsAndMetadata(t *testing.T) {
 	w := testWriter()
-	c := rowchange.Change{Op: rowchange.OpUpdate, After: map[string]any{"id": int64(7), "v": "x"}}
-	out, err := w.project(c)
+	b := wireBatch(t, [3]any{int64(7), "x", rowchange.OpUpdate}, [3]any{int64(1), nil, rowchange.OpInsert})
+	defer b.Release()
+	out, err := w.projectRecord(context.Background(), b)
 	if err != nil {
-		t.Fatalf("project: %v", err)
+		t.Fatalf("projectRecord: %v", err)
 	}
-	if out["id"] != int64(7) || out["v"] != "x" {
-		t.Fatalf("project = %v, want id=7 v=x", out)
+	defer out.Release()
+
+	ids := out.Column(0).(*array.Int64)
+	if ids.Value(0) != 7 || ids.Value(1) != 1 {
+		t.Fatalf("id column = %v", ids)
 	}
-	if out["_op"] != "update" {
-		t.Fatalf("_op = %v, want update", out["_op"])
+	vs := out.Column(1).(*array.String)
+	if vs.Value(0) != "x" {
+		t.Fatalf("v column = %v", vs)
 	}
-	// A change missing a declared column yields NULL for that column.
-	sparse := rowchange.Change{Op: rowchange.OpInsert, After: map[string]any{"id": int64(1)}}
-	out, err = w.project(sparse)
-	if err != nil {
-		t.Fatalf("project sparse: %v", err)
+	if !vs.IsNull(1) {
+		t.Fatalf("missing column must project NULL, got %q", vs.Value(1))
 	}
-	if out["v"] != nil {
-		t.Fatalf("missing column = %v, want nil", out["v"])
+	ops := out.Column(2).(*array.String)
+	if ops.Value(0) != "update" || ops.Value(1) != "insert" {
+		t.Fatalf("_op = %q,%q, want update,insert", ops.Value(0), ops.Value(1))
 	}
 }
 
-// project applies the declared cast to the source value.
+// projectRecord applies the declared cast to the source value — the
+// regression guard for the columnar path silently skipping cast policies.
 func TestProjectAppliesCast(t *testing.T) {
 	cp, err := core.ParseCastPolicy(map[string]string{"v": "string(hex)"})
 	if err != nil {
@@ -72,26 +109,44 @@ func TestProjectAppliesCast(t *testing.T) {
 		cast:       cp,
 		metaByName: map[string]core.MetadataColumn{},
 	}
-	c := rowchange.Change{After: map[string]any{"id": int64(1), "v": []byte{0xde, 0xad}}}
-	out, err := w.project(c)
+	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindBinary, Nullable: true}},
+	}})
 	if err != nil {
-		t.Fatalf("project: %v", err)
+		t.Fatalf("schema: %v", err)
 	}
-	if out["v"] != "dead" {
-		t.Fatalf("v after cast = %v, want dead", out["v"])
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, data)
+	defer bld.Release()
+	bld.Field(0).(*array.Int64Builder).Append(1)
+	bld.Field(1).(*array.BinaryBuilder).Append([]byte{0xde, 0xad})
+	for j := 2; j < int(data.NumFields()); j++ {
+		bld.Field(j).AppendNull()
+	}
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p"), Mode: dataplane.UpsertMode}
+	defer b.Release()
+
+	out, err := w.projectRecord(context.Background(), b)
+	if err != nil {
+		t.Fatalf("projectRecord: %v", err)
+	}
+	defer out.Release()
+	vs := out.Column(1).(*array.String)
+	if vs.Value(0) != "dead" {
+		t.Fatalf("v after cast = %v, want dead", vs.Value(0))
 	}
 }
 
-// dataRecord materializes rows into a typed record, including metadata.
-func TestDataRecord(t *testing.T) {
+// projectRecord materializes rows into a typed record, including metadata.
+func TestProjectRecordRows(t *testing.T) {
 	w := testWriter()
-	rows := []rowchange.Change{
-		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(1), "v": "a"}},
-		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(2), "v": "b"}},
-	}
-	rec, err := w.dataRecord(rows)
+	b := wireBatch(t, [3]any{int64(1), "a", rowchange.OpInsert}, [3]any{int64(2), "b", rowchange.OpInsert})
+	defer b.Release()
+	rec, err := w.projectRecord(context.Background(), b)
 	if err != nil {
-		t.Fatalf("dataRecord: %v", err)
+		t.Fatalf("projectRecord: %v", err)
 	}
 	defer rec.Release()
 	if rec.NumRows() != 2 {
