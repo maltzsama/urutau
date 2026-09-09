@@ -197,6 +197,14 @@ func marshalArrowRecord(schema *arrow.Schema, rec arrow.RecordBatch) ([]byte, er
 	return buf.Bytes(), nil
 }
 
+// EncodeRecord serializes an existing wire-schema RecordBatch to IPC bytes
+// without re-encoding from rows. The coordinator's batch-native pump uses
+// it to forward a source batch whole — one serialize per batch instead of
+// one per row (G0/M4).
+func EncodeRecord(rec arrow.RecordBatch) ([]byte, error) {
+	return marshalArrowRecord(rec.Schema(), rec)
+}
+
 // inferBoundType picks a column's Arrow type from the first non-nil cell
 // across both bound tuples. An all-null column decodes as Null — the caller
 // reads nil for every cell, so the exact type is irrelevant.
