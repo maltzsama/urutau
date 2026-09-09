@@ -37,15 +37,11 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 		pkIdxs[i] = idx
 	}
 
-	// 1. Build exact keys and check for null PKs.
+	// 1. Build exact keys — EncodeKey is the authority for null PKs and
+	// column validity; indices resolved once (M-9).
 	keys := make([][]byte, nrows)
 	for row := range nrows {
-		for i, idx := range pkIdxs {
-			if batch.Record.Column(idx).IsNull(row) {
-				return nil, nil, fmt.Errorf("dataplane: collapse: null in PK column %q at row %d", pkCols[i], row)
-			}
-		}
-		key, err := EncodeKey(batch.Record, row, pkCols)
+		key, err := EncodeKey(batch.Record, row, pkIdxs, pkCols)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dataplane: collapse: %w", err)
 		}
@@ -68,27 +64,22 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 
 	// 3. Map-based scan: last occurrence wins per group, first-appearance
 	// order for emission. O(n), no hashing, no collision risk.
-	type groupInfo struct {
-		winnerRow int
-	}
-	groups := make(map[string]*groupInfo, nrows)
+	// groups maps key → winning row (M-9: no groupInfo struct).
+	groups := make(map[string]int, nrows)
 	var groupOrder []string
 
 	for row, key := range keys {
 		k := string(key)
-		g, exists := groups[k]
-		if !exists {
+		if _, exists := groups[k]; !exists {
 			groupOrder = append(groupOrder, k)
-			groups[k] = &groupInfo{winnerRow: row}
-		} else {
-			g.winnerRow = row // last occurrence always wins
 		}
+		groups[k] = row // last occurrence always wins
 	}
 
-	// 3. Collect winner indices in first-appearance order.
+	// 4. Collect winner indices in first-appearance order.
 	winnerIndices := make([]int32, 0, len(groupOrder))
 	for _, k := range groupOrder {
-		winnerIndices = append(winnerIndices, int32(groups[k].winnerRow))
+		winnerIndices = append(winnerIndices, int32(groups[k]))
 	}
 
 	// 4. Build an index array for Take.

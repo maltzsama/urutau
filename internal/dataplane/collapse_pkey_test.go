@@ -202,7 +202,21 @@ func TestEncodeKeyTypeAntiCollision(t *testing.T) {
 
 	keyOf := func(row int, cols []string) []byte {
 		t.Helper()
-		k, err := dataplane.EncodeKey(rec, row, cols)
+		idxs := make([]int, len(cols))
+		for i, c := range cols {
+			found := -1
+			for j := range int(rec.NumCols()) {
+				if rec.Schema().Field(j).Name == c {
+					found = j
+					break
+				}
+			}
+			if found < 0 {
+				t.Fatalf("column %q not found", c)
+			}
+			idxs[i] = found
+		}
+		k, err := dataplane.EncodeKey(rec, row, idxs, cols)
 		if err != nil {
 			t.Fatalf("EncodeKey: %v", err)
 		}

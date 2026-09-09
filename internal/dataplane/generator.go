@@ -337,11 +337,15 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 	return &Batch{Table: "adv_null_before", Record: rec, Watermark: []byte("pos-0002")}
 }
 
-// EncodeKey encodes a composite key as length-prefixed binary concat
-// of the string representations — used by collapse to avoid hash
-// collisions (CR-069 §3.2).
+// EncodeKey encodes a composite key as type-tagged binary payload concat —
+// used by collapse to avoid hash collisions (CR-069 §3.2).
 //
-// v4: type-tagged binary encoding. Each field is [type-byte][payload…]:
+// pkIdxs are the pre-resolved data-column indices of the PK columns
+// (resolved ONCE by the caller — M-9); pkCols ride along for error
+// messages only. Null in any PK column is an error here — EncodeKey is
+// the single authority for key validity (M-9).
+//
+// Each field is [type-byte][payload…]:
 // fixed-width payloads for numerics/bool/date/time/timestamp, length-
 // prefixed for string/binary/decimal, raw fixed width for FixedSizeBinary.
 // Different types cannot collide (distinct tags); equal values of the same
@@ -351,7 +355,8 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 // Collapse call and never persist or cross batches. If keys ever need to
 // persist or be compared across batches, this design must be revisited
 // (type widening across batches, e.g. int32→int64, would change keys).
-func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, error) {
+// See docs/encode-key.md.
+func EncodeKey(record arrow.RecordBatch, row int, pkIdxs []int, pkCols []string) ([]byte, error) {
 	const (
 		typeInt32   byte = 0x01
 		typeInt64   byte = 0x02
@@ -372,18 +377,18 @@ func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, erro
 	)
 	var buf []byte
 	var lenBuf [4]byte
-	for _, col := range pkCols {
-		idx := -1
-		for i := 0; i < int(record.NumCols()); i++ {
-			if record.Schema().Field(i).Name == col {
-				idx = i
-				break
-			}
+	for i, col := range pkCols {
+		if i >= len(pkIdxs) {
+			return nil, fmt.Errorf("dataplane: encode key: pkIdxs (%d) shorter than pkCols (%d)", len(pkIdxs), len(pkCols))
 		}
-		if idx < 0 {
-			return nil, fmt.Errorf("dataplane: encode key: column %q not found", col)
+		idx := pkIdxs[i]
+		if idx < 0 || idx >= int(record.NumCols()) {
+			return nil, fmt.Errorf("dataplane: encode key: column %q index %d out of range", col, idx)
 		}
 		arr := record.Column(idx)
+		if arr.IsNull(row) {
+			return nil, fmt.Errorf("dataplane: encode key: null in PK column %q at row %d", col, row)
+		}
 		switch a := arr.(type) {
 		case *array.Int32:
 			buf = append(buf, typeInt32)

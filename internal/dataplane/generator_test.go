@@ -197,11 +197,11 @@ func TestEncodeKeyDistinct(t *testing.T) {
 	b := dataplane.AdversarialCompositeKey(0, alloc)
 	defer b.Release()
 
-	key0, err := dataplane.EncodeKey(b.Record, 0, []string{"pk1", "pk2"})
+	key0, err := dataplane.EncodeKey(b.Record, 0, []int{0, 1}, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
-	key1, err := dataplane.EncodeKey(b.Record, 1, []string{"pk1", "pk2"})
+	key1, err := dataplane.EncodeKey(b.Record, 1, []int{0, 1}, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestEncodeKeyV4AllTypes(t *testing.T) {
 	rec := bld.NewRecordBatch()
 	defer rec.Release()
 
-	key1, err := dataplane.EncodeKey(rec, 0, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
+	key1, err := dataplane.EncodeKey(rec, 0, []int{0, 1, 2, 3, 4, 5}, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -365,7 +365,7 @@ func TestEncodeKeyV4AllTypes(t *testing.T) {
 	rec2 := bld2.NewRecordBatch()
 	defer rec2.Release()
 
-	key2, err := dataplane.EncodeKey(rec2, 0, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
+	key2, err := dataplane.EncodeKey(rec2, 0, []int{0, 1, 2, 3, 4, 5}, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
