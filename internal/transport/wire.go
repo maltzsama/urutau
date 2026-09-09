@@ -22,6 +22,9 @@ import (
 func EncodeTableSchema(cs core.Schema) ([]byte, error) {
 	fields := make([]arrow.Field, 0, len(cs.Columns))
 	for _, col := range cs.Columns {
+		if isReservedColumnName(col.Name) {
+			return nil, fmt.Errorf("transport: schema: column %q is reserved (wire metadata)", col.Name)
+		}
 		af, err := columnToArrowField(col)
 		if err != nil {
 			return nil, fmt.Errorf("transport: schema: column %q: %w", col.Name, err)
@@ -56,6 +59,9 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 // last chunk; a nil low produces an empty record). Column types are
 // inferred from the values — the PK tuple's native types survive the wire.
 func EncodeBounds(low, high []any) ([]byte, error) {
+	if low == nil && high != nil {
+		return nil, fmt.Errorf("transport: bounds: low nil com high não-nil não é representável (row 0 é o slot do low)")
+	}
 	width := len(low)
 	if high != nil && len(high) > width {
 		width = len(high)
