@@ -346,7 +346,7 @@ func TestEncodeKeyV4AllTypes(t *testing.T) {
 	bld.Field(3).(*array.Float64Builder).Append(3.14)
 	bld.Field(4).(*array.StringBuilder).Append("hello")
 	bld.Field(5).(*array.BooleanBuilder).Append(true)
-	rec := bld.NewRecord()
+	rec := bld.NewRecordBatch()
 	defer rec.Release()
 
 	key1, err := dataplane.EncodeKey(rec, 0, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
@@ -362,7 +362,7 @@ func TestEncodeKeyV4AllTypes(t *testing.T) {
 	bld2.Field(3).(*array.Float64Builder).Append(2.71)
 	bld2.Field(4).(*array.StringBuilder).Append("world")
 	bld2.Field(5).(*array.BooleanBuilder).Append(false)
-	rec2 := bld2.NewRecord()
+	rec2 := bld2.NewRecordBatch()
 	defer rec2.Release()
 
 	key2, err := dataplane.EncodeKey(rec2, 0, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})

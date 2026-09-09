@@ -346,16 +346,16 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 // No fmt.Sprintf — direct binary encoding for determinism and speed.
 func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, error) {
 	const (
-		typeInt32    byte = 0x01
-		typeInt64    byte = 0x02
-		typeUInt64   byte = 0x03
-		typeFloat32  byte = 0x04
-		typeFloat64  byte = 0x05
-		typeBool     byte = 0x06
-		typeString   byte = 0x07
-		typeDate32   byte = 0x09
-		typeTime64   byte = 0x0A
-		typeTSNZ     byte = 0x0B
+		typeInt32   byte = 0x01
+		typeInt64   byte = 0x02
+		typeUInt64  byte = 0x03
+		typeFloat32 byte = 0x04
+		typeFloat64 byte = 0x05
+		typeBool    byte = 0x06
+		typeString  byte = 0x07
+		typeDate32  byte = 0x09
+		typeTime64  byte = 0x0A
+		typeTSNZ    byte = 0x0B
 	)
 	var buf []byte
 	var lenBuf [4]byte

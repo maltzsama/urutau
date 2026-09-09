@@ -312,10 +312,10 @@ func TestCodecKindCoverageMatrix(t *testing.T) {
 		{
 			Op: rowchange.OpInsert, Table: "t",
 			After: map[string]any{
-				"c_bool":   true,
-				"c_int32":  int32(42),
-				"c_int64":  int64(9007199254740993),
-				"c_uint64": uint64(18446744073709551615),
+				"c_bool":    true,
+				"c_int32":   int32(42),
+				"c_int64":   int64(9007199254740993),
+				"c_uint64":  uint64(18446744073709551615),
 				"c_float32": float32(1.5),
 				"c_float64": float64(2.5),
 				"c_string":  "hello",
