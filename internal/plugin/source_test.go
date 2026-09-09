@@ -6,6 +6,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/position"
 )
 
 func TestStringPositionCompare(t *testing.T) {
@@ -14,9 +15,11 @@ func TestStringPositionCompare(t *testing.T) {
 		a, b     StringPosition
 		expected int
 	}{
+		// Identity-only: an opaque offset (contract §8.2) has no order other
+		// than identity. Different offsets are Incomparable, never < or >.
 		{"equal", StringPosition{Offset: "abc"}, StringPosition{Offset: "abc"}, 0},
-		{"less", StringPosition{Offset: "aaa"}, StringPosition{Offset: "bbb"}, -1},
-		{"greater", StringPosition{Offset: "ccc"}, StringPosition{Offset: "bbb"}, 1},
+		{"different", StringPosition{Offset: "aaa"}, StringPosition{Offset: "bbb"}, position.Incomparable},
+		{"different-reverse", StringPosition{Offset: "ccc"}, StringPosition{Offset: "bbb"}, position.Incomparable},
 		{"empty", StringPosition{}, StringPosition{}, 0},
 	}
 	for _, tt := range tests {
@@ -37,7 +40,7 @@ func TestStringPositionContains(t *testing.T) {
 
 	c := StringPosition{Offset: "aaa"}
 	if a.Contains(c) {
-		t.Error("should not contain lesser position")
+		t.Error("should not contain a different offset")
 	}
 }
 
@@ -158,4 +161,36 @@ func batchWithColumns(t *testing.T, cols ...string) rowchange.Batch {
 		})
 	}
 	return b
+}
+
+// TestStringPositionOpaqueOffsetsNotOrdered is the regression for the
+// audit finding: base64 lexicographic order can INVERT the byte order of the
+// encoded offsets, so an opaque offset must never be compared for order.
+//
+//	C = base64([0xFF, 0x01]) = "/wE="
+//	D = base64([0x02, 0x00]) = "AgA="
+//
+// Byte-wise C > D, but lexicographically "/wE=" < "AgA=" — the old Compare
+// returned -1 here, so a resume decision would treat the OLDER offset C as
+// "covered" by the NEWER D and skip its batch: silent data loss.
+func TestStringPositionOpaqueOffsetsNotOrdered(t *testing.T) {
+	older := StringPosition{Offset: "/wE="} // byte-wise [0xFF, 0x01]
+	newer := StringPosition{Offset: "AgA="} // byte-wise [0x02, 0x00]
+
+	if c := older.Compare(newer); c != position.Incomparable {
+		t.Fatalf("older.Compare(newer) = %d, want Incomparable (lexicographic order is inverted)", c)
+	}
+	if c := newer.Compare(older); c != position.Incomparable {
+		t.Fatalf("newer.Compare(older) = %d, want Incomparable", c)
+	}
+
+	// Coverage of the older by the newer must not be decided — that is what
+	// would skip the older batch. position.Min must keep the first.
+	if older.Contains(newer) {
+		t.Fatal("opaque offset must not 'contain' a different offset")
+	}
+	got := position.Min([]position.Position{older, newer})
+	if got.String() != older.String() {
+		t.Fatalf("Min kept %s, want the first (%s) when order is undefined", got, older)
+	}
 }

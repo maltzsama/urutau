@@ -36,22 +36,25 @@ type StringPosition struct {
 
 func (p StringPosition) String() string { return p.Offset }
 
+// Compare is identity-only. An opaque offset is a plugin cookie (contract
+// §8.2), not an ordinal — the base64 alphabet does not preserve byte order,
+// so lexicographic comparison is meaningless and can silently reorder
+// resume points (skipping uncommitted data). The only defined relation is
+// identity; anything else is position.Incomparable and callers MUST handle
+// it conservatively.
 func (p StringPosition) Compare(other position.Position) int {
 	o, ok := other.(StringPosition)
-	if !ok {
-		return 1
+	if !ok || p.Offset != o.Offset {
+		return position.Incomparable
 	}
-	if p.Offset == o.Offset {
-		return 0
-	}
-	if p.Offset < o.Offset {
-		return -1
-	}
-	return 1
+	return 0
 }
 
+// Contains is identity-only for the same reason: an opaque offset does not
+// contain another unless it is the same cookie.
 func (p StringPosition) Contains(other position.Position) bool {
-	return p.Compare(other) <= 0
+	o, ok := other.(StringPosition)
+	return ok && p.Offset == o.Offset
 }
 
 // SourceAdapter wraps a Flight client as a source.Source. It speaks the

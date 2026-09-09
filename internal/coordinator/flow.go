@@ -172,7 +172,7 @@ type PositionManifest struct {
 func (p *positionIndex) truncate(table string, pos position.Position) int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if cur, ok := p.acked[table]; !ok || pos.Compare(cur) > 0 {
+	if cur, ok := p.acked[table]; !ok || advances(pos, cur) {
 		p.acked[table] = pos
 		p.dirty = true
 	}
@@ -183,7 +183,7 @@ func (p *positionIndex) truncate(table string, pos position.Position) int64 {
 			if _, ok := p.acked[h.table]; !ok {
 				break
 			}
-		} else if cur, ok := p.acked[h.table]; !ok || h.high.Compare(cur) > 0 {
+		} else if cur, ok := p.acked[h.table]; !ok || !covered(h.high, cur) {
 			break
 		}
 		freed += h.bytes
@@ -191,4 +191,19 @@ func (p *positionIndex) truncate(table string, pos position.Position) int64 {
 		p.dirty = true
 	}
 	return freed
+}
+
+// advances reports whether pos is provably strictly greater than cur. An
+// Incomparable comparison (opaque plugin offsets, contract §8.2) does not
+// advance the confirmed point — the conservative choice.
+func advances(pos, cur position.Position) bool {
+	c := pos.Compare(cur)
+	return c != position.Incomparable && c > 0
+}
+
+// covered reports whether pos is provably at or before cur. Incomparable
+// means not covered — a head batch stays queued until coverage is certain.
+func covered(pos, cur position.Position) bool {
+	c := pos.Compare(cur)
+	return c != position.Incomparable && c <= 0
 }
