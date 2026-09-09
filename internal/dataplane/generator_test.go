@@ -1,9 +1,12 @@
 package dataplane_test
 
 import (
+	"bytes"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
@@ -319,5 +322,59 @@ func TestGeneratorBeforeValReal(t *testing.T) {
 				t.Errorf("row %d: update/delete of PK %d has null __before_val", i, id)
 			}
 		}
+	}
+}
+
+// T-14: EncodeKey v4 — type-prefixed binary encoding for all Arrow types.
+func TestEncodeKeyV4AllTypes(t *testing.T) {
+	alloc := checkedAlloc(t)
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "pk_int32", Type: arrow.PrimitiveTypes.Int32, Nullable: false},
+		{Name: "pk_int64", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "pk_uint64", Type: arrow.PrimitiveTypes.Uint64, Nullable: false},
+		{Name: "pk_float64", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+		{Name: "pk_string", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "pk_bool", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+	}, nil)
+
+	bld := array.NewRecordBuilder(alloc, schema)
+	defer bld.Release()
+	bld.Field(0).(*array.Int32Builder).Append(42)
+	bld.Field(1).(*array.Int64Builder).Append(9007199254740993)
+	bld.Field(2).(*array.Uint64Builder).Append(18446744073709551615)
+	bld.Field(3).(*array.Float64Builder).Append(3.14)
+	bld.Field(4).(*array.StringBuilder).Append("hello")
+	bld.Field(5).(*array.BooleanBuilder).Append(true)
+	rec := bld.NewRecord()
+	defer rec.Release()
+
+	key1, err := dataplane.EncodeKey(rec, 0, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+
+	bld2 := array.NewRecordBuilder(alloc, schema)
+	defer bld2.Release()
+	bld2.Field(0).(*array.Int32Builder).Append(43)
+	bld2.Field(1).(*array.Int64Builder).Append(9007199254740994)
+	bld2.Field(2).(*array.Uint64Builder).Append(18446744073709551614)
+	bld2.Field(3).(*array.Float64Builder).Append(2.71)
+	bld2.Field(4).(*array.StringBuilder).Append("world")
+	bld2.Field(5).(*array.BooleanBuilder).Append(false)
+	rec2 := bld2.NewRecord()
+	defer rec2.Release()
+
+	key2, err := dataplane.EncodeKey(rec2, 0, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+
+	if bytes.Equal(key1, key2) {
+		t.Error("different values must produce different keys")
+	}
+
+	if key1[0] != 0x01 { // typeInt32
+		t.Errorf("first key byte = 0x%02X, want 0x01 (Int32 prefix)", key1[0])
 	}
 }

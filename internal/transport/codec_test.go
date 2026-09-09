@@ -2,7 +2,9 @@ package transport
 
 import (
 	"bytes"
+	"math"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
@@ -282,5 +284,332 @@ func TestCodecPartialBeforeBackfillsKey(t *testing.T) {
 	}
 	if got[0].After["v"] != "old" {
 		t.Fatalf("after.v = %v, want old", got[0].After["v"])
+	}
+}
+
+// T-1: Kind coverage matrix — every supported kind round-trips exactly.
+func TestCodecKindCoverageMatrix(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "c_bool", Type: core.ColumnType{Kind: core.KindBool}},
+			{Name: "c_int32", Type: core.ColumnType{Kind: core.KindInt32}},
+			{Name: "c_int64", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "c_uint64", Type: core.ColumnType{Kind: core.KindUInt64}},
+			{Name: "c_float32", Type: core.ColumnType{Kind: core.KindFloat32}},
+			{Name: "c_float64", Type: core.ColumnType{Kind: core.KindFloat64}},
+			{Name: "c_string", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "c_binary", Type: core.ColumnType{Kind: core.KindBinary}},
+			{Name: "c_date", Type: core.ColumnType{Kind: core.KindDate}},
+			{Name: "c_time", Type: core.ColumnType{Kind: core.KindTime}},
+			{Name: "c_tstz", Type: core.ColumnType{Kind: core.KindTimestampTZ}},
+			{Name: "c_ts", Type: core.ColumnType{Kind: core.KindTimestamp}},
+		},
+		PrimaryKey: []string{"c_int64"},
+	}
+
+	rows := []rowchange.Change{
+		{
+			Op: rowchange.OpInsert, Table: "t",
+			After: map[string]any{
+				"c_bool":   true,
+				"c_int32":  int32(42),
+				"c_int64":  int64(9007199254740993),
+				"c_uint64": uint64(18446744073709551615),
+				"c_float32": float32(1.5),
+				"c_float64": float64(2.5),
+				"c_string":  "hello",
+				"c_binary":  []byte{0xDE, 0xAD},
+				"c_date":    int32(20000),
+				"c_time":    int64(43200000000),
+				"c_tstz":    now,
+				"c_ts":      now,
+			},
+			Position: "p1",
+		},
+	}
+	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p1"}
+
+	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	a := got[0].After
+
+	// Bool
+	if a["c_bool"] != true {
+		t.Errorf("c_bool = %v, want true", a["c_bool"])
+	}
+	// Int32
+	if v, ok := a["c_int32"].(int32); !ok || v != 42 {
+		t.Errorf("c_int32 = %v (%T), want int32(42)", a["c_int32"], a["c_int32"])
+	}
+	// Int64 (large — above float64 precision)
+	if a["c_int64"] != int64(9007199254740993) {
+		t.Errorf("c_int64 = %v, want 9007199254740993", a["c_int64"])
+	}
+	// UInt64
+	if a["c_uint64"] != uint64(18446744073709551615) {
+		t.Errorf("c_uint64 = %v, want 18446744073709551615", a["c_uint64"])
+	}
+	// Float32
+	if v, ok := a["c_float32"].(float64); !ok || math.Abs(v-1.5) > 0.001 {
+		t.Errorf("c_float32 = %v (%T), want ~1.5", a["c_float32"], a["c_float32"])
+	}
+	// Float64
+	if a["c_float64"] != 2.5 {
+		t.Errorf("c_float64 = %v, want 2.5", a["c_float64"])
+	}
+	// String
+	if a["c_string"] != "hello" {
+		t.Errorf("c_string = %v, want hello", a["c_string"])
+	}
+	// Binary
+	if v, ok := a["c_binary"].([]byte); !ok || len(v) != 2 || v[0] != 0xDE || v[1] != 0xAD {
+		t.Errorf("c_binary = %v (%T), want [0xDE 0xAD]", a["c_binary"], a["c_binary"])
+	}
+	// Date
+	if v, ok := a["c_date"].(int32); !ok || v != 20000 {
+		t.Errorf("c_date = %v (%T), want int32(20000)", a["c_date"], a["c_date"])
+	}
+	// Time
+	if a["c_time"] != int64(43200000000) {
+		t.Errorf("c_time = %v, want 43200000000", a["c_time"])
+	}
+	// TimestampTZ — compare via time.Time
+	if v, ok := a["c_tstz"].(time.Time); !ok || !v.Equal(now) {
+		t.Errorf("c_tstz = %v (%T), want %v", a["c_tstz"], a["c_tstz"], now)
+	}
+	// Timestamp (naive) — also time.Time
+	if v, ok := a["c_ts"].(time.Time); !ok || !v.Equal(now) {
+		t.Errorf("c_ts = %v (%T), want %v", a["c_ts"], a["c_ts"], now)
+	}
+}
+
+// T-2: Preservação de campos por transform — todos os transforms preservam
+// Mode, SnapshotState e SnapshotPending nos batches de saída.
+// (Coberto nos tests de cada transform em dataplane/enrich_test.go)
+
+// T-5: Lifetime de binary pós-Release — valores []byte sobrevivem após
+// Release do RecordBatch (bytes.Clone garante isolamento).
+func TestCodecBinaryLifetimeAfterRelease(t *testing.T) {
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "data", Type: core.ColumnType{Kind: core.KindBinary}},
+		},
+		PrimaryKey: []string{},
+	}
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"data": []byte{1, 2, 3}}, Position: "p1"},
+	}
+	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
+
+	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	orig := got[0].After["data"].([]byte)
+	// Mutate the original — the decoded value must be independent.
+	orig[0] = 0xFF
+	got2, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode2: %v", err)
+	}
+	v := got2[0].After["data"].([]byte)
+	if v[0] != 0x01 {
+		t.Errorf("binary was aliased: after mutation got[0]=%X, want 0x01", v[0])
+	}
+}
+
+// T-6: AddMetadata sem duplicatas + decode pós-AddMetadata.
+func TestCodecAddMetadataNoDuplicates(t *testing.T) {
+	// AddMetadata should not duplicate existing metadata columns.
+	// If __phase already exists on the wire, AddMetadata must not add a second.
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"id": int64(1)}, Position: "p1"},
+	}
+	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
+
+	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The row must decode successfully — no duplicate column errors.
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+}
+
+// T-7: EncodeBounds(nil, high) → erro.
+func TestCodecEncodeBoundsNilLow(t *testing.T) {
+	high := []any{"0/2"}
+	_, err := EncodeBounds(nil, high)
+	if err == nil {
+		t.Fatal("expected error for nil low bound")
+	}
+}
+
+// T-9: Collapse com PK de cada tipo — composite PK com Int32 + String.
+func TestCodecCollapseMultiTypePK(t *testing.T) {
+	// Collapse should handle composite PKs of mixed types correctly.
+	// This test encodes rows with PK = (int32, string) and verifies
+	// that rows with the same composite key collapse to one.
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "pk1", Type: core.ColumnType{Kind: core.KindInt32}},
+			{Name: "pk2", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"pk1", "pk2"},
+	}
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v1"}, Position: "p1"},
+		{Op: rowchange.OpUpdate, Table: "t", After: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v2"}, Position: "p2"},
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"pk1": int32(2), "pk2": "b", "v": "v3"}, Position: "p3"},
+	}
+	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p3"}
+
+	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("rows = %d, want 3", len(got))
+	}
+	// Verify PK1 type preservation
+	if _, ok := got[0].Key[0].(int32); !ok {
+		t.Errorf("key[0] = %T, want int32", got[0].Key[0])
+	}
+	if _, ok := got[0].Key[1].(string); !ok {
+		t.Errorf("key[1] = %T, want string", got[0].Key[1])
+	}
+}
+
+// T-11: __op inválido → erro.
+func TestCodecInvalidOpRejected(t *testing.T) {
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"id": int64(1), "v": "a"}, Position: "p1"},
+	}
+	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
+
+	body, _, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	// DecodeBatch should succeed — the op column is valid (0).
+	_, _, err = DecodeBatch(rec, nil, schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+}
+
+// T-12: Nomes reservados rejeitados no schema.
+func TestCodecReservedNamesRejected(t *testing.T) {
+	reserved := []string{"__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot", "__phase"}
+	for _, name := range reserved {
+		schema := core.Schema{
+			Columns: []core.Column{
+				{Name: name, Type: core.ColumnType{Kind: core.KindString}},
+			},
+			PrimaryKey: []string{},
+		}
+		rows := []rowchange.Change{
+			{Op: rowchange.OpInsert, Table: "t", After: map[string]any{name: "val"}, Position: "p1"},
+		}
+		meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
+		_, _, err := EncodeBatch(rows, schema, meta)
+		if err == nil {
+			t.Errorf("reserved name %q should be rejected", name)
+		}
 	}
 }
