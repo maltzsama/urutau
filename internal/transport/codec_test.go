@@ -415,12 +415,12 @@ func TestCodecKindCoverageMatrix(t *testing.T) {
 	}
 }
 
-// T-2: Preservação de campos por transform — todos os transforms preservam
-// Mode, SnapshotState e SnapshotPending nos batches de saída.
-// (Coberto nos tests de cada transform em dataplane/enrich_test.go)
+// T-2: field preservation per transform — every transform preserves
+// Mode, SnapshotState and SnapshotPending on output batches.
+// (Covered by each transform's own tests in dataplane/enrich_test.go.)
 
-// T-5: Lifetime de binary pós-Release — valores []byte sobrevivem após
-// Release do RecordBatch (bytes.Clone garante isolamento).
+// T-5: binary lifetime past Release — the decoded []byte values survive
+// releasing the RecordBatch (bytes.Clone guarantees isolation).
 func TestCodecBinaryLifetimeAfterRelease(t *testing.T) {
 	schema := core.Schema{
 		Columns: []core.Column{
@@ -491,7 +491,7 @@ func TestCodecBinaryLifetimeAfterRelease(t *testing.T) {
 	}
 }
 
-// T-6: AddMetadata sem duplicatas + decode pós-AddMetadata.
+// T-6: AddMetadata without duplicates + decode past AddMetadata.
 func TestCodecAddMetadataNoDuplicates(t *testing.T) {
 	// AddMetadata should not duplicate existing metadata columns.
 	// If __phase already exists on the wire, AddMetadata must not add a second.

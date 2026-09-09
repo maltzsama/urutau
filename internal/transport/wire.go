@@ -63,7 +63,7 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 // inferred from the values — the PK tuple's native types survive the wire.
 func EncodeBounds(low, high []any) ([]byte, error) {
 	if low == nil && high != nil {
-		return nil, fmt.Errorf("transport: bounds: low nil com high não-nil não é representável (row 0 é o slot do low)")
+		return nil, fmt.Errorf("transport: bounds: nil low with non-nil high is not representable (row 0 is the low slot)")
 	}
 	width := len(low)
 	if high != nil && len(high) > width {

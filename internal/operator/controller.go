@@ -75,9 +75,10 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Deleção tem precedência sobre terminação: uma pipeline terminada
-	// precisa poder ser removida — se o curto-circuito de terminated viesse
-	// antes, o finalizer nunca sairia e a CR travaria em Terminating.
+	// Deletion takes precedence over termination: a finished pipeline
+	// must still be removable — if the terminated short-circuit ran
+	// first, the finalizer would never run and the CR would stick in
+	// Terminating forever.
 	if !cr.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(cr, finalizer) {
 			if err := r.deleteCoordinator(ctx, cr); err != nil {

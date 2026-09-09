@@ -58,7 +58,7 @@ func Cast(ctx context.Context, batch *Batch, policy CastPolicy) (*Batch, []core.
 	for name, target := range policy {
 		from, ok := srcType[name]
 		if !ok {
-			return nil, nil, fmt.Errorf("dataplane: cast: coluna %q inexistente", name)
+			return nil, nil, fmt.Errorf("dataplane: cast: column %q does not exist", name)
 		}
 		if err := core.CheckCast(from, target); err != nil {
 			return nil, nil, fmt.Errorf("dataplane: cast %q: %w", name, err)
@@ -142,7 +142,7 @@ func castColumn(ctx context.Context, col arrow.Array, from core.ColumnType, targ
 			// Custom kernel: arrow has no hex/base64 encode.
 			return encodeBinaryToString(col, from.Kind, target.Encoding)
 		case core.KindStruct, core.KindList, core.KindMap:
-			return nil, fmt.Errorf("cast composite→string aguarda executor columnar (CR-069) — declare um tipo nativo ou remova o cast")
+			return nil, fmt.Errorf("cast composite-to-string awaits a columnar executor (CR-069) — declare a native type or drop the cast")
 		}
 	case core.KindTimestampTZ:
 		// assume_utc semantics are policy (validated by the matrix); the
@@ -218,7 +218,7 @@ func AddMetadata(ctx context.Context, alloc memory.Allocator, batch *Batch, phas
 	// Validate that the wire schema carries the 5 metadata columns.
 	for _, w := range []string{"__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot"} {
 		if colIndex(batch.Record.Schema(), w) < 0 {
-			return nil, fmt.Errorf("dataplane: addmetadata: %q ausente — requer batch wire-schema", w)
+			return nil, fmt.Errorf("dataplane: addmetadata: %q missing — wire-schema batch required", w)
 		}
 	}
 	// Idempotent: __phase already present → no-op.

@@ -155,13 +155,13 @@ func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta, al
 // identity must not decode silently (M-2).
 func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]rowchange.Change, error) {
 	if table == "" {
-		return nil, fmt.Errorf("transport: batch sem identidade — table vazio")
+		return nil, fmt.Errorf("transport: batch has no identity — empty table")
 	}
 
 	schema := rec.Schema()
 	numCols := int(rec.NumCols())
 	if numCols < 5 {
-		return nil, fmt.Errorf("transport: batch com %d colunas — wire-schema requer ≥5", numCols)
+		return nil, fmt.Errorf("transport: batch has %d columns — wire schema requires >= 5", numCols)
 	}
 	numDataCols := numCols - 5 // subtract metadata columns
 
@@ -178,7 +178,7 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 		f := schema.Field(numDataCols + k)
 		if f.Name != w.Name || !arrow.TypeEqual(f.Type, w.Type) {
 			return nil, fmt.Errorf(
-				"transport: coluna %d: want %s, got %s(%s) — não é wire-schema",
+				"transport: column %d: want %s, got %s(%s) — not wire schema",
 				numDataCols+k, w.Name, f.Name, f.Type)
 		}
 	}
@@ -191,11 +191,11 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 			// A reserved name in the data region means the record was
 			// produced post-AddMetadata (__phase appended) — decoding it
 			// would silently turn the phase into a data column.
-			return nil, fmt.Errorf("transport: coluna %d %q é reservada na região de dados — batch pós-AddMetadata não é decodável", j, name)
+			return nil, fmt.Errorf("transport: column %d %q is reserved in the data region — post-AddMetadata batch is not decodable", j, name)
 		}
 		ct, err := fieldTypeToCore(schema.Field(j))
 		if err != nil {
-			return nil, fmt.Errorf("transport: coluna %d: %w", j, err)
+			return nil, fmt.Errorf("transport: column %d: %w", j, err)
 		}
 		colTypes[j] = ct
 	}
@@ -351,7 +351,7 @@ func arrowTypeToCore(dt arrow.DataType) (core.ColumnType, error) {
 		vt.Nullable = vf.Nullable
 		return core.ColumnType{Kind: core.KindMap, KeyType: &kt, ValueType: &vt}, nil
 	default:
-		return core.ColumnType{}, fmt.Errorf("transport: tipo arrow %s sem mapeamento canônico", dt)
+		return core.ColumnType{}, fmt.Errorf("transport: arrow type %s has no canonical mapping", dt)
 	}
 }
 
@@ -375,17 +375,19 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Int32Builder).Append(t)
 		case int:
 			if t < math.MinInt32 || t > math.MaxInt32 {
-				return fmt.Errorf("valor %d fora do range int32", t)
+				return fmt.Errorf("value %d out of int32 range", t)
 			}
 			bld.(*array.Int32Builder).Append(int32(t))
 		case int64:
 			if t < math.MinInt32 || t > math.MaxInt32 {
-				return fmt.Errorf("valor %d fora do range int32", t)
+				return fmt.Errorf("value %d out of int32 range", t)
 			}
 			bld.(*array.Int32Builder).Append(int32(t))
 		case float64:
-			if !isIntegralFloat(t) || t < math.MinInt32 || t > math.MaxInt32 {
-				return fmt.Errorf("valor %v não é inteiro representável em int32", t)
+			// RV-04 family: math.MaxInt32 as float64 rounds to exactly
+			// 2^31 (2^31-1 is not representable), so the bound is >=.
+			if !isIntegralFloat(t) || t < math.MinInt32 || t >= math.MaxInt32 {
+				return fmt.Errorf("value %v is not an integer representable in int32", t)
 			}
 			bld.(*array.Int32Builder).Append(int32(t))
 		default:
@@ -400,8 +402,12 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		case int32:
 			bld.(*array.Int64Builder).Append(int64(t))
 		case float64:
-			if !isIntegralFloat(t) || t < math.MinInt64 || t > math.MaxInt64 {
-				return fmt.Errorf("valor %v não é inteiro representável em int64", t)
+			// RV-04: math.MaxInt64 as an untyped constant converts to
+			// float64 as exactly 2^63 (float64 cannot represent 2^63-1
+			// and rounds UP). The exclusive bound is therefore >=: t = 2^63
+			// must be REJECTED even though `t > math.MaxInt64` reads false.
+			if !isIntegralFloat(t) || t < math.MinInt64 || t >= math.MaxInt64 {
+				return fmt.Errorf("value %v is not an integer representable in int64", t)
 			}
 			bld.(*array.Int64Builder).Append(int64(t))
 		default:
@@ -413,17 +419,19 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Uint64Builder).Append(t)
 		case int:
 			if t < 0 {
-				return fmt.Errorf("valor %d negativo não representável em uint64", t)
+				return fmt.Errorf("negative value %d is not representable in uint64", t)
 			}
 			bld.(*array.Uint64Builder).Append(uint64(t))
 		case int64:
 			if t < 0 {
-				return fmt.Errorf("valor %d negativo não representável em uint64", t)
+				return fmt.Errorf("negative value %d is not representable in uint64", t)
 			}
 			bld.(*array.Uint64Builder).Append(uint64(t))
 		case float64:
-			if t < 0 || t > math.MaxUint64 || !isIntegralFloat(t) {
-				return fmt.Errorf("valor %v não é representável em uint64", t)
+			// RV-04: math.MaxUint64 converts to float64 as exactly 2^64 —
+			// the exclusive bound is >=. `t > math.MaxUint64` never fires.
+			if t < 0 || t >= math.MaxUint64 || !isIntegralFloat(t) {
+				return fmt.Errorf("value %v is not representable in uint64", t)
 			}
 			bld.(*array.Uint64Builder).Append(uint64(t))
 		default:
@@ -448,12 +456,12 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Float64Builder).Append(float64(t)) // widening — permitido
 		case int64:
 			if int64(float64(t)) != t {
-				return fmt.Errorf("valor %d perde precisão em float64", t)
+				return fmt.Errorf("value %d loses precision in float64", t)
 			}
 			bld.(*array.Float64Builder).Append(float64(t))
 		case int:
 			if int64(float64(t)) != int64(t) {
-				return fmt.Errorf("valor %d perde precisão em float64", t)
+				return fmt.Errorf("value %d loses precision in float64", t)
 			}
 			bld.(*array.Float64Builder).Append(float64(t))
 		case int32:
@@ -494,12 +502,12 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Date32Builder).Append(arrow.Date32(t))
 		case int64:
 			if t < math.MinInt32 || t > math.MaxInt32 {
-				return fmt.Errorf("date %d fora do range int32", t)
+				return fmt.Errorf("date %d out of int32 range", t)
 			}
 			bld.(*array.Date32Builder).Append(arrow.Date32(t))
 		case int:
 			if int64(t) < math.MinInt32 || int64(t) > math.MaxInt32 {
-				return fmt.Errorf("date %d fora do range int32", t)
+				return fmt.Errorf("date %d out of int32 range", t)
 			}
 			bld.(*array.Date32Builder).Append(arrow.Date32(t))
 		default:
@@ -561,36 +569,80 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 	if col.IsNull(i) {
 		return nil, nil
 	}
+	// Every assertion is comma-ok (RV-03, defense-in-depth): the type was
+	// validated at the schema boundary, but a decoding path that feeds a
+	// mismatched array must error, not panic a remote-triggerable wire
+	// boundary. castErr is the uniform failure.
+	castErr := func() (any, error) {
+		return nil, fmt.Errorf("transport: column type %s does not match canonical kind %s", col.DataType(), ct.Kind)
+	}
 	switch ct.Kind {
 	case core.KindBool:
-		return col.(*array.Boolean).Value(i), nil
+		if a, ok := col.(*array.Boolean); ok {
+			return a.Value(i), nil
+		}
+		return castErr()
 	case core.KindInt32:
-		return col.(*array.Int32).Value(i), nil
+		if a, ok := col.(*array.Int32); ok {
+			return a.Value(i), nil
+		}
+		return castErr()
 	case core.KindInt64:
-		return col.(*array.Int64).Value(i), nil
+		if a, ok := col.(*array.Int64); ok {
+			return a.Value(i), nil
+		}
+		return castErr()
 	case core.KindUInt64:
-		return col.(*array.Uint64).Value(i), nil
+		if a, ok := col.(*array.Uint64); ok {
+			return a.Value(i), nil
+		}
+		return castErr()
 	case core.KindFloat32:
-		return float64(col.(*array.Float32).Value(i)), nil // promote to float64 for map[string]any
+		// Promote to float64 for map[string]any (M-3 contract).
+		if a, ok := col.(*array.Float32); ok {
+			return float64(a.Value(i)), nil
+		}
+		return castErr()
 	case core.KindFloat64:
-		return col.(*array.Float64).Value(i), nil
+		if a, ok := col.(*array.Float64); ok {
+			return a.Value(i), nil
+		}
+		return castErr()
 	case core.KindDecimal:
-		return col.(*array.Decimal128).ValueStr(i), nil // canonical text form
+		if a, ok := col.(*array.Decimal128); ok {
+			return a.ValueStr(i), nil // canonical text form
+		}
+		return castErr()
 	case core.KindString, core.KindJSON:
-		return col.(*array.String).Value(i), nil
+		if a, ok := col.(*array.String); ok {
+			return a.Value(i), nil
+		}
+		return castErr()
 	case core.KindBinary:
-		return bytes.Clone(col.(*array.Binary).Value(i)), nil
+		if a, ok := col.(*array.Binary); ok {
+			return bytes.Clone(a.Value(i)), nil
+		}
+		return castErr()
 	case core.KindDate:
-		return int32(col.(*array.Date32).Value(i)), nil // days since epoch
+		if a, ok := col.(*array.Date32); ok {
+			return int32(a.Value(i)), nil // days since epoch
+		}
+		return castErr()
 	case core.KindTime:
-		return int64(col.(*array.Time64).Value(i)), nil // micros since midnight
+		if a, ok := col.(*array.Time64); ok {
+			return int64(a.Value(i)), nil // micros since midnight
+		}
+		return castErr()
 	case core.KindTimestamp, core.KindTimestampTZ:
-		ts := col.(*array.Timestamp).Value(i)
-		return ts.ToTime(arrow.Microsecond), nil
-	case core.KindUUID:
-		return bytes.Clone(col.(*array.FixedSizeBinary).Value(i)), nil
-	case core.KindFixedBinary:
-		return bytes.Clone(col.(*array.FixedSizeBinary).Value(i)), nil
+		if a, ok := col.(*array.Timestamp); ok {
+			return a.Value(i).ToTime(arrow.Microsecond), nil
+		}
+		return castErr()
+	case core.KindUUID, core.KindFixedBinary:
+		if a, ok := col.(*array.FixedSizeBinary); ok {
+			return bytes.Clone(a.Value(i)), nil
+		}
+		return castErr()
 	default:
 		return nil, fmt.Errorf("unsupported kind %s", ct.Kind)
 	}

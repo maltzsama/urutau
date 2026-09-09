@@ -13,6 +13,11 @@ import (
 // seam is columnar: it takes *dataplane.Batch and returns *dataplane.Batch
 // with the reference columns appended.
 //
+// primaryKey carries the table's PK (from the Assignment). The wire record
+// does not carry it, and the re-encode bridge REJECTS deletes on a schema
+// without PK (C-8 fail-fast) — without it, any enriched batch containing a
+// delete errors out.
+//
 // QUARANTINE: the join itself is still row-based — the batch is decoded to
 // rows, joined, and re-encoded. This establishes the columnar seam so the
 // worker can consume batches; the join becomes truly columnar (CR-069 §3.4)
@@ -21,11 +26,11 @@ import (
 //
 // OWNERSHIP: the input batch is NOT released; the caller owns it. Returns
 // nil when inner joins dropped every row.
-func (s *Stage) EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error) {
+func (s *Stage) EnrichBatch(b *dataplane.Batch, primaryKey []string) (*dataplane.Batch, error) {
 	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
 		return b, nil
 	}
-	rows, err := transport.DecodeBatch(b.Record, b.Table, nil)
+	rows, err := transport.DecodeBatch(b.Record, b.Table, primaryKey)
 	if err != nil {
 		return nil, fmt.Errorf("enrich: decode: %w", err)
 	}
@@ -43,6 +48,9 @@ func (s *Stage) EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error) {
 	if err != nil {
 		return nil, fmt.Errorf("enrich: input schema: %w", err)
 	}
+	// The wire record carries columns only; PK rides from the Assignment
+	// so delete-key projection and the bridge C-8 validation hold.
+	cs.PrimaryKey = primaryKey
 	cb := rowchange.Batch{
 		Table:           b.Table,
 		Changes:         enriched,

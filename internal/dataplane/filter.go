@@ -459,7 +459,7 @@ func validateOpColumn(opCol *array.Uint8) error {
 		switch opCol.Value(i) {
 		case OpInsert, OpUpdate, OpDelete:
 		default:
-			return fmt.Errorf("dataplane: __op inválido %d na row %d", opCol.Value(i), i)
+			return fmt.Errorf("dataplane: invalid __op %d at row %d", opCol.Value(i), i)
 		}
 	}
 	return nil
@@ -549,7 +549,7 @@ func TransitionMatrix(ctx context.Context, alloc memory.Allocator, batch *Batch,
 	// W-2: __op defines existence; predicates define membership.
 	opIdx := colIndex(batch.Record.Schema(), "__op")
 	if opIdx < 0 {
-		return nil, nil, nil, fmt.Errorf("dataplane: transition: __op não encontrada")
+		return nil, nil, nil, fmt.Errorf("dataplane: transition: __op column not found")
 	}
 	opCol, ok := batch.Record.Column(opIdx).(*array.Uint8)
 	if !ok {

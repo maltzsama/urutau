@@ -217,8 +217,12 @@ func resolveColumn(chg rowchange.Change, name string) any {
 func collectColumns(b rowchange.Batch) []string {
 	seen := make(map[string]bool)
 	for _, c := range b.Changes {
+		// DELETE IMAGE CONTRACT (RV-02/RV-11): wire-decoded deletes carry
+		// their image in After (flat = before image per CR-021; Before is
+		// nil). Only prefer Before when a source decoder actually filled
+		// it — otherwise the delete projects zero columns.
 		src := c.After
-		if c.Op == rowchange.OpDelete {
+		if c.Op == rowchange.OpDelete && len(c.Before) > 0 {
 			src = c.Before
 		}
 		for k := range src {

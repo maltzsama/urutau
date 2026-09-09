@@ -179,7 +179,7 @@ func (w *Worker) OnDroppedDelete(f OnDroppedDelete) { w.onDroppedDelete = f }
 // join. Implemented by internal/enrich.Stage; the interface keeps the worker
 // free of the reference-join machinery.
 type Enricher interface {
-	EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error)
+	EnrichBatch(b *dataplane.Batch, primaryKey []string) (*dataplane.Batch, error)
 }
 
 // SetEnricher installs the enrichment stage for a target table. Nil (the
@@ -617,7 +617,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 						if err != nil {
 							return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
 						}
-						enriched, err := p.enricher.EnrichBatch(dpb)
+						enriched, err := p.enricher.EnrichBatch(dpb, p.knownSchema.PrimaryKey)
 						dpb.Release()
 						if err != nil {
 							return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
@@ -756,7 +756,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// Enrich the whole batch (columnar seam), then decode.
 			batch := ing.Batch
 			if p.enricher != nil {
-				enriched, err := p.enricher.EnrichBatch(batch)
+				enriched, err := p.enricher.EnrichBatch(batch, p.knownSchema.PrimaryKey)
 				if err != nil {
 					return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
 				}
