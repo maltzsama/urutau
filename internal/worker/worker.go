@@ -926,7 +926,7 @@ func decodeToChanges(b *dataplane.Batch, pk []string) ([]rowchange.Change, error
 	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
 		return nil, nil
 	}
-	rows, _, err := transport.DecodeBatch(b.Record, nil, pk)
+	rows, err := transport.DecodeBatch(b.Record, b.Table, pk)
 	if err != nil {
 		return nil, err
 	}

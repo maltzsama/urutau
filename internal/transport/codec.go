@@ -134,21 +134,22 @@ func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta) (b
 // does not carry the key separately — the sink's equality deletes need it,
 // and an empty key would make every commit fail on arity. Pass nil only for
 // batches whose consumer never commits (tests).
-func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) ([]rowchange.Change, *pb.BatchMeta, error) {
-	if len(metaBytes) == 0 && metaBytes != nil {
-		return nil, nil, fmt.Errorf("transport: meta vazio — batch sem identidade")
-	}
-	meta := &pb.BatchMeta{}
-	if len(metaBytes) > 0 {
-		if err := proto.Unmarshal(metaBytes, meta); err != nil {
-			return nil, nil, fmt.Errorf("transport: unmarshal batch meta: %w", err)
-		}
+// DecodeBatch decodes an Arrow IPC record into row-oriented changes.
+//
+// The table identity is passed explicitly: on the real wire the BatchMeta
+// frame (FlightData.app_metadata) is parsed by the transport layer BEFORE
+// decode (worker/remote.go), so the codec takes the already-parsed identity
+// instead of re-parsing bytes. Empty table is rejected — a batch without
+// identity must not decode silently (M-2).
+func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]rowchange.Change, error) {
+	if table == "" {
+		return nil, fmt.Errorf("transport: batch sem identidade — table vazio")
 	}
 
 	schema := rec.Schema()
 	numCols := int(rec.NumCols())
 	if numCols < 5 {
-		return nil, nil, fmt.Errorf("transport: batch com %d colunas — wire-schema requer ≥5", numCols)
+		return nil, fmt.Errorf("transport: batch com %d colunas — wire-schema requer ≥5", numCols)
 	}
 	numDataCols := numCols - 5 // subtract metadata columns
 
@@ -164,7 +165,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 	for k, w := range want {
 		f := schema.Field(numDataCols + k)
 		if f.Name != w.Name || !arrow.TypeEqual(f.Type, w.Type) {
-			return nil, nil, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"transport: coluna %d: want %s, got %s(%s) — não é wire-schema",
 				numDataCols+k, w.Name, f.Name, f.Type)
 		}
@@ -174,6 +175,12 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 	// honoring extension metadata (uuid/json) so the Kind survives the wire.
 	colTypes := make([]core.ColumnType, numDataCols)
 	for j := 0; j < numDataCols; j++ {
+		if name := schema.Field(j).Name; isMetadataColumn(name) {
+			// A reserved name in the data region means the record was
+			// produced post-AddMetadata (__phase appended) — decoding it
+			// would silently turn the phase into a data column.
+			return nil, fmt.Errorf("transport: coluna %d %q é reservada na região de dados — batch pós-AddMetadata não é decodável", j, name)
+		}
 		colTypes[j] = fieldTypeToCore(schema.Field(j))
 	}
 	// Resolve key column positions once: data-column index per PK name.
@@ -187,7 +194,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 			}
 		}
 		if idx < 0 {
-			return nil, nil, fmt.Errorf("transport: primary key column %q not in batch schema", name)
+			return nil, fmt.Errorf("transport: primary key column %q not in batch schema", name)
 		}
 		keyCols = append(keyCols, idx)
 	}
@@ -195,7 +202,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 	rows := make([]rowchange.Change, 0, rec.NumRows())
 	for i := 0; i < int(rec.NumRows()); i++ {
 		c := rowchange.Change{
-			Table:    meta.Table,
+			Table:    table,
 			IngestTS: time.Now(), // fallback when the wire column is null
 		}
 
@@ -205,7 +212,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 			field := schema.Field(j)
 			v, err := readTypedValue(rec.Column(j), colTypes[j], i)
 			if err != nil {
-				return nil, nil, fmt.Errorf("transport: column %q row %d: %w", field.Name, i, err)
+				return nil, fmt.Errorf("transport: column %q row %d: %w", field.Name, i, err)
 			}
 			if v != nil {
 				c.After[field.Name] = v
@@ -240,7 +247,7 @@ func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) (
 
 		rows = append(rows, c)
 	}
-	return rows, meta, nil
+	return rows, nil
 }
 
 // ── typed value helpers ──────────────────────────────────────────────
@@ -412,6 +419,9 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			}
 			bld.(*array.Float64Builder).Append(float64(t))
 		case int:
+			if int64(float64(t)) != int64(t) {
+				return fmt.Errorf("valor %d perde precisão em float64", t)
+			}
 			bld.(*array.Float64Builder).Append(float64(t))
 		case int32:
 			bld.(*array.Float64Builder).Append(float64(t))

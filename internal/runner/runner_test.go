@@ -33,7 +33,7 @@ func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 		c.mu.Unlock()
 		return nil
 	}
-	rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
+	rows, _ := transport.DecodeBatch(b.Record, b.Table, []string{"id"})
 	var upserts []rowchange.Change
 	for _, r := range rows {
 		if r.Op != rowchange.OpDelete {

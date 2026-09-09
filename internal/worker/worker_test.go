@@ -30,7 +30,7 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	if b.Record == nil || b.Record.NumRows() == 0 {
 		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 	} else {
-		rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
+		rows, _ := transport.DecodeBatch(b.Record, b.Table, []string{"id"})
 		if b.Mode == dataplane.AppendMode {
 			// Append: every row is an upsert (deletes already rewritten/dropped).
 			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: rows, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})

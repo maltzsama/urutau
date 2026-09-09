@@ -239,7 +239,7 @@ func (w *sinkWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
 	if b.Record == nil || b.Record.NumRows() == 0 {
 		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
 	}
-	rows, _, err := transport.DecodeBatch(b.Record, nil, nil)
+	rows, err := transport.DecodeBatch(b.Record, b.Table, nil)
 	if err != nil {
 		return rowchange.Batch{}, err
 	}

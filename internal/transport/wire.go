@@ -56,7 +56,7 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 
 // EncodeBounds serializes chunk bounds as a one-or-two-row Arrow record:
 // row 0 is the low tuple, row 1 the high tuple (absent for the open-high
-// last chunk; a nil low produces an empty record). Column types are
+// last chunk; nil low with non-nil high is an error). Column types are
 // inferred from the values — the PK tuple's native types survive the wire.
 func EncodeBounds(low, high []any) ([]byte, error) {
 	if low == nil && high != nil {

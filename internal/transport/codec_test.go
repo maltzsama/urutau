@@ -6,7 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -64,12 +68,18 @@ func TestCodecRoundTrip(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, gotMeta, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "raw.orders", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if gotMeta.Table != "raw.orders" || gotMeta.BatchId != 9 || !gotMeta.Window.Snapshot || gotMeta.Window.ChunkId != 3 {
-		t.Fatalf("meta mismatch: %+v", gotMeta)
+	// The meta frame is opaque to the codec — it must round-trip verbatim
+	// for the transport layer (FlightData.app_metadata) to parse.
+	parsedMeta := &pb.BatchMeta{}
+	if err := proto.Unmarshal(metaBytes, parsedMeta); err != nil {
+		t.Fatalf("unmarshal meta: %v", err)
+	}
+	if parsedMeta.Table != "raw.orders" || parsedMeta.BatchId != 9 || !parsedMeta.Window.Snapshot || parsedMeta.Window.ChunkId != 3 {
+		t.Fatalf("meta mismatch: %+v", parsedMeta)
 	}
 	if len(got) != len(rows) {
 		t.Fatalf("rows = %d, want %d", len(got), len(rows))
@@ -126,7 +136,7 @@ func TestCodecLargeInt64(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p1"}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -142,7 +152,7 @@ func TestCodecLargeInt64(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -171,7 +181,7 @@ func TestCodecDecimal(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p1"}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -187,7 +197,7 @@ func TestCodecDecimal(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -215,7 +225,7 @@ func TestCodecDeleteKeyOnly(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "raw.orders", HighPos: "p1"}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -230,7 +240,7 @@ func TestCodecDeleteKeyOnly(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -260,7 +270,7 @@ func TestCodecPartialBeforeBackfillsKey(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -275,7 +285,7 @@ func TestCodecPartialBeforeBackfillsKey(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -330,7 +340,7 @@ func TestCodecKindCoverageMatrix(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p1"}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -346,7 +356,7 @@ func TestCodecKindCoverageMatrix(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -423,7 +433,7 @@ func TestCodecBinaryLifetimeAfterRelease(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -437,22 +447,47 @@ func TestCodecBinaryLifetimeAfterRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ipc read: %v", err)
 	}
-	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	orig := got[0].After["data"].([]byte)
-	// Mutate the original — the decoded value must be independent.
-	orig[0] = 0xFF
-	got2, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+
+	// LIFETIME (the real T-5): release the record BEFORE reading the
+	// decoded value. DecodeBatch must have cloned the bytes — if it had
+	// aliased the record's buffers, this read would be use-after-free.
+	rec.Release()
+
+	v := got[0].After["data"].([]byte)
+	if !bytes.Equal(v, []byte{1, 2, 3}) {
+		t.Fatalf("binary not independent of record lifetime: got %X, want 010203", v)
+	}
+
+	// ISOLATION: a second decode (fresh reader over the same record body)
+	// must not observe mutations to the first decode's bytes.
+	r2, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader2: %v", err)
+	}
+	defer r2.Release()
+	rec2, err := r2.Read()
+	if err != nil {
+		t.Fatalf("ipc read2: %v", err)
+	}
+	defer rec2.Release()
+	got2, err := DecodeBatch(rec2, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode2: %v", err)
 	}
-	v := got2[0].After["data"].([]byte)
-	if v[0] != 0x01 {
-		t.Errorf("binary was aliased: after mutation got[0]=%X, want 0x01", v[0])
+	orig := got2[0].After["data"].([]byte)
+	orig[0] = 0xFF
+	got3, err := DecodeBatch(rec2, "t", schema.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode3: %v", err)
+	}
+	v3 := got3[0].After["data"].([]byte)
+	if v3[0] != 0x01 {
+		t.Errorf("binary was aliased: after mutation got=%X, want 0x01", v3[0])
 	}
 }
 
@@ -471,7 +506,7 @@ func TestCodecAddMetadataNoDuplicates(t *testing.T) {
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
+	body, _, err := EncodeBatch(rows, schema, meta)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -487,7 +522,7 @@ func TestCodecAddMetadataNoDuplicates(t *testing.T) {
 	}
 	defer rec.Release()
 
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -506,68 +541,18 @@ func TestCodecEncodeBoundsNilLow(t *testing.T) {
 	}
 }
 
-// T-9: Collapse com PK de cada tipo — composite PK com Int32 + String.
-func TestCodecCollapseMultiTypePK(t *testing.T) {
-	// Collapse should handle composite PKs of mixed types correctly.
-	// This test encodes rows with PK = (int32, string) and verifies
-	// that rows with the same composite key collapse to one.
+// T-9 (real Collapse coverage) lives in dataplane: collapse_pkey_test.go.
+// The codec's share of T-9: composite Key types survive the round-trip.
+func TestCodecCompositeKeyTypesRoundTrip(t *testing.T) {
 	schema := core.Schema{
 		Columns: []core.Column{
 			{Name: "pk1", Type: core.ColumnType{Kind: core.KindInt32}},
 			{Name: "pk2", Type: core.ColumnType{Kind: core.KindString}},
-			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
 		},
 		PrimaryKey: []string{"pk1", "pk2"},
 	}
 	rows := []rowchange.Change{
-		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v1"}, Position: "p1"},
-		{Op: rowchange.OpUpdate, Table: "t", After: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v2"}, Position: "p2"},
-		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"pk1": int32(2), "pk2": "b", "v": "v3"}, Position: "p3"},
-	}
-	meta := &pb.BatchMeta{Table: "t", LowPos: "p1", HighPos: "p3"}
-
-	body, metaBytes, err := EncodeBatch(rows, schema, meta)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	r, err := ipc.NewReader(bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("ipc reader: %v", err)
-	}
-	defer r.Release()
-	rec, err := r.Read()
-	if err != nil {
-		t.Fatalf("ipc read: %v", err)
-	}
-	defer rec.Release()
-
-	got, _, err := DecodeBatch(rec, metaBytes, schema.PrimaryKey)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("rows = %d, want 3", len(got))
-	}
-	// Verify PK1 type preservation
-	if _, ok := got[0].Key[0].(int32); !ok {
-		t.Errorf("key[0] = %T, want int32", got[0].Key[0])
-	}
-	if _, ok := got[0].Key[1].(string); !ok {
-		t.Errorf("key[1] = %T, want string", got[0].Key[1])
-	}
-}
-
-// T-11: __op inválido → erro.
-func TestCodecInvalidOpRejected(t *testing.T) {
-	schema := core.Schema{
-		Columns: []core.Column{
-			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
-		},
-		PrimaryKey: []string{"id"},
-	}
-	rows := []rowchange.Change{
-		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"id": int64(1), "v": "a"}, Position: "p1"},
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"pk1": int32(1), "pk2": "a"}, Position: "p1"},
 	}
 	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
 
@@ -586,12 +571,79 @@ func TestCodecInvalidOpRejected(t *testing.T) {
 	}
 	defer rec.Release()
 
-	// DecodeBatch should succeed — the op column is valid (0).
-	_, _, err = DecodeBatch(rec, nil, schema.PrimaryKey)
+	got, err := DecodeBatch(rec, "t", schema.PrimaryKey)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	if k0, ok := got[0].Key[0].(int32); !ok || k0 != 1 {
+		t.Errorf("key[0] = %T(%v), want int32(1)", got[0].Key[0], got[0].Key[0])
+	}
+	if k1, ok := got[0].Key[1].(string); !ok || k1 != "a" {
+		t.Errorf("key[1] = %T(%v), want string(\"a\")", got[0].Key[1], got[0].Key[1])
+	}
 }
+
+// T-6 (transport side): a record with __phase appended past the metadata
+// tail (i.e. post-AddMetadata) is NOT wire-schema — decode must fail with
+// a clean error instead of silently promoting __phase to a data column.
+func TestCodecDecodeRejectsPostAddMetadataRecord(t *testing.T) {
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{"id": int64(1)}, Position: "p1"},
+	}
+	meta := &pb.BatchMeta{Table: "t", HighPos: "p1"}
+
+	body, _, err := EncodeBatch(rows, schema, meta)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	r, err := ipc.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("ipc reader: %v", err)
+	}
+	defer r.Release()
+	rec, err := r.Read()
+	if err != nil {
+		t.Fatalf("ipc read: %v", err)
+	}
+	defer rec.Release()
+
+	// Append a __phase string column, mimicking AddMetadata output.
+	phaseBld := array.NewStringBuilder(memory.DefaultAllocator)
+	defer phaseBld.Release()
+	phaseBld.Append("live")
+	phaseArr := phaseBld.NewStringArray()
+	defer phaseArr.Release()
+
+	cols := make([]arrow.Array, rec.NumCols()+1)
+	for i := range int(rec.NumCols()) {
+		rec.Column(i).Retain()
+		cols[i] = rec.Column(i)
+	}
+	cols[rec.NumCols()] = phaseArr
+	fields := append(rec.Schema().Fields(), arrow.Field{Name: "__phase", Type: arrow.BinaryTypes.String, Nullable: true})
+	tagged := array.NewRecordBatch(arrow.NewSchema(fields, nil), cols, rec.NumRows())
+	for _, c := range cols {
+		c.Release()
+	}
+	defer tagged.Release()
+
+	if _, err := DecodeBatch(tagged, "t", schema.PrimaryKey); err == nil {
+		t.Fatal("decode must reject a post-AddMetadata record (__phase in data region)")
+	}
+}
+
+// T-11 (op validation) lives in dataplane: op_validation_test.go — the
+// codec round-trips the __op byte verbatim; op-semantics validation is a
+// dataplane concern (SplitByOp/Filter/Collapse/TransitionMatrix).
 
 // T-12: Nomes reservados rejeitados no schema.
 func TestCodecReservedNamesRejected(t *testing.T) {

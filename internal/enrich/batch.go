@@ -25,7 +25,7 @@ func (s *Stage) EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error) {
 	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
 		return b, nil
 	}
-	rows, _, err := transport.DecodeBatch(b.Record, nil, nil)
+	rows, err := transport.DecodeBatch(b.Record, b.Table, nil)
 	if err != nil {
 		return nil, fmt.Errorf("enrich: decode: %w", err)
 	}

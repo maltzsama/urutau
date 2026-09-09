@@ -121,7 +121,7 @@ func (w *tableWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
 		return rowchange.Batch{Table: b.Table, Position: string(b.Watermark)}, nil
 	}
 
-	rows, _, err := transport.DecodeBatch(b.Record, nil, w.plan.pk)
+	rows, err := transport.DecodeBatch(b.Record, b.Table, w.plan.pk)
 	if err != nil {
 		return rowchange.Batch{}, err
 	}
