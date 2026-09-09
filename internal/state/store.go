@@ -21,6 +21,33 @@
 //
 // Offsets are opaque cookies (contract §8.2): this store never inspects
 // or compares them.
+//
+// ROLE AND ARBITRATION (audit §3 — the decision, written down):
+//
+// The project's default is "the position lives in the sink, atomic with the
+// data" (design §17.3) — no parallel store that can diverge. This store is
+// the EXCEPTION, and only for one case: external plugin sinks that cannot
+// persist a position themselves. For those, Urutau commits the offset here
+// AFTER the sink confirms a flush (contract §9) — never before, the same
+// ordering invariant as the Iceberg path.
+//
+// Arbitrage rule when both exist for the same pipeline/table:
+//
+//  1. If the sink reports a committed position (sink.Position != ""),
+//     that is the source of truth — it was written atomically with the
+//     data. The store's copy, if any, is ignored.
+//  2. Only when the sink has no position capability (plugin sinks) does
+//     the store become authoritative.
+//  3. On resume, the sink position wins; the store is consulted only as
+//     the fallback.
+//
+// The two are never merged. One wins per table. This rule keeps the
+// single-source-of-truth property the project is built on.
+//
+// STATUS: this package is NOT yet wired into the runtime. It exists for
+// the plugin-sink position path; wiring it (or removing it) is a separate
+// change. Until then no code path can give the false impression that the
+// problem is solved.
 package state
 
 import (

@@ -505,7 +505,11 @@ func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
 	if err != nil {
 		return false
 	}
-	return high.Compare(cp) <= 0
+	// A batch is covered only when its high position is at or before the
+	// committed point. An Incomparable comparison (opaque plugin offsets)
+	// cannot decide — never skip, reprocess is safe.
+	c := high.Compare(cp)
+	return c != position.Incomparable && c <= 0
 }
 
 // apply routes one Flight batch: the demux. It builds a *dataplane.Batch

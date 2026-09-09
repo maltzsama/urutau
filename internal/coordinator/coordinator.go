@@ -928,7 +928,7 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	}
 	best := positions[0]
 	for _, p := range positions[1:] {
-		if p.Compare(best) < 0 {
+		if c := p.Compare(best); c != position.Incomparable && c < 0 {
 			best = p
 		}
 	}

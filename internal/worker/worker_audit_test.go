@@ -336,3 +336,52 @@ func TestSchemaDriftRecursiveStructConforms(t *testing.T) {
 		t.Fatalf("batches = %d, want 1 committed", len(fc.batches))
 	}
 }
+
+// TestWorkerRegimeBoundaryRowColumnar: the snapshot partition path (row-based)
+// and the columnar collapse must agree on the same data — the boundary
+// between the two regimes must not diverge. In snapshot mode: an untouched
+// PK's snapshot row is pure-appended, a touched PK's live version wins its
+// snapshot row, a live insert survives, and a live delete removes its key —
+// all in ONE flush that crosses both regimes.
+func TestWorkerRegimeBoundaryRowColumnar(t *testing.T) {
+	batches, err := runSnapshotWorker(t, string(snapshot.StateInProgress), []uint32{0}, []rowchange.Change{
+		snapChange("t", 1, "s1", "low"),               // touched by the live update below
+		snapChange("t", 2, "s2", "low"),               // untouched -> pure append
+		chg("t", rowchange.OpUpdate, 1, "live", "p2"), // touches PK 1 -> rest
+		chg("t", rowchange.OpInsert, 3, "new", "p3"),  // live -> rest
+		chg("t", rowchange.OpDelete, 4, "", "p4"),     // live delete -> rest
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Expect two commits: the append batch (untouched PK 2) then the upsert
+	// batch (rest: PK 1 live wins, PK 3 insert, PK 4 delete).
+	if len(batches) != 2 {
+		t.Fatalf("batches = %d, want append + upsert", len(batches))
+	}
+	ab, ub := batches[0], batches[1]
+	if ab.Mode != rowchange.AppendMode {
+		t.Fatalf("batch 0 mode = %v, want append", ab.Mode)
+	}
+	if len(ab.Upserts) != 1 || ab.Upserts[0].Key[0] != int64(2) || ab.Upserts[0].After["v"] != "s2" {
+		t.Fatalf("append batch = %+v, want [2:s2]", ab.Upserts)
+	}
+
+	if ub.Mode != rowchange.UpsertMode {
+		t.Fatalf("batch 1 mode = %v, want upsert", ub.Mode)
+	}
+	got := map[int64]string{}
+	for _, u := range ub.Upserts {
+		got[u.Key[0].(int64)] = u.After["v"].(string)
+	}
+	if got[1] != "live" {
+		t.Fatalf("PK 1 must carry the live value, got %q (the snapshot version must lose)", got[1])
+	}
+	if got[3] != "new" {
+		t.Fatalf("PK 3 must survive, got %q", got[3])
+	}
+	if len(ub.Deletes) != 1 || ub.Deletes[0].Key[0] != int64(4) {
+		t.Fatalf("deletes = %+v, want [4]", ub.Deletes)
+	}
+}
