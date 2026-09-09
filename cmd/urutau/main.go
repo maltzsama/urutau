@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -20,6 +21,8 @@ import (
 	"github.com/maltzsama/urutau/internal/runner"
 	"github.com/maltzsama/urutau/internal/supervisor"
 	"github.com/maltzsama/urutau/internal/version"
+	"github.com/maltzsama/urutau/sink"
+	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -121,59 +124,74 @@ func runCmd() *cobra.Command {
 	return cmd
 }
 
-// runExternalPlugins spawns source and sink plugin subprocesses, connects
-// Flight clients, and runs the pipeline using the plugin adapters.
+// runExternalPlugins runs the pipeline over external plugin subprocesses.
+// Each side (source, sink) that names a plugin binary is spawned via the
+// supervisor and adapted to the public source.Source / sink.Sink contracts;
+// a side left empty falls back to the built-in driver registry. The runner
+// consumes both through the columnar seam (NewRunnerWithAdapters).
 func runExternalPlugins(ctx context.Context, s *spec.Spec, sourceBin, sinkBin string) error {
 	logger := slog.Default()
-	token := generateToken()
-
-	var sourceCfg, sinkCfg pipeline.StageConfig
-	workDir := "."
-
-	if sourceBin != "" {
-		sourceCfg = pipeline.StageConfig{
-			Kind:    pipeline.StageSource,
-			Bin:     sourceBin,
-			Token:   token,
-			WorkDir: workDir,
-			Logger:  logger,
-		}
-	}
-	if sinkBin != "" {
-		sinkCfg = pipeline.StageConfig{
-			Kind:    pipeline.StageSink,
-			Bin:     sinkBin,
-			Token:   token,
-			WorkDir: workDir,
-			Logger:  logger,
-		}
-	}
-
-	pipeCfg := supervisor.PipelineConfig{
-		Source: sourceCfg,
-		Sink:   sinkCfg,
-	}
-	sup := supervisor.NewPipelineSupervisor(pipeCfg, logger)
-
-	// Start all plugin subprocesses.
-	go func() {
-		if err := sup.Run(ctx); err != nil {
-			logger.Error("supervisor stopped", "err", err)
-		}
-	}()
-
-	// Wait for both plugins to be connected.
-	if err := sup.WaitForReady(ctx); err != nil {
+	token, err := generateToken()
+	if err != nil {
 		return err
 	}
 
-	// Build adapters from connected clients.
-	srcStage := sup.Source().Stage()
-	snkStage := sup.Sink().Stage()
+	rc := runner.Config{
+		Heartbeat:         5 * time.Second,
+		CaughtUpPoll:      time.Second,
+		MaxRows:           1000,
+		MaxInterval:       5 * time.Second,
+		MaxParallelChunks: 0, // plugin source declares no registry ceiling
+	}
 
-	srcAdapter := plugin.NewSourceAdapter(srcStage.Client, s.Source, logger)
-	snkAdapter := plugin.NewSinkAdapter(snkStage.Client, logger)
-	_ = snkAdapter // used by runner in full integration
+	var (
+		src source.Source
+		snk sink.Sink
+	)
+	var closers []func()
+	defer func() {
+		for _, f := range closers {
+			f()
+		}
+	}()
+
+	// Source side: plugin adapter or registry driver.
+	if sourceBin != "" {
+		stage, err := spawnPluginStage(ctx, sourceBin, token, pipeline.StageSource, logger)
+		if err != nil {
+			return err
+		}
+		closers = append(closers, func() { _ = stage.Stop(context.Background()) })
+		src = plugin.NewSourceAdapter(stage.Client, s.Source, logger)
+	} else {
+		regSrc, err := driver.OpenSource(s, source.Runtime{
+			ServerID:  rc.ServerID,
+			Heartbeat: rc.Heartbeat,
+			Logger:    logger,
+		})
+		if err != nil {
+			return err
+		}
+		// The source owns its query connection; the runner releases it.
+		src = regSrc
+	}
+
+	// Sink side: plugin adapter or registry driver.
+	if sinkBin != "" {
+		stage, err := spawnPluginStage(ctx, sinkBin, token, pipeline.StageSink, logger)
+		if err != nil {
+			return err
+		}
+		closers = append(closers, func() { _ = stage.Stop(context.Background()) })
+		snk = plugin.NewSinkAdapter(stage.Client, logger)
+	} else {
+		regSnk, err := driver.OpenSink(ctx, s)
+		if err != nil {
+			return err
+		}
+		closers = append(closers, func() { _ = regSnk.Close() })
+		snk = regSnk
+	}
 
 	logger.Info("external plugins connected",
 		"source", sourceBin,
@@ -181,25 +199,62 @@ func runExternalPlugins(ctx context.Context, s *spec.Spec, sourceBin, sinkBin st
 		"pipeline", s.Pipeline,
 	)
 
-	// Build the collapsed runner with plugin adapters as the source.
-	// The full integration wires srcAdapter as the source and snkAdapter
-	// as the sink. For now, we use the existing runner path.
-	// TODO: wire plugin adapters into the runner when the runner
-	// accepts source.Source and sink.Sink interfaces directly.
-	_ = srcAdapter
-
-	// Block until shutdown.
-	<-ctx.Done()
-	logger.Info("shutting down")
-	return nil
+	r, err := runner.NewRunnerWithAdapters(ctx, s, rc, src, snk)
+	if err != nil {
+		return err
+	}
+	return r.Run(ctx)
 }
 
-func generateToken() string {
+// spawnPluginStage runs one plugin stage via its supervisor and waits for
+// the Flight client to be connected. The supervisor keeps the process alive
+// (restart with backoff) until ctx ends.
+func spawnPluginStage(ctx context.Context, bin, token string, kind pipeline.StageKind, logger *slog.Logger) (*pipeline.Stage, error) {
+	sup := supervisor.NewStageSupervisor(pipeline.StageConfig{
+		Kind:    kind,
+		Bin:     bin,
+		Token:   token,
+		WorkDir: ".",
+		Logger:  logger,
+	}, logger)
+	go func() {
+		if err := sup.Run(ctx); err != nil {
+			logger.Error("plugin stage stopped", "err", err)
+		}
+	}()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-sup.Dead():
+			return nil, fmt.Errorf("plugin stage %s: died: %v", bin, sup.DeadErr())
+		default:
+		}
+		st := sup.Stage()
+		if st != nil && st.Client != nil {
+			return st, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("plugin stage %s: not ready within 30s", bin)
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func generateToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		panic("crypto/rand: " + err.Error())
+		return "", fmt.Errorf("generate plugin token: %w", err)
 	}
-	return base64.URLEncoding.EncodeToString(b)
+	return base64.URLEncoding.EncodeToString(b), nil
 }
 
 func versionCmd() *cobra.Command {
