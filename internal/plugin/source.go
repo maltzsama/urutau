@@ -221,6 +221,13 @@ func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from 
 				if err != nil {
 					return fmt.Errorf("deserialize schema: %w", err)
 				}
+				// Contract §8.1 gate: validate the announced change-record
+				// schema BEFORE consuming any record — the sink-side §10
+				// rule (reject on the first batch, not the tenth) applied
+				// symmetrically to the source side.
+				if err := validateChangeSchema(schema); err != nil {
+					return fmt.Errorf("contract violation: %w", err)
+				}
 				arrowSchema = schema
 				break
 			}
@@ -234,6 +241,7 @@ func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from 
 }
 
 func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arrowSchema *arrow.Schema, ref core.TableRef, out chan<- rowchange.Change) error {
+	announcedChecked := false
 	for {
 		fd, err := stream.Recv()
 		if err != nil {
@@ -254,6 +262,15 @@ func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arro
 			rec := reader.RecordBatch()
 			if rec == nil {
 				continue
+			}
+			// Contract §8 gate: the schema is fixed within the stream. On
+			// the first record, the embedded record schema must match what
+			// was announced — otherwise every column read below shifts.
+			if !announcedChecked {
+				if err := recordMatchesAnnouncedSchema(rec.Schema(), arrowSchema); err != nil {
+					return fmt.Errorf("contract violation: %w", err)
+				}
+				announcedChecked = true
 			}
 			changes := cdcRecordToChanges(rec, arrowSchema, ref)
 			for i := range changes {
@@ -313,9 +330,11 @@ func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref co
 		offset := readBinaryCol(rec, offsetIdx, i)
 		var commitTS time.Time
 		if tsIdx >= 0 && !rec.Column(tsIdx).IsNull(i) {
+			// §8.1 fixes ts_source at Timestamp(ns, "UTC") and the schema
+			// gate enforces it — decode ticks AS NANOSECONDS. The old
+			// UnixMicro read misinterpreted ns ticks by 1000x.
 			tsCol := rec.Column(tsIdx).(*array.Timestamp)
-			v := tsCol.Value(i)
-			commitTS = time.UnixMicro(int64(v)).UTC()
+			commitTS = tsCol.Value(i).ToTime(arrow.Nanosecond).UTC()
 		}
 
 		var chg rowchange.Change
@@ -397,6 +416,83 @@ func columnIndex(s *arrow.Schema, name string) int {
 		}
 	}
 	return -1
+}
+
+// validateChangeSchema enforces contract §8.1 (change record, v1, fixed) on
+// the plugin's announced schema — BEFORE any record is consumed (the
+// sink-side §10 rule applied symmetrically: rejection at the first batch,
+// not the tenth). A plugin is third-party code in any language: a wrong
+// column type here used to panic the reader deep in the stream instead of
+// failing the stream cleanly.
+//
+// Contract shape (exactly, in order; before MAY be omitted):
+//
+//	op        Utf8                    NOT NULL   ("c" | "u" | "d")
+//	before    Struct<table columns>   NULL       (row null on insert)  [optional]
+//	after     Struct<table columns>   NULL       (row null on delete)
+//	offset    Binary                  NOT NULL   (opaque, §8.2)
+//	ts_source Timestamp(ns, "UTC")    NULL
+func validateChangeSchema(s *arrow.Schema) error {
+	// before is the only optional field; when omitted, the rest shift up.
+	names := []string{"op", "after", "offset", "ts_source"}
+	if s.NumFields() == 5 {
+		names = []string{"op", "before", "after", "offset", "ts_source"}
+	} else if s.NumFields() != 4 {
+		return fmt.Errorf("plugin schema: %d fields, want 4 (before omitted) or 5 per contract §8.1", s.NumFields())
+	}
+
+	checks := map[string]struct {
+		is   func(arrow.DataType) bool
+		desc string
+		null bool
+	}{
+		"op":        {func(dt arrow.DataType) bool { return dt.ID() == arrow.STRING }, "Utf8", false},
+		"before":    {func(dt arrow.DataType) bool { return dt.ID() == arrow.STRUCT }, "Struct", true},
+		"after":     {func(dt arrow.DataType) bool { return dt.ID() == arrow.STRUCT }, "Struct", true},
+		"offset":    {func(dt arrow.DataType) bool { return dt.ID() == arrow.BINARY }, "Binary", false},
+		"ts_source": {func(dt arrow.DataType) bool { return dt.ID() == arrow.TIMESTAMP }, "Timestamp(ns, UTC)", true},
+	}
+
+	for i, name := range names {
+		f := s.Field(i)
+		if f.Name != name {
+			return fmt.Errorf("plugin schema: field %d is %q, want %q per contract §8.1", i, f.Name, name)
+		}
+		want := checks[name]
+		if !want.is(f.Type) {
+			return fmt.Errorf("plugin schema: field %d %q is %s, want %s per contract §8.1", i, f.Name, f.Type, want.desc)
+		}
+		if f.Nullable != want.null {
+			return fmt.Errorf("plugin schema: field %d %q: nullability %v, want %v per contract §8.1", i, f.Name, f.Nullable, want.null)
+		}
+	}
+	if s.NumFields() == 5 {
+		ts := s.Field(4).Type.(*arrow.TimestampType)
+		if ts.Unit != arrow.Nanosecond || ts.TimeZone != "UTC" {
+			return fmt.Errorf("plugin schema: field 4 ts_source is Timestamp(%s, %q), want Timestamp(ns, UTC) per contract §8.1", ts.Unit, ts.TimeZone)
+		}
+	}
+	return nil
+}
+
+// recordMatchesAnnouncedSchema rejects mid-stream schema drift (contract §8:
+// the schema is fixed within the stream). Checked on the first record of
+// every stream; a plugin that announces one schema and ships another must
+// fail the stream, not shift every column read by one.
+func recordMatchesAnnouncedSchema(recSchema, announced *arrow.Schema) error {
+	if recSchema.NumFields() != announced.NumFields() {
+		return fmt.Errorf("plugin record: %d fields, announced %d — schema drifted mid-stream (contract §8)", recSchema.NumFields(), announced.NumFields())
+	}
+	for i := range recSchema.NumFields() {
+		rf, af := recSchema.Field(i), announced.Field(i)
+		if rf.Name != af.Name {
+			return fmt.Errorf("plugin record: field %d is %q, announced %q — schema drifted mid-stream (contract §8)", i, rf.Name, af.Name)
+		}
+		if !arrow.TypeEqual(rf.Type, af.Type) {
+			return fmt.Errorf("plugin record: field %q is %s, announced %s — schema drifted mid-stream (contract §8)", rf.Name, rf.Type, af.Type)
+		}
+	}
+	return nil
 }
 
 func readStringCol(rec arrow.RecordBatch, idx, row int) string {
