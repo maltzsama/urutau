@@ -10,6 +10,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // GeneratorOpts configures batch generation.
@@ -22,18 +24,17 @@ type GeneratorOpts struct {
 }
 
 // baseSchema returns the fixed part of the generator schema.
-// Columns: id, val, __before_val, amount, active, __op, __pos, __commit_ts.
+// Uses WireMetadataFields() for the metadata columns (H-12).
 func baseSchema() *arrow.Schema {
-	return arrow.NewSchema([]arrow.Field{
+	data := []arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "val", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "__before_val", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "amount", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
 		{Name: "active", Type: arrow.FixedWidthTypes.Boolean, Nullable: true},
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-	}, nil)
+	}
+	fields := append(data, transport.WireMetadataFields()...)
+	return arrow.NewSchema(fields, nil)
 }
 
 // GenerateBatch creates a batch with controlled data for property tests.
@@ -116,6 +117,12 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 		// __commit_ts (nanoseconds per M2a decision)
 		ts := timeFromNano(int64(i))
 		bb.Field(7).(*array.TimestampBuilder).AppendTime(ts)
+
+		// __ingest_ts (microseconds — same as commit for test purposes)
+		bb.Field(8).(*array.TimestampBuilder).AppendTime(ts)
+
+		// __snapshot (boolean — false for live data)
+		bb.Field(9).(*array.BooleanBuilder).Append(false)
 	}
 
 	rec := bb.NewRecordBatch()
@@ -152,6 +159,9 @@ func AdversarialCompositeKey(seed int64, alloc memory.Allocator) *Batch {
 		{Name: "val", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	}, nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
@@ -160,12 +170,18 @@ func AdversarialCompositeKey(seed int64, alloc memory.Allocator) *Batch {
 	bb.Field(2).(*array.StringBuilder).Append("row1")
 	bb.Field(3).(*array.Uint8Builder).Append(0)
 	bb.Field(4).(*array.StringBuilder).Append("pos-0001")
+	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(7).(*array.BooleanBuilder).Append(false)
 
 	bb.Field(0).(*array.StringBuilder).Append("a")
 	bb.Field(1).(*array.StringBuilder).Append("bc")
 	bb.Field(2).(*array.StringBuilder).Append("row2")
 	bb.Field(3).(*array.Uint8Builder).Append(0)
 	bb.Field(4).(*array.StringBuilder).Append("pos-0002")
+	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(7).(*array.BooleanBuilder).Append(false)
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -181,16 +197,25 @@ func AdversarialDeleteLast(seed int64, alloc memory.Allocator) *Batch {
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	}, nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.Uint8Builder).Append(0)
 	bb.Field(2).(*array.StringBuilder).Append("pos-0001")
+	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(5).(*array.BooleanBuilder).Append(false)
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.Uint8Builder).Append(2)
 	bb.Field(2).(*array.StringBuilder).Append("pos-0002")
+	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(5).(*array.BooleanBuilder).Append(false)
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -207,16 +232,25 @@ func AdversarialInsertAfterDelete(seed int64, alloc memory.Allocator) *Batch {
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	}, nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.Uint8Builder).Append(2)
 	bb.Field(2).(*array.StringBuilder).Append("pos-0001")
+	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(5).(*array.BooleanBuilder).Append(false)
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.Uint8Builder).Append(0)
 	bb.Field(2).(*array.StringBuilder).Append("pos-0002")
+	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(5).(*array.BooleanBuilder).Append(false)
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -234,6 +268,9 @@ func AdversarialInt64Overflow(seed int64, alloc memory.Allocator) *Batch {
 		{Name: "big", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	}, nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
@@ -242,11 +279,17 @@ func AdversarialInt64Overflow(seed int64, alloc memory.Allocator) *Batch {
 	bb.Field(1).(*array.Int64Builder).Append(big + 1)
 	bb.Field(2).(*array.Uint8Builder).Append(0)
 	bb.Field(3).(*array.StringBuilder).Append("pos-0001")
+	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(6).(*array.BooleanBuilder).Append(false)
 
 	bb.Field(0).(*array.Int64Builder).Append(2)
 	bb.Field(1).(*array.Int64Builder).Append(math.MaxInt64)
 	bb.Field(2).(*array.Uint8Builder).Append(0)
 	bb.Field(3).(*array.StringBuilder).Append("pos-0002")
+	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(6).(*array.BooleanBuilder).Append(false)
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -265,6 +308,9 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 		{Name: "__before_val", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
 		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
 	}, nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
@@ -273,12 +319,18 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 	bb.Field(2).(*array.StringBuilder).AppendNull()
 	bb.Field(3).(*array.Uint8Builder).Append(1)
 	bb.Field(4).(*array.StringBuilder).Append("pos-0001")
+	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(7).(*array.BooleanBuilder).Append(false)
 
 	bb.Field(0).(*array.Int64Builder).Append(2)
 	bb.Field(1).(*array.StringBuilder).Append("hello")
 	bb.Field(2).(*array.StringBuilder).AppendNull()
 	bb.Field(3).(*array.Uint8Builder).Append(0)
 	bb.Field(4).(*array.StringBuilder).Append("pos-0002")
+	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
+	bb.Field(7).(*array.BooleanBuilder).Append(false)
 
 	rec := bb.NewRecordBatch()
 	bb.Release()

@@ -13,6 +13,7 @@ package dataplane
 import (
 	"bytes"
 	"fmt"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
@@ -106,7 +107,9 @@ func goTypeToCore(v any) core.ColumnType {
 	switch v.(type) {
 	case bool:
 		return core.ColumnType{Kind: core.KindBool}
-	case int, int32:
+	case int:
+		return core.ColumnType{Kind: core.KindInt64} // int is 64-bit on 64-bit platforms
+	case int32:
 		return core.ColumnType{Kind: core.KindInt32}
 	case int64:
 		return core.ColumnType{Kind: core.KindInt64}
@@ -120,8 +123,10 @@ func goTypeToCore(v any) core.ColumnType {
 		return core.ColumnType{Kind: core.KindString}
 	case []byte:
 		return core.ColumnType{Kind: core.KindBinary}
+	case time.Time:
+		return core.ColumnType{Kind: core.KindTimestampTZ}
 	default:
-		return core.ColumnType{Kind: core.KindString}
+		return core.ColumnType{Kind: core.KindString} // QUARANTINE: unknown → string
 	}
 }
 
