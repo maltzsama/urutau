@@ -268,77 +268,12 @@ func TestAppendModeOnDeleteSkip(t *testing.T) {
 	}
 }
 
-// A field added inside a struct column is the same class of event as a
-// top-level ADD COLUMN: the table pauses and the drift reports the full
-// dotted path (address.complement), not just the top-level column.
-func TestSchemaDriftRecursiveStruct(t *testing.T) {
-	// GATED on M4: the row->batch bridge encodes against the KNOWN schema,
-	// so an extra nested field ("complement") is silently dropped at encode
-	// and the drift is undetectable by the time the worker decodes the
-	// batch. Only source-native batches (sources producing Arrow directly)
-	// carry the source's own shape for the drift check to see. The nested
-	// drift LOGIC is unit-tested directly in checkDriftNested.
-	t.Skip("nested drift is undetectable through the known-schema bridge (QUARANTINE, dies in M4)")
-
-	var drifts []SchemaDrift
-	fc := &fakeCommitter{}
-	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	regTable(t, w, "t", fc, dataplane.UpsertMode)
-	w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
-		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-		{Name: "address", Type: core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
-			{Name: "city", Type: core.ColumnType{Kind: core.KindString}},
-		}}},
-	}})
-	w.OnSchemaDrift(func(d SchemaDrift) { drifts = append(drifts, d) })
-
-	ingest := make(chan rowchange.Change, 4)
-	ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{1},
-		After: map[string]any{
-			"id":      int64(1),
-			"address": map[string]any{"city": "sp", "complement": "apto 4"},
-		}, Position: "p1"}
-	close(ingest)
-	err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema()))
-	if err == nil || !strings.Contains(err.Error(), "schema drift") {
-		t.Fatalf("err = %v, want terminal schema-drift error", err)
-	}
-	if len(drifts) != 1 || drifts[0].Column != "address.complement" {
-		t.Fatalf("drifts = %+v, want one report for the full path address.complement", drifts)
-	}
-}
-
-// A conforming nested value (no new fields) passes through untouched.
-func TestSchemaDriftRecursiveStructConforms(t *testing.T) {
-	// GATED on M4 for the same reason as TestSchemaDriftRecursiveStruct:
-	// the bridge encode against the known schema cannot carry a nested
-	// shape worth conforming to; source-native batches close this.
-	t.Skip("nested drift is undetectable through the known-schema bridge (QUARANTINE, dies in M4)")
-
-	fc := &fakeCommitter{}
-	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
-	regTable(t, w, "t", fc, dataplane.UpsertMode)
-	w.SetKnownSchema("t", core.Schema{Columns: []core.Column{
-		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-		{Name: "address", Type: core.ColumnType{Kind: core.KindStruct, Fields: []core.Column{
-			{Name: "city", Type: core.ColumnType{Kind: core.KindString}},
-		}}},
-	}})
-
-	ingest := make(chan rowchange.Change, 4)
-	ingest <- rowchange.Change{Op: rowchange.OpInsert, Table: "t", Key: []any{1},
-		After: map[string]any{
-			"id":      int64(1),
-			"address": map[string]any{"city": "sp"},
-		}, Position: "p1"}
-	close(ingest)
-	if err := w.Run(context.Background(), IngestFromChanges(context.Background(), ingest, testSchema())); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if len(fc.batches) != 1 {
-		t.Fatalf("batches = %d, want 1 committed", len(fc.batches))
-	}
-}
+// Nested schema drift (a field added inside a struct column) is detected at
+// the SOURCE boundary, where the native row shape exists — encoding against
+// the canonical schema would silently drop the new field before the worker
+// sees it. Coverage lives in sourcepull/drift_test.go (driftAgainst /
+// driftNested). The worker's own schemaDrift remains the top-level backstop
+// for schema-less producers.
 
 // TestWorkerRegimeBoundaryRowColumnar: the snapshot partition path (row-based)
 // and the columnar collapse must agree on the same data — the boundary

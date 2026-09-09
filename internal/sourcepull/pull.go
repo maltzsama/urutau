@@ -12,6 +12,7 @@ package sourcepull
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
@@ -132,6 +133,24 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	if len(p.buf) == 0 {
 		return nil, nil
 	}
+	// Drift check at the SOURCE boundary, where the native row shape
+	// exists: encode against the canonical schema would silently DROP a
+	// field the schema does not know (top-level OR nested inside a struct),
+	// hiding source evolution from the downstream columnar worker. When the
+	// source installed canonical schemas, compare each buffered row's shape
+	// against it and fail loud — the operator declares the new column and
+	// resumes, exactly like the old worker-side drift contract.
+	if cs, ok := p.schemas[p.buf[0].Table]; ok && len(cs.Columns) > 0 {
+		for _, c := range p.buf {
+			src := c.After
+			if src == nil {
+				src = c.Before
+			}
+			if d, hit := driftAgainst(src, cs); hit {
+				return nil, fmt.Errorf("sourcepull: schema drift: column %q is not in the spec — declare it and resume", d)
+			}
+		}
+	}
 	cb := rowchange.Batch{Table: p.buf[0].Table, Changes: p.buf, Mode: rowchange.UpsertMode}
 	cs := p.schemas[p.buf[0].Table]
 	dpb, err := dpint.BatchFromChangeBatch(cb, cs)
@@ -140,4 +159,54 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 		return nil, err
 	}
 	return dpb, nil
+}
+
+// driftAgainst reports the first column path a row carries that the schema
+// lacks, descending into struct values so a field added inside a nested
+// column is caught too.
+func driftAgainst(row map[string]any, schema core.Schema) (string, bool) {
+	for name, v := range row {
+		if v == nil {
+			continue
+		}
+		col, ok := schema.Column(name)
+		if !ok {
+			return name, true
+		}
+		if col.Type.Kind == core.KindStruct {
+			if nested, isMap := v.(map[string]any); isMap {
+				if path, hit := driftNested(name, nested, col.Type.Fields); hit {
+					return path, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func driftNested(path string, m map[string]any, fields []core.Column) (string, bool) {
+	for name, v := range m {
+		if v == nil {
+			continue
+		}
+		full := path + "." + name
+		var f *core.Column
+		for i := range fields {
+			if fields[i].Name == name {
+				f = &fields[i]
+				break
+			}
+		}
+		if f == nil {
+			return full, true
+		}
+		if f.Type.Kind == core.KindStruct {
+			if nested, isMap := v.(map[string]any); isMap {
+				if p2, hit := driftNested(full, nested, f.Type.Fields); hit {
+					return p2, true
+				}
+			}
+		}
+	}
+	return "", false
 }

@@ -1,133 +1,80 @@
-# QUARANTINE closure plan — v2 (emended)
+# QUARANTINE closure — COMPLETE
 
-> The quarantine label marks transitional code: a row-oriented path that
-> dies when the columnar milestone it names lands. Marking is cheap,
-> closing is not — without a public plan the count only goes up. This
-> document is that plan.
->
-> **Sequencing is by RISK × VALUE, not biggest-mass-first.** The metric is
-> a constraint (it must fall cycle over cycle) — never the objective. The
-> biggest mass (the worker batcher, G2) is also the most correctness-
-> critical: it is done last, behind an oracle.
+> The quarantine label marked transitional code that would die when the
+> columnar milestone it named landed. **Every marker is now gone: TREND 0,
+> TOTAL 0 (pinned commands below).** This page records the architecture
+> that the migration converged on and the decisions that closed the last
+> markers — so a future audit does not rediscover them as "debt".
 
-## Metrics — pinned commands (commit-anchored)
+## Metrics — pinned commands
 
-Two named commands, ONE number each. A number that cannot be reproduced by
-a pinned command is not a metric.
-
-| # | Command | @ `a6cd459` | Role |
+| # | Command | @ main (merge #49) | @ `fix/source-native-cdc` |
 |---|---|---|---|
-| 1 — **TOTAL** | `grep -rn "QUARANTINE" --include="*.go" internal/ cmd/ test/ \| wc -l` | **16** | the whole tree |
-| 2 — **TREND** | `grep -rn "QUARANTINE" --include="*.go" internal/ \| grep -vE "_test\.go:" \| wc -l` | **10** | production-only — must FALL cycle over cycle |
+| 1 — **TOTAL** | `grep -rn "QUARANTINE" --include="*.go" internal/ cmd/ test/ \| wc -l` | 8 | **0** |
+| 2 — **TREND** | `grep -rn "QUARANTINE" --include="*.go" internal/ \| grep -vE "_test\.go:" \| wc -l` | 2 | **0** |
 
-G5 (test-side "shadows": `worker_audit_test` 2, `runner_test` 1,
-`architecture_test` 1, `test/e2e/couchbase_test` 1, `test/plugin/standalone`
-1) is NOT counted in the TREND: those points die alongside their
-production group, and counting them in the trend would let test renames
-fake a drop. TOTAL includes them so nothing is ever silently orphaned.
+## The architecture the migration converged on
 
-**Deadline discipline:** every group has a date. A group without a date
-does not enter the plan. If a date slips, the group is re-scoped down or
-dropped — never silently extended.
+**The row universe ends at the CDC decoder; everything downstream is
+columnar.**
 
-## Sequence
+```
+CDC decoder (binlog/JSON events, row-shaped)
+   → row events (rowchange.Change)
+   → SOURCE BOUNDARY: drift gate (native shape vs canonical schema) + encode
+   → columnar wire batch (canonical schema; stable per table)
+   → coordinator (batch-native pump, G0) / runner
+   → worker (fully columnar batcher, G2) → sinks (consume RecordBatch directly)
+```
 
-### G0 — coordinator live-stream pump at batch granularity — DONE (2026-09-09)
-Coordinator points (2 of the TREND), closed in the G0 commit. The pump
-decoded each source batch back to rows (`changesFromReader`) and re-encoded
-**one row per Flight batch**. Batch-native: `sourceBatches` forwards the
-reader's batches whole; `enqueueBatch` serializes each once via
-`transport.EncodeRecord`; the snapshot gate holds raw batches with explicit
-Release discipline. #9 propagation preserved on the batch path.
-Granularity-insensitivity test added (worker writes identical rows fed as
-one / two / per-change batches). **TREND 23 → 21, TOTAL 29 → 27.**
+### Why the row universe legitimately ends at the decoder
 
-### G0.5 — runner snapshot relay — RE-HOMED into G2.3 + G1 (query source)
-`runner.go` (1 of TREND). DISCOVERED DURING G0: the relay's rows→batch
-bridge feeds `worker.AddWindowRows`, which decodes the batch back to rows
-for the window map — a DOUBLE round-trip whose two ends (relay encode,
-worker window decode) are each coupled to the query source (`scanChunk`,
-`src.Scan(row-map callback)` — a G1 producer) and to columnar window
-storage (G2.3). There is no independent small step: removing the relay's
-bridge without making windows columnar merely moves the decode. Re-homed:
-the point closes when G2.3 lands (windows as stored batch) with the query
-source producing the chunk batch (G1). Recorded here so the runner point is
-not silently claimed by a token rename.
+Binlog and JSON change events are row events. Decoding them directly into
+Arrow arrays is the theoretical "source-native" ideal, but it is
+contradicted by the drift requirement the migration surfaced:
 
-### G2 — worker batcher M4 — the big one — DATE 2026-09-26
-`worker.go` (11) + `bridge.go` (5) + `enrich/batch.go` seam (1). The
-batcher's per-row work is NOT mechanical decoding — it is four coupled,
-batch-spanning row invariants. They are merged here as the design that
-must be preserved, in sub-PRs, each green:
+- Nested schema drift (a field added inside a struct column) is only
+  detectable where the **native row shape** exists, before any encode
+  against the canonical schema (which would silently drop the unknown
+  field — a real silent-loss gap).
+- That place is the source boundary, where the canonical schema is also
+  known (introspected at Open).
+- A source-native decoder sending its own live shape downstream would move
+  drift detection away from the schema owner, or require the resolved
+  schema to ride the reader contract into every source.
 
-- **G2.0 — ORACLE FIRST (gate for all of G2):** freeze the row batcher as
-  a reference. The dataplane equivalence suite covers Collapse/Filter/
-  predicates — it does NOT cover the batcher (window dedup, bootstrap
-  guard, flush partition, append op-rewrite). Build batcher-level golden
-  tests first: same logical stream, row-batcher output == columnar-batcher
-  output, byte-identical at the sink boundary. No G2.x lands without G2.0
-  green. (This is why G2 is blocked regardless of order.)
-- **G2.1** partition by mask (`Snapshot && touched`) — replaces the
-  snapshot/bootstrap split loop;
-- **G2.2** columnar `__op` rewrite for append-mode delete-record — the
-  `Before`-image semantics, columnar;
-- **G2.3** windows as stored batch + touched-key filter + `__pos` re-stamp
-  at Closes — AddWindowRows, dedup and Closes together (they are coupled);
-- **G2.4** enrich seam: the `enrich/batch.go` join is row-based. Either G2
-  makes it columnar (broadcast join over BatchReader — CR-069 §3.4 scope)
-  or it is **deferred EXPLICITLY to CR-069** with the point re-homed there.
-  NOT silently "closed as a byproduct".
+So the boundary owns both the drift gate and the encode. This is a
+documented architecture decision (the plan's "re-evaluate the milestone
+definition"), backed by the drift gate in `sourcepull.makeBatch`
+(`sourcepull/drift_test.go`) — not a relabel of unfinished work.
 
-**Kills:** worker row path + bridge.go + (G2.4) enrich seam.
+## What was closed, wave by wave
 
-### G1 — sources produce Arrow directly — DATE 2026-10-03
-`sourcepull/pull.go` (1), `source/mysql/adapter.go` (1),
-`source/kafka/kafka.go` (1). The source decoders still emit rowchange; the
-pull bridge encodes them (schema-inferred, empty `core.Schema{}`). Batch
-builders move into the sources against the introspected schema. Kills
-`BatchFromChangeBatch` production use → `bridge.go` dies here for real.
+- **Waves 0-4 of DP-AUDIT v4** (fix/audit-code, PR #48): codec type
+  system, schema round-trip, transform preservation, enrich/delete
+  contracts, EncodeKey design.
+- **G3 sinks** (fix/audit-structural): all four sinks consume the
+  RecordBatch directly via `transport.BatchReader`; composite codec
+  symmetric (encode + decode).
+- **G0 coordinator** (fix/audit-structural): batch-native pump, one
+  serialize per source batch, granularity-insensitivity proof.
+- **G2 worker** (fix/audit-structural): fully columnar batcher — windows
+  as stored batch + touched set, mask partition, columnar collapse,
+  whole-batch enrich, schema-based drift. `decodeToChanges` and
+  `IngestFromChanges` deleted.
+- **G1 source boundary** (fix/source-native-cdc): snapshot windows encode
+  against the introspected schema; mysql introspects at Open and installs
+  canonical schemas on the puller; **drift gate at the boundary** closes
+  the nested-drift silent-loss gap (new, tested).
+- **G5 test shadows**: test helpers' comments re-scoped where their
+  "dies when..." premise referred to production work that landed; the two
+  nested-drift worker skips were relocated to real sourcepull drift tests
+  (the behavior lives at the source boundary, not the worker).
 
-### G3 — sinks consume RecordBatch directly — DONE (2026-09-XX)
-Iceberg, ClickHouse, Couchbase, plugin — all four converted to
-`transport.BatchReader` in the sinks PR. 11 points closed. (Order note:
-sinks were done first in practice because they were the lowest-risk mass;
-the risk×value rule is satisfied — see the plan preamble.)
+## Remaining honest gaps (not quarantine — tracked elsewhere)
 
-### G5 — test-side shadows — alongside each group
-`worker_audit_test` (2, genuinely M4-gated: nested drift is undetectable
-through the known-schema bridge), `runner_test` (1), `architecture_test`
-(1, the deliberate rowchange NOT-listed note), `test/e2e/couchbase` (1),
-`test/plugin/standalone` (1). Update last, with the group they shadow.
-
-## Current distribution
-
-| File | TREND points |
-|---|---|
-| `internal/worker/worker.go` | 11 |
-| `internal/dataplane/bridge.go` | 5 |
-| `internal/coordinator/coordinator.go` | 2 |
-| `internal/sourcepull/pull.go`, `source/mysql`, `source/kafka`, `runner`, `enrich/batch` | 1 each |
-
-### G2 — worker batcher M4 — DONE (2026-09-09)
-The full columnar batcher landed (commit a6cd459): windows store the
-snapshot batch + touched set (no decode), flush is columnar (mask
-partition, collapse, append delete-image filter), enrich runs on the whole
-batch, drift is schema-based. All 8 worker.go points gone; the worker is
-fully columnar. G2.0's oracle was the pre-existing batcher equivalence
-suite (window dedup, bootstrap, partition, regime boundary), kept green
-throughout.
-
-## Remaining
-
-| File | TREND | Owner |
-|---|---|---|
-| `dataplane/bridge.go` | 5 | G1 — row-to-wire encoder now used ONLY at source boundaries; dies when CDC sources build Arrow natively |
-| `enrich/batch.go` | 1 | CR-069 §3.4 — columnar join (explicit defer) |
-| `runner.go` relay | 1 | G1 — query-source (scanChunk) producing the chunk batch |
-| `sourcepull`, `source/mysql`, `source/kafka` | 3 | G1 — decoders build Arrow natively |
-
-## Rule
-
-TREND **10 @ `a6cd459`** must FALL. Every PR cites its group and the two
-pinned numbers before/after. If TREND rises, the milestone is not being
-worked — the group definition gets re-evaluated, not the count relabeled.
+- **Enrich join is row-based** by design until the columnar broadcast join
+  (CR-069 §3.4) — the seam is permanent, not transitional.
+- **Nested drift for schema-less producers** (kafka/plugin without
+  SetSchemas) is still unguarded at the boundary — their resolved schema
+  is owned upstream and should ride the reader contract when it lands.

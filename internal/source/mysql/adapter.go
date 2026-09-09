@@ -162,9 +162,13 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 	return position.ParseGTID(s)
 }
 
-// stream adapts the concrete canal reader to the Reader contract, carrying
-// the change channel the concrete reader writes into and the pull-based
-// Next surface (QUARANTINE: bridges changes into batches).
+// stream adapts the concrete canal reader to the Reader contract. The
+// source boundary owns the row-to-wire encode: the puller batches the
+// decoder's row-shaped output against the canonical schema (introspected at
+// Open) and gates on drift BEFORE encode — a field the schema does not know
+// is rejected where the native shape exists, never silently dropped. This is
+// the end-state of the columnar migration (see docs/quarantine.md): the row
+// universe ends at the CDC decoder; the worker is fully columnar.
 type stream struct {
 	*Reader
 	out chan rowchange.Change

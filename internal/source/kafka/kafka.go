@@ -235,7 +235,10 @@ func (r *Reader) Start(ctx context.Context, _ position.Position) error {
 	return nil
 }
 
-// Next returns the next columnar batch (QUARANTINE: bridges changes).
+// Next returns the next columnar batch. The source boundary owns the
+// row-to-wire encode (the puller batches the decoder's row-shaped output);
+// the row universe ends at the CDC decoder, the worker is fully columnar
+// (see docs/quarantine.md).
 func (r *Reader) Next(ctx context.Context) (*dataplane.Batch, error) {
 	return r.puller.Next(ctx)
 }
