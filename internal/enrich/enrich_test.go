@@ -73,8 +73,7 @@ func newTestStage(t *testing.T, cfg spec.Enrich, rows []map[string]any) (*Stage,
 }
 
 func (rj *refJoin) isHot() bool {
-	snap := rj.snap.Load()
-	return snap != nil && snap.hot
+	return rj.snap.Load() != nil
 }
 
 func (s *Stage) applyOne(t *testing.T, c rowchange.Change) ([]rowchange.Change, error) {
@@ -254,7 +253,7 @@ func TestBufferMaxWaitExpires(t *testing.T) {
 	// Pretend the reference went hot with an empty drain list... no: the
 	// real path flips hot in refresh; simulate by flipping manually.
 	img, dests, star, _ := buildImage(s.refs[0], usersRows())
-	s.refs[0].snap.Store(&snapshot{hot: true, image: img, dests: dests, star: star})
+	s.refs[0].snap.Store(&snapshot{image: img, dests: dests, star: star})
 	s.refs[0].mu.Lock()
 	s.refs[0].pendingDrain = s.refs[0].queue
 	s.refs[0].queue = nil
@@ -694,5 +693,155 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 	// Source columns remain unprefixed.
 	if out[0].After["id"] != int64(1) {
 		t.Fatalf("source id overwritten: %v", out[0].After)
+	}
+}
+
+// --- audit fixes: enrich.go ------------------------------------------------
+
+func TestFirstErrClearedOnSuccess(t *testing.T) {
+	// Build stage manually so we can fail the FIRST load (before hot).
+	// Use a fast refresh so the second load happens promptly.
+	fl := &fakeLoader{rows: nil, err: errors.New("db down")}
+	cfg := refCfg(nil)
+	cfg.Refresh = "10ms"
+	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := s.UseLoader("users", fl); err != nil {
+		t.Fatalf("use loader: %v", err)
+	}
+	s.Start(context.Background())
+	defer s.Stop()
+	// First load fails → snap is nil → firstErr is set.
+	<-time.After(10 * time.Millisecond)
+	if _, err := s.Enrich(nil); err == nil {
+		t.Fatal("expected sticky error before first success")
+	}
+	// Fix the loader; next refresh clears firstErr (audit #1).
+	fl.SetErr(nil)
+	fl.SetRows(usersRows())
+	<-time.After(20 * time.Millisecond) // wait for the 10ms tick
+	if _, err := s.Enrich(nil); err != nil {
+		t.Fatalf("firstErr not cleared after success: %v", err)
+	}
+}
+
+func TestEmptyRefGoesHot(t *testing.T) {
+	s, _ := newTestStage(t, refCfg(nil), []map[string]any{}) // legitimately empty
+	if !s.refs[0].isHot() {
+		t.Fatal("empty reference should go hot (audit #3)")
+	}
+	out, err := s.applyOne(t, rowchange.Change{
+		After: map[string]any{"user_ref": int64(1), "v": "x"},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !out[0].EnrichMiss {
+		t.Fatal("all joins must miss against empty image")
+	}
+}
+
+func TestDeleteBypassAllPolicies(t *testing.T) {
+	// coldDrop would normally drop the event, but deletes bypass everything.
+	s, _ := newTestStage(t, refCfg(func(c *spec.Enrich) { c.OnColdStart = "drop" }), usersRows())
+	out, err := s.applyOne(t, rowchange.Change{
+		Op:     rowchange.OpDelete,
+		After:  nil, // tombstone — no data, no join key
+		Before: map[string]any{"id": int64(1)},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatal("tombstone must bypass cold drop (audit #4)")
+	}
+}
+
+func TestNullJoinKeyMiss(t *testing.T) {
+	s, _ := newTestStage(t, refCfg(nil), usersRows())
+	out, err := s.applyOne(t, rowchange.Change{
+		After: map[string]any{"user_ref": nil, "v": "x"},
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !out[0].EnrichMiss {
+		t.Fatal("NULL join key must miss, not match \"nil\" (audit #7)")
+	}
+}
+
+func TestStickyErrAtStart(t *testing.T) {
+	// Build stage manually so the first load fails (before hot).
+	fl := &fakeLoader{rows: nil, err: errors.New("broken")}
+	s, err := New([]spec.Enrich{refCfg(nil)}, []string{"id", "user_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := s.UseLoader("users", fl); err != nil {
+		t.Fatalf("use loader: %v", err)
+	}
+	s.Start(context.Background())
+	defer s.Stop()
+	<-time.After(10 * time.Millisecond)
+	_, err = s.Enrich([]rowchange.Change{{After: map[string]any{"user_ref": int64(1)}}})
+	if err == nil {
+		t.Fatal("sticky error must block Enrich at top (audit #8)")
+	}
+}
+
+func TestJoinTypeValidation(t *testing.T) {
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.JoinType = "cross" })}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("unknown join_type must be rejected at boot (audit #10)")
+	}
+}
+
+func TestMaxWaitValidation(t *testing.T) {
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "not-a-duration" })}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("invalid maxWait must be rejected at boot (audit #10)")
+	}
+}
+
+func TestMaxEventsValidation(t *testing.T) {
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxEvents = -1 })}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("negative maxEvents must be rejected at boot (audit #10)")
+	}
+}
+
+func TestDestCollisionRejected(t *testing.T) {
+	// Two columns project to the same destination name via overlapping "as".
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) {
+		c.Select = []string{"*"}
+		c.As = map[string]string{"users.name": "collided", "users.tier": "collided"}
+	})}, []string{"user_ref", "v"}, nil)
+	if err == nil {
+		t.Fatal("two renames to the same destination must be rejected (audit #11)")
+	}
+}
+
+func TestMySQLDSN(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+		err  bool
+	}{
+		{"mysql://u:p@myhost:3307/mydb", "u:p@tcp(myhost:3307)/mydb?parseTime=true", false},
+		{"mysql://u:p@myhost/mydb", "u:p@tcp(myhost:3306)/mydb?parseTime=true", false},
+		{"mysql://u:p@myhost/", "", true},
+		{"postgres://u:p@myhost/mydb", "", true},
+	}
+	for _, tc := range tests {
+		dsn, err := mysqlDSN(tc.in)
+		if (err != nil) != tc.err {
+			t.Errorf("mysqlDSN(%q): err=%v, wantErr=%v", tc.in, err, tc.err)
+			continue
+		}
+		if dsn != tc.want {
+			t.Errorf("mysqlDSN(%q) = %q, want %q", tc.in, dsn, tc.want)
+		}
 	}
 }

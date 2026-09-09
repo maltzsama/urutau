@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -27,22 +28,56 @@ type Loader interface {
 // driver (mysql:// or postgres://); the query returns the full reference
 // image and is re-run on every refresh.
 func NewSQLLoader(uri, query string) (Loader, error) {
-	var driver string
+	var driver, dsn string
 	switch {
-	case strings.HasPrefix(uri, "mysql://"):
+	case len(uri) >= 8 && uri[:8] == "mysql://":
 		driver = "mysql"
-	case strings.HasPrefix(uri, "postgres://"), strings.HasPrefix(uri, "postgresql://"):
+		d, err := mysqlDSN(uri)
+		if err != nil {
+			return nil, fmt.Errorf("enrich: reference uri: %w", err)
+		}
+		dsn = d
+	case len(uri) >= 11 && (uri[:11] == "postgres://" || uri[:14] == "postgresql://"):
 		driver = "pgx"
+		dsn = uri // pgx accepts postgres:// URIs natively
 	default:
 		return nil, fmt.Errorf("enrich: reference uri %q: unsupported scheme (mysql:// | postgres://)", uri)
 	}
-	db, err := sql.Open(driver, uri)
+	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("enrich: open reference: %w", err)
 	}
 	db.SetMaxOpenConns(1) // one sequential re-read per refresh; no pool theater
 	db.SetConnMaxLifetime(5 * time.Minute)
 	return &sqlLoader{db: db, query: query}, nil
+}
+
+// mysqlDSN converts a "mysql://user:pass@host:port/db" URI into the
+// DSN format the go-sql-driver/mysql driver expects:
+// "user:pass@tcp(host:port)/db?parseTime=true".
+func mysqlDSN(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != "mysql" {
+		return "", fmt.Errorf("mysql: uri scheme %q, want mysql", u.Scheme)
+	}
+	user := u.User.Username()
+	pass, _ := u.User.Password()
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("mysql: uri %q lacks host", raw)
+	}
+	port := u.Port()
+	if port == "" {
+		port = "3306"
+	}
+	db := strings.TrimPrefix(u.Path, "/")
+	if db == "" {
+		return "", fmt.Errorf("mysql: uri %q lacks /db", raw)
+	}
+	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", user, pass, host, port, db), nil
 }
 
 type sqlLoader struct {

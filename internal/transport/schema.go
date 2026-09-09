@@ -200,3 +200,22 @@ func isMetadataColumn(name string) bool {
 	}
 	return false
 }
+
+// SchemaFromArrow reconstructs a core.Schema from a typed Arrow schema.
+// Data columns (non-metadata) appear in schema order; metadata columns
+// (__op, __pos, __commit_ts, __ingest_ts, __snapshot) are excluded —
+// they travel outside the core schema.
+func SchemaFromArrow(as *arrow.Schema) core.Schema {
+	cols := make([]core.Column, 0, as.NumFields())
+	for i := range as.NumFields() {
+		f := as.Field(i)
+		if isMetadataColumn(f.Name) {
+			continue
+		}
+		cols = append(cols, core.Column{
+			Name: f.Name,
+			Type: fieldTypeToCore(f),
+		})
+	}
+	return core.Schema{Columns: cols}
+}
