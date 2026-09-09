@@ -279,28 +279,26 @@ func arrowTypeToCore(dt arrow.DataType) (core.ColumnType, error) {
 	switch dt.ID() {
 	case arrow.BOOL:
 		return core.ColumnType{Kind: core.KindBool}, nil
-	case arrow.INT8, arrow.INT16, arrow.INT32:
+	case arrow.INT32:
 		return core.ColumnType{Kind: core.KindInt32}, nil
 	case arrow.INT64:
 		return core.ColumnType{Kind: core.KindInt64}, nil
-	case arrow.UINT8, arrow.UINT16, arrow.UINT32:
-		return core.ColumnType{Kind: core.KindInt64}, nil // widening, defensivo
 	case arrow.UINT64:
 		return core.ColumnType{Kind: core.KindUInt64}, nil
-	case arrow.FLOAT16, arrow.FLOAT32:
+	case arrow.FLOAT32:
 		return core.ColumnType{Kind: core.KindFloat32}, nil
 	case arrow.FLOAT64:
 		return core.ColumnType{Kind: core.KindFloat64}, nil
 	case arrow.DECIMAL128:
 		d := dt.(*arrow.Decimal128Type)
 		return core.ColumnType{Kind: core.KindDecimal, Precision: int(d.Precision), Scale: int(d.Scale)}, nil
-	case arrow.STRING, arrow.LARGE_STRING:
+	case arrow.STRING:
 		return core.ColumnType{Kind: core.KindString}, nil
-	case arrow.BINARY, arrow.LARGE_BINARY:
+	case arrow.BINARY:
 		return core.ColumnType{Kind: core.KindBinary}, nil
-	case arrow.DATE32, arrow.DATE64:
+	case arrow.DATE32:
 		return core.ColumnType{Kind: core.KindDate}, nil
-	case arrow.TIME32, arrow.TIME64:
+	case arrow.TIME64:
 		return core.ColumnType{Kind: core.KindTime}, nil
 	case arrow.TIMESTAMP:
 		tt := dt.(*arrow.TimestampType)
@@ -351,7 +349,12 @@ func arrowTypeToCore(dt arrow.DataType) (core.ColumnType, error) {
 		vt.Nullable = vf.Nullable
 		return core.ColumnType{Kind: core.KindMap, KeyType: &kt, ValueType: &vt}, nil
 	default:
-		return core.ColumnType{}, fmt.Errorf("transport: arrow type %s has no canonical mapping", dt)
+		// Closed world (RV-03): only types kindToArrow produces are
+		// decodable. Widened mappings (uint32 -> int64, float16 ->
+		// float32, ...) previously let a mismatched array reach a hard
+		// type assertion in readTypedValue — a remote-triggerable panic.
+		// The wire is ours end to end: what we do not produce, we reject.
+		return core.ColumnType{}, fmt.Errorf("transport: arrow type %s is not produced by the encoder — rejected at decode", dt)
 	}
 }
 

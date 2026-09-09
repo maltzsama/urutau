@@ -85,6 +85,20 @@ func EncodeBounds(low, high []any) ([]byte, error) {
 	bldrs := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	defer bldrs.Release()
 
+	// normalizeBound widens unsigned 32-bit values to int64 in step with
+	// inferArrowType's type choice (RV-05): type AND value must normalize
+	// together or appendTypedValue sees a uint32 against an int64 target.
+	normalizeBound := func(v any) any {
+		switch t := v.(type) {
+		case uint32:
+			return int64(t)
+		case uint:
+			return int64(t)
+		default:
+			return v
+		}
+	}
+
 	rows := make([][]any, 0, 2)
 	if low != nil {
 		rows = append(rows, low)
@@ -96,7 +110,7 @@ func EncodeBounds(low, high []any) ([]byte, error) {
 		for j := 0; j < width; j++ {
 			var v any
 			if j < len(rows[i]) {
-				v = rows[i][j]
+				v = normalizeBound(rows[i][j])
 			}
 			ct, err := arrowTypeToCore(types[j])
 			if err != nil {
@@ -205,11 +219,14 @@ func inferArrowType(v any) (arrow.DataType, error) {
 		return arrow.PrimitiveTypes.Int64, nil
 	case int:
 		return arrow.PrimitiveTypes.Int64, nil
-	case uint32:
-		return arrow.PrimitiveTypes.Uint32, nil
+	// Bounds are PK tuples: unsigned values normalize to the signed
+	// widening type at the SOURCE (RV-05) so both encode and decode only
+	// ever speak types the canonical codec understands. uint64 keeps its
+	// own type — the full-range unsigned space has no lossless signed
+	// widening.
+	case uint32, uint:
+		return arrow.PrimitiveTypes.Int64, nil
 	case uint64:
-		return arrow.PrimitiveTypes.Uint64, nil
-	case uint:
 		return arrow.PrimitiveTypes.Uint64, nil
 	case float32:
 		return arrow.PrimitiveTypes.Float32, nil

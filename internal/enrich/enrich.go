@@ -182,6 +182,23 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 			}
 			rj.onKey, rj.onRef = ev, ref
 		}
+		// Default destinations claim seenDests too (RV-07): a rename from
+		// ANOTHER reference must not steal a name a default projection
+		// ("<table>.<col>") would produce. Wildcard stays out — with "*"
+		// the destinations are only known at load time, and the per-ref
+		// destSeen check in buildImage covers that case.
+		if star := len(cfg.Select) == 1 && cfg.Select[0] == "*"; !star {
+			for _, s := range cfg.Select {
+				dest := cfg.Table + "." + s
+				if _, renamed := cfg.As[dest]; renamed {
+					continue // this ref's own rename overrides the default
+				}
+				if firstRef, exists := seenDests[dest]; exists && firstRef != cfg.Table {
+					return nil, fmt.Errorf("enrich: destination %q is claimed by reference %q and also by reference %q", dest, firstRef, cfg.Table)
+				}
+				seenDests[dest] = cfg.Table
+			}
+		}
 		// The as map is keyed by the prefixed name ("users.name"); a dangling
 		// or unselected key is a spec typo that would silently no-op (audit
 		// #10/#11). Destination names must not collide with the event's own

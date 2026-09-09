@@ -31,20 +31,11 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 	} else {
 		rows, _ := transport.DecodeBatch(b.Record, b.Table, []string{"id"})
-		if b.Mode == dataplane.AppendMode {
-			// Append: every row is an upsert (deletes already rewritten/dropped).
-			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: rows, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
-		} else {
-			var upserts, deletes []rowchange.Change
-			for _, r := range rows {
-				if r.Op == rowchange.OpDelete {
-					deletes = append(deletes, r)
-				} else {
-					upserts = append(upserts, r)
-				}
-			}
-			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: append(append([]rowchange.Change{}, upserts...), deletes...), Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
-		}
+		// Record rows VERBATIM in wire order (RV-10): the W-3 contract is
+		// that the wire preserves arrival order — re-partitioning into
+		// upserts-then-deletes here would hide an ordering regression in
+		// the code under test. Assertions that need the split call ByOp.
+		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: rows, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 	}
 	if f.failAt != nil && f.failAt[i] {
 		return errors.New("boom")

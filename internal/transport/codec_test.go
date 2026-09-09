@@ -541,6 +541,85 @@ func TestCodecEncodeBoundsNilLow(t *testing.T) {
 	}
 }
 
+// RV-05: unsigned 32-bit bound values normalize at the source — the wire
+// column becomes Int64 and decode yields int64. uint64 keeps its own
+// full-range type.
+func TestCodecBoundsUnsignedNormalize(t *testing.T) {
+	b, err := EncodeBounds([]any{uint32(7), "0/1"}, []any{uint(9), "0/2"})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	rows, err := DecodeBounds(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	if v, ok := rows[0][0].(int64); !ok || v != 7 {
+		t.Fatalf("low[0] = %T(%v), want int64(7)", rows[0][0], rows[0][0])
+	}
+	if v, ok := rows[1][0].(int64); !ok || v != 9 {
+		t.Fatalf("high[0] = %T(%v), want int64(9)", rows[1][0], rows[1][0])
+	}
+
+	u, err := EncodeBounds([]any{uint64(math.MaxUint64)}, nil)
+	if err != nil {
+		t.Fatalf("encode uint64: %v", err)
+	}
+	uRows, err := DecodeBounds(u)
+	if err != nil {
+		t.Fatalf("decode uint64: %v", err)
+	}
+	if v, ok := uRows[0][0].(uint64); !ok || v != math.MaxUint64 {
+		t.Fatalf("uint64 bound = %T(%v), want uint64 max", uRows[0][0], uRows[0][0])
+	}
+}
+
+// RV-04: float→int guards reject the rounded-up constant boundary. 2^63
+// is a valid float64 integer and converts to int64 as implementation-
+// defined garbage — the guard must catch it even though
+// `2^63 > math.MaxInt64` reads false (MaxInt64 converts to float64 2^63).
+func TestCodecFloatToIntBoundaryRejected(t *testing.T) {
+	schema := core.Schema{
+		Columns: []core.Column{
+			{Name: "i", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "u", Type: core.ColumnType{Kind: core.KindUInt64}},
+		},
+		PrimaryKey: []string{},
+	}
+	two63 := math.Ldexp(1, 63) // exactly 2^63
+	two64 := math.Ldexp(1, 64) // exactly 2^64 (what float64(math.MaxUint64) rounds to)
+	cases := []struct {
+		name string
+		vals map[string]any
+	}{
+		{"float64 2^63 into int64", map[string]any{"i": two63, "u": uint64(1)}},
+		{"float64 -2^63 into int64 is legal", nil}, // checked below separately
+		{"float64 2^64 into uint64", map[string]any{"i": int64(1), "u": two64}},
+	}
+	for _, tc := range cases {
+		if tc.vals == nil {
+			continue
+		}
+		rows := []rowchange.Change{
+			{Op: rowchange.OpInsert, Table: "t", After: tc.vals, Position: "p1"},
+		}
+		if _, _, err := EncodeBatch(rows, schema, nil, nil); err == nil {
+			t.Errorf("%s: must be rejected", tc.name)
+		}
+	}
+	// Boundary that IS legal: -2^63 fits int64 exactly.
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "t", After: map[string]any{
+			"i": -math.Ldexp(1, 63), "u": uint64(0),
+		}, Position: "p1"},
+	}
+	if _, _, err := EncodeBatch(rows, schema, nil, nil); err != nil {
+		t.Errorf("-2^63 into int64 must be accepted, got: %v", err)
+	}
+}
+
 // T-9 (real Collapse coverage) lives in dataplane: collapse_pkey_test.go.
 // The codec's share of T-9: composite Key types survive the round-trip.
 func TestCodecCompositeKeyTypesRoundTrip(t *testing.T) {

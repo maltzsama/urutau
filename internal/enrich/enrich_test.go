@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
+
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -696,6 +698,19 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 	}
 }
 
+// pollUntil asserts cond() becomes true within the deadline (RV-09):
+// fixed sleeps wait instead of establishing state, so a slow CI runner
+// observes a mid-transition stage and flakes.
+func pollUntil(t *testing.T, deadline time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	for start := time.Now(); time.Since(start) < deadline; time.Sleep(time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatal(msg)
+}
+
 // --- audit fixes: enrich.go ------------------------------------------------
 
 func TestFirstErrClearedOnSuccess(t *testing.T) {
@@ -713,18 +728,19 @@ func TestFirstErrClearedOnSuccess(t *testing.T) {
 	}
 	s.Start(context.Background())
 	defer s.Stop()
-	// First load fails → snap is nil → firstErr is set.
-	<-time.After(10 * time.Millisecond)
-	if _, err := s.Enrich(nil); err == nil {
-		t.Fatal("expected sticky error before first success")
-	}
-	// Fix the loader; next refresh clears firstErr (audit #1).
+	// First load fails -> snap is nil -> firstErr is set.
+	pollUntil(t, 2*time.Second, func() bool {
+		_, err := s.Enrich(nil)
+		return err != nil
+	}, "expected sticky error before first success")
+
+	// Fix the loader; the next refresh tick clears firstErr (audit #1).
 	fl.SetErr(nil)
 	fl.SetRows(usersRows())
-	<-time.After(20 * time.Millisecond) // wait for the 10ms tick
-	if _, err := s.Enrich(nil); err != nil {
-		t.Fatalf("firstErr not cleared after success: %v", err)
-	}
+	pollUntil(t, 2*time.Second, func() bool {
+		_, err := s.Enrich(nil)
+		return err == nil
+	}, "firstErr not cleared after success")
 }
 
 func TestEmptyRefGoesHot(t *testing.T) {
@@ -820,11 +836,11 @@ func TestStickyErrAtStart(t *testing.T) {
 	}
 	s.Start(context.Background())
 	defer s.Stop()
-	<-time.After(10 * time.Millisecond)
-	_, err = s.Enrich([]rowchange.Change{{After: map[string]any{"user_ref": int64(1)}}})
-	if err == nil {
-		t.Fatal("sticky error must block Enrich at top (audit #8)")
-	}
+	// The failing first load installs the sticky error; poll for it.
+	pollUntil(t, 2*time.Second, func() bool {
+		_, err := s.Enrich([]rowchange.Change{{After: map[string]any{"user_ref": int64(1)}}})
+		return err != nil
+	}, "sticky error must block Enrich at top (audit #8)")
 }
 
 func TestJoinTypeValidation(t *testing.T) {
@@ -859,25 +875,104 @@ func TestDestCollisionRejected(t *testing.T) {
 	}
 }
 
-func TestMySQLDSN(t *testing.T) {
+func TestCrossRefDefaultCollisionRejected(t *testing.T) {
+	// RV-07: ref A selects "name" (default destination "users.name"); ref B
+	// renames onto "users.name" — the rename silently overwrites A's
+	// projection. Both directions must be rejected at boot.
+	refA := refCfg(func(c *spec.Enrich) { c.Table = "users" })
+	refB := refCfg(func(c *spec.Enrich) {
+		c.Table = "orders"
+		c.Select = []string{"id"}
+		c.As = map[string]string{"orders.id": "users.name"}
+	})
+	if _, err := New([]spec.Enrich{refA, refB}, []string{"user_ref", "v"}, nil); err == nil {
+		t.Fatal("rename onto another ref's default destination must be rejected")
+	}
+
+	// Reverse order: a default projecting onto a name already claimed by
+	// another ref's rename must also collide. refC (users, select name)
+	// defaults to destination "users.name" — claimed above by refB's rename.
+	refC := refCfg(func(c *spec.Enrich) {
+		c.Table = "users"
+		c.Select = []string{"name"}
+	})
+	if _, err := New([]spec.Enrich{refB, refC}, []string{"user_ref", "v"}, nil); err == nil {
+		t.Fatal("default projecting over another ref's rename must be rejected")
+	}
+}
+
+func TestMySQLConfig(t *testing.T) {
 	tests := []struct {
-		in   string
-		want string
-		err  bool
+		name  string
+		in    string
+		check func(t *testing.T, cfg *mysql.Config)
+		err   bool
 	}{
-		{"mysql://u:p@myhost:3307/mydb", "u:p@tcp(myhost:3307)/mydb?parseTime=true", false},
-		{"mysql://u:p@myhost/mydb", "u:p@tcp(myhost:3306)/mydb?parseTime=true", false},
-		{"mysql://u:p@myhost/", "", true},
-		{"postgres://u:p@myhost/mydb", "", true},
+		{
+			name: "explicit port",
+			in:   "mysql://u:p@myhost:3307/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.User != "u" || cfg.Passwd != "p" || cfg.Addr != "myhost:3307" || cfg.DBName != "mydb" {
+					t.Fatalf("cfg = %q/%q@%s/%s", cfg.User, cfg.Passwd, cfg.Addr, cfg.DBName)
+				}
+			},
+		},
+		{
+			name: "default port",
+			in:   "mysql://u:p@myhost/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.Addr != "myhost:3306" {
+					t.Fatalf("addr = %q, want myhost:3306", cfg.Addr)
+				}
+			},
+		},
+		{
+			name: "parseTime on",
+			in:   "mysql://u:p@myhost/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if !cfg.ParseTime {
+					t.Fatal("ParseTime must stay on (DATETIME -> time.Time)")
+				}
+			},
+		},
+		{
+			name: "password with DSN delimiters survives decoded",
+			in:   "mysql://u:p%2Fass%3Fx%40y@myhost/mydb",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.Passwd != "p/ass?x@y" {
+					t.Fatalf("passwd = %q, want %q", cfg.Passwd, "p/ass?x@y")
+				}
+			},
+		},
+		{
+			name: "query params carried through",
+			in:   "mysql://u:p@myhost/mydb?timeout=10s&charset=utf8mb4",
+			check: func(t *testing.T, cfg *mysql.Config) {
+				if cfg.Params["timeout"] != "10s" || cfg.Params["charset"] != "utf8mb4" {
+					t.Fatalf("params = %v, want timeout+charset", cfg.Params)
+				}
+			},
+		},
+		{
+			name: "missing db is an error",
+			in:   "mysql://u:p@myhost/",
+			err:  true,
+		},
+		{
+			name: "wrong scheme is an error",
+			in:   "postgres://u:p@myhost/mydb",
+			err:  true,
+		},
 	}
 	for _, tc := range tests {
-		dsn, err := mysqlDSN(tc.in)
-		if (err != nil) != tc.err {
-			t.Errorf("mysqlDSN(%q): err=%v, wantErr=%v", tc.in, err, tc.err)
-			continue
-		}
-		if dsn != tc.want {
-			t.Errorf("mysqlDSN(%q) = %q, want %q", tc.in, dsn, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := mysqlConfig(tc.in)
+			if (err != nil) != tc.err {
+				t.Fatalf("err=%v, wantErr=%v", err, tc.err)
+			}
+			if err == nil && tc.check != nil {
+				tc.check(t, cfg)
+			}
+		})
 	}
 }

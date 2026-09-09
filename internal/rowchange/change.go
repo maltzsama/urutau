@@ -35,6 +35,14 @@ func (o Op) String() string {
 // when needed (mutable-column filters). Position is the source coordinate
 // (GTID | LSN) the event came from; CommitTS is the source commit timestamp.
 //
+// DELETE IMAGE CONTRACT (RV-11): a delete's row image lives in Before when
+// the change comes from an in-process source decoder, and in After when the
+// change was decoded from the wire — the wire carries the before image in
+// the flat columns (CR-021), so DecodeBatch fills After and leaves Before
+// nil. Consumers selecting the delete image must handle BOTH: prefer
+// Before when non-empty, else After. Two consumers assuming one location
+// produced mirrored data-loss bugs (enrich #4, sink.go RV-02).
+//
 // Value contract (row universe): Arrow has no Go-exact float16/float32
 // value type in map[string]any, so a Float32 column DECODES as float64
 // (promotion, M-3). Re-encoding a promoted value back into a Float32
