@@ -44,24 +44,44 @@ var reg registry
 
 // RegisterSource registers a source kind (mysql, postgres, kafka) with its
 // static capabilities. Called from init() in each source package.
-func RegisterSource(kind string, caps source.Capabilities, factory SourceFactory) {
+//
+// A duplicate registration is an error: the last-write-wins behavior would
+// let a plugin silently hijack a builtin kind and redirect every pipeline
+// that names it. An empty kind is an error too. Callers in init() panic on
+// error — a duplicate at boot is a programming error, not a runtime choice.
+func RegisterSource(kind string, caps source.Capabilities, factory SourceFactory) error {
+	if kind == "" {
+		return fmt.Errorf("driver: source kind must not be empty")
+	}
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
+	if _, dup := reg.sources[kind]; dup {
+		return fmt.Errorf("driver: source kind %q already registered — a plugin or builtin is trying to hijack it", kind)
+	}
 	if reg.sources == nil {
 		reg.sources = make(map[string]sourceEntry)
 	}
 	reg.sources[kind] = sourceEntry{caps: caps, factory: factory}
+	return nil
 }
 
 // RegisterSink registers a sink type (iceberg+rest, delta, …). Called from
-// init() in each sink package.
-func RegisterSink(scheme string, factory SinkFactory) {
+// init() in each sink package. A duplicate or empty type is an error (see
+// RegisterSource).
+func RegisterSink(scheme string, factory SinkFactory) error {
+	if scheme == "" {
+		return fmt.Errorf("driver: sink type must not be empty")
+	}
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
+	if _, dup := reg.sinks[scheme]; dup {
+		return fmt.Errorf("driver: sink type %q already registered — a plugin or builtin is trying to hijack it", scheme)
+	}
 	if reg.sinks == nil {
 		reg.sinks = make(map[string]SinkFactory)
 	}
 	reg.sinks[scheme] = factory
+	return nil
 }
 
 // LoadPlugin opens a Go plugin (.so) and calls its exported Init function.
@@ -71,7 +91,14 @@ func RegisterSink(scheme string, factory SinkFactory) {
 //
 // Init is responsible for calling RegisterSource/RegisterSink.
 // Rules: same Go version, same dependency graph, Linux/macOS only.
-func LoadPlugin(path string) error {
+func LoadPlugin(path string) (err error) {
+	// A panicking Init must not take down the host: registration is partial
+	// at that point and the error is far more actionable than a crash.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("driver: plugin %s Init panicked: %v", path, r)
+		}
+	}()
 	p, err := plugin.Open(path)
 	if err != nil {
 		return fmt.Errorf("driver: open plugin %s: %w", path, err)
@@ -88,7 +115,8 @@ func LoadPlugin(path string) error {
 }
 
 // registeredKinds lists the registered source kinds, sorted so diagnostics
-// read deterministically. Called with the map lock released.
+// read deterministically. Callers must NOT hold the map lock — this acquires
+// it.
 func registeredKinds() []string {
 	reg.mu.RLock()
 	defer reg.mu.RUnlock()
@@ -101,7 +129,8 @@ func registeredKinds() []string {
 }
 
 // registeredSinks lists the registered sink types, sorted so diagnostics
-// read deterministically. Called with the map lock released.
+// read deterministically. Callers must NOT hold the map lock — this acquires
+// it.
 func registeredSinks() []string {
 	reg.mu.RLock()
 	defer reg.mu.RUnlock()
@@ -126,6 +155,9 @@ func unknownSinkErr(scheme string) error {
 
 // OpenSource resolves and instantiates a source for a spec's source kind.
 func OpenSource(s *spec.Spec, rt source.Runtime) (source.Source, error) {
+	if s == nil {
+		return nil, fmt.Errorf("driver: nil spec")
+	}
 	reg.mu.RLock()
 	entry, ok := reg.sources[s.Source.Kind]
 	reg.mu.RUnlock()
@@ -164,6 +196,17 @@ func OpenSink(ctx context.Context, s *spec.Spec) (sink.Sink, error) {
 	return OpenSinkConfig(ctx, SinkConfig(s))
 }
 
+// Sink option keys — the neutral-config contract between SinkConfig and each
+// sink factory. Named constants so a typo is a compile error, not a silent
+// "" read. client_secret is a credential: never log the Options map.
+const (
+	OptWarehouse    = "warehouse"
+	OptClientID     = "client_id"
+	OptClientSecret = "client_secret"
+	OptScope        = "scope"
+	OptCommitMode   = "commit_mode"
+)
+
 // SinkConfig renders a spec's sink section into the neutral config.
 func SinkConfig(s *spec.Spec) sink.Config {
 	return sink.Config{
@@ -171,11 +214,11 @@ func SinkConfig(s *spec.Spec) sink.Config {
 		URI:       s.Sink.URI,
 		Namespace: s.Sink.Namespace,
 		Options: map[string]string{
-			"warehouse":     s.Sink.Warehouse,
-			"client_id":     s.Sink.ClientID,
-			"client_secret": s.Sink.ClientSecret,
-			"scope":         s.Sink.Scope,
-			"commit_mode":   string(s.Sink.CommitMode),
+			OptWarehouse:    s.Sink.Warehouse,
+			OptClientID:     s.Sink.ClientID,
+			OptClientSecret: s.Sink.ClientSecret,
+			OptScope:        s.Sink.Scope,
+			OptCommitMode:   string(s.Sink.CommitMode),
 		},
 	}
 }
@@ -200,7 +243,10 @@ func OpenSinkConfig(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
 // tolerate the same snapshot concurrency as a dedicated Postgres. A ceiling
 // of 0 means the driver has no opinion.
 func ValidateParallelism(kind string, maxParallelChunks int) error {
-	if maxParallelChunks <= 0 {
+	if maxParallelChunks < 0 {
+		return fmt.Errorf("driver: maxParallelChunks %d is negative", maxParallelChunks)
+	}
+	if maxParallelChunks == 0 {
 		return nil
 	}
 	caps, err := CapsForKind(kind)
@@ -212,4 +258,14 @@ func ValidateParallelism(kind string, maxParallelChunks int) error {
 			maxParallelChunks, kind, caps.MaxConnections)
 	}
 	return nil
+}
+
+// resetRegistry clears the registry. TEST-ONLY: it exists so driver tests can
+// assert empty-registry diagnostics without being polluted by other tests'
+// registrations. Never call from production code.
+func resetRegistry() {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.sources = nil
+	reg.sinks = nil
 }

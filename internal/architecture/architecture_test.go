@@ -7,17 +7,45 @@
 package architecture
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
+
+// listTimeout bounds every `go list` subprocess so a hung toolchain (network
+// proxy, slow module load) fails the test instead of hanging CI.
+const listTimeout = 30 * time.Second
+
+// listPackages resolves a package pattern (e.g. ./internal/sink/...) into
+// import paths, so the walls auto-cover new drivers instead of drifting from
+// a hand-maintained list.
+func listPackages(t *testing.T, pattern string) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "go", "list", pattern).CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list %s: %v\n%s", pattern, err, out)
+	}
+	var pkgs []string
+	for _, line := range strings.Fields(string(out)) {
+		if line != "" {
+			pkgs = append(pkgs, line)
+		}
+	}
+	return pkgs
+}
 
 // directImports returns the direct import set of pkg (non-test files).
 func directImports(t *testing.T, pkg string) map[string]bool {
 	t.Helper()
-	out, err := exec.Command("go", "list", "-f", "{{.Imports}}", pkg).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "go", "list", "-f", "{{.Imports}}", pkg).CombinedOutput()
 	if err != nil {
-		t.Fatalf("go list -f imports %s: %v", pkg, err)
+		t.Fatalf("go list -f imports %s: %v\n%s", pkg, err, out)
 	}
 	set := map[string]bool{}
 	for _, line := range strings.Fields(string(out)) {
@@ -29,14 +57,12 @@ func directImports(t *testing.T, pkg string) map[string]bool {
 }
 
 // TestSourcesNeverKnowSinks: the source packages must not directly import
-// any sink or iceberg-go (acceptance §2).
+// any sink or iceberg-go (acceptance §2). Discovered via go list so a new
+// source driver is covered without editing this test.
 func TestSourcesNeverKnowSinks(t *testing.T) {
-	for _, pkg := range []string{
-		"github.com/maltzsama/urutau/internal/source/mysql",
-		"github.com/maltzsama/urutau/internal/source/postgres",
-		"github.com/maltzsama/urutau/internal/source/kafka",
-		"github.com/maltzsama/urutau/internal/snapshot",
-	} {
+	pkgs := append(listPackages(t, "github.com/maltzsama/urutau/internal/source/..."),
+		"github.com/maltzsama/urutau/internal/snapshot")
+	for _, pkg := range pkgs {
 		d := directImports(t, pkg)
 		for imp := range d {
 			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/sink") ||
@@ -48,22 +74,26 @@ func TestSourcesNeverKnowSinks(t *testing.T) {
 	}
 }
 
-// TestSinksNeverKnowSources: the sink package must not directly import any
-// source or the go-mysql driver (acceptance §3).
+// TestSinksNeverKnowSources: every sink package must not directly import any
+// source or the go-mysql driver (acceptance §3). Discovered via go list so a
+// new sink driver is covered.
 func TestSinksNeverKnowSources(t *testing.T) {
-	d := directImports(t, "github.com/maltzsama/urutau/internal/sink/iceberg")
-	for imp := range d {
-		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/source") ||
-			strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source") ||
-			strings.HasPrefix(imp, "github.com/go-mysql-org/go-mysql") {
-			t.Errorf("internal/sink/iceberg imports %s — sinks consume core.Schema", imp)
+	for _, pkg := range listPackages(t, "github.com/maltzsama/urutau/internal/sink/...") {
+		d := directImports(t, pkg)
+		for imp := range d {
+			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/source") ||
+				strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source") ||
+				strings.HasPrefix(imp, "github.com/go-mysql-org/go-mysql") {
+				t.Errorf("%s imports %s — sinks consume core.Schema", pkg, imp)
+			}
 		}
 	}
 }
 
 // TestOrchestrationConsumesContracts: runner, coordinator and worker consume
 // only the source/sink/driver contracts — never a concrete source or sink,
-// and never iceberg-go.
+// and never iceberg-go. internal/builtin is prohibited too: it blank-imports
+// every concrete driver, so importing it would be a backdoor past this wall.
 func TestOrchestrationConsumesContracts(t *testing.T) {
 	for _, pkg := range []string{
 		"github.com/maltzsama/urutau/internal/runner",
@@ -74,6 +104,7 @@ func TestOrchestrationConsumesContracts(t *testing.T) {
 		for imp := range d {
 			if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/source") ||
 				strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/sink") ||
+				strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/builtin") ||
 				strings.HasPrefix(imp, "github.com/apache/iceberg-go") {
 				t.Errorf("%s imports %s — consume the source/sink/driver contracts", pkg, imp)
 			}
@@ -83,14 +114,16 @@ func TestOrchestrationConsumesContracts(t *testing.T) {
 
 // TestContractsArePluginSafe: the public contract packages must not import
 // anything under internal/ — an external plugin imports these contracts and
-// must not transitively pull the engine internals.
+// must not transitively pull the engine internals. internal/rowchange is
+// deliberately NOT listed: it is an internal QUARANTINE type, not a public
+// contract (Go forbids external modules from importing internal/ at all), so
+// checking it here would be a false promise.
 func TestContractsArePluginSafe(t *testing.T) {
 	for _, pkg := range []string{
 		"github.com/maltzsama/urutau/source",
 		"github.com/maltzsama/urutau/sink",
 		"github.com/maltzsama/urutau/driver",
 		"github.com/maltzsama/urutau/core",
-		"github.com/maltzsama/urutau/internal/rowchange",
 		"github.com/maltzsama/urutau/position",
 		"github.com/maltzsama/urutau/spec",
 		"github.com/maltzsama/urutau/dataplane",

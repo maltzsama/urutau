@@ -17,7 +17,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 
 	"github.com/maltzsama/urutau/core"
-	publicdp "github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -35,7 +34,7 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 	all = append(all, b.Upserts...)
 	all = append(all, b.Deletes...)
 	if len(all) == 0 {
-		return &Batch{Table: b.Table, Watermark: []byte(b.Position), Mode: publicdp.WriteMode(b.Mode)}, nil
+		return &Batch{Table: b.Table, Watermark: []byte(b.Position), Mode: rowchange.ToDataplaneMode(b.Mode)}, nil
 	}
 
 	// Schema: known schema, plus any columns the changes carry that the
@@ -73,7 +72,7 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 		Table:           b.Table,
 		Record:          rec,
 		Watermark:       []byte(b.Position),
-		Mode:            publicdp.WriteMode(b.Mode),
+		Mode:            rowchange.ToDataplaneMode(b.Mode),
 		SnapshotState:   b.SnapshotState,
 		SnapshotPending: b.SnapshotPending,
 	}, nil

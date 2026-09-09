@@ -131,7 +131,10 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 func (s *Sink) Close() error { return s.conn.Close() }
 
 func init() {
-	driver.RegisterSink("clickhouse", func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
+	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
 		return Open(ctx, cfg)
-	})
+	}
+	if err := driver.RegisterSink("clickhouse", factory); err != nil {
+		panic(err)
+	}
 }

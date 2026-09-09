@@ -40,7 +40,7 @@ func capabilities() source.Capabilities {
 }
 
 func init() {
-	driver.RegisterSource("mysql", capabilities(), func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
+	factory := func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
 		conn, err := ParseURI(s.Source.URI)
 		if err != nil {
 			return nil, err
@@ -50,7 +50,10 @@ func init() {
 			return nil, err
 		}
 		return Source{spec: s, rt: rt, db: db}, nil
-	})
+	}
+	if err := driver.RegisterSource("mysql", capabilities(), factory); err != nil {
+		panic(err)
+	}
 }
 
 var _ source.Source = Source{}

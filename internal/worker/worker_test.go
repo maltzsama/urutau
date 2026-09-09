@@ -28,12 +28,12 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	defer f.mu.Unlock()
 	i := len(f.batches)
 	if b.Record == nil || b.Record.NumRows() == 0 {
-		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode)})
+		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 	} else {
 		rows, _, _ := transport.DecodeBatch(b.Record, nil, []string{"id"})
 		if b.Mode == dataplane.AppendMode {
 			// Append: every row is an upsert (deletes already rewritten/dropped).
-			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: rows, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode)})
+			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: rows, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 		} else {
 			var upserts, deletes []rowchange.Change
 			for _, r := range rows {
@@ -43,7 +43,7 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 					upserts = append(upserts, r)
 				}
 			}
-			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: upserts, Deletes: deletes, Position: string(b.Watermark), Mode: rowchange.WriteMode(b.Mode)})
+			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: upserts, Deletes: deletes, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 		}
 	}
 	if f.failAt != nil && f.failAt[i] {
@@ -279,3 +279,34 @@ type CommitterFunc func(context.Context, *dataplane.Batch) error
 func (f CommitterFunc) Close() error { return nil }
 
 func (f CommitterFunc) Commit(ctx context.Context, b *dataplane.Batch) error { return f(ctx, b) }
+
+// mergeBatches must propagate Mode on all three paths (a-only, b-only,
+// concat) — a lost mode silently defaulted to upsert before the ModeUnset
+// guard existed (audit #5). This is the exact trap the enum shift exposed.
+func TestMergeBatchesPropagatesMode(t *testing.T) {
+	mk := func(mode dataplane.WriteMode) *dataplane.Batch {
+		b := dpint.GenerateBatch(1, dpint.GeneratorOpts{NumRows: 1, Allocator: nil})
+		b.Mode = mode
+		return b
+	}
+	for _, mode := range []dataplane.WriteMode{dataplane.UpsertMode, dataplane.AppendMode} {
+		// a-only
+		got, err := mergeBatches(mk(mode), nil, nil)
+		if err != nil || got.Mode != mode {
+			t.Fatalf("a-only mode = %v, want %v (err %v)", got.Mode, mode, err)
+		}
+		got.Release()
+		// b-only
+		got, err = mergeBatches(nil, mk(mode), nil)
+		if err != nil || got.Mode != mode {
+			t.Fatalf("b-only mode = %v, want %v (err %v)", got.Mode, mode, err)
+		}
+		got.Release()
+		// concat
+		got, err = mergeBatches(mk(mode), mk(mode), nil)
+		if err != nil || got.Mode != mode {
+			t.Fatalf("concat mode = %v, want %v (err %v)", got.Mode, mode, err)
+		}
+		got.Release()
+	}
+}

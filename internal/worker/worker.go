@@ -461,6 +461,12 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 	for rb := range p.readyCh {
 		start := time.Now()
+		// A zero-value WriteMode would silently default to upsert semantics.
+		// Every batch must carry an explicit mode; reject the unset one.
+		if rb.batch.Mode == dataplane.ModeUnset {
+			rb.batch.Release()
+			return fmt.Errorf("worker: table %s: batch has no write mode set", p.target)
+		}
 		if w.onCommit != nil {
 			w.onCommit(rb.batch, rb.rows)
 		}
@@ -523,7 +529,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				appendPos = ""
 			}
 			if len(untouched) > 0 {
-				ab := rowchange.Batch{Table: p.target, Upserts: untouched, Position: appendPos, Mode: rowchange.WriteMode(dataplane.AppendMode)}
+				ab := rowchange.Batch{Table: p.target, Upserts: untouched, Position: appendPos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
 				p.snapshotMu.Lock()
 				ab.SnapshotState = p.snapshotState
 				ab.SnapshotPending = p.snapshotPending
@@ -542,7 +548,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			}
 			if len(rest) > 0 {
 				collapsed := rowchange.Collapse(rest)
-				b := rowchange.Batch{Table: p.target, Upserts: collapsed.Upserts, Deletes: collapsed.Deletes, Position: pos, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
+				b := rowchange.Batch{Table: p.target, Upserts: collapsed.Upserts, Deletes: collapsed.Deletes, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 				p.snapshotMu.Lock()
 				b.SnapshotState = p.snapshotState
 				b.SnapshotPending = p.snapshotPending
@@ -606,7 +612,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 						// QUARANTINE: enrich the rewritten delete as a single-row
 						// batch through the columnar seam; dies when the join
 						// becomes columnar.
-						dpb, err := dpint.BatchFromChangeBatch(rowchange.Batch{Table: p.target, Upserts: []rowchange.Change{c}, Mode: rowchange.WriteMode(dataplane.AppendMode)}, p.knownSchema)
+						dpb, err := dpint.BatchFromChangeBatch(rowchange.Batch{Table: p.target, Upserts: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.AppendMode)}, p.knownSchema)
 						if err != nil {
 							return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
 						}
@@ -631,7 +637,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				}
 				upserts = append(upserts, c)
 			}
-			b := rowchange.Batch{Table: p.target, Upserts: upserts, Position: pos, Mode: rowchange.WriteMode(dataplane.AppendMode)}
+			b := rowchange.Batch{Table: p.target, Upserts: upserts, Position: pos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
 			p.snapshotMu.Lock()
 			b.SnapshotState = p.snapshotState
 			b.SnapshotPending = p.snapshotPending
@@ -656,7 +662,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// the sink commits a single batch per flush, and the position
 			// must never separate from its data (two commits would advance
 			// past uncommitted upserts on a crash between them).
-			cb := rowchange.Batch{Table: p.target, Upserts: buf, Position: pos, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
+			cb := rowchange.Batch{Table: p.target, Upserts: buf, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 			dpb, err := dpint.BatchFromChangeBatch(cb, p.knownSchema)
 			if err != nil {
 				return fmt.Errorf("worker: table %s: bridge upsert: %w", p.target, err)
@@ -876,12 +882,12 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		}
 		b.Record.Retain()
 		return &dataplane.Batch{Table: b.Table, Record: b.Record, Watermark: b.Watermark,
-			SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending}, nil
+			Mode: b.Mode, SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending}, nil
 	}
 	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
 		a.Record.Retain()
 		return &dataplane.Batch{Table: a.Table, Record: a.Record, Watermark: a.Watermark,
-			SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending}, nil
+			Mode: a.Mode, SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending}, nil
 	}
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
@@ -908,6 +914,7 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		Table:           a.Table,
 		Record:          rec,
 		Watermark:       a.Watermark,
+		Mode:            a.Mode,
 		SnapshotState:   a.SnapshotState,
 		SnapshotPending: a.SnapshotPending,
 	}, nil
@@ -941,7 +948,7 @@ func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, sch
 				if len(buf) == 0 {
 					continue
 				}
-				cb := rowchange.Batch{Table: table, Upserts: buf, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
+				cb := rowchange.Batch{Table: table, Upserts: buf, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 				dpb, err := dpint.BatchFromChangeBatch(cb, schema)
 				if err != nil {
 					bufs[table] = bufs[table][:0] // QUARANTINE: drop on bridge error; dies in M4
@@ -978,7 +985,7 @@ func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, sch
 						continue
 					}
 					// InWindow is DATA + a routing tag; the batch must survive.
-					cb := rowchange.Batch{Table: c.Table, Upserts: []rowchange.Change{c}, Mode: rowchange.WriteMode(dataplane.UpsertMode)}
+					cb := rowchange.Batch{Table: c.Table, Upserts: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 					dpb, err := dpint.BatchFromChangeBatch(cb, schema)
 					if err != nil {
 						continue

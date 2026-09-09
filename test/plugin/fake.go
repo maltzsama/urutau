@@ -157,12 +157,16 @@ func (r *records) rows(target string) []recRow {
 var committed = newRecords()
 
 func init() {
-	driver.RegisterSource("fake", source.Capabilities{Stream: true}, func(*spec.Spec, source.Runtime) (source.Source, error) {
+	if err := driver.RegisterSource("fake", source.Capabilities{Stream: true}, func(*spec.Spec, source.Runtime) (source.Source, error) {
 		return Source{}, nil
-	})
-	driver.RegisterSink("fake", func(context.Context, sink.Config) (sink.Sink, error) {
+	}); err != nil {
+		panic(err)
+	}
+	if err := driver.RegisterSink("fake", func(context.Context, sink.Config) (sink.Sink, error) {
 		return &Sink{rec: committed}, nil
-	})
+	}); err != nil {
+		panic(err)
+	}
 }
 
 // Source is a stream-only fake: it emits seedRows and holds the stream open
