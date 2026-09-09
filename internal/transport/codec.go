@@ -7,6 +7,7 @@ package transport
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -83,6 +84,11 @@ func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta) (b
 				src = cp
 			}
 		}
+		// H-6: a delete with no image and no key produces a NULL tuple —
+		// the equality delete would match nothing. Fail explicitly.
+		if r.Op == rowchange.OpDelete && src == nil && len(r.Key) == 0 {
+			return nil, nil, fmt.Errorf("transport: delete sem key e sem imagem — o equality delete casaria nada")
+		}
 		for j, col := range cs.Columns {
 			var v any
 			if src != nil {
@@ -129,14 +135,40 @@ func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta) (b
 // and an empty key would make every commit fail on arity. Pass nil only for
 // batches whose consumer never commits (tests).
 func DecodeBatch(rec arrow.RecordBatch, metaBytes []byte, primaryKey []string) ([]rowchange.Change, *pb.BatchMeta, error) {
+	if len(metaBytes) == 0 && metaBytes != nil {
+		return nil, nil, fmt.Errorf("transport: meta vazio — batch sem identidade")
+	}
 	meta := &pb.BatchMeta{}
-	if err := proto.Unmarshal(metaBytes, meta); err != nil {
-		return nil, nil, fmt.Errorf("transport: unmarshal batch meta: %w", err)
+	if len(metaBytes) > 0 {
+		if err := proto.Unmarshal(metaBytes, meta); err != nil {
+			return nil, nil, fmt.Errorf("transport: unmarshal batch meta: %w", err)
+		}
 	}
 
 	schema := rec.Schema()
 	numCols := int(rec.NumCols())
+	if numCols < 5 {
+		return nil, nil, fmt.Errorf("transport: batch com %d colunas — wire-schema requer ≥5", numCols)
+	}
 	numDataCols := numCols - 5 // subtract metadata columns
+
+	// Validate the trailing 5 columns by name and type — before the row
+	// loop, so comma-ok casts below are safe assertions.
+	want := []arrow.Field{
+		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8},
+		{Name: "__pos", Type: arrow.BinaryTypes.String},
+		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}},
+		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
+		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean},
+	}
+	for k, w := range want {
+		f := schema.Field(numDataCols + k)
+		if f.Name != w.Name || !arrow.TypeEqual(f.Type, w.Type) {
+			return nil, nil, fmt.Errorf(
+				"transport: coluna %d: want %s, got %s(%s) — não é wire-schema",
+				numDataCols+k, w.Name, f.Name, f.Type)
+		}
+	}
 
 	// Pre-resolve core types for each data column from the Arrow schema,
 	// honoring extension metadata (uuid/json) so the Kind survives the wire.
@@ -223,8 +255,10 @@ func arrowTypeToCore(dt arrow.DataType) core.ColumnType {
 		return core.ColumnType{Kind: core.KindInt32}
 	case arrow.INT64:
 		return core.ColumnType{Kind: core.KindInt64}
-	case arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64:
-		return core.ColumnType{Kind: core.KindInt64} // unsigned → int64
+	case arrow.UINT8, arrow.UINT16, arrow.UINT32:
+		return core.ColumnType{Kind: core.KindInt64} // widening, defensivo
+	case arrow.UINT64:
+		return core.ColumnType{Kind: core.KindUInt64}
 	case arrow.FLOAT16, arrow.FLOAT32:
 		return core.ColumnType{Kind: core.KindFloat32}
 	case arrow.FLOAT64:
@@ -241,7 +275,11 @@ func arrowTypeToCore(dt arrow.DataType) core.ColumnType {
 	case arrow.TIME32, arrow.TIME64:
 		return core.ColumnType{Kind: core.KindTime}
 	case arrow.TIMESTAMP:
-		return core.ColumnType{Kind: core.KindTimestampTZ} // timestamps travel as UTC
+		tt := dt.(*arrow.TimestampType)
+		if tt.TimeZone != "" {
+			return core.ColumnType{Kind: core.KindTimestampTZ}
+		}
+		return core.ColumnType{Kind: core.KindTimestamp}
 	case arrow.FIXED_SIZE_BINARY:
 		// A bare fixed-size binary without the uuid extension is a fixed
 		// byte sequence; uuid is disambiguated at the field level via
@@ -296,10 +334,19 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		case int32:
 			bld.(*array.Int32Builder).Append(t)
 		case int:
+			if t < math.MinInt32 || t > math.MaxInt32 {
+				return fmt.Errorf("valor %d fora do range int32", t)
+			}
 			bld.(*array.Int32Builder).Append(int32(t))
 		case int64:
+			if t < math.MinInt32 || t > math.MaxInt32 {
+				return fmt.Errorf("valor %d fora do range int32", t)
+			}
 			bld.(*array.Int32Builder).Append(int32(t))
 		case float64:
+			if !isIntegralFloat(t) || t < math.MinInt32 || t > math.MaxInt32 {
+				return fmt.Errorf("valor %v não é inteiro representável em int32", t)
+			}
 			bld.(*array.Int32Builder).Append(int32(t))
 		default:
 			return fmt.Errorf("want int32-compatible, got %T", v)
@@ -313,6 +360,9 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		case int32:
 			bld.(*array.Int64Builder).Append(int64(t))
 		case float64:
+			if !isIntegralFloat(t) || t < math.MinInt64 || t > math.MaxInt64 {
+				return fmt.Errorf("valor %v não é inteiro representável em int64", t)
+			}
 			bld.(*array.Int64Builder).Append(int64(t))
 		default:
 			return fmt.Errorf("want int64-compatible, got %T", v)
@@ -322,10 +372,19 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		case uint64:
 			bld.(*array.Uint64Builder).Append(t)
 		case int:
+			if t < 0 {
+				return fmt.Errorf("valor %d negativo não representável em uint64", t)
+			}
 			bld.(*array.Uint64Builder).Append(uint64(t))
 		case int64:
+			if t < 0 {
+				return fmt.Errorf("valor %d negativo não representável em uint64", t)
+			}
 			bld.(*array.Uint64Builder).Append(uint64(t))
 		case float64:
+			if t < 0 || t > math.MaxUint64 || !isIntegralFloat(t) {
+				return fmt.Errorf("valor %v não é representável em uint64", t)
+			}
 			bld.(*array.Uint64Builder).Append(uint64(t))
 		default:
 			return fmt.Errorf("want uint64-compatible, got %T", v)
@@ -346,8 +405,11 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		case float64:
 			bld.(*array.Float64Builder).Append(t)
 		case float32:
-			bld.(*array.Float64Builder).Append(float64(t))
+			bld.(*array.Float64Builder).Append(float64(t)) // widening — permitido
 		case int64:
+			if int64(float64(t)) != t {
+				return fmt.Errorf("valor %d perde precisão em float64", t)
+			}
 			bld.(*array.Float64Builder).Append(float64(t))
 		case int:
 			bld.(*array.Float64Builder).Append(float64(t))
@@ -383,24 +445,30 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			return fmt.Errorf("want []byte, got %T", v)
 		}
 	case core.KindDate:
-		// Dates travel as int32 (days since epoch).
+		// Dates travel as Date32 (days since epoch).
 		switch t := v.(type) {
 		case int32:
-			bld.(*array.Int32Builder).Append(t)
+			bld.(*array.Date32Builder).Append(arrow.Date32(t))
 		case int64:
-			bld.(*array.Int32Builder).Append(int32(t))
+			if t < math.MinInt32 || t > math.MaxInt32 {
+				return fmt.Errorf("date %d fora do range int32", t)
+			}
+			bld.(*array.Date32Builder).Append(arrow.Date32(t))
 		case int:
-			bld.(*array.Int32Builder).Append(int32(t))
+			if int64(t) < math.MinInt32 || int64(t) > math.MaxInt32 {
+				return fmt.Errorf("date %d fora do range int32", t)
+			}
+			bld.(*array.Date32Builder).Append(arrow.Date32(t))
 		default:
 			return fmt.Errorf("want date-int32, got %T", v)
 		}
 	case core.KindTime:
-		// Times travel as int64 (micros since midnight).
+		// Times travel as Time64 (micros since midnight).
 		switch t := v.(type) {
 		case int64:
-			bld.(*array.Int64Builder).Append(t)
+			bld.(*array.Time64Builder).Append(arrow.Time64(t))
 		case int:
-			bld.(*array.Int64Builder).Append(int64(t))
+			bld.(*array.Time64Builder).Append(arrow.Time64(t))
 		default:
 			return fmt.Errorf("want time-int64, got %T", v)
 		}
@@ -468,18 +536,18 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 	case core.KindString, core.KindJSON:
 		return col.(*array.String).Value(i), nil
 	case core.KindBinary:
-		return col.(*array.Binary).Value(i), nil
+		return bytes.Clone(col.(*array.Binary).Value(i)), nil
 	case core.KindDate:
-		return col.(*array.Int32).Value(i), nil // days since epoch
+		return int32(col.(*array.Date32).Value(i)), nil // days since epoch
 	case core.KindTime:
-		return col.(*array.Int64).Value(i), nil // micros since midnight
+		return int64(col.(*array.Time64).Value(i)), nil // micros since midnight
 	case core.KindTimestamp, core.KindTimestampTZ:
 		ts := col.(*array.Timestamp).Value(i)
 		return ts.ToTime(arrow.Microsecond), nil
 	case core.KindUUID:
-		return col.(*array.FixedSizeBinary).Value(i), nil
+		return bytes.Clone(col.(*array.FixedSizeBinary).Value(i)), nil
 	case core.KindFixedBinary:
-		return col.(*array.FixedSizeBinary).Value(i), nil
+		return bytes.Clone(col.(*array.FixedSizeBinary).Value(i)), nil
 	default:
 		return nil, fmt.Errorf("unsupported kind %s", ct.Kind)
 	}
@@ -520,4 +588,9 @@ func hexDigit(c byte) int {
 	default:
 		return -1
 	}
+}
+
+// isIntegralFloat reports whether f is an integer representable without loss.
+func isIntegralFloat(f float64) bool {
+	return f == math.Trunc(f) && !math.IsInf(f, 0) && !math.IsNaN(f)
 }
