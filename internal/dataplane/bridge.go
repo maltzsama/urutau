@@ -13,6 +13,7 @@ package dataplane
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
@@ -41,7 +42,9 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 	// Schema: known schema, plus any columns the changes carry that the
 	// known schema lacks (enriched columns, e.g. join output). Enrichment
 	// adds columns after registration, so the known schema alone would
-	// drop them on the wire.
+	// drop them on the wire. When cs is empty (cold path — first bridge
+	// call before schema registration), schemaFromChanges infers from
+	// the row values.
 	cs = mergeSchema(all, cs)
 
 	meta := &pb.BatchMeta{
@@ -80,6 +83,7 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 }
 
 // schemaFromChanges infers a core.Schema from the changes' After/Before maps.
+// Columns are sorted by name for deterministic output.
 // QUARANTINE: dies in commit 3/4.
 func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	seen := make(map[string]core.ColumnType)
@@ -98,6 +102,7 @@ func schemaFromChanges(changes []rowchange.Change) core.Schema {
 	for k, ct := range seen {
 		cols = append(cols, core.Column{Name: k, Type: ct})
 	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })
 	return core.Schema{Columns: cols}
 }
 
@@ -131,8 +136,8 @@ func goTypeToCore(v any) core.ColumnType {
 }
 
 // mergeSchema returns the known schema extended with any columns present in
-// the changes but missing from it (enriched columns). When the known schema
-// is empty, infers entirely from the changes.
+// the changes but missing from it (enriched columns, e.g. join output).
+// Does NOT mutate the incoming cs — returns a new Schema.
 func mergeSchema(changes []rowchange.Change, cs core.Schema) core.Schema {
 	if len(cs.Columns) == 0 {
 		return schemaFromChanges(changes)
@@ -141,12 +146,14 @@ func mergeSchema(changes []rowchange.Change, cs core.Schema) core.Schema {
 	for _, c := range cs.Columns {
 		has[c.Name] = true
 	}
+	merged := make([]core.Column, len(cs.Columns))
+	copy(merged, cs.Columns)
 	inferred := schemaFromChanges(changes)
 	for _, col := range inferred.Columns {
 		if !has[col.Name] {
-			cs.Columns = append(cs.Columns, col)
+			merged = append(merged, col)
 			has[col.Name] = true
 		}
 	}
-	return cs
+	return core.Schema{Columns: merged}
 }

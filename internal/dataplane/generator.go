@@ -340,8 +340,25 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 // EncodeKey encodes a composite key as length-prefixed binary concat
 // of the string representations — used by collapse to avoid hash
 // collisions (CR-069 §3.2).
+//
+// v4: type-prefixed binary encoding. Each field is [type-byte][payload…].
+// Different types cannot collide because they carry distinct type tags.
+// No fmt.Sprintf — direct binary encoding for determinism and speed.
 func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, error) {
+	const (
+		typeInt32    byte = 0x01
+		typeInt64    byte = 0x02
+		typeUInt64   byte = 0x03
+		typeFloat32  byte = 0x04
+		typeFloat64  byte = 0x05
+		typeBool     byte = 0x06
+		typeString   byte = 0x07
+		typeDate32   byte = 0x09
+		typeTime64   byte = 0x0A
+		typeTSNZ     byte = 0x0B
+	)
 	var buf []byte
+	var lenBuf [4]byte
 	for _, col := range pkCols {
 		idx := -1
 		for i := 0; i < int(record.NumCols()); i++ {
@@ -354,23 +371,60 @@ func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, erro
 			return nil, fmt.Errorf("dataplane: encode key: column %q not found", col)
 		}
 		arr := record.Column(idx)
-		var val string
 		switch a := arr.(type) {
+		case *array.Int32:
+			buf = append(buf, typeInt32)
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(a.Value(row)))
+			buf = append(buf, lenBuf[:]...)
 		case *array.Int64:
-			val = fmt.Sprintf("i:%d", a.Value(row))
-		case *array.String:
-			val = "s:" + a.Value(row)
-		case *array.Boolean:
-			val = fmt.Sprintf("b:%t", a.Value(row))
+			buf = append(buf, typeInt64)
+			var v [8]byte
+			binary.LittleEndian.PutUint64(v[:], uint64(a.Value(row)))
+			buf = append(buf, v[:]...)
+		case *array.Uint64:
+			buf = append(buf, typeUInt64)
+			var v [8]byte
+			binary.LittleEndian.PutUint64(v[:], a.Value(row))
+			buf = append(buf, v[:]...)
+		case *array.Float32:
+			buf = append(buf, typeFloat32)
+			binary.LittleEndian.PutUint32(lenBuf[:], math.Float32bits(a.Value(row)))
+			buf = append(buf, lenBuf[:]...)
 		case *array.Float64:
-			val = fmt.Sprintf("f:%v", a.Value(row))
+			buf = append(buf, typeFloat64)
+			var v [8]byte
+			binary.LittleEndian.PutUint64(v[:], math.Float64bits(a.Value(row)))
+			buf = append(buf, v[:]...)
+		case *array.Boolean:
+			buf = append(buf, typeBool)
+			if a.Value(row) {
+				buf = append(buf, 1)
+			} else {
+				buf = append(buf, 0)
+			}
+		case *array.String:
+			buf = append(buf, typeString)
+			s := a.Value(row)
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(s)))
+			buf = append(buf, lenBuf[:]...)
+			buf = append(buf, s...)
+		case *array.Date32:
+			buf = append(buf, typeDate32)
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(a.Value(row)))
+			buf = append(buf, lenBuf[:]...)
+		case *array.Time64:
+			buf = append(buf, typeTime64)
+			var v [8]byte
+			binary.LittleEndian.PutUint64(v[:], uint64(a.Value(row)))
+			buf = append(buf, v[:]...)
+		case *array.Timestamp:
+			buf = append(buf, typeTSNZ)
+			var v [8]byte
+			binary.LittleEndian.PutUint64(v[:], uint64(a.Value(row)))
+			buf = append(buf, v[:]...)
 		default:
 			return nil, fmt.Errorf("dataplane: encode key: unsupported column type %T for PK column %q", arr, col)
 		}
-		var lenBuf [4]byte
-		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(val)))
-		buf = append(buf, lenBuf[:]...)
-		buf = append(buf, val...)
 	}
 	return buf, nil
 }
