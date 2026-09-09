@@ -79,3 +79,16 @@ type MetadataColumn struct {
 	From MetadataKey `json:"from"`
 	As   string      `json:"as"`
 }
+
+// validMetadataKey reports whether k is a member of the closed catalog.
+// The catalog is closed by design (package doc); an unknown key is a spec
+// typo and must fail loudly, never become a silent string column.
+func validMetadataKey(k MetadataKey) bool {
+	switch k {
+	case MetaOp, MetaCommitTS, MetaIngestTS, MetaPosition, MetaSourceTable,
+		MetaPhase, MetaEnrichMiss, MetaStream, MetaShard, MetaSeq, MetaMsgTS,
+		MetaMsgKey, MetaHeaders:
+		return true
+	}
+	return false
+}
