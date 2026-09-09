@@ -341,9 +341,16 @@ func AdversarialNullBefore(seed int64, alloc memory.Allocator) *Batch {
 // of the string representations — used by collapse to avoid hash
 // collisions (CR-069 §3.2).
 //
-// v4: type-prefixed binary encoding. Each field is [type-byte][payload…].
-// Different types cannot collide because they carry distinct type tags.
-// No fmt.Sprintf — direct binary encoding for determinism and speed.
+// v4: type-tagged binary encoding. Each field is [type-byte][payload…]:
+// fixed-width payloads for numerics/bool/date/time/timestamp, length-
+// prefixed for string/binary/decimal, raw fixed width for FixedSizeBinary.
+// Different types cannot collide (distinct tags); equal values of the same
+// type always produce equal keys (NaN/±0 compare by bit pattern — M-11).
+//
+// INVARIANT: keys are EPHEMERAL — they live for the duration of one
+// Collapse call and never persist or cross batches. If keys ever need to
+// persist or be compared across batches, this design must be revisited
+// (type widening across batches, e.g. int32→int64, would change keys).
 func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, error) {
 	const (
 		typeInt32   byte = 0x01
@@ -353,9 +360,15 @@ func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, erro
 		typeFloat64 byte = 0x05
 		typeBool    byte = 0x06
 		typeString  byte = 0x07
+		typeDecimal byte = 0x08
 		typeDate32  byte = 0x09
 		typeTime64  byte = 0x0A
-		typeTSNZ    byte = 0x0B
+		// typeTimestamp covers every *array.Timestamp regardless of
+		// timezone or unit — keys are per-batch and a column has a single
+		// type within a batch, so unit/TZ normalization is unnecessary.
+		typeTimestamp byte = 0x0B
+		typeBinary    byte = 0x0C
+		typeFSB       byte = 0x0D // FixedSizeBinary (UUID)
 	)
 	var buf []byte
 	var lenBuf [4]byte
@@ -418,10 +431,25 @@ func EncodeKey(record arrow.RecordBatch, row int, pkCols []string) ([]byte, erro
 			binary.LittleEndian.PutUint64(v[:], uint64(a.Value(row)))
 			buf = append(buf, v[:]...)
 		case *array.Timestamp:
-			buf = append(buf, typeTSNZ)
+			buf = append(buf, typeTimestamp)
 			var v [8]byte
 			binary.LittleEndian.PutUint64(v[:], uint64(a.Value(row)))
 			buf = append(buf, v[:]...)
+		case *array.Decimal128:
+			buf = append(buf, typeDecimal)
+			s := a.ValueStr(row)
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(s)))
+			buf = append(buf, lenBuf[:]...)
+			buf = append(buf, s...)
+		case *array.Binary:
+			buf = append(buf, typeBinary)
+			b := a.Value(row)
+			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(b)))
+			buf = append(buf, lenBuf[:]...)
+			buf = append(buf, b...)
+		case *array.FixedSizeBinary:
+			buf = append(buf, typeFSB)
+			buf = append(buf, a.Value(row)...)
 		default:
 			return nil, fmt.Errorf("dataplane: encode key: unsupported column type %T for PK column %q", arr, col)
 		}
