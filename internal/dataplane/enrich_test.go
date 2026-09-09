@@ -6,6 +6,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
@@ -14,8 +16,8 @@ func TestCastIntToString(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
-	policy := dataplane.CastPolicy{"id": &arrow.StringType{}}
-	out, err := dataplane.Cast(context.Background(), b, policy)
+	policy := dataplane.CastPolicy{"id": {Type: core.ColumnType{Kind: core.KindString}}}
+	out, _, err := dataplane.Cast(context.Background(), b, policy)
 	if err != nil {
 		t.Fatalf("Cast: %v", err)
 	}
@@ -35,8 +37,8 @@ func TestCastPreservesNonCastColumns(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	policy := dataplane.CastPolicy{"id": &arrow.StringType{}}
-	out, err := dataplane.Cast(context.Background(), b, policy)
+	policy := dataplane.CastPolicy{"id": {Type: core.ColumnType{Kind: core.KindString}}}
+	out, _, err := dataplane.Cast(context.Background(), b, policy)
 	if err != nil {
 		t.Fatalf("Cast: %v", err)
 	}
@@ -53,7 +55,7 @@ func TestCastEmptyPolicy(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	out, err := dataplane.Cast(context.Background(), b, nil)
+	out, _, err := dataplane.Cast(context.Background(), b, nil)
 	if err != nil {
 		t.Fatalf("Cast: %v", err)
 	}
@@ -67,8 +69,8 @@ func TestCastPreservesWatermark(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	policy := dataplane.CastPolicy{"id": &arrow.StringType{}}
-	out, err := dataplane.Cast(context.Background(), b, policy)
+	policy := dataplane.CastPolicy{"id": {Type: core.ColumnType{Kind: core.KindString}}}
+	out, _, err := dataplane.Cast(context.Background(), b, policy)
 	if err != nil {
 		t.Fatalf("Cast: %v", err)
 	}
@@ -87,8 +89,8 @@ func TestCastNoOpSameType(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	policy := dataplane.CastPolicy{"val": &arrow.StringType{}}
-	out, err := dataplane.Cast(context.Background(), b, policy)
+	policy := dataplane.CastPolicy{"val": {Type: core.ColumnType{Kind: core.KindString}}}
+	out, _, err := dataplane.Cast(context.Background(), b, policy)
 	if err != nil {
 		t.Fatalf("Cast: %v", err)
 	}
@@ -104,8 +106,8 @@ func TestCastPreservesNullability(t *testing.T) {
 	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	policy := dataplane.CastPolicy{"id": &arrow.StringType{}}
-	out, err := dataplane.Cast(context.Background(), b, policy)
+	policy := dataplane.CastPolicy{"id": {Type: core.ColumnType{Kind: core.KindString}}}
+	out, _, err := dataplane.Cast(context.Background(), b, policy)
 	if err != nil {
 		t.Fatalf("Cast: %v", err)
 	}
@@ -117,18 +119,17 @@ func TestCastPreservesNullability(t *testing.T) {
 	}
 }
 
-func TestCastPolicyMatchesNothing(t *testing.T) {
+func TestCastPolicyUnknownColumnIsError(t *testing.T) {
 	alloc := checkedAlloc(t)
 	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	out, err := dataplane.Cast(context.Background(), b,
-		dataplane.CastPolicy{"nope": arrow.PrimitiveTypes.Int64})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out != b {
-		t.Error("expected same batch")
+	// W-1: a policy naming a column the batch does not carry is a spec
+	// typo — fail loudly instead of silently no-oping.
+	_, _, err := dataplane.Cast(context.Background(), b,
+		dataplane.CastPolicy{"nope": {Type: core.ColumnType{Kind: core.KindInt64}}})
+	if err == nil {
+		t.Fatal("unknown policy column must error")
 	}
 }
 
@@ -253,8 +254,8 @@ func TestCastInt64OverflowPreserved(t *testing.T) {
 	b := dataplane.AdversarialInt64Overflow(0, alloc)
 	defer b.Release()
 
-	policy := dataplane.CastPolicy{"id": &arrow.StringType{}}
-	out, err := dataplane.Cast(context.Background(), b, policy)
+	policy := dataplane.CastPolicy{"id": {Type: core.ColumnType{Kind: core.KindString}}}
+	out, _, err := dataplane.Cast(context.Background(), b, policy)
 	if err != nil {
 		t.Fatalf("Cast: %v", err)
 	}
@@ -282,11 +283,11 @@ func TestCastStructReturnsError(t *testing.T) {
 	defer rec.Release()
 
 	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
-	_, err := dataplane.Cast(context.Background(), b, dataplane.CastPolicy{
-		"s": &arrow.StringType{},
+	_, _, err := dataplane.Cast(context.Background(), b, dataplane.CastPolicy{
+		"s": {Type: core.ColumnType{Kind: core.KindString}},
 	})
 	if err == nil {
-		t.Error("expected error for struct → string cast")
+		t.Error("expected error for struct → string cast (no columnar executor yet)")
 	}
 }
 
@@ -303,10 +304,10 @@ func TestCastListReturnsError(t *testing.T) {
 	defer rec.Release()
 
 	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
-	_, err := dataplane.Cast(context.Background(), b, dataplane.CastPolicy{
-		"lst": &arrow.StringType{},
+	_, _, err := dataplane.Cast(context.Background(), b, dataplane.CastPolicy{
+		"lst": {Type: core.ColumnType{Kind: core.KindString}},
 	})
 	if err == nil {
-		t.Error("expected error for list → string cast")
+		t.Error("expected error for list → string cast (no columnar executor yet)")
 	}
 }

@@ -94,6 +94,14 @@ func columnToArrowField(col core.Column) (arrow.Field, error) {
 // kindToArrow maps a canonical ColumnType to its Arrow type. Scalars map to
 // primitives; composite kinds recurse. Element and value nullability are
 // carried on the child field where Arrow supports it.
+// KindToArrow maps a canonical ColumnType to its Arrow type. Exported for
+// the dataplane cast executor (W-1/D-4): the matrix is the policy, arrow
+// is the single executor, so the target type must come from the same
+// mapping CoreSchemaToArrow uses.
+func KindToArrow(ct core.ColumnType) (arrow.DataType, error) {
+	return kindToArrow(ct)
+}
+
 func kindToArrow(ct core.ColumnType) (arrow.DataType, error) {
 	switch ct.Kind {
 	case core.KindStruct:
