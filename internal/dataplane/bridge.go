@@ -155,5 +155,5 @@ func mergeSchema(changes []rowchange.Change, cs core.Schema) core.Schema {
 			has[col.Name] = true
 		}
 	}
-	return core.Schema{Columns: merged}
+	return core.Schema{Columns: merged, PrimaryKey: cs.PrimaryKey}
 }
