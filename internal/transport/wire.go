@@ -47,7 +47,10 @@ func DecodeTableSchema(b []byte) (core.Schema, error) {
 		if isMetadataColumn(f.Name) {
 			continue
 		}
-		ct := fieldTypeToCore(f)
+		ct, err := fieldTypeToCore(f)
+		if err != nil {
+			return core.Schema{}, fmt.Errorf("transport: schema field %q: %w", f.Name, err)
+		}
 		ct.Nullable = f.Nullable
 		cs.Columns = append(cs.Columns, core.Column{Name: f.Name, Type: ct})
 	}
@@ -95,7 +98,11 @@ func EncodeBounds(low, high []any) ([]byte, error) {
 			if j < len(rows[i]) {
 				v = rows[i][j]
 			}
-			if err := appendTypedValue(bldrs.Field(j), arrowTypeToCore(types[j]), v); err != nil {
+			ct, err := arrowTypeToCore(types[j])
+			if err != nil {
+				return nil, fmt.Errorf("transport: bounds col %d: %w", j, err)
+			}
+			if err := appendTypedValue(bldrs.Field(j), ct, v); err != nil {
 				return nil, fmt.Errorf("transport: bounds row %d col %d: %w", i, j, err)
 			}
 		}
@@ -122,11 +129,19 @@ func DecodeBounds(b []byte) ([][]any, error) {
 	defer rec.Release()
 
 	schema := rec.Schema()
+	rowTypes := make([]core.ColumnType, rec.NumCols())
+	for j := 0; j < int(rec.NumCols()); j++ {
+		ct, err := arrowTypeToCore(schema.Field(j).Type)
+		if err != nil {
+			return nil, fmt.Errorf("transport: bounds col %d: %w", j, err)
+		}
+		rowTypes[j] = ct
+	}
 	rows := make([][]any, 0, rec.NumRows())
 	for i := 0; i < int(rec.NumRows()); i++ {
 		tuple := make([]any, rec.NumCols())
 		for j := 0; j < int(rec.NumCols()); j++ {
-			v, err := readTypedValue(rec.Column(j), arrowTypeToCore(schema.Field(j).Type), i)
+			v, err := readTypedValue(rec.Column(j), rowTypes[j], i)
 			if err != nil {
 				return nil, fmt.Errorf("transport: bounds row %d col %d: %w", i, j, err)
 			}

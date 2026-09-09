@@ -1,10 +1,12 @@
 package transport
 
-// T-13: table-schema round-trip. EncodeTableSchema -> DecodeTableSchema
-// must preserve every kind — including the distinction the row codec
-// cannot make: KindTimestamp (naive, no TZ) vs KindTimestampTZ (UTC
-// instant). Both decode to time.Time in rows, so only the SCHEMA level
-// can catch a TZ-mapping regression.
+// T-1 (schema level): table-schema round-trip. EncodeTableSchema ->
+// DecodeTableSchema must preserve every kind — including the distinction
+// the row codec cannot make: KindTimestamp (naive, no TZ) vs
+// KindTimestampTZ (UTC instant). Both decode to time.Time in rows, so
+// only the SCHEMA level can catch a TZ-mapping regression.
+// (The audit doc's T-13 is a different item: insert→delete→insert
+// ordering under W-3.)
 
 import (
 	"testing"

@@ -181,7 +181,11 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 			// would silently turn the phase into a data column.
 			return nil, fmt.Errorf("transport: coluna %d %q é reservada na região de dados — batch pós-AddMetadata não é decodável", j, name)
 		}
-		colTypes[j] = fieldTypeToCore(schema.Field(j))
+		ct, err := fieldTypeToCore(schema.Field(j))
+		if err != nil {
+			return nil, fmt.Errorf("transport: coluna %d: %w", j, err)
+		}
+		colTypes[j] = ct
 	}
 	// Resolve key column positions once: data-column index per PK name.
 	keyCols := make([]int, 0, len(primaryKey))
@@ -253,72 +257,86 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 // ── typed value helpers ──────────────────────────────────────────────
 
 // arrowTypeToCore maps an Arrow DataType back to a core.ColumnType for
-// driving the typed decoder.
-func arrowTypeToCore(dt arrow.DataType) core.ColumnType {
+// driving the typed decoder. Unmappable types are an ERROR (M-1) — the
+// old silent KindString fallback corrupted data downstream instead of
+// failing at the decode boundary.
+func arrowTypeToCore(dt arrow.DataType) (core.ColumnType, error) {
 	switch dt.ID() {
 	case arrow.BOOL:
-		return core.ColumnType{Kind: core.KindBool}
+		return core.ColumnType{Kind: core.KindBool}, nil
 	case arrow.INT8, arrow.INT16, arrow.INT32:
-		return core.ColumnType{Kind: core.KindInt32}
+		return core.ColumnType{Kind: core.KindInt32}, nil
 	case arrow.INT64:
-		return core.ColumnType{Kind: core.KindInt64}
+		return core.ColumnType{Kind: core.KindInt64}, nil
 	case arrow.UINT8, arrow.UINT16, arrow.UINT32:
-		return core.ColumnType{Kind: core.KindInt64} // widening, defensivo
+		return core.ColumnType{Kind: core.KindInt64}, nil // widening, defensivo
 	case arrow.UINT64:
-		return core.ColumnType{Kind: core.KindUInt64}
+		return core.ColumnType{Kind: core.KindUInt64}, nil
 	case arrow.FLOAT16, arrow.FLOAT32:
-		return core.ColumnType{Kind: core.KindFloat32}
+		return core.ColumnType{Kind: core.KindFloat32}, nil
 	case arrow.FLOAT64:
-		return core.ColumnType{Kind: core.KindFloat64}
+		return core.ColumnType{Kind: core.KindFloat64}, nil
 	case arrow.DECIMAL128:
 		d := dt.(*arrow.Decimal128Type)
-		return core.ColumnType{Kind: core.KindDecimal, Precision: int(d.Precision), Scale: int(d.Scale)}
+		return core.ColumnType{Kind: core.KindDecimal, Precision: int(d.Precision), Scale: int(d.Scale)}, nil
 	case arrow.STRING, arrow.LARGE_STRING:
-		return core.ColumnType{Kind: core.KindString}
+		return core.ColumnType{Kind: core.KindString}, nil
 	case arrow.BINARY, arrow.LARGE_BINARY:
-		return core.ColumnType{Kind: core.KindBinary}
+		return core.ColumnType{Kind: core.KindBinary}, nil
 	case arrow.DATE32, arrow.DATE64:
-		return core.ColumnType{Kind: core.KindDate}
+		return core.ColumnType{Kind: core.KindDate}, nil
 	case arrow.TIME32, arrow.TIME64:
-		return core.ColumnType{Kind: core.KindTime}
+		return core.ColumnType{Kind: core.KindTime}, nil
 	case arrow.TIMESTAMP:
 		tt := dt.(*arrow.TimestampType)
 		if tt.TimeZone != "" {
-			return core.ColumnType{Kind: core.KindTimestampTZ}
+			return core.ColumnType{Kind: core.KindTimestampTZ}, nil
 		}
-		return core.ColumnType{Kind: core.KindTimestamp}
+		return core.ColumnType{Kind: core.KindTimestamp}, nil
 	case arrow.FIXED_SIZE_BINARY:
 		// A bare fixed-size binary without the uuid extension is a fixed
 		// byte sequence; uuid is disambiguated at the field level via
 		// extension metadata (fieldTypeToCore).
 		fsb := dt.(*arrow.FixedSizeBinaryType)
-		return core.ColumnType{Kind: core.KindFixedBinary, FixedSize: int(fsb.ByteWidth)}
+		return core.ColumnType{Kind: core.KindFixedBinary, FixedSize: int(fsb.ByteWidth)}, nil
 	case arrow.STRUCT:
 		st := dt.(*arrow.StructType)
 		ct := core.ColumnType{Kind: core.KindStruct, Fields: make([]core.Column, 0, len(st.Fields()))}
 		for _, f := range st.Fields() {
-			ft := fieldTypeToCore(f)
+			ft, err := fieldTypeToCore(f)
+			if err != nil {
+				return core.ColumnType{}, fmt.Errorf("struct field %q: %w", f.Name, err)
+			}
 			ft.Nullable = f.Nullable
 			ct.Fields = append(ct.Fields, core.Column{Name: f.Name, Type: ft})
 		}
-		return ct
+		return ct, nil
 	case arrow.LIST:
 		lt := dt.(*arrow.ListType)
 		ef := lt.ElemField()
-		et := fieldTypeToCore(ef)
+		et, err := fieldTypeToCore(ef)
+		if err != nil {
+			return core.ColumnType{}, fmt.Errorf("list elem: %w", err)
+		}
 		et.Nullable = ef.Nullable
-		return core.ColumnType{Kind: core.KindList, Elem: &et}
+		return core.ColumnType{Kind: core.KindList, Elem: &et}, nil
 	case arrow.MAP:
 		mt := dt.(*arrow.MapType)
 		kf := mt.KeyField()
 		vf := mt.ItemField()
-		kt := fieldTypeToCore(kf)
+		kt, err := fieldTypeToCore(kf)
+		if err != nil {
+			return core.ColumnType{}, fmt.Errorf("map key: %w", err)
+		}
+		vt, err := fieldTypeToCore(vf)
+		if err != nil {
+			return core.ColumnType{}, fmt.Errorf("map value: %w", err)
+		}
 		kt.Nullable = kf.Nullable
-		vt := fieldTypeToCore(vf)
 		vt.Nullable = vf.Nullable
-		return core.ColumnType{Kind: core.KindMap, KeyType: &kt, ValueType: &vt}
+		return core.ColumnType{Kind: core.KindMap, KeyType: &kt, ValueType: &vt}, nil
 	default:
-		return core.ColumnType{Kind: core.KindString} // fallback
+		return core.ColumnType{}, fmt.Errorf("transport: tipo arrow %s sem mapeamento canônico", dt)
 	}
 }
 

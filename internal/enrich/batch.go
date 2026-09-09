@@ -39,7 +39,10 @@ func (s *Stage) EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error) {
 	// Pass the input batch's schema so mergeSchema picks up the enriched
 	// columns. An empty schema caused per-batch inference drift: different
 	// batches inferred different types for the same column (audit #6).
-	cs := transport.SchemaFromArrow(b.Record.Schema())
+	cs, err := transport.SchemaFromArrow(b.Record.Schema())
+	if err != nil {
+		return nil, fmt.Errorf("enrich: input schema: %w", err)
+	}
 	cb := rowchange.Batch{
 		Table:           b.Table,
 		Upserts:         enriched,
