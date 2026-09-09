@@ -529,7 +529,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				appendPos = ""
 			}
 			if len(untouched) > 0 {
-				ab := rowchange.Batch{Table: p.target, Upserts: untouched, Position: appendPos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
+				ab := rowchange.Batch{Table: p.target, Changes: untouched, Position: appendPos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
 				p.snapshotMu.Lock()
 				ab.SnapshotState = p.snapshotState
 				ab.SnapshotPending = p.snapshotPending
@@ -548,7 +548,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			}
 			if len(rest) > 0 {
 				collapsed := rowchange.Collapse(rest)
-				b := rowchange.Batch{Table: p.target, Upserts: collapsed.Upserts, Deletes: collapsed.Deletes, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
+				b := rowchange.Batch{Table: p.target, Changes: collapsed.Changes, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 				p.snapshotMu.Lock()
 				b.SnapshotState = p.snapshotState
 				b.SnapshotPending = p.snapshotPending
@@ -559,8 +559,9 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				}
 				dpb.SnapshotState = b.SnapshotState
 				dpb.SnapshotPending = b.SnapshotPending
+				ups, dels := collapsed.Count()
 				select {
-				case p.readyCh <- readyBatch{batch: dpb, rows: len(rest), upserts: len(collapsed.Upserts), deletes: len(collapsed.Deletes)}:
+				case p.readyCh <- readyBatch{batch: dpb, rows: len(rest), upserts: ups, deletes: dels}:
 				case <-ctx.Done():
 					return ctx.Err()
 				}
@@ -612,7 +613,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 						// QUARANTINE: enrich the rewritten delete as a single-row
 						// batch through the columnar seam; dies when the join
 						// becomes columnar.
-						dpb, err := dpint.BatchFromChangeBatch(rowchange.Batch{Table: p.target, Upserts: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.AppendMode)}, p.knownSchema)
+						dpb, err := dpint.BatchFromChangeBatch(rowchange.Batch{Table: p.target, Changes: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.AppendMode)}, p.knownSchema)
 						if err != nil {
 							return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
 						}
@@ -637,7 +638,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				}
 				upserts = append(upserts, c)
 			}
-			b := rowchange.Batch{Table: p.target, Upserts: upserts, Position: pos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
+			b := rowchange.Batch{Table: p.target, Changes: upserts, Position: pos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
 			p.snapshotMu.Lock()
 			b.SnapshotState = p.snapshotState
 			b.SnapshotPending = p.snapshotPending
@@ -662,7 +663,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// the sink commits a single batch per flush, and the position
 			// must never separate from its data (two commits would advance
 			// past uncommitted upserts on a crash between them).
-			cb := rowchange.Batch{Table: p.target, Upserts: buf, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
+			cb := rowchange.Batch{Table: p.target, Changes: buf, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 			dpb, err := dpint.BatchFromChangeBatch(cb, p.knownSchema)
 			if err != nil {
 				return fmt.Errorf("worker: table %s: bridge upsert: %w", p.target, err)
@@ -948,7 +949,7 @@ func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, sch
 				if len(buf) == 0 {
 					continue
 				}
-				cb := rowchange.Batch{Table: table, Upserts: buf, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
+				cb := rowchange.Batch{Table: table, Changes: buf, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 				dpb, err := dpint.BatchFromChangeBatch(cb, schema)
 				if err != nil {
 					bufs[table] = bufs[table][:0] // QUARANTINE: drop on bridge error; dies in M4
@@ -985,7 +986,7 @@ func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, sch
 						continue
 					}
 					// InWindow is DATA + a routing tag; the batch must survive.
-					cb := rowchange.Batch{Table: c.Table, Upserts: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
+					cb := rowchange.Batch{Table: c.Table, Changes: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
 					dpb, err := dpint.BatchFromChangeBatch(cb, schema)
 					if err != nil {
 						continue

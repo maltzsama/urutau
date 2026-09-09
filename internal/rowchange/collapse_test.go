@@ -20,14 +20,14 @@ func TestCollapseLastOperationWins(t *testing.T) {
 		chg(OpUpdate, 1, "c", "p3"),
 	})
 
-	if len(got.Upserts) != 1 || len(got.Deletes) != 0 {
-		t.Fatalf("want 1 upsert / 0 deletes, got %+v", got)
+	if len(got.Changes) != 1 || got.Changes[0].Op == OpDelete {
+		t.Fatalf("want 1 upsert, got %+v", got.Changes)
 	}
-	if got.Upserts[0].After["v"] != "c" {
-		t.Fatalf("want final value c, got %v", got.Upserts[0].After["v"])
+	if got.Changes[0].After["v"] != "c" {
+		t.Fatalf("want final value c, got %v", got.Changes[0].After["v"])
 	}
-	if got.Upserts[0].Position != "p3" {
-		t.Fatalf("want position of last change, got %v", got.Upserts[0].Position)
+	if got.Changes[0].Position != "p3" {
+		t.Fatalf("want position of last change, got %v", got.Changes[0].Position)
 	}
 }
 
@@ -37,11 +37,8 @@ func TestCollapseDeleteLastNeverYieldsDataRow(t *testing.T) {
 		chg(OpDelete, 7, "", "p2"),
 	})
 
-	if len(got.Upserts) != 0 {
-		t.Fatalf("deleted key must never yield a data row, got upserts %+v", got.Upserts)
-	}
-	if len(got.Deletes) != 1 || got.Deletes[0].Key[0] != int64(7) {
-		t.Fatalf("want single delete for key 7, got %+v", got.Deletes)
+	if len(got.Changes) != 1 || got.Changes[0].Op != OpDelete {
+		t.Fatalf("want single delete for key 7, got %+v", got.Changes)
 	}
 }
 
@@ -52,11 +49,11 @@ func TestCollapseReinsertAfterDelete(t *testing.T) {
 		chg(OpInsert, 1, "b", "p3"),
 	})
 
-	if len(got.Upserts) != 1 || len(got.Deletes) != 0 {
-		t.Fatalf("re-inserted key must end as an upsert, got %+v", got)
+	if len(got.Changes) != 1 || got.Changes[0].Op == OpDelete {
+		t.Fatalf("re-inserted key must end as an upsert, got %+v", got.Changes)
 	}
-	if got.Upserts[0].After["v"] != "b" {
-		t.Fatalf("want final value b, got %v", got.Upserts[0].After["v"])
+	if got.Changes[0].After["v"] != "b" {
+		t.Fatalf("want final value b, got %v", got.Changes[0].After["v"])
 	}
 }
 
@@ -68,15 +65,16 @@ func TestCollapseKeepsFirstAppearanceOrder(t *testing.T) {
 		chg(OpDelete, 2, "", "p4"),
 	})
 
-	wantKeys := []any{int64(1)}
-	if len(got.Upserts) != len(wantKeys) {
-		t.Fatalf("want %d upserts, got %+v", len(wantKeys), got.Upserts)
+	// First-appearance order across the single slice: key 1 (upsert)
+	// before key 2 (delete).
+	if len(got.Changes) != 2 {
+		t.Fatalf("want 2 winners, got %+v", got.Changes)
 	}
-	if got.Upserts[0].Key[0] != int64(1) {
-		t.Fatalf("want key 1 first, got %v", got.Upserts[0].Key)
+	if got.Changes[0].Key[0] != int64(1) || got.Changes[0].Op == OpDelete {
+		t.Fatalf("want key 1 upsert first, got %+v", got.Changes[0])
 	}
-	if len(got.Deletes) != 1 || got.Deletes[0].Key[0] != int64(2) {
-		t.Fatalf("want key 2 deleted, got %+v", got.Deletes)
+	if got.Changes[1].Key[0] != int64(2) || got.Changes[1].Op != OpDelete {
+		t.Fatalf("want key 2 deleted second, got %+v", got.Changes[1])
 	}
 }
 
@@ -94,7 +92,7 @@ func TestCollapseKeysCoversBothSets(t *testing.T) {
 
 func TestCollapseEmpty(t *testing.T) {
 	got := Collapse(nil)
-	if len(got.Upserts) != 0 || len(got.Deletes) != 0 {
+	if len(got.Changes) != 0 {
 		t.Fatalf("empty batch must collapse to empty, got %+v", got)
 	}
 }
@@ -104,8 +102,8 @@ func TestCollapseCompositeKey(t *testing.T) {
 		return Change{Op: OpInsert, Key: []any{a, b}, After: map[string]any{}}
 	}
 	got := Collapse([]Change{mk(1, 2), mk(1, 3), mk(12, 3)})
-	if len(got.Upserts) != 3 {
-		t.Fatalf("composite keys must stay distinct, got %+v", got.Upserts)
+	if len(got.Changes) != 3 {
+		t.Fatalf("composite keys must stay distinct, got %+v", got.Changes)
 	}
 }
 

@@ -128,7 +128,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return fmt.Errorf("worker: chunk %d scan: %w", req.ChunkId, err)
 	}
 
-	cb := rowchange.Batch{Table: ta.TargetTable, Upserts: rows, Mode: rowchange.AppendMode}
+	cb := rowchange.Batch{Table: ta.TargetTable, Changes: rows, Mode: rowchange.AppendMode}
 	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
 	if err != nil {
 		return fmt.Errorf("worker: chunk %d bridge: %w", req.ChunkId, err)

@@ -108,7 +108,7 @@ func TestClickHouseSinkUpsertAndResume(t *testing.T) {
 	row := func(id int64, v, pos string) rowchange.Batch {
 		return rowchange.Batch{
 			Table: ref.Target, Position: pos,
-			Upserts: []rowchange.Change{{
+			Changes: []rowchange.Change{{
 				Op: rowchange.OpInsert, Table: ref.Target, Key: []any{id},
 				After: map[string]any{"id": id, "v": v}, IngestTS: time.Now(),
 			}},
@@ -174,12 +174,12 @@ func TestClickHouseSinkDelete(t *testing.T) {
 	}
 	commit(rowchange.Batch{
 		Table: ref.Target, Position: "0/1",
-		Upserts: []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(7)},
+		Changes: []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(7)},
 			After: map[string]any{"id": int64(7), "v": "doomed"}, IngestTS: time.Now()}},
 	})
 	commit(rowchange.Batch{
 		Table: ref.Target, Position: "0/2",
-		Deletes: []rowchange.Change{{Op: rowchange.OpDelete, Table: ref.Target, Key: []any{int64(7)}}},
+		Changes: []rowchange.Change{{Op: rowchange.OpDelete, Table: ref.Target, Key: []any{int64(7)}}},
 	})
 
 	if got := chQueryInt(t, db, "SELECT count() FROM lakehouse.ch_orders FINAL WHERE id = 7"); got != 0 {
@@ -223,7 +223,7 @@ func TestClickHouseSinkAppendMode(t *testing.T) {
 
 	for i, pos := range []string{"0/1", "0/2"} {
 		b := rowchange.Batch{Table: ref.Target, Position: pos, Mode: rowchange.AppendMode}
-		b.Upserts = []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: nil,
+		b.Changes = []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: nil,
 			After: map[string]any{"id": int64(i + 1), "v": fmt.Sprintf("row-%d", i+1)}, IngestTS: time.Now()}}
 		if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 			t.Fatalf("commit %d: %v", i+1, err)
@@ -304,7 +304,7 @@ func TestClickHouseSinkFailedBatchIsAtomic(t *testing.T) {
 	defer func() { _ = w.Close() }()
 
 	b := rowchange.Batch{Table: ref.Target, Position: "0/1",
-		Upserts: []rowchange.Change{
+		Changes: []rowchange.Change{
 			{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(1)},
 				After: map[string]any{"id": int64(1), "amount": "12.34"}, IngestTS: time.Now()},
 			// A structured object cannot be a decimal: coerce fails on this
@@ -343,7 +343,7 @@ func TestClickHouseSinkControlWithoutFinal(t *testing.T) {
 	defer func() { _ = w.Close() }()
 
 	b := rowchange.Batch{Table: ref.Target, Position: "0/1",
-		Upserts: []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(9)},
+		Changes: []rowchange.Change{{Op: rowchange.OpInsert, Table: ref.Target, Key: []any{int64(9)},
 			After: map[string]any{"id": int64(9), "v": "v1"}, IngestTS: time.Now()}}}
 	if err := w.Commit(ctx, toDPBatch(b)); err != nil {
 		t.Fatalf("commit: %v", err)

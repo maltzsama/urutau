@@ -56,7 +56,10 @@ func TestWindowSnapshotSingleBatch(t *testing.T) {
 	}
 	b := fc.batches[0]
 	got := map[int64]string{}
-	for _, u := range b.Upserts {
+	for _, u := range b.Changes {
+		if u.Op == rowchange.OpDelete {
+			continue
+		}
 		got[u.Key[0].(int64)] = u.After["v"].(string)
 	}
 	if got[1] != "b" {
@@ -101,11 +104,8 @@ func TestWindowLiveDeleteWins(t *testing.T) {
 		t.Fatalf("want 1 commit, got %d", len(fc.batches))
 	}
 	b := fc.batches[0]
-	if len(b.Upserts) != 0 {
-		t.Fatalf("no snapshot row may survive a live delete, got upserts %+v", b.Upserts)
-	}
-	if len(b.Deletes) != 1 || b.Deletes[0].Key[0] != int64(9) {
-		t.Fatalf("want delete of id=9, got %+v", b.Deletes)
+	if len(b.Changes) != 1 || b.Changes[0].Op != rowchange.OpDelete || b.Changes[0].Key[0] != int64(9) {
+		t.Fatalf("no snapshot row may survive a live delete; want delete of id=9, got %+v", b.Changes)
 	}
 }
 
@@ -135,8 +135,9 @@ func TestWindowNoEventsClosesEmitsAll(t *testing.T) {
 		t.Fatalf("want 1 commit, got %d", len(fc.batches))
 	}
 	b := fc.batches[0]
-	if len(b.Upserts) != 2 {
-		t.Fatalf("want both snapshot rows emitted, got %+v", b.Upserts)
+	ups, _ := b.ByOp()
+	if len(ups) != 2 {
+		t.Fatalf("want both snapshot rows emitted, got %+v", ups)
 	}
 	// Emitted rows carry the marker's position (the safe resume point).
 	if b.Position != "p5" {

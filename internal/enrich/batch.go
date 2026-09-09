@@ -45,7 +45,7 @@ func (s *Stage) EnrichBatch(b *dataplane.Batch) (*dataplane.Batch, error) {
 	}
 	cb := rowchange.Batch{
 		Table:           b.Table,
-		Upserts:         enriched,
+		Changes:         enriched,
 		Mode:            rowchange.ToRowMode(b.Mode),
 		Position:        string(b.Watermark),
 		SnapshotState:   b.SnapshotState,

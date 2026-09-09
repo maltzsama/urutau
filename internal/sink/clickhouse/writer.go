@@ -135,7 +135,7 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	}
 
 	seq := w.nextSeq()
-	n := len(cb.Upserts) + len(cb.Deletes)
+	n := len(cb.Changes)
 	cols := make([][]any, len(w.cols))
 	for i := range cols {
 		cols[i] = make([]any, 0, n)
@@ -155,13 +155,8 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		}
 		return nil
 	}
-	for _, u := range cb.Upserts {
-		if err := emit(u, false); err != nil {
-			return err
-		}
-	}
-	for _, d := range cb.Deletes {
-		if err := emit(d, true); err != nil {
+	for _, c := range cb.Changes {
+		if err := emit(c, c.Op == rowchange.OpDelete); err != nil {
 			return err
 		}
 	}
@@ -371,20 +366,9 @@ func (w *tableWriter) unpackBatch(b *dataplane.Batch) (rowchange.Batch, error) {
 		return rowchange.Batch{}, err
 	}
 
-	var upserts, deletes []rowchange.Change
-	for _, r := range rows {
-		switch r.Op {
-		case rowchange.OpDelete:
-			deletes = append(deletes, r)
-		default:
-			upserts = append(upserts, r)
-		}
-	}
-
 	return rowchange.Batch{
 		Table:    b.Table,
-		Upserts:  upserts,
-		Deletes:  deletes,
+		Changes:  rows,
 		Position: string(b.Watermark),
 		Mode:     rowchange.ToRowMode(b.Mode),
 	}, nil

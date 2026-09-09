@@ -33,7 +33,7 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 		rows, _ := transport.DecodeBatch(b.Record, b.Table, []string{"id"})
 		if b.Mode == dataplane.AppendMode {
 			// Append: every row is an upsert (deletes already rewritten/dropped).
-			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: rows, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
+			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: rows, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 		} else {
 			var upserts, deletes []rowchange.Change
 			for _, r := range rows {
@@ -43,7 +43,7 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 					upserts = append(upserts, r)
 				}
 			}
-			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Upserts: upserts, Deletes: deletes, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
+			f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: append(append([]rowchange.Change{}, upserts...), deletes...), Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
 		}
 	}
 	if f.failAt != nil && f.failAt[i] {
@@ -106,7 +106,7 @@ func testSchema() core.Schema {
 // window marker into Ingest with Win set.
 func toIngest(t *testing.T, c rowchange.Change) Ingest {
 	t.Helper()
-	cb := rowchange.Batch{Table: c.Table, Upserts: []rowchange.Change{c}, Mode: rowchange.UpsertMode}
+	cb := rowchange.Batch{Table: c.Table, Changes: []rowchange.Change{c}, Mode: rowchange.UpsertMode}
 	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
 	if err != nil {
 		t.Fatalf("toIngest: %v", err)
@@ -124,7 +124,7 @@ func toIngest(t *testing.T, c rowchange.Change) Ingest {
 // toWindow bridges window rows into a batch for AddWindowRows.
 func toWindow(t *testing.T, target string, rows []rowchange.Change) *dataplane.Batch {
 	t.Helper()
-	cb := rowchange.Batch{Table: target, Upserts: rows, Mode: rowchange.AppendMode}
+	cb := rowchange.Batch{Table: target, Changes: rows, Mode: rowchange.AppendMode}
 	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
 	if err != nil {
 		t.Fatalf("toWindow: %v", err)
@@ -149,11 +149,11 @@ func TestFlushOnCloseCollapses(t *testing.T) {
 		t.Fatalf("want single batch on close, got %d", len(fc.batches))
 	}
 	b := fc.batches[0]
-	if len(b.Upserts) != 1 || b.Upserts[0].After["v"] != "b" {
-		t.Fatalf("want id=1 v=b collapsed, got %+v", b.Upserts)
+	if len(batchUpserts(b)) != 1 || batchUpserts(b)[0].After["v"] != "b" {
+		t.Fatalf("want id=1 v=b collapsed, got %+v", batchUpserts(b))
 	}
-	if len(b.Deletes) != 1 || b.Deletes[0].Key[0] != int64(2) {
-		t.Fatalf("want id=2 deleted, got %+v", b.Deletes)
+	if len(batchDeletes(b)) != 1 || batchDeletes(b)[0].Key[0] != int64(2) {
+		t.Fatalf("want id=2 deleted, got %+v", batchDeletes(b))
 	}
 	if b.Position != "p4" {
 		t.Fatalf("position = %q, want p4 (last change)", b.Position)
@@ -233,10 +233,10 @@ func TestTablesCommitIndependently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if len(orders.batches) != 1 || len(orders.batches[0].Deletes) != 1 {
+	if len(orders.batches) != 1 || len(batchDeletes(orders.batches[0])) != 1 {
 		t.Fatalf("orders batches = %+v", orders.batches)
 	}
-	if len(items.batches) != 1 || len(items.batches[0].Upserts) != 1 {
+	if len(items.batches) != 1 || len(batchUpserts(items.batches[0])) != 1 {
 		t.Fatalf("items batches = %+v", items.batches)
 	}
 }
@@ -309,4 +309,15 @@ func TestMergeBatchesPropagatesMode(t *testing.T) {
 		}
 		got.Release()
 	}
+}
+
+// batchUpserts/batchDeletes: ByOp views for assertions.
+func batchUpserts(b rowchange.Batch) []rowchange.Change {
+	u, _ := b.ByOp()
+	return u
+}
+
+func batchDeletes(b rowchange.Batch) []rowchange.Change {
+	_, d := b.ByOp()
+	return d
 }

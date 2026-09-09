@@ -119,7 +119,7 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	if len(p.buf) == 0 {
 		return nil, nil
 	}
-	cb := rowchange.Batch{Table: p.buf[0].Table, Upserts: p.buf, Mode: rowchange.UpsertMode}
+	cb := rowchange.Batch{Table: p.buf[0].Table, Changes: p.buf, Mode: rowchange.UpsertMode}
 	dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
 	p.buf = nil
 	if err != nil {

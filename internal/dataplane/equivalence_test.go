@@ -420,26 +420,24 @@ func batchToChanges(b *dataplane.Batch) []rowchange.Change {
 
 // changesToUpserts extracts upserts from a Collapsed as eqChange slices.
 func changesToUpserts(c rowchange.Collapsed) []eqChange {
-	out := make([]eqChange, len(c.Upserts))
-	for i, ch := range c.Upserts {
-		out[i] = eqChange{
-			ID:  ch.Key[0].(int64),
-			Val: ch.After["val"].(string),
-			Op:  uint8(ch.Op),
+	var out []eqChange
+	for _, ch := range c.Changes {
+		if ch.Op == rowchange.OpDelete {
+			continue
 		}
+		out = append(out, eqChange{ID: ch.Key[0].(int64), Val: ch.After["val"].(string), Op: uint8(ch.Op)})
 	}
 	return out
 }
 
 // changesToDeletes extracts deletes from a Collapsed as eqChange slices.
 func changesToDeletes(c rowchange.Collapsed) []eqChange {
-	out := make([]eqChange, len(c.Deletes))
-	for i, ch := range c.Deletes {
-		out[i] = eqChange{
-			ID:  ch.Key[0].(int64),
-			Val: ch.After["val"].(string),
-			Op:  uint8(ch.Op),
+	var out []eqChange
+	for _, ch := range c.Changes {
+		if ch.Op != rowchange.OpDelete {
+			continue
 		}
+		out = append(out, eqChange{ID: ch.Key[0].(int64), Val: ch.After["val"].(string), Op: uint8(ch.Op)})
 	}
 	return out
 }

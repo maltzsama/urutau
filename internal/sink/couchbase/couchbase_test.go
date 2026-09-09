@@ -155,7 +155,7 @@ func metaIngest() map[string]core.MetadataColumn {
 func upsertBatch(pos string, rows ...int64) *dataplane.Batch {
 	cb := rowchange.Batch{Table: "orders", Position: pos, Mode: rowchange.UpsertMode}
 	for _, id := range rows {
-		cb.Upserts = append(cb.Upserts, rowchange.Change{
+		cb.Changes = append(cb.Changes, rowchange.Change{
 			Op: rowchange.OpInsert, Key: []any{id},
 			After:    map[string]any{"id": id, "v": fmt.Sprintf("v%d", id)},
 			IngestTS: time.Unix(1700000000, 0).UTC(),
@@ -175,7 +175,7 @@ func upsertBatch(pos string, rows ...int64) *dataplane.Batch {
 func deleteBatch(pos string, ids ...int64) *dataplane.Batch {
 	cb := rowchange.Batch{Table: "orders", Position: pos, Mode: rowchange.UpsertMode}
 	for _, id := range ids {
-		cb.Deletes = append(cb.Deletes, rowchange.Change{Op: rowchange.OpDelete, Key: []any{id}})
+		cb.Changes = append(cb.Changes, rowchange.Change{Op: rowchange.OpDelete, Key: []any{id}})
 	}
 	cs := core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},

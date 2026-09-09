@@ -31,10 +31,8 @@ import (
 //
 // QUARANTINE: dies in commit 3/4 when the worker produces Batch directly.
 func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
-	// Merge upserts and deletes into a single ordered slice.
-	all := make([]rowchange.Change, 0, len(b.Upserts)+len(b.Deletes))
-	all = append(all, b.Upserts...)
-	all = append(all, b.Deletes...)
+	// D-6: the batch's single arrival-ordered slice IS the wire order.
+	all := b.Changes
 	if len(all) == 0 {
 		return &Batch{Table: b.Table, Watermark: []byte(b.Position), Mode: rowchange.ToDataplaneMode(b.Mode)}, nil
 	}
@@ -50,8 +48,16 @@ func BatchFromChangeBatch(b rowchange.Batch, cs core.Schema) (*Batch, error) {
 	// C-8 fail-fast: deletes without a PK produce orphaned NULL tuples in
 	// the sink. The enrich path cannot reconstitute a key from After (it
 	// may be nil or empty). When PK is empty the pump must not send deletes.
-	if len(cs.PrimaryKey) == 0 && len(b.Deletes) > 0 {
-		return nil, fmt.Errorf("dataplane: batch %q has %d delete(s) but schema has no PrimaryKey — deletes would become orphaned NULLs in the sink", b.Table, len(b.Deletes))
+	if len(cs.PrimaryKey) == 0 {
+		nDeletes := 0
+		for _, c := range all {
+			if c.Op == rowchange.OpDelete {
+				nDeletes++
+			}
+		}
+		if nDeletes > 0 {
+			return nil, fmt.Errorf("dataplane: batch %q has %d delete(s) but schema has no PrimaryKey — deletes would become orphaned NULLs in the sink", b.Table, nDeletes)
+		}
 	}
 
 	meta := &pb.BatchMeta{

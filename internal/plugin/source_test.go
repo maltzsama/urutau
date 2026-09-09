@@ -120,11 +120,9 @@ func TestBatchToRecords(t *testing.T) {
 	b := rowchange.Batch{
 		Table:    "test",
 		Position: "pos123",
-		Upserts: []rowchange.Change{
+		Changes: []rowchange.Change{
 			{Op: rowchange.OpInsert, Table: "test", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "name": "alice"}},
 			{Op: rowchange.OpUpdate, Table: "test", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "name": "bob"}},
-		},
-		Deletes: []rowchange.Change{
 			{Op: rowchange.OpDelete, Table: "test", Key: []any{int64(3)}, Before: map[string]any{"id": int64(3), "name": "charlie"}},
 		},
 	}
@@ -156,7 +154,7 @@ func batchWithColumns(t *testing.T, cols ...string) rowchange.Batch {
 	t.Helper()
 	b := rowchange.Batch{Table: "test"}
 	for _, c := range cols {
-		b.Upserts = append(b.Upserts, rowchange.Change{
+		b.Changes = append(b.Changes, rowchange.Change{
 			After: map[string]any{c: "val"},
 		})
 	}
