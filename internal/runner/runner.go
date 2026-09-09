@@ -110,10 +110,10 @@ func (r *relay) AddWindowRows(target string, chunkID uint32, rows []rowchange.Ch
 	if err != nil {
 		return err
 	}
+	// The worker window takes ownership of the batch.
 	if err := r.window.AddWindowRows(target, chunkID, dpb); err != nil {
 		return err
 	}
-	dpb.Release()
 	return nil
 }
 

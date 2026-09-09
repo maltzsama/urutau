@@ -570,9 +570,8 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 
 	switch {
 	case meta.Window != nil && meta.Window.Snapshot:
-		err := r.w.AddWindowRows(meta.Table, meta.Window.ChunkId, b)
-		b.Release()
-		if err != nil {
+		// AddWindowRows takes ownership of the batch (the window stores it).
+		if err := r.w.AddWindowRows(meta.Table, meta.Window.ChunkId, b); err != nil {
 			return err
 		}
 	case meta.Window != nil && meta.Window.Closes:

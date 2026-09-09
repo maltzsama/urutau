@@ -10,6 +10,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/core"
@@ -76,14 +77,14 @@ type tablePipeline struct {
 	readyCh chan readyBatch
 
 	// DBLog snapshot windows, per design: each chunk's SELECT rows land in
-	// their own window (AddWindowRows); live events tagged InWindow remove
-	// their key from that chunk's window; the chunk's Closes marker flushes
-	// what remains. Windows are keyed by chunkID because the orchestrator
-	// may populate chunk N+1 while the batcher is still draining chunk N's
-	// buffered release. Guarded by winMu: the runner (snapshot orchestrator)
-	// populates windows while the batcher goroutine consumes events.
+	// their own window (AddWindowRows); live events tagged InWindow mark
+	// their key touched in every open window; the chunk's Closes marker
+	// emits the stored batch minus touched rows. Windows are keyed by
+	// chunkID because the orchestrator may populate chunk N+1 while the
+	// batcher is still draining chunk N's buffered release. Guarded by
+	// winMu. The window OWNS its batch; Closes consumes and releases it.
 	winMu   sync.Mutex
-	windows map[uint32]map[string]rowchange.Change
+	windows map[uint32]*snapshotWindow
 	dropped int64
 
 	// Snapshot state for resumable backfill. The snapshot state machine
@@ -223,39 +224,35 @@ func newTablePipeline(target string, c sink.TableWriter, mode dataplane.WriteMod
 		mode:           mode,
 		ch:             make(chan Ingest, 1024),
 		readyCh:        make(chan readyBatch, 1),
-		windows:        map[uint32]map[string]rowchange.Change{},
+		windows:        map[uint32]*snapshotWindow{},
 		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
 		driftReported:  map[string]bool{},
 	}
 }
 
-// AddWindowRows feeds one chunk's SELECT result of a DBLog snapshot window
-// into the table's batcher. The rows are held in that chunk's window until
-// its Closes marker: a live event tagged InWindow discards its key (the live
-// version wins). Chunks are independent — a previous chunk may still be
-// draining while a new one opens.
-//
-// QUARANTINE: the batch is decoded to rows for the window map; dies when the
-// worker consumes Batch directly (M4).
+// snapshotWindow is one DBLog chunk's SELECT rows, stored as the batch the
+// snapshot source produced (no row decode). Live InWindow events mark keys
+// in touched; Closes emits the batch minus the touched rows.
+type snapshotWindow struct {
+	batch   *dataplane.Batch
+	touched map[string]struct{}
+}
+
+// AddWindowRows stores one chunk's SELECT batch for the snapshot window.
+// The window TAKES OWNERSHIP of the batch; the Closes handler releases it.
 func (w *Worker) AddWindowRows(target string, chunkID uint32, batch *dataplane.Batch) error {
 	p, ok := w.tables[target]
 	if !ok {
+		batch.Release()
 		return fmt.Errorf("worker: window rows for unregistered table %s", target)
-	}
-	rows, err := decodeToChanges(batch, p.knownSchema.PrimaryKey)
-	if err != nil {
-		return fmt.Errorf("worker: window rows %s: %w", target, err)
 	}
 	p.winMu.Lock()
 	defer p.winMu.Unlock()
-	win, ok := p.windows[chunkID]
-	if !ok {
-		win = make(map[string]rowchange.Change, len(rows))
-		p.windows[chunkID] = win
+	if _, dup := p.windows[chunkID]; dup {
+		batch.Release()
+		return fmt.Errorf("worker: window rows: duplicate chunk %d for %s", chunkID, target)
 	}
-	for _, r := range rows {
-		win[rowchange.KeyString(r.Key)] = r
-	}
+	p.windows[chunkID] = &snapshotWindow{batch: batch, touched: make(map[string]struct{})}
 	return nil
 }
 
@@ -490,218 +487,125 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 // runBatcher collects changes, collapses them, and sends ready batches to
 // the committer. When the channel closes, the committer drains and exits.
 func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
-	var buf []rowchange.Change
+	// The batcher is COLUMNAR (G2): pending holds owned wire batches, never
+	// decoded rows. Per-row decisions (bootstrap marking, window dedup,
+	// drift, append delete-image) read the record through a BatchReader and
+	// mutate only side state (guard, windows, counters); the batches flow
+	// through to the columnar flush untouched.
+	var pending []*dataplane.Batch
+	pendingRows := 0
 	ticker := time.NewTicker(w.cfg.MaxInterval)
 	defer ticker.Stop()
 
+	// freePending releases every buffered batch (ownership returns here on
+	// error paths).
+	freePending := func() {
+		for _, b := range pending {
+			b.Release()
+		}
+		pending = nil
+		pendingRows = 0
+	}
+
+	// ready sends a prepared batch to the committer (ownership transfers).
+	ready := func(b *dataplane.Batch, rows, upserts, deletes int) error {
+		select {
+		case p.readyCh <- readyBatch{batch: b, rows: rows, upserts: upserts, deletes: deletes}:
+			return nil
+		case <-ctx.Done():
+			b.Release()
+			return ctx.Err()
+		}
+	}
+
 	flush := func() error {
-		if len(buf) == 0 {
+		if len(pending) == 0 {
 			return nil
 		}
-		pos := buf[len(buf)-1].Position
-		rows := len(buf)
+		merged, err := concatBatches(pending)
+		if err != nil {
+			freePending()
+			return fmt.Errorf("worker: table %s: concat: %w", p.target, err)
+		}
+		rows := int(merged.Record.NumRows())
+		pos := lastRowPos(merged)
 
-		// During snapshot phase, separate snapshot lines into two groups:
-		// untouched PKs (pure append, no delete) and touched PKs (upsert
-		// with delete). This eliminates equality deletes for the initial
-		// backfill on an empty table. A resumed snapshot skips this path
-		// entirely (see snapshotResumed).
-		// QUARANTINE: this partition path stays row-based until the sources
-		// produce Arrow (M4); only the normal upsert path is columnar.
 		p.snapshotMu.Lock()
 		inSnapshot := p.snapshotState == string(snapshot.StateInProgress)
 		guard := p.bootstrapGuard
 		resumed := p.snapshotResumed
+		snapState := p.snapshotState
+		snapPending := p.snapshotPending
 		p.snapshotMu.Unlock()
 
+		defer func() {
+			merged.Release()
+			freePending()
+		}()
+
+		// Snapshot partition: untouched snapshot PKs are pure-appended (no
+		// equality delete); everything else collapses columnar.
 		if inSnapshot && !resumed && p.mode == dataplane.UpsertMode {
-			var untouched []rowchange.Change
-			var rest []rowchange.Change
-			for _, c := range buf {
-				if c.Snapshot && !guard.TestAndAddString(rowchange.KeyString(c.Key)) {
-					untouched = append(untouched, c)
-				} else {
-					rest = append(rest, c)
-				}
+			untouchedIdx, restIdx, err := partitionSnapshotRows(merged, guard, p.knownSchema.PrimaryKey)
+			if err != nil {
+				return err
 			}
 			appendPos := pos
-			if len(rest) > 0 {
+			delCount := 0
+			if len(restIdx) > 0 {
 				appendPos = ""
 			}
-			if len(untouched) > 0 {
-				ab := rowchange.Batch{Table: p.target, Changes: untouched, Position: appendPos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
-				p.snapshotMu.Lock()
-				ab.SnapshotState = p.snapshotState
-				ab.SnapshotPending = p.snapshotPending
-				p.snapshotMu.Unlock()
-				dpb, err := dpint.BatchFromChangeBatch(ab, p.knownSchema)
+			if len(untouchedIdx) > 0 {
+				ab, err := selectRows(merged, untouchedIdx, appendPos, dataplane.AppendMode, snapState, snapPending)
 				if err != nil {
-					return fmt.Errorf("worker: table %s: bridge append: %w", p.target, err)
+					return fmt.Errorf("worker: table %s: select append: %w", p.target, err)
 				}
-				dpb.SnapshotState = ab.SnapshotState
-				dpb.SnapshotPending = ab.SnapshotPending
-				select {
-				case p.readyCh <- readyBatch{batch: dpb, rows: len(untouched), upserts: len(untouched)}:
-				case <-ctx.Done():
-					return ctx.Err()
+				if err := ready(ab, len(untouchedIdx), len(untouchedIdx), 0); err != nil {
+					return err
 				}
 			}
-			if len(rest) > 0 {
-				collapsed := rowchange.Collapse(rest)
-				b := rowchange.Batch{Table: p.target, Changes: collapsed.Changes, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
-				p.snapshotMu.Lock()
-				b.SnapshotState = p.snapshotState
-				b.SnapshotPending = p.snapshotPending
-				p.snapshotMu.Unlock()
-				dpb, err := dpint.BatchFromChangeBatch(b, p.knownSchema)
+			if len(restIdx) > 0 {
+				rest, err := selectRows(merged, restIdx, pos, dataplane.UpsertMode, snapState, snapPending)
 				if err != nil {
-					return fmt.Errorf("worker: table %s: bridge rest: %w", p.target, err)
+					return fmt.Errorf("worker: table %s: select rest: %w", p.target, err)
 				}
-				dpb.SnapshotState = b.SnapshotState
-				dpb.SnapshotPending = b.SnapshotPending
-				ups, dels := collapsed.Count()
-				select {
-				case p.readyCh <- readyBatch{batch: dpb, rows: len(rest), upserts: ups, deletes: dels}:
-				case <-ctx.Done():
-					return ctx.Err()
+				upCount, dCount, err := collapseAndSend(ctx, p, rest, rows, pos, ready)
+				delCount = dCount
+				if err != nil {
+					return err
 				}
+				_ = upCount
+				_ = delCount
 			}
-			buf = buf[:0]
 			return nil
 		}
 
 		switch p.mode {
 		case dataplane.AppendMode:
-			upserts := make([]rowchange.Change, 0, len(buf))
-			for _, c := range buf {
-				if c.Op == rowchange.OpDelete {
-					// onDelete: skip — the delete is a fact only its absence
-					// records. Drop and count.
-					if p.appendDropDeletes {
-						p.droppedDeletes.Add(1)
-						if w.metrics != nil {
-							w.metrics.DeletesDropped.WithLabelValues(p.target).Inc()
-						}
-						if w.onDroppedDelete != nil {
-							w.onDroppedDelete(p.target, c.Position)
-						}
-						continue
-					}
-					// onDelete: record — appends the deleted row from its
-					// before image. A delete with NO before image (Kafka
-					// tombstone, source without the image) must never write
-					// an all-null row: it is dropped and counted instead.
-					// QUARANTINE: after the bridge round-trip the image lives in
-					// After (the wire has no __before_* columns yet); dies in M4.
-					// Only treat it as an image when it carries non-PK columns —
-					// an image-less delete projects only its key onto the wire.
-					if len(c.Before) == 0 && hasNonPKValue(c.After, p.knownSchema.PrimaryKey) {
-						c.Before = c.After
-					}
-					if len(c.Before) == 0 {
-						p.droppedDeletes.Add(1)
-						if w.metrics != nil {
-							w.metrics.DeletesDropped.WithLabelValues(p.target).Inc()
-						}
-						if w.onDroppedDelete != nil {
-							w.onDroppedDelete(p.target, c.Position)
-						}
-						continue
-					}
-					c.After = c.Before
-					if p.enricher != nil {
-						// QUARANTINE: enrich the rewritten delete as a single-row
-						// batch through the columnar seam; dies when the join
-						// becomes columnar.
-						dpb, err := dpint.BatchFromChangeBatch(rowchange.Batch{Table: p.target, Changes: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.AppendMode)}, p.knownSchema)
-						if err != nil {
-							return fmt.Errorf("worker: table %s: bridge: %w", p.target, err)
-						}
-						enriched, err := p.enricher.EnrichBatch(dpb, p.knownSchema.PrimaryKey)
-						dpb.Release()
-						if err != nil {
-							return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
-						}
-						if enriched == nil {
-							p.enrichDropped.Add(1)
-							continue
-						}
-						enrichedRows, derr := decodeToChanges(enriched, p.knownSchema.PrimaryKey)
-						enriched.Release()
-						if derr != nil {
-							return fmt.Errorf("worker: table %s: decode: %w", p.target, derr)
-						}
-						p.enrichDropped.Add(int64(1 - len(enrichedRows)))
-						upserts = append(upserts, enrichedRows...)
-						continue
-					}
-				}
-				upserts = append(upserts, c)
-			}
-			b := rowchange.Batch{Table: p.target, Changes: upserts, Position: pos, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
-			p.snapshotMu.Lock()
-			b.SnapshotState = p.snapshotState
-			b.SnapshotPending = p.snapshotPending
-			p.snapshotMu.Unlock()
-			dpb, err := dpint.BatchFromChangeBatch(b, p.knownSchema)
+			// Append: keep non-delete rows; delete rows are dropped when
+			// onDelete is skip, or when they carry no image (a key-only
+			// tombstone must never write an all-null row). A delete WITH an
+			// image is kept — its row is the before image (DELETE IMAGE
+			// CONTRACT: on the wire the image already sits in the data
+			// columns) and the append sink writes it.
+			keepIdx, err := appendRowsToKeep(ctx, p, w, merged)
 			if err != nil {
-				return fmt.Errorf("worker: table %s: bridge append: %w", p.target, err)
+				return err
 			}
-			dpb.SnapshotState = b.SnapshotState
-			dpb.SnapshotPending = b.SnapshotPending
-			select {
-			case p.readyCh <- readyBatch{batch: dpb, rows: rows, upserts: len(upserts)}:
-			case <-ctx.Done():
-				return ctx.Err()
+			out, err := selectRows(merged, keepIdx, pos, dataplane.AppendMode, snapState, snapPending)
+			if err != nil {
+				return fmt.Errorf("worker: table %s: select append: %w", p.target, err)
 			}
-			buf = buf[:0]
-			return nil
+			return ready(out, rows, len(keepIdx), 0)
 		default:
-			// Columnar upsert path: bridge the accumulated changes to a
-			// dataplane.Batch and collapse columnar (CR-069 §3.2). The
-			// collapsed upserts/deletes are merged back into ONE batch —
-			// the sink commits a single batch per flush, and the position
-			// must never separate from its data (two commits would advance
-			// past uncommitted upserts on a crash between them).
-			cb := rowchange.Batch{Table: p.target, Changes: buf, Position: pos, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
-			dpb, err := dpint.BatchFromChangeBatch(cb, p.knownSchema)
+			// Upsert: collapse the whole buffer columnar, merge survivors
+			// into one batch (the position never separates from its data).
+			upCount, delCount, err := collapseAndSend(ctx, p, merged, rows, pos, ready)
 			if err != nil {
-				return fmt.Errorf("worker: table %s: bridge upsert: %w", p.target, err)
+				return err
 			}
-			p.snapshotMu.Lock()
-			dpb.SnapshotState = p.snapshotState
-			dpb.SnapshotPending = p.snapshotPending
-			p.snapshotMu.Unlock()
-			upCount, delCount := 0, 0
-			upserts, deletes, err := dpint.Collapse(ctx, nil, dpb, p.knownSchema.PrimaryKey)
-			dpb.Release()
-			if err != nil {
-				return fmt.Errorf("worker: table %s: collapse: %w", p.target, err)
-			}
-			if upserts != nil {
-				upCount = int(upserts.Record.NumRows())
-			}
-			if deletes != nil {
-				delCount = int(deletes.Record.NumRows())
-			}
-			combined, err := mergeBatches(upserts, deletes, nil)
-			if upserts != nil {
-				upserts.Release()
-			}
-			if deletes != nil {
-				deletes.Release()
-			}
-			if err != nil {
-				return fmt.Errorf("worker: table %s: merge: %w", p.target, err)
-			}
-			if combined != nil {
-				select {
-				case p.readyCh <- readyBatch{batch: combined, rows: rows, upserts: upCount, deletes: delCount}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			buf = buf[:0]
+			_ = upCount
+			_ = delCount
 			return nil
 		}
 	}
@@ -712,130 +616,451 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			if !ok {
 				return flush()
 			}
-			// Closes marker: emit the chunk's remaining window rows.
+			// Closes marker: emit the chunk's remaining window rows (the
+			// stored snapshot batch minus the keys live events touched),
+			// adopting the marker's position.
 			if ing.Win != nil && ing.Win.Closes {
-				p.winMu.Lock()
-				win := p.windows[ing.Win.ChunkID]
-				if win != nil {
-					for _, row := range win {
-						row.Position = ing.Position
-						buf = append(buf, row)
-					}
-					delete(p.windows, ing.Win.ChunkID)
+				if err := closeWindow(p, ing, &pending, &pendingRows); err != nil {
+					return err
 				}
-				p.winMu.Unlock()
-				continue // the Closes marker is not a data row
+				continue
 			}
 			if ing.Batch == nil {
 				continue
 			}
-			// Drift check runs on the SOURCE rows first — enrich adds reference
-			// columns that must not trip drift. QUARANTINE: decodes the batch;
-			// dies when the worker consumes Batch directly (M4).
+			batch := ing.Batch
+			if batch.Record == nil || batch.Record.NumRows() == 0 {
+				batch.Release()
+				continue
+			}
+			// Schema drift, columnar: any data column the batch carries that
+			// the known schema lacks is a spec violation — report once and
+			// go terminal. Runs on the SOURCE batch before enrich (enrich
+			// adds reference columns that must not trip drift).
 			if len(p.knownSchema.Columns) > 0 {
-				srcRows, derr := decodeToChanges(ing.Batch, p.knownSchema.PrimaryKey)
-				if derr != nil {
-					return fmt.Errorf("worker: table %s: decode: %w", p.target, derr)
+				d, hit, err := schemaDrift(batch, p.knownSchema)
+				if err != nil {
+					batch.Release()
+					return fmt.Errorf("worker: table %s: %w", p.target, err)
 				}
-				for i := range srcRows {
-					c := &srcRows[i]
-					if c.After != nil {
-						if d, hit := checkDrift(c.After, p.knownSchema); hit {
-							p.snapshotMu.Lock()
-							first := !p.driftReported[d.Column]
-							p.driftReported[d.Column] = true
-							p.snapshotMu.Unlock()
-							if first && w.schemaDrift != nil {
-								w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
-							}
-							return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
-						}
+				if hit {
+					p.snapshotMu.Lock()
+					first := !p.driftReported[d.Column]
+					p.driftReported[d.Column] = true
+					p.snapshotMu.Unlock()
+					if first && w.schemaDrift != nil {
+						w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
 					}
+					batch.Release()
+					return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
 				}
 			}
-			// Enrich the whole batch (columnar seam), then decode.
-			batch := ing.Batch
+			// Enrich the whole batch (columnar seam). Deletes bypass the
+			// join, so no single-row special case is needed.
+			origRows := int(batch.Record.NumRows())
 			if p.enricher != nil {
 				enriched, err := p.enricher.EnrichBatch(batch, p.knownSchema.PrimaryKey)
+				batch.Release()
 				if err != nil {
 					return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
 				}
 				if enriched == nil {
-					// Every row was dropped by an inner join.
-					p.enrichDropped.Add(int64(batch.Record.NumRows()))
-					batch.Release()
+					p.enrichDropped.Add(int64(origRows))
 					continue
 				}
+				p.enrichDropped.Add(int64(origRows - int(enriched.Record.NumRows())))
 				batch = enriched
 			}
-			// Decode the columnar batch to rows for per-row processing.
-			// QUARANTINE: dies when the worker consumes Batch directly (M4).
-			rows, err := decodeToChanges(batch, p.knownSchema.PrimaryKey)
-			if err != nil {
+
+			// Per-row side effects, read columnar: bootstrap marking for
+			// live keys, InWindow dedup against the open windows.
+			if err := markBatchSideEffects(p, batch, ing); err != nil {
 				batch.Release()
-				return fmt.Errorf("worker: table %s: decode: %w", p.target, err)
-			}
-			if p.enricher != nil && len(rows) < int(batch.Record.NumRows()) {
-				p.enrichDropped.Add(int64(batch.Record.NumRows() - int64(len(rows))))
+				return err
 			}
 
-			for i := range rows {
-				c := &rows[i]
-				if ing.Win != nil && ing.Win.InWindow {
-					c.Window = &rowchange.Window{ChunkID: ing.Win.ChunkID, InWindow: true}
+			pending = append(pending, batch)
+			pendingRows += int(batch.Record.NumRows())
+			if w.cfg.MaxRows > 0 && pendingRows >= w.cfg.MaxRows {
+				if err := flush(); err != nil {
+					return err
 				}
-				// A live event during the snapshot marks its PK as touched:
-				// the snapshot row for that key must take the safe upsert path,
-				// never a pure append. The DBLog window only deduplicates events
-				// that arrive while the covering chunk is open — events that
-				// landed before their chunk was read would otherwise duplicate
-				// the row. Closes markers carry no key and skip this.
-				if !c.Snapshot && c.Key != nil {
-					p.snapshotMu.Lock()
-					if p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil {
-						p.bootstrapGuard.AddString(rowchange.KeyString(c.Key))
-					}
-					p.snapshotMu.Unlock()
-				}
-				// DBLog window application, design 3.4: an InWindow event is itself a
-				// real change — it removes its snapshot row from the owning
-				// chunk's window (the live version wins) and is then appended
-				// normally. The coordinator tags gated live events with the
-				// chunk that was draining when they were released, which need
-				// not be the chunk that contains the row, so the delete scans
-				// every open window.
-				if c.Window != nil && c.Window.InWindow {
-					p.winMu.Lock()
-					k := rowchange.KeyString(c.Key)
-					for _, win := range p.windows {
-						if _, hit := win[k]; hit {
-							delete(win, k)
-							p.dropped++
-						}
-					}
-					p.winMu.Unlock()
-				}
-				buf = append(buf, *c)
-				if w.cfg.MaxRows > 0 && len(buf) >= w.cfg.MaxRows {
-					if err := flush(); err != nil {
-						return err
-					}
-				}
-			}
-			// The demux handed us the batch; we own it and decoded it. The
-			// enriched batch (if any) is separate and also owned.
-			batch.Release()
-			if batch != ing.Batch {
-				ing.Batch.Release()
 			}
 		case <-ticker.C:
 			if err := flush(); err != nil {
 				return err
 			}
 		case <-ctx.Done():
+			freePending()
 			return ctx.Err()
 		}
 	}
+}
+
+// collapseAndSend collapses one batch columnar and sends the merged single
+// batch to the committer.
+func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, rows int, pos string, ready func(*dataplane.Batch, int, int, int) error) (upCount, delCount int, err error) {
+	p.snapshotMu.Lock()
+	snapState := p.snapshotState
+	snapPending := p.snapshotPending
+	p.snapshotMu.Unlock()
+	upserts, deletes, cerr := dpint.Collapse(ctx, nil, b, p.knownSchema.PrimaryKey)
+	if cerr != nil {
+		return 0, 0, fmt.Errorf("worker: table %s: collapse: %w", p.target, cerr)
+	}
+	defer func() {
+		if upserts != nil {
+			upserts.Release()
+		}
+		if deletes != nil {
+			deletes.Release()
+		}
+	}()
+	if upserts != nil {
+		upCount = int(upserts.Record.NumRows())
+	}
+	if deletes != nil {
+		delCount = int(deletes.Record.NumRows())
+	}
+	combined, err := mergeBatches(upserts, deletes, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("worker: table %s: merge: %w", p.target, err)
+	}
+	if combined == nil {
+		return 0, 0, nil
+	}
+	combined.Watermark = []byte(pos)
+	combined.Mode = p.mode
+	combined.SnapshotState = snapState
+	combined.SnapshotPending = snapPending
+	if err := ready(combined, rows, upCount, delCount); err != nil {
+		return 0, 0, err
+	}
+	return upCount, delCount, nil
+}
+
+// closeWindow emits the stored chunk batch minus the keys live InWindow
+// events touched, with every row's __pos adopted to the marker position.
+func closeWindow(p *tablePipeline, ing Ingest, pending *[]*dataplane.Batch, pendingRows *int) error {
+	p.winMu.Lock()
+	win := p.windows[ing.Win.ChunkID]
+	if win == nil {
+		p.winMu.Unlock()
+		return nil
+	}
+	delete(p.windows, ing.Win.ChunkID)
+	p.winMu.Unlock()
+
+	if win.batch.Record == nil || win.batch.Record.NumRows() == 0 {
+		win.batch.Release()
+		return nil
+	}
+	reader, err := transport.NewBatchReader(win.batch.Record, p.knownSchema.PrimaryKey)
+	if err != nil {
+		win.batch.Release()
+		return fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
+	}
+	// Keep every row whose key was not touched by a live InWindow event.
+	var keepIdx []int32
+	for i := range reader.NumRows() {
+		k := rowchange.KeyString(reader.Key(i))
+		if _, hit := win.touched[k]; !hit {
+			keepIdx = append(keepIdx, int32(i))
+		}
+	}
+	if len(keepIdx) == 0 {
+		win.batch.Release()
+		return nil
+	}
+	sel, err := selectRows(win.batch, keepIdx, "", dataplane.AppendMode, "", nil)
+	win.batch.Release() // the window is consumed; selectRows retained its columns
+	if err != nil {
+		return err
+	}
+	out, err := adoptWindowPos(sel, ing.Position)
+	sel.Release()
+	if err != nil {
+		return err
+	}
+	*pending = append(*pending, out)
+	*pendingRows += int(out.Record.NumRows())
+	return nil
+}
+
+// adoptWindowPos rebuilds a batch with __pos replaced by a constant — the
+// Closes rows adopt the marker's position (the safe resume point).
+func adoptWindowPos(b *dataplane.Batch, pos string) (*dataplane.Batch, error) {
+	rec := b.Record
+	posIdx := -1
+	for i := range rec.Schema().NumFields() {
+		if rec.Schema().Field(i).Name == "__pos" {
+			posIdx = i
+			break
+		}
+	}
+	if posIdx < 0 {
+		return nil, fmt.Errorf("worker: window batch has no __pos column")
+	}
+	bld := array.NewStringBuilder(memory.DefaultAllocator)
+	defer bld.Release()
+	for range int(rec.NumRows()) {
+		bld.Append(pos)
+	}
+	posArr := bld.NewStringArray()
+	defer posArr.Release()
+
+	cols := make([]arrow.Array, rec.NumCols())
+	for i := range int(rec.NumCols()) {
+		if i == posIdx {
+			posArr.Retain()
+			cols[i] = posArr
+		} else {
+			rec.Column(i).Retain()
+			cols[i] = rec.Column(i)
+		}
+	}
+	newRec := array.NewRecordBatch(rec.Schema(), cols, rec.NumRows())
+	for _, c := range cols {
+		c.Release()
+	}
+	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: []byte(pos), Mode: dataplane.AppendMode}, nil
+}
+
+// markBatchSideEffects applies the per-row, side-effect-only decisions for a
+// live batch: bootstrap-guard marking (a live key during snapshot takes the
+// upsert path) and InWindow dedup (a live key removes its snapshot row from
+// every open window). Pure reads of the record; the batch itself is not
+// modified.
+func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) error {
+	reader, err := transport.NewBatchReader(batch.Record, p.knownSchema.PrimaryKey)
+	if err != nil {
+		return fmt.Errorf("worker: table %s: %w", p.target, err)
+	}
+	inWindow := ing.Win != nil && ing.Win.InWindow
+	for i := range reader.NumRows() {
+		key := reader.Key(i)
+		if len(key) == 0 {
+			continue
+		}
+		k := rowchange.KeyString(key)
+		if !reader.Snapshot(i) {
+			p.snapshotMu.Lock()
+			if p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil {
+				p.bootstrapGuard.AddString(k)
+			}
+			p.snapshotMu.Unlock()
+		}
+		if inWindow {
+			p.winMu.Lock()
+			for _, win := range p.windows {
+				if _, hit := win.touched[k]; hit {
+					continue
+				}
+				// Only touch a key the window actually holds.
+				if rowHoldsKey(win, k, p.knownSchema.PrimaryKey) {
+					win.touched[k] = struct{}{}
+					p.dropped++
+				}
+			}
+			p.winMu.Unlock()
+		}
+	}
+	return nil
+}
+
+// rowHoldsKey reports whether the stored window batch holds a row with the
+// given key string.
+func rowHoldsKey(win *snapshotWindow, key string, pk []string) bool {
+	reader, err := transport.NewBatchReader(win.batch.Record, pk)
+	if err != nil {
+		return false
+	}
+	for i := range reader.NumRows() {
+		if rowchange.KeyString(reader.Key(i)) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// partitionSnapshotRows splits a merged batch's row indices into untouched
+// snapshot PKs (pure append) and the rest.
+func partitionSnapshotRows(b *dataplane.Batch, guard *bloom.BloomFilter, pk []string) (untouched, rest []int32, err error) {
+	reader, err := transport.NewBatchReader(b.Record, pk)
+	if err != nil {
+		return nil, nil, err
+	}
+	for i := range reader.NumRows() {
+		if reader.Snapshot(i) {
+			key := reader.Key(i)
+			if len(key) > 0 && !guard.TestString(rowchange.KeyString(key)) {
+				untouched = append(untouched, int32(i))
+				continue
+			}
+		}
+		rest = append(rest, int32(i))
+	}
+	return untouched, rest, nil
+}
+
+// appendRowsToKeep returns the row indices an append-mode flush keeps:
+// every non-delete row, plus delete rows that carry a real before image (a
+// non-PK data column set). Dropped deletes are counted and reported.
+func appendRowsToKeep(ctx context.Context, p *tablePipeline, w *Worker, b *dataplane.Batch) ([]int32, error) {
+	reader, err := transport.NewBatchReader(b.Record, p.knownSchema.PrimaryKey)
+	if err != nil {
+		return nil, fmt.Errorf("worker: table %s: %w", p.target, err)
+	}
+	nonPK := make([]string, 0, len(reader.DataColumns()))
+	for _, name := range reader.DataColumns() {
+		isPK := false
+		for _, pkn := range p.knownSchema.PrimaryKey {
+			if pkn == name {
+				isPK = true
+				break
+			}
+		}
+		if !isPK {
+			nonPK = append(nonPK, name)
+		}
+	}
+	var keep []int32
+	for i := range reader.NumRows() {
+		if reader.Op(i) != rowchange.OpDelete {
+			keep = append(keep, int32(i))
+			continue
+		}
+		// A delete: drop on skip; else keep only if it carries an image.
+		if p.appendDropDeletes || !rowHasImage(reader, nonPK, i) {
+			p.droppedDeletes.Add(1)
+			if w.metrics != nil {
+				w.metrics.DeletesDropped.WithLabelValues(p.target).Inc()
+			}
+			if w.onDroppedDelete != nil {
+				w.onDroppedDelete(p.target, reader.Position(i))
+			}
+			continue
+		}
+		keep = append(keep, int32(i))
+	}
+	return keep, nil
+}
+
+// rowHasImage reports whether the row carries a value in a non-PK column —
+// a delete with an image is appendable; a key-only tombstone is not.
+func rowHasImage(r *transport.BatchReader, nonPK []string, i int) bool {
+	for _, name := range nonPK {
+		v, ok := r.Value(name, i)
+		if ok && v != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaDrift returns the first data column the batch carries a VALUE in
+// that the known schema lacks. An all-null extra column is a padding
+// artifact of the row bridge, not a source column; only a column the batch
+// actually populates counts as drift.
+func schemaDrift(b *dataplane.Batch, schema core.Schema) (SchemaDrift, bool, error) {
+	rec := b.Record
+	for i := range rec.Schema().NumFields() {
+		name := rec.Schema().Field(i).Name
+		if isMetadataName(name) {
+			continue
+		}
+		if _, ok := schema.Column(name); ok {
+			continue
+		}
+		col := rec.Column(i)
+		if col.IsNull(0) {
+			continue // padding artifact — no source value, no drift
+		}
+		return SchemaDrift{Column: name, Kind: "added"}, true, nil
+	}
+	return SchemaDrift{}, false, nil
+}
+
+// isMetadataName reports the reserved wire metadata columns.
+func isMetadataName(name string) bool {
+	switch name {
+	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot", "__phase":
+		return true
+	}
+	return false
+}
+
+// lastRowPos returns the __pos of the batch's last row (its commit
+// coordinate), or "" for an empty batch.
+func lastRowPos(b *dataplane.Batch) string {
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		return ""
+	}
+	reader, err := transport.NewBatchReader(b.Record, nil)
+	if err != nil {
+		return ""
+	}
+	return reader.Position(reader.NumRows() - 1)
+}
+
+// concatBatches concatenates the row lists of the given batches, in order,
+// into one owned batch. The input batches are NOT released.
+func concatBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
+	if len(bs) == 0 {
+		return nil, nil
+	}
+	acc, err := mergeBatches(bs[0], nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range bs[1:] {
+		next, err := mergeBatches(acc, b, nil)
+		acc.Release()
+		if err != nil {
+			return nil, err
+		}
+		acc = next
+	}
+	return acc, nil
+}
+
+// selectRows returns a new owned batch holding the rows at the given
+// indices, with the given mode and position. The input is NOT released.
+func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.WriteMode, snapState string, snapPending []uint32) (*dataplane.Batch, error) {
+	if len(idx) == 0 {
+		return nil, nil
+	}
+	rec := b.Record
+	ib := array.NewInt32Builder(memory.DefaultAllocator)
+	for _, v := range idx {
+		ib.Append(v)
+	}
+	idxArr := ib.NewInt32Array()
+	defer idxArr.Release()
+
+	cols := make([]arrow.Array, rec.NumCols())
+	for i := range int(rec.NumCols()) {
+		t, err := compute.TakeArray(context.Background(), rec.Column(i), idxArr)
+		if err != nil {
+			for j := range i {
+				cols[j].Release()
+			}
+			return nil, err
+		}
+		cols[i] = t
+	}
+	newRec := array.NewRecordBatch(rec.Schema(), cols, int64(len(idx)))
+	for _, c := range cols {
+		c.Release()
+	}
+	return &dataplane.Batch{
+		Table:           b.Table,
+		Record:          newRec,
+		Watermark:       []byte(pos),
+		Mode:            mode,
+		SnapshotState:   snapState,
+		SnapshotPending: snapPending,
+	}, nil
 }
 
 // countOps returns the number of upsert and delete rows in a batch by
@@ -919,39 +1144,4 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		SnapshotState:   a.SnapshotState,
 		SnapshotPending: a.SnapshotPending,
 	}, nil
-}
-
-// decodeToChanges decodes a columnar batch back to row-oriented changes.
-// QUARANTINE: dies when the worker consumes Batch directly (M4).
-func decodeToChanges(b *dataplane.Batch, pk []string) ([]rowchange.Change, error) {
-	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
-		return nil, nil
-	}
-	rows, err := transport.DecodeBatch(b.Record, b.Table, pk)
-	if err != nil {
-		return nil, err
-	}
-	return rows, nil
-}
-
-// hasNonPKValue reports whether the row image carries a value in a non-PK
-// column. Used to distinguish a real delete image from a key-only projection
-// after the bridge round-trip (QUARANTINE).
-func hasNonPKValue(row map[string]any, pk []string) bool {
-	for name, v := range row {
-		if v == nil {
-			continue
-		}
-		isPK := false
-		for _, p := range pk {
-			if p == name {
-				isPK = true
-				break
-			}
-		}
-		if !isPK {
-			return true
-		}
-	}
-	return false
 }
