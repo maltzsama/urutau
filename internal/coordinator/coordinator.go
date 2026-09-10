@@ -1340,17 +1340,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		w.attached, w.out, w.cancel = false, nil, nil
 		c.mu.Unlock()
 		sessCancel()
-		// A supervisor reset is not a worker failure, and neither is the
-		// death of a worker mid-reset (it suicides on channel loss); the
-		// supervisor owns the outcome (crashloop or recovery).
-		if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(hello.WorkerName) {
-			c.sessionErrs <- retErr
-		} else if c.snapshotActive.Load() {
-			// A reset (or reset-death) mid-snapshot is not a worker failure,
-			// but the snapshot cannot continue: fail the run so it restarts
-			// and re-snapshots cleanly (CD-5).
-			c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", hello.WorkerName, retErr)
-		}
+		c.signalSessionEnd(hello.WorkerName, retErr)
 	}()
 
 	select {
@@ -1424,6 +1414,24 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 // failure, so it must not kill the run via sessionErrs.
 var errSessionReset = errors.New("session reset")
 
+// signalSessionEnd reports a session's terminal state to the run loop.
+//
+// A supervisor reset is not a worker failure, and neither is the death of a
+// worker mid-reset (it suicides on channel loss); the supervisor owns the
+// outcome. The one exception is a snapshot in progress: the worker's
+// in-memory window died with the session, so the protocol cannot continue —
+// either it waits out AckTimeout/MaxResets, or a stale ChunkReady from the
+// old generation satisfies waitChunkReady against an empty window (a
+// silently incomplete snapshot). Fail the run instead, so it restarts and
+// re-snapshots cleanly (CD-5).
+func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
+	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
+		c.sessionErrs <- retErr
+	} else if c.snapshotActive.Load() {
+		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)
+	}
+}
+
 // workerSession is one connected worker's session-local surface; the group's
 // durable state lives in workerState.
 type workerSession struct {
@@ -1458,10 +1466,9 @@ func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr e
 		w.control = nil
 		c.mu.Unlock()
 		// A worker mid-reset suicides and closes this stream too; only a
-		// non-reset death is a real session failure.
-		if !c.supervisor.isPending(hello.WorkerName) {
-			c.sessionErrs <- retErr
-		}
+		// non-reset death is a real session failure (signalSessionEnd owns
+		// the reset/snapshot rule).
+		c.signalSessionEnd(hello.WorkerName, retErr)
 	}()
 	// The worker never writes again; its death is the stream ending.
 	<-stream.Context().Done()

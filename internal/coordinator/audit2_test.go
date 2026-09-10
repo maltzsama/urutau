@@ -4,6 +4,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -78,3 +79,65 @@ func TestEnqueueBatchMarkerEmptyTableErrors(t *testing.T) {
 		t.Fatalf("err = %v, want a marker-table error", err)
 	}
 }
+
+// V7 / CD-T2: a session ending during an active snapshot must fail the run
+// fast — a reset mid-snapshot is NOT a recoverable non-failure here (the
+// worker's window died with it), and letting the snapshot loop continue
+// would either wait out AckTimeout/MaxResets or let a stale ChunkReady
+// satisfy the wait against an empty window.
+func TestSignalSessionEndDuringSnapshot(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	c.snapshotActive.Store(true)
+
+	// A reset (errSessionReset) mid-snapshot must still surface as a run
+	// error, not be swallowed by the reset-is-not-a-failure rule.
+	c.signalSessionEnd("w1", errSessionReset)
+
+	select {
+	case err := <-c.sessionErrs:
+		if err == nil || !strings.Contains(err.Error(), "during snapshot") {
+			t.Fatalf("err = %v, want a snapshot-session error", err)
+		}
+	default:
+		t.Fatal("a reset mid-snapshot must fail the run")
+	}
+}
+
+// The control: the SAME reset without a snapshot active is not a run error
+// (the supervisor recovers).
+func TestSignalSessionEndResetWithoutSnapshotIsSilent(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	c.snapshotActive.Store(false)
+
+	c.signalSessionEnd("w1", errSessionReset)
+
+	select {
+	case err := <-c.sessionErrs:
+		t.Fatalf("a reset outside a snapshot must not fail the run, got %v", err)
+	default:
+	}
+}
+
+// A genuine worker death always surfaces, snapshot or not.
+func TestSignalSessionEndDeathSurfaces(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+
+	c.signalSessionEnd("w1", errWorkerDead)
+
+	select {
+	case err := <-c.sessionErrs:
+		if err != errWorkerDead {
+			t.Fatalf("err = %v, want the death error", err)
+		}
+	default:
+		t.Fatal("a worker death must surface")
+	}
+}
+
+var errWorkerDead = errors.New("stream died")

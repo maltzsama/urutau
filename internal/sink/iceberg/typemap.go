@@ -117,6 +117,11 @@ func mapCanonicalType(t core.ColumnType) (iceberg.Type, error) {
 		return iceberg.PrimitiveTypes.Int32, nil
 	case core.KindInt64:
 		return iceberg.PrimitiveTypes.Int64, nil
+	case core.KindUInt64:
+		// Iceberg has no unsigned integer. Decimal(20,0) covers the full
+		// uint64 range (max ~1.8e19 = 20 digits) losslessly; mapping to
+		// Int64 would silently wrap values above MaxInt64.
+		return iceberg.DecimalTypeOf(20, 0), nil
 	case core.KindFloat32:
 		return iceberg.PrimitiveTypes.Float32, nil
 	case core.KindFloat64:
