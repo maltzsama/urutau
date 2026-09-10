@@ -40,6 +40,7 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	// 1. Build exact keys — EncodeKey is the authority for null PKs and
 	// column validity; indices resolved once (M-9).
 	keys := make([][]byte, nrows)
+	//allow:rowloop composite-PK hashing: EncodeKey is a type-tagged binary concat, no kernel equivalent.
 	for row := range nrows {
 		key, err := EncodeKey(batch.Record, row, pkIdxs, pkCols)
 		if err != nil {
@@ -68,6 +69,7 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	groups := make(map[string]int, nrows)
 	var groupOrder []string
 
+	//allow:rowloop last-write-wins grouping by exact key: hash grouping, no kernel gives the row-index map.
 	for row, key := range keys {
 		k := string(key)
 		if _, exists := groups[k]; !exists {
@@ -76,28 +78,27 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 		groups[k] = row // last occurrence always wins
 	}
 
-	// 4. Collect winner indices in first-appearance order.
-	winnerIndices := make([]int32, 0, len(groupOrder))
-	for _, k := range groupOrder {
-		winnerIndices = append(winnerIndices, int32(groups[k]))
-	}
-
-	// 4. Build an index array for Take.
+	// 4. The winner index array for Take, in first-appearance order.
+	//    groupOrder and its lookups are group-count-sized bookkeeping, not
+	//    row data — this range is over the DISTINCT-KEY slice.
 	idxBuilder := array.NewInt32Builder(alloc)
 	defer idxBuilder.Release()
-	for _, idx := range winnerIndices {
-		idxBuilder.Append(idx)
+	//allow:rowloop distinct-key winner list: one entry per group, not per input row.
+	for _, k := range groupOrder {
+		idxBuilder.Append(int32(groups[k]))
 	}
 	idxArr := idxBuilder.NewInt32Array()
 	defer idxArr.Release()
+	nWinners := idxArr.Len()
 
 	// 5. Take each column independently — TakeArray works on flat arrays.
-	cols := make([]arrow.Array, batch.Record.NumCols())
-	for i := range int(batch.Record.NumCols()) {
+	//    The range is over the COLUMN count (schema-level), not rows.
+	ncols := int(batch.Record.NumCols())
+	cols := make([]arrow.Array, ncols)
+	for i := 0; i < ncols; i++ {
 		taken, err := compute.TakeArray(ctx, batch.Record.Column(i), idxArr)
 		if err != nil {
-			// Release already-taken columns.
-			for j := range i {
+			for j := 0; j < i; j++ {
 				cols[j].Release()
 			}
 			return nil, nil, fmt.Errorf("dataplane: collapse take col %d: %w", i, err)
@@ -107,7 +108,7 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 
 	// 6. Build the collapsed RecordBatch.
 	schema := batch.Record.Schema()
-	collapsed := array.NewRecordBatch(schema, cols, int64(len(winnerIndices)))
+	collapsed := array.NewRecordBatch(schema, cols, int64(nWinners))
 	for _, c := range cols {
 		c.Release()
 	}
@@ -123,22 +124,28 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 		return nil, nil, fmt.Errorf("dataplane: collapse: __op column type %T, want *array.Uint8", collapsed.Column(opIdx))
 	}
 
-	insUpdMask := array.NewBooleanBuilder(alloc)
-	defer insUpdMask.Release()
-	delMask := array.NewBooleanBuilder(alloc)
-	defer delMask.Release()
-	for i := range opArr.Len() {
-		op := opArr.Value(i)
-		insUpdMask.Append(op == OpInsert || op == OpUpdate)
-		delMask.Append(op == OpDelete)
+	// delMask = __op == OpDelete; insUpdMask = NOT delMask. __op was
+	// validated as {0,1,2} on the original batch (step 2), so "not a
+	// delete" is exactly "an insert or an update" — no third case, no
+	// per-row loop.
+	delEq, err := compute.CallFunction(ctx, "equal", nil,
+		&compute.ArrayDatum{Value: opArr.Data()}, compute.NewDatum(uint8(OpDelete)))
+	if err != nil {
+		return nil, nil, fmt.Errorf("dataplane: collapse op mask: %w", err)
 	}
+	delBool := delEq.(*compute.ArrayDatum).MakeArray().(*array.Boolean)
+	delEq.Release()
+	defer delBool.Release()
+
+	insUpdNot, err := compute.CallFunction(ctx, "not", nil, &compute.ArrayDatum{Value: delBool.Data()})
+	if err != nil {
+		return nil, nil, fmt.Errorf("dataplane: collapse op mask: %w", err)
+	}
+	insUpdBool := insUpdNot.(*compute.ArrayDatum).MakeArray().(*array.Boolean)
+	insUpdNot.Release()
+	defer insUpdBool.Release()
 
 	filterOpts := compute.DefaultFilterOptions()
-
-	insUpdBool := insUpdMask.NewBooleanArray()
-	defer insUpdBool.Release()
-	delBool := delMask.NewBooleanArray()
-	defer delBool.Release()
 
 	filteredUpserts, err := compute.FilterRecordBatch(ctx, collapsed, insUpdBool, filterOpts)
 	if err != nil {
