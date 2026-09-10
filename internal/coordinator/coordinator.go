@@ -311,7 +311,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	resolvedSchemas := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
 	tableBySource := make(map[string]spec.Table, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, srcSchema, _, err := src.Introspect(ctx, t)
+		ref, srcSchema, srcWarns, err := src.Introspect(ctx, t)
 		if err != nil {
 			return err
 		}
@@ -323,7 +323,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		for _, w := range warns {
+		for _, w := range append(srcWarns, warns...) {
 			c.log.Warn("schema", "table", ref.Source, "warning", w.Message)
 		}
 		refs = append(refs, ref)

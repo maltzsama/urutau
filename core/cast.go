@@ -284,7 +284,7 @@ func (t CastTarget) Convert(from Kind, v any) (any, error) {
 	case KindJSON:
 		return castToJSON(v)
 	case KindTimestamp:
-		return castToTimestamp(v)
+		return castToTimestamp(from, v)
 	case KindTimestampTZ:
 		return castToTimestampTZ(v, t.AssumeUTC)
 	default:
@@ -728,7 +728,7 @@ func ParseTimeOfDayText(s string) (int64, error) {
 
 // castToTimestamp reinterprets a naive temporal value: date becomes midnight,
 // timestamptz drops its zone. Never parses a free-form string.
-func castToTimestamp(v any) (any, error) {
+func castToTimestamp(from Kind, v any) (any, error) {
 	switch t := v.(type) {
 	case nil:
 		return nil, nil
@@ -737,12 +737,15 @@ func castToTimestamp(v any) (any, error) {
 		// naive so the sink sees one consistent textual form.
 		return t.Format(naiveTimestampTextLayout), nil
 	case int, int32, int64, uint64:
-		// A date arrives as int32 days since epoch (the columnar
-		// representation of KindDate). asInt64 rejects a uint64 above
-		// MaxInt64.
+		// Only a date (KindDate) carries days-since-epoch as an integer;
+		// any other source handing an integer here is a wire bug, not a
+		// guess (from exists to say which).
+		if from != KindDate && from != KindUnknown {
+			return nil, fmt.Errorf("core: cannot render %T as %s text — wire representation ambiguous; fix the wire Kind", v, from)
+		}
 		days, err := asInt64(t)
 		if err != nil {
-			return nil, fmt.Errorf("core: date → timestamp: %w", err)
+			return nil, fmt.Errorf("core: %s → timestamp: %w", from, err)
 		}
 		return time.Unix(days*86400, 0).UTC().Format(naiveTimestampTextLayout), nil
 	case string:

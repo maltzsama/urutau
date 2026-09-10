@@ -515,12 +515,16 @@ func TestFormatMicrosOfDay(t *testing.T) {
 // D3: castToTimestamp accepts a uint64 date (the overflow guard is B's).
 func TestCastToTimestampAcceptsUint64(t *testing.T) {
 	days := uint64(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
-	got, err := castToTimestamp(days)
+	got, err := castToTimestamp(KindDate, days)
 	if err != nil {
 		t.Fatalf("uint64 date → timestamp: %v", err)
 	}
 	if got != "2024-01-01 00:00:00.000000000" {
 		t.Fatalf("got %v", got)
+	}
+	// An integer under a non-date source is ambiguous (wire bug), not days.
+	if _, err := castToTimestamp(KindTimestamp, int64(42)); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("timestamp int must error as ambiguous, got %v", err)
 	}
 }
 
@@ -553,7 +557,9 @@ func TestWireSchema(t *testing.T) {
 		t.Fatalf("pk = %v, want [id]", w.PrimaryKey)
 	}
 
-	// Mutating the inputs must not change the output (no aliasing).
+	// Mutating the input slices and name fields must not change the output:
+	// the columns slice and the PK slice are copied (composite/Opaque
+	// pointers are shared, but they are immutable in practice).
 	source.Columns[0].Name = "MUT"
 	source.PrimaryKey[0] = "MUT"
 	if c, _ := w.Column("id"); c.Name != "id" {

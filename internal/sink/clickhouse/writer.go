@@ -245,6 +245,9 @@ func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, er
 				return nil, nil
 			}
 			if target != nil {
+				// Backstop: bindResolvers already rejected a missing cast
+				// column; this closure-side check reads the same dataIndex
+				// and guards against a bind/resolve divergence.
 				from, kindOK := r.ColumnKind(colName)
 				if !kindOK {
 					return nil, fmt.Errorf("clickhouse: column %q: kind not found in wire schema — cast cannot be applied", colName)
