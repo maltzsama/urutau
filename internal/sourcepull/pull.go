@@ -1,13 +1,14 @@
 // Package sourcepull adapts a push-based change channel into the pull-based
-// source.Reader.Next surface, bridging changes into columnar batches.
+// source.Reader.Next surface, encoding buffered changes into wire batches.
 //
-// The decoders emit rowchange.Change (binlog/JSON events are row-shaped);
-// Next bridges them into wire batches. A source that can introspect its
-// tables supplies the canonical schemas via SetSchemas so batches encode
-// against a STABLE schema — never a per-batch inference that drifts when a
-// drain happens to omit a sparse column. Without schemas, makeBatch falls
-// back to inference for schema-less producers (their resolved schema is
-// owned upstream; see quarantine plan G1).
+// The built-in decoders emit rowchange.Change (binlog/JSON events are
+// row-shaped — a private detail of the decoders); makeBatch buffers a few
+// and encodes one wire RecordBatch via transport.RecordFromChanges. A
+// source that can introspect its tables supplies the canonical schemas via
+// SetSchemas so batches encode against a STABLE schema — never a per-batch
+// inference that drifts when a drain happens to omit a sparse column.
+// Without schemas, makeBatch falls back to inference for schema-less
+// producers (their resolved schema is owned upstream).
 package sourcepull
 
 import (
@@ -16,8 +17,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 const batchTarget = 100
@@ -151,14 +152,28 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 			}
 		}
 	}
-	cb := rowchange.Batch{Table: p.buf[0].Table, Changes: p.buf, Mode: rowchange.UpsertMode}
-	cs := p.schemas[p.buf[0].Table]
-	dpb, err := dpint.BatchFromChangeBatch(cb, cs)
+	table := p.buf[0].Table
+	// Known schema plus any column a change carries that the schema lacks
+	// (schema-less producers, sparse rows). Empty cs → full inference.
+	cs := transport.MergeSchema(p.buf, p.schemas[table])
+
+	// C-8: a delete with no PK becomes an orphaned NULL tuple in the sink.
+	// The live CDC path carries deletes; the bridge used to guard this.
+	if len(cs.PrimaryKey) == 0 {
+		for _, c := range p.buf {
+			if c.Op == rowchange.OpDelete {
+				p.buf = nil
+				return nil, fmt.Errorf("sourcepull: batch %q carries a delete but the schema has no primary key — declare it and resume", table)
+			}
+		}
+	}
+
+	rec, err := transport.RecordFromChanges(p.buf, cs, nil)
 	p.buf = nil
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("sourcepull: encode batch: %w", err)
 	}
-	return dpb, nil
+	return &dataplane.Batch{Table: table, Record: rec, Mode: dataplane.UpsertMode}, nil
 }
 
 // driftAgainst reports the first column path a row carries that the schema

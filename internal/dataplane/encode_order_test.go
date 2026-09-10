@@ -1,6 +1,6 @@
 package dataplane_test
 
-// T-13 (W-3 / H-7 / D-6): the bridge must preserve the batch's arrival
+// T-13 (W-3 / H-7 / D-6): the wire encode must preserve the batch's arrival
 // order. With the old upserts+deletes buckets, the delete concatenated at
 // the END, so the columnar collapse (last-write-wins) resurrected a deleted
 // row: insert k → delete k → insert k won with the DELETE, killing a row
@@ -14,22 +14,20 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 
 	"github.com/maltzsama/urutau/core"
+	publicdp "github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
-func TestBridgeOrderInsertDeleteInsertWinsWithInsert(t *testing.T) {
+func TestWireEncodeOrderInsertDeleteInsertWinsWithInsert(t *testing.T) {
 	alloc := checkedAlloc(t)
 
 	key := []any{int64(42)}
-	cb := rowchange.Batch{
-		Table: "t",
-		Changes: []rowchange.Change{
-			{Op: rowchange.OpInsert, Key: key, After: map[string]any{"id": int64(42), "v": "first"}},
-			{Op: rowchange.OpDelete, Key: key},
-			{Op: rowchange.OpInsert, Key: key, After: map[string]any{"id": int64(42), "v": "back"}},
-		},
-		Mode: rowchange.UpsertMode,
+	changes := []rowchange.Change{
+		{Op: rowchange.OpInsert, Key: key, After: map[string]any{"id": int64(42), "v": "first"}},
+		{Op: rowchange.OpDelete, Key: key},
+		{Op: rowchange.OpInsert, Key: key, After: map[string]any{"id": int64(42), "v": "back"}},
 	}
 	cs := core.Schema{
 		Columns: []core.Column{
@@ -39,10 +37,11 @@ func TestBridgeOrderInsertDeleteInsertWinsWithInsert(t *testing.T) {
 		PrimaryKey: []string{"id"},
 	}
 
-	dpb, err := dataplane.BatchFromChangeBatch(cb, cs)
+	rec, err := transport.RecordFromChanges(changes, cs, alloc)
 	if err != nil {
-		t.Fatalf("bridge: %v", err)
+		t.Fatalf("encode: %v", err)
 	}
+	dpb := &dataplane.Batch{Table: "t", Record: rec, Mode: publicdp.UpsertMode}
 	defer dpb.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, dpb, []string{"id"})

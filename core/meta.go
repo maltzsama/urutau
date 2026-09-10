@@ -36,8 +36,8 @@ const (
 	// MetaSourceTable is the source table the row came from, e.g.
 	// "shop.orders".
 	MetaSourceTable MetadataKey = "source_table"
-	// MetaPhase distinguishes backfill from live traffic: "snapshot" for
-	// rows read by the DBLog chunk SELECT, "stream" for live events. It is
+	// MetaPhase distinguishes backfill from live traffic: PhaseSnapshot for
+	// rows read by the DBLog chunk SELECT, PhaseStream for live events. It is
 	// an axis orthogonal to op — a snapshot row is semantically an insert.
 	MetaPhase MetadataKey = "phase"
 
@@ -60,6 +60,12 @@ const (
 	MetaMsgTS   MetadataKey = "msg_ts"   // message arrival time (CDC: NULL)
 	MetaMsgKey  MetadataKey = "msg_key"  // message key (CDC: NULL)
 	MetaHeaders MetadataKey = "headers"  // JSON-serialized headers (CDC: NULL)
+)
+
+// Phase values for the __phase wire column and the phase metadata column.
+const (
+	PhaseSnapshot = "snapshot" // rows read by a DBLog chunk SELECT
+	PhaseStream   = "stream"   // live CDC events
 )
 
 // String renders the key name.

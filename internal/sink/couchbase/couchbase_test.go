@@ -15,7 +15,6 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 )
@@ -156,40 +155,39 @@ func metaIngest() map[string]core.MetadataColumn {
 	}
 }
 
+func ordersSchema() core.Schema {
+	return core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+	}, PrimaryKey: []string{"id"}}
+}
+
+func wireBatch(pos string, changes []rowchange.Change) *dataplane.Batch {
+	rec, err := transport.RecordFromChanges(changes, ordersSchema(), nil)
+	if err != nil {
+		panic(err)
+	}
+	return &dataplane.Batch{Table: "orders", Record: rec, Watermark: []byte(pos), Mode: dataplane.UpsertMode}
+}
+
 func upsertBatch(pos string, rows ...int64) *dataplane.Batch {
-	cb := rowchange.Batch{Table: "orders", Position: pos, Mode: rowchange.UpsertMode}
+	var changes []rowchange.Change
 	for _, id := range rows {
-		cb.Changes = append(cb.Changes, rowchange.Change{
+		changes = append(changes, rowchange.Change{
 			Op: rowchange.OpInsert, Key: []any{id},
 			After:    map[string]any{"id": id, "v": fmt.Sprintf("v%d", id)},
 			IngestTS: time.Unix(1700000000, 0).UTC(),
 		})
 	}
-	cs := core.Schema{Columns: []core.Column{
-		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
-	}, PrimaryKey: []string{"id"}}
-	dpb, err := dpint.BatchFromChangeBatch(cb, cs)
-	if err != nil {
-		panic(err)
-	}
-	return dpb
+	return wireBatch(pos, changes)
 }
 
 func deleteBatch(pos string, ids ...int64) *dataplane.Batch {
-	cb := rowchange.Batch{Table: "orders", Position: pos, Mode: rowchange.UpsertMode}
+	var changes []rowchange.Change
 	for _, id := range ids {
-		cb.Changes = append(cb.Changes, rowchange.Change{Op: rowchange.OpDelete, Key: []any{id}})
+		changes = append(changes, rowchange.Change{Op: rowchange.OpDelete, Key: []any{id}})
 	}
-	cs := core.Schema{Columns: []core.Column{
-		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
-	}, PrimaryKey: []string{"id"}}
-	dpb, err := dpint.BatchFromChangeBatch(cb, cs)
-	if err != nil {
-		panic(err)
-	}
-	return dpb
+	return wireBatch(pos, changes)
 }
 
 // TestFastCommitDataThenControl: the batch lands as documents, the control

@@ -61,8 +61,13 @@ type Change struct {
 	// between CommitTS and IngestTS is the per-row replication lag.
 	IngestTS time.Time
 	// Snapshot marks rows read by a DBLog chunk SELECT (true) versus live
-	// stream events (false). It drives the "phase" metadata column.
+	// stream events (false). Read by name on the collapse/window paths.
 	Snapshot bool
+	// Phase is the __phase wire column: "snapshot" for DBLog chunk rows,
+	// "stream" for live events, "" when the producer did not set it. An axis
+	// orthogonal to Op — a snapshot row is semantically an insert. Sinks
+	// materialize it only when the table declares the phase metadata column.
+	Phase string
 	// Window tags the change as part of a DBLog snapshot window. Nil for
 	// plain stream events.
 	Window *Window

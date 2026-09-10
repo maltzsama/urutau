@@ -102,6 +102,7 @@ func pluginSeedBatch(refs []source.TableRef) *dataplane.Batch {
 		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
 		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
 		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+		{Name: "__phase", Type: arrow.BinaryTypes.String, Nullable: true},
 	}, nil)
 	bb := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	for i, v := range []string{"a", "b"} {
@@ -112,6 +113,7 @@ func pluginSeedBatch(refs []source.TableRef) *dataplane.Batch {
 		bb.Field(4).(*array.TimestampBuilder).AppendNull()
 		bb.Field(5).(*array.TimestampBuilder).AppendNull()
 		bb.Field(6).(*array.BooleanBuilder).Append(false)
+		bb.Field(7).(*array.StringBuilder).Append("stream")
 	}
 	rec := bb.NewRecordBatch()
 	return &dataplane.Batch{Table: target, Record: rec, Watermark: []byte("p2")}

@@ -7,8 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -51,7 +52,8 @@ func newChunkExecutor(assign *pb.Assignment, w *Worker, log *slog.Logger, send f
 
 // querySource opens the source's SQL surface on first use. The worker holds
 // only kind + dsn from the assignment, so it builds a minimal spec and
-// resolves the driver through the registry.
+// resolves the driver through the registry. Tests preset x.qsrc to bypass
+// the driver registry.
 func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, error) {
 	if x.qsrc != nil {
 		return x.qsrc, nil
@@ -121,6 +123,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 			Key:      key,
 			After:    row,
 			Snapshot: true,
+			Phase:    core.PhaseSnapshot,
 			IngestTS: time.Now(),
 		})
 		return nil
@@ -129,14 +132,17 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return fmt.Errorf("worker: chunk %d scan: %w", req.ChunkId, err)
 	}
 
-	// Encode against the introspected schema (the worker's known schema for
-	// this target), never a per-batch inference: window rows must carry the
-	// stable table shape the sink expects.
-	cb := rowchange.Batch{Table: ta.TargetTable, Changes: rows, Mode: rowchange.AppendMode}
-	dpb, err := dpint.BatchFromChangeBatch(cb, x.w.KnownSchema(ta.TargetTable))
+	// Build the record against the introspected schema (the worker's known
+	// schema for this target), never a per-batch inference: window rows must
+	// carry the stable table shape the sink expects. MergeSchema keeps that
+	// shape and only appends columns a row carries that the schema lacks.
+	// Snapshot chunk rows are inserts only, so the bridge C-8 delete guard
+	// does not apply here.
+	rec, err := transport.RecordFromChanges(rows, transport.MergeSchema(rows, x.w.KnownSchema(ta.TargetTable)), nil)
 	if err != nil {
-		return fmt.Errorf("worker: chunk %d bridge: %w", req.ChunkId, err)
+		return fmt.Errorf("worker: chunk %d encode: %w", req.ChunkId, err)
 	}
+	dpb := &dataplane.Batch{Table: ta.TargetTable, Record: rec, Mode: dataplane.AppendMode}
 	// AddWindowRows takes ownership of the batch (the window stores it).
 	if err := x.w.AddWindowRows(ta.TargetTable, req.ChunkId, dpb); err != nil {
 		return err

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
@@ -33,12 +32,8 @@ func toIngestBatch(t *testing.T, changes []rowchange.Change, perBatch int) []Ing
 		if len(chunk) == 0 {
 			continue
 		}
-		cb := rowchange.Batch{Table: chunk[0].Table, Changes: chunk, Mode: rowchange.UpsertMode}
-		dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
-		if err != nil {
-			t.Fatalf("bridge: %v", err)
-		}
-		out = append(out, Ingest{Table: cb.Table, Batch: dpb})
+		dpb := wireBatch(t, chunk[0].Table, dataplane.UpsertMode, chunk)
+		out = append(out, Ingest{Table: chunk[0].Table, Batch: dpb})
 	}
 	return out
 }

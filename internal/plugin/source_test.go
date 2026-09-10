@@ -133,6 +133,7 @@ func TestRecordsFromReader(t *testing.T) {
 		bld.Field(4).(*array.TimestampBuilder).Append(0)
 		bld.Field(5).(*array.TimestampBuilder).Append(0)
 		bld.Field(6).(*array.BooleanBuilder).Append(false)
+		bld.Field(7).(*array.StringBuilder).Append("stream")
 	}
 	appendRow(rowchange.OpInsert, 1, "alice")
 	appendRow(rowchange.OpUpdate, 2, "bob")
@@ -208,5 +209,58 @@ func TestStringPositionOpaqueOffsetsNotOrdered(t *testing.T) {
 	got := position.Min([]position.Position{older, newer})
 	if got.String() != older.String() {
 		t.Fatalf("Min kept %s, want the first (%s) when order is undefined", got, older)
+	}
+}
+
+// TestCdcRecordToWire — a plugin §8.1 CDC record (op/after/offset struct
+// shaped) projects straight into the flat urutau wire schema, no rowchange
+// round-trip visible to the caller.
+func TestCdcRecordToWire(t *testing.T) {
+	alloc := memory.NewGoAllocator()
+	afterType := arrow.StructOf(
+		arrow.Field{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		arrow.Field{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	)
+	cdcSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "op", Type: arrow.BinaryTypes.String},
+		{Name: "after", Type: afterType, Nullable: true},
+		{Name: "offset", Type: arrow.BinaryTypes.Binary},
+		{Name: "ts_source", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
+	}, nil)
+
+	bld := array.NewRecordBuilder(alloc, cdcSchema)
+	defer bld.Release()
+	bld.Field(0).(*array.StringBuilder).Append("c")
+	ab := bld.Field(1).(*array.StructBuilder)
+	ab.Append(true)
+	ab.FieldBuilder(0).(*array.Int64Builder).Append(7)
+	ab.FieldBuilder(1).(*array.StringBuilder).Append("ana")
+	bld.Field(2).(*array.BinaryBuilder).Append([]byte("off-1"))
+	bld.Field(3).(*array.TimestampBuilder).AppendNull()
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+
+	ref := core.TableRef{Source: "s.t", Target: "d.t", PrimaryKey: []string{"id"}}
+	wire, offset, err := cdcRecordToWire(rec, cdcSchema, ref, alloc)
+	if err != nil {
+		t.Fatalf("cdcRecordToWire: %v", err)
+	}
+	defer wire.Release()
+	if offset != "b2ZmLTE=" { // base64("off-1")
+		t.Fatalf("offset = %q, want base64(off-1)", offset)
+	}
+
+	rows, err := transport.DecodeBatch(wire, "d.t", []string{"id"})
+	if err != nil {
+		t.Fatalf("decode wire: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Op != rowchange.OpInsert {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if rows[0].After["id"] != int64(7) || rows[0].After["name"] != "ana" {
+		t.Fatalf("after = %v", rows[0].After)
+	}
+	if rows[0].Key[0] != int64(7) {
+		t.Fatalf("key = %v", rows[0].Key)
 	}
 }

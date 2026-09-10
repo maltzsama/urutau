@@ -87,6 +87,7 @@ type rowMeta struct {
 	CommitTS   time.Time
 	IngestTS   time.Time
 	Snapshot   bool
+	Phase      string
 	EnrichMiss bool
 }
 
@@ -99,6 +100,7 @@ func rowMetaOf(r *transport.BatchReader, i int) rowMeta {
 		CommitTS: commitTS,
 		IngestTS: ingestTS,
 		Snapshot: r.Snapshot(i),
+		Phase:    r.Phase(i),
 	}
 }
 
@@ -167,10 +169,13 @@ func metaValue(key core.MetadataKey, c rowMeta, sourceTable string) (any, error)
 	case core.MetaSourceTable:
 		return sourceTable, nil
 	case core.MetaPhase:
-		if c.Snapshot {
-			return "snapshot", nil
+		if c.Phase != "" {
+			return c.Phase, nil
 		}
-		return "stream", nil
+		if c.Snapshot {
+			return core.PhaseSnapshot, nil
+		}
+		return core.PhaseStream, nil
 	case core.MetaStream:
 		// Wire path: no transport envelope; the source table IS the stream.
 		return sourceTable, nil

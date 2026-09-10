@@ -491,10 +491,11 @@ func TestCodecBinaryLifetimeAfterRelease(t *testing.T) {
 	}
 }
 
-// T-6: AddMetadata without duplicates + decode past AddMetadata.
-func TestCodecAddMetadataNoDuplicates(t *testing.T) {
-	// AddMetadata should not duplicate existing metadata columns.
-	// If __phase already exists on the wire, AddMetadata must not add a second.
+// A minimal one-data-column batch and a record with a column past the
+// metadata tail.
+func TestCodecEncodeSingleDataColumn(t *testing.T) {
+	// A minimal one-data-column batch round-trips through the 6-column
+	// metadata tail without error.
 	schema := core.Schema{
 		Columns: []core.Column{
 			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
@@ -665,10 +666,10 @@ func TestCodecCompositeKeyTypesRoundTrip(t *testing.T) {
 	}
 }
 
-// T-6 (transport side): a record with __phase appended past the metadata
-// tail (i.e. post-AddMetadata) is NOT wire-schema — decode must fail with
-// a clean error instead of silently promoting __phase to a data column.
-func TestCodecDecodeRejectsPostAddMetadataRecord(t *testing.T) {
+// A record with a column appended PAST the metadata tail is not
+// wire-schema — decode must fail with a clean error instead of silently
+// promoting it to a data column.
+func TestCodecDecodeRejectsColumnPastMetadataTail(t *testing.T) {
 	schema := core.Schema{
 		Columns: []core.Column{
 			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
@@ -695,10 +696,10 @@ func TestCodecDecodeRejectsPostAddMetadataRecord(t *testing.T) {
 	}
 	defer rec.Release()
 
-	// Append a __phase string column, mimicking AddMetadata output.
+	// Append a stray column past the metadata tail.
 	phaseBld := array.NewStringBuilder(memory.DefaultAllocator)
 	defer phaseBld.Release()
-	phaseBld.Append("live")
+	phaseBld.Append("extra")
 	phaseArr := phaseBld.NewStringArray()
 	defer phaseArr.Release()
 
@@ -708,7 +709,7 @@ func TestCodecDecodeRejectsPostAddMetadataRecord(t *testing.T) {
 		cols[i] = rec.Column(i)
 	}
 	cols[rec.NumCols()] = phaseArr
-	fields := append(rec.Schema().Fields(), arrow.Field{Name: "__phase", Type: arrow.BinaryTypes.String, Nullable: true})
+	fields := append(rec.Schema().Fields(), arrow.Field{Name: "__extra", Type: arrow.BinaryTypes.String, Nullable: true})
 	tagged := array.NewRecordBatch(arrow.NewSchema(fields, nil), cols, rec.NumRows())
 	for _, c := range cols {
 		c.Release()
@@ -716,7 +717,7 @@ func TestCodecDecodeRejectsPostAddMetadataRecord(t *testing.T) {
 	defer tagged.Release()
 
 	if _, err := DecodeBatch(tagged, "t", schema.PrimaryKey); err == nil {
-		t.Fatal("decode must reject a post-AddMetadata record (__phase in data region)")
+		t.Fatal("decode must reject a record with a column past the metadata tail")
 	}
 }
 
