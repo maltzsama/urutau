@@ -252,7 +252,12 @@ func Run(ctx context.Context, cfg Config) error {
 	c.terminate = make(chan error, 1)
 	if cfg.MetricsAddr != "" {
 		c.metrics = observability.New()
-		go func() { _ = c.metrics.Serve(cfg.MetricsAddr, c.statusz) }()
+		go func() {
+			// A busy port silently disables observability otherwise — say so.
+			if err := c.metrics.Serve(cfg.MetricsAddr, c.statusz); err != nil {
+				c.log.Warn("coordinator: metrics server stopped", "addr", cfg.MetricsAddr, "err", err)
+			}
+		}()
 	}
 	return c.run(ctx)
 }
@@ -741,6 +746,11 @@ const gateMaxEvents = 1024
 // gate blocks the pump until the snapshot drains it, instead of growing the
 // buffer without bound. Ownership: when gateHold returns true the batch is
 // in the gate and released by flushWindow/closeWindow.
+//
+// If the context dies while the pump waits on a full gate, gateHold returns
+// false and the batch is treated as live (not gated). That is only reachable
+// during shutdown, where the pump exits on ctx.Done immediately after — it
+// must not be relied on in any live path.
 func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 	c.gateMu.Lock()
 	if !c.gateOn || b.Table != c.gateTgt {
