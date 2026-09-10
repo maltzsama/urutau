@@ -972,8 +972,9 @@ func rowHasImage(r *transport.BatchReader, nonPK []string, i int) bool {
 
 // schemaDrift returns the first data column the batch carries a VALUE in
 // that the known schema lacks. An all-null extra column is a padding
-// artifact of the row bridge, not a source column; only a column the batch
-// actually populates counts as drift.
+// artifact of schema merging (e.g. a reference column declared but not yet
+// populated), not a source column; only a column the batch actually
+// populates counts as drift.
 func schemaDrift(b *dataplane.Batch, schema core.Schema) (SchemaDrift, bool, error) {
 	rec := b.Record
 	for i := range rec.Schema().NumFields() {
