@@ -536,3 +536,40 @@ func TestParseCommitModeRules(t *testing.T) {
 		t.Fatal("unknown mode accepted")
 	}
 }
+
+// A cast column absent from the wire must fail loudly (FIX-DOC v2 A): the
+// sink would otherwise skip the cast and serialize the raw value.
+func TestBuildDocErrorsOnMissingCastColumn(t *testing.T) {
+	p := &tablePlan{
+		schema: core.Schema{Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "ghost", Type: core.ColumnType{Kind: core.KindString}}, // cast target, absent from the wire
+		}},
+		sourceTable: "src.t",
+	}
+	p.cast, _ = core.ParseCastPolicy(map[string]string{"ghost": "string"})
+
+	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+	}})
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	bld := array.NewRecordBuilder(memory.NewGoAllocator(), data)
+	defer bld.Release()
+	bld.Field(0).(*array.Int64Builder).Append(1)
+	for j := 1; j < int(data.NumFields()); j++ {
+		bld.Field(j).AppendNull()
+	}
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+	reader, err := transport.NewBatchReader(rec, []string{"id"})
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+
+	_, _, err = p.buildDoc(reader, 0)
+	if err == nil || !strings.Contains(err.Error(), `"ghost"`) || !strings.Contains(err.Error(), "kind not found") {
+		t.Fatalf("missing cast column must error citing the column, got %v", err)
+	}
+}
