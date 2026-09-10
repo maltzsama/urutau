@@ -561,27 +561,47 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		if mode == dataplane.AppendMode && specByTarget[target].OnDelete == spec.OnDeleteSkip {
 			w.SetDropDeletes(target, true)
 		}
-		// The drift check knows the source (wire) schema (with its types, so
-		// nested struct drift is caught) per table.
-		if cs := canonicalForTarget(wire, refs, target); len(cs.Columns) > 0 {
-			w.SetKnownSchema(target, cs)
-		}
-		// Enrichment: broadcast reference joins declared for this table.
-		// Built against the introspected schema — a join on a column the
-		// table does not have fails boot, not the first event. Loads run
-		// asynchronously; the cold-start policy governs early traffic.
+		// Enrichment is built BEFORE the wire schema is registered: its
+		// reference columns (explicit selects — known at boot) extend the
+		// wire, so every batch travels with the full column set and the
+		// drift check sees one stable shape from batch 1, miss or hit.
+		var stage *enrich.Stage
 		if t := specByTarget[target]; len(t.Enrich) > 0 {
 			st, err := enrich.New(t.Enrich, columnNames(canonicalForTarget(wire, refs, target)), log)
 			if err != nil {
 				closeQuery()
 				closeStages()
-				closeStages()
-				closeStages()
 				return nil, fmt.Errorf("runner: %s: %w", target, err)
 			}
-			st.Start(ctx)
-			enrichStages = append(enrichStages, st)
-			w.SetEnricher(target, st)
+			stage = st
+			for _, ref := range refs {
+				if ref.Target != target {
+					continue
+				}
+				ws := wire[ref.Source]
+				for _, dest := range stage.RefColumns() {
+					if _, exists := ws.Column(dest); !exists {
+						// Registered decision: reference columns travel as
+						// nullable strings until the columnar join (CR-069)
+						// can resolve their real types.
+						ws.Columns = append(ws.Columns, core.Column{
+							Name: dest,
+							Type: core.ColumnType{Kind: core.KindString, Nullable: true},
+						})
+					}
+				}
+				wire[ref.Source] = ws
+			}
+		}
+		// The drift check knows the source (wire) schema (with its types, so
+		// nested struct drift is caught) per table.
+		if cs := canonicalForTarget(wire, refs, target); len(cs.Columns) > 0 {
+			w.SetKnownSchema(target, cs)
+		}
+		if stage != nil {
+			stage.Start(ctx)
+			enrichStages = append(enrichStages, stage)
+			w.SetEnricher(target, stage)
 		}
 	}
 	r = &Runner{w: w, log: log, ev: ev, enrichStages: enrichStages, closeQuery: func() {

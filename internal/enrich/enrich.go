@@ -120,6 +120,14 @@ type refJoin struct {
 	// maxWaitEvery is the validated cold-buffer latency cap, resolved once
 	// in New for the same reason; zero means "no cap".
 	maxWaitEvery time.Duration
+	// refDests are the FINAL destination names (renames applied) this
+	// reference injects, known at construction for explicit selects. The
+	// join's miss fallback writes NULLs into them when the projected set is
+	// unknown (cold start, empty reference), and Stage.RefColumns exposes
+	// them so the caller can extend the table's wire schema. Empty for a
+	// wildcard select — wildcard destinations are only known at load time
+	// (the documented exception in New).
+	refDests []string
 
 	// snap is the hot-path state: image + dests + hot flag, swapped
 	// atomically on refresh. Load() is lock-free; Store() is called
@@ -157,6 +165,12 @@ type buffered struct {
 // known columns — the checks spec.Validate cannot make without schemas:
 // the join's event side must exist, and the grammar is re-checked so a
 // spec that reached us unvalidated fails loudly here.
+//
+// Wildcard exception: with select ["*"] the reference destinations are only
+// known at load time, so RefColumns is empty and a miss before the first
+// non-empty load injects no columns — the table's schema can drift between
+// the first batches and the first load. Documented trade-off: the
+// cold-start policy governs it, or declare the columns explicitly.
 func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("enrich: no references declared")
@@ -213,6 +227,14 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		if star := len(cfg.Select) == 1 && cfg.Select[0] == "*"; !star {
 			for _, s := range cfg.Select {
 				dest := cfg.Table + "." + s
+				// refDests carries the FINAL destination name (rename
+				// applied) — what the miss fallback writes NULLs into and
+				// what RefColumns exposes for the wire.
+				final := dest
+				if as, ok := cfg.As[final]; ok {
+					final = as
+				}
+				rj.refDests = append(rj.refDests, final)
 				if _, renamed := cfg.As[dest]; renamed {
 					continue // this ref's own rename overrides the default
 				}
@@ -286,6 +308,22 @@ func (s *Stage) SetMetrics(misses, dropped, evicted func(table, ref string)) {
 	for _, rj := range s.refs {
 		rj.metrics = m
 	}
+}
+
+// RefColumns returns the destination columns this stage injects — resolved
+// at construction for explicit selects, empty for a wildcard select (those
+// destinations are only known at load time; see New for the documented
+// exception). The caller adds them to the table's WIRE schema as nullable
+// columns BEFORE the pipeline starts, so every batch travels with the full
+// column set and the drift check sees one stable shape. A left-join miss
+// writes NULL into these columns; the schema declares them nullable, so the
+// wire is never violated.
+func (s *Stage) RefColumns() []string {
+	var out []string
+	for _, rj := range s.refs {
+		out = append(out, rj.refDests...)
+	}
+	return out
 }
 
 // refreshInterval resolves the re-read cadence.
@@ -680,14 +718,15 @@ func (rj *refJoin) apply(c *rowchange.Change) applyResult {
 // event with NULL reference columns and marks it; an inner join drops it.
 // That grammar is the ONLY miss policy — cold start, eviction and expiry
 // all route through it.
-// join merges one matched (or missed) reference row into the change.
+// join merges one matched (or missed) reference row into the change. A miss
+// in a left join passes the event with the reference columns set to NULL —
+// under the projected names when known, else under the construction-time
+// refDests — and marks it; an inner join drops it. That grammar is the ONLY
+// miss policy — cold start, eviction and expiry all route through it.
 //
-// NOTE on empty references (hot with zero rows): buildImage returns dests
-// == nil for an empty image, so the left-join miss path appends NO columns
-// — not even NULLs. The enriched row therefore distinguishes "reference
-// empty/missed" (key absent) from "matched with NULL value" (key present,
-// nil). Downstream consumers must treat a missing enriched key as NULL, or
-// declare the join NOT NULL-able in the sink schema deliberately.
+// Wildcard exception: with select ["*"] the destinations are only known at
+// load time, so a miss before the first non-empty load writes no columns at
+// all (key absent) — the documented exception in New.
 func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest) applyResult {
 	if row == nil {
 		rj.misses.Add(1)
@@ -697,8 +736,19 @@ func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest) a
 		if rj.cfg.JoinType == "inner" {
 			return dropped
 		}
-		for _, d := range dests {
-			c.After[d.as] = nil
+		if dests == nil {
+			// Cold-start or empty-reference miss: the columns are still
+			// declared on the wire — write NULLs under their final names so
+			// the batch keeps the full column set. Empty for a wildcard
+			// select (destinations unknown until load): zero columns, the
+			// documented exception.
+			for _, as := range rj.refDests {
+				c.After[as] = nil
+			}
+		} else {
+			for _, d := range dests {
+				c.After[d.as] = nil
+			}
 		}
 		c.EnrichMiss = true
 		return applied

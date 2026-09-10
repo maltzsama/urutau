@@ -225,20 +225,39 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		w.Register(ta.TargetTable, writer, mode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
-		// The drift check knows the assigned canonical schema — with its
-		// types, so a field added inside a struct column is caught too.
-		w.SetKnownSchema(ta.TargetTable, cs)
 		// Broadcast reference joins arrive with the assignment; the stage
 		// validates the event side against the assigned schema here and
 		// loads its references asynchronously (cold-start policy applies).
+		// Built BEFORE SetKnownSchema: its reference columns (explicit
+		// selects — known at boot) extend the assigned schema, so every
+		// batch travels with the full column set and the drift check sees
+		// one stable shape from batch 1.
+		var stage *enrich.Stage
 		if len(ta.Enrich) > 0 {
 			st, err := buildEnrichStage(ta.Enrich, ta.TargetTable, columnNames(cs), cfg.Logger)
 			if err != nil {
 				return err
 			}
-			st.Start(ctx)
-			stages = append(stages, st)
-			w.SetEnricher(ta.TargetTable, st)
+			stage = st
+			for _, dest := range stage.RefColumns() {
+				if _, exists := cs.Column(dest); !exists {
+					// Registered decision: reference columns travel as
+					// nullable strings until the columnar join (CR-069)
+					// can resolve their real types.
+					cs.Columns = append(cs.Columns, core.Column{
+						Name: dest,
+						Type: core.ColumnType{Kind: core.KindString, Nullable: true},
+					})
+				}
+			}
+		}
+		// The drift check knows the assigned canonical schema — with its
+		// types, so a field added inside a struct column is caught too.
+		w.SetKnownSchema(ta.TargetTable, cs)
+		if stage != nil {
+			stage.Start(ctx)
+			stages = append(stages, stage)
+			w.SetEnricher(ta.TargetTable, stage)
 		}
 	}
 	// The stages' refresh loops live on sessCtx: they die with the session.
