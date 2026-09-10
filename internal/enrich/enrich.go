@@ -101,7 +101,6 @@ type enrichMetrics struct {
 type snapshot struct {
 	image map[string]map[string]any // normalized join key → reference row
 	dests []dest                    // projected reference columns
-	star  bool                      // true when select is ["*"]
 }
 
 // refJoin is one reference: its config, the hot lookup image, and the
@@ -301,7 +300,8 @@ func (rj *refJoin) refreshInterval() (time.Duration, error) {
 	return d, nil
 }
 
-// UseLoader overrides the SQL loader for one reference (test seam).
+// UseLoader overrides the SQL loader for one reference (test seam). Must be
+// called before Start — the loader field has no lock.
 func (s *Stage) UseLoader(refTable string, l Loader) error {
 	for _, rj := range s.refs {
 		if rj.cfg.Table == refTable {
@@ -374,7 +374,7 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		log.Error("enrich: reference load failed (keeping previous image, will retry)", "reference", rj.cfg.Table, "err", err)
 		return
 	}
-	image, dests, star, err := buildImage(rj, rows)
+	image, dests, err := buildImage(rj, rows)
 	if err != nil {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
@@ -382,7 +382,7 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 	}
 	// Atomic swap: the hot path reads this with a single Load(), no lock.
 	wasHot := rj.snap.Load() != nil
-	rj.snap.Store(&snapshot{image: image, dests: dests, star: star})
+	rj.snap.Store(&snapshot{image: image, dests: dests})
 	// Clear the sticky first-load error on ANY success: "Sticky ONLY before
 	// the first success" means a transient boot failure must not poison the
 	// stage forever once the reference comes hot (audit #1).
@@ -428,7 +428,7 @@ func (rj *refJoin) setFirstErr(err error) {
 //
 // The on-reference column is validated to exist and be unique; it is
 // projected only when explicitly listed in select or under "*".
-func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, bool, error) {
+func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, error) {
 	star := len(rj.cfg.Select) == 1 && rj.cfg.Select[0] == "*"
 
 	// A legitimately empty reference (every join misses) is not a broken
@@ -436,11 +436,11 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	// all-miss map. The on/select columns cannot be validated against an
 	// empty result; a later non-empty refresh does.
 	if len(rows) == 0 {
-		return make(map[string]map[string]any), nil, star, nil
+		return make(map[string]map[string]any), nil, nil
 	}
 
 	if _, ok := rows[0][rj.onRef]; !ok {
-		return nil, nil, false, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
+		return nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
 	}
 	available := map[string]bool{}
 	for col := range rows[0] {
@@ -449,7 +449,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	if !star {
 		for _, s := range rj.cfg.Select {
 			if !available[s] {
-				return nil, nil, false, fmt.Errorf("select: reference column %q is not in the query result", s)
+				return nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
 			}
 		}
 	}
@@ -481,13 +481,13 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	if star {
 		for col := range available {
 			if err := addDest(col); err != nil {
-				return nil, nil, false, err
+				return nil, nil, err
 			}
 		}
 	} else {
 		for _, s := range rj.cfg.Select {
 			if err := addDest(s); err != nil {
-				return nil, nil, false, err
+				return nil, nil, err
 			}
 		}
 	}
@@ -504,7 +504,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 		}
 		k := joinKey(row[rj.onRef])
 		if _, dup := image[k]; dup {
-			return nil, nil, false, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
+			return nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
 		}
 		projected := make(map[string]any, len(dests))
 		for refCol, name := range projection {
@@ -512,7 +512,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 		}
 		image[k] = projected
 	}
-	return image, dests, star, nil
+	return image, dests, nil
 }
 
 // Enrich runs the batch through every reference in order and returns the
@@ -530,7 +530,8 @@ func (s *Stage) Enrich(changes []rowchange.Change) ([]rowchange.Change, error) {
 		}
 	}
 	out := make([]seqChange, 0, len(changes))
-	// Release cold-start queues first: FIFO order beats the new traffic.
+	// Release cold-start queues before the new traffic so parked events are
+	// not starved; the final seq-sort restores true arrival order.
 	for i, rj := range s.refs {
 		for _, b := range rj.takeDrained() {
 			// MaxWait: an event parked past the cap follows the join type
@@ -617,7 +618,7 @@ func (s *Stage) enqueue(rj *refJoin, at int, seq uint64, c rowchange.Change, out
 		max = defaultMaxEvents
 	}
 	var evicted []buffered
-	for max > 0 && len(rj.queue) >= max {
+	for len(rj.queue) >= max {
 		evicted = append(evicted, rj.queue[0])
 		rj.queue = rj.queue[1:]
 	}

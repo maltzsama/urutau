@@ -66,7 +66,9 @@ func (s *Stage) EnrichBatch(b *dataplane.Batch, primaryKey []string) (*dataplane
 		return nil, fmt.Errorf("enrich: re-encode: %w", err)
 	}
 	// Carry the batch's watermark and snapshot state through: the sink
-	// needs them to persist position atomically (audit #6).
+	// needs them to persist position atomically (audit #6). Explicit
+	// defensive carry — the bridge sets the same values today; this guards
+	// against bridge divergence.
 	dpb.Watermark = b.Watermark
 	dpb.SnapshotState = b.SnapshotState
 	dpb.SnapshotPending = b.SnapshotPending

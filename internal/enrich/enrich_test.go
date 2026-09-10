@@ -254,8 +254,8 @@ func TestBufferMaxWaitExpires(t *testing.T) {
 	time.Sleep(5 * time.Millisecond) // the parked event is now past MaxWait
 	// Pretend the reference went hot with an empty drain list... no: the
 	// real path flips hot in refresh; simulate by flipping manually.
-	img, dests, star, _ := buildImage(s.refs[0], usersRows())
-	s.refs[0].snap.Store(&snapshot{image: img, dests: dests, star: star})
+	img, dests, _ := buildImage(s.refs[0], usersRows())
+	s.refs[0].snap.Store(&snapshot{image: img, dests: dests})
 	s.refs[0].mu.Lock()
 	s.refs[0].pendingDrain = s.refs[0].queue
 	s.refs[0].queue = nil
