@@ -7,7 +7,6 @@ package enrich
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -26,17 +25,17 @@ func TestEnrichPreservesArrivalOrderAcrossColdRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	// Both references fail their first load -> cold.
-	flu := &fakeLoader{err: errors.New("down")}
-	flo := &fakeLoader{err: errors.New("down")}
+	// Both references start cold: the loaders are ready but no load has run
+	// yet (Start comes after the cold assertion), so there is no sticky
+	// error and every event parks.
+	flu := &fakeLoader{rows: usersRows()}
+	flo := &fakeLoader{rows: usersRows()}
 	if err := s.UseLoader("users", flu); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UseLoader("orders", flo); err != nil {
 		t.Fatal(err)
 	}
-	s.Start(context.Background())
-	defer s.Stop()
 
 	ev := func(id int64) rowchange.Change {
 		return rowchange.Change{Op: rowchange.OpInsert, Key: []any{id},
@@ -45,16 +44,15 @@ func TestEnrichPreservesArrivalOrderAcrossColdRefs(t *testing.T) {
 	}
 	in := []rowchange.Change{ev(1), ev(2), ev(3), ev(4)}
 
-	// Cold: every event parks (output empty).
+	// Cold: every event parks (output empty). No Start yet, so the cold
+	// reference cannot race a sticky first-load error into this assertion.
 	if out, err := s.Enrich(in); err != nil || len(out) != 0 {
 		t.Fatalf("cold enrich: out=%d err=%v, want all parked", len(out), err)
 	}
 
-	// Both references go hot.
-	flu.SetErr(nil)
-	flu.SetRows(usersRows())
-	flo.SetErr(nil)
-	flo.SetRows(usersRows())
+	// Start: both references load and go hot.
+	s.Start(context.Background())
+	defer s.Stop()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && (!s.refs[0].isHot() || !s.refs[1].isHot()) {
 		time.Sleep(time.Millisecond)
