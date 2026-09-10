@@ -21,33 +21,45 @@ import "fmt"
 // addition.
 type Kind uint8
 
+// Kind values are explicit (not iota) because Kind crosses the wire in the
+// Arrow extension metadata and in serialized schemas: inserting a value must
+// never silently renumber the existing ones.
 const (
-	KindUnknown Kind = iota
-	KindBool
-	KindInt32
-	KindInt64
-	KindUInt64 // unsigned 64-bit integer; sources that natively emit uint64 keep
-	// their exact width instead of silently widening to int64.
-	KindFloat32
-	KindFloat64
-	KindDecimal // uses Precision, Scale
-	KindString
-	KindBinary
-	KindFixedBinary // Iceberg fixed(L) — fixed-size byte sequence, distinct from variable binary
-	KindDate        // days since epoch
-	KindTime        // micros since midnight
-	KindTimestamp   // naive wall clock, NO timezone (MySQL DATETIME)
-	KindTimestampTZ // UTC instant (MySQL TIMESTAMP)
-	KindUUID
-	KindJSON // semantically JSON; physically a string in most sinks
+	KindUnknown Kind = 0
+	KindBool    Kind = 1
+	KindInt32   Kind = 2
+	KindInt64   Kind = 3
+	// KindUInt64 is an unsigned 64-bit integer; sources that natively emit
+	// uint64 keep their exact width instead of silently widening to int64.
+	KindUInt64  Kind = 4
+	KindFloat32 Kind = 5
+	KindFloat64 Kind = 6
+	// KindDecimal uses Precision and Scale.
+	KindDecimal Kind = 7
+	KindString  Kind = 8
+	KindBinary  Kind = 9
+	// KindFixedBinary is Iceberg fixed(L) — a fixed-size byte sequence,
+	// distinct from variable binary.
+	KindFixedBinary Kind = 10
+	// KindDate is days since epoch.
+	KindDate Kind = 11
+	// KindTime is micros since midnight.
+	KindTime Kind = 12
+	// KindTimestamp is a naive wall clock, NO timezone (MySQL DATETIME).
+	KindTimestamp Kind = 13
+	// KindTimestampTZ is a UTC instant (MySQL TIMESTAMP).
+	KindTimestampTZ Kind = 14
+	KindUUID        Kind = 15
+	// KindJSON is semantically JSON; physically a string in most sinks.
+	KindJSON Kind = 16
 
 	// Composite kinds — a separate dimension of the model, entered only
 	// because both sides of the boundary have a real representation for
 	// them: message-log sources (Avro/Protobuf via schema registry) produce
 	// nested values and Iceberg holds struct/list/map natively.
-	KindStruct
-	KindList
-	KindMap
+	KindStruct Kind = 17
+	KindList   Kind = 18
+	KindMap    Kind = 19
 )
 
 // String renders the kind name for errors and diagnostics.
@@ -150,6 +162,12 @@ func (t ColumnType) String() string {
 		return fmt.Sprintf("decimal(%d,%d)", t.Precision, t.Scale)
 	case KindFixedBinary:
 		return fmt.Sprintf("fixed(%d)", t.FixedSize)
+	case KindUnknown:
+		// Carry the provenance into diagnostics instead of dropping it.
+		if t.Opaque != nil {
+			return "unknown (" + t.Opaque.String() + ")"
+		}
+		return "unknown"
 	default:
 		return t.Kind.String()
 	}
@@ -195,6 +213,33 @@ func (s Schema) KeyIndexes() ([]int, error) {
 	return out, nil
 }
 
+// Validate reports whether the schema is internally coherent: every column
+// is named, names are unique, and the primary key names existing columns
+// without repetition. An empty schema is valid.
+func (s Schema) Validate() error {
+	seen := make(map[string]bool, len(s.Columns))
+	for _, c := range s.Columns {
+		if c.Name == "" {
+			return fmt.Errorf("core: schema has a column with an empty name")
+		}
+		if seen[c.Name] {
+			return fmt.Errorf("core: schema has duplicate column %q", c.Name)
+		}
+		seen[c.Name] = true
+	}
+	key := make(map[string]bool, len(s.PrimaryKey))
+	for _, name := range s.PrimaryKey {
+		if !seen[name] {
+			return fmt.Errorf("core: primary key column %q not in schema", name)
+		}
+		if key[name] {
+			return fmt.Errorf("core: primary key lists %q twice", name)
+		}
+		key[name] = true
+	}
+	return nil
+}
+
 // TableRef identifies one replicated table on both sides. This is the
 // pipeline-wide table identity (replaces the per-source TableRef).
 type TableRef struct {
@@ -214,6 +259,27 @@ func ParseColumnType(s string) (ColumnType, error) {
 	return ct.Type, nil
 }
 
-// Row is a decoded source row: column name → value, using only the Go types
-// that ColumnType.Kind implies.
+// Row is a decoded source row: column name → value. The Go type per Kind is
+// the canonical contract both cast kernels (core.Convert and the columnar
+// encoder) rely on:
+//
+//	KindBool        bool
+//	KindInt32       int32
+//	KindInt64       int64
+//	KindUInt64      uint64
+//	KindFloat32     float32
+//	KindFloat64     float64
+//	KindDecimal     string (decimal text)
+//	KindString      string
+//	KindBinary      []byte
+//	KindFixedBinary []byte
+//	KindDate        time.Time, int32 days, or "2006-01-02" text
+//	KindTime        time.Time, int64 micros, or "15:04:05" text
+//	KindTimestamp   time.Time or naive timestamp text
+//	KindTimestampTZ time.Time or RFC3339 text
+//	KindUUID        string or 16 raw bytes
+//	KindJSON        string, []byte, or a Go composite (map/slice)
+//
+// A Kind may arrive in more than one representation — the DBLog snapshot and
+// the live stream decode differently — so both kernels accept the union.
 type Row map[string]any

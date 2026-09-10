@@ -1,9 +1,11 @@
 package core
 
 import (
+	"bytes"
 	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseCastTarget(t *testing.T) {
@@ -366,5 +368,71 @@ func TestResolveWarnsOnPKCast(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("Resolve should warn about a cast on a primary-key column, got %v", warns)
+	}
+}
+
+// ── Columnar-representation completeness (the worker/sink round-trip) ──
+
+// The sink re-applies Convert to values the worker already cast, so Convert
+// must accept the canonical columnar representations too.
+func TestConvertAcceptsColumnarRepresentations(t *testing.T) {
+	ts := time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC)
+
+	// timestamp <- time.Time (a batch that skipped the worker cast).
+	got, err := CastTarget{Type: ColumnType{Kind: KindTimestamp}}.Convert(ts)
+	if err != nil || got != "2024-01-02 15:04:05.000000000" {
+		t.Fatalf("timestamp <- time.Time = %v, %v", got, err)
+	}
+	// timestamptz <- time.Time.
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindTimestampTZ}}).Convert(ts); err != nil || got != "2024-01-02T15:04:05Z" {
+		t.Fatalf("timestamptz <- time.Time = %v, %v", got, err)
+	}
+	// uuid <- 16 raw bytes (idempotent re-cast).
+	raw := bytes.Repeat([]byte{0xab}, 16)
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindUUID}}).Convert(raw); err != nil || !bytes.Equal(got.([]byte), raw) {
+		t.Fatalf("uuid <- []byte = %v, %v", got, err)
+	}
+	if _, err := (CastTarget{Type: ColumnType{Kind: KindUUID}}).Convert([]byte{1, 2, 3}); err == nil {
+		t.Error("uuid <- 3 bytes must error")
+	}
+	// json <- []byte and <- composite.
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindJSON}}).Convert([]byte(`{"a":1}`)); err != nil || got != `{"a":1}` {
+		t.Fatalf("json <- []byte = %v, %v", got, err)
+	}
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindJSON}}).Convert(map[string]any{"a": float64(1)}); err != nil || got != `{"a":1}` {
+		t.Fatalf("json <- map = %v, %v", got, err)
+	}
+}
+
+// StringifyScalar is the shared Go-type → string mapping.
+func TestStringifyScalar(t *testing.T) {
+	if s, err := StringifyScalar(time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)); err != nil || s != "2024-01-02T00:00:00Z" {
+		t.Fatalf("StringifyScalar(time) = %q, %v", s, err)
+	}
+	if _, err := StringifyScalar([]byte{1}); err == nil {
+		t.Error("StringifyScalar([]byte) must error — binary needs an encoding")
+	}
+}
+
+// The single naive layout covers both with and without a fraction.
+func TestParseTimestampText(t *testing.T) {
+	for _, in := range []string{"2024-01-02", "2024-01-02 15:04:05", "2024-01-02 15:04:05.123", "2024-01-02T15:04:05Z"} {
+		if _, err := ParseTimestampText(in); err != nil {
+			t.Errorf("ParseTimestampText(%q): %v", in, err)
+		}
+	}
+	if _, err := ParseTimestampText("not a time"); err == nil {
+		t.Error("ParseTimestampText must reject free-form text")
+	}
+}
+
+func TestParseTimeOfDayText(t *testing.T) {
+	got, err := ParseTimeOfDayText("15:04:05.000001")
+	if err != nil {
+		t.Fatalf("ParseTimeOfDayText: %v", err)
+	}
+	want := int64(15*3_600_000_000 + 4*60_000_000 + 5*1_000_000 + 1)
+	if got != want {
+		t.Fatalf("micros = %d, want %d", got, want)
 	}
 }

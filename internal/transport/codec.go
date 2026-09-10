@@ -448,21 +448,40 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			return fmt.Errorf("want float64-compatible, got %T", v)
 		}
 	case core.KindDecimal:
-		s, ok := v.(string)
-		if !ok {
-			return fmt.Errorf("decimal: want string, got %T", v)
-		}
-		if err := bld.(*array.Decimal128Builder).AppendValueFromString(s); err != nil {
-			return fmt.Errorf("decimal parse: %w", err)
+		switch t := v.(type) {
+		case string:
+			if err := bld.(*array.Decimal128Builder).AppendValueFromString(t); err != nil {
+				return fmt.Errorf("decimal parse: %w", err)
+			}
+		case int, int32, int64, float32, float64:
+			// A numeric source column cast to decimal renders its decimal
+			// text through the shared kernel, then appends that.
+			s, err := (core.CastTarget{Type: ct}).Convert(v)
+			if err != nil {
+				return err
+			}
+			if err := bld.(*array.Decimal128Builder).AppendValueFromString(s.(string)); err != nil {
+				return fmt.Errorf("decimal parse: %w", err)
+			}
+		default:
+			return fmt.Errorf("decimal: want string or number, got %T", v)
 		}
 	case core.KindString, core.KindJSON:
 		switch t := v.(type) {
 		case string:
 			bld.(*array.StringBuilder).Append(t)
 		case []byte:
+			// A text-typed source may hand over raw bytes (the snapshot
+			// normalizers only cover some drivers); keep them as-is.
 			bld.(*array.StringBuilder).Append(string(t))
 		default:
-			return fmt.Errorf("want string, got %T", v)
+			// "to string always": bool/int/float/time.Time/composite all
+			// render through the shared scalar stringifier.
+			s, err := core.StringifyScalar(v)
+			if err != nil {
+				return err
+			}
+			bld.(*array.StringBuilder).Append(s)
 		}
 	case core.KindBinary:
 		switch t := v.(type) {
@@ -488,6 +507,14 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 				return fmt.Errorf("date %d out of int32 range", t)
 			}
 			bld.(*array.Date32Builder).Append(arrow.Date32(t))
+		case time.Time:
+			bld.(*array.Date32Builder).Append(arrow.Date32FromTime(t))
+		case string:
+			tm, err := core.ParseTimestampText(t)
+			if err != nil {
+				return fmt.Errorf("date: %w", err)
+			}
+			bld.(*array.Date32Builder).Append(arrow.Date32FromTime(tm))
 		default:
 			return fmt.Errorf("want date-int32, got %T", v)
 		}
@@ -498,6 +525,14 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Time64Builder).Append(arrow.Time64(t))
 		case int:
 			bld.(*array.Time64Builder).Append(arrow.Time64(t))
+		case time.Time:
+			bld.(*array.Time64Builder).Append(arrow.Time64(timeOfDayMicros(t)))
+		case string:
+			micros, err := core.ParseTimeOfDayText(t)
+			if err != nil {
+				return fmt.Errorf("time: %w", err)
+			}
+			bld.(*array.Time64Builder).Append(arrow.Time64(micros))
 		default:
 			return fmt.Errorf("want time-int64, got %T", v)
 		}
@@ -505,6 +540,12 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		switch t := v.(type) {
 		case time.Time:
 			bld.(*array.TimestampBuilder).AppendTime(t)
+		case string:
+			tm, err := core.ParseTimestampText(t)
+			if err != nil {
+				return fmt.Errorf("timestamp: %w", err)
+			}
+			bld.(*array.TimestampBuilder).AppendTime(tm)
 		default:
 			return fmt.Errorf("want time.Time, got %T", v)
 		}
@@ -605,6 +646,13 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		return fmt.Errorf("unsupported kind %s", ct.Kind)
 	}
 	return nil
+}
+
+// timeOfDayMicros returns the micros since midnight for a wall-clock time,
+// ignoring the date and zone (the canonical KindTime representation).
+func timeOfDayMicros(t time.Time) int64 {
+	return int64(t.Hour())*3_600_000_000 + int64(t.Minute())*60_000_000 +
+		int64(t.Second())*1_000_000 + int64(t.Nanosecond())/1_000
 }
 
 // readTypedValue reads a single typed value from an Arrow column at row i.

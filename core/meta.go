@@ -6,6 +6,11 @@
 // a value that already exists.
 package core
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // MetadataKey identifies one pipeline-provided value that can be landed as a
 // column in the target table. The catalog is closed: every key has a fixed
 // canonical type and a fixed semantic, and there is no free-form field.
@@ -60,16 +65,45 @@ const (
 // String renders the key name.
 func (k MetadataKey) String() string { return string(k) }
 
-// ColumnType returns the canonical type the key lands as.
+// ColumnType returns the canonical type the key lands as. Every metadata
+// column is nullable: snapshot rows carry NULL for commit_ts, the transport
+// envelope is NULL for CDC sources, and a left-join miss is NULL for
+// enrich_miss. The kind is the shape; nullability is a property of the value
+// and is always true for a metadata column.
 func (k MetadataKey) ColumnType() ColumnType {
 	switch k {
 	case MetaCommitTS, MetaIngestTS, MetaMsgTS:
-		return ColumnType{Kind: KindTimestampTZ}
+		return ColumnType{Kind: KindTimestampTZ, Nullable: true}
 	case MetaEnrichMiss:
 		return ColumnType{Kind: KindBool, Nullable: true}
 	default:
-		return ColumnType{Kind: KindString}
+		return ColumnType{Kind: KindString, Nullable: true}
 	}
+}
+
+// UnmarshalJSON validates the key against the closed catalog at parse time,
+// so a spec typo fails at load instead of at schema resolution. The spec
+// loader round-trips YAML through JSON, so this is the effective hook.
+func (k *MetadataKey) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	return k.set(s)
+}
+
+// UnmarshalText is the YAML/text counterpart of UnmarshalJSON.
+func (k *MetadataKey) UnmarshalText(b []byte) error {
+	return k.set(string(b))
+}
+
+func (k *MetadataKey) set(s string) error {
+	key := MetadataKey(s)
+	if !validMetadataKey(key) {
+		return fmt.Errorf("core: unknown metadata key %q (the catalog is closed)", s)
+	}
+	*k = key
+	return nil
 }
 
 // MetadataColumn maps one metadata key to a destination column name. The
