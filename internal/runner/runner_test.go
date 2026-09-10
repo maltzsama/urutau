@@ -293,3 +293,17 @@ func TestIntrospectAllExtendsBothShapesForEnrich(t *testing.T) {
 		}
 	}
 }
+
+// FT-5: the golden-path integration — a spec with enrich, an empty→hot
+// loader, and a runner with fake source/sink producing one batch per phase,
+// asserting the schema of the batch WRITTEN to the sink — is not covered
+// here. The runner has no fake source/sink harness: newRunner needs a
+// streaming source.Reader (Start/Next/Close) and a full sink.Sink, plus the
+// snapshot/caught-up machinery; the existing gateCommitter drives a worker
+// directly, not newRunner. That is a new harness, not an adaptation.
+// Coverage stands on the two halves instead: the wire extension
+// (TestIntrospectAllExtendsBothShapesForEnrich) and the seam schema equality
+// (enrich.TestEnrichBatchSameSchemaAcrossEmptyAndHotReference).
+func TestGoldenPathEnrichRunnerIntegration(t *testing.T) {
+	t.Skip("needs a fake streaming source.Reader + sink.Sink harness; tracked in the PR body")
+}

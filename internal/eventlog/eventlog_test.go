@@ -218,10 +218,10 @@ func (p *orderPutter) Put(_ context.Context, _ string, key string, body []byte) 
 	return nil
 }
 
-func (p *orderPutter) snapshot() (keys, bodies []string) {
+func (p *orderPutter) snapshot() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]string(nil), p.keys...), append([]string(nil), p.bodies...)
+	return append([]string(nil), p.bodies...)
 }
 
 // E-1: two concurrent Emits must land their PUTs in append order — the one
@@ -246,7 +246,7 @@ func TestConcurrentEmitPreservesPUTOrder(t *testing.T) {
 	}
 	wg.Wait()
 
-	keys, bodies := p.snapshot()
+	bodies := p.snapshot()
 	if len(bodies) != n {
 		t.Fatalf("puts = %d, want %d", len(bodies), n)
 	}
@@ -261,7 +261,6 @@ func TestConcurrentEmitPreservesPUTOrder(t *testing.T) {
 			t.Fatalf("last PUT missing event %d: %s", i, last)
 		}
 	}
-	_ = keys
 }
 
 // failNthPutter fails exactly one PUT (by call index), recording everything.
@@ -345,7 +344,7 @@ func TestCloseSerializesWithInFlightEmits(t *testing.T) {
 	}
 	// Every PUT body is a prefix of the final buffer (appends only grow it),
 	// so the largest body must carry exactly the accepted events.
-	_, bodies := p.snapshot()
+	bodies := p.snapshot()
 	maxLines := 0
 	for _, b := range bodies {
 		if c := strings.Count(b, "\n"); c > maxLines {
@@ -457,7 +456,7 @@ func TestCloseAfterRotationFlushesCurrentObject(t *testing.T) {
 	if err := r.Emit(context.Background(), "final", nil); err != nil {
 		t.Fatal(err)
 	}
-	current := r.ObjectKey()
+	current := r.ObjectKey() // single-threaded test; r.seq read without mu
 
 	r.Close()
 
