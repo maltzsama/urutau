@@ -1202,6 +1202,7 @@ type ChunkReady struct {
 	ChunkId         uint32                 `protobuf:"varint,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"`
 	Rows            uint64                 `protobuf:"varint,3,opt,name=rows,proto3" json:"rows,omitempty"`
 	DroppedByWindow uint64                 `protobuf:"varint,4,opt,name=dropped_by_window,json=droppedByWindow,proto3" json:"dropped_by_window,omitempty"` // proves DBLog is working
+	Epoch           uint64                 `protobuf:"varint,5,opt,name=epoch,proto3" json:"epoch,omitempty"`                                              // the Assignment epoch this reply belongs to; stale-epoch replies are ignored
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1260,6 +1261,13 @@ func (x *ChunkReady) GetRows() uint64 {
 func (x *ChunkReady) GetDroppedByWindow() uint64 {
 	if x != nil {
 		return x.DroppedByWindow
+	}
+	return 0
+}
+
+func (x *ChunkReady) GetEpoch() uint64 {
+	if x != nil {
+		return x.Epoch
 	}
 	return 0
 }
@@ -1769,13 +1777,14 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12\x16\n" +
 	"\x06bounds\x18\x03 \x01(\fR\x06bounds\x12%\n" +
-	"\x0einclusive_high\x18\x04 \x01(\bR\rinclusiveHigh\"}\n" +
+	"\x0einclusive_high\x18\x04 \x01(\bR\rinclusiveHigh\"\x93\x01\n" +
 	"\n" +
 	"ChunkReady\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12\x12\n" +
 	"\x04rows\x18\x03 \x01(\x04R\x04rows\x12*\n" +
-	"\x11dropped_by_window\x18\x04 \x01(\x04R\x0fdroppedByWindow\"\x83\x01\n" +
+	"\x11dropped_by_window\x18\x04 \x01(\x04R\x0fdroppedByWindow\x12\x14\n" +
+	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\"\x83\x01\n" +
 	"\vChunkFailed\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12+\n" +

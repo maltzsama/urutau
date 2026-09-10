@@ -899,22 +899,19 @@ func (c *Coordinator) confirmedPosition() position.Position {
 	return best
 }
 
-// waitChunkReady blocks until the worker reports the chunk SELECT done.
-//
-// KNOWN RESIDUAL (CD-5 follow-up, low risk): a ChunkReady is matched on
-// (table, chunkID) with no epoch tag, so a stale/replayed reply from a
-// superseded generation with the same ids would satisfy the wait. The CD-5
-// fail-fast (session loss during an active snapshot fails the run) removes
-// the session-loss path that produced stale replies; a same-epoch duplicate
-// is not rejected. Tag ChunkReady with the epoch if this ever surfaces.
-func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32) error {
+// waitChunkReady blocks until the worker reports the chunk SELECT done for
+// THIS epoch. A ChunkReady from a superseded generation (same table+chunkID,
+// different epoch) is ignored, so a stale reply cannot satisfy the wait
+// against a dead window.
+func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32, epoch uint64) error {
 	for {
 		select {
 		case cr := <-c.chunkReady:
-			if cr.Table == table && cr.ChunkId == chunkID {
+			if cr.Table == table && cr.ChunkId == chunkID && cr.Epoch == epoch {
 				return nil
 			}
-			c.log.Warn("coordinator: unexpected ChunkReady", "table", cr.Table, "chunk", cr.ChunkId)
+			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
+				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -937,6 +934,11 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	if !ok {
 		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
 	}
+	// The epoch the ChunkRequests are sent under; the worker echoes it on
+	// ChunkReady so a reply from a superseded generation is ignored.
+	c.mu.Lock()
+	epoch := w.epoch
+	c.mu.Unlock()
 
 	for i, ch := range chunks {
 		chunkID := uint32(i)
@@ -959,7 +961,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 			return ctx.Err()
 		}
 
-		if err := c.waitChunkReady(ctx, ref.Source, chunkID); err != nil {
+		if err := c.waitChunkReady(ctx, ref.Source, chunkID, epoch); err != nil {
 			return err
 		}
 		c.log.Info("chunk ready", "table", ref.Source, "chunk", chunkID)

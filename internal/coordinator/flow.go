@@ -44,10 +44,9 @@ func (b *flowBudget) sum() int64 {
 // over budget AND the worker is beyond its minimum floor. The wait is
 // ctx-aware: a cancelled pipeline stops waiting.
 //
-// DEFERRED OPTIMIZATION: each acquire spawns a goroutine + channel to
-// broadcast on ctx.Done (one per batch on the hot path). Correct, but
-// allocates; a single notifier goroutine per budget would remove it. Not
-// worth the complexity until profiling shows it.
+// The ctx wake-up uses context.AfterFunc, which registers a callback fired
+// only on cancellation — no goroutine or channel is allocated on the hot
+// (under-budget) path.
 func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -56,15 +55,8 @@ func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error 
 	defer b.mu.Unlock()
 
 	// Wake blocked waiters when ctx dies, so they re-check and exit.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			b.cond.Broadcast()
-		case <-stop:
-		}
-	}()
+	stop := context.AfterFunc(ctx, func() { b.cond.Broadcast() })
+	defer stop()
 
 	for b.sum()+n > b.totalBytes && b.used[worker]+n > b.perWorkerMin {
 		if err := ctx.Err(); err != nil {
