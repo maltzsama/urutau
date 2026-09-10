@@ -47,8 +47,14 @@ type Spec struct {
 }
 
 type Source struct {
-	Kind          string `json:"kind"`
-	URI           string `json:"uri"`
+	Kind string `json:"kind"`
+	URI  string `json:"uri"`
+	// SnapshotURI is a READ-ONLY connection string the workers use for the
+	// snapshot chunk SELECT. The full replication URI stays coordinator-only;
+	// the worker never needs replication credentials, so a deployment can
+	// grant the worker a SELECT-only user. When empty, URI is used (the
+	// pre-scoping behavior).
+	SnapshotURI   string `json:"snapshotUri,omitempty"`
 	ServerID      string `json:"serverId,omitempty"`
 	SlotName      string `json:"slotName,omitempty"`
 	SnapshotMode  string `json:"snapshotMode,omitempty"`

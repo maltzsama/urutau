@@ -70,7 +70,17 @@ type Stage struct {
 
 	// metrics is optional; when set, counters are mirrored to Prometheus.
 	metrics *enrichMetrics
+
+	// seq stamps every event with its arrival order. Cold-start buffering
+	// parks events in per-reference queues and drains them reference by
+	// reference, which can reorder events across references relative to
+	// arrival; the output is sorted by seq so last-write-wins downstream
+	// sees true arrival order (enrich #5).
+	seq atomic.Uint64
 }
+
+// nextSeq returns the next arrival-order stamp.
+func (s *Stage) nextSeq() uint64 { return s.seq.Add(1) }
 
 // enrichMetrics wraps the Prometheus counters for the enrichment stage.
 // Nil-safe: if the pointer is nil, Inc calls are no-ops.
@@ -130,6 +140,7 @@ type dest struct {
 type buffered struct {
 	c      rowchange.Change
 	queued time.Time
+	seq    uint64 // arrival-order stamp, preserved across parking
 }
 
 // New builds the stage and validates the declarations against the event's
@@ -504,7 +515,7 @@ func (s *Stage) Enrich(changes []rowchange.Change) ([]rowchange.Change, error) {
 			return nil, fmt.Errorf("enrich: reference %q: %w", rj.cfg.Table, err)
 		}
 	}
-	out := make([]rowchange.Change, 0, len(changes))
+	out := make([]seqChange, 0, len(changes))
 	// Release cold-start queues first: FIFO order beats the new traffic.
 	for i, rj := range s.refs {
 		for _, b := range rj.takeDrained() {
@@ -513,22 +524,37 @@ func (s *Stage) Enrich(changes []rowchange.Change) ([]rowchange.Change, error) {
 			if wait := rj.maxWait(); wait > 0 && time.Since(b.queued) > wait {
 				s.evicted.Add(1)
 				if s.metrics != nil {
-					s.metrics.evicted(rj.cfg.Table, rj.cfg.Table)
+					s.metrics.evicted(b.c.Table, rj.cfg.Table)
 				}
-				s.forceMiss(i, b.c, &out)
+				s.forceMiss(i, b.seq, b.c, &out)
 				continue
 			}
-			s.applyFrom(i, b.c, &out)
+			s.applyFrom(i, b.seq, b.c, &out)
 		}
 	}
 	for _, c := range changes {
-		s.applyFrom(0, c, &out)
+		s.applyFrom(0, s.nextSeq(), c, &out)
 	}
-	return out, nil
+	// Arrival order, not reference-drain order: a cold-start buffer parks
+	// events per reference and they drain reference by reference, which can
+	// reorder across references. Sorting by seq restores true arrival order
+	// so the downstream last-write-wins collapse is correct (enrich #5).
+	sort.SliceStable(out, func(i, j int) bool { return out[i].seq < out[j].seq })
+	res := make([]rowchange.Change, len(out))
+	for i := range out {
+		res[i] = out[i].c
+	}
+	return res, nil
+}
+
+// seqChange is one output event tagged with its arrival-order stamp.
+type seqChange struct {
+	seq uint64
+	c   rowchange.Change
 }
 
 // applyFrom pushes one change through references starting at i.
-func (s *Stage) applyFrom(i int, c rowchange.Change, out *[]rowchange.Change) {
+func (s *Stage) applyFrom(i int, seq uint64, c rowchange.Change, out *[]seqChange) {
 	for ; i < len(s.refs); i++ {
 		rj := s.refs[i]
 		switch rj.apply(&c) {
@@ -537,20 +563,20 @@ func (s *Stage) applyFrom(i int, c rowchange.Change, out *[]rowchange.Change) {
 		case dropped:
 			s.innerDropped.Add(1)
 			if s.metrics != nil {
-				s.metrics.dropped(rj.cfg.Table, rj.cfg.Table)
+				s.metrics.dropped(c.Table, rj.cfg.Table)
 			}
 			return
 		case parked:
-			s.enqueue(rj, i, c, out)
+			s.enqueue(rj, i, seq, c, out)
 			return
 		}
 	}
-	*out = append(*out, c)
+	*out = append(*out, seqChange{seq: seq, c: c})
 }
 
 // forceMiss joins a change against reference i as a miss (whatever the
 // event was, it will not be matched) and continues downstream.
-func (s *Stage) forceMiss(i int, c rowchange.Change, out *[]rowchange.Change) {
+func (s *Stage) forceMiss(i int, seq uint64, c rowchange.Change, out *[]seqChange) {
 	// Deletes never park (apply bypasses every cold policy), so a key-only
 	// delete reaching here is impossible; the guard is defensive only.
 	if c.After == nil {
@@ -563,32 +589,32 @@ func (s *Stage) forceMiss(i int, c rowchange.Change, out *[]rowchange.Change) {
 		dests = snap.dests
 	}
 	if rj.join(&c, nil, dests) == applied {
-		s.applyFrom(i+1, c, out)
+		s.applyFrom(i+1, seq, c, out)
 	}
 }
 
 // enqueue parks a change in a cold-start buffer, evacuating the oldest
 // when MaxEvents is exceeded. An evacuated change follows the join type —
 // the buffer's bounds are a latency/memory contract, not a third policy.
-func (s *Stage) enqueue(rj *refJoin, at int, c rowchange.Change, out *[]rowchange.Change) {
+func (s *Stage) enqueue(rj *refJoin, at int, seq uint64, c rowchange.Change, out *[]seqChange) {
 	rj.mu.Lock()
 	max := rj.cfg.BufferLimits.MaxEvents
 	if max <= 0 {
 		max = defaultMaxEvents
 	}
-	var evicted []rowchange.Change
+	var evicted []buffered
 	for max > 0 && len(rj.queue) >= max {
-		evicted = append(evicted, rj.queue[0].c)
+		evicted = append(evicted, rj.queue[0])
 		rj.queue = rj.queue[1:]
 	}
-	rj.queue = append(rj.queue, buffered{c: c, queued: time.Now()})
+	rj.queue = append(rj.queue, buffered{c: c, queued: time.Now(), seq: seq})
 	rj.mu.Unlock()
 	for _, e := range evicted {
 		s.evicted.Add(1)
 		if s.metrics != nil {
-			s.metrics.evicted(rj.cfg.Table, rj.cfg.Table)
+			s.metrics.evicted(e.c.Table, rj.cfg.Table)
 		}
-		s.forceMiss(at, e, out)
+		s.forceMiss(at, e.seq, e.c, out)
 	}
 }
 
@@ -651,7 +677,7 @@ func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest) a
 	if row == nil {
 		rj.misses.Add(1)
 		if rj.metrics != nil {
-			rj.metrics.misses(rj.cfg.Table, rj.cfg.Table)
+			rj.metrics.misses(c.Table, rj.cfg.Table)
 		}
 		if rj.cfg.JoinType == "inner" {
 			return dropped
@@ -708,6 +734,15 @@ func (rj *refJoin) takeDrained() []buffered {
 // normalize (drivers disagree on int widths), []byte becomes string; a
 // string "5" and an int64 5 stay DISTINCT — the cast lives in the
 // reference query's SQL, not in silent coercion.
+// intKey places a signed integer in the shared non-negative space when it
+// is non-negative, else in its own negative space.
+func intKey(t int64) string {
+	if t >= 0 {
+		return "n:" + strconv.FormatInt(t, 10)
+	}
+	return "i:" + strconv.FormatInt(t, 10)
+}
+
 func joinKey(v any) string {
 	switch t := v.(type) {
 	case nil:
@@ -716,18 +751,23 @@ func joinKey(v any) string {
 		return "s:" + t
 	case []byte:
 		return "s:" + string(t)
+	// Signed and unsigned integers share one space for non-negative values:
+	// the same logical key loads as uint64 from a SQL reference (MySQL
+	// UNSIGNED) and decodes as int64 from the binlog, and a signed/unsigned
+	// split would make the join never match. Negative values have no
+	// unsigned counterpart, so they keep their own space.
 	case int:
-		return "i:" + strconv.FormatInt(int64(t), 10)
+		return intKey(int64(t))
 	case int32:
-		return "i:" + strconv.FormatInt(int64(t), 10)
+		return intKey(int64(t))
 	case int64:
-		return "i:" + strconv.FormatInt(t, 10)
+		return intKey(t)
 	case uint:
-		return "u:" + strconv.FormatUint(uint64(t), 10)
+		return "n:" + strconv.FormatUint(uint64(t), 10)
 	case uint32:
-		return "u:" + strconv.FormatUint(uint64(t), 10)
+		return "n:" + strconv.FormatUint(uint64(t), 10)
 	case uint64:
-		return "u:" + strconv.FormatUint(t, 10)
+		return "n:" + strconv.FormatUint(t, 10)
 	case float32:
 		return "f:" + strconv.FormatFloat(float64(t), 'g', -1, 64)
 	case float64:

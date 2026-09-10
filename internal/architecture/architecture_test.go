@@ -115,9 +115,10 @@ func TestOrchestrationConsumesContracts(t *testing.T) {
 // TestContractsArePluginSafe: the public contract packages must not import
 // anything under internal/ — an external plugin imports these contracts and
 // must not transitively pull the engine internals. internal/rowchange is
-// deliberately NOT listed: it is an internal QUARANTINE type, not a public
-// contract (Go forbids external modules from importing internal/ at all), so
-// checking it here would be a false promise.
+// deliberately NOT listed: it is the internal row-universe type at the CDC
+// decoder boundary, never a public contract (Go forbids external modules
+// from importing internal/ at all), so checking it here would be a false
+// promise.
 func TestContractsArePluginSafe(t *testing.T) {
 	for _, pkg := range []string{
 		"github.com/maltzsama/urutau/source",

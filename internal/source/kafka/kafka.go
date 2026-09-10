@@ -162,7 +162,18 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		refBySource: refBySource,
 		synced:      &position.Offsets{},
 	}
+	// The puller wraps the reader's own out channel. (A nil puller would
+	// panic in Start — the reader must not be handed out half-wired.)
+	r.puller = sourcepull.New(r.out)
 	return r, nil
+}
+
+// SetSourceSchemas installs the resolved canonical schema per target table
+// so the source boundary gates on drift and encodes against a stable shape.
+// The coordinator/runner holds the resolved schema (spec-declared for
+// Kafka) and injects it after Open through this optional interface.
+func (r *Reader) SetSourceSchemas(schemas map[string]core.Schema) {
+	r.puller.SetSchemas(schemas)
 }
 
 // InitialPosition returns an empty offset — Kafka consumers start from
@@ -235,7 +246,10 @@ func (r *Reader) Start(ctx context.Context, _ position.Position) error {
 	return nil
 }
 
-// Next returns the next columnar batch (QUARANTINE: bridges changes).
+// Next returns the next columnar batch. The source boundary owns the
+// row-to-wire encode (the puller batches the decoder's row-shaped output);
+// the row universe ends at the CDC decoder, the worker is fully columnar
+// (see docs/quarantine.md).
 func (r *Reader) Next(ctx context.Context) (*dataplane.Batch, error) {
 	return r.puller.Next(ctx)
 }

@@ -114,6 +114,13 @@ func newPositionIndex(runID string) *positionIndex {
 	return &positionIndex{acked: map[string]position.Position{}, runID: runID}
 }
 
+// InFlight reports the number of unacked batches (delivered, not yet acked).
+func (p *positionIndex) InFlight() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.head)
+}
+
 func (p *positionIndex) add(b inflightBatch) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

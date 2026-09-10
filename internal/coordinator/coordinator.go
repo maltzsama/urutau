@@ -24,6 +24,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -46,6 +49,11 @@ import (
 type Config struct {
 	Spec       *spec.Spec
 	ListenAddr string // gRPC + Flight listen address ("host:port" or ":0")
+
+	// TLS is the mutual-TLS material for the control plane. Empty means
+	// plaintext — a loud warning is logged, because the Assignment carries
+	// the source DSN (CD-1b).
+	TLS grpctls.Config
 
 	ChunkSize     int
 	WindowTimeout time.Duration
@@ -129,8 +137,15 @@ type Coordinator struct {
 
 	ready       chan struct{} // one send per attached session
 	sessionErrs chan error    // first exit wins
-	batchSeq    atomic.Uint64 // monotonic BatchMeta.batch_id
-	mu          sync.Mutex    // guards session attach/detach
+	// snapshotActive is true while the snapshot phase runs. A worker
+	// session lost during it (reset OR death) must fail the run fast: the
+	// worker's in-memory window died with it, so the protocol would either
+	// wait out AckTimeout/MaxResets (15min) or let a stale ChunkReady from
+	// the old generation satisfy the wait against an empty window — a
+	// silently incomplete snapshot.
+	snapshotActive atomic.Bool
+	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
+	mu             sync.Mutex    // guards session attach/detach
 
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
 	// on the worker, live events of that table are held here instead of
@@ -187,6 +202,12 @@ type workerState struct {
 	// committed: target table → position the worker reported after its last
 	// commit. Refreshed on every ready Hello (design §5.6.1).
 	committed map[string]string
+
+	// activeGet guards one DoGet stream per worker. Two concurrent streams
+	// on the same ticket would each pop the queue, splitting batches across
+	// readers — a batch sent to a dying stream is lost (the one-slot resend
+	// cannot cover two readers).
+	activeGet atomic.Bool
 }
 
 // workerName resolves the worker group of one spec table: the explicit
@@ -231,7 +252,12 @@ func Run(ctx context.Context, cfg Config) error {
 	c.terminate = make(chan error, 1)
 	if cfg.MetricsAddr != "" {
 		c.metrics = observability.New()
-		go func() { _ = c.metrics.Serve(cfg.MetricsAddr, c.statusz) }()
+		go func() {
+			// A busy port silently disables observability otherwise — say so.
+			if err := c.metrics.Serve(cfg.MetricsAddr, c.statusz); err != nil {
+				c.log.Warn("coordinator: metrics server stopped", "addr", cfg.MetricsAddr, "err", err)
+			}
+		}()
 	}
 	return c.run(ctx)
 }
@@ -292,6 +318,22 @@ func (c *Coordinator) run(ctx context.Context) error {
 	c.refs = refs
 	c.canonical = canonical
 
+	// K4: a worker group name must not collide with another table's TARGET
+	// (an implicit worker name). "worker: payments" on one table plus a
+	// table targeting "payments" would silently merge two unrelated
+	// pipelines onto one worker.
+	explicitGroups := make(map[string]bool)
+	for _, t := range c.cfg.Spec.Tables {
+		if t.Worker != "" {
+			explicitGroups[t.Worker] = true
+		}
+	}
+	for _, t := range c.cfg.Spec.Tables {
+		if t.Worker == "" && explicitGroups[t.Target] {
+			return fmt.Errorf("coordinator: table %q targets %q, which is also an explicit worker group — rename the group or the target", t.Source, t.Target)
+		}
+	}
+
 	// Resolve worker groups: explicit worker= or the table's own pod.
 	for i, t := range c.cfg.Spec.Tables {
 		name := workerName(t)
@@ -351,7 +393,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 		tbl := tableBySource[ref.Source]
 		// The cast policy must reach DDL: an empty policy here creates a
 		// table whose types diverge from the collapsed runner's (audit #8).
-		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], tbl.PartitionBy, coreCastOf(tbl), tbl.WriteMode.ChangeMode()); err != nil {
+		cast, err := coreCastOf(tbl)
+		if err != nil {
+			return err
+		}
+		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
@@ -370,7 +416,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	defer func() { _ = lis.Close() }()
 	c.log.Info("coordinator listening", "addr", lis.Addr().String())
 
-	grpcServer := grpc.NewServer(
+	opts := []grpc.ServerOption{
 		// Keepalive agreement with the worker: MinTime ≤ client Time, else
 		// the server GOAWAYs a healthy worker for pinging too much.
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -383,9 +429,20 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}),
 		// Flight batches can be a full snapshot chunk; 128Mi covers the
 		// default batching ceiling.
-		grpc.MaxRecvMsgSize(128<<20),
-		grpc.MaxSendMsgSize(128<<20),
-	)
+		grpc.MaxRecvMsgSize(128 << 20),
+		grpc.MaxSendMsgSize(128 << 20),
+	}
+	if c.cfg.TLS.Enabled() {
+		tlsOpt, err := c.cfg.TLS.ServerOption()
+		if err != nil {
+			return fmt.Errorf("coordinator: tls: %w", err)
+		}
+		opts = append(opts, tlsOpt)
+		c.log.Info("coordinator: control plane mTLS enabled")
+	} else {
+		c.log.Warn("coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA")
+	}
+	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterUrutauControlServer(grpcServer, &controlServer{c: c})
 	flight.RegisterFlightServiceServer(grpcServer, &flightServer{c: c})
 	go func() { _ = grpcServer.Serve(lis) }()
@@ -407,6 +464,19 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	defer rdr.Close()
+	// A source that can take the resolved schema (optional interface) gets
+	// it now: the source boundary then gates on drift against the native
+	// shape and encodes stable batches. Keyed by the TARGET the changes are
+	// addressed to.
+	if si, ok := rdr.(source.SchemaSetter); ok {
+		byTarget := make(map[string]core.Schema, len(refs))
+		for _, ref := range refs {
+			if cs, ok := c.canonical[ref.Source]; ok {
+				byTarget[ref.Target] = cs
+			}
+		}
+		si.SetSourceSchemas(byTarget)
+	}
 	// The slot's confirmed point tracks the minimum position workers have
 	// durably committed (their Acks), never the decode position — otherwise
 	// a crash between decode and commit would lose the in-flight window.
@@ -436,8 +506,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// session error lands in sessionErrs, and nobody reads it (audit #1).
 	snapCtx, snapCancel := context.WithCancel(ctx)
 	defer snapCancel()
+	c.snapshotActive.Store(true)
 	snapDone := make(chan error, 1)
 	go func() {
+		defer c.snapshotActive.Store(false)
 		defer snapCancel()
 		defer close(snapDone)
 		snapCfg := snapshot.SnapshotConfig{
@@ -573,8 +645,14 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 	// lock still races the map write on boot (audit #13).
 	c.mu.Lock()
 	for name, w := range c.workers {
+		// Phase reflects reality: the field used to hardcode "attached" for
+		// every worker, which lied about detached/pending ones.
+		phase := "detached"
+		if w.attached {
+			phase = "attached"
+		}
 		ws[name] = &workerStatus{
-			Phase:     "attached",
+			Phase:     phase,
 			Epoch:     w.epoch,
 			Attached:  w.attached,
 			Inflight:  c.budget.inFlight(name),
@@ -595,7 +673,12 @@ func (c *Coordinator) emit(kind string, fields map[string]any) error {
 	if c.ev == nil {
 		return nil
 	}
-	if err := c.ev.Emit(context.Background(), kind, fields); err != nil {
+	// Bounded: the audit-trail upload must not hang the caller (the ack hot
+	// path already fires-and-forgets, but emit is also called synchronously
+	// on boot/terminal paths).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.ev.Emit(ctx, kind, fields); err != nil {
 		return err
 	}
 	return nil
@@ -684,6 +767,11 @@ const gateMaxEvents = 1024
 // gate blocks the pump until the snapshot drains it, instead of growing the
 // buffer without bound. Ownership: when gateHold returns true the batch is
 // in the gate and released by flushWindow/closeWindow.
+//
+// If the context dies while the pump waits on a full gate, gateHold returns
+// false and the batch is treated as live (not gated). That is only reachable
+// during shutdown, where the pump exits on ctx.Done immediately after — it
+// must not be relied on in any live path.
 func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 	c.gateMu.Lock()
 	if !c.gateOn || b.Table != c.gateTgt {
@@ -908,6 +996,9 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if b != nil {
 		defer b.Release()
 	}
+	if b == nil && (meta == nil || meta.Table == "") {
+		return fmt.Errorf("coordinator: marker batch requires a table in meta")
+	}
 	if meta == nil {
 		meta = &pb.BatchMeta{}
 	}
@@ -928,13 +1019,20 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	var err error
 	if b == nil {
 		// Resolve the canonical schema for typed wire encoding of the
-		// zero-row marker record.
+		// zero-row marker record. A marker whose table is not in refs would
+		// otherwise encode with a zero-value schema (0 data columns) and be
+		// rejected downstream with an error pointing at the wrong place.
 		var cs core.Schema
+		found := false
 		for _, ref := range c.refs {
 			if ref.Target == meta.Table {
 				cs = c.canonical[ref.Source]
+				found = true
 				break
 			}
+		}
+		if !found {
+			return fmt.Errorf("coordinator: marker batch: table %q has no canonical schema (not in refs)", meta.Table)
 		}
 		body, metaBytes, err = transport.EncodeBatch(nil, cs, meta, nil)
 		if err != nil {
@@ -1066,7 +1164,7 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		RunId:      c.runID,
 		Ticket:     w.ticket,
 		SourceKind: c.cfg.Spec.Source.Kind,
-		SourceDsn:  c.cfg.Spec.Source.URI,
+		SourceDsn:  c.snapshotDSN(),
 		ChunkSize:  uint32(c.cfg.ChunkSize),
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
@@ -1094,7 +1192,11 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		tbl, ok := c.specForSource(ref.Source)
 		if ok {
 			ta.WriteMode = writeModeToPB(tbl.WriteMode.ChangeMode())
-			if castB, err := json.Marshal(coreCastOf(tbl)); err != nil {
+			cast, cerr := coreCastOf(tbl)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if castB, err := json.Marshal(cast); err != nil {
 				return nil, fmt.Errorf("coordinator: cast %s: %w", ref.Source, err)
 			} else {
 				ta.CastPolicy = castB
@@ -1155,9 +1257,29 @@ func writeModeToPB(m dataplane.WriteMode) pb.WriteMode {
 // DDL and the worker's writes must both apply. Parse errors are ignored the
 // same way the collapsed runner ignores them (the cast is re-validated on
 // the write path); the coordinator must not diverge from the runner.
-func coreCastOf(tbl spec.Table) core.CastPolicy {
-	cast, _ := core.ParseCastPolicy(tbl.Cast)
-	return cast
+// snapshotDSN returns the connection string the WORKER uses for the snapshot
+// chunk SELECT: the scoped read-only SnapshotURI when set, else the full
+// source URI (pre-scoping behavior). The worker never opens a replication
+// connection, so a deployment can grant it a SELECT-only user and keep the
+// replication credential coordinator-side (D-CD1).
+func (c *Coordinator) snapshotDSN() string {
+	if u := c.cfg.Spec.Source.SnapshotURI; u != "" {
+		return u
+	}
+	return c.cfg.Spec.Source.URI
+}
+
+// coreCastOf parses the table's declared cast policy, failing loud: a
+// swallowed parse error would ship an empty policy, creating a sink table
+// whose types diverge from the spec (audit #8). The source Introspect
+// validates the same string at boot, so this cannot normally fail — but the
+// coordinator must not degrade silently if it ever does.
+func coreCastOf(tbl spec.Table) (core.CastPolicy, error) {
+	cast, err := core.ParseCastPolicy(tbl.Cast)
+	if err != nil {
+		return core.CastPolicy{}, fmt.Errorf("coordinator: table %s cast: %w", tbl.Target, err)
+	}
+	return cast, nil
 }
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
@@ -1183,11 +1305,11 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	if len(positions) == 0 {
 		return nil, needsSnapshot, nil
 	}
-	best := positions[0]
-	for _, p := range positions[1:] {
-		if c := p.Compare(best); c != position.Incomparable && c < 0 {
-			best = p
-		}
+	// MinSafe: an incomparable pair (should not happen for one source) is an
+	// error — guessing a minimum could resume past uncommitted data (P1).
+	best, err := position.MinSafe(positions)
+	if err != nil {
+		return nil, nil, fmt.Errorf("coordinator: %w", err)
 	}
 	return best, needsSnapshot, nil
 }
@@ -1251,12 +1373,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		w.attached, w.out, w.cancel = false, nil, nil
 		c.mu.Unlock()
 		sessCancel()
-		// A supervisor reset is not a worker failure, and neither is the
-		// death of a worker mid-reset (it suicides on channel loss); the
-		// supervisor owns the outcome (crashloop or recovery).
-		if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(hello.WorkerName) {
-			c.sessionErrs <- retErr
-		}
+		c.signalSessionEnd(hello.WorkerName, retErr)
 	}()
 
 	select {
@@ -1330,6 +1447,24 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 // failure, so it must not kill the run via sessionErrs.
 var errSessionReset = errors.New("session reset")
 
+// signalSessionEnd reports a session's terminal state to the run loop.
+//
+// A supervisor reset is not a worker failure, and neither is the death of a
+// worker mid-reset (it suicides on channel loss); the supervisor owns the
+// outcome. The one exception is a snapshot in progress: the worker's
+// in-memory window died with the session, so the protocol cannot continue —
+// either it waits out AckTimeout/MaxResets, or a stale ChunkReady from the
+// old generation satisfies waitChunkReady against an empty window (a
+// silently incomplete snapshot). Fail the run instead, so it restarts and
+// re-snapshots cleanly (CD-5).
+func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
+	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
+		c.sessionErrs <- retErr
+	} else if c.snapshotActive.Load() {
+		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)
+	}
+}
+
 // workerSession is one connected worker's session-local surface; the group's
 // durable state lives in workerState.
 type workerSession struct {
@@ -1364,10 +1499,9 @@ func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr e
 		w.control = nil
 		c.mu.Unlock()
 		// A worker mid-reset suicides and closes this stream too; only a
-		// non-reset death is a real session failure.
-		if !c.supervisor.isPending(hello.WorkerName) {
-			c.sessionErrs <- retErr
-		}
+		// non-reset death is a real session failure (signalSessionEnd owns
+		// the reset/snapshot rule).
+		c.signalSessionEnd(hello.WorkerName, retErr)
 	}()
 	// The worker never writes again; its death is the stream ending.
 	<-stream.Context().Done()
@@ -1419,6 +1553,10 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 	if !ok {
 		return fmt.Errorf("coordinator: unknown flight ticket %q", string(req.Ticket))
 	}
+	if !w.activeGet.CompareAndSwap(false, true) {
+		return status.Error(codes.ResourceExhausted, "coordinator: a DoGet stream is already active for this worker")
+	}
+	defer w.activeGet.Store(false)
 	for {
 		// Deliver any resend first: it was popped ahead of the queue's head,
 		// so it must land ahead of it too.
@@ -1474,7 +1612,10 @@ func resumeOrNone(p position.Position) string {
 func randSuffix(n int) string {
 	b := make([]byte, n/2+1)
 	if _, err := rand.Read(b); err != nil {
-		return "000000"
+		// Same rule as randTicket: a deterministic fallback would make
+		// runIDs collide across restarts and overwrite a prior run's S3
+		// manifests. crypto/rand failure is fatal, not degraded.
+		panic(fmt.Sprintf("coordinator: crypto/rand: %v", err))
 	}
 	return hex.EncodeToString(b)[:n]
 }
