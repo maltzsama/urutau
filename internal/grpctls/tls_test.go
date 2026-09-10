@@ -151,3 +151,15 @@ func TestPartialConfigIsRejected(t *testing.T) {
 		t.Fatal("fully-set config must report enabled")
 	}
 }
+
+func TestValidateRejectsPartialAndAcceptsEmpty(t *testing.T) {
+	if err := (Config{}).Validate(); err != nil {
+		t.Fatalf("empty config is plaintext, not an error: %v", err)
+	}
+	if err := (Config{CertFile: "x"}).Validate(); err == nil {
+		t.Fatal("partial TLS config must fail Validate")
+	}
+	if err := (Config{CertFile: "x", KeyFile: "y", ClientCAFile: "z"}).Validate(); err != nil {
+		t.Fatalf("full config must pass Validate: %v", err)
+	}
+}
