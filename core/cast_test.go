@@ -446,3 +446,80 @@ func TestAsInt64RejectsUint64Overflow(t *testing.T) {
 		t.Fatalf("asInt64(uint64(42)) = %d, %v; want 42", got, err)
 	}
 }
+
+// C3: the temporal → string contract is canonical and stable, byte for byte.
+// Naive timestamp carries no zone; timestamptz carries RFC3339Nano.
+func TestTemporalToStringCanonical(t *testing.T) {
+	ts := time.Date(2024, 1, 2, 15, 4, 5, 123000000, time.UTC)
+	dateDays := int32(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+	cases := []struct {
+		name string
+		from Kind
+		v    any
+		want string
+	}{
+		{"date", KindDate, dateDays, "2024-01-01"},
+		{"time", KindTime, int64(15*3_600_000_000 + 4*60_000_000 + 5*1_000_000 + 1), "15:04:05.000001"},
+		{"timestamp", KindTimestamp, ts, "2024-01-02 15:04:05.123000000"},
+		{"timestamptz", KindTimestampTZ, ts, "2024-01-02T15:04:05.123Z"},
+	}
+	to := CastTarget{Type: ColumnType{Kind: KindString}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := to.Convert(tc.from, tc.v)
+			if err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// C2: an integer under a timestamp source is a wire bug, not a guess.
+func TestTemporalToStringRejectsInteger(t *testing.T) {
+	to := CastTarget{Type: ColumnType{Kind: KindString}}
+	for _, from := range []Kind{KindTimestamp, KindTimestampTZ} {
+		_, err := to.Convert(from, int64(42))
+		if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Fatalf("%s with an int must error as ambiguous, got %v", from, err)
+		}
+	}
+}
+
+// D1/D2: micros-since-midnight formatting, with the two out-of-range errors.
+func TestFormatMicrosOfDay(t *testing.T) {
+	cases := []struct {
+		micros int64
+		want   string
+	}{
+		{0, "00:00:00"},
+		{int64(12 * time.Hour / time.Microsecond), "12:00:00"},
+		{int64(15*3_600_000_000 + 4*60_000_000 + 5*1_000_000 + 123456), "15:04:05.123456"},
+	}
+	for _, tc := range cases {
+		got, err := formatMicrosOfDay(tc.micros)
+		if err != nil || got != tc.want {
+			t.Fatalf("formatMicrosOfDay(%d) = %q, %v; want %q", tc.micros, got, err, tc.want)
+		}
+	}
+	if _, err := formatMicrosOfDay(-1); err == nil {
+		t.Error("negative micros must error")
+	}
+	if _, err := formatMicrosOfDay(int64(24 * time.Hour / time.Microsecond)); err == nil {
+		t.Error("24h micros must error")
+	}
+}
+
+// D3: castToTimestamp accepts a uint64 date (the overflow guard is B's).
+func TestCastToTimestampAcceptsUint64(t *testing.T) {
+	days := uint64(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+	got, err := castToTimestamp(days)
+	if err != nil {
+		t.Fatalf("uint64 date → timestamp: %v", err)
+	}
+	if got != "2024-01-01 00:00:00.000000000" {
+		t.Fatalf("got %v", got)
+	}
+}

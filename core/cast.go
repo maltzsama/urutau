@@ -360,25 +360,41 @@ func castToString(from Kind, v any, enc string) (any, error) {
 			return nil, fmt.Errorf("core: cannot cast %T to uuid text", v)
 		}
 	case KindDate:
+		// The wire form of a date is int32 days since epoch.
 		days, err := asInt64(v)
 		if err != nil {
 			return nil, fmt.Errorf("core: date → string: %w", err)
 		}
 		return time.Unix(days*86400, 0).UTC().Format(dateLayout), nil
 	case KindTime:
+		// The wire form of a time is int64 micros since midnight.
 		micros, err := asInt64(v)
 		if err != nil {
 			return nil, fmt.Errorf("core: time → string: %w", err)
 		}
-		return formatMicrosOfDay(micros), nil
-	case KindTimestamp, KindTimestampTZ:
+		return formatMicrosOfDay(micros)
+	case KindTimestamp:
+		// Naive: the TZ does not exist in the data, so the canonical text
+		// carries no zone. An integer here is ambiguous — the wire form of a
+		// timestamp is time.Time, not a count of days or micros (that
+		// distinction belongs to Date/Time, whose from says so) — so it is a
+		// wire bug, not something to guess.
+		if tm, ok := v.(time.Time); ok {
+			return tm.Format(naiveTimestampTextLayout), nil
+		}
+		if s, ok := v.(string); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("core: cannot render %T as %s text — wire representation ambiguous; fix the wire Kind", v, from)
+	case KindTimestampTZ:
+		// The zone IS the semantics, so the canonical text is RFC3339Nano.
 		if tm, ok := v.(time.Time); ok {
 			return tm.Format(time.RFC3339Nano), nil
 		}
 		if s, ok := v.(string); ok {
 			return s, nil
 		}
-		return nil, fmt.Errorf("core: cannot cast %T to timestamp text", v)
+		return nil, fmt.Errorf("core: cannot render %T as %s text — wire representation ambiguous; fix the wire Kind", v, from)
 	default:
 		return StringifyScalar(v)
 	}
@@ -427,8 +443,16 @@ func formatUUID(b []byte) (string, error) {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
-// formatMicrosOfDay renders micros since midnight as HH:MM:SS[.ffffff].
-func formatMicrosOfDay(micros int64) string {
+// formatMicrosOfDay renders micros since midnight as HH:MM:SS[.ffffff]. A
+// negative value or one at/after 24h has no time-of-day meaning and is an
+// error — never clamped or truncated.
+func formatMicrosOfDay(micros int64) (string, error) {
+	if micros < 0 {
+		return "", fmt.Errorf("core: time-of-day %d micros is negative", micros)
+	}
+	if micros >= int64(24*time.Hour/time.Microsecond) {
+		return "", fmt.Errorf("core: time-of-day %d micros is at or past 24h", micros)
+	}
 	ns := micros * 1000
 	h := ns / int64(time.Hour)
 	ns -= h * int64(time.Hour)
@@ -437,9 +461,9 @@ func formatMicrosOfDay(micros int64) string {
 	s := ns / int64(time.Second)
 	ns -= s * int64(time.Second)
 	if ns == 0 {
-		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s), nil
 	}
-	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000)
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000), nil
 }
 
 func castToBinary(v any) (any, error) {
@@ -665,10 +689,14 @@ func castToJSON(v any) (any, error) {
 // fraction optional and strips trailing zeros, so it alone covers a naive
 // timestamp with or without a fraction — there is no separate layout for
 // "no fraction".
+//
+// naiveTimestampTextLayout is the canonical OUTPUT for a naive timestamp:
+// fixed nine-digit fraction, no zone (the zone does not exist in the data).
 const (
-	dateLayout           = "2006-01-02"
-	naiveTimestampLayout = "2006-01-02 15:04:05.999999999"
-	timeOfDayLayout      = "15:04:05.999999999"
+	dateLayout               = "2006-01-02"
+	naiveTimestampLayout     = "2006-01-02 15:04:05.999999999"
+	naiveTimestampTextLayout = "2006-01-02 15:04:05.000000000"
+	timeOfDayLayout          = "15:04:05.999999999"
 )
 
 // ParseTimestampText parses a temporal text into a time.Time: an RFC3339
@@ -706,18 +734,22 @@ func castToTimestamp(v any) (any, error) {
 	case time.Time:
 		// Already a timestamp (the columnar representation); re-render it
 		// naive so the sink sees one consistent textual form.
-		return t.Format("2006-01-02 15:04:05.000000000"), nil
-	case int, int32, int64:
+		return t.Format(naiveTimestampTextLayout), nil
+	case int, int32, int64, uint64:
 		// A date arrives as int32 days since epoch (the columnar
-		// representation of KindDate).
-		days, _ := asInt64(t)
-		return time.Unix(days*86400, 0).UTC().Format("2006-01-02 15:04:05.000000000"), nil
+		// representation of KindDate). asInt64 rejects a uint64 above
+		// MaxInt64.
+		days, err := asInt64(t)
+		if err != nil {
+			return nil, fmt.Errorf("core: date → timestamp: %w", err)
+		}
+		return time.Unix(days*86400, 0).UTC().Format(naiveTimestampTextLayout), nil
 	case string:
 		tm, err := ParseTimestampText(t)
 		if err != nil {
 			return nil, fmt.Errorf("core: %q is not a naive timestamp or date", t)
 		}
-		return tm.Format("2006-01-02 15:04:05.000000000"), nil
+		return tm.Format(naiveTimestampTextLayout), nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to timestamp", v)
 	}
