@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -419,6 +421,16 @@ func refRows() []map[string]any {
 	}
 }
 
+// refRowsStrKey is refRows with a string join key: reference destinations
+// travel as nullable strings on the wire (until CR-069), so PROJECTING the
+// join key requires it to be a string — an int64 key fails the load loud.
+func refRowsStrKey() []map[string]any {
+	return []map[string]any{
+		{"id": "1", "name": "ana", "tier": "gold", "email": "ana@x", "created_at": "2020-01-01"},
+		{"id": "2", "name": "beto", "tier": "silver", "email": "beto@x", "created_at": "2020-01-02"},
+	}
+}
+
 // 5.1 — Projection: only the selected columns reach the event.
 func TestProjectionOnlySelectedColumns(t *testing.T) {
 	s, _ := newTestStage(t, refCfg(nil), refRows())
@@ -466,15 +478,15 @@ func TestCollisionOverwriteAndCoexistence(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"id", "name"}
 	})
-	s, _ := newTestStage(t, cfg, refRows())
-	out, err := s.applyOne(t, searchEvent(99, int64(1))) // source id=99
+	s, _ := newTestStage(t, cfg, refRowsStrKey())
+	out, err := s.applyOne(t, searchEvent(99, "1")) // source id=99
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if out[0].After["id"] != int64(99) {
 		t.Fatalf("source id was overwritten: %v", out[0].After)
 	}
-	if out[0].After["users.id"] != int64(1) {
+	if out[0].After["users.id"] != "1" {
 		t.Fatalf("reference id not projected with prefix: %v", out[0].After)
 	}
 
@@ -483,12 +495,12 @@ func TestCollisionOverwriteAndCoexistence(t *testing.T) {
 		c.Select = []string{"id", "name"}
 		c.As = map[string]string{"users.id": "ref_id"}
 	})
-	sAs, _ := newTestStage(t, cfgAs, refRows())
-	outAs, err := sAs.applyOne(t, searchEvent(99, int64(1)))
+	sAs, _ := newTestStage(t, cfgAs, refRowsStrKey())
+	outAs, err := sAs.applyOne(t, searchEvent(99, "1"))
 	if err != nil {
 		t.Fatalf("apply as: %v", err)
 	}
-	if outAs[0].After["id"] != int64(99) || outAs[0].After["ref_id"] != int64(1) {
+	if outAs[0].After["id"] != int64(99) || outAs[0].After["ref_id"] != "1" {
 		t.Fatalf("coexistence broken: %v", outAs[0].After)
 	}
 }
@@ -499,8 +511,8 @@ func TestStarProjectionPreservesJoinKey(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"*"}
 	})
-	s, _ := newTestStage(t, cfg, refRows())
-	out, err := s.applyOne(t, searchEvent(1, int64(2)))
+	s, _ := newTestStage(t, cfg, refRowsStrKey())
+	out, err := s.applyOne(t, searchEvent(1, "2"))
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -515,7 +527,7 @@ func TestStarProjectionPreservesJoinKey(t *testing.T) {
 		t.Fatalf("source id overwritten: %v", out[0].After)
 	}
 	// Reference join column is projected with prefix.
-	if out[0].After["users.id"] != int64(2) {
+	if out[0].After["users.id"] != "2" {
 		t.Fatalf("reference join column not projected: %v", out[0].After)
 	}
 	if out[0].After["users.name"] != "beto" {
@@ -530,8 +542,8 @@ func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
 		c.Select = []string{"*"}
 		c.As = map[string]string{"users.id": "ref_id"}
 	})
-	s, _ := newTestStage(t, cfg, refRows())
-	out, err := s.applyOne(t, searchEvent(1, int64(2)))
+	s, _ := newTestStage(t, cfg, refRowsStrKey())
+	out, err := s.applyOne(t, searchEvent(1, "2"))
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -540,7 +552,7 @@ func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
 		t.Fatalf("source id overwritten: %v", out[0].After)
 	}
 	// Reference id injected under the renamed key (no prefix because of "as").
-	if out[0].After["ref_id"] != int64(2) {
+	if out[0].After["ref_id"] != "2" {
 		t.Fatalf("renamed join column missing or wrong: %v", out[0].After)
 	}
 	// Other reference columns are prefixed.
@@ -974,5 +986,127 @@ func TestMySQLConfig(t *testing.T) {
 				tc.check(t, cfg)
 			}
 		})
+	}
+}
+
+// FT-2: a non-string reference value has no contract on the string wire —
+// the load fails loud, citing the column, the type and the way out (CAST),
+// through the existing sticky-error path; a later load with the query fixed
+// clears it and the pipeline proceeds.
+func TestNonStringReferenceFailsLoadAndRecovers(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) { c.Refresh = "10ms" })
+	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	loader := &fakeLoader{rows: []map[string]any{
+		{"id": int64(1), "name": "ana", "tier": int64(3)},
+	}}
+	if err := s.UseLoader("users", loader); err != nil {
+		t.Fatal(err)
+	}
+	s.Start(context.Background())
+	defer s.Stop()
+
+	// First load: tier is int64 → rejected, sticky.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && s.refs[0].stickyErr() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	serr := s.refs[0].stickyErr()
+	if serr == nil {
+		t.Fatal("non-string reference column did not fail the load")
+	}
+	for _, want := range []string{"tier", "int64", "CAST"} {
+		if !strings.Contains(serr.Error(), want) {
+			t.Fatalf("error must cite %q, got: %v", want, serr)
+		}
+	}
+	// Enrich blocks on the named reason.
+	if _, err := s.Enrich([]rowchange.Change{searchEvent(1, int64(1))}); err == nil {
+		t.Fatal("Enrich must block on the sticky load error")
+	}
+
+	// The query is fixed (CAST tier AS CHAR): the next load clears the error.
+	loader.SetRows([]map[string]any{{"id": int64(1), "name": "ana", "tier": "gold"}})
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && s.refs[0].stickyErr() != nil {
+		time.Sleep(time.Millisecond)
+	}
+	if serr := s.refs[0].stickyErr(); serr != nil {
+		t.Fatalf("fixed load did not clear the sticky error: %v", serr)
+	}
+	if _, err := s.Enrich([]rowchange.Change{searchEvent(1, int64(1))}); err != nil {
+		t.Fatalf("pipeline did not recover: %v", err)
+	}
+}
+
+// FT-2: a non-string JOIN KEY that is projected (wildcard, or the key in
+// select) is the same non-representable case — it fails the load rather
+// than crashing the sink on a String column fed an int.
+func TestProjectedNonStringJoinKeyFailsLoad(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) { c.Select = []string{"*"} })
+	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	loader := &fakeLoader{rows: []map[string]any{{"id": int64(1), "name": "ana", "tier": "gold"}}}
+	if err := s.UseLoader("users", loader); err != nil {
+		t.Fatal(err)
+	}
+	s.Start(context.Background())
+	defer s.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && s.refs[0].stickyErr() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	serr := s.refs[0].stickyErr()
+	if serr == nil || !strings.Contains(serr.Error(), `"id"`) || !strings.Contains(serr.Error(), "int64") {
+		t.Fatalf("projected non-string join key must fail loud citing the column and type, got: %v", serr)
+	}
+}
+
+// FT-1: RefColumnsFor is the single computation the three schema owners
+// (runner, worker, coordinator) apply — explicit selects only, final names
+// with renames, empty for wildcard.
+func TestRefColumnsFor(t *testing.T) {
+	cfgs := []spec.Enrich{
+		{Table: "users", Select: []string{"name", "tier"}},
+		{Table: "orders", Select: []string{"total"}, As: map[string]string{"orders.total": "order_total"}},
+		{Table: "geo", Select: []string{"*"}}, // wildcard: unknown at boot
+	}
+	got := RefColumnsFor(cfgs)
+	want := []string{"users.name", "users.tier", "order_total"}
+	if len(got) != len(want) {
+		t.Fatalf("RefColumnsFor = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("RefColumnsFor[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if len(RefColumnsFor([]spec.Enrich{{Table: "geo", Select: []string{"*"}}})) != 0 {
+		t.Fatal("wildcard must contribute no boot-time columns")
+	}
+}
+
+// FT-1: AddRefColumns appends the destinations as nullable strings, dedups
+// against existing columns, and leaves the source columns untouched.
+func TestAddRefColumns(t *testing.T) {
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "users.name", Type: core.ColumnType{Kind: core.KindString, Nullable: true}}, // already present
+	}}
+	got := AddRefColumns(cs, []spec.Enrich{{Table: "users", Select: []string{"name", "tier"}}})
+	if len(got.Columns) != 3 {
+		t.Fatalf("columns = %v, want id + users.name (dedup) + users.tier", got.Columns)
+	}
+	col, ok := got.Column("users.tier")
+	if !ok || col.Type.Kind != core.KindString || !col.Type.Nullable {
+		t.Fatalf("users.tier = %+v, want nullable string", col.Type)
+	}
+	if n := len(got.Columns); n != 3 {
+		t.Fatalf("dedup failed: %d columns", n)
 	}
 }

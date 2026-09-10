@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -224,17 +225,15 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		// ("<table>.<col>") would produce. Wildcard stays out — with "*"
 		// the destinations are only known at load time, and the per-ref
 		// destSeen check in buildImage covers that case.
+		// refDests carries the FINAL destination names (rename applied) —
+		// what the miss fallback writes NULLs into and what RefColumns
+		// exposes for the wire. RefColumnsFor is the single source of this
+		// computation: the coordinator applies the same extension without
+		// building a stage.
+		rj.refDests = RefColumnsFor([]spec.Enrich{cfg})
 		if star := len(cfg.Select) == 1 && cfg.Select[0] == "*"; !star {
 			for _, s := range cfg.Select {
 				dest := cfg.Table + "." + s
-				// refDests carries the FINAL destination name (rename
-				// applied) — what the miss fallback writes NULLs into and
-				// what RefColumns exposes for the wire.
-				final := dest
-				if as, ok := cfg.As[final]; ok {
-					final = as
-				}
-				rj.refDests = append(rj.refDests, final)
 				if _, renamed := cfg.As[dest]; renamed {
 					continue // this ref's own rename overrides the default
 				}
@@ -298,6 +297,52 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		s.refs = append(s.refs, rj)
 	}
 	return s, nil
+}
+
+// RefColumnsFor returns the FINAL destination names (renames applied) the
+// given declarations inject, for explicit selects — the wire-schema extension
+// a caller must apply BEFORE the pipeline starts, so every batch travels with
+// the full column set and the drift check sees one stable shape. Empty for a
+// wildcard select: those destinations are only known at load time (the
+// documented exception in New).
+//
+// Exported because the pipeline's three schema owners — the collapsed runner,
+// the worker's assignment path and the coordinator's assignment builder —
+// must all apply the SAME extension, and the coordinator builds no stage.
+func RefColumnsFor(cfgs []spec.Enrich) []string {
+	var out []string
+	for _, cfg := range cfgs {
+		if len(cfg.Select) == 1 && cfg.Select[0] == "*" {
+			continue
+		}
+		for _, s := range cfg.Select {
+			dest := cfg.Table + "." + s
+			if as, ok := cfg.As[dest]; ok {
+				dest = as
+			}
+			out = append(out, dest)
+		}
+	}
+	return out
+}
+
+// AddRefColumns returns cs extended with the declarations' reference
+// destination columns (deduplicated; nullable strings — the registered type
+// decision until CR-069 resolves real types). Callers apply it to every
+// schema shape that feeds a sink table or a drift check BEFORE the pipeline
+// starts: without it, the first enriched batch carries columns the table
+// lacks and every sink silently drops them (they project by the table's own
+// columns, never by the wire's).
+func AddRefColumns(cs core.Schema, cfgs []spec.Enrich) core.Schema {
+	for _, dest := range RefColumnsFor(cfgs) {
+		if _, exists := cs.Column(dest); !exists {
+			cs.Columns = append(cs.Columns, core.Column{
+				Name: dest,
+				Type: core.ColumnType{Kind: core.KindString, Nullable: true},
+			})
+		}
+	}
+	return cs
 }
 
 // SetMetrics wires Prometheus counters into the stage. Call after New;
@@ -546,7 +591,21 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 		}
 		projected := make(map[string]any, len(dests))
 		for refCol, name := range projection {
-			projected[name] = row[refCol]
+			v := row[refCol]
+			// Reference destinations are nullable strings on the wire (the
+			// registered decision until CR-069): a non-string value has no
+			// contract — it would be silently dropped by every sink or
+			// coerced into wrong data. Fail the load loud, teaching the way
+			// out; a later load with the query fixed clears the sticky
+			// error like any other image rejection.
+			if v != nil {
+				if _, ok := v.(string); !ok {
+					return nil, nil, fmt.Errorf(
+						"reference %q column %q carries %T — non-string reference columns are not representable on the wire until CR-069; cast in the query (e.g. CAST(tier AS CHAR)) or use string columns",
+						rj.cfg.Table, refCol, v)
+				}
+			}
+			projected[name] = v
 		}
 		image[k] = projected
 	}

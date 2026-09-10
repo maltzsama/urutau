@@ -32,6 +32,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/observability"
@@ -326,8 +327,14 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		c.surfaceWarnings(ref.Source, warns)
 		refs = append(refs, ref)
-		canonical[t.Source] = core.WireSchema(srcSchema, res)
-		resolvedSchemas[t.Source] = res
+		// Reference columns (explicit selects — known at boot) join BOTH
+		// shapes: the assignment/wire schema the worker encodes against and
+		// the resolved schema EnsureTable creates the table from. Without
+		// it, the first enriched batch carries a column the table lacks and
+		// every sink silently drops it. Registered decision: nullable
+		// strings until CR-069 resolves real types.
+		canonical[t.Source] = enrich.AddRefColumns(core.WireSchema(srcSchema, res), t.Enrich)
+		resolvedSchemas[t.Source] = enrich.AddRefColumns(res, t.Enrich)
 		tableBySource[t.Source] = t
 	}
 	c.refs = refs

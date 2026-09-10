@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -14,6 +15,8 @@ import (
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 const runnerTestUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
@@ -237,4 +240,56 @@ func (o opaqueTestPos) Compare(other position.Position) int {
 func (o opaqueTestPos) Contains(other position.Position) bool {
 	p, ok := other.(opaqueTestPos)
 	return ok && o == p
+}
+
+// introspectSource is the minimal source.Source for the introspectAll test:
+// only Introspect is exercised.
+type introspectSource struct {
+	schema core.Schema
+}
+
+func (f *introspectSource) Open(context.Context, []source.TableRef) (source.Reader, error) {
+	return nil, errors.New("not used")
+}
+func (f *introspectSource) InitialPosition(context.Context) (position.Position, error) {
+	return nil, nil
+}
+func (f *introspectSource) ParsePosition(string) (position.Position, error) { return nil, nil }
+func (f *introspectSource) Introspect(context.Context, spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
+	return core.TableRef{Source: "db.users", Target: "raw.users", PrimaryKey: []string{"id"}}, f.schema, nil, nil
+}
+
+// FT-1: introspectAll extends BOTH the wire and the resolved shape with the
+// reference destinations (explicit selects, final names), so EnsureTable
+// creates the column and the drift check sees one stable shape from batch 1.
+func TestIntrospectAllExtendsBothShapesForEnrich(t *testing.T) {
+	src := &introspectSource{schema: core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+	}}}
+	s := &spec.Spec{Tables: []spec.Table{{
+		Source: "db.users", Target: "raw.users",
+		Enrich: []spec.Enrich{{
+			Table:  "users",
+			Select: []string{"name"},
+			On:     map[string]string{"user_ref": "id"},
+			As:     map[string]string{"users.name": "user_name"},
+		}},
+	}}}
+	_, resolved, wire, _, sourceCols, err := introspectAll(context.Background(), src, s, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("introspectAll: %v", err)
+	}
+	for name, m := range map[string]map[string]core.Schema{"resolved": resolved, "wire": wire} {
+		col, ok := m["db.users"].Column("user_name")
+		if !ok || col.Type.Kind != core.KindString || !col.Type.Nullable {
+			t.Fatalf("%s shape lacks the reference column as nullable string: %+v", name, col.Type)
+		}
+	}
+	// The event columns handed to enrich.New are the SOURCE view: the
+	// reference destination is not an event column.
+	for _, c := range sourceCols["db.users"] {
+		if c == "user_name" {
+			t.Fatal("sourceCols must not contain the reference destination")
+		}
+	}
 }
