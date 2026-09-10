@@ -101,7 +101,7 @@ func TestConvertWidening(t *testing.T) {
 		{ColumnType{Kind: KindBool}, CastTarget{Type: ColumnType{Kind: KindString}}, true, "true"},
 	}
 	for _, tt := range tests {
-		got, err := tt.target.Convert(tt.input)
+		got, err := tt.target.Convert(tt.src.Kind, tt.input)
 		if err != nil {
 			t.Errorf("Convert(%v → %+v) unexpected error: %v", tt.input, tt.target, err)
 			continue
@@ -113,7 +113,7 @@ func TestConvertWidening(t *testing.T) {
 }
 
 func TestConvertNilPassthrough(t *testing.T) {
-	got, err := CastTarget{Type: ColumnType{Kind: KindString}}.Convert(nil)
+	got, err := CastTarget{Type: ColumnType{Kind: KindString}}.Convert(KindString, nil)
 	if err != nil {
 		t.Errorf("Convert(nil) unexpected error: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestConvertNilPassthrough(t *testing.T) {
 }
 
 func TestConvertTypeMismatch(t *testing.T) {
-	_, err := CastTarget{Type: ColumnType{Kind: KindInt64}}.Convert("not a number")
+	_, err := CastTarget{Type: ColumnType{Kind: KindInt64}}.Convert(KindString, "not a number")
 	if err == nil {
 		t.Error("Convert with mismatched type should error")
 	}
@@ -257,7 +257,7 @@ func TestResolveSchemaCastPreservesNullable(t *testing.T) {
 // float32 → decimal: the matrix allowed it but the converter lacked a
 // float32 case — every value failed at runtime after plan validation.
 func TestConvertFloat32ToDecimal(t *testing.T) {
-	got, err := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 10, Scale: 2}}.Convert(float32(3.14))
+	got, err := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 10, Scale: 2}}.Convert(KindFloat32, float32(3.14))
 	if err != nil {
 		t.Fatalf("Convert(float32 → decimal) unexpected error: %v", err)
 	}
@@ -269,10 +269,10 @@ func TestConvertFloat32ToDecimal(t *testing.T) {
 // NaN and ±Inf have no decimal text; the converter must reject them.
 func TestConvertNonFiniteToDecimal(t *testing.T) {
 	target := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 10, Scale: 2}}
-	if _, err := target.Convert(math.NaN()); err == nil {
+	if _, err := target.Convert(KindFloat64, math.NaN()); err == nil {
 		t.Error("Convert(NaN → decimal) should error")
 	}
-	if _, err := target.Convert(math.Inf(1)); err == nil {
+	if _, err := target.Convert(KindFloat64, math.Inf(1)); err == nil {
 		t.Error("Convert(+Inf → decimal) should error")
 	}
 }
@@ -283,17 +283,17 @@ func TestConvertDecimalPrecisionOverflow(t *testing.T) {
 	// decimal(4,2) holds 2 integer digits. 12345 renders as "123.45" —
 	// 3 integer digits overflow.
 	target := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 4, Scale: 2}}
-	if _, err := target.Convert(int64(12345)); err == nil {
+	if _, err := target.Convert(KindInt64, int64(12345)); err == nil {
 		t.Error("Convert(int64 12345 → decimal(4,2)) should error (3 integer digits > 2)")
 	}
 	// 123 renders as "1.23" (scale absorbs two digits) — fits.
-	if _, err := target.Convert(int64(123)); err != nil {
+	if _, err := target.Convert(KindInt64, int64(123)); err != nil {
 		t.Errorf("Convert(int64 123 → decimal(4,2)) should pass: %v", err)
 	}
 	// 123456 → decimal(6,1) renders "12345.6" — 5 integer digits fits; the
 	// 7th would not. Use a value that overflows: 1234567 → "123456.7".
 	t61 := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 6, Scale: 1}}
-	if _, err := t61.Convert(int64(1234567)); err == nil {
+	if _, err := t61.Convert(KindInt64, int64(1234567)); err == nil {
 		t.Error("Convert(int64 1234567 → decimal(6,1)) should error (6 integer digits > 5)")
 	}
 }
@@ -301,13 +301,13 @@ func TestConvertDecimalPrecisionOverflow(t *testing.T) {
 // string → decimal passthrough (KindUnknown bypass) must validate the text.
 func TestConvertStringToDecimalValidates(t *testing.T) {
 	target := CastTarget{Type: ColumnType{Kind: KindDecimal, Precision: 10, Scale: 2}}
-	if _, err := target.Convert("12.345"); err == nil {
+	if _, err := target.Convert(KindString, "12.345"); err == nil {
 		t.Error("Convert(\"12.345\" → decimal(10,2)) should error (3 fraction digits > scale 2)")
 	}
-	if _, err := target.Convert("not-a-number"); err == nil {
+	if _, err := target.Convert(KindString, "not-a-number"); err == nil {
 		t.Error("Convert(\"not-a-number\" → decimal) should error")
 	}
-	if _, err := target.Convert("12.34"); err != nil {
+	if _, err := target.Convert(KindString, "12.34"); err != nil {
 		t.Errorf("Convert(\"12.34\" → decimal(10,2)) should pass: %v", err)
 	}
 }
@@ -325,7 +325,7 @@ func TestUInt64CastSupport(t *testing.T) {
 	if err := CheckCast(ColumnType{Kind: KindUInt64}, CastTarget{Type: ColumnType{Kind: KindString}}); err != nil {
 		t.Errorf("CheckCast(uint64 → string) should be allowed (to string always): %v", err)
 	}
-	got, err := CastTarget{Type: ColumnType{Kind: KindString}}.Convert(uint64(42))
+	got, err := CastTarget{Type: ColumnType{Kind: KindString}}.Convert(KindUInt64, uint64(42))
 	if err != nil || got != "42" {
 		t.Errorf("Convert(uint64 → string) = %v, %v; want 42", got, err)
 	}
@@ -379,27 +379,27 @@ func TestConvertAcceptsColumnarRepresentations(t *testing.T) {
 	ts := time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC)
 
 	// timestamp <- time.Time (a batch that skipped the worker cast).
-	got, err := CastTarget{Type: ColumnType{Kind: KindTimestamp}}.Convert(ts)
+	got, err := CastTarget{Type: ColumnType{Kind: KindTimestamp}}.Convert(KindTimestampTZ, ts)
 	if err != nil || got != "2024-01-02 15:04:05.000000000" {
 		t.Fatalf("timestamp <- time.Time = %v, %v", got, err)
 	}
 	// timestamptz <- time.Time.
-	if got, err := (CastTarget{Type: ColumnType{Kind: KindTimestampTZ}}).Convert(ts); err != nil || got != "2024-01-02T15:04:05Z" {
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindTimestampTZ}}).Convert(KindTimestampTZ, ts); err != nil || got != "2024-01-02T15:04:05Z" {
 		t.Fatalf("timestamptz <- time.Time = %v, %v", got, err)
 	}
 	// uuid <- 16 raw bytes (idempotent re-cast).
 	raw := bytes.Repeat([]byte{0xab}, 16)
-	if got, err := (CastTarget{Type: ColumnType{Kind: KindUUID}}).Convert(raw); err != nil || !bytes.Equal(got.([]byte), raw) {
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindUUID}}).Convert(KindUUID, raw); err != nil || !bytes.Equal(got.([]byte), raw) {
 		t.Fatalf("uuid <- []byte = %v, %v", got, err)
 	}
-	if _, err := (CastTarget{Type: ColumnType{Kind: KindUUID}}).Convert([]byte{1, 2, 3}); err == nil {
+	if _, err := (CastTarget{Type: ColumnType{Kind: KindUUID}}).Convert(KindUUID, []byte{1, 2, 3}); err == nil {
 		t.Error("uuid <- 3 bytes must error")
 	}
 	// json <- []byte and <- composite.
-	if got, err := (CastTarget{Type: ColumnType{Kind: KindJSON}}).Convert([]byte(`{"a":1}`)); err != nil || got != `{"a":1}` {
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindJSON}}).Convert(KindJSON, []byte(`{"a":1}`)); err != nil || got != `{"a":1}` {
 		t.Fatalf("json <- []byte = %v, %v", got, err)
 	}
-	if got, err := (CastTarget{Type: ColumnType{Kind: KindJSON}}).Convert(map[string]any{"a": float64(1)}); err != nil || got != `{"a":1}` {
+	if got, err := (CastTarget{Type: ColumnType{Kind: KindJSON}}).Convert(KindStruct, map[string]any{"a": float64(1)}); err != nil || got != `{"a":1}` {
 		t.Fatalf("json <- map = %v, %v", got, err)
 	}
 }
@@ -434,5 +434,173 @@ func TestParseTimeOfDayText(t *testing.T) {
 	want := int64(15*3_600_000_000 + 4*60_000_000 + 5*1_000_000 + 1)
 	if got != want {
 		t.Fatalf("micros = %d, want %d", got, want)
+	}
+}
+
+// asInt64 must reject a uint64 that has no exact int64 form (FIX-DOC v2 B).
+func TestAsInt64RejectsUint64Overflow(t *testing.T) {
+	if _, err := asInt64(uint64(math.MaxInt64) + 1); err == nil {
+		t.Fatal("uint64 above MaxInt64 must error")
+	}
+	if got, err := asInt64(uint64(42)); err != nil || got != 42 {
+		t.Fatalf("asInt64(uint64(42)) = %d, %v; want 42", got, err)
+	}
+}
+
+// C3: the temporal → string contract is canonical and stable, byte for byte.
+// Naive timestamp carries no zone; timestamptz carries RFC3339Nano.
+func TestTemporalToStringCanonical(t *testing.T) {
+	ts := time.Date(2024, 1, 2, 15, 4, 5, 123000000, time.UTC)
+	dateDays := int32(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+	cases := []struct {
+		name string
+		from Kind
+		v    any
+		want string
+	}{
+		{"date", KindDate, dateDays, "2024-01-01"},
+		{"time", KindTime, int64(15*3_600_000_000 + 4*60_000_000 + 5*1_000_000 + 1), "15:04:05.000001"},
+		{"timestamp", KindTimestamp, ts, "2024-01-02 15:04:05.123000000"},
+		{"timestamptz", KindTimestampTZ, ts, "2024-01-02T15:04:05.123Z"},
+	}
+	to := CastTarget{Type: ColumnType{Kind: KindString}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := to.Convert(tc.from, tc.v)
+			if err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// C2: an integer under a timestamp source is a wire bug, not a guess.
+func TestTemporalToStringRejectsInteger(t *testing.T) {
+	to := CastTarget{Type: ColumnType{Kind: KindString}}
+	for _, from := range []Kind{KindTimestamp, KindTimestampTZ} {
+		_, err := to.Convert(from, int64(42))
+		if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Fatalf("%s with an int must error as ambiguous, got %v", from, err)
+		}
+	}
+}
+
+// D1/D2: micros-since-midnight formatting, with the two out-of-range errors.
+func TestFormatMicrosOfDay(t *testing.T) {
+	cases := []struct {
+		micros int64
+		want   string
+	}{
+		{0, "00:00:00"},
+		{int64(12 * time.Hour / time.Microsecond), "12:00:00"},
+		{int64(15*3_600_000_000 + 4*60_000_000 + 5*1_000_000 + 123456), "15:04:05.123456"},
+	}
+	for _, tc := range cases {
+		got, err := formatMicrosOfDay(tc.micros)
+		if err != nil || got != tc.want {
+			t.Fatalf("formatMicrosOfDay(%d) = %q, %v; want %q", tc.micros, got, err, tc.want)
+		}
+	}
+	if _, err := formatMicrosOfDay(-1); err == nil {
+		t.Error("negative micros must error")
+	}
+	if _, err := formatMicrosOfDay(int64(24 * time.Hour / time.Microsecond)); err == nil {
+		t.Error("24h micros must error")
+	}
+}
+
+// D3: castToTimestamp accepts a uint64 date (the overflow guard is B's).
+func TestCastToTimestampAcceptsUint64(t *testing.T) {
+	days := uint64(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+	got, err := castToTimestamp(KindDate, days)
+	if err != nil {
+		t.Fatalf("uint64 date → timestamp: %v", err)
+	}
+	if got != "2024-01-01 00:00:00.000000000" {
+		t.Fatalf("got %v", got)
+	}
+	// An integer under a non-date source is ambiguous (wire bug), not days —
+	// including KindUnknown, which cannot tell days from micros.
+	for _, from := range []Kind{KindTimestamp, KindUnknown} {
+		if _, err := castToTimestamp(from, int64(42)); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Fatalf("%s int must error as ambiguous, got %v", from, err)
+		}
+	}
+}
+
+// E4: WireSchema keeps the SOURCE type (so the sink's cast sees the origin),
+// swaps only a KindUnknown column for its cast target, preserves the source
+// nullability, copies the PK, and never aliases its inputs.
+func TestWireSchema(t *testing.T) {
+	source := Schema{
+		Columns: []Column{
+			{Name: "id", Type: ColumnType{Kind: KindInt64}},
+			{Name: "d", Type: ColumnType{Kind: KindDate, Nullable: true}},
+			{Name: "geom", Type: ColumnType{Kind: KindUnknown, Nullable: true, Opaque: &OpaqueOrigin{TypeName: "point"}}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	resolved := Schema{Columns: []Column{
+		{Name: "id", Type: ColumnType{Kind: KindInt64}},
+		{Name: "d", Type: ColumnType{Kind: KindString, Nullable: true}},    // cast d -> string
+		{Name: "geom", Type: ColumnType{Kind: KindString, Nullable: true}}, // cast geom -> string
+	}}
+
+	w := WireSchema(source, resolved)
+	if c, _ := w.Column("d"); c.Type.Kind != KindDate || !c.Type.Nullable {
+		t.Fatalf("d = %+v, want the source Date (nullable), not the target String", c.Type)
+	}
+	if c, _ := w.Column("geom"); c.Type.Kind != KindString || !c.Type.Nullable {
+		t.Fatalf("geom = %+v, want the cast target String (nullable)", c.Type)
+	}
+	if len(w.PrimaryKey) != 1 || w.PrimaryKey[0] != "id" {
+		t.Fatalf("pk = %v, want [id]", w.PrimaryKey)
+	}
+
+	// Mutating the input slices and name fields must not change the output:
+	// the columns slice and the PK slice are copied (composite/Opaque
+	// pointers are shared, but they are immutable in practice).
+	source.Columns[0].Name = "MUT"
+	source.PrimaryKey[0] = "MUT"
+	if c, _ := w.Column("id"); c.Name != "id" {
+		t.Fatal("WireSchema aliased the source columns")
+	}
+	if w.PrimaryKey[0] != "id" {
+		t.Fatal("WireSchema aliased the source PK")
+	}
+}
+
+// E4: a KindUnknown column with no resolved cast (unreachable when the
+// pipeline resolves — ResolveSchema rejects it — but fixed here) keeps
+// KindUnknown, so the encoder rejects it loudly rather than inventing a type.
+func TestWireSchemaUnknownWithoutCast(t *testing.T) {
+	source := Schema{Columns: []Column{{Name: "geom", Type: ColumnType{Kind: KindUnknown}}}}
+	w := WireSchema(source, Schema{})
+	if c, _ := w.Column("geom"); c.Type.Kind != KindUnknown {
+		t.Fatalf("geom = %+v, want KindUnknown preserved", c.Type)
+	}
+}
+
+// An unmappable column (KindUnknown) cannot carry an encoding on the wire, so
+// string(hex)/string(base64) over it would be a cast the sink can never
+// honor. Reject at the policy, cite the provenance; a plain string (the JSON
+// dump escape valve) stays valid.
+func TestCheckCastRejectsEncodedStringOnUnknown(t *testing.T) {
+	err := CheckCast(
+		ColumnType{Kind: KindUnknown, Opaque: &OpaqueOrigin{TypeName: "point", VendorName: "mysql"}},
+		CastTarget{Type: ColumnType{Kind: KindString}, Encoding: "hex"},
+	)
+	if err == nil {
+		t.Fatal("string(hex) on KindUnknown must be rejected")
+	}
+	if !strings.Contains(err.Error(), "mysql point") {
+		t.Fatalf("error must cite the provenance, got: %v", err)
+	}
+
+	if err := CheckCast(ColumnType{Kind: KindUnknown}, CastTarget{Type: ColumnType{Kind: KindString}}); err != nil {
+		t.Fatalf("plain string on KindUnknown must pass: %v", err)
 	}
 }

@@ -1,8 +1,15 @@
 package clickhouse
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // TestNextSeqGuardProvesDeterministicOrdering is the deterministic half of
@@ -53,5 +60,42 @@ func TestNextSeqSeededFromTable(t *testing.T) {
 
 	if got := w.nextSeq(); got != seed+1 {
 		t.Fatalf("seq after boot with stepped-back clock = %d, want %d (seed+1)", got, seed+1)
+	}
+}
+
+// wireReader builds a one-row wire-schema batch (all NULL) and its reader.
+func wireReader(t *testing.T, cs core.Schema) *transport.BatchReader {
+	t.Helper()
+	as, err := transport.CoreSchemaToArrow(cs)
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, as)
+	defer bld.Release()
+	for j := 0; j < int(as.NumFields()); j++ {
+		bld.Field(j).AppendNull()
+	}
+	rec := bld.NewRecordBatch()
+	t.Cleanup(rec.Release)
+	r, err := transport.NewBatchReader(rec, nil)
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	return r
+}
+
+// A cast column absent from the wire must fail at bind time (FIX-DOC v2 A).
+func TestBindResolversErrorsOnMissingCastColumn(t *testing.T) {
+	cp, err := core.ParseCastPolicy(map[string]string{"ghost": "string"})
+	if err != nil {
+		t.Fatalf("cast: %v", err)
+	}
+	w := &tableWriter{cols: []column{{name: "ghost"}}, cast: cp}
+	r := wireReader(t, core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+	}})
+	_, err = w.bindResolvers(r)
+	if err == nil || !strings.Contains(err.Error(), `"ghost"`) || !strings.Contains(err.Error(), "kind not found") {
+		t.Fatalf("missing cast column must error citing the column, got %v", err)
 	}
 }

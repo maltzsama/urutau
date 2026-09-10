@@ -142,8 +142,18 @@ func parseDecimalArgs(args string) (precision, scale int, err error) {
 // runs at runtime beyond value conversion.
 func CheckCast(from ColumnType, to CastTarget) error {
 	// KindUnknown is the cast bypass: the source type has no canonical form
-	// and the declared target becomes its type directly.
+	// and the declared target becomes its type directly. An encoded string
+	// (string(hex)/string(base64)) is rejected: an unmappable column carries
+	// no encoding on the wire, so the sink could never apply it — a plain
+	// string (the JSON dump) is the supported escape valve.
 	if from.Kind == KindUnknown {
+		if to.Type.Kind == KindString && to.Encoding != "" {
+			prov := ""
+			if from.Opaque != nil {
+				prov = " (" + from.Opaque.String() + ")"
+			}
+			return fmt.Errorf("core: unmappable column%s → string(%s) is not supported; declare a plain string cast", prov, to.Encoding)
+		}
 		return nil
 	}
 	switch to.Type.Kind {
@@ -252,8 +262,12 @@ func CastWarning(from Kind, to CastTarget) string {
 
 // ── Value conversion ──────────────────────────────────────────────────
 
-// Convert applies an allowed cast to one value. It returns an error for a
-// value the cast cannot represent (invalid UUID text, invalid JSON).
+// Convert applies an allowed cast to one value. from is the source column's
+// canonical Kind: the value kernel needs it to disambiguate representations
+// that share a Go type ([]byte is binary or uuid; int32 is an integer or a
+// date; int64 is an integer or a time-of-day). from is consultive — it only
+// shapes the rendering; the policy switch is t.Type. It returns an error for
+// a value the cast cannot represent (invalid UUID text, invalid JSON).
 //
 // Convert is NOT a leftover from the pre-columnar design: it is the
 // per-value cast kernel the sinks apply on their write paths (clickhouse,
@@ -263,10 +277,10 @@ func CastWarning(from Kind, to CastTarget) string {
 // batch-level executor; the two coexist by design (W-1 / D-4: the matrix is
 // the single policy, the arrow kernel and this value kernel are the two
 // executors). Deleting Convert would strand the sinks.
-func (t CastTarget) Convert(v any) (any, error) {
+func (t CastTarget) Convert(from Kind, v any) (any, error) {
 	switch t.Type.Kind {
 	case KindString:
-		return castToString(v, t.Encoding)
+		return castToString(from, v, t.Encoding)
 	case KindBinary:
 		return castToBinary(v)
 	case KindInt64:
@@ -280,7 +294,7 @@ func (t CastTarget) Convert(v any) (any, error) {
 	case KindJSON:
 		return castToJSON(v)
 	case KindTimestamp:
-		return castToTimestamp(v)
+		return castToTimestamp(from, v)
 	case KindTimestampTZ:
 		return castToTimestampTZ(v, t.AssumeUTC)
 	default:
@@ -325,12 +339,20 @@ func StringifyScalar(v any) (string, error) {
 	}
 }
 
-func castToString(v any, enc string) (any, error) {
+// castToString renders a source value as string. from selects the rendering
+// for the Kinds whose Go type is ambiguous on its own: a date (int32 days),
+// a time (int64 micros), a uuid ([]byte) and binary ([]byte, which needs the
+// declared encoding). Everything else falls through to StringifyScalar.
+func castToString(from Kind, v any, enc string) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	// Binary needs the explicit encoding before the scalar path.
-	if b, ok := v.([]byte); ok {
+	switch from {
+	case KindBinary, KindFixedBinary:
+		b, err := asBytes(v)
+		if err != nil {
+			return nil, fmt.Errorf("core: binary → string: %w", err)
+		}
 		switch enc {
 		case "hex":
 			return hex.EncodeToString(b), nil
@@ -339,8 +361,120 @@ func castToString(v any, enc string) (any, error) {
 		default:
 			return nil, fmt.Errorf("core: binary → string requires string(hex) or string(base64)")
 		}
+	case KindUUID:
+		switch t := v.(type) {
+		case string:
+			return strings.ToLower(t), nil
+		case []byte:
+			return formatUUID(t)
+		default:
+			return nil, fmt.Errorf("core: cannot cast %T to uuid text", v)
+		}
+	case KindDate:
+		// The wire form of a date is int32 days since epoch.
+		days, err := asInt64(v)
+		if err != nil {
+			return nil, fmt.Errorf("core: date → string: %w", err)
+		}
+		return time.Unix(days*86400, 0).UTC().Format(dateLayout), nil
+	case KindTime:
+		// The wire form of a time is int64 micros since midnight.
+		micros, err := asInt64(v)
+		if err != nil {
+			return nil, fmt.Errorf("core: time → string: %w", err)
+		}
+		return formatMicrosOfDay(micros)
+	case KindTimestamp:
+		// Naive: the TZ does not exist in the data, so the canonical text
+		// carries no zone. An integer here is ambiguous — the wire form of a
+		// timestamp is time.Time, not a count of days or micros (that
+		// distinction belongs to Date/Time, whose from says so) — so it is a
+		// wire bug, not something to guess.
+		if tm, ok := v.(time.Time); ok {
+			return tm.Format(naiveTimestampTextLayout), nil
+		}
+		if s, ok := v.(string); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("core: cannot render %T as %s text — wire representation ambiguous; fix the wire Kind", v, from)
+	case KindTimestampTZ:
+		// The zone IS the semantics, so the canonical text is RFC3339Nano.
+		if tm, ok := v.(time.Time); ok {
+			return tm.Format(time.RFC3339Nano), nil
+		}
+		if s, ok := v.(string); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("core: cannot render %T as %s text — wire representation ambiguous; fix the wire Kind", v, from)
+	default:
+		return StringifyScalar(v)
 	}
-	return StringifyScalar(v)
+}
+
+// asBytes interprets a value as raw bytes (a source may hand binary over as
+// []byte or as an already-normalized string).
+func asBytes(v any) ([]byte, error) {
+	switch t := v.(type) {
+	case []byte:
+		return t, nil
+	case string:
+		return []byte(t), nil
+	default:
+		return nil, fmt.Errorf("cannot interpret %T as bytes", v)
+	}
+}
+
+// asInt64 interprets a value as an integer (the columnar representation of a
+// date is int32 days, of a time int64 micros). A uint64 above MaxInt64 has no
+// exact int64 form and is rejected, never silently wrapped.
+func asInt64(v any) (int64, error) {
+	switch t := v.(type) {
+	case int:
+		return int64(t), nil
+	case int32:
+		return int64(t), nil
+	case int64:
+		return t, nil
+	case uint64:
+		if t > math.MaxInt64 {
+			return 0, fmt.Errorf("core: uint64 %d overflows int64", t)
+		}
+		return int64(t), nil
+	default:
+		return 0, fmt.Errorf("cannot interpret %T as an integer", v)
+	}
+}
+
+// formatUUID renders 16 raw bytes as the canonical 8-4-4-4-12 uuid text.
+func formatUUID(b []byte) (string, error) {
+	if len(b) != 16 {
+		return "", fmt.Errorf("core: uuid bytes must be 16 long, got %d", len(b))
+	}
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// formatMicrosOfDay renders micros since midnight as HH:MM:SS[.ffffff]. A
+// negative value or one at/after 24h has no time-of-day meaning and is an
+// error — never clamped or truncated.
+func formatMicrosOfDay(micros int64) (string, error) {
+	if micros < 0 {
+		return "", fmt.Errorf("core: time-of-day %d micros is negative", micros)
+	}
+	if micros >= int64(24*time.Hour/time.Microsecond) {
+		return "", fmt.Errorf("core: time-of-day %d micros is at or past 24h", micros)
+	}
+	ns := micros * 1000
+	h := ns / int64(time.Hour)
+	ns -= h * int64(time.Hour)
+	m := ns / int64(time.Minute)
+	ns -= m * int64(time.Minute)
+	s := ns / int64(time.Second)
+	ns -= s * int64(time.Second)
+	if ns == 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s), nil
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000), nil
 }
 
 func castToBinary(v any) (any, error) {
@@ -566,10 +700,14 @@ func castToJSON(v any) (any, error) {
 // fraction optional and strips trailing zeros, so it alone covers a naive
 // timestamp with or without a fraction — there is no separate layout for
 // "no fraction".
+//
+// naiveTimestampTextLayout is the canonical OUTPUT for a naive timestamp:
+// fixed nine-digit fraction, no zone (the zone does not exist in the data).
 const (
-	dateLayout           = "2006-01-02"
-	naiveTimestampLayout = "2006-01-02 15:04:05.999999999"
-	timeOfDayLayout      = "15:04:05.999999999"
+	dateLayout               = "2006-01-02"
+	naiveTimestampLayout     = "2006-01-02 15:04:05.999999999"
+	naiveTimestampTextLayout = "2006-01-02 15:04:05.000000000"
+	timeOfDayLayout          = "15:04:05.999999999"
 )
 
 // ParseTimestampText parses a temporal text into a time.Time: an RFC3339
@@ -600,20 +738,33 @@ func ParseTimeOfDayText(s string) (int64, error) {
 
 // castToTimestamp reinterprets a naive temporal value: date becomes midnight,
 // timestamptz drops its zone. Never parses a free-form string.
-func castToTimestamp(v any) (any, error) {
+func castToTimestamp(from Kind, v any) (any, error) {
 	switch t := v.(type) {
 	case nil:
 		return nil, nil
 	case time.Time:
 		// Already a timestamp (the columnar representation); re-render it
 		// naive so the sink sees one consistent textual form.
-		return t.Format("2006-01-02 15:04:05.000000000"), nil
+		return t.Format(naiveTimestampTextLayout), nil
+	case int, int32, int64, uint64:
+		// Only a date (KindDate) carries days-since-epoch as an integer.
+		// Any other source — including an unknown Kind, which cannot tell
+		// days from micros — handing an integer here is a wire bug, not a
+		// guess (from exists to say which).
+		if from != KindDate {
+			return nil, fmt.Errorf("core: cannot render %T as %s text — wire representation ambiguous; fix the wire Kind", v, from)
+		}
+		days, err := asInt64(t)
+		if err != nil {
+			return nil, fmt.Errorf("core: %s → timestamp: %w", from, err)
+		}
+		return time.Unix(days*86400, 0).UTC().Format(naiveTimestampTextLayout), nil
 	case string:
 		tm, err := ParseTimestampText(t)
 		if err != nil {
 			return nil, fmt.Errorf("core: %q is not a naive timestamp or date", t)
 		}
-		return tm.Format("2006-01-02 15:04:05.000000000"), nil
+		return tm.Format(naiveTimestampTextLayout), nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to timestamp", v)
 	}
@@ -730,6 +881,31 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 		}
 	}
 	return out, warns, nil
+}
+
+// WireSchema returns the shape a source encodes and the wire carries.
+//
+// Invariant: the wire preserves the SOURCE type — including its nullability
+// — so a sink's Kind-aware cast sees the true origin (a date as Date32,
+// binary as Binary, not the already-cast target). The resolved schema
+// dictates only the KIND, and only for a KindUnknown column, which has no
+// Arrow representation of its own; the sink then re-applies that cast
+// idempotently.
+func WireSchema(source, resolved Schema) Schema {
+	out := Schema{PrimaryKey: append([]string(nil), source.PrimaryKey...), Columns: make([]Column, 0, len(source.Columns))}
+	for _, c := range source.Columns {
+		if c.Type.Kind == KindUnknown {
+			if rc, ok := resolved.Column(c.Name); ok {
+				// Take the resolved Kind, keep the source nullability: the
+				// wire's nullability is always the source's.
+				nullable := c.Type.Nullable
+				c.Type = rc.Type
+				c.Type.Nullable = nullable
+			}
+		}
+		out.Columns = append(out.Columns, c)
+	}
+	return out
 }
 
 // inPrimaryKey reports whether name is a member of the key list.

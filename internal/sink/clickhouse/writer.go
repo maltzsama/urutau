@@ -220,18 +220,23 @@ func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, er
 			}
 			continue
 		}
+		var target *core.CastTarget
+		if ct, ok := w.cast.Target(name); ok {
+			t := ct
+			target = &t
+		}
 		if !r.HasColumn(name) {
+			// A cast column must be present on the wire: a missing column
+			// would silently bypass the matrix and write the raw value.
+			if target != nil {
+				return nil, fmt.Errorf("clickhouse: column %q: kind not found in wire schema — cast cannot be applied", name)
+			}
 			// A target column the stream does not carry: nil per the
 			// nullability rules, identical to the old absent-key path.
 			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, _ uint64, _ chRowMeta) (any, error) {
 				return nil, nil
 			}
 			continue
-		}
-		var target *core.CastTarget
-		if ct, ok := w.cast.Target(name); ok {
-			t := ct
-			target = &t
 		}
 		colName := name
 		resolvers[i] = func(r *transport.BatchReader, i int, _ bool, _ string, _ uint64, _ chRowMeta) (any, error) {
@@ -240,7 +245,14 @@ func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, er
 				return nil, nil
 			}
 			if target != nil {
-				cv, err := target.Convert(v)
+				// Backstop: bindResolvers already rejected a missing cast
+				// column; this closure-side check reads the same dataIndex
+				// and guards against a bind/resolve divergence.
+				from, kindOK := r.ColumnKind(colName)
+				if !kindOK {
+					return nil, fmt.Errorf("clickhouse: column %q: kind not found in wire schema — cast cannot be applied", colName)
+				}
+				cv, err := target.Convert(from, v)
 				if err != nil {
 					return nil, fmt.Errorf("column %q: %w", colName, err)
 				}

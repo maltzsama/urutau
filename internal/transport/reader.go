@@ -195,6 +195,18 @@ func (r *BatchReader) Value(name string, i int) (any, bool) {
 	return v, true
 }
 
+// ColumnKind returns the canonical Kind of a data column as carried on the
+// wire. A cast kernel needs it to disambiguate representations that share a
+// Go type ([]byte binary vs uuid; int32 integer vs date; int64 integer vs
+// time-of-day). ok is false for an unknown column.
+func (r *BatchReader) ColumnKind(name string) (core.Kind, bool) {
+	idx, ok := r.dataIndex[name]
+	if !ok {
+		return core.KindUnknown, false
+	}
+	return r.colTypes[idx].Kind, true
+}
+
 // value reads one canonical Go value from an Arrow column.
 func (r *BatchReader) value(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 	return readTypedValue(col, ct, i)

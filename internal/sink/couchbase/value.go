@@ -42,12 +42,28 @@ func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, m
 			meta[col.Name] = jv
 			continue
 		}
-		v, ok := r.Value(col.Name, i)
-		if !ok {
+		ct, hasCast := p.cast.Target(col.Name)
+		var from core.Kind
+		if hasCast {
+			// A cast column must be present on the wire: a missing column
+			// would silently bypass the matrix and write the raw value.
+			var kindOK bool
+			from, kindOK = r.ColumnKind(col.Name)
+			if !kindOK {
+				return nil, nil, fmt.Errorf("couchbase: column %q: kind not found in wire schema — cast cannot be applied", col.Name)
+			}
+		}
+		v, present := r.Value(col.Name, i)
+		if !present {
+			if hasCast {
+				// ColumnKind said the column is on the wire; a divergence
+				// here is a bug, not a missing optional column.
+				return nil, nil, fmt.Errorf("couchbase: column %q: kind present but value absent from the wire", col.Name)
+			}
 			continue
 		}
-		if ct, ok := p.cast.Target(col.Name); ok {
-			cv, err := ct.Convert(v)
+		if hasCast {
+			cv, err := ct.Convert(from, v)
 			if err != nil {
 				return nil, nil, fmt.Errorf("column %q: %w", col.Name, err)
 			}

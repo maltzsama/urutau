@@ -349,25 +349,40 @@ func columnNames(s core.Schema) []string {
 	return names
 }
 
-// introspectAll resolves each spec table through the source, so the pipeline
-// knows the PK (equality key) and the resolved canonical shape before writing
-// anything. The canonical schema carries the declared cast and metadata
-// columns; the target schema is the sink's concern.
-func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) ([]core.TableRef, map[string]core.Schema, error) {
-	refs := make([]core.TableRef, 0, len(s.Tables))
-	canonical := make(map[string]core.Schema, len(s.Tables))
+// introspectAll resolves each spec table through the source, producing both
+// the RESOLVED shape (cast types + metadata columns, the sink's target) and
+// the WIRE shape (the source types the worker encodes). Cast warnings surface
+// here, once, from the resolver.
+func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire map[string]core.Schema, casts map[string]core.CastPolicy, err error) {
+	refs = make([]core.TableRef, 0, len(s.Tables))
+	resolved = make(map[string]core.Schema, len(s.Tables))
+	wire = make(map[string]core.Schema, len(s.Tables))
+	casts = make(map[string]core.CastPolicy, len(s.Tables))
 	for _, t := range s.Tables {
-		ref, cs, warns, err := src.Introspect(ctx, t)
-		if err != nil {
-			return nil, nil, err
+		ref, srcSchema, warns, ierr := src.Introspect(ctx, t)
+		if ierr != nil {
+			return nil, nil, nil, nil, ierr
+		}
+		cast, cerr := core.ParseCastPolicy(t.Cast)
+		if cerr != nil {
+			return nil, nil, nil, nil, fmt.Errorf("runner: %s: %w", t.Source, cerr)
+		}
+		res, rwarns, rerr := core.ResolveSchema(srcSchema, cast, t.Metadata)
+		if rerr != nil {
+			return nil, nil, nil, nil, rerr
 		}
 		for _, w := range warns {
 			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
 		}
+		for _, w := range rwarns {
+			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
+		}
 		refs = append(refs, ref)
-		canonical[t.Source] = cs
+		resolved[t.Source] = res
+		wire[t.Source] = core.WireSchema(srcSchema, res)
+		casts[t.Source] = cast
 	}
-	return refs, canonical, nil
+	return refs, resolved, wire, casts, nil
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
@@ -491,10 +506,12 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		}
 	}
 
-	// Resolve source tables and their canonical schemas. The canonical
-	// schemas also feed the schema-drift check: the batcher compares every
-	// change against the column set known at introspection time.
-	refs, canonical, err := introspectAll(ctx, src, s, log)
+	// Resolve source tables into the SOURCE schema (what the worker encodes
+	// and the wire carries) and the RESOLVED schema (the sink's target shape
+	// with cast types and metadata columns). The source schemas also feed the
+	// schema-drift check: the batcher compares every change against the
+	// column set known at introspection time.
+	refs, resolved, wire, casts, err := introspectAll(ctx, src, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -514,9 +531,9 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	modes := make(map[string]dataplane.WriteMode, len(refs))
 	for _, ref := range refs {
 		t := specBySource[ref.Source]
-		cast, _ := core.ParseCastPolicy(t.Cast)
+		cast := casts[ref.Source]
 		mode := t.WriteMode.ChangeMode()
-		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], t.PartitionBy, cast, mode); err != nil {
+		if err := snk.EnsureTable(ctx, ref, resolved[ref.Source], t.PartitionBy, cast, mode); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
 		wr, err := snk.Writer(ctx, ref, cast, t.Metadata)
@@ -544,9 +561,9 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		if mode == dataplane.AppendMode && specByTarget[target].OnDelete == spec.OnDeleteSkip {
 			w.SetDropDeletes(target, true)
 		}
-		// The drift check knows the introspected canonical schema (with its
-		// types, so nested struct drift is caught) per table.
-		if cs := canonicalForTarget(canonical, refs, target); len(cs.Columns) > 0 {
+		// The drift check knows the source (wire) schema (with its types, so
+		// nested struct drift is caught) per table.
+		if cs := canonicalForTarget(wire, refs, target); len(cs.Columns) > 0 {
 			w.SetKnownSchema(target, cs)
 		}
 		// Enrichment: broadcast reference joins declared for this table.
@@ -554,7 +571,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		// table does not have fails boot, not the first event. Loads run
 		// asynchronously; the cold-start policy governs early traffic.
 		if t := specByTarget[target]; len(t.Enrich) > 0 {
-			st, err := enrich.New(t.Enrich, columnNames(canonicalForTarget(canonical, refs, target)), log)
+			st, err := enrich.New(t.Enrich, columnNames(canonicalForTarget(wire, refs, target)), log)
 			if err != nil {
 				closeQuery()
 				closeStages()
@@ -628,13 +645,14 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		closeStages()
 		return nil, err
 	}
-	// A source that can take the resolved schema (optional interface) gets
-	// it now so the source boundary gates on drift and encodes stable
-	// batches, keyed by the TARGET the changes are addressed to.
+	// A source that can take the source schema (optional interface) gets it
+	// now so the source boundary gates on drift and encodes stable batches
+	// with the source types the sink casts, keyed by the TARGET the changes
+	// are addressed to.
 	if si, ok := rdr.(source.SchemaSetter); ok {
 		byTarget := make(map[string]core.Schema, len(refs))
 		for _, t := range s.Tables {
-			if cs, ok := canonical[t.Source]; ok {
+			if cs, ok := wire[t.Source]; ok {
 				byTarget[t.Target] = cs
 			}
 		}

@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -195,5 +196,43 @@ func TestAppendColumnTypeErrors(t *testing.T) {
 	}
 	if err := appendColumn(b.Field(0), intField, []any{nil, int64(1), int32(2)}); err != nil {
 		t.Fatalf("valid ints rejected: %v", err)
+	}
+}
+
+// A cast column absent from the wire must fail loudly: silently projecting it
+// as NULL (or raw) would bypass the matrix. Guard added in FIX-DOC v2 (A).
+func TestProjectErrorsOnMissingCastColumn(t *testing.T) {
+	cp, err := core.ParseCastPolicy(map[string]string{"v": "string(hex)"})
+	if err != nil {
+		t.Fatalf("cast: %v", err)
+	}
+	w := &TableWriter{
+		dataSchema: arrow.NewSchema([]arrow.Field{
+			{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "v", Type: arrow.BinaryTypes.String}, // cast target, absent from the wire
+		}, nil),
+		cast:       cp,
+		metaByName: map[string]core.MetadataColumn{},
+	}
+	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+	}})
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, data)
+	defer bld.Release()
+	bld.Field(0).(*array.Int64Builder).Append(1)
+	for j := 1; j < int(data.NumFields()); j++ {
+		bld.Field(j).AppendNull()
+	}
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p"), Mode: dataplane.UpsertMode}
+	defer b.Release()
+
+	_, err = w.projectRecord(context.Background(), b)
+	if err == nil || !strings.Contains(err.Error(), `"v"`) || !strings.Contains(err.Error(), "kind not found") {
+		t.Fatalf("missing cast column must error citing the column, got %v", err)
 	}
 }

@@ -47,7 +47,7 @@ func TestConvertFixedBinaryToString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	got, err := to.Convert([]byte{0xde, 0xad})
+	got, err := to.Convert(KindFixedBinary, []byte{0xde, 0xad})
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestCompositeToStringCast(t *testing.T) {
 	if err := CheckCast(st, to); err != nil {
 		t.Fatalf("struct → string must be allowed: %v", err)
 	}
-	got, err := to.Convert(map[string]any{"city": "sp", "zip": int64(12345)})
+	got, err := to.Convert(KindStruct, map[string]any{"city": "sp", "zip": int64(12345)})
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestCompositeToStringCast(t *testing.T) {
 	if err := CheckCast(lt, to); err != nil {
 		t.Fatalf("list → string must be allowed: %v", err)
 	}
-	got, err = to.Convert([]any{"a", "b"})
+	got, err = to.Convert(KindList, []any{"a", "b"})
 	if err != nil || got != `["a","b"]` {
 		t.Fatalf("list dump = %v (%v)", got, err)
 	}

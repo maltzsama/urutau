@@ -71,6 +71,16 @@ func (w *TableWriter) projectRecord(ctx context.Context, b *dataplane.Batch) (ar
 // express. The row-based path always applied the cast; the columnar path
 // silently skipped it until the test-verification helpers caught it.
 func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.BatchReader, src arrow.RecordBatch, field arrow.Field) (arrow.Array, error) {
+	// The source Kind (from the wire) lets the kernel disambiguate values
+	// whose Go type alone is ambiguous. A cast column must be present on the
+	// wire: a missing column would silently bypass the matrix and write the
+	// raw value.
+	ct, hasCast := w.cast.Target(field.Name)
+	from, kindOK := reader.ColumnKind(field.Name)
+	if hasCast && !kindOK {
+		return nil, fmt.Errorf("iceberg: column %q: kind not found in wire schema — cast cannot be applied", field.Name)
+	}
+
 	idx := -1
 	for i := range src.Schema().NumFields() {
 		if src.Schema().Field(i).Name == field.Name {
@@ -83,7 +93,7 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.B
 	}
 	col := src.Column(idx)
 
-	if ct, ok := w.cast.Target(field.Name); ok {
+	if hasCast {
 		bld := array.NewBuilder(memory.DefaultAllocator, field.Type)
 		defer bld.Release()
 		values := make([]any, reader.NumRows())
@@ -93,7 +103,7 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.B
 				values[i] = nil
 				continue
 			}
-			cv, err := ct.Convert(v)
+			cv, err := ct.Convert(from, v)
 			if err != nil {
 				return nil, fmt.Errorf("value %d: %w", i, err)
 			}

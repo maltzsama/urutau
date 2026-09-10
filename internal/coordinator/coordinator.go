@@ -304,15 +304,30 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 
 	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
+	// canonical holds the WIRE shape (source types; the workers encode it
+	// and the sink casts). resolvedSchemas holds the sink's target shape
+	// (cast types + metadata columns) for DDL.
 	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
+	resolvedSchemas := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
 	tableBySource := make(map[string]spec.Table, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, cs, _, err := src.Introspect(ctx, t)
+		ref, srcSchema, srcWarns, err := src.Introspect(ctx, t)
 		if err != nil {
 			return err
 		}
+		c.surfaceWarnings(ref.Source, srcWarns)
+		cast, err := coreCastOf(t)
+		if err != nil {
+			return err
+		}
+		res, warns, err := core.ResolveSchema(srcSchema, cast, t.Metadata)
+		if err != nil {
+			return err
+		}
+		c.surfaceWarnings(ref.Source, warns)
 		refs = append(refs, ref)
-		canonical[t.Source] = cs
+		canonical[t.Source] = core.WireSchema(srcSchema, res)
+		resolvedSchemas[t.Source] = res
 		tableBySource[t.Source] = t
 	}
 	c.refs = refs
@@ -397,7 +412,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
+		if err := snk.EnsureTable(ctx, ref, resolvedSchemas[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
@@ -1286,6 +1301,15 @@ func (c *Coordinator) snapshotDSN() string {
 		return u
 	}
 	return c.cfg.Spec.Source.URI
+}
+
+// surfaceWarnings logs the advisory warnings from source introspection and
+// cast resolution at boot — never swallowed, matching the runner (the
+// core.Warning contract is operator-facing).
+func (c *Coordinator) surfaceWarnings(table string, warns []core.Warning) {
+	for _, w := range warns {
+		c.log.Warn("schema", "table", table, "warning", w.Message)
+	}
 }
 
 // coreCastOf parses the table's declared cast policy, failing loud: a
