@@ -255,8 +255,9 @@ func CastWarning(from Kind, to CastTarget) string {
 // Convert applies an allowed cast to one value. from is the source column's
 // canonical Kind: the value kernel needs it to disambiguate representations
 // that share a Go type ([]byte is binary or uuid; int32 is an integer or a
-// date; int64 is an integer or a time-of-day). It returns an error for a
-// value the cast cannot represent (invalid UUID text, invalid JSON).
+// date; int64 is an integer or a time-of-day). from is consultive — it only
+// shapes the rendering; the policy switch is t.Type. It returns an error for
+// a value the cast cannot represent (invalid UUID text, invalid JSON).
 //
 // Convert is NOT a leftover from the pre-columnar design: it is the
 // per-value cast kernel the sinks apply on their write paths (clickhouse,
@@ -868,17 +869,24 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 	return out, warns, nil
 }
 
-// WireSchema returns the shape a source encodes and the wire carries: the
-// SOURCE column types, so a sink's Kind-aware cast sees the true origin (a
-// date as Date32, binary as Binary — not the already-cast target). A
-// KindUnknown column has no Arrow representation of its own, so it takes its
-// resolved cast target; the sink then re-applies that cast idempotently.
+// WireSchema returns the shape a source encodes and the wire carries.
+//
+// Invariant: the wire preserves the SOURCE type — including its nullability
+// — so a sink's Kind-aware cast sees the true origin (a date as Date32,
+// binary as Binary, not the already-cast target). The resolved schema
+// dictates only the KIND, and only for a KindUnknown column, which has no
+// Arrow representation of its own; the sink then re-applies that cast
+// idempotently.
 func WireSchema(source, resolved Schema) Schema {
 	out := Schema{PrimaryKey: append([]string(nil), source.PrimaryKey...), Columns: make([]Column, 0, len(source.Columns))}
 	for _, c := range source.Columns {
 		if c.Type.Kind == KindUnknown {
 			if rc, ok := resolved.Column(c.Name); ok {
+				// Take the resolved Kind, keep the source nullability: the
+				// wire's nullability is always the source's.
+				nullable := c.Type.Nullable
 				c.Type = rc.Type
+				c.Type.Nullable = nullable
 			}
 		}
 		out.Columns = append(out.Columns, c)

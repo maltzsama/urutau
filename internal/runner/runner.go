@@ -353,22 +353,23 @@ func columnNames(s core.Schema) []string {
 // knows the PK (equality key) and the resolved canonical shape before writing
 // anything. The canonical schema carries the declared cast and metadata
 // columns; the target schema is the sink's concern.
-func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire map[string]core.Schema, err error) {
+func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire map[string]core.Schema, casts map[string]core.CastPolicy, err error) {
 	refs = make([]core.TableRef, 0, len(s.Tables))
 	resolved = make(map[string]core.Schema, len(s.Tables))
 	wire = make(map[string]core.Schema, len(s.Tables))
+	casts = make(map[string]core.CastPolicy, len(s.Tables))
 	for _, t := range s.Tables {
 		ref, srcSchema, warns, ierr := src.Introspect(ctx, t)
 		if ierr != nil {
-			return nil, nil, nil, ierr
+			return nil, nil, nil, nil, ierr
 		}
 		cast, cerr := core.ParseCastPolicy(t.Cast)
 		if cerr != nil {
-			return nil, nil, nil, fmt.Errorf("runner: %s: %w", t.Source, cerr)
+			return nil, nil, nil, nil, fmt.Errorf("runner: %s: %w", t.Source, cerr)
 		}
 		res, rwarns, rerr := core.ResolveSchema(srcSchema, cast, t.Metadata)
 		if rerr != nil {
-			return nil, nil, nil, rerr
+			return nil, nil, nil, nil, rerr
 		}
 		for _, w := range append(warns, rwarns...) {
 			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
@@ -376,8 +377,9 @@ func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger 
 		refs = append(refs, ref)
 		resolved[t.Source] = res
 		wire[t.Source] = core.WireSchema(srcSchema, res)
+		casts[t.Source] = cast
 	}
-	return refs, resolved, wire, nil
+	return refs, resolved, wire, casts, nil
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
@@ -506,7 +508,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	// with cast types and metadata columns). The source schemas also feed the
 	// schema-drift check: the batcher compares every change against the
 	// column set known at introspection time.
-	refs, resolved, wire, err := introspectAll(ctx, src, s, log)
+	refs, resolved, wire, casts, err := introspectAll(ctx, src, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +528,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	modes := make(map[string]dataplane.WriteMode, len(refs))
 	for _, ref := range refs {
 		t := specBySource[ref.Source]
-		cast, _ := core.ParseCastPolicy(t.Cast)
+		cast := casts[ref.Source]
 		mode := t.WriteMode.ChangeMode()
 		if err := snk.EnsureTable(ctx, ref, resolved[ref.Source], t.PartitionBy, cast, mode); err != nil {
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)

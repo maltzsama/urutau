@@ -319,9 +319,12 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		res, _, err := core.ResolveSchema(srcSchema, cast, t.Metadata)
+		res, warns, err := core.ResolveSchema(srcSchema, cast, t.Metadata)
 		if err != nil {
 			return err
+		}
+		for _, w := range warns {
+			c.log.Warn("schema", "table", ref.Source, "warning", w.Message)
 		}
 		refs = append(refs, ref)
 		canonical[t.Source] = core.WireSchema(srcSchema, res)

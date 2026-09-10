@@ -523,3 +523,54 @@ func TestCastToTimestampAcceptsUint64(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+// E4: WireSchema keeps the SOURCE type (so the sink's cast sees the origin),
+// swaps only a KindUnknown column for its cast target, preserves the source
+// nullability, copies the PK, and never aliases its inputs.
+func TestWireSchema(t *testing.T) {
+	source := Schema{
+		Columns: []Column{
+			{Name: "id", Type: ColumnType{Kind: KindInt64}},
+			{Name: "d", Type: ColumnType{Kind: KindDate, Nullable: true}},
+			{Name: "geom", Type: ColumnType{Kind: KindUnknown, Nullable: true, Opaque: &OpaqueOrigin{TypeName: "point"}}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	resolved := Schema{Columns: []Column{
+		{Name: "id", Type: ColumnType{Kind: KindInt64}},
+		{Name: "d", Type: ColumnType{Kind: KindString, Nullable: true}},    // cast d -> string
+		{Name: "geom", Type: ColumnType{Kind: KindString, Nullable: true}}, // cast geom -> string
+	}}
+
+	w := WireSchema(source, resolved)
+	if c, _ := w.Column("d"); c.Type.Kind != KindDate || !c.Type.Nullable {
+		t.Fatalf("d = %+v, want the source Date (nullable), not the target String", c.Type)
+	}
+	if c, _ := w.Column("geom"); c.Type.Kind != KindString || !c.Type.Nullable {
+		t.Fatalf("geom = %+v, want the cast target String (nullable)", c.Type)
+	}
+	if len(w.PrimaryKey) != 1 || w.PrimaryKey[0] != "id" {
+		t.Fatalf("pk = %v, want [id]", w.PrimaryKey)
+	}
+
+	// Mutating the inputs must not change the output (no aliasing).
+	source.Columns[0].Name = "MUT"
+	source.PrimaryKey[0] = "MUT"
+	if c, _ := w.Column("id"); c.Name != "id" {
+		t.Fatal("WireSchema aliased the source columns")
+	}
+	if w.PrimaryKey[0] != "id" {
+		t.Fatal("WireSchema aliased the source PK")
+	}
+}
+
+// E4: a KindUnknown column with no resolved cast (unreachable when the
+// pipeline resolves — ResolveSchema rejects it — but fixed here) keeps
+// KindUnknown, so the encoder rejects it loudly rather than inventing a type.
+func TestWireSchemaUnknownWithoutCast(t *testing.T) {
+	source := Schema{Columns: []Column{{Name: "geom", Type: ColumnType{Kind: KindUnknown}}}}
+	w := WireSchema(source, Schema{})
+	if c, _ := w.Column("geom"); c.Type.Kind != KindUnknown {
+		t.Fatalf("geom = %+v, want KindUnknown preserved", c.Type)
+	}
+}
