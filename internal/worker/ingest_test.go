@@ -12,8 +12,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // IngestFromChanges wraps a change-oriented channel into Ingest batches.
@@ -27,12 +27,12 @@ func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, sch
 				if len(buf) == 0 {
 					continue
 				}
-				cb := rowchange.Batch{Table: table, Changes: buf, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
-				dpb, err := dpint.BatchFromChangeBatch(cb, schema)
+				rec, err := transport.RecordFromChanges(buf, transport.MergeSchema(buf, schema), nil)
 				if err != nil {
 					bufs[table] = bufs[table][:0]
 					continue
 				}
+				dpb := &dataplane.Batch{Table: table, Record: rec, Mode: dataplane.UpsertMode}
 				select {
 				case out <- Ingest{Table: table, Batch: dpb}:
 				case <-ctx.Done():
@@ -60,11 +60,12 @@ func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, sch
 						}
 						continue
 					}
-					cb := rowchange.Batch{Table: c.Table, Changes: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
-					dpb, err := dpint.BatchFromChangeBatch(cb, schema)
+					one := []rowchange.Change{c}
+					rec, err := transport.RecordFromChanges(one, transport.MergeSchema(one, schema), nil)
 					if err != nil {
 						continue
 					}
+					dpb := &dataplane.Batch{Table: c.Table, Record: rec, Mode: dataplane.UpsertMode}
 					select {
 					case out <- Ingest{Table: c.Table, Batch: dpb, Win: c.Window}:
 					case <-ctx.Done():

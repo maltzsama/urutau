@@ -23,8 +23,8 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -171,12 +171,13 @@ func cbWriter(t *testing.T, ctx context.Context, s sink.Sink, ref core.TableRef,
 func toDPBatch(b rowchange.Batch) *dataplane.Batch {
 	cs := core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
 	}, PrimaryKey: []string{"id"}}
-	dpb, err := dpint.BatchFromChangeBatch(b, cs)
+	rec, err := transport.RecordFromChanges(b.Changes, transport.MergeSchema(b.Changes, cs), nil)
 	if err != nil {
 		panic(err)
 	}
+	dpb := &dataplane.Batch{Table: b.Table, Record: rec, Watermark: []byte(b.Position), Mode: dataplane.UpsertMode}
 	return dpb
 }
 func cbRow(id int64, v, pos string) rowchange.Batch {

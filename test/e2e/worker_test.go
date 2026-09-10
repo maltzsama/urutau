@@ -11,9 +11,9 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -31,11 +31,12 @@ func localIngestFromChanges(ctx context.Context, changes <-chan rowchange.Change
 				if !ok {
 					return
 				}
-				cb := rowchange.Batch{Table: c.Table, Changes: []rowchange.Change{c}, Mode: rowchange.ToRowMode(dataplane.UpsertMode)}
-				dpb, err := dpint.BatchFromChangeBatch(cb, core.Schema{})
+				one := []rowchange.Change{c}
+				rec, err := transport.RecordFromChanges(one, transport.MergeSchema(one, core.Schema{}), nil)
 				if err != nil {
 					continue
 				}
+				dpb := &dataplane.Batch{Table: c.Table, Record: rec, Mode: dataplane.UpsertMode}
 				var win *rowchange.Window
 				if c.Window != nil && c.Window.InWindow {
 					win = &rowchange.Window{ChunkID: c.Window.ChunkID, InWindow: true}
