@@ -314,16 +314,24 @@ func TestFailedRefreshKeepsPreviousImage(t *testing.T) {
 	}
 }
 
-// Join key typing: int64 and string do not bridge; int widths do.
-func TestJoinKeyTyping(t *testing.T) {
-	if joinKey(int64(5)) != joinKey(int32(5)) {
+// normalizeKey: int widths collapse (uint64 == int64 for non-negatives);
+// []byte becomes string; string and int stay distinct; float widths stay
+// distinct. The join-key type contract, now on the snapshot index.
+func TestNormalizeKey(t *testing.T) {
+	if normalizeKey(int64(5)) != normalizeKey(int32(5)) {
 		t.Fatal("int widths should normalize to one key")
 	}
-	if joinKey("5") == joinKey(int64(5)) {
+	if normalizeKey(int64(5)) != normalizeKey(uint64(5)) {
+		t.Fatal("int64 and uint64 non-negative should normalize (MySQL UNSIGNED case)")
+	}
+	if normalizeKey("5") == normalizeKey(int64(5)) {
 		t.Fatal("string and int must NOT bridge — cast in SQL instead")
 	}
-	if joinKey([]byte("x")) != joinKey("x") {
+	if normalizeKey([]byte("x")) != normalizeKey("x") {
 		t.Fatal("[]byte and string should normalize to one key")
+	}
+	if normalizeKey(int64(-1)) == normalizeKey(uint64(18446744073709551615)) {
+		t.Fatal("negative int must not collide with a large uint64")
 	}
 }
 
@@ -491,38 +499,35 @@ func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
 	}
 }
 
-// The image itself carries ONLY the projected columns, under their final
-// prefixed names — the memory contract of the map.
-func TestImageHoldsProjectedColumnsOnly(t *testing.T) {
+// The refTable carries ONLY the projected columns (plus the join key at
+// column 0), under their final prefixed/renamed names.
+func TestRefTableHoldsProjectedColumnsOnly(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.As = map[string]string{"users.name": "user_name"}
 	})
 	s, _ := newTestStage(t, cfg, refRows())
-	rj := s.refs[0]
-	snap := rj.snap.Load()
+	snap := s.refs[0].snap.Load()
 	if snap == nil {
 		t.Fatal("snapshot not loaded")
 	}
-	img := snap.image
-	for k, row := range img {
-		if len(row) != len(cfg.Select) {
-			t.Fatalf("key %s: image row has %d columns, want %d: %v", k, len(row), len(cfg.Select), row)
-		}
-		// Renamed column uses the custom name.
-		if _, ok := row["user_name"]; !ok {
-			t.Fatalf("image missing renamed column: %v", row)
-		}
-		// Unrenamed column uses prefixed name.
-		if _, ok := row["users.tier"]; !ok {
-			t.Fatalf("image missing prefixed column: %v", row)
-		}
-		// Original unprefixed name should not exist.
-		if _, ok := row["name"]; ok {
-			t.Fatalf("image holds the pre-rename name: %v", row)
-		}
-		if _, ok := row["tier"]; ok {
-			t.Fatalf("image holds unprefixed name: %v", row)
-		}
+	sch := snap.refTable.Schema()
+	// column 0 is the join key; 1..N are the dests.
+	if sch.NumFields() != len(cfg.Select)+1 {
+		t.Fatalf("refTable has %d columns, want %d (join key + %d dests)",
+			sch.NumFields(), len(cfg.Select)+1, len(cfg.Select))
+	}
+	names := map[string]bool{}
+	for i := 1; i < sch.NumFields(); i++ {
+		names[sch.Field(i).Name] = true
+	}
+	if !names["user_name"] {
+		t.Fatalf("refTable missing renamed column: %v", names)
+	}
+	if !names["users.tier"] {
+		t.Fatalf("refTable missing prefixed column: %v", names)
+	}
+	if names["name"] || names["tier"] {
+		t.Fatalf("refTable holds a pre-rename / unprefixed name: %v", names)
 	}
 }
 
@@ -953,7 +958,7 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 	if !s.refs[0].isHot() {
 		t.Fatalf("reference did not go hot: %v", s.refs[0].stickyErr())
 	}
-	if got := s.refs[0].snap.Load().refTypes["users.tier"]; got.ID() != arrow.INT64 {
+	if got := s.refs[0].snap.Load().refType("users.tier"); got.ID() != arrow.INT64 {
 		t.Fatalf("users.tier refType = %s, want int64", got)
 	}
 
@@ -1015,7 +1020,7 @@ func TestProjectedNonStringJoinKeyLandsTyped(t *testing.T) {
 	if !s.refs[0].isHot() {
 		t.Fatalf("reference did not go hot: %v", s.refs[0].stickyErr())
 	}
-	if got := s.refs[0].snap.Load().refTypes["users.id"]; got.ID() != arrow.INT64 {
+	if got := s.refs[0].snap.Load().refType("users.id"); got.ID() != arrow.INT64 {
 		t.Fatalf("users.id refType = %s, want int64", got)
 	}
 }
