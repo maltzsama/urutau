@@ -583,3 +583,24 @@ func TestWireSchemaUnknownWithoutCast(t *testing.T) {
 		t.Fatalf("geom = %+v, want KindUnknown preserved", c.Type)
 	}
 }
+
+// An unmappable column (KindUnknown) cannot carry an encoding on the wire, so
+// string(hex)/string(base64) over it would be a cast the sink can never
+// honor. Reject at the policy, cite the provenance; a plain string (the JSON
+// dump escape valve) stays valid.
+func TestCheckCastRejectsEncodedStringOnUnknown(t *testing.T) {
+	err := CheckCast(
+		ColumnType{Kind: KindUnknown, Opaque: &OpaqueOrigin{TypeName: "point", VendorName: "mysql"}},
+		CastTarget{Type: ColumnType{Kind: KindString}, Encoding: "hex"},
+	)
+	if err == nil {
+		t.Fatal("string(hex) on KindUnknown must be rejected")
+	}
+	if !strings.Contains(err.Error(), "mysql point") {
+		t.Fatalf("error must cite the provenance, got: %v", err)
+	}
+
+	if err := CheckCast(ColumnType{Kind: KindUnknown}, CastTarget{Type: ColumnType{Kind: KindString}}); err != nil {
+		t.Fatalf("plain string on KindUnknown must pass: %v", err)
+	}
+}

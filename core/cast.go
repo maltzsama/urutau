@@ -142,8 +142,18 @@ func parseDecimalArgs(args string) (precision, scale int, err error) {
 // runs at runtime beyond value conversion.
 func CheckCast(from ColumnType, to CastTarget) error {
 	// KindUnknown is the cast bypass: the source type has no canonical form
-	// and the declared target becomes its type directly.
+	// and the declared target becomes its type directly. An encoded string
+	// (string(hex)/string(base64)) is rejected: an unmappable column carries
+	// no encoding on the wire, so the sink could never apply it — a plain
+	// string (the JSON dump) is the supported escape valve.
 	if from.Kind == KindUnknown {
+		if to.Type.Kind == KindString && to.Encoding != "" {
+			prov := ""
+			if from.Opaque != nil {
+				prov = " (" + from.Opaque.String() + ")"
+			}
+			return fmt.Errorf("core: unmappable column%s → string(%s) is not supported; declare a plain string cast", prov, to.Encoding)
+		}
 		return nil
 	}
 	switch to.Type.Kind {
