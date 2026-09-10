@@ -22,7 +22,10 @@
 //	offset   Binary ≤256            __pos      String (opaque, zero-copy)
 //	ts_source                       __commit_ts Nanoseconds
 //
-// Physical sinks truncate __commit_ts as needed (Iceberg µs).
+// The wire record carries a fixed metadata tail (transport.WireMetadataFields):
+// __op, __pos, __commit_ts, __ingest_ts, __snapshot, __phase — all six born
+// at the source, none injected downstream. Physical sinks truncate
+// __commit_ts as needed (Iceberg µs).
 package dataplane
 
 import "github.com/apache/arrow-go/v18/arrow"
@@ -61,11 +64,10 @@ type Batch struct {
 	// the worker routes on and the sink writes to. core.TableRef splits the
 	// source/target pair; this is the target half.
 	Table string
-	// Record is the wire schema: data columns in schema order,
-	// followed by __op, __pos, __commit_ts. System columns
-	// __ingest_ts, __snapshot, and __phase are injected by
-	// AddMetadata at the last stage (§3.6, four-readers rule) —
-	// they are NOT on the wire.
+	// Record is the wire schema: data columns in schema order, followed by
+	// the six metadata columns (transport.WireMetadataFields): __op, __pos,
+	// __commit_ts, __ingest_ts, __snapshot, __phase. All six are on the wire,
+	// written by the source encoder.
 	Record arrow.RecordBatch
 	// Watermark is __pos of the LAST row as received — the commit
 	// point. Captured at RECEIVE time, before any transform (§3.3).

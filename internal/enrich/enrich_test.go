@@ -4,15 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -80,9 +83,62 @@ func (rj *refJoin) isHot() bool {
 	return rj.snap.Load() != nil
 }
 
+// applyChanges drives changes through the columnar seam: encode to a wire
+// batch against a schema carrying the event columns plus the reference
+// destinations (nullable strings, the registered pre-load shape), run
+// ColumnarJoin, decode back to rows for assertion. A nil result (whole
+// batch dropped) returns nil.
+func (s *Stage) applyChanges(t *testing.T, changes []rowchange.Change) ([]rowchange.Change, error) {
+	t.Helper()
+	// Base: every key any change carries, inferred nullable, plus the
+	// standard event columns so the PK ("id") and join column always exist.
+	inferred := transport.InferSchemaFromChanges(changes)
+	for i := range inferred.Columns {
+		inferred.Columns[i].Type.Nullable = true
+	}
+	inferred.PrimaryKey = []string{"id"}
+	seen := map[string]bool{}
+	for _, c := range inferred.Columns {
+		seen[c.Name] = true
+	}
+	ensure := func(name string, kind core.Kind) {
+		if !seen[name] {
+			inferred.Columns = append(inferred.Columns, core.Column{Name: name, Type: core.ColumnType{Kind: kind, Nullable: true}})
+			seen[name] = true
+		}
+	}
+	ensure("id", core.KindInt64)
+	ensure("user_ref", core.KindInt64)
+	ensure("order_ref", core.KindInt64)
+	for _, rj := range s.refs {
+		for _, name := range rj.refDests {
+			ensure(name, core.KindString)
+		}
+	}
+	rec, err := transport.RecordFromChanges(changes, inferred, nil)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+	defer in.Release()
+	out, err := s.ColumnarJoin(in)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return nil, nil
+	}
+	defer out.Release()
+	rows, derr := transport.DecodeBatch(out.Record, "events", []string{"id"})
+	if derr != nil {
+		t.Fatalf("decode: %v", derr)
+	}
+	return rows, nil
+}
+
 func (s *Stage) applyOne(t *testing.T, c rowchange.Change) ([]rowchange.Change, error) {
 	t.Helper()
-	return s.Enrich([]rowchange.Change{c})
+	return s.applyChanges(t, []rowchange.Change{c})
 }
 
 // 1 — Broadcast join: N events × M rows in O(N); the loader runs once per
@@ -117,11 +173,11 @@ func TestLeftMissPassesWithNullsAndFlag(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("left miss dropped the event")
 	}
-	if out[0].After["users.name"] != nil || out[0].After["users.tier"] != nil {
+	if _, ok := out[0].After["users.name"]; ok {
 		t.Fatalf("miss columns not NULL: %v", out[0].After)
 	}
-	if !out[0].EnrichMiss {
-		t.Fatal("EnrichMiss not set on a left miss")
+	if _, ok := out[0].After["users.tier"]; ok {
+		t.Fatalf("miss columns not NULL: %v", out[0].After)
 	}
 	if s.misses.Load() != 1 {
 		t.Fatalf("misses = %d, want 1", s.misses.Load())
@@ -131,7 +187,7 @@ func TestLeftMissPassesWithNullsAndFlag(t *testing.T) {
 // 3 — Inner miss: the event is dropped; survivors are the matches.
 func TestInnerMissDrops(t *testing.T) {
 	s, _ := newTestStage(t, refCfg(func(c *spec.Enrich) { c.JoinType = "inner" }), usersRows())
-	out, err := s.Enrich([]rowchange.Change{
+	out, err := s.applyChanges(t, []rowchange.Change{
 		searchEvent(1, int64(1)),  // hit
 		searchEvent(2, int64(99)), // miss → dropped
 		searchEvent(3, int64(2)),  // hit
@@ -145,135 +201,6 @@ func TestInnerMissDrops(t *testing.T) {
 	if s.innerDropped.Load() != 1 {
 		t.Fatalf("innerDropped = %d, want 1", s.innerDropped.Load())
 	}
-}
-
-// 4 — Boot buffer: events arriving cold are queued, then drained in order
-// once the reference is hot.
-func TestColdStartBufferDrainsInOrder(t *testing.T) {
-	cfg := refCfg(func(c *spec.Enrich) {
-		c.OnColdStart = "buffer"
-		c.BufferLimits = spec.EnrichBufferLimits{MaxEvents: 100, MaxWait: "30s"}
-	})
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
-	if err != nil {
-		t.Fatalf("new: %v", err)
-	}
-	fl := &fakeLoader{rows: usersRows()}
-	_ = s.UseLoader(cfg.Table, fl)
-	// NOT started: the reference stays cold.
-	_, _ = s.Enrich(nil) // warm call: no-op
-
-	var survived []rowchange.Change
-	for i := 1; i <= 3; i++ {
-		out, err := s.Enrich([]rowchange.Change{searchEvent(int64(i), int64(1))})
-		if err != nil {
-			t.Fatalf("apply %d: %v", i, err)
-		}
-		survived = append(survived, out...)
-	}
-	if len(survived) != 0 {
-		t.Fatalf("cold events should be buffered, %d leaked through", len(survived))
-	}
-	// Start: the first load flips hot; the NEXT Apply drains the queue.
-	s.Start(context.Background())
-	t.Cleanup(s.Stop)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if s.refs[0].isHot() {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	drained, err := s.Enrich(nil)
-	if err != nil {
-		t.Fatalf("drain: %v", err)
-	}
-	if len(drained) != 3 {
-		t.Fatalf("drained = %d, want 3", len(drained))
-	}
-	for i, c := range drained {
-		if c.After["id"] != int64(i+1) {
-			t.Fatalf("drain order broken at %d: %v", i, c.After)
-		}
-		if c.After["users.name"] != "ana" {
-			t.Fatalf("drained event %d not enriched: %v", i, c.After)
-		}
-	}
-}
-
-// 5 — MaxEvents expiry: the OLDEST event is evacuated and follows the
-// join type (left → NULLs + flag).
-func TestBufferMaxEventsEvictsOldest(t *testing.T) {
-	cfg := refCfg(func(c *spec.Enrich) {
-		c.BufferLimits = spec.EnrichBufferLimits{MaxEvents: 2}
-	})
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
-	if err != nil {
-		t.Fatalf("new: %v", err)
-	}
-	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: usersRows()})
-
-	// Three events cold with a queue of 2: the first is evacuated
-	// (follows left-join miss) and surfaces in the output.
-	out, err := s.Enrich([]rowchange.Change{
-		searchEvent(1, int64(1)),
-		searchEvent(2, int64(1)),
-		searchEvent(3, int64(1)),
-	})
-	if err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-	if len(out) != 1 {
-		t.Fatalf("evacuated = %d, want 1", len(out))
-	}
-	if out[0].After["id"] != int64(1) {
-		t.Fatalf("evicted the wrong event: %v", out[0].After)
-	}
-	if !out[0].EnrichMiss {
-		t.Fatal("evacuated event did not follow the left-join miss policy")
-	}
-	if s.evicted.Load() != 1 {
-		t.Fatalf("evicted counter = %d, want 1", s.evicted.Load())
-	}
-	s.Stop()
-}
-
-// 6 — MaxWait expiry: an event queued past the cap follows the join type
-// at drain time.
-func TestBufferMaxWaitExpires(t *testing.T) {
-	cfg := refCfg(func(c *spec.Enrich) {
-		c.OnColdStart = "buffer"
-		c.BufferLimits = spec.EnrichBufferLimits{MaxWait: "1ms"}
-	})
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
-	if err != nil {
-		t.Fatalf("new: %v", err)
-	}
-	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: usersRows()})
-	if _, err := s.Enrich([]rowchange.Change{searchEvent(1, int64(1))}); err != nil {
-		t.Fatalf("park: %v", err)
-	}
-	time.Sleep(5 * time.Millisecond) // the parked event is now past MaxWait
-	// Pretend the reference went hot with an empty drain list... no: the
-	// real path flips hot in refresh; simulate by flipping manually.
-	img, dests, _ := buildImage(s.refs[0], usersRows())
-	s.refs[0].snap.Store(&snapshot{image: img, dests: dests})
-	s.refs[0].mu.Lock()
-	s.refs[0].pendingDrain = s.refs[0].queue
-	s.refs[0].queue = nil
-	s.refs[0].mu.Unlock()
-
-	out, err := s.Enrich(nil)
-	if err != nil {
-		t.Fatalf("drain: %v", err)
-	}
-	if len(out) != 1 || !out[0].EnrichMiss {
-		t.Fatalf("expired event did not follow the miss policy: %+v", out)
-	}
-	if s.evicted.Load() != 1 {
-		t.Fatalf("evicted = %d, want 1", s.evicted.Load())
-	}
-	s.Stop()
 }
 
 // 7 — Refresh is an atomic swap: readers in flight never see a partial
@@ -405,7 +332,7 @@ func TestDeleteChangePassesThrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if len(out) != 1 || out[0].EnrichMiss {
+	if len(out) != 1 {
 		t.Fatalf("delete must pass untouched: %+v", out)
 	}
 }
@@ -689,7 +616,7 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 		IngestTS: time.Now(),
 	}
 
-	out, err := s.Enrich([]rowchange.Change{event})
+	out, err := s.applyChanges(t, []rowchange.Change{event})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -742,16 +669,14 @@ func TestFirstErrClearedOnSuccess(t *testing.T) {
 	defer s.Stop()
 	// First load fails -> snap is nil -> firstErr is set.
 	pollUntil(t, 2*time.Second, func() bool {
-		_, err := s.Enrich(nil)
-		return err != nil
+		return s.refs[0].stickyErr() != nil
 	}, "expected sticky error before first success")
 
 	// Fix the loader; the next refresh tick clears firstErr (audit #1).
 	fl.SetErr(nil)
 	fl.SetRows(usersRows())
 	pollUntil(t, 2*time.Second, func() bool {
-		_, err := s.Enrich(nil)
-		return err == nil
+		return s.refs[0].isHot() && s.refs[0].stickyErr() == nil
 	}, "firstErr not cleared after success")
 }
 
@@ -766,8 +691,8 @@ func TestEmptyRefGoesHot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if !out[0].EnrichMiss {
-		t.Fatal("all joins must miss against empty image")
+	if _, ok := out[0].After["users.name"]; ok {
+		t.Fatalf("all joins must miss against empty image: %v", out[0].After)
 	}
 }
 
@@ -831,8 +756,8 @@ func TestNullJoinKeyMiss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if !out[0].EnrichMiss {
-		t.Fatal("NULL join key must miss, not match \"nil\" (audit #7)")
+	if _, ok := out[0].After["users.name"]; ok {
+		t.Fatalf("NULL join key must miss, not match \"nil\" (audit #7): %v", out[0].After)
 	}
 }
 
@@ -850,7 +775,7 @@ func TestStickyErrAtStart(t *testing.T) {
 	defer s.Stop()
 	// The failing first load installs the sticky error; poll for it.
 	pollUntil(t, 2*time.Second, func() bool {
-		_, err := s.Enrich([]rowchange.Change{{After: map[string]any{"user_ref": int64(1)}}})
+		_, err := s.applyChanges(t, []rowchange.Change{{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "user_ref": int64(1)}}})
 		return err != nil
 	}, "sticky error must block Enrich at top (audit #8)")
 }
@@ -1001,12 +926,11 @@ func TestMySQLConfig(t *testing.T) {
 	}
 }
 
-// FT-2: a non-string reference value has no contract on the string wire —
-// the load fails loud, citing the column, the type and the way out (CAST),
-// through the existing sticky-error path; a later load with the query fixed
-// clears it and the pipeline proceeds.
-func TestNonStringReferenceFailsLoadAndRecovers(t *testing.T) {
-	cfg := refCfg(func(c *spec.Enrich) { c.Refresh = "10ms" })
+// CR-069: a non-string reference value is now representable natively — the
+// destination column lands typed (Int64 here), no CAST workaround, no
+// sticky load error.
+func TestNonStringReferenceLandsTyped(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) { c.Select = []string{"name", "tier"} })
 	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1019,44 +943,57 @@ func TestNonStringReferenceFailsLoadAndRecovers(t *testing.T) {
 	}
 	s.Start(context.Background())
 	defer s.Stop()
-
-	// First load: tier is int64 → rejected, sticky.
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && s.refs[0].stickyErr() == nil {
+	for time.Now().Before(deadline) && !s.refs[0].isHot() {
 		time.Sleep(time.Millisecond)
 	}
-	serr := s.refs[0].stickyErr()
-	if serr == nil {
-		t.Fatal("non-string reference column did not fail the load")
+	if !s.refs[0].isHot() {
+		t.Fatalf("reference did not go hot: %v", s.refs[0].stickyErr())
 	}
-	for _, want := range []string{"tier", "int64", "CAST"} {
-		if !strings.Contains(serr.Error(), want) {
-			t.Fatalf("error must cite %q, got: %v", want, serr)
-		}
-	}
-	// Enrich blocks on the named reason.
-	if _, err := s.Enrich([]rowchange.Change{searchEvent(1, int64(1))}); err == nil {
-		t.Fatal("Enrich must block on the sticky load error")
+	if got := s.refs[0].snap.Load().refTypes["users.tier"]; got.ID() != arrow.INT64 {
+		t.Fatalf("users.tier refType = %s, want int64", got)
 	}
 
-	// The query is fixed (CAST tier AS CHAR): the next load clears the error.
-	loader.SetRows([]map[string]any{{"id": int64(1), "name": "ana", "tier": "gold"}})
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && s.refs[0].stickyErr() != nil {
-		time.Sleep(time.Millisecond)
+	// Encode the batch with the reference columns pre-declared with their
+	// resolved types (what AddRefColumns does once a snapshot exists) so the
+	// decoded value comes back as int64, not a stringified column.
+	rec, err := transport.RecordFromChanges(
+		[]rowchange.Change{searchEvent(1, int64(1))},
+		core.Schema{
+			Columns: []core.Column{
+				{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+				{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64, Nullable: true}},
+				{Name: "q", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+				{Name: "users.name", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+				{Name: "users.tier", Type: core.ColumnType{Kind: core.KindInt64, Nullable: true}},
+			},
+			PrimaryKey: []string{"id"},
+		}, nil)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
 	}
-	if serr := s.refs[0].stickyErr(); serr != nil {
-		t.Fatalf("fixed load did not clear the sticky error: %v", serr)
+	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+	defer in.Release()
+	out, err := s.ColumnarJoin(in)
+	if err != nil {
+		t.Fatalf("ColumnarJoin: %v", err)
 	}
-	if _, err := s.Enrich([]rowchange.Change{searchEvent(1, int64(1))}); err != nil {
-		t.Fatalf("pipeline did not recover: %v", err)
+	defer out.Release()
+	rows, err := transport.DecodeBatch(out.Record, "events", []string{"id"})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if rows[0].After["users.tier"] != int64(3) {
+		t.Fatalf("users.tier = %#v, want int64(3)", rows[0].After["users.tier"])
+	}
+	if rows[0].After["users.name"] != "ana" {
+		t.Fatalf("users.name = %v, want ana", rows[0].After["users.name"])
 	}
 }
 
-// FT-2: a non-string JOIN KEY that is projected (wildcard, or the key in
-// select) is the same non-representable case — it fails the load rather
-// than crashing the sink on a String column fed an int.
-func TestProjectedNonStringJoinKeyFailsLoad(t *testing.T) {
+// CR-069: a wildcard select projects the join key too; an int64 key lands
+// as an Int64 column, no load failure.
+func TestProjectedNonStringJoinKeyLandsTyped(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) { c.Select = []string{"*"} })
 	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
 	if err != nil {
@@ -1068,14 +1005,15 @@ func TestProjectedNonStringJoinKeyFailsLoad(t *testing.T) {
 	}
 	s.Start(context.Background())
 	defer s.Stop()
-
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && s.refs[0].stickyErr() == nil {
+	for time.Now().Before(deadline) && !s.refs[0].isHot() {
 		time.Sleep(time.Millisecond)
 	}
-	serr := s.refs[0].stickyErr()
-	if serr == nil || !strings.Contains(serr.Error(), `"id"`) || !strings.Contains(serr.Error(), "int64") {
-		t.Fatalf("projected non-string join key must fail loud citing the column and type, got: %v", serr)
+	if !s.refs[0].isHot() {
+		t.Fatalf("reference did not go hot: %v", s.refs[0].stickyErr())
+	}
+	if got := s.refs[0].snap.Load().refTypes["users.id"]; got.ID() != arrow.INT64 {
+		t.Fatalf("users.id refType = %s, want int64", got)
 	}
 }
 

@@ -1,10 +1,15 @@
-// Package enrich is the table-level enrichment stage: a broadcast hash
-// join against small reference tables. The reference is read WHOLE into a
-// worker-local map (one map per reference), every batch matches against it
-// in O(rows), and the map is swapped atomically on a full periodic re-read.
-// There is no lookup per event against a database, no shuffle, no windowed
-// state — the reference is small by contract, and if it stops being small
-// the answer is a different tool, not a cache.
+// Package enrich is the table-level enrichment stage: a columnar broadcast
+// hash join against small reference tables (CR-069). The reference is read
+// WHOLE into a worker-local map (one map per reference), ColumnarJoin
+// matches a whole RecordBatch against it in O(rows) — Arrow in, Arrow out,
+// no rowchange in the path — and the map is swapped atomically on a full
+// periodic re-read. There is no lookup per event against a database, no
+// shuffle, no windowed state — the reference is small by contract, and if
+// it stops being small the answer is a different tool, not a cache.
+//
+// Cold start (no snapshot loaded yet) is decided per batch: onColdStart=drop
+// drops the whole batch, buffer/pass miss every row. The row path's per-row
+// cold-start buffer is gone.
 //
 // Enrichment is point-in-time: the enriched columns depend on the
 // reference image when the event passed, and the image is a snapshot, not
@@ -31,6 +36,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
@@ -44,23 +51,21 @@ import (
 // size cold-start expectations accordingly, or set `refresh` shorter.
 const DefaultRefresh = 5 * time.Minute
 
-// defaultMaxEvents caps the cold-start buffer when the spec leaves
-// BufferLimits.MaxEvents at zero (the Go int zero value).
-const defaultMaxEvents = 100_000
-
-// coldStartPolicy resolves the onColdStart grammar.
+// coldStartPolicy resolves the onColdStart grammar. The columnar join
+// decides cold start PER BATCH: coldDrop returns the whole batch as
+// dropped; coldBuffer and coldPass both miss every row (the per-row buffer
+// the row path kept is gone — see docs/semantics.md).
 type coldStartPolicy int
 
 const (
-	coldBuffer coldStartPolicy = iota // default
-	coldPass
-	coldDrop
+	coldBuffer coldStartPolicy = iota // default — miss every row until first load
+	coldPass                          // identical to coldBuffer under the columnar join
+	coldDrop                          // drop the whole batch until first load
 )
 
 // Stage enriches one table's changes across its declared references, in
-// declaration order. Apply runs on the worker's batcher goroutine; the
-// refresh goroutines only swap images and park the drained cold-start
-// queue for the next Apply to release.
+// declaration order. ColumnarJoin runs on the worker's batcher goroutine;
+// the refresh goroutines only swap reference snapshots atomically.
 type Stage struct {
 	refs []*refJoin
 
@@ -70,45 +75,40 @@ type Stage struct {
 	log     *slog.Logger
 
 	// Counters are the evidence the stage ran, and what it cost.
-	misses       atomic.Int64 // left-join misses (events that passed with NULLs)
-	innerDropped atomic.Int64 // events an inner join discarded
-	evicted      atomic.Int64 // cold-start evacuations (maxEvents / maxWait)
+	misses       atomic.Int64 // left-join misses (rows that passed with NULLs)
+	innerDropped atomic.Int64 // rows an inner join discarded
 
 	// metrics is optional; when set, counters are mirrored to Prometheus.
 	metrics *enrichMetrics
-
-	// seq stamps every event with its arrival order. Cold-start buffering
-	// parks events in per-reference queues and drains them reference by
-	// reference, which can reorder events across references relative to
-	// arrival; the output is sorted by seq so last-write-wins downstream
-	// sees true arrival order (enrich #5).
-	seq atomic.Uint64
 }
-
-// nextSeq returns the next arrival-order stamp.
-func (s *Stage) nextSeq() uint64 { return s.seq.Add(1) }
 
 // enrichMetrics wraps the Prometheus counters for the enrichment stage.
 // Nil-safe: if the pointer is nil, Inc calls are no-ops.
 type enrichMetrics struct {
 	misses  func(table, ref string)
 	dropped func(table, ref string)
-	evicted func(table, ref string)
 }
 
 // snapshot is the immutable reference state swapped atomically on refresh.
-// Bundling image and dests ensures the hot path reads a consistent view
-// with a single atomic.Load — no lock, no partial reads.
+// Bundling image, dests and refTypes ensures the hot path reads a consistent
+// view with a single atomic.Load — no lock, no partial reads.
 type snapshot struct {
 	image map[string]map[string]any // normalized join key → reference row
 	dests []dest                    // projected reference columns
+	// refTypes is the Arrow type each destination column lands as on the
+	// wire, derived from the first non-null value seen for it in the load.
+	// A destination that was NULL in every reference row gets a String
+	// placeholder; the next load carrying a real value swaps the whole
+	// snapshot and corrects it (a reference column changing Arrow type
+	// between loads — the sink tolerates the widening or the first load is
+	// synchronous).
+	refTypes map[string]arrow.DataType
 }
 
-// refJoin is one reference: its config, the hot lookup image, and the
-// cold-start queue. The snapshot is swapped atomically — an in-flight
-// batch finishes against the old map, never a half-built one. The mutex
-// only protects cold-start state (queue, pendingDrain) and the sticky
-// error; the hot path is lock-free.
+// refJoin is one reference: its config and the hot lookup snapshot. The
+// snapshot is swapped atomically — an in-flight batch finishes against the
+// old image, never a half-built one. The mutex only protects the sticky
+// first-load error; the hot path is lock-free.
 type refJoin struct {
 	cfg    spec.Enrich
 	loader Loader
@@ -118,32 +118,23 @@ type refJoin struct {
 	// refreshEvery is the validated re-read cadence, resolved once in New
 	// so Start never re-parses (and never ignores a parse error).
 	refreshEvery time.Duration
-	// maxWaitEvery is the validated cold-buffer latency cap, resolved once
-	// in New for the same reason; zero means "no cap".
-	maxWaitEvery time.Duration
 	// refDests are the FINAL destination names (renames applied) this
-	// reference injects, known at construction for explicit selects. The
-	// join's miss fallback writes NULLs into them when the projected set is
-	// unknown (cold start, empty reference), and Stage.RefColumns exposes
-	// them so the caller can extend the table's wire schema. Empty for a
-	// wildcard select — wildcard destinations are only known at load time
-	// (the documented exception in New).
+	// reference injects, known at construction for explicit selects.
+	// ColumnarJoin's miss fallback writes NULLs into them; Stage.RefColumns
+	// exposes them so the caller can extend the table's wire schema. Empty
+	// for a wildcard select — those destinations are only known at load
+	// time (the documented exception in New).
 	refDests []string
 
-	// snap is the hot-path state: image + dests + hot flag, swapped
-	// atomically on refresh. Load() is lock-free; Store() is called
-	// only by refresh (one goroutine per reference).
+	// snap is the hot-path state: image + dests + refTypes, swapped
+	// atomically on refresh. Load() is lock-free; Store() is called only by
+	// refresh (one goroutine per reference).
 	snap atomic.Pointer[snapshot]
 
-	// mu protects cold-start state and the sticky error — written
-	// rarely (cold start, first load), never on the hot path.
-	mu    sync.Mutex
-	queue []buffered
-	// pendingDrain is the queue captured at the hot flip, released into
-	// the pipeline by the next Apply (the batcher goroutine owns Apply).
-	pendingDrain []buffered
-
-	firstErr error // sticky: a broken reference surfaces on the first event
+	// mu protects the sticky first-load error — written rarely (first
+	// load), never on the hot path.
+	mu       sync.Mutex
+	firstErr error // sticky: a broken reference surfaces on the first batch
 
 	// misses is the stage-level counter, shared by reference pointers.
 	misses  *atomic.Int64
@@ -153,13 +144,6 @@ type refJoin struct {
 type dest struct {
 	ref string // reference column
 	as  string // destination event column
-}
-
-// buffered is an event parked by a cold-start buffer.
-type buffered struct {
-	c      rowchange.Change
-	queued time.Time
-	seq    uint64 // arrival-order stamp, preserved across parking
 }
 
 // New builds the stage and validates the declarations against the event's
@@ -204,15 +188,14 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 			return nil, fmt.Errorf("enrich: reference %q: join_type %q unknown (want left | inner)", cfg.Table, cfg.JoinType)
 		}
 		rj := &refJoin{cfg: cfg}
+		// bufferLimits is still validated as grammar (a spec that reached us
+		// unvalidated fails loudly), but the cold-start row buffer it tuned
+		// is gone: the columnar join decides cold start per batch, not per
+		// row. See docs/semantics.md.
 		if cfg.BufferLimits.MaxWait != "" {
-			d, err := time.ParseDuration(cfg.BufferLimits.MaxWait)
-			// A negative duration parses fine but silently means "no cap" at
-			// drain time (wait > 0). Reject it: a config error must not
-			// become "unlimited" (same family as audit #10).
-			if err != nil || d < 0 {
+			if d, err := time.ParseDuration(cfg.BufferLimits.MaxWait); err != nil || d < 0 {
 				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a non-negative duration", cfg.Table, cfg.BufferLimits.MaxWait)
 			}
-			rj.maxWaitEvery = d
 		}
 		if cfg.BufferLimits.MaxEvents < 0 {
 			return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxEvents %d must be >= 0", cfg.Table, cfg.BufferLimits.MaxEvents)
@@ -350,12 +333,25 @@ func AddRefColumns(cs core.Schema, cfgs []spec.Enrich) core.Schema {
 
 // SetMetrics wires Prometheus counters into the stage. Call after New;
 // nil-safe (metrics pointer is stored, not dereferenced).
-func (s *Stage) SetMetrics(misses, dropped, evicted func(table, ref string)) {
-	m := &enrichMetrics{misses: misses, dropped: dropped, evicted: evicted}
+func (s *Stage) SetMetrics(misses, dropped func(table, ref string)) {
+	m := &enrichMetrics{misses: misses, dropped: dropped}
 	s.metrics = m
 	for _, rj := range s.refs {
 		rj.metrics = m
 	}
+}
+
+// Ready reports whether every reference has completed its first load. Until
+// then ColumnarJoin runs the cold-start policy (drop the batch, or miss
+// every row). Callers may poll this at boot to avoid a burst of cold-start
+// misses; the pipeline does not require it.
+func (s *Stage) Ready() bool {
+	for _, rj := range s.refs {
+		if rj.snap.Load() == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // RefColumns returns the destination columns this stage injects — resolved
@@ -460,25 +456,19 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		log.Error("enrich: reference load failed (keeping previous image, will retry)", "reference", rj.cfg.Table, "err", err)
 		return
 	}
-	image, dests, err := buildImage(rj, rows)
+	image, dests, refTypes, err := buildImage(rj, rows)
 	if err != nil {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
 		return
 	}
 	// Atomic swap: the hot path reads this with a single Load(), no lock.
-	wasHot := rj.snap.Load() != nil
-	rj.snap.Store(&snapshot{image: image, dests: dests})
+	rj.snap.Store(&snapshot{image: image, dests: dests, refTypes: refTypes})
 	// Clear the sticky first-load error on ANY success: "Sticky ONLY before
 	// the first success" means a transient boot failure must not poison the
 	// stage forever once the reference comes hot (audit #1).
 	rj.mu.Lock()
 	rj.firstErr = nil
-	// Cold-start queue flip: captured under mu for the batcher to release.
-	if !wasHot {
-		rj.pendingDrain = rj.queue
-		rj.queue = nil
-	}
 	rj.mu.Unlock()
 	log.Info("enrich: reference loaded", "reference", rj.cfg.Table, "rows", len(image))
 }
@@ -514,7 +504,7 @@ func (rj *refJoin) setFirstErr(err error) {
 //
 // The on-reference column is validated to exist and be unique; it is
 // projected only when explicitly listed in select or under "*".
-func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, error) {
+func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, map[string]arrow.DataType, error) {
 	star := len(rj.cfg.Select) == 1 && rj.cfg.Select[0] == "*"
 
 	// A legitimately empty reference (every join misses) is not a broken
@@ -522,11 +512,11 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	// all-miss map. The on/select columns cannot be validated against an
 	// empty result; a later non-empty refresh does.
 	if len(rows) == 0 {
-		return make(map[string]map[string]any), nil, nil
+		return make(map[string]map[string]any), nil, nil, nil
 	}
 
 	if _, ok := rows[0][rj.onRef]; !ok {
-		return nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
+		return nil, nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
 	}
 	available := map[string]bool{}
 	for col := range rows[0] {
@@ -535,7 +525,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	if !star {
 		for _, s := range rj.cfg.Select {
 			if !available[s] {
-				return nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
+				return nil, nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
 			}
 		}
 	}
@@ -567,13 +557,13 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	if star {
 		for col := range available {
 			if err := addDest(col); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	} else {
 		for _, s := range rj.cfg.Select {
 			if err := addDest(s); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
@@ -581,6 +571,11 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	// column order costs nothing and makes traces comparable.
 	sort.Slice(dests, func(i, j int) bool { return dests[i].as < dests[j].as })
 
+	// refTypes: the Arrow type each destination lands as, from the first
+	// non-null value seen. A dest that is null in every row falls back to
+	// String (a placeholder the next non-null load replaces). A value whose
+	// Go type has no wire mapping is a rejected load — teaching the way out.
+	refTypes := make(map[string]arrow.DataType, len(dests))
 	image := make(map[string]map[string]any, len(rows))
 	for _, row := range rows {
 		// A NULL join key never matches (SQL semantics): a reference row
@@ -590,266 +585,61 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 		}
 		k := joinKey(row[rj.onRef])
 		if _, dup := image[k]; dup {
-			return nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
+			return nil, nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
 		}
 		projected := make(map[string]any, len(dests))
 		for refCol, name := range projection {
 			v := row[refCol]
-			// Reference destinations are nullable strings on the wire (the
-			// registered decision until CR-069): a non-string value has no
-			// contract — it would be silently dropped by every sink or
-			// coerced into wrong data. Fail the load loud, teaching the way
-			// out; a later load with the query fixed clears the sticky
-			// error like any other image rejection.
 			if v != nil {
-				if _, ok := v.(string); !ok {
-					return nil, nil, fmt.Errorf(
-						"reference %q column %q carries %T — non-string reference columns are not representable on the wire until CR-069; cast in the query (e.g. CAST(tier AS CHAR)) or use string columns",
-						rj.cfg.Table, refCol, v)
+				if _, seen := refTypes[name]; !seen {
+					dt, err := refValueArrowType(v)
+					if err != nil {
+						return nil, nil, nil, fmt.Errorf("reference %q column %q: %w", rj.cfg.Table, refCol, err)
+					}
+					refTypes[name] = dt
 				}
 			}
 			projected[name] = v
 		}
 		image[k] = projected
 	}
-	return image, dests, nil
-}
-
-// Enrich runs the batch through every reference in order and returns the
-// events that survived: joined, miss-marked, or released from a cold-start
-// buffer. Dropped events (inner miss, drop policy) vanish — dropping IS
-// their effect, and the batch position advances past them.
-func (s *Stage) Enrich(changes []rowchange.Change) ([]rowchange.Change, error) {
-	// A sticky first-load error pauses the pipeline on the first event —
-	// never silently pass unenriched rows. Checked at the TOP, before any
-	// event is processed: checking at the end parked/dropped/enriched the
-	// batch first, and a caller retry would double-park the queue (audit #8).
-	for _, rj := range s.refs {
-		if err := rj.stickyErr(); err != nil {
-			return nil, fmt.Errorf("enrich: reference %q: %w", rj.cfg.Table, err)
-		}
-	}
-	out := make([]seqChange, 0, len(changes))
-	// Release cold-start queues before the new traffic so parked events are
-	// not starved; the final seq-sort restores true arrival order.
-	for i, rj := range s.refs {
-		for _, b := range rj.takeDrained() {
-			// MaxWait: an event parked past the cap follows the join type
-			// at release time — latency bound, not a third policy.
-			if wait := rj.maxWait(); wait > 0 && time.Since(b.queued) > wait {
-				s.evicted.Add(1)
-				if s.metrics != nil {
-					s.metrics.evicted(b.c.Table, rj.cfg.Table)
-				}
-				s.forceMiss(i, b.seq, b.c, &out)
-				continue
-			}
-			s.applyFrom(i, b.seq, b.c, &out)
-		}
-	}
-	for _, c := range changes {
-		s.applyFrom(0, s.nextSeq(), c, &out)
-	}
-	// Arrival order, not reference-drain order: a cold-start buffer parks
-	// events per reference and they drain reference by reference, which can
-	// reorder across references. Sorting by seq restores true arrival order
-	// so the downstream last-write-wins collapse is correct (enrich #5).
-	sort.SliceStable(out, func(i, j int) bool { return out[i].seq < out[j].seq })
-	res := make([]rowchange.Change, len(out))
-	for i := range out {
-		res[i] = out[i].c
-	}
-	return res, nil
-}
-
-// seqChange is one output event tagged with its arrival-order stamp.
-type seqChange struct {
-	seq uint64
-	c   rowchange.Change
-}
-
-// applyFrom pushes one change through references starting at i.
-func (s *Stage) applyFrom(i int, seq uint64, c rowchange.Change, out *[]seqChange) {
-	for ; i < len(s.refs); i++ {
-		rj := s.refs[i]
-		switch rj.apply(&c) {
-		case applied:
-			// continue to the next reference
-		case dropped:
-			s.innerDropped.Add(1)
-			if s.metrics != nil {
-				s.metrics.dropped(c.Table, rj.cfg.Table)
-			}
-			return
-		case parked:
-			s.enqueue(rj, i, seq, c, out)
-			return
-		}
-	}
-	*out = append(*out, seqChange{seq: seq, c: c})
-}
-
-// forceMiss joins a change against reference i as a miss (whatever the
-// event was, it will not be matched) and continues downstream.
-func (s *Stage) forceMiss(i int, seq uint64, c rowchange.Change, out *[]seqChange) {
-	// Deletes never park (apply bypasses every cold policy), so a key-only
-	// delete reaching here is impossible; the guard is defensive only.
-	if c.After == nil {
-		return
-	}
-	rj := s.refs[i]
-	snap := rj.snap.Load()
-	var dests []dest
-	if snap != nil {
-		dests = snap.dests
-	}
-	if rj.join(&c, nil, dests) == applied {
-		s.applyFrom(i+1, seq, c, out)
-	}
-}
-
-// enqueue parks a change in a cold-start buffer, evacuating the oldest
-// when MaxEvents is exceeded. An evacuated change follows the join type —
-// the buffer's bounds are a latency/memory contract, not a third policy.
-func (s *Stage) enqueue(rj *refJoin, at int, seq uint64, c rowchange.Change, out *[]seqChange) {
-	rj.mu.Lock()
-	max := rj.cfg.BufferLimits.MaxEvents
-	if max <= 0 {
-		max = defaultMaxEvents
-	}
-	var evicted []buffered
-	for len(rj.queue) >= max {
-		evicted = append(evicted, rj.queue[0])
-		rj.queue = rj.queue[1:]
-	}
-	rj.queue = append(rj.queue, buffered{c: c, queued: time.Now(), seq: seq})
-	rj.mu.Unlock()
-	for _, e := range evicted {
-		s.evicted.Add(1)
-		if s.metrics != nil {
-			s.metrics.evicted(e.c.Table, rj.cfg.Table)
-		}
-		s.forceMiss(at, e.seq, e.c, out)
-	}
-}
-
-type applyResult int
-
-const (
-	applied applyResult = iota
-	dropped
-	parked
-)
-
-// apply joins one change against this reference, mutating After in place.
-func (rj *refJoin) apply(c *rowchange.Change) applyResult {
-	// A delete bypasses EVERY policy — cold drop/pass/buffer and
-	// inner-miss alike — so the delete reaches the sink. Dropping it
-	// anywhere (park+evict, coldDrop, inner miss) left the row behind
-	// in the sink (audit #4). Production deletes always carry After
-	// (DecodeBatch allocates the map; PK is backfilled on encode), so
-	// OpDelete is the authoritative guard — After == nil is defensive
-	// only for in-process changes that never crossed the wire.
-	if c.Op == rowchange.OpDelete || c.After == nil {
-		return applied
-	}
-	snap := rj.snap.Load() // lock-free read
-
-	if snap == nil {
-		switch rj.policy {
-		case coldDrop:
-			return dropped
-		case coldPass:
-			// Cold map: every lookup misses; the miss follows the join
-			// type. Reference columns are unknown until the first load,
-			// so a cold left-miss marks the row without adding NULLs.
-			return rj.join(c, nil, nil)
-		default: // coldBuffer
-			return parked
-		}
-	}
-	// A NULL join key never matches (SQL semantics) — a miss, not a lookup
-	// into the "nil" key (audit #7).
-	if v, ok := c.After[rj.onKey]; ok && v != nil {
-		return rj.join(c, snap.image[joinKey(v)], snap.dests)
-	}
-	return rj.join(c, nil, snap.dests)
-}
-
-// join materializes the hit or the miss. A miss in a left join passes the
-// event with NULL reference columns and marks it; an inner join drops it.
-// That grammar is the ONLY miss policy — cold start, eviction and expiry
-// all route through it.
-// join merges one matched (or missed) reference row into the change. A miss
-// in a left join passes the event with the reference columns set to NULL —
-// under the projected names when known, else under the construction-time
-// refDests — and marks it; an inner join drops it. That grammar is the ONLY
-// miss policy — cold start, eviction and expiry all route through it.
-//
-// Wildcard exception: with select ["*"] the destinations are only known at
-// load time, so a miss before the first non-empty load writes no columns at
-// all (key absent) — the documented exception in New.
-func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest) applyResult {
-	if row == nil {
-		rj.misses.Add(1)
-		if rj.metrics != nil {
-			rj.metrics.misses(c.Table, rj.cfg.Table)
-		}
-		if rj.cfg.JoinType == "inner" {
-			return dropped
-		}
-		if dests == nil {
-			// Cold-start or empty-reference miss: the columns are still
-			// declared on the wire — write NULLs under their final names so
-			// the batch keeps the full column set. Empty for a wildcard
-			// select (destinations unknown until load): zero columns, the
-			// documented exception.
-			for _, as := range rj.refDests {
-				c.After[as] = nil
-			}
-		} else {
-			for _, d := range dests {
-				c.After[d.as] = nil
-			}
-		}
-		c.EnrichMiss = true
-		return applied
-	}
 	for _, d := range dests {
-		// With table-prefixed names (Spark-style), the reference's join
-		// column is injected as "table.column" while the source retains
-		// its original name. Both coexist without collision. When the
-		// user renames via "as", the reference value is used under the
-		// new name.
-		c.After[d.as] = row[d.as] // the image is already projected + renamed
+		if _, ok := refTypes[d.as]; !ok {
+			refTypes[d.as] = arrow.BinaryTypes.String
+		}
 	}
-	return applied
+	return image, dests, refTypes, nil
+}
+
+// refValueArrowType maps a reference value's Go type to the Arrow type its
+// destination column lands as on the wire. The reference SQL loader yields
+// string / int64 / float64 / []byte / bool / time.Time (drivers may also
+// hand int/int32/uint64); anything else has no wire contract.
+func refValueArrowType(v any) (arrow.DataType, error) {
+	switch v.(type) {
+	case string:
+		return arrow.BinaryTypes.String, nil
+	case []byte:
+		return arrow.BinaryTypes.Binary, nil
+	case bool:
+		return arrow.FixedWidthTypes.Boolean, nil
+	case int, int32, int64:
+		return arrow.PrimitiveTypes.Int64, nil
+	case uint64:
+		return arrow.PrimitiveTypes.Uint64, nil
+	case float32, float64:
+		return arrow.PrimitiveTypes.Float64, nil
+	case time.Time:
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, nil
+	default:
+		return nil, fmt.Errorf("value type %T is not representable on the wire", v)
+	}
 }
 
 func (rj *refJoin) stickyErr() error {
 	rj.mu.Lock()
 	defer rj.mu.Unlock()
 	return rj.firstErr
-}
-
-// maxWait returns the resolved cold-buffer latency cap (zero when unset).
-// The value is parsed once in New — the drain checks it per released event,
-// never re-parsing — and is checked at drain time (Enrich), not per-event
-// during the buffer: events that exceed maxWait are evicted when the
-// cold-start queue is released, not on a background timer. This is a
-// deliberate simplicity trade-off: the drain is a single pass that handles
-// all events at once.
-func (rj *refJoin) maxWait() time.Duration {
-	return rj.maxWaitEvery
-}
-
-// takeDrained returns (and clears) the queue captured at the hot flip.
-func (rj *refJoin) takeDrained() []buffered {
-	rj.mu.Lock()
-	q := rj.pendingDrain
-	rj.pendingDrain = nil
-	rj.mu.Unlock()
-	return q
 }
 
 // joinKey renders a join value into the map key. Numeric families

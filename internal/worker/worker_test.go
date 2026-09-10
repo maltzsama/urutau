@@ -92,15 +92,21 @@ func testSchema() core.Schema {
 	}
 }
 
+// wireBatch builds a wire-schema batch from row changes against testSchema.
+func wireBatch(t *testing.T, table string, mode dataplane.WriteMode, changes []rowchange.Change) *dataplane.Batch {
+	t.Helper()
+	rec, err := transport.RecordFromChanges(changes, transport.MergeSchema(changes, testSchema()), nil)
+	if err != nil {
+		t.Fatalf("wireBatch: %v", err)
+	}
+	return &dataplane.Batch{Table: table, Record: rec, Mode: mode}
+}
+
 // toIngest wraps one change into an Ingest (bridging to a batch), or a
 // window marker into Ingest with Win set.
 func toIngest(t *testing.T, c rowchange.Change) Ingest {
 	t.Helper()
-	cb := rowchange.Batch{Table: c.Table, Changes: []rowchange.Change{c}, Mode: rowchange.UpsertMode}
-	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
-	if err != nil {
-		t.Fatalf("toIngest: %v", err)
-	}
+	dpb := wireBatch(t, c.Table, dataplane.UpsertMode, []rowchange.Change{c})
 	if c.Window != nil {
 		if c.Window.Closes {
 			return Ingest{Table: c.Table, Win: c.Window, Position: c.Position}
@@ -138,12 +144,7 @@ func ingestFromChanges(t *testing.T, changes []rowchange.Change) []Ingest {
 // toWindow bridges window rows into a batch for AddWindowRows.
 func toWindow(t *testing.T, target string, rows []rowchange.Change) *dataplane.Batch {
 	t.Helper()
-	cb := rowchange.Batch{Table: target, Changes: rows, Mode: rowchange.AppendMode}
-	dpb, err := dpint.BatchFromChangeBatch(cb, testSchema())
-	if err != nil {
-		t.Fatalf("toWindow: %v", err)
-	}
-	return dpb
+	return wireBatch(t, target, dataplane.AppendMode, rows)
 }
 
 func TestFlushOnCloseCollapses(t *testing.T) {

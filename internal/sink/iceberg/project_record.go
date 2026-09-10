@@ -158,20 +158,13 @@ func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKe
 		return timestampColumn(src, "__ingest_ts")
 
 	case core.MetaPhase:
-		snapCol, err := boolColumn(src, "__snapshot")
+		// __phase rides the wire (born at the source); project it straight.
+		phaseCol, err := stringColumn(src, "__phase")
 		if err != nil {
 			return nil, err
 		}
-		bb := array.NewStringBuilder(memory.DefaultAllocator)
-		defer bb.Release()
-		for i := range snapCol.Len() {
-			if snapCol.Value(i) {
-				bb.Append("snapshot")
-			} else {
-				bb.Append("stream")
-			}
-		}
-		return bb.NewStringArray(), nil
+		phaseCol.Retain()
+		return phaseCol, nil
 
 	case core.MetaSourceTable, core.MetaStream:
 		return constString(src.NumRows(), w.sourceTable), nil
@@ -220,18 +213,6 @@ func stringColumn(src arrow.RecordBatch, name string) (*array.String, error) {
 	col, ok := src.Column(idx).(*array.String)
 	if !ok {
 		return nil, fmt.Errorf("column %q type %T, want *array.String", name, src.Column(idx))
-	}
-	return col, nil
-}
-
-func boolColumn(src arrow.RecordBatch, name string) (*array.Boolean, error) {
-	idx := colIndexByName(src.Schema(), name)
-	if idx < 0 {
-		return nil, fmt.Errorf("column %q not on wire", name)
-	}
-	col, ok := src.Column(idx).(*array.Boolean)
-	if !ok {
-		return nil, fmt.Errorf("column %q type %T, want *array.Boolean", name, src.Column(idx))
 	}
 	return col, nil
 }

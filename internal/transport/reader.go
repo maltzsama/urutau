@@ -6,9 +6,9 @@ package transport
 // and worker internals consume batches natively — the row universe stays
 // at the CDC decoder boundary where it belongs.
 //
-// Construction validates the wire schema exactly once (the same trailing-5
-// validation DecodeBatch applies), so the per-row accessors are assertion-
-// free afterwards.
+// Construction validates the wire schema exactly once (the same trailing
+// metadata-column validation DecodeBatch applies), so the per-row accessors
+// are assertion-free afterwards.
 //
 // OWNERSHIP: the reader does NOT retain the record. The caller must keep
 // the record alive (Rec() accessor returns it with its original refcount)
@@ -36,6 +36,7 @@ type BatchReader struct {
 	commitIdx int
 	ingestIdx int
 	snapIdx   int
+	phaseIdx  int
 }
 
 // NewBatchReader validates the record against the wire schema and resolves
@@ -57,6 +58,7 @@ func NewBatchReader(rec arrow.RecordBatch, primaryKey []string) (*BatchReader, e
 		commitIdx: numDataCols + 2,
 		ingestIdx: numDataCols + 3,
 		snapIdx:   numDataCols + 4,
+		phaseIdx:  numDataCols + 5,
 	}
 	for j := 0; j < numDataCols; j++ {
 		ct, err := fieldTypeToCore(schema.Field(j))
@@ -76,22 +78,16 @@ func NewBatchReader(rec arrow.RecordBatch, primaryKey []string) (*BatchReader, e
 	return br, nil
 }
 
-// validateWireSchema enforces the wire layout: the 5 trailing metadata
+// validateWireSchema enforces the wire layout: the trailing metadata
 // columns by name and type, and no reserved names in the data region.
 // Returns the number of data columns.
 func validateWireSchema(schema *arrow.Schema) (int, error) {
 	numCols := schema.NumFields()
-	if numCols < 5 {
-		return 0, fmt.Errorf("transport: batch has %d columns — wire schema requires >= 5", numCols)
+	if numCols < numWireMetadataFields {
+		return 0, fmt.Errorf("transport: batch has %d columns — wire schema requires >= %d", numCols, numWireMetadataFields)
 	}
-	numDataCols := numCols - 5
-	want := []arrow.Field{
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8},
-		{Name: "__pos", Type: arrow.BinaryTypes.String},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean},
-	}
+	numDataCols := numCols - numWireMetadataFields
+	want := WireMetadataFields()
 	for k, w := range want {
 		f := schema.Field(numDataCols + k)
 		if f.Name != w.Name || !arrow.TypeEqual(f.Type, w.Type) {
@@ -102,7 +98,7 @@ func validateWireSchema(schema *arrow.Schema) (int, error) {
 	}
 	for j := 0; j < numDataCols; j++ {
 		if isMetadataColumn(schema.Field(j).Name) {
-			return 0, fmt.Errorf("transport: column %d %q is reserved in the data region — post-AddMetadata batch is not decodable", j, schema.Field(j).Name)
+			return 0, fmt.Errorf("transport: column %d %q is a reserved metadata name in the data region", j, schema.Field(j).Name)
 		}
 	}
 	return numDataCols, nil
@@ -146,6 +142,15 @@ func (r *BatchReader) IngestTS(i int) (time.Time, bool) {
 // Snapshot reports a DBLog chunk row (true) versus a live event (false).
 func (r *BatchReader) Snapshot(i int) bool {
 	return r.rec.Column(r.snapIdx).(*array.Boolean).Value(i)
+}
+
+// Phase returns the __phase value ("snapshot" | "stream"), empty when null.
+func (r *BatchReader) Phase(i int) string {
+	col := r.rec.Column(r.phaseIdx).(*array.String)
+	if col.IsNull(i) {
+		return ""
+	}
+	return col.Value(i)
 }
 
 // Key returns the primary-key tuple for the row, in PK order. Values are

@@ -22,7 +22,7 @@ import (
 	"github.com/maltzsama/urutau/internal/plugin/client"
 	"github.com/maltzsama/urutau/internal/plugin/contract"
 	"github.com/maltzsama/urutau/internal/rowchange"
-	"github.com/maltzsama/urutau/internal/sourcepull"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
@@ -58,8 +58,9 @@ func (p StringPosition) Contains(other position.Position) bool {
 }
 
 // SourceAdapter wraps a Flight client as a source.Source. It speaks the
-// external plugin contract (GetFlightInfo + DoGet) and translates the
-// Arrow CDC record stream into rowchange.Change events.
+// external plugin contract (GetFlightInfo + DoGet) and projects the plugin's
+// Arrow CDC record stream (contract §8.1) straight into the flat urutau wire
+// schema.
 type SourceAdapter struct {
 	client *client.Client
 	spec   spec.Source
@@ -135,7 +136,6 @@ func (a *SourceAdapter) ParsePosition(s string) (position.Position, error) {
 // mode to get the schema and then starts streaming via DoGet.
 func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.Reader, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	out := make(chan rowchange.Change, 256)
 	r := &sourceReader{
 		client: a.client,
 		alloc:  a.alloc,
@@ -143,13 +143,16 @@ func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.
 		ctx:    ctx,
 		cancel: cancel,
 		logger: a.logger,
-		out:    out,
-		puller: sourcepull.New(out),
+		out:    make(chan *dataplane.Batch, 16),
+		errCh:  make(chan error, 1),
 	}
 	return r, nil
 }
 
-// sourceReader implements source.Reader over a Flight DoGet stream.
+// sourceReader implements source.Reader over a Flight DoGet stream. The
+// plugin ships an Arrow CDC record (contract §8.1, before/after struct
+// shaped); the reader projects it straight into the flat urutau wire schema
+// — no rowchange round-trip.
 type sourceReader struct {
 	client   *client.Client
 	alloc    memory.Allocator
@@ -157,21 +160,22 @@ type sourceReader struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	logger   *slog.Logger
-	out      chan rowchange.Change
-	puller   *sourcepull.Puller
+	out      chan *dataplane.Batch
+	errCh    chan error
 	position StringPosition
 	mu       sync.Mutex
 	setConf  func() position.Position
 }
 
 func (r *sourceReader) Start(ctx context.Context, from position.Position) error {
-	errCh := make(chan error, 1)
-	r.puller.SetErr(errCh)
 	go func() {
 		defer close(r.out)
 		for _, ref := range r.refs {
-			if err := r.streamTable(ctx, ref, from, r.out); err != nil {
-				errCh <- fmt.Errorf("stream %s: %w", ref.Source, err)
+			if err := r.streamTable(ctx, ref, from); err != nil {
+				select {
+				case r.errCh <- fmt.Errorf("stream %s: %w", ref.Source, err):
+				case <-ctx.Done():
+				}
 				return
 			}
 		}
@@ -180,10 +184,20 @@ func (r *sourceReader) Start(ctx context.Context, from position.Position) error 
 }
 
 func (r *sourceReader) Next(ctx context.Context) (*dataplane.Batch, error) {
-	return r.puller.Next(ctx)
+	select {
+	case b, ok := <-r.out:
+		if !ok {
+			return nil, nil
+		}
+		return b, nil
+	case err := <-r.errCh:
+		return nil, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
-func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from position.Position, out chan<- rowchange.Change) error {
+func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from position.Position) error {
 	var fromOffset string
 	if from != nil {
 		fromOffset = from.String()
@@ -233,14 +247,14 @@ func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from 
 			}
 		}
 
-		if err := r.readBatches(stream, arrowSchema, ref, out); err != nil {
+		if err := r.readBatches(ctx, stream, arrowSchema, ref); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arrowSchema *arrow.Schema, ref core.TableRef, out chan<- rowchange.Change) error {
+func (r *sourceReader) readBatches(ctx context.Context, stream flight.FlightService_DoGetClient, arrowSchema *arrow.Schema, ref core.TableRef) error {
 	announcedChecked := false
 	for {
 		fd, err := stream.Recv()
@@ -256,7 +270,6 @@ func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arro
 		if err != nil {
 			return fmt.Errorf("ipc reader: %w", err)
 		}
-		defer reader.Release()
 
 		for reader.Next() {
 			rec := reader.RecordBatch()
@@ -268,23 +281,34 @@ func (r *sourceReader) readBatches(stream flight.FlightService_DoGetClient, arro
 			// was announced — otherwise every column read below shifts.
 			if !announcedChecked {
 				if err := recordMatchesAnnouncedSchema(rec.Schema(), arrowSchema); err != nil {
+					reader.Release()
 					return fmt.Errorf("contract violation: %w", err)
 				}
 				announcedChecked = true
 			}
-			changes := cdcRecordToChanges(rec, arrowSchema, ref)
-			for i := range changes {
-				r.mu.Lock()
-				r.position = StringPosition{Offset: extractOffset(rec, i)}
-				r.mu.Unlock()
-				out <- changes[i]
+			wire, lastOffset, err := cdcRecordToWire(rec, arrowSchema, ref, r.alloc)
+			if err != nil {
+				reader.Release()
+				return err
 			}
-			rec.Retain()
-			reader.Release()
+			if wire == nil {
+				continue // every row had an unknown op
+			}
+			r.mu.Lock()
+			r.position = StringPosition{Offset: lastOffset}
+			r.mu.Unlock()
+			select {
+			case r.out <- &dataplane.Batch{Table: ref.Target, Record: wire, Mode: dataplane.UpsertMode}:
+			case <-ctx.Done():
+				reader.Release()
+				return ctx.Err()
+			}
 		}
 		if err := reader.Err(); err != nil {
+			reader.Release()
 			return fmt.Errorf("read ipc: %w", err)
 		}
+		reader.Release()
 	}
 }
 
@@ -313,6 +337,28 @@ func (r *sourceReader) Master(_ context.Context) (position.Position, error) {
 func (r *sourceReader) OpenWindow(_ context.Context, _ uint32) {}
 
 func (r *sourceReader) ClearWindow() {}
+
+// cdcRecordToWire projects one plugin CDC record (contract §8.1, before/
+// after struct shaped) straight into the flat urutau wire schema. The
+// before/after struct children become top-level data columns; op maps to
+// __op; offset rides __pos; ts_source rides __commit_ts. Returns the wire
+// record (nil if every row had an unknown op) and the last row's offset for
+// the reader's position.
+func cdcRecordToWire(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.TableRef, alloc memory.Allocator) (arrow.RecordBatch, string, error) {
+	changes := cdcRecordToChanges(rec, arrowSchema, ref)
+	if len(changes) == 0 {
+		return nil, "", nil
+	}
+	// The wire schema is inferred from the change images — the plugin's
+	// announced Arrow schema is struct-shaped, not the flat data schema, so
+	// MergeSchema over the rows is the source of the flat column types.
+	cs := transport.MergeSchema(changes, core.Schema{PrimaryKey: ref.PrimaryKey})
+	wire, err := transport.RecordFromChanges(changes, cs, alloc)
+	if err != nil {
+		return nil, "", fmt.Errorf("plugin: encode wire batch: %w", err)
+	}
+	return wire, changes[len(changes)-1].Position, nil
+}
 
 // cdcRecordToChanges translates one Arrow CDC record batch into change events.
 func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.TableRef) []rowchange.Change {
@@ -509,11 +555,6 @@ func readBinaryCol(rec arrow.RecordBatch, idx, row int) string {
 	}
 	col := rec.Column(idx).(*array.Binary)
 	return base64.StdEncoding.EncodeToString(col.Value(row))
-}
-
-func extractOffset(rec arrow.RecordBatch, row int) string {
-	idx := columnIndex(rec.Schema(), "offset")
-	return readBinaryCol(rec, idx, row)
 }
 
 func structToMap(col arrow.Array, row int) map[string]any {

@@ -29,11 +29,22 @@ There is **no cross-table transaction** and none is promised.
 Within one table, changes are applied in **arrival order**, and the
 last-write-wins collapse picks the last operation per key. The worker's
 batch buffer preserves arrival order across source batches (the
-granularity-insensitivity property); the enrich stage re-sorts its output by
-arrival sequence so a multi-reference cold start cannot reorder events
-(enrich #5).
+granularity-insensitivity property); the columnar enrich join preserves row
+order (it is a broadcast lookup, never a re-sort).
 
 Across tables there is **no ordering guarantee**.
+
+### The order rule for upserts across batches
+
+Iceberg does not know the order between a delete in one commit and an insert
+in another. The system does, by **position**: the watermark per batch (the
+`__pos` of the last row received), commits applied sequentially per table
+(the coordinator's FIFO), and the replay skip (`covered` in
+`batchReceiver` — a batch whose high position is already committed is
+dropped, never re-applied). A sink writes its data and delete files in the
+order the positions dictate — **never the order batches happen to arrive at
+the sink.** This is why a replayed insert cannot resurrect a row a newer
+delete removed.
 
 ## Delete image contract (RV-11)
 
@@ -49,6 +60,51 @@ came from:
 Consumers selecting a delete's image MUST handle both: **prefer `Before`
 when non-empty, else `After`**. Two consumers that assumed one location
 produced mirrored data-loss bugs (enrich #4, plugin sink RV-02).
+
+## Pipeline context columns
+
+Every wire batch carries a fixed tail of metadata columns —
+`__op`, `__pos`, `__commit_ts`, `__ingest_ts`, `__snapshot`, `__phase` —
+**born as columns at the source** (the encoder that turns decoded events
+into the RecordBatch). They ride the same RecordBatch as the data, aligned
+by construction. Nothing downstream injects them.
+
+`__phase` is `"snapshot"` for rows from a DBLog chunk `SELECT` and
+`"stream"` for live events — an axis orthogonal to `__op` (a snapshot row is
+semantically an insert).
+
+A context column reaches the target table **only if the operator names it**,
+per column, with their own name:
+
+```yaml
+tables:
+  - source: shop.orders
+    target: raw.orders
+    metadata:
+      - {from: commit_ts, as: committed_at}
+      - {from: phase, as: source_phase}
+```
+
+Every sink projects by the target table's own columns. A context column with
+no `metadata` entry is **discarded by omission** — the projection simply
+never includes it. There is no code path that "strips" context; not
+materializing it is the default.
+
+## Enrich: columnar broadcast join
+
+The enrich stage (CR-069) is a **columnar** broadcast hash join: Arrow in,
+Arrow out, no per-row `rowchange` on the path. The reference table is read
+whole into a worker-local map, swapped atomically on a periodic re-read; a
+whole RecordBatch matches against it in one pass. Reference columns land
+**typed** (Int64, Float64, Timestamp, …) — the destination type is derived
+from the first non-null value seen in the reference load. A reference column
+that is NULL in every row falls back to a String placeholder that the next
+non-null load corrects.
+
+**Cold start is per batch, not per row.** Before the first reference load:
+`onColdStart: drop` drops the whole batch; `buffer` and `pass` both let
+every row through as a miss (reference columns NULL). The row path's per-row
+cold-start buffer — parking events until the reference warmed — is gone.
 
 ## Table-name convention
 
@@ -96,11 +152,21 @@ sink wins (see `docs/state-position.md`). Resume folds use `position.MinSafe`
 These are deliberate deferrals, recorded so they are not rediscovered as
 debt. None is a correctness gap in v1.
 
-- **Columnar enrich join** (CR-069 §3.4): the join is row-based by design
-  until the broadcast join lands; the worker consumes the seam columnar.
 - **Operator image/S3 planner**: the operator supports inline definitions
   only; an image/S3 source is not implemented.
 - **ADD COLUMN propagation**: a schema change requires declare-and-resume;
   live propagation is not automatic.
 - **Dead-letter queue** (and multi-destination DLQ): a poison batch is
   terminal in v1; a DLQ with a manual skip valve is a v2 feature.
+- **Wildcard enrich drift** (issue #56a): with `select: ["*"]` the reference
+  destinations are only known at load time, so a miss before the first
+  non-empty load injects no columns and the table's schema can drift between
+  the first batches and the first load. Governed by the cold-start policy or
+  by declaring the reference columns explicitly. A synchronous pre-boot load
+  (or `Stage.AddRefColumnsFromSnapshot` feeding the resolved types into the
+  schema owners after warm-up) would close it.
+- **`enrich_miss` as a materializable column**: the columnar join marks a
+  left-join miss by leaving the reference columns NULL — it does not emit a
+  dedicated `__enrich_miss` wire column, so the `enrich_miss` metadata key
+  cannot be materialized yet. Adding it is a 7th wire metadata column, the
+  same shape as `__phase`.
