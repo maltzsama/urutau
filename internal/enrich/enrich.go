@@ -203,17 +203,21 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 		if len(cfg.On) != 1 {
 			return nil, fmt.Errorf("enrich: reference %q: on: exactly one join pair is supported today", cfg.Table)
 		}
-		if len(cfg.Select) == 0 {
-			return nil, fmt.Errorf("enrich: reference %q: select is required — declare the reference columns the event receives (\"*\" injects all)", cfg.Table)
-		}
 		// Grammar validated at boot, not on the first event (audit #10): an
 		// unknown join type silently became left, a bad maxWait silently
 		// became "no limit", and a negative maxEvents silently became the
 		// 100k default.
 		switch cfg.JoinType {
-		case "", "left", "inner":
+		case "", "left", "left outer", "inner", "left semi", "left anti":
 		default:
-			return nil, fmt.Errorf("enrich: reference %q: join_type %q unknown (want left | inner)", cfg.Table, cfg.JoinType)
+			return nil, fmt.Errorf("enrich: reference %q: join_type %q unknown (want left | left outer | inner | left semi | left anti)", cfg.Table, cfg.JoinType)
+		}
+		semiAnti := cfg.JoinType == "left semi" || cfg.JoinType == "left anti"
+		if len(cfg.Select) == 0 && !semiAnti {
+			return nil, fmt.Errorf("enrich: reference %q: select is required — declare the reference columns the event receives (\"*\" injects all)", cfg.Table)
+		}
+		if len(cfg.Select) > 0 && semiAnti {
+			return nil, fmt.Errorf("enrich: reference %q: %s emits no reference columns — remove select", cfg.Table, cfg.JoinType)
 		}
 		rj := &refJoin{cfg: cfg}
 		// bufferLimits is still validated as grammar (a spec that reached us
