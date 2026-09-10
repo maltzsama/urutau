@@ -20,3 +20,24 @@ func TestResolveSchemaRejectsEmptyAs(t *testing.T) {
 		t.Error("ResolveSchema with an empty metadata destination should error")
 	}
 }
+
+// The spec loader round-trips YAML through JSON, so an unknown key must fail
+// at parse time via UnmarshalJSON, not only at ResolveSchema.
+func TestMetadataKeyUnmarshalJSON(t *testing.T) {
+	var k MetadataKey
+	if err := k.UnmarshalJSON([]byte(`"commit_ts"`)); err != nil || k != MetaCommitTS {
+		t.Fatalf("valid key: k=%q err=%v", k, err)
+	}
+	if err := k.UnmarshalJSON([]byte(`"comit_ts"`)); err == nil {
+		t.Error("unknown key must fail UnmarshalJSON")
+	}
+}
+
+// Every metadata column is nullable; the type is the shape only.
+func TestMetadataKeyColumnTypeNullable(t *testing.T) {
+	for _, k := range []MetadataKey{MetaOp, MetaCommitTS, MetaEnrichMiss, MetaStream} {
+		if ct := k.ColumnType(); !ct.Nullable {
+			t.Errorf("%s.ColumnType() must be nullable, got %+v", k, ct)
+		}
+	}
+}
