@@ -26,3 +26,13 @@ func TestJoinKeySignedUnsignedShareSpace(t *testing.T) {
 		t.Fatal("5 and 6 must not collide")
 	}
 }
+
+// float32 and float64 of the same literal are DIFFERENT VALUES (0.1f
+// upcasts to 0.10000000149011612, not 0.1) and therefore different keys —
+// same doctrine as string-vs-int: the cast lives in the reference query's
+// SQL, not in silent coercion. Pinning the contract, not proving a bug.
+func TestJoinKeyFloatWidthsAreDistinct(t *testing.T) {
+	if joinKey(float32(0.1)) == joinKey(float64(0.1)) {
+		t.Fatal("float32(0.1) and float64(0.1) must be distinct keys: the values differ, only the int family shares a space")
+	}
+}

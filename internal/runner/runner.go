@@ -353,23 +353,24 @@ func columnNames(s core.Schema) []string {
 // the RESOLVED shape (cast types + metadata columns, the sink's target) and
 // the WIRE shape (the source types the worker encodes). Cast warnings surface
 // here, once, from the resolver.
-func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire map[string]core.Schema, casts map[string]core.CastPolicy, err error) {
+func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire map[string]core.Schema, casts map[string]core.CastPolicy, sourceCols map[string][]string, err error) {
 	refs = make([]core.TableRef, 0, len(s.Tables))
 	resolved = make(map[string]core.Schema, len(s.Tables))
 	wire = make(map[string]core.Schema, len(s.Tables))
 	casts = make(map[string]core.CastPolicy, len(s.Tables))
+	sourceCols = make(map[string][]string, len(s.Tables))
 	for _, t := range s.Tables {
 		ref, srcSchema, warns, ierr := src.Introspect(ctx, t)
 		if ierr != nil {
-			return nil, nil, nil, nil, ierr
+			return nil, nil, nil, nil, nil, ierr
 		}
 		cast, cerr := core.ParseCastPolicy(t.Cast)
 		if cerr != nil {
-			return nil, nil, nil, nil, fmt.Errorf("runner: %s: %w", t.Source, cerr)
+			return nil, nil, nil, nil, nil, fmt.Errorf("runner: %s: %w", t.Source, cerr)
 		}
 		res, rwarns, rerr := core.ResolveSchema(srcSchema, cast, t.Metadata)
 		if rerr != nil {
-			return nil, nil, nil, nil, rerr
+			return nil, nil, nil, nil, nil, rerr
 		}
 		for _, w := range warns {
 			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
@@ -379,10 +380,15 @@ func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger 
 		}
 		refs = append(refs, ref)
 		resolved[t.Source] = res
-		wire[t.Source] = core.WireSchema(srcSchema, res)
+		// Event columns are captured BEFORE the enrich extension: the
+		// reference destinations ride the wire, but they are not event
+		// columns — New validates the event side against the source view.
+		sourceCols[t.Source] = columnNames(srcSchema)
+		wire[t.Source] = enrich.AddRefColumns(core.WireSchema(srcSchema, res), t.Enrich)
+		resolved[t.Source] = enrich.AddRefColumns(res, t.Enrich)
 		casts[t.Source] = cast
 	}
-	return refs, resolved, wire, casts, nil
+	return refs, resolved, wire, casts, sourceCols, nil
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
@@ -511,7 +517,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	// with cast types and metadata columns). The source schemas also feed the
 	// schema-drift check: the batcher compares every change against the
 	// column set known at introspection time.
-	refs, resolved, wire, casts, err := introspectAll(ctx, src, s, log)
+	refs, resolved, wire, casts, sourceCols, err := introspectAll(ctx, src, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -519,9 +525,11 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	// Lookup spec tables by source and target for plan parameters.
 	specBySource := make(map[string]spec.Table, len(s.Tables))
 	specByTarget := make(map[string]spec.Table, len(s.Tables))
+	sourceByTarget := make(map[string]string, len(s.Tables))
 	for _, t := range s.Tables {
 		specBySource[t.Source] = t
 		specByTarget[t.Target] = t
+		sourceByTarget[t.Target] = t.Source
 	}
 
 	// Writers, ensuring tables exist through the sink. The table's write
@@ -567,15 +575,15 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 			w.SetKnownSchema(target, cs)
 		}
 		// Enrichment: broadcast reference joins declared for this table.
-		// Built against the introspected schema — a join on a column the
-		// table does not have fails boot, not the first event. Loads run
-		// asynchronously; the cold-start policy governs early traffic.
+		// Event columns come from the SOURCE view (introspectAll captured
+		// them before the reference-destination extension) — a join on a
+		// column the table does not have fails boot, not the first event.
+		// Loads run asynchronously; the cold-start policy governs early
+		// traffic.
 		if t := specByTarget[target]; len(t.Enrich) > 0 {
-			st, err := enrich.New(t.Enrich, columnNames(canonicalForTarget(wire, refs, target)), log)
+			st, err := enrich.New(t.Enrich, sourceCols[sourceByTarget[target]], log)
 			if err != nil {
 				closeQuery()
-				closeStages()
-				closeStages()
 				closeStages()
 				return nil, fmt.Errorf("runner: %s: %w", target, err)
 			}

@@ -54,9 +54,9 @@ type RemoteConfig struct {
 	FaultStopAck bool
 }
 
-// buildEnrichStage converts an assignment's reference joins into the
-// worker-local enrichment stage.
-func buildEnrichStage(refs []*pb.EnrichRef, target string, eventColumns []string, log *slog.Logger) (*enrich.Stage, error) {
+// enrichSpecs converts the assignment's reference joins into the spec shape
+// the enrich stage consumes.
+func enrichSpecs(refs []*pb.EnrichRef) []spec.Enrich {
 	cfgs := make([]spec.Enrich, 0, len(refs))
 	for _, e := range refs {
 		cfgs = append(cfgs, spec.Enrich{
@@ -74,7 +74,7 @@ func buildEnrichStage(refs []*pb.EnrichRef, target string, eventColumns []string
 			BufferLimits: spec.EnrichBufferLimits{MaxEvents: int(e.BufferMaxEvents), MaxWait: e.BufferMaxWait},
 		})
 	}
-	return enrich.New(cfgs, eventColumns, log)
+	return cfgs
 }
 
 // columnNames lists a schema's columns for the enrich boot validation.
@@ -214,6 +214,21 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		if ta.WriteMode == pb.WriteMode_WRITE_MODE_APPEND {
 			mode = dataplane.AppendMode
 		}
+		// Broadcast reference joins arrive with the assignment. Their
+		// destination columns (explicit selects — known at boot) join the
+		// assigned schema BEFORE EnsureTable: the sink table must have the
+		// column, or the first enriched batch's values are silently dropped
+		// (every sink projects by the table's own columns). Event columns
+		// are captured before the extension — they are not event columns.
+		var enrichCfgs []spec.Enrich
+		var eventCols []string
+		if len(ta.Enrich) > 0 {
+			enrichCfgs = enrichSpecs(ta.Enrich)
+			// SOURCE view, captured BEFORE the reference-column extension
+			// — see FT-1: the destinations are not event columns.
+			eventCols = columnNames(cs)
+			cs = enrich.AddRefColumns(cs, enrichCfgs)
+		}
 		if ta.CreateIfNotExists {
 			if err := snk.EnsureTable(ctx, ref, cs, nil, cast, mode); err != nil {
 				return fmt.Errorf("worker: ensure %s: %w", ta.TargetTable, err)
@@ -225,14 +240,12 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		w.Register(ta.TargetTable, writer, mode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
-		// The drift check knows the assigned canonical schema — with its
-		// types, so a field added inside a struct column is caught too.
-		w.SetKnownSchema(ta.TargetTable, cs)
-		// Broadcast reference joins arrive with the assignment; the stage
-		// validates the event side against the assigned schema here and
-		// loads its references asynchronously (cold-start policy applies).
-		if len(ta.Enrich) > 0 {
-			st, err := buildEnrichStage(ta.Enrich, ta.TargetTable, columnNames(cs), cfg.Logger)
+		// The stage validates the event side against the assigned schema
+		// (the SOURCE view, captured before the reference-column extension)
+		// and loads its references asynchronously (cold-start policy
+		// applies).
+		if len(enrichCfgs) > 0 {
+			st, err := enrich.New(enrichCfgs, eventCols, cfg.Logger)
 			if err != nil {
 				return err
 			}

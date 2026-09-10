@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -101,7 +102,6 @@ type enrichMetrics struct {
 type snapshot struct {
 	image map[string]map[string]any // normalized join key → reference row
 	dests []dest                    // projected reference columns
-	star  bool                      // true when select is ["*"]
 }
 
 // refJoin is one reference: its config, the hot lookup image, and the
@@ -118,6 +118,17 @@ type refJoin struct {
 	// refreshEvery is the validated re-read cadence, resolved once in New
 	// so Start never re-parses (and never ignores a parse error).
 	refreshEvery time.Duration
+	// maxWaitEvery is the validated cold-buffer latency cap, resolved once
+	// in New for the same reason; zero means "no cap".
+	maxWaitEvery time.Duration
+	// refDests are the FINAL destination names (renames applied) this
+	// reference injects, known at construction for explicit selects. The
+	// join's miss fallback writes NULLs into them when the projected set is
+	// unknown (cold start, empty reference), and Stage.RefColumns exposes
+	// them so the caller can extend the table's wire schema. Empty for a
+	// wildcard select — wildcard destinations are only known at load time
+	// (the documented exception in New).
+	refDests []string
 
 	// snap is the hot-path state: image + dests + hot flag, swapped
 	// atomically on refresh. Load() is lock-free; Store() is called
@@ -155,6 +166,12 @@ type buffered struct {
 // known columns — the checks spec.Validate cannot make without schemas:
 // the join's event side must exist, and the grammar is re-checked so a
 // spec that reached us unvalidated fails loudly here.
+//
+// Wildcard exception: with select ["*"] the reference destinations are only
+// known at load time, so RefColumns is empty and a miss before the first
+// non-empty load injects no columns — the table's schema can drift between
+// the first batches and the first load. Documented trade-off: the
+// cold-start policy governs it, or declare the columns explicitly.
 func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("enrich: no references declared")
@@ -186,15 +203,20 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		default:
 			return nil, fmt.Errorf("enrich: reference %q: join_type %q unknown (want left | inner)", cfg.Table, cfg.JoinType)
 		}
+		rj := &refJoin{cfg: cfg}
 		if cfg.BufferLimits.MaxWait != "" {
-			if _, err := time.ParseDuration(cfg.BufferLimits.MaxWait); err != nil {
-				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a duration", cfg.Table, cfg.BufferLimits.MaxWait)
+			d, err := time.ParseDuration(cfg.BufferLimits.MaxWait)
+			// A negative duration parses fine but silently means "no cap" at
+			// drain time (wait > 0). Reject it: a config error must not
+			// become "unlimited" (same family as audit #10).
+			if err != nil || d < 0 {
+				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a non-negative duration", cfg.Table, cfg.BufferLimits.MaxWait)
 			}
+			rj.maxWaitEvery = d
 		}
 		if cfg.BufferLimits.MaxEvents < 0 {
 			return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxEvents %d must be >= 0", cfg.Table, cfg.BufferLimits.MaxEvents)
 		}
-		rj := &refJoin{cfg: cfg}
 		for ev, ref := range cfg.On {
 			if !evCols[ev] {
 				return nil, fmt.Errorf("enrich: reference %q: on: event column %q is not in the table's schema", cfg.Table, ev)
@@ -206,6 +228,12 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		// ("<table>.<col>") would produce. Wildcard stays out — with "*"
 		// the destinations are only known at load time, and the per-ref
 		// destSeen check in buildImage covers that case.
+		// refDests carries the FINAL destination names (rename applied) —
+		// what the miss fallback writes NULLs into and what RefColumns
+		// exposes for the wire. RefColumnsFor is the single source of this
+		// computation: the coordinator applies the same extension without
+		// building a stage.
+		rj.refDests = RefColumnsFor([]spec.Enrich{cfg})
 		if star := len(cfg.Select) == 1 && cfg.Select[0] == "*"; !star {
 			for _, s := range cfg.Select {
 				dest := cfg.Table + "." + s
@@ -274,6 +302,52 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 	return s, nil
 }
 
+// RefColumnsFor returns the FINAL destination names (renames applied) the
+// given declarations inject, for explicit selects — the wire-schema extension
+// a caller must apply BEFORE the pipeline starts, so every batch travels with
+// the full column set and the drift check sees one stable shape. Empty for a
+// wildcard select: those destinations are only known at load time (the
+// documented exception in New).
+//
+// Exported because the pipeline's three schema owners — the collapsed runner,
+// the worker's assignment path and the coordinator's assignment builder —
+// must all apply the SAME extension, and the coordinator builds no stage.
+func RefColumnsFor(cfgs []spec.Enrich) []string {
+	var out []string
+	for _, cfg := range cfgs {
+		if len(cfg.Select) == 1 && cfg.Select[0] == "*" {
+			continue
+		}
+		for _, s := range cfg.Select {
+			dest := cfg.Table + "." + s
+			if as, ok := cfg.As[dest]; ok {
+				dest = as
+			}
+			out = append(out, dest)
+		}
+	}
+	return out
+}
+
+// AddRefColumns returns cs extended with the declarations' reference
+// destination columns (deduplicated; nullable strings — the registered type
+// decision until CR-069 resolves real types). Callers apply it to every
+// schema shape that feeds a sink table or a drift check BEFORE the pipeline
+// starts: without it, the first enriched batch carries columns the table
+// lacks and every sink silently drops them (they project by the table's own
+// columns, never by the wire's).
+func AddRefColumns(cs core.Schema, cfgs []spec.Enrich) core.Schema {
+	for _, dest := range RefColumnsFor(cfgs) {
+		if _, exists := cs.Column(dest); !exists {
+			cs.Columns = append(cs.Columns, core.Column{
+				Name: dest,
+				Type: core.ColumnType{Kind: core.KindString, Nullable: true},
+			})
+		}
+	}
+	return cs
+}
+
 // SetMetrics wires Prometheus counters into the stage. Call after New;
 // nil-safe (metrics pointer is stored, not dereferenced).
 func (s *Stage) SetMetrics(misses, dropped, evicted func(table, ref string)) {
@@ -282,6 +356,22 @@ func (s *Stage) SetMetrics(misses, dropped, evicted func(table, ref string)) {
 	for _, rj := range s.refs {
 		rj.metrics = m
 	}
+}
+
+// RefColumns returns the destination columns this stage injects — resolved
+// at construction for explicit selects, empty for a wildcard select (those
+// destinations are only known at load time; see New for the documented
+// exception). The caller adds them to the table's WIRE schema as nullable
+// columns BEFORE the pipeline starts, so every batch travels with the full
+// column set and the drift check sees one stable shape. A left-join miss
+// writes NULL into these columns; the schema declares them nullable, so the
+// wire is never violated.
+func (s *Stage) RefColumns() []string {
+	var out []string
+	for _, rj := range s.refs {
+		out = append(out, rj.refDests...)
+	}
+	return out
 }
 
 // refreshInterval resolves the re-read cadence.
@@ -296,7 +386,8 @@ func (rj *refJoin) refreshInterval() (time.Duration, error) {
 	return d, nil
 }
 
-// UseLoader overrides the SQL loader for one reference (test seam).
+// UseLoader overrides the SQL loader for one reference (test seam). Must be
+// called before Start — the loader field has no lock.
 func (s *Stage) UseLoader(refTable string, l Loader) error {
 	for _, rj := range s.refs {
 		if rj.cfg.Table == refTable {
@@ -369,7 +460,7 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		log.Error("enrich: reference load failed (keeping previous image, will retry)", "reference", rj.cfg.Table, "err", err)
 		return
 	}
-	image, dests, star, err := buildImage(rj, rows)
+	image, dests, err := buildImage(rj, rows)
 	if err != nil {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
@@ -377,7 +468,7 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 	}
 	// Atomic swap: the hot path reads this with a single Load(), no lock.
 	wasHot := rj.snap.Load() != nil
-	rj.snap.Store(&snapshot{image: image, dests: dests, star: star})
+	rj.snap.Store(&snapshot{image: image, dests: dests})
 	// Clear the sticky first-load error on ANY success: "Sticky ONLY before
 	// the first success" means a transient boot failure must not poison the
 	// stage forever once the reference comes hot (audit #1).
@@ -423,7 +514,7 @@ func (rj *refJoin) setFirstErr(err error) {
 //
 // The on-reference column is validated to exist and be unique; it is
 // projected only when explicitly listed in select or under "*".
-func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, bool, error) {
+func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, error) {
 	star := len(rj.cfg.Select) == 1 && rj.cfg.Select[0] == "*"
 
 	// A legitimately empty reference (every join misses) is not a broken
@@ -431,11 +522,11 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	// all-miss map. The on/select columns cannot be validated against an
 	// empty result; a later non-empty refresh does.
 	if len(rows) == 0 {
-		return make(map[string]map[string]any), nil, star, nil
+		return make(map[string]map[string]any), nil, nil
 	}
 
 	if _, ok := rows[0][rj.onRef]; !ok {
-		return nil, nil, false, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
+		return nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
 	}
 	available := map[string]bool{}
 	for col := range rows[0] {
@@ -444,7 +535,7 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	if !star {
 		for _, s := range rj.cfg.Select {
 			if !available[s] {
-				return nil, nil, false, fmt.Errorf("select: reference column %q is not in the query result", s)
+				return nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
 			}
 		}
 	}
@@ -476,13 +567,13 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 	if star {
 		for col := range available {
 			if err := addDest(col); err != nil {
-				return nil, nil, false, err
+				return nil, nil, err
 			}
 		}
 	} else {
 		for _, s := range rj.cfg.Select {
 			if err := addDest(s); err != nil {
-				return nil, nil, false, err
+				return nil, nil, err
 			}
 		}
 	}
@@ -499,15 +590,29 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 		}
 		k := joinKey(row[rj.onRef])
 		if _, dup := image[k]; dup {
-			return nil, nil, false, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
+			return nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
 		}
 		projected := make(map[string]any, len(dests))
 		for refCol, name := range projection {
-			projected[name] = row[refCol]
+			v := row[refCol]
+			// Reference destinations are nullable strings on the wire (the
+			// registered decision until CR-069): a non-string value has no
+			// contract — it would be silently dropped by every sink or
+			// coerced into wrong data. Fail the load loud, teaching the way
+			// out; a later load with the query fixed clears the sticky
+			// error like any other image rejection.
+			if v != nil {
+				if _, ok := v.(string); !ok {
+					return nil, nil, fmt.Errorf(
+						"reference %q column %q carries %T — non-string reference columns are not representable on the wire until CR-069; cast in the query (e.g. CAST(tier AS CHAR)) or use string columns",
+						rj.cfg.Table, refCol, v)
+				}
+			}
+			projected[name] = v
 		}
 		image[k] = projected
 	}
-	return image, dests, star, nil
+	return image, dests, nil
 }
 
 // Enrich runs the batch through every reference in order and returns the
@@ -525,7 +630,8 @@ func (s *Stage) Enrich(changes []rowchange.Change) ([]rowchange.Change, error) {
 		}
 	}
 	out := make([]seqChange, 0, len(changes))
-	// Release cold-start queues first: FIFO order beats the new traffic.
+	// Release cold-start queues before the new traffic so parked events are
+	// not starved; the final seq-sort restores true arrival order.
 	for i, rj := range s.refs {
 		for _, b := range rj.takeDrained() {
 			// MaxWait: an event parked past the cap follows the join type
@@ -612,7 +718,7 @@ func (s *Stage) enqueue(rj *refJoin, at int, seq uint64, c rowchange.Change, out
 		max = defaultMaxEvents
 	}
 	var evicted []buffered
-	for max > 0 && len(rj.queue) >= max {
+	for len(rj.queue) >= max {
 		evicted = append(evicted, rj.queue[0])
 		rj.queue = rj.queue[1:]
 	}
@@ -674,14 +780,15 @@ func (rj *refJoin) apply(c *rowchange.Change) applyResult {
 // event with NULL reference columns and marks it; an inner join drops it.
 // That grammar is the ONLY miss policy — cold start, eviction and expiry
 // all route through it.
-// join merges one matched (or missed) reference row into the change.
+// join merges one matched (or missed) reference row into the change. A miss
+// in a left join passes the event with the reference columns set to NULL —
+// under the projected names when known, else under the construction-time
+// refDests — and marks it; an inner join drops it. That grammar is the ONLY
+// miss policy — cold start, eviction and expiry all route through it.
 //
-// NOTE on empty references (hot with zero rows): buildImage returns dests
-// == nil for an empty image, so the left-join miss path appends NO columns
-// — not even NULLs. The enriched row therefore distinguishes "reference
-// empty/missed" (key absent) from "matched with NULL value" (key present,
-// nil). Downstream consumers must treat a missing enriched key as NULL, or
-// declare the join NOT NULL-able in the sink schema deliberately.
+// Wildcard exception: with select ["*"] the destinations are only known at
+// load time, so a miss before the first non-empty load writes no columns at
+// all (key absent) — the documented exception in New.
 func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest) applyResult {
 	if row == nil {
 		rj.misses.Add(1)
@@ -691,8 +798,19 @@ func (rj *refJoin) join(c *rowchange.Change, row map[string]any, dests []dest) a
 		if rj.cfg.JoinType == "inner" {
 			return dropped
 		}
-		for _, d := range dests {
-			c.After[d.as] = nil
+		if dests == nil {
+			// Cold-start or empty-reference miss: the columns are still
+			// declared on the wire — write NULLs under their final names so
+			// the batch keeps the full column set. Empty for a wildcard
+			// select (destinations unknown until load): zero columns, the
+			// documented exception.
+			for _, as := range rj.refDests {
+				c.After[as] = nil
+			}
+		} else {
+			for _, d := range dests {
+				c.After[d.as] = nil
+			}
 		}
 		c.EnrichMiss = true
 		return applied
@@ -714,20 +832,15 @@ func (rj *refJoin) stickyErr() error {
 	return rj.firstErr
 }
 
-// maxWait parses the optional latency cap. The value is checked at drain
-// time (Enrich), not per-event during the buffer — events that exceed
-// maxWait are evicted when the cold-start queue is released, not on a
-// background timer. This is a deliberate simplicity trade-off: the drain
-// is a single pass that handles all events at once.
+// maxWait returns the resolved cold-buffer latency cap (zero when unset).
+// The value is parsed once in New — the drain checks it per released event,
+// never re-parsing — and is checked at drain time (Enrich), not per-event
+// during the buffer: events that exceed maxWait are evicted when the
+// cold-start queue is released, not on a background timer. This is a
+// deliberate simplicity trade-off: the drain is a single pass that handles
+// all events at once.
 func (rj *refJoin) maxWait() time.Duration {
-	if rj.cfg.BufferLimits.MaxWait == "" {
-		return 0
-	}
-	d, err := time.ParseDuration(rj.cfg.BufferLimits.MaxWait)
-	if err != nil {
-		return 0
-	}
-	return d
+	return rj.maxWaitEvery
 }
 
 // takeDrained returns (and clears) the queue captured at the hot flip.
@@ -745,6 +858,13 @@ func (rj *refJoin) takeDrained() []buffered {
 // reference query's SQL, not in silent coercion.
 // intKey places a signed integer in the shared non-negative space when it
 // is non-negative, else in its own negative space.
+//
+// float32 and float64 of the same literal are DIFFERENT VALUES (0.1f
+// upcasts to 0.10000000149011612, not 0.1) and therefore different keys.
+// Same doctrine as string-vs-int: the cast lives in the reference query's
+// SQL, not in silent coercion. The int family is the exception — signed
+// and unsigned share the non-negative space because the VALUE is the same
+// and only the width differs.
 func intKey(t int64) string {
 	if t >= 0 {
 		return "n:" + strconv.FormatInt(t, 10)
