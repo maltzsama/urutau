@@ -107,7 +107,29 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if err != nil {
 		return nil, err
 	}
-	return stream{Reader: rdr, out: out}, nil
+	puller := sourcepull.New(out)
+	// Introspect each table so live batches encode against the canonical
+	// schema — a stable shape per table, never a per-drain inference.
+	if a.db != nil {
+		schemas := make(map[string]core.Schema, len(refs))
+		for _, ref := range refs {
+			schemaName, tableName, ok := strings.Cut(ref.Source, ".")
+			if !ok {
+				continue
+			}
+			st, qerr := QueryTable(ctx, a.db, schemaName, tableName)
+			if qerr != nil {
+				return nil, fmt.Errorf("postgres: introspect %s: %w", ref.Source, qerr)
+			}
+			cs, serr := CanonicalSchema(st)
+			if serr != nil {
+				return nil, fmt.Errorf("postgres: schema %s: %w", ref.Source, serr)
+			}
+			schemas[ref.Target] = cs
+		}
+		puller.SetSchemas(schemas)
+	}
+	return stream{Reader: rdr, out: out, Puller: puller}, nil
 }
 
 // InitialPosition returns the slot's confirmed LSN: a first boot starts
