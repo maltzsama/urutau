@@ -1,9 +1,19 @@
 // Package source defines the replication source contract. A source maps its
-// native types into core.Schema and streams row changes into rowchange.Change;
-// it knows nothing about any sink. The contract is deliberately small: a
-// source implements a handful of focused interfaces, and the driver registry
-// resolves a spec's source kind into a concrete Source. Orchestration
-// composes the interfaces it needs.
+// native types into core.Schema and streams COLUMNAR batches
+// (dataplane.Batch) through Reader.Next; it knows nothing about any sink.
+// The contract is deliberately small: a source implements a handful of
+// focused interfaces, and the driver registry resolves a spec's source kind
+// into a concrete Source. Orchestration composes the interfaces it needs.
+//
+// # Row universe boundary (R6)
+//
+// rowchange.Change is the INTERNAL CDC decode type (internal/rowchange): a
+// binlog or JSON event is row-shaped, so the built-in decoders decode into
+// it and the source boundary re-encodes to the wire batch. It is never part
+// of this public contract — external plugins receive and produce
+// dataplane.Batch only, and Go forbids importing internal/ from an external
+// module anyway. There is no contradiction: the row universe is a private
+// detail of the built-in decoders, and every public seam is columnar.
 package source
 
 import (

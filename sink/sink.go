@@ -6,6 +6,7 @@ package sink
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
@@ -18,6 +19,36 @@ type Config struct {
 	URI       string // REST catalog endpoint / connection string
 	Namespace string
 	Options   map[string]string // warehouse, client_id, client_secret, scope, …
+}
+
+// secretOptionKeys are the Options keys whose values are credentials. They
+// are redacted by LogValue so a naive slog of a Config cannot leak them.
+var secretOptionKeys = map[string]bool{
+	"client_secret": true,
+	"password":      true,
+	"token":         true,
+	"secret":        true,
+	"private_key":   true,
+}
+
+// LogValue implements slog.LogValuer: Options carries credentials, so
+// logging the Config directly would leak them. The known secret keys are
+// replaced with "[REDACTED]".
+func (c Config) LogValue() slog.Value {
+	opts := make(map[string]string, len(c.Options))
+	for k, v := range c.Options {
+		if secretOptionKeys[k] {
+			opts[k] = "[REDACTED]"
+			continue
+		}
+		opts[k] = v
+	}
+	return slog.GroupValue(
+		slog.String("type", c.Type),
+		slog.String("uri", c.URI),
+		slog.String("namespace", c.Namespace),
+		slog.Any("options", opts),
+	)
 }
 
 // TableWriter commits one table's batches. The CDC position travels inside

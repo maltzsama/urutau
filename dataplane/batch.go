@@ -84,10 +84,13 @@ type Batch struct {
 	// the worker). The sink must know it to apply the right write path.
 	Mode WriteMode
 
-	// SnapshotState is the resumable-backfill state machine value
-	// ("not_started", "in_progress", "complete"). Traveled with the
-	// batch so the sink can persist it atomically with the position.
-	// Empty when the table is not in snapshot phase.
+	// SnapshotState is the resumable-backfill state machine value.
+	// CLOSED SET (R5): "" (not in snapshot), "not_started", "in_progress",
+	// "complete". It is a string rather than an enum type because the
+	// canonical enum lives in internal/snapshot, which this public package
+	// must not import; producers set it from snapshot.State, and no other
+	// value is valid. Traveled with the batch so the sink can persist it
+	// atomically with the position.
 	SnapshotState string
 	// SnapshotPending lists chunk IDs still to process. Persisted
 	// atomically with position so a crash resumes from the right
