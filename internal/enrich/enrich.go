@@ -118,6 +118,9 @@ type refJoin struct {
 	// refreshEvery is the validated re-read cadence, resolved once in New
 	// so Start never re-parses (and never ignores a parse error).
 	refreshEvery time.Duration
+	// maxWaitEvery is the validated cold-buffer latency cap, resolved once
+	// in New for the same reason; zero means "no cap".
+	maxWaitEvery time.Duration
 
 	// snap is the hot-path state: image + dests + hot flag, swapped
 	// atomically on refresh. Load() is lock-free; Store() is called
@@ -186,15 +189,17 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		default:
 			return nil, fmt.Errorf("enrich: reference %q: join_type %q unknown (want left | inner)", cfg.Table, cfg.JoinType)
 		}
+		rj := &refJoin{cfg: cfg}
 		if cfg.BufferLimits.MaxWait != "" {
-			if _, err := time.ParseDuration(cfg.BufferLimits.MaxWait); err != nil {
+			d, err := time.ParseDuration(cfg.BufferLimits.MaxWait)
+			if err != nil {
 				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a duration", cfg.Table, cfg.BufferLimits.MaxWait)
 			}
+			rj.maxWaitEvery = d
 		}
 		if cfg.BufferLimits.MaxEvents < 0 {
 			return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxEvents %d must be >= 0", cfg.Table, cfg.BufferLimits.MaxEvents)
 		}
-		rj := &refJoin{cfg: cfg}
 		for ev, ref := range cfg.On {
 			if !evCols[ev] {
 				return nil, fmt.Errorf("enrich: reference %q: on: event column %q is not in the table's schema", cfg.Table, ev)
@@ -714,20 +719,15 @@ func (rj *refJoin) stickyErr() error {
 	return rj.firstErr
 }
 
-// maxWait parses the optional latency cap. The value is checked at drain
-// time (Enrich), not per-event during the buffer — events that exceed
-// maxWait are evicted when the cold-start queue is released, not on a
-// background timer. This is a deliberate simplicity trade-off: the drain
-// is a single pass that handles all events at once.
+// maxWait returns the resolved cold-buffer latency cap (zero when unset).
+// The value is parsed once in New — the drain checks it per released event,
+// never re-parsing — and is checked at drain time (Enrich), not per-event
+// during the buffer: events that exceed maxWait are evicted when the
+// cold-start queue is released, not on a background timer. This is a
+// deliberate simplicity trade-off: the drain is a single pass that handles
+// all events at once.
 func (rj *refJoin) maxWait() time.Duration {
-	if rj.cfg.BufferLimits.MaxWait == "" {
-		return 0
-	}
-	d, err := time.ParseDuration(rj.cfg.BufferLimits.MaxWait)
-	if err != nil {
-		return 0
-	}
-	return d
+	return rj.maxWaitEvery
 }
 
 // takeDrained returns (and clears) the queue captured at the hot flip.
