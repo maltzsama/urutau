@@ -54,10 +54,25 @@ func searchEvent(id int64, userRef any) rowchange.Change {
 
 // newTestStage builds a hot stage with a fake loader already loaded. The
 // rows fixtures stay column-value maps for readability; rowsToRec turns
-// them into the Arrow record the loader contract now returns.
+// them into the Arrow record the loader contract now returns. The event
+// join column's type is derived from the fixture's reference join column
+// so the P4 boot check (types must match) passes for string-keyed refs.
 func newTestStage(t *testing.T, cfg spec.Enrich, rows []map[string]any) (*Stage, *fakeLoader) {
 	t.Helper()
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	kinds := map[string]core.Kind{}
+	for ev, ref := range cfg.On {
+		if len(rows) > 0 {
+			switch rows[0][ref].(type) {
+			case string:
+				kinds[ev] = core.KindString
+			case float64, float32:
+				kinds[ev] = core.KindFloat64
+			case bool:
+				kinds[ev] = core.KindBool
+			}
+		}
+	}
+	s, err := New([]spec.Enrich{cfg}, evSchemaTyped(kinds, "id", "user_ref", "order_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new stage: %v", err)
 	}
@@ -266,7 +281,7 @@ func TestNewRejectsUnknownEventColumn(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.On = map[string]string{"nope": "id"}
 	})
-	if _, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil); err == nil {
 		t.Fatal("unknown event column accepted")
 	}
 }
@@ -275,7 +290,7 @@ func TestNewRejectsUnknownEventColumn(t *testing.T) {
 // when the image is built, and the failure is sticky.
 func TestFirstLoadRejectsBadReference(t *testing.T) {
 	cfg := refCfg(nil)
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -537,7 +552,7 @@ func TestSelectColumnMissingFromQueryRejected(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"name", "nope"}
 	})
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -581,7 +596,7 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 		JoinType: "left",
 	}
 
-	s, err := New([]spec.Enrich{cfg1, cfg2}, []string{"id", "user_ref", "product_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg1, cfg2}, evSchema("id", "user_ref", "product_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -666,7 +681,7 @@ func TestFirstErrClearedOnSuccess(t *testing.T) {
 	fl := fakeErr(errors.New("db down"))
 	cfg := refCfg(nil)
 	cfg.Refresh = "10ms"
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -772,7 +787,7 @@ func TestNullJoinKeyMiss(t *testing.T) {
 func TestStickyErrAtStart(t *testing.T) {
 	// Build stage manually so the first load fails (before hot).
 	fl := fakeErr(errors.New("broken"))
-	s, err := New([]spec.Enrich{refCfg(nil)}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{refCfg(nil)}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -789,33 +804,33 @@ func TestStickyErrAtStart(t *testing.T) {
 }
 
 func TestJoinTypeValidation(t *testing.T) {
-	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.JoinType = "cross" })}, []string{"user_ref", "v"}, nil)
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.JoinType = "cross" })}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("unknown join_type must be rejected at boot (audit #10)")
 	}
 }
 
 func TestMaxWaitValidation(t *testing.T) {
-	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "not-a-duration" })}, []string{"user_ref", "v"}, nil)
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "not-a-duration" })}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("invalid maxWait must be rejected at boot (audit #10)")
 	}
 	// R-3: a negative duration parses but silently disables the cap at drain
 	// time — reject it too.
-	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "-1s" })}, []string{"user_ref", "v"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "-1s" })}, evSchema("user_ref", "v"), nil); err == nil {
 		t.Fatal("negative maxWait must be rejected at boot")
 	}
 	// "0s" and absent stay valid (both mean "no cap").
-	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "0s" })}, []string{"user_ref", "v"}, nil); err != nil {
+	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "0s" })}, evSchema("user_ref", "v"), nil); err != nil {
 		t.Fatalf("0s maxWait must boot: %v", err)
 	}
-	if _, err := New([]spec.Enrich{refCfg(nil)}, []string{"user_ref", "v"}, nil); err != nil {
+	if _, err := New([]spec.Enrich{refCfg(nil)}, evSchema("user_ref", "v"), nil); err != nil {
 		t.Fatalf("absent maxWait must boot: %v", err)
 	}
 }
 
 func TestMaxEventsValidation(t *testing.T) {
-	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxEvents = -1 })}, []string{"user_ref", "v"}, nil)
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxEvents = -1 })}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("negative maxEvents must be rejected at boot (audit #10)")
 	}
@@ -826,7 +841,7 @@ func TestDestCollisionRejected(t *testing.T) {
 	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"*"}
 		c.As = map[string]string{"users.name": "collided", "users.tier": "collided"}
-	})}, []string{"user_ref", "v"}, nil)
+	})}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("two renames to the same destination must be rejected (audit #11)")
 	}
@@ -842,7 +857,7 @@ func TestCrossRefDefaultCollisionRejected(t *testing.T) {
 		c.Select = []string{"id"}
 		c.As = map[string]string{"orders.id": "users.name"}
 	})
-	if _, err := New([]spec.Enrich{refA, refB}, []string{"user_ref", "v"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{refA, refB}, evSchema("user_ref", "v"), nil); err == nil {
 		t.Fatal("rename onto another ref's default destination must be rejected")
 	}
 
@@ -853,7 +868,7 @@ func TestCrossRefDefaultCollisionRejected(t *testing.T) {
 		c.Table = "users"
 		c.Select = []string{"name"}
 	})
-	if _, err := New([]spec.Enrich{refB, refC}, []string{"user_ref", "v"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{refB, refC}, evSchema("user_ref", "v"), nil); err == nil {
 		t.Fatal("default projecting over another ref's rename must be rejected")
 	}
 }
@@ -939,7 +954,7 @@ func TestMySQLConfig(t *testing.T) {
 // sticky load error.
 func TestNonStringReferenceLandsTyped(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) { c.Select = []string{"name", "tier"} })
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -1003,7 +1018,7 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 // as an Int64 column, no load failure.
 func TestProjectedNonStringJoinKeyLandsTyped(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) { c.Select = []string{"*"} })
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}

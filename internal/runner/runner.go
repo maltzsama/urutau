@@ -339,26 +339,16 @@ func canonicalForTarget(canonical map[string]core.Schema, refs []core.TableRef, 
 	return core.Schema{}
 }
 
-// columnNames lists a schema's columns — the event-side join validation
-// needs names, not types.
-func columnNames(s core.Schema) []string {
-	names := make([]string, 0, len(s.Columns))
-	for _, c := range s.Columns {
-		names = append(names, c.Name)
-	}
-	return names
-}
-
 // introspectAll resolves each spec table through the source, producing both
 // the RESOLVED shape (cast types + metadata columns, the sink's target) and
 // the WIRE shape (the source types the worker encodes). Cast warnings surface
 // here, once, from the resolver.
-func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire map[string]core.Schema, casts map[string]core.CastPolicy, sourceCols map[string][]string, err error) {
+func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire, sourceSchemas map[string]core.Schema, casts map[string]core.CastPolicy, err error) {
 	refs = make([]core.TableRef, 0, len(s.Tables))
 	resolved = make(map[string]core.Schema, len(s.Tables))
 	wire = make(map[string]core.Schema, len(s.Tables))
 	casts = make(map[string]core.CastPolicy, len(s.Tables))
-	sourceCols = make(map[string][]string, len(s.Tables))
+	sourceSchemas = make(map[string]core.Schema, len(s.Tables))
 	for _, t := range s.Tables {
 		ref, srcSchema, warns, ierr := src.Introspect(ctx, t)
 		if ierr != nil {
@@ -383,12 +373,12 @@ func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger 
 		// Event columns are captured BEFORE the enrich extension: the
 		// reference destinations ride the wire, but they are not event
 		// columns — New validates the event side against the source view.
-		sourceCols[t.Source] = columnNames(srcSchema)
+		sourceSchemas[t.Source] = srcSchema
 		wire[t.Source] = enrich.AddRefColumns(core.WireSchema(srcSchema, res), t.Enrich)
 		resolved[t.Source] = enrich.AddRefColumns(res, t.Enrich)
 		casts[t.Source] = cast
 	}
-	return refs, resolved, wire, casts, sourceCols, nil
+	return refs, resolved, wire, sourceSchemas, casts, nil
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
@@ -517,7 +507,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	// with cast types and metadata columns). The source schemas also feed the
 	// schema-drift check: the batcher compares every change against the
 	// column set known at introspection time.
-	refs, resolved, wire, casts, sourceCols, err := introspectAll(ctx, src, s, log)
+	refs, resolved, wire, sourceSchemas, casts, err := introspectAll(ctx, src, s, log)
 	if err != nil {
 		return nil, err
 	}
@@ -581,7 +571,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		// Loads run asynchronously; the cold-start policy governs early
 		// traffic.
 		if t := specByTarget[target]; len(t.Enrich) > 0 {
-			st, err := enrich.New(t.Enrich, sourceCols[sourceByTarget[target]], log)
+			st, err := enrich.New(t.Enrich, sourceSchemas[sourceByTarget[target]], log)
 			if err != nil {
 				closeQuery()
 				closeStages()
