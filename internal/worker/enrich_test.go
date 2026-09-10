@@ -5,6 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
@@ -13,11 +17,22 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
-// staticLoader satisfies enrich.Loader without a database.
-type staticLoader struct{ rows []map[string]any }
+// staticLoader satisfies enrich.Loader without a database: one row,
+// id (Int64) + name (String).
+type staticLoader struct{}
 
-func (l *staticLoader) Load(context.Context) ([]map[string]any, error) { return l.rows, nil }
-func (l *staticLoader) Close() error                                   { return nil }
+func (l *staticLoader) Load(context.Context) (arrow.RecordBatch, error) {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	b.Field(0).(*array.Int64Builder).Append(7)
+	b.Field(1).(*array.StringBuilder).Append("ana")
+	return b.NewRecordBatch(), nil
+}
+func (l *staticLoader) Close() error { return nil }
 
 // TestWorkerEnrichJoinsBeforeBuffering: enriched rows land in the
 // committed batch with the reference columns; an inner-miss event is
@@ -38,7 +53,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		if err != nil {
 			t.Fatalf("enrich.New: %v", err)
 		}
-		if err := s.UseLoader("users", &staticLoader{rows: []map[string]any{{"id": int64(7), "name": "ana"}}}); err != nil {
+		if err := s.UseLoader("users", &staticLoader{}); err != nil {
 			t.Fatalf("UseLoader: %v", err)
 		}
 		s.Start(context.Background())
