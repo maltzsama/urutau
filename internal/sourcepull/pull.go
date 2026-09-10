@@ -1,13 +1,14 @@
 // Package sourcepull adapts a push-based change channel into the pull-based
-// source.Reader.Next surface, bridging changes into columnar batches.
+// source.Reader.Next surface, encoding buffered changes into wire batches.
 //
-// The decoders emit rowchange.Change (binlog/JSON events are row-shaped);
-// Next bridges them into wire batches. A source that can introspect its
-// tables supplies the canonical schemas via SetSchemas so batches encode
-// against a STABLE schema — never a per-batch inference that drifts when a
-// drain happens to omit a sparse column. Without schemas, makeBatch falls
-// back to inference for schema-less producers (their resolved schema is
-// owned upstream; see quarantine plan G1).
+// The built-in decoders emit rowchange.Change (binlog/JSON events are
+// row-shaped — a private detail of the decoders); makeBatch buffers a few
+// and encodes one wire RecordBatch via transport.RecordFromChanges. A
+// source that can introspect its tables supplies the canonical schemas via
+// SetSchemas so batches encode against a STABLE schema — never a per-batch
+// inference that drifts when a drain happens to omit a sparse column.
+// Without schemas, makeBatch falls back to inference for schema-less
+// producers (their resolved schema is owned upstream).
 package sourcepull
 
 import (
