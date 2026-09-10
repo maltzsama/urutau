@@ -37,6 +37,16 @@ func (c Config) validate() error {
 	return nil
 }
 
+// Validate reports whether the config is a coherent mTLS set: either all
+// three paths are set, or none are. It lets a CLI fail fast on a partial
+// set at flag-parse time instead of at the first connection.
+func (c Config) Validate() error {
+	if !c.Enabled() {
+		return nil
+	}
+	return c.validate()
+}
+
 func (c Config) pool() (*x509.CertPool, error) {
 	pem, err := os.ReadFile(c.ClientCAFile)
 	if err != nil {
