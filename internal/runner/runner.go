@@ -15,11 +15,11 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -103,18 +103,18 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 }
 
 func (r *relay) AddWindowRows(target string, chunkID uint32, rows []rowchange.Change) error {
-	// Encode against the introspected schema (the worker's known schema),
-	// never a per-batch inference.
-	cb := rowchange.Batch{Table: target, Changes: rows, Mode: rowchange.ToRowMode(dataplane.AppendMode)}
-	dpb, err := dpint.BatchFromChangeBatch(cb, r.window.KnownSchema(target))
+	// Build the wire record against the introspected schema (the worker's
+	// known schema), never a per-batch inference. Snapshot chunk rows are
+	// inserts only, so the C-8 delete guard does not apply. MergeSchema
+	// keeps the known shape and only appends columns a row carries that it
+	// lacks.
+	rec, err := transport.RecordFromChanges(rows, transport.MergeSchema(rows, r.window.KnownSchema(target)), nil)
 	if err != nil {
 		return err
 	}
+	dpb := &dataplane.Batch{Table: target, Record: rec, Mode: dataplane.AppendMode}
 	// The worker window takes ownership of the batch.
-	if err := r.window.AddWindowRows(target, chunkID, dpb); err != nil {
-		return err
-	}
-	return nil
+	return r.window.AddWindowRows(target, chunkID, dpb)
 }
 
 // GateOn starts buffering the table's live events for a chunk SELECT in
