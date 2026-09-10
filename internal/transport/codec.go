@@ -455,8 +455,10 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			}
 		case int, int32, int64, float32, float64:
 			// A numeric source column cast to decimal renders its decimal
-			// text through the shared kernel, then appends that.
-			s, err := (core.CastTarget{Type: ct}).Convert(v)
+			// text through the shared kernel, then appends that. The decimal
+			// kernel is Kind-agnostic (the value type is enough), so the
+			// source Kind is not needed here.
+			s, err := (core.CastTarget{Type: ct}).Convert(core.KindUnknown, v)
 			if err != nil {
 				return err
 			}

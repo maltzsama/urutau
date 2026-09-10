@@ -252,7 +252,10 @@ func CastWarning(from Kind, to CastTarget) string {
 
 // ── Value conversion ──────────────────────────────────────────────────
 
-// Convert applies an allowed cast to one value. It returns an error for a
+// Convert applies an allowed cast to one value. from is the source column's
+// canonical Kind: the value kernel needs it to disambiguate representations
+// that share a Go type ([]byte is binary or uuid; int32 is an integer or a
+// date; int64 is an integer or a time-of-day). It returns an error for a
 // value the cast cannot represent (invalid UUID text, invalid JSON).
 //
 // Convert is NOT a leftover from the pre-columnar design: it is the
@@ -263,10 +266,10 @@ func CastWarning(from Kind, to CastTarget) string {
 // batch-level executor; the two coexist by design (W-1 / D-4: the matrix is
 // the single policy, the arrow kernel and this value kernel are the two
 // executors). Deleting Convert would strand the sinks.
-func (t CastTarget) Convert(v any) (any, error) {
+func (t CastTarget) Convert(from Kind, v any) (any, error) {
 	switch t.Type.Kind {
 	case KindString:
-		return castToString(v, t.Encoding)
+		return castToString(from, v, t.Encoding)
 	case KindBinary:
 		return castToBinary(v)
 	case KindInt64:
@@ -325,12 +328,20 @@ func StringifyScalar(v any) (string, error) {
 	}
 }
 
-func castToString(v any, enc string) (any, error) {
+// castToString renders a source value as string. from selects the rendering
+// for the Kinds whose Go type is ambiguous on its own: a date (int32 days),
+// a time (int64 micros), a uuid ([]byte) and binary ([]byte, which needs the
+// declared encoding). Everything else falls through to StringifyScalar.
+func castToString(from Kind, v any, enc string) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	// Binary needs the explicit encoding before the scalar path.
-	if b, ok := v.([]byte); ok {
+	switch from {
+	case KindBinary, KindFixedBinary:
+		b, err := asBytes(v)
+		if err != nil {
+			return nil, fmt.Errorf("core: binary → string: %w", err)
+		}
 		switch enc {
 		case "hex":
 			return hex.EncodeToString(b), nil
@@ -339,8 +350,92 @@ func castToString(v any, enc string) (any, error) {
 		default:
 			return nil, fmt.Errorf("core: binary → string requires string(hex) or string(base64)")
 		}
+	case KindUUID:
+		switch t := v.(type) {
+		case string:
+			return strings.ToLower(t), nil
+		case []byte:
+			return formatUUID(t)
+		default:
+			return nil, fmt.Errorf("core: cannot cast %T to uuid text", v)
+		}
+	case KindDate:
+		days, err := asInt64(v)
+		if err != nil {
+			return nil, fmt.Errorf("core: date → string: %w", err)
+		}
+		return time.Unix(days*86400, 0).UTC().Format(dateLayout), nil
+	case KindTime:
+		micros, err := asInt64(v)
+		if err != nil {
+			return nil, fmt.Errorf("core: time → string: %w", err)
+		}
+		return formatMicrosOfDay(micros), nil
+	case KindTimestamp, KindTimestampTZ:
+		if tm, ok := v.(time.Time); ok {
+			return tm.Format(time.RFC3339Nano), nil
+		}
+		if s, ok := v.(string); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("core: cannot cast %T to timestamp text", v)
+	default:
+		return StringifyScalar(v)
 	}
-	return StringifyScalar(v)
+}
+
+// asBytes interprets a value as raw bytes (a source may hand binary over as
+// []byte or as an already-normalized string).
+func asBytes(v any) ([]byte, error) {
+	switch t := v.(type) {
+	case []byte:
+		return t, nil
+	case string:
+		return []byte(t), nil
+	default:
+		return nil, fmt.Errorf("cannot interpret %T as bytes", v)
+	}
+}
+
+// asInt64 interprets a value as an integer (the columnar representation of a
+// date is int32 days, of a time int64 micros).
+func asInt64(v any) (int64, error) {
+	switch t := v.(type) {
+	case int:
+		return int64(t), nil
+	case int32:
+		return int64(t), nil
+	case int64:
+		return t, nil
+	case uint64:
+		return int64(t), nil
+	default:
+		return 0, fmt.Errorf("cannot interpret %T as an integer", v)
+	}
+}
+
+// formatUUID renders 16 raw bytes as the canonical 8-4-4-4-12 uuid text.
+func formatUUID(b []byte) (string, error) {
+	if len(b) != 16 {
+		return "", fmt.Errorf("core: uuid bytes must be 16 long, got %d", len(b))
+	}
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// formatMicrosOfDay renders micros since midnight as HH:MM:SS[.ffffff].
+func formatMicrosOfDay(micros int64) string {
+	ns := micros * 1000
+	h := ns / int64(time.Hour)
+	ns -= h * int64(time.Hour)
+	m := ns / int64(time.Minute)
+	ns -= m * int64(time.Minute)
+	s := ns / int64(time.Second)
+	ns -= s * int64(time.Second)
+	if ns == 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000)
 }
 
 func castToBinary(v any) (any, error) {
@@ -608,6 +703,11 @@ func castToTimestamp(v any) (any, error) {
 		// Already a timestamp (the columnar representation); re-render it
 		// naive so the sink sees one consistent textual form.
 		return t.Format("2006-01-02 15:04:05.000000000"), nil
+	case int, int32, int64:
+		// A date arrives as int32 days since epoch (the columnar
+		// representation of KindDate).
+		days, _ := asInt64(t)
+		return time.Unix(days*86400, 0).UTC().Format("2006-01-02 15:04:05.000000000"), nil
 	case string:
 		tm, err := ParseTimestampText(t)
 		if err != nil {

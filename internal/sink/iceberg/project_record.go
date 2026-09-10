@@ -84,6 +84,9 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.B
 	col := src.Column(idx)
 
 	if ct, ok := w.cast.Target(field.Name); ok {
+		// The source Kind (from the wire) lets the kernel disambiguate
+		// values whose Go type alone is ambiguous.
+		from, _ := reader.ColumnKind(field.Name)
 		bld := array.NewBuilder(memory.DefaultAllocator, field.Type)
 		defer bld.Release()
 		values := make([]any, reader.NumRows())
@@ -93,7 +96,7 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.B
 				values[i] = nil
 				continue
 			}
-			cv, err := ct.Convert(v)
+			cv, err := ct.Convert(from, v)
 			if err != nil {
 				return nil, fmt.Errorf("value %d: %w", i, err)
 			}

@@ -240,7 +240,8 @@ func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, er
 				return nil, nil
 			}
 			if target != nil {
-				cv, err := target.Convert(v)
+				from, _ := r.ColumnKind(colName)
+				cv, err := target.Convert(from, v)
 				if err != nil {
 					return nil, fmt.Errorf("column %q: %w", colName, err)
 				}

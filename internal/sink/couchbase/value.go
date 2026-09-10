@@ -47,7 +47,8 @@ func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, m
 			continue
 		}
 		if ct, ok := p.cast.Target(col.Name); ok {
-			cv, err := ct.Convert(v)
+			from, _ := r.ColumnKind(col.Name)
+			cv, err := ct.Convert(from, v)
 			if err != nil {
 				return nil, nil, fmt.Errorf("column %q: %w", col.Name, err)
 			}
