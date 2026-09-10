@@ -121,7 +121,11 @@ func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
 func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 	cols := make([]core.Column, 0, len(tbl.Columns))
 	for _, col := range tbl.Columns {
-		cols = append(cols, core.Column{Name: col.Name, Type: mapColumnType(col.DataType, col.DataType)})
+		ct, err := mapColumnType(col.DataType, col.DataType)
+		if err != nil {
+			return core.Schema{}, fmt.Errorf("postgres: column %q: %w", col.Name, err)
+		}
+		cols = append(cols, core.Column{Name: col.Name, Type: ct})
 	}
 	var pk []string
 	for _, idx := range tbl.PKColumns {
@@ -137,64 +141,76 @@ func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 // the canonical value (the pgoutput text form round-trips losslessly, and
 // the snapshot chunker produces the same text). Unmappable types become
 // KindUnknown so a declared cast is the only way to land them.
-func mapColumnType(dataType, rawType string) core.ColumnType {
+func mapColumnType(dataType, rawType string) (core.ColumnType, error) {
 	switch {
 	case dataType == "smallint", dataType == "integer", dataType == "bigint":
-		return core.ColumnType{Kind: core.KindInt64}
+		return core.ColumnType{Kind: core.KindInt64}, nil
 	case dataType == "real", dataType == "double precision", dataType == "money":
-		return core.ColumnType{Kind: core.KindFloat64}
+		return core.ColumnType{Kind: core.KindFloat64}, nil
 	case strings.HasPrefix(dataType, "numeric"):
-		precision, scale := parseNumericPrecision(rawType)
-		return core.ColumnType{Kind: core.KindDecimal, Precision: precision, Scale: scale}
+		precision, scale, err := parseNumericPrecision(rawType)
+		if err != nil {
+			return core.ColumnType{}, err
+		}
+		return core.ColumnType{Kind: core.KindDecimal, Precision: precision, Scale: scale}, nil
 	case dataType == "boolean":
-		return core.ColumnType{Kind: core.KindBool}
+		return core.ColumnType{Kind: core.KindBool}, nil
 	case dataType == "character varying", dataType == "character", dataType == "text", dataType == "citext":
-		return core.ColumnType{Kind: core.KindString}
+		return core.ColumnType{Kind: core.KindString}, nil
 	case dataType == "date":
-		return core.ColumnType{Kind: core.KindDate}
+		return core.ColumnType{Kind: core.KindDate}, nil
 	case dataType == "time without time zone", dataType == "time with time zone":
-		return core.ColumnType{Kind: core.KindTime}
+		return core.ColumnType{Kind: core.KindTime}, nil
 	case dataType == "timestamp without time zone":
-		return core.ColumnType{Kind: core.KindTimestamp}
+		return core.ColumnType{Kind: core.KindTimestamp}, nil
 	case dataType == "timestamp with time zone":
-		return core.ColumnType{Kind: core.KindTimestampTZ}
+		return core.ColumnType{Kind: core.KindTimestampTZ}, nil
 	case dataType == "uuid":
-		return core.ColumnType{Kind: core.KindUUID}
+		return core.ColumnType{Kind: core.KindUUID}, nil
 	case dataType == "json", dataType == "jsonb":
-		return core.ColumnType{Kind: core.KindJSON}
+		return core.ColumnType{Kind: core.KindJSON}, nil
 	case dataType == "bytea":
-		return core.ColumnType{Kind: core.KindBinary}
+		return core.ColumnType{Kind: core.KindBinary}, nil
 	case dataType == "interval":
 		// interval is text-encoded by pgoutput; map to String so the
 		// sink stores it verbatim (no canonical numeric form).
-		return core.ColumnType{Kind: core.KindString}
+		return core.ColumnType{Kind: core.KindString}, nil
 	default:
 		// xml, inet, cidr, macaddr, interval, extensions, … — no canonical
 		// form; a cast is the only way to land them. The type name is
 		// carried so the validation error says what the valve is holding.
 		return core.ColumnType{Kind: core.KindUnknown,
-			Opaque: &core.OpaqueOrigin{TypeName: rawType, VendorName: "postgres"}}
+			Opaque: &core.OpaqueOrigin{TypeName: rawType, VendorName: "postgres"}}, nil
 	}
 }
 
 // parseNumericPrecision extracts precision and scale from a PostgreSQL
-// numeric type string like "numeric(10,2)". Returns 0,0 when absent.
-func parseNumericPrecision(s string) (precision, scale int) {
+// numeric type string like "numeric(10,2)". Absent (plain "numeric") is
+// 0,0; a present but unparseable or malformed value is an error — a silent 0
+// would look like a legitimate default and hide broken introspection.
+func parseNumericPrecision(s string) (precision, scale int, err error) {
 	s = strings.TrimPrefix(s, "numeric")
 	s = strings.TrimSpace(s)
 	if !strings.HasPrefix(s, "(") {
-		return 0, 0
+		return 0, 0, nil
 	}
 	s = strings.TrimPrefix(s, "(")
 	s = strings.TrimSuffix(s, ")")
 	parts := strings.Split(s, ",")
 	if len(parts) == 1 {
-		_, _ = fmt.Sscanf(parts[0], "%d", &precision)
-		return precision, 0
+		if _, err := fmt.Sscanf(parts[0], "%d", &precision); err != nil {
+			return 0, 0, fmt.Errorf("numeric precision %q: %w", parts[0], err)
+		}
+		return precision, 0, nil
 	}
 	if len(parts) == 2 {
-		_, _ = fmt.Sscanf(parts[0], "%d", &precision)
-		_, _ = fmt.Sscanf(parts[1], "%d", &scale)
+		if _, err := fmt.Sscanf(parts[0], "%d", &precision); err != nil {
+			return 0, 0, fmt.Errorf("numeric precision %q: %w", parts[0], err)
+		}
+		if _, err := fmt.Sscanf(parts[1], "%d", &scale); err != nil {
+			return 0, 0, fmt.Errorf("numeric scale %q: %w", parts[1], err)
+		}
+		return precision, scale, nil
 	}
-	return precision, scale
+	return 0, 0, fmt.Errorf("numeric type %q: expected at most precision,scale", s)
 }

@@ -48,3 +48,27 @@ func TestIntervalEscapeValveEndToEnd(t *testing.T) {
 		t.Fatalf("duration = %v, want KindString", col.Type.Kind)
 	}
 }
+
+// A present but unparseable numeric precision/scale is an error, not a
+// silent 0 (which would look like a legitimate default).
+func TestParseNumericPrecisionErrors(t *testing.T) {
+	if _, _, err := parseNumericPrecision("numeric(bad,2)"); err == nil {
+		t.Fatal("unparseable precision must error")
+	}
+	if _, _, err := parseNumericPrecision("numeric(1,bad)"); err == nil {
+		t.Fatal("unparseable scale must error")
+	}
+	if _, _, err := parseNumericPrecision("numeric(1,2,3)"); err == nil {
+		t.Fatal("malformed numeric with extra parts must error")
+	}
+	// Plain numeric (no precision) is a legitimate default.
+	p, s, err := parseNumericPrecision("numeric")
+	if err != nil || p != 0 || s != 0 {
+		t.Fatalf("plain numeric = %d,%d err=%v, want 0,0", p, s, err)
+	}
+	// Valid precision/scale parses.
+	p, s, err = parseNumericPrecision("numeric(10,2)")
+	if err != nil || p != 10 || s != 2 {
+		t.Fatalf("numeric(10,2) = %d,%d err=%v", p, s, err)
+	}
+}

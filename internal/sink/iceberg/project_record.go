@@ -7,6 +7,7 @@ package iceberg
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -365,6 +366,13 @@ func extractKeys(batches []*dataplane.Batch, pkCols []string) ([][]any, error) {
 
 // scalarValue extracts one scalar from an Arrow array at row. Used only for
 // the equality-delete key boundary (§4.1) — never on the data path.
+//
+// The value it returns must be one that appendColumn accepts for the PK
+// column's Iceberg type. Iceberg has no unsigned integer, so a KindUInt64
+// column is Decimal(20,0) in the schema (typemap) and on the data path; the
+// delete key must carry the SAME canonical decimal form, not the raw uint64,
+// or the delete path diverges from the data path (one value, one wire
+// representation — the RV-11 family).
 func scalarValue(col arrow.Array, row int) any {
 	switch c := col.(type) {
 	case *array.Int64:
@@ -374,7 +382,7 @@ func scalarValue(col arrow.Array, row int) any {
 	case *array.Uint8:
 		return c.Value(row)
 	case *array.Uint64:
-		return c.Value(row)
+		return strconv.FormatUint(c.Value(row), 10) // canonical decimal(20,0) text
 	case *array.Float64:
 		return c.Value(row)
 	case *array.String:

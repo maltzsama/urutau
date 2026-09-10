@@ -43,6 +43,11 @@ func (b *flowBudget) sum() int64 {
 // acquire reserves n bytes for one worker, blocking while the process is
 // over budget AND the worker is beyond its minimum floor. The wait is
 // ctx-aware: a cancelled pipeline stops waiting.
+//
+// DEFERRED OPTIMIZATION: each acquire spawns a goroutine + channel to
+// broadcast on ctx.Done (one per batch on the hot path). Correct, but
+// allocates; a single notifier goroutine per budget would remove it. Not
+// worth the complexity until profiling shows it.
 func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
