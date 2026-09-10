@@ -1,16 +1,13 @@
 package enrich
 
-// S1 — Demolition scaffold for the columnar-join cutover (BRIEF-ARROW Onda 1).
-//
-// The harness pins the enrich seam's observable behavior so the row path
-// (DecodeBatch -> Stage.Enrich -> BatchFromChangeBatch, today) and the
-// columnar path (Stage.ColumnarJoin, landing in S6) can be proven
-// field-for-field equal before the row path is deleted.
+// Behavioral harness for the columnar enrich seam (Stage.ColumnarJoin):
+// per-key version retention, reinsert-over-delete, delete-key backfill,
+// left-miss NULLs, hit values, windowed-row order.
 //
 // The seam is a broadcast hash join on the reference key. It does not act on
 // windows or collapse — those are the worker's job downstream — but window
-// tags and op/key identity must survive the round-trip untouched, so the
-// canonical scenario carries them.
+// tags and op/key identity must survive it untouched, so the canonical
+// scenario carries them.
 
 import (
 	"context"
