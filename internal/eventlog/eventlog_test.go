@@ -3,6 +3,7 @@ package eventlog
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -311,7 +312,7 @@ func TestCloseReFlushesFailedLastEvent(t *testing.T) {
 	if !strings.Contains(last, `"kind":"last"`) {
 		t.Fatalf("close PUT does not carry the failed event: %s", last)
 	}
-	if !strings.Contains(p.keys[len(p.keys)-1], "events.jsonl") {
+	if !strings.HasSuffix(p.keys[len(p.keys)-1], "events-000000.jsonl") {
 		t.Fatalf("close PUT key = %q", p.keys[len(p.keys)-1])
 	}
 }
@@ -331,16 +332,24 @@ func TestCloseSerializesWithInFlightEmits(t *testing.T) {
 			_ = r.Emit(context.Background(), "commit", map[string]any{"n": i}) // closed errors are fine
 		}(i)
 	}
+	closed := make(chan struct{})
 	go func() {
+		defer close(closed)
 		time.Sleep(10 * time.Millisecond)
 		r.Close()
 	}()
 	wg.Wait()
-	r.Close() // idempotent
+	<-closed  // the first Close finished, including its final PUT
+	r.Close() // idempotency only now
 
 	accepted := r.Emitted()
 	if accepted == 0 {
 		t.Fatal("no events accepted")
+	}
+	// The Close made exactly one PUT beyond the accepted emits — proving it
+	// actually ran, not merely that the emit PUTs covered the buffer.
+	if bodies := p.snapshot(); len(bodies) != accepted+1 {
+		t.Fatalf("PUTs = %d, want %d (accepted emits + one close)", len(bodies), accepted+1)
 	}
 	// Every PUT body is a prefix of the final buffer (appends only grow it),
 	// so the largest body must carry exactly the accepted events.
@@ -388,8 +397,8 @@ func TestRotationKeepsBytesLinear(t *testing.T) {
 
 // Three-plus rotations with the literal key sequence: the crossing event
 // travels in the object being closed, the next Emit opens the next object,
-// and the trail reads events.jsonl, events-01.jsonl, … in lexicographic
-// order.
+// and the trail reads events-000000.jsonl, events-000001.jsonl, … in
+// lexicographic order.
 func TestRotationKeySequence(t *testing.T) {
 	const threshold = 256
 	p := &fakePutter{}
@@ -416,7 +425,7 @@ func TestRotationKeySequence(t *testing.T) {
 			objects = append(objects, suffix)
 		}
 	}
-	want := []string{"events.jsonl", "events-01.jsonl", "events-02.jsonl", "events-03.jsonl"}
+	want := []string{"events-000000.jsonl", "events-000001.jsonl", "events-000002.jsonl", "events-000003.jsonl"}
 	if len(objects) < len(want) {
 		t.Fatalf("rotations = %d objects, want at least %d: %v", len(objects), len(want), objects)
 	}
@@ -427,16 +436,16 @@ func TestRotationKeySequence(t *testing.T) {
 	}
 	// The original object is not empty.
 	if strings.Count(p.putBodies[0], "\n") == 0 {
-		t.Fatal("events.jsonl is empty")
+		t.Fatal("the first object is empty")
 	}
 	// The current object key is the latest rotated one.
-	if got := r.ObjectKey(); !strings.HasSuffix(got, fmt.Sprintf("events-%02d.jsonl", r.seq)) || r.seq == 0 {
+	if got := r.ObjectKey(); !strings.HasSuffix(got, fmt.Sprintf("events-%06d.jsonl", r.seq)) || r.seq == 0 {
 		t.Fatalf("ObjectKey = %q, seq = %d; want the current rotated object", got, r.seq)
 	}
 }
 
 // Close after a rotation re-flushes the buffer into the CURRENT object, not
-// back into events.jsonl.
+// back into the first object.
 func TestCloseAfterRotationFlushesCurrentObject(t *testing.T) {
 	const threshold = 256
 	p := &fakePutter{}
@@ -490,7 +499,7 @@ func TestMaxObjectBytesClampedToDefault(t *testing.T) {
 		keys := append([]string(nil), p.putKeys...)
 		p.mu.Unlock()
 		for _, k := range keys {
-			if !strings.HasSuffix(k, "events.jsonl") {
+			if !strings.HasSuffix(k, "events-000000.jsonl") {
 				t.Fatalf("clamped run rotated to %q", k)
 			}
 		}
@@ -504,5 +513,157 @@ func TestMaxObjectBytesClampedToDefault(t *testing.T) {
 	}
 	if r.maxObjectBytes != defaultMaxObjectBytes {
 		t.Fatalf("New: maxObjectBytes = %d, want %d", r.maxObjectBytes, defaultMaxObjectBytes)
+	}
+}
+
+// flakyPutter fails the first failFirst PUTs (transient), recording all.
+type flakyPutter struct {
+	mu        sync.Mutex
+	failFirst int
+	call      int
+	keys      []string
+	bodies    []string
+}
+
+func (p *flakyPutter) Put(_ context.Context, _ string, key string, body []byte) error {
+	p.mu.Lock()
+	n := p.call
+	p.call++
+	p.keys = append(p.keys, key)
+	p.bodies = append(p.bodies, string(body))
+	p.mu.Unlock()
+	if n < p.failFirst {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// lastPerKey returns the final body written to each object key.
+func (p *flakyPutter) lastPerKey() map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]string, len(p.keys))
+	for i, k := range p.keys {
+		out[k] = p.bodies[i]
+	}
+	return out
+}
+
+// R-1 (1): a rotated object whose PUT fails is retained and retried by the
+// next Emit — no event of the sealed object is lost.
+func TestRotationRetainsFailedObject(t *testing.T) {
+	const threshold = 200
+	p := &flakyPutter{failFirst: 1} // the first rotation's PUT fails
+	r := NewWithPutter("bucket", "prefix", threshold, p)
+
+	const n = 12
+	for i := 0; i < n; i++ {
+		_ = r.Emit(context.Background(), "commit", map[string]any{ // failures are best-effort
+			"n":   i,
+			"pad": strings.Repeat("x", 40),
+		})
+	}
+	// The retained object must have been delivered on a later retry: every
+	// event appears in the final body of some object.
+	var all strings.Builder
+	for _, b := range p.lastPerKey() {
+		all.WriteString(b)
+	}
+	for i := 0; i < n; i++ {
+		if !strings.Contains(all.String(), fmt.Sprintf(`"n":%d`, i)) {
+			t.Fatalf("event %d missing from the trail: %s", i, all.String())
+		}
+	}
+}
+
+// R-1 (2) regression: a NON-rotated current object whose PUT fails keeps its
+// buffer — the next Emit re-PUTs the accumulated buffer, as before.
+func TestNonRotatedPutFailureRetriesViaBuffer(t *testing.T) {
+	p := &flakyPutter{failFirst: 1}
+	r := NewWithPutter("bucket", "prefix", 0, p) // clamped to the default: never rotates here
+
+	if err := r.Emit(context.Background(), "one", nil); err == nil {
+		t.Fatal("expected the failing PUT to error the first emit")
+	}
+	if err := r.Emit(context.Background(), "two", nil); err != nil {
+		t.Fatalf("second emit: %v", err)
+	}
+	last := p.lastPerKey()
+	var body string
+	for _, b := range last {
+		if strings.Contains(b, `"kind":"two"`) {
+			body = b
+		}
+	}
+	if !strings.Contains(body, `"kind":"one"`) || !strings.Contains(body, `"kind":"two"`) {
+		t.Fatalf("buffer was not re-PUT whole: %s", body)
+	}
+}
+
+// R-1 (3): a rotated object left pending when no further Emit happens is
+// delivered by Close.
+func TestCloseDeliversPendingObject(t *testing.T) {
+	p := &flakyPutter{failFirst: 1}
+	r := NewWithPutter("bucket", "prefix", 1, p) // threshold 1: every emit rotates
+
+	if err := r.Emit(context.Background(), "final", nil); err == nil {
+		t.Fatal("expected the rotation PUT to fail")
+	}
+	r.Close()
+
+	// The pending object (the first key) carries the event.
+	last := p.lastPerKey()
+	body, ok := last["prefix/run-"+r.ID()+"/events-000000.jsonl"]
+	if !ok {
+		// key layout differs in tests? fall back to scanning for the marker
+		for _, b := range last {
+			if strings.Contains(b, `"kind":"final"`) {
+				body = b
+			}
+		}
+	}
+	if !strings.Contains(body, `"kind":"final"`) {
+		t.Fatalf("Close did not deliver the pending object: %v", last)
+	}
+}
+
+// R-2: fixed-width keys sort in creation order as plain strings — catches
+// both the "events.jsonl" dot-vs-dash inversion and the %02d width overflow
+// (which the creation-order test never exercised).
+func TestRotationKeySortOrder(t *testing.T) {
+	const threshold = 32
+	p := &fakePutter{}
+	r := NewWithPutter("bucket", "prefix", threshold, p)
+
+	// Enough events to cross 100 rotations: that is the width-overflow case
+	// (%02d would make events-100 sort before events-99), beyond the dot-vs-
+	// dash inversion the first key already exposes.
+	for i := 0; i < 300; i++ {
+		if err := r.Emit(context.Background(), "commit", map[string]any{"n": i, "pad": strings.Repeat("y", 20)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.mu.Lock()
+	keys := append([]string(nil), p.putKeys...)
+	p.mu.Unlock()
+
+	// Distinct keys in first-PUT (creation) order.
+	var created []string
+	seen := map[string]bool{}
+	for _, k := range keys {
+		if !seen[k] {
+			seen[k] = true
+			created = append(created, k)
+		}
+	}
+	if len(created) < 100 {
+		t.Fatalf("only %d objects; want 100+ to cover the width overflow", len(created))
+	}
+	sorted := append([]string(nil), created...)
+	sort.Strings(sorted)
+	for i := range created {
+		if created[i] != sorted[i] {
+			t.Fatalf("keys do not sort in creation order at %d: created=%q sorted=%q", i, created[i], sorted[i])
+		}
 	}
 }

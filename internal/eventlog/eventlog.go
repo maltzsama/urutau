@@ -1,9 +1,11 @@
 // Package eventlog writes a per-run JSONL audit trail to S3: lifecycle and
-// commit events appended as they happen, in objects rotated by size
-// (events.jsonl, then events-01.jsonl, events-02.jsonl, … in lexicographic
-// order). The trail is the post-mortem record — what ran, when, from where,
-// with which positions — cheap enough to keep forever. Emits are
-// best-effort by contract: a lost trail must never fail the pipeline.
+// commit events appended as they happen, in objects rotated by size. Keys
+// are fixed-width (events-000000.jsonl, events-000001.jsonl, …), so they
+// sort in creation order as plain strings. The trail is the post-mortem
+// record — what ran, when, from where, with which positions — cheap enough
+// to keep forever. Emits are best-effort by contract: a lost trail must
+// never fail the pipeline. A rotated object whose PUT fails is retained and
+// retried (see Run.pending), so a transient never drops a sealed object.
 //
 // Every Emit uploads the whole current object (one atomic PUT per event).
 // At CDC commit rates the object stays tiny and every upload replaces the
@@ -79,18 +81,33 @@ type Run struct {
 	bucket string
 	// baseKey is the run's key prefix (".../run-<id>/") — immutable after
 	// New. Rotated object keys are always derived from it: deriving from
-	// the current key corrupts from the second rotation on (the
-	// "events.jsonl" suffix no longer matches).
+	// the current key corrupts from the second rotation on (its
+	// "events-NNNNNN.jsonl" suffix no longer matches).
 	baseKey        string
 	key            string // current object; mutated under mu on rotation
 	seq            int    // rotations so far; 0 before the first
 	maxObjectBytes int64
 	putter         putter
-	mu             sync.Mutex // buffer + closed + emitted + key/seq
+	mu             sync.Mutex // buffer + closed + emitted + key/seq + pending
 	putMu          sync.Mutex // serializes PUTs (see Emit for the lock order)
 	buf            []byte
 	closed         bool
 	emitted        int
+	// pending holds rotated objects whose PUT failed, in creation order.
+	// They are retried — before the next own PUT and by Close — because the
+	// buffer that produced them is gone: a rotated object must never be
+	// dropped (R-1). Rotation is DEFERRED while the backlog is non-empty, so
+	// it only holds the objects sealed in the window before the first
+	// failure propagated (bounded by concurrent Emits), never an unbounded
+	// stream. Mutated only under mu, and never while putMu is held (mu is
+	// re-acquired after putMu is released — no lock-order violation).
+	pending []pendingObject
+}
+
+// pendingObject is a rotated object awaiting (re)delivery.
+type pendingObject struct {
+	key  string
+	body []byte
 }
 
 // putter abstracts the S3 PutObject call (unit tests use a fake).
@@ -130,7 +147,7 @@ func New(ctx context.Context, cfg Config) (*Run, error) {
 		id:             id,
 		bucket:         bucket,
 		baseKey:        base,
-		key:            base + "events.jsonl",
+		key:            base + "events-000000.jsonl",
 		seq:            0,
 		maxObjectBytes: max,
 		putter:         &s3Putter{client: client},
@@ -149,7 +166,7 @@ func NewWithPutter(bucket, prefix string, maxObjectBytes int64, p putter) *Run {
 		id:             id,
 		bucket:         bucket,
 		baseKey:        base,
-		key:            base + "events.jsonl",
+		key:            base + "events-000000.jsonl",
 		seq:            0,
 		maxObjectBytes: maxObjectBytes,
 		putter:         p,
@@ -201,6 +218,10 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 		r.mu.Unlock()
 		return fmt.Errorf("eventlog: run %s is closed", r.id)
 	}
+	// Drain the undelivered rotated objects; they are retried, in order,
+	// before this emit's own PUT.
+	pending := r.pending
+	r.pending = nil
 	r.buf = append(r.buf, line...)
 	r.buf = append(r.buf, '\n')
 	r.emitted++
@@ -209,13 +230,18 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	// Rotation: the event that crosses the threshold travels in the object
 	// being closed; the next Emit opens the next one. One rotation = one
 	// PUT, zero extra. The key is ALWAYS derived from baseKey — deriving
-	// from the current key corrupts from the second rotation on (its
-	// "events.jsonl" suffix no longer matches). buf/key/seq mutate only
-	// under mu.
-	if len(r.buf) >= int(r.maxObjectBytes) {
+	// from the current key corrupts from the second rotation on. buf/key/seq
+	// mutate only under mu.
+	//
+	// Rotation is DEFERRED while the backlog is non-empty: sealing a new
+	// object behind a failing PUT would orphan its buffer (the loss R-1
+	// fixes). The buffer keeps accumulating instead, so nothing is sealed
+	// until delivery works.
+	rotated := len(pending) == 0 && len(r.buf) >= int(r.maxObjectBytes)
+	if rotated {
 		r.seq++
 		r.buf = nil
-		r.key = r.baseKey + fmt.Sprintf("events-%02d.jsonl", r.seq)
+		r.key = r.baseKey + fmt.Sprintf("events-%06d.jsonl", r.seq)
 	}
 	// putMu is acquired BEFORE releasing mu. The race that forces this
 	// order is between two Emits: both clone the body under mu, and whoever
@@ -229,20 +255,43 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 
 	putCtx, cancel := context.WithTimeout(ctx, putTimeout)
 	defer cancel()
+	// Deliver the backlog first, in order. On the first failure, requeue the
+	// failed object and everything after it — nothing is lost. The own PUT
+	// is skipped (the network is down) and the buffer survives, because
+	// rotation was deferred whenever a backlog existed.
+	for i := range pending {
+		if err := r.putter.Put(putCtx, r.bucket, pending[i].key, pending[i].body); err != nil {
+			r.putMu.Unlock()
+			r.mu.Lock()
+			r.pending = append(append([]pendingObject{}, pending[i:]...), r.pending...)
+			r.mu.Unlock()
+			return fmt.Errorf("eventlog: put %s/%s: %w", r.bucket, pending[i].key, err)
+		}
+	}
 	err = r.putter.Put(putCtx, r.bucket, key, body)
 	r.putMu.Unlock()
 	if err != nil {
+		if rotated {
+			// The rotated object's buffer is gone: retain it so the next
+			// Emit or Close retries it — a rotated object must never be
+			// dropped. A non-rotated current object's buffer survives, so
+			// the next Emit re-PUTs it as before.
+			r.mu.Lock()
+			r.pending = append(r.pending, pendingObject{key: key, body: body})
+			r.mu.Unlock()
+		}
 		return fmt.Errorf("eventlog: put %s/%s: %w", r.bucket, key, err)
 	}
 	return nil
 }
 
-// Close seals the run: further emits fail, and the final buffer is
-// re-uploaded best-effort. A failed last Emit left its line in the buffer
-// (the contract is best-effort, the event stays accepted), and without the
-// re-flush a graceful shutdown would lose exactly that final event. The
-// close PUT is serialized against in-flight Emits through putMu, so the
-// object never lands smaller than what was accepted.
+// Close seals the run: further emits fail, and the final buffer — plus any
+// rotated object still awaiting delivery — is re-uploaded best-effort. A
+// failed last Emit left its line in the buffer (the contract is best-effort,
+// the event stays accepted), and without the re-flush a graceful shutdown
+// would lose exactly that final event. The close PUTs are serialized against
+// in-flight Emits through putMu, so the objects never land smaller than what
+// was accepted.
 //
 // Lock order: mu is released BEFORE putMu is taken — the inverse of Emit,
 // and safe here. The Emit race (both Emits clone the body and compete for
@@ -257,18 +306,26 @@ func (r *Run) Close() {
 		return
 	}
 	r.closed = true
+	pending := r.pending
+	r.pending = nil
 	body := slices.Clone(r.buf)
 	key := r.key
 	r.mu.Unlock()
 
 	r.putMu.Lock()
 	defer r.putMu.Unlock()
-	if len(body) == 0 {
+	if len(pending) == 0 && len(body) == 0 {
 		return
 	}
 	putCtx, cancel := context.WithTimeout(context.Background(), putTimeout)
 	defer cancel()
-	_ = r.putter.Put(putCtx, r.bucket, key, body) // best-effort
+	// Deliver the backlog first, then the current buffer — best-effort.
+	for _, po := range pending {
+		_ = r.putter.Put(putCtx, r.bucket, po.key, po.body)
+	}
+	if len(body) > 0 {
+		_ = r.putter.Put(putCtx, r.bucket, key, body)
+	}
 }
 
 func newRunID() string {
