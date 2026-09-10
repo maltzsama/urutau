@@ -745,6 +745,13 @@ func (rj *refJoin) takeDrained() []buffered {
 // reference query's SQL, not in silent coercion.
 // intKey places a signed integer in the shared non-negative space when it
 // is non-negative, else in its own negative space.
+//
+// float32 and float64 of the same literal are DIFFERENT VALUES (0.1f
+// upcasts to 0.10000000149011612, not 0.1) and therefore different keys.
+// Same doctrine as string-vs-int: the cast lives in the reference query's
+// SQL, not in silent coercion. The int family is the exception — signed
+// and unsigned share the non-negative space because the VALUE is the same
+// and only the width differs.
 func intKey(t int64) string {
 	if t >= 0 {
 		return "n:" + strconv.FormatInt(t, 10)
