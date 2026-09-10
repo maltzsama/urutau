@@ -12,7 +12,6 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/protobuf/proto"
 
@@ -34,106 +33,17 @@ func EncodeBatch(rows []rowchange.Change, cs core.Schema, meta *pb.BatchMeta, al
 		return nil, nil, fmt.Errorf("transport: marshal batch meta: %w", err)
 	}
 
-	schema, err := CoreSchemaToArrow(cs)
+	rec, err := RecordFromChanges(rows, cs, alloc)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	if alloc == nil {
-		alloc = memory.DefaultAllocator
-	}
-	bld := array.NewRecordBuilder(alloc, schema)
-	defer bld.Release()
-
-	numDataCols := len(cs.Columns)
-	for i := range rows {
-		r := &rows[i]
-		// Data columns: look up in After (or Before for deletes when After is nil).
-		src := r.After
-		if src == nil {
-			src = r.Before
-		}
-		// A delete may carry no row image at all — only the key (the MySQL
-		// binlog decoder works this way). The equality delete needs the key
-		// values on the wire to match at read time, so project the key onto
-		// the PK columns; without it the delete file holds NULL tuples and
-		// silently deletes nothing.
-		if src == nil && len(r.Key) > 0 {
-			src = make(map[string]any, len(r.Key))
-			for k, name := range cs.PrimaryKey {
-				if k < len(r.Key) {
-					src[name] = r.Key[k]
-				}
-			}
-		}
-		// Same guarantee when a row image exists but lacks a key column
-		// (partial before-images): backfill from the key tuple. The row map
-		// is copied, never mutated — it belongs to the caller.
-		if src != nil && len(cs.PrimaryKey) > 0 && len(r.Key) > 0 {
-			missing := false
-			for i, name := range cs.PrimaryKey {
-				if i < len(r.Key) && src[name] == nil {
-					missing = true
-					break
-				}
-			}
-			if missing {
-				cp := make(map[string]any, len(src)+len(cs.PrimaryKey))
-				for k, v := range src {
-					cp[k] = v
-				}
-				for i, name := range cs.PrimaryKey {
-					if i < len(r.Key) && cp[name] == nil {
-						cp[name] = r.Key[i]
-					}
-				}
-				src = cp
-			}
-		}
-		// H-6: a delete with no image and no key produces a NULL tuple —
-		// the equality delete would match nothing. Fail explicitly.
-		if r.Op == rowchange.OpDelete && src == nil && len(r.Key) == 0 {
-			return nil, nil, fmt.Errorf("transport: delete sem key e sem imagem — o equality delete casaria nada")
-		}
-		for j, col := range cs.Columns {
-			var v any
-			if src != nil {
-				v = src[col.Name]
-			}
-			if err := appendTypedValue(bld.Field(j), col.Type, v); err != nil {
-				return nil, nil, fmt.Errorf("transport: column %q row %d: %w", col.Name, i, err)
-			}
-		}
-		// Metadata columns.
-		bld.Field(numDataCols).(*array.Uint8Builder).Append(uint8(r.Op))
-		bld.Field(numDataCols + 1).(*array.StringBuilder).Append(r.Position)
-		if r.CommitTS.IsZero() {
-			bld.Field(numDataCols + 2).AppendNull()
-		} else {
-			bld.Field(numDataCols + 2).(*array.TimestampBuilder).AppendTime(r.CommitTS)
-		}
-		if r.IngestTS.IsZero() {
-			// Parity with CommitTS (M-4): a zero timestamp means "not
-			// set" — it must not masquerade as a real instant on the wire.
-			bld.Field(numDataCols + 3).AppendNull()
-		} else {
-			bld.Field(numDataCols + 3).(*array.TimestampBuilder).AppendTime(r.IngestTS)
-		}
-		bld.Field(numDataCols + 4).(*array.BooleanBuilder).Append(r.Snapshot)
-	}
-
-	rec := bld.NewRecordBatch()
 	defer rec.Release()
 
-	var buf bytes.Buffer
-	w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
-	if err := w.Write(rec); err != nil {
-		return nil, nil, fmt.Errorf("transport: ipc write: %w", err)
+	body, err = recordToIPC(rec)
+	if err != nil {
+		return nil, nil, err
 	}
-	if err := w.Close(); err != nil {
-		return nil, nil, fmt.Errorf("transport: ipc close: %w", err)
-	}
-	return buf.Bytes(), metaBytes, nil
+	return body, metaBytes, nil
 }
 
 // DecodeBatch reads a typed Arrow record + app_metadata back into rows and
