@@ -2,6 +2,7 @@ package eventlog
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -185,4 +186,76 @@ func TestEmitTimestamp(t *testing.T) {
 
 	_ = before
 	_ = after
+}
+
+// orderPutter records every PUT (key + body) in arrival order and sleeps on
+// the first call: with concurrent Emits, the first PUT in flight finishes
+// last, so a lost lock order would let a later PUT land before it.
+type orderPutter struct {
+	mu     sync.Mutex
+	bodies []string
+	keys   []string
+	call   int
+	delay  time.Duration
+}
+
+func (p *orderPutter) Put(_ context.Context, _ string, key string, body []byte) error {
+	p.mu.Lock()
+	n := p.call
+	p.call++
+	p.mu.Unlock()
+	if n == 0 && p.delay > 0 {
+		time.Sleep(p.delay)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.keys = append(p.keys, key)
+	p.bodies = append(p.bodies, string(body))
+	return nil
+}
+
+func (p *orderPutter) snapshot() (keys, bodies []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.keys...), append([]string(nil), p.bodies...)
+}
+
+// E-1: two concurrent Emits must land their PUTs in append order — the one
+// that appends first PUTs first, even though it finishes last. Without
+// putMu held across the PUT (acquired before mu.Unlock), the slower first
+// PUT could land after a later one and S3's last-writer-wins would drop the
+// earlier events.
+func TestConcurrentEmitPreservesPUTOrder(t *testing.T) {
+	p := &orderPutter{delay: 50 * time.Millisecond}
+	r := NewWithPutter("bucket", "prefix", p)
+
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := r.Emit(context.Background(), "commit", map[string]any{"n": i}); err != nil {
+				t.Errorf("emit %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	keys, bodies := p.snapshot()
+	if len(bodies) != n {
+		t.Fatalf("puts = %d, want %d", len(bodies), n)
+	}
+	// Every PUT carries the whole buffer, so the last one lands with all n
+	// lines — including the event whose PUT was held up by the delay.
+	last := bodies[len(bodies)-1]
+	if got := strings.Count(last, "\n"); got != n {
+		t.Fatalf("last PUT has %d lines, want %d", got, n)
+	}
+	for i := 0; i < n; i++ {
+		if !strings.Contains(last, fmt.Sprintf(`"n":%d`, i)) {
+			t.Fatalf("last PUT missing event %d: %s", i, last)
+		}
+	}
+	_ = keys
 }

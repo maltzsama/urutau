@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -58,13 +59,16 @@ const (
 )
 
 // Run accumulates one run's events and uploads the trail object as it
-// grows. Safe for concurrent use.
+// grows. Safe for concurrent use — the coordinator emits KindCommit from
+// per-commit goroutines while the run loop emits lifecycle events, so
+// multi-writer is the real shape, not a documentation nicety.
 type Run struct {
 	id      string
 	bucket  string
 	key     string
 	putter  putter
-	mu      sync.Mutex
+	mu      sync.Mutex // buffer + closed + emitted
+	putMu   sync.Mutex // serializes PUTs (see Emit for the lock order)
 	buf     []byte
 	closed  bool
 	emitted int
@@ -159,14 +163,24 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	r.buf = append(r.buf, line...)
 	r.buf = append(r.buf, '\n')
 	r.emitted++
-	body := make([]byte, len(r.buf))
-	copy(body, r.buf)
+	body := slices.Clone(r.buf)
+	key := r.key
+	// putMu is acquired BEFORE releasing mu. The race that forces this
+	// order is between two Emits: both clone the body under mu, and whoever
+	// releases mu first could reach putMu after the other — inverting the
+	// PUT order relative to the append order, so a smaller PUT could land
+	// last on S3's last-writer-wins and the event would vanish. Holding
+	// putMu across the PUT (and mu until it is taken) makes PUT order ==
+	// append order by construction.
+	r.putMu.Lock()
 	r.mu.Unlock()
 
 	putCtx, cancel := context.WithTimeout(ctx, putTimeout)
 	defer cancel()
-	if err := r.putter.Put(putCtx, r.bucket, r.key, body); err != nil {
-		return fmt.Errorf("eventlog: put %s/%s: %w", r.bucket, r.key, err)
+	err = r.putter.Put(putCtx, r.bucket, key, body)
+	r.putMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("eventlog: put %s/%s: %w", r.bucket, key, err)
 	}
 	return nil
 }
