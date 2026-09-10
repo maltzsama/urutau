@@ -119,23 +119,13 @@ func (s *snapshot) refType(as string) arrow.DataType {
 	return nil
 }
 
-// rowAt returns the reference row keyed by the typed join value, or nil on
-// a miss. The returned map is keyed by dest name. Used by the current
-// executor row loop; P5 replaces this with a columnar Take.
-func (s *snapshot) rowAt(key any) map[string]any {
+// lookup returns the row index for a typed join value and whether it hit.
+func (s *snapshot) lookup(key any) (int32, bool) {
 	if s.refTable == nil {
-		return nil
+		return 0, false
 	}
 	idx, ok := s.keyIndex[normalizeKey(key)]
-	if !ok {
-		return nil
-	}
-	row := make(map[string]any, len(s.dests))
-	for i, d := range s.dests {
-		col := s.refTable.Column(i + 1)
-		row[d.as] = arrowValueAt(col, int(idx))
-	}
-	return row
+	return idx, ok
 }
 
 // refJoin is one reference: its config and the hot lookup snapshot. The

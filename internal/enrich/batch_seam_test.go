@@ -48,7 +48,7 @@ func TestEnrichBatchKeepsDeletesColumnar(t *testing.T) {
 
 	// CR-069: no PK argument — the wire record carries the key columns and
 	// a delete bypasses the join entirely (never a key lookup).
-	out, err := s.EnrichBatch(in, nil)
+	out, err := s.EnrichBatch(t.Context(), in, nil)
 	if err != nil {
 		t.Fatalf("EnrichBatch: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 	// reference columns are written as NULL instead of left out.
 	b1 := mkBatch(t, 1)
 	defer b1.Release()
-	out1, err := s.EnrichBatch(b1, []string{"id"})
+	out1, err := s.EnrichBatch(t.Context(), b1, []string{"id"})
 	if err != nil {
 		t.Fatalf("enrich batch 1: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 	// Batch 2: hits.
 	b2 := mkBatch(t, 2)
 	defer b2.Release()
-	out2, err := s.EnrichBatch(b2, []string{"id"})
+	out2, err := s.EnrichBatch(t.Context(), b2, []string{"id"})
 	if err != nil {
 		t.Fatalf("enrich batch 2: %v", err)
 	}

@@ -160,7 +160,7 @@ func runColumnar(t *testing.T, s *Stage, changes []rowchange.Change) []rowchange
 	in := &dpint.Batch{Table: "t", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
 
-	out, err := s.ColumnarJoin(in)
+	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
 		t.Fatalf("ColumnarJoin: %v", err)
 	}
