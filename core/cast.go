@@ -499,6 +499,11 @@ func decimalText(n *big.Int, scale int) string {
 	return intPart + "." + frac
 }
 
+// decimalFloatText renders a float at the target scale. FormatFloat with an
+// explicit scale rounds to that many fraction digits — the target's declared
+// scale is authoritative, so this is the intended quantization, not silent
+// truncation. The caller validates the rounded text against the precision
+// afterwards, so an overflow is still an error.
 func decimalFloatText(f float64, scale int) string {
 	if scale == 0 {
 		return strconv.FormatFloat(f, 'f', 0, 64)
@@ -676,6 +681,9 @@ func (p CastPolicy) Target(name string) (CastTarget, bool) {
 // canonical schema: cast columns in place, KindUnknown columns replaced by
 // their cast or rejected, and the source primary key preserved.
 func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
+	if err := src.Validate(); err != nil {
+		return Schema{}, nil, err
+	}
 	out := Schema{PrimaryKey: append([]string(nil), src.PrimaryKey...)}
 	var warns []Warning
 	srcHas := make(map[string]bool, len(src.Columns))
@@ -765,7 +773,7 @@ func ResolveSchema(src Schema, cast CastPolicy, meta []MetadataColumn) (Schema, 
 		seen[m.As] = true
 		resolved.Columns = append(resolved.Columns, Column{
 			Name: m.As,
-			Type: ColumnType{Kind: m.From.ColumnType().Kind, Nullable: true},
+			Type: m.From.ColumnType(), // already nullable (see MetadataKey.ColumnType)
 		})
 	}
 	return resolved, warns, nil
