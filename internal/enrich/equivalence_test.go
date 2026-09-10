@@ -7,11 +7,6 @@ package enrich
 // columnar path (Stage.ColumnarJoin, landing in S6) can be proven
 // field-for-field equal before the row path is deleted.
 //
-// runCurrentPipeline and TestColumnarPathMatchesCurrentPath exist ONLY until
-// S6: once the 5 invariant tests below are green against the columnar path,
-// the current path and the cross-check are removed and the invariants stay,
-// pointed at columnar.
-//
 // The seam is a broadcast hash join on the reference key. It does not act on
 // windows or collapse — those are the worker's job downstream — but window
 // tags and op/key identity must survive the round-trip untouched, so the
@@ -23,6 +18,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -156,28 +152,20 @@ func newHarnessStage(t *testing.T) *Stage {
 	return s
 }
 
-// runCurrentPipeline drives the scenario through the row path: encode to a
-// wire batch, run the seam (EnrichBatch, which today decodes -> Stage.Enrich
-// -> re-encodes), decode the output back to rows for comparison.
-//
-// REMOVED IN S6 once the columnar path is proven equal.
-func runCurrentPipeline(t *testing.T, s *Stage, changes []rowchange.Change) []rowchange.Change {
+// runColumnar drives the scenario through the columnar seam: encode against
+// the harness wire schema, run ColumnarJoin, decode back to rows.
+func runColumnar(t *testing.T, s *Stage, changes []rowchange.Change) []rowchange.Change {
 	t.Helper()
-	cb := rowchange.Batch{
-		Table:    "t",
-		Changes:  changes,
-		Position: changes[len(changes)-1].Position,
-		Mode:     rowchange.UpsertMode,
-	}
-	in, err := dpint.BatchFromChangeBatch(cb, harnessSchema())
+	rec, err := transport.RecordFromChanges(changes, transport.MergeSchema(changes, harnessSchema()), nil)
 	if err != nil {
-		t.Fatalf("current: encode input: %v", err)
+		t.Fatalf("encode input: %v", err)
 	}
+	in := &dpint.Batch{Table: "t", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
 
-	out, err := s.EnrichBatch(in, []string{"id"})
+	out, err := s.ColumnarJoin(in)
 	if err != nil {
-		t.Fatalf("current: EnrichBatch: %v", err)
+		t.Fatalf("ColumnarJoin: %v", err)
 	}
 	if out == nil {
 		return nil
@@ -186,19 +174,9 @@ func runCurrentPipeline(t *testing.T, s *Stage, changes []rowchange.Change) []ro
 
 	rows, err := transport.DecodeBatch(out.Record, "t", []string{"id"})
 	if err != nil {
-		t.Fatalf("current: decode output: %v", err)
+		t.Fatalf("decode output: %v", err)
 	}
 	return rows
-}
-
-// runColumnarPipeline drives the scenario through the columnar path
-// (Stage.ColumnarJoin). Stubbed until S6 lands ColumnarJoin; the
-// cross-check test skips while this returns nil.
-func runColumnarPipeline(t *testing.T, s *Stage, changes []rowchange.Change) []rowchange.Change {
-	t.Helper()
-	_ = s
-	_ = changes
-	return nil // S6: encode -> s.ColumnarJoin(b) -> decode
 }
 
 // ── comparison helpers ──────────────────────────────────────────────────
@@ -215,41 +193,24 @@ func rowsByKey(rows []rowchange.Change) map[int64]rowchange.Change {
 	return m
 }
 
-func afterEqual(t *testing.T, a, b map[string]any, ctx string) {
-	t.Helper()
-	if len(a) != len(b) {
-		t.Fatalf("%s: After key count %d != %d\n a=%v\n b=%v", ctx, len(a), len(b), a, b)
-	}
-	for k, va := range a {
-		if vb, ok := b[k]; !ok || va != vb {
-			t.Fatalf("%s: After[%q] = %v vs %v", ctx, k, va, vb)
-		}
-	}
-}
-
 // ── tests ───────────────────────────────────────────────────────────────
 
-// TestColumnarPathMatchesCurrentPath — field-by-field, same order.
-// REMOVED IN S6.
-func TestColumnarPathMatchesCurrentPath(t *testing.T) {
+// TestColumnarSeamRowOrderAndCount — the columnar seam preserves row order
+// and count (no collapse, no reorder), keys intact, ops intact.
+func TestColumnarSeamRowOrderAndCount(t *testing.T) {
 	sc := canonicalScenario()
-	cur := runCurrentPipeline(t, newHarnessStage(t), sc)
-	col := runColumnarPipeline(t, newHarnessStage(t), sc)
-	if col == nil {
-		t.Skip("S6: ColumnarJoin not implemented yet")
+	rows := runColumnar(t, newHarnessStage(t), sc)
+	if len(rows) != len(sc) {
+		t.Fatalf("row count: in %d, out %d (the seam must not collapse or drop on a left join)", len(sc), len(rows))
 	}
-	if len(cur) != len(col) {
-		t.Fatalf("row count: current %d, columnar %d", len(cur), len(col))
-	}
-	for i := range cur {
-		a, b := cur[i], col[i]
-		if a.Op != b.Op || a.Position != b.Position {
-			t.Fatalf("row %d: op/pos (%v,%q) vs (%v,%q)", i, a.Op, a.Position, b.Op, b.Position)
+	for i := range sc {
+		in, out := sc[i], rows[i]
+		if in.Op != out.Op || in.Position != out.Position {
+			t.Fatalf("row %d: (%v,%q) -> (%v,%q)", i, in.Op, in.Position, out.Op, out.Position)
 		}
-		if len(a.Key) != len(b.Key) || (len(a.Key) == 1 && a.Key[0] != b.Key[0]) {
-			t.Fatalf("row %d: key %v vs %v", i, a.Key, b.Key)
+		if len(in.Key) == 1 && (len(out.Key) != 1 || out.Key[0] != in.Key[0]) {
+			t.Fatalf("row %d: key %v -> %v", i, in.Key, out.Key)
 		}
-		afterEqual(t, a.After, b.After, "row "+pad4(i))
 	}
 }
 
@@ -378,10 +339,9 @@ func TestWindowReleasesBeforeCloses(t *testing.T) {
 	}
 }
 
-// harnessRows runs the canonical scenario through the current path once and
-// returns the decoded output. The invariant tests read it; after S6 this
-// switches to runColumnarPipeline.
+// harnessRows runs the canonical scenario through the columnar seam once
+// and returns the decoded output. The invariant tests read it.
 func harnessRows(t *testing.T) []rowchange.Change {
 	t.Helper()
-	return runCurrentPipeline(t, newHarnessStage(t), canonicalScenario())
+	return runColumnar(t, newHarnessStage(t), canonicalScenario())
 }

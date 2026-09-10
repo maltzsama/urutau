@@ -83,15 +83,35 @@ func TestEnrichBatchPrimaryKeyUnlocksDeletes(t *testing.T) {
 	}
 }
 
-func TestEnrichBatchWithoutPKRejectsDeletes(t *testing.T) {
+func TestEnrichBatchPassesDeletesColumnar(t *testing.T) {
 	s, _ := newTestStage(t, refCfg(nil), usersRows())
 	in := pkBatch(t)
 	defer in.Release()
 
-	// Control: without the PK the bridge C-8 fail-fast must still fire —
-	// the seam must not silently lose the guard.
-	if _, err := s.EnrichBatch(in, nil); err == nil {
-		t.Fatal("EnrichBatch without PK must error on batches carrying deletes")
+	// CR-069: the columnar seam needs no PK argument — the wire record
+	// carries the key columns and deletes bypass the join without a key
+	// lookup. The old bridge C-8 guard (reconstruct a key from After) is
+	// gone with the bridge.
+	out, err := s.EnrichBatch(in, nil)
+	if err != nil {
+		t.Fatalf("EnrichBatch: %v", err)
+	}
+	if out == nil {
+		t.Fatal("expected output (left join keeps the delete row)")
+	}
+	defer out.Release()
+	rows, err := transport.DecodeBatch(out.Record, "events", []string{"id"})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var sawDelete bool
+	for _, r := range rows {
+		if r.Op == rowchange.OpDelete && r.Key[0] == int64(2) {
+			sawDelete = true
+		}
+	}
+	if !sawDelete {
+		t.Fatal("delete row missing from columnar seam output")
 	}
 }
 
