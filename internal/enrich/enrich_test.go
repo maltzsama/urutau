@@ -867,6 +867,18 @@ func TestMaxWaitValidation(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid maxWait must be rejected at boot (audit #10)")
 	}
+	// R-3: a negative duration parses but silently disables the cap at drain
+	// time — reject it too.
+	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "-1s" })}, []string{"user_ref", "v"}, nil); err == nil {
+		t.Fatal("negative maxWait must be rejected at boot")
+	}
+	// "0s" and absent stay valid (both mean "no cap").
+	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "0s" })}, []string{"user_ref", "v"}, nil); err != nil {
+		t.Fatalf("0s maxWait must boot: %v", err)
+	}
+	if _, err := New([]spec.Enrich{refCfg(nil)}, []string{"user_ref", "v"}, nil); err != nil {
+		t.Fatalf("absent maxWait must boot: %v", err)
+	}
 }
 
 func TestMaxEventsValidation(t *testing.T) {

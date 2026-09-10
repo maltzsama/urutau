@@ -224,6 +224,8 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		var eventCols []string
 		if len(ta.Enrich) > 0 {
 			enrichCfgs = enrichSpecs(ta.Enrich)
+			// SOURCE view, captured BEFORE the reference-column extension
+			// — see FT-1: the destinations are not event columns.
 			eventCols = columnNames(cs)
 			cs = enrich.AddRefColumns(cs, enrichCfgs)
 		}

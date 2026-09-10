@@ -206,8 +206,11 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		rj := &refJoin{cfg: cfg}
 		if cfg.BufferLimits.MaxWait != "" {
 			d, err := time.ParseDuration(cfg.BufferLimits.MaxWait)
-			if err != nil {
-				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a duration", cfg.Table, cfg.BufferLimits.MaxWait)
+			// A negative duration parses fine but silently means "no cap" at
+			// drain time (wait > 0). Reject it: a config error must not
+			// become "unlimited" (same family as audit #10).
+			if err != nil || d < 0 {
+				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a non-negative duration", cfg.Table, cfg.BufferLimits.MaxWait)
 			}
 			rj.maxWaitEvery = d
 		}
