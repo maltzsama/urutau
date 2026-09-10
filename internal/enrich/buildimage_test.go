@@ -88,9 +88,24 @@ func TestBuildImageEmptyReferenceGoesHot(t *testing.T) {
 	if snap.refTable != nil {
 		t.Fatal("empty reference snapshot should carry no refTable")
 	}
-	if snap.rowAt(int64(1)) != nil {
+	if _, ok := snap.lookup(int64(1)); ok {
 		t.Fatal("every lookup against an empty reference must miss")
 	}
+}
+
+// snapValue reads a dest column's value for the row a key resolves to.
+func snapValue(t *testing.T, snap *snapshot, key any, dest string) any {
+	t.Helper()
+	idx, ok := snap.lookup(key)
+	if !ok {
+		return nil
+	}
+	for i, d := range snap.dests {
+		if d.as == dest {
+			return arrowValueAt(snap.refTable.Column(i+1), int(idx))
+		}
+	}
+	return nil
 }
 
 // TestBuildImageJoinTableShape — column 0 is the join key, 1..N the dests.
@@ -104,10 +119,10 @@ func TestBuildImageJoinTableShape(t *testing.T) {
 	if sch.Field(0).Type.ID() != arrow.INT64 {
 		t.Fatalf("join key type = %s, want int64", sch.Field(0).Type)
 	}
-	if snap.rowAt(int64(1))["users.name"] != "ana" {
-		t.Fatalf("rowAt(1) = %v", snap.rowAt(int64(1)))
+	if snapValue(t, snap, int64(1), "users.name") != "ana" {
+		t.Fatalf("lookup(1).users.name = %v", snapValue(t, snap, int64(1), "users.name"))
 	}
-	if snap.rowAt(int64(99)) != nil {
-		t.Fatal("rowAt(99) must miss")
+	if _, ok := snap.lookup(int64(99)); ok {
+		t.Fatal("lookup(99) must miss")
 	}
 }

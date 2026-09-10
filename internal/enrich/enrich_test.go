@@ -119,14 +119,33 @@ func (s *Stage) applyChanges(t *testing.T, changes []rowchange.Change) ([]rowcha
 	for _, c := range inferred.Columns {
 		seen[c.Name] = true
 	}
+	force := func(name string, kind core.Kind) {
+		for i := range inferred.Columns {
+			if inferred.Columns[i].Name == name {
+				inferred.Columns[i].Type = core.ColumnType{Kind: kind, Nullable: true}
+				return
+			}
+		}
+		inferred.Columns = append(inferred.Columns, core.Column{Name: name, Type: core.ColumnType{Kind: kind, Nullable: true}})
+		seen[name] = true
+	}
+	force("id", core.KindInt64)
+	// The join column's type must match the reference's (P4). The stage's
+	// only reference joins on user_ref → int64 unless the test overrode it;
+	// derive from the stage.
+	joinKind := core.KindInt64
+	for _, rj := range s.refs {
+		if rj.onKeyType != nil && rj.onKeyType.ID() == arrow.STRING {
+			joinKind = core.KindString
+		}
+	}
+	force("user_ref", joinKind)
 	ensure := func(name string, kind core.Kind) {
 		if !seen[name] {
 			inferred.Columns = append(inferred.Columns, core.Column{Name: name, Type: core.ColumnType{Kind: kind, Nullable: true}})
 			seen[name] = true
 		}
 	}
-	ensure("id", core.KindInt64)
-	ensure("user_ref", core.KindInt64)
 	ensure("order_ref", core.KindInt64)
 	for _, rj := range s.refs {
 		for _, name := range rj.refDests {
@@ -139,7 +158,7 @@ func (s *Stage) applyChanges(t *testing.T, changes []rowchange.Change) ([]rowcha
 	}
 	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
-	out, err := s.ColumnarJoin(in)
+	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
 		return nil, err
 	}
@@ -997,7 +1016,7 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 	}
 	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
-	out, err := s.ColumnarJoin(in)
+	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
 		t.Fatalf("ColumnarJoin: %v", err)
 	}
