@@ -13,6 +13,7 @@ import (
 	_ "github.com/maltzsama/urutau/internal/builtin"
 	"github.com/maltzsama/urutau/internal/coordinator"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -41,6 +42,9 @@ func main() {
 		resetWindow     time.Duration
 		metricsAddr     string
 		pluginPaths     []string
+		tlsCert         string
+		tlsKey          string
+		tlsCA           string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -82,6 +86,7 @@ func main() {
 				MaxResets:         maxResets,
 				ResetWindow:       resetWindow,
 				MetricsAddr:       metricsAddr,
+				TLS:               grpctls.Config{CertFile: tlsCert, KeyFile: tlsKey, ClientCAFile: tlsCA},
 			})
 		},
 	}
@@ -101,6 +106,9 @@ func main() {
 	cmd.Flags().IntVar(&maxResets, "max-resets", 5, "resets within the window before the job terminates")
 	cmd.Flags().DurationVar(&resetWindow, "reset-window", 15*time.Minute, "sliding window for the reset count")
 	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics and /statusz on this address (optional)")
+	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "server certificate for the control plane (mTLS; all three TLS flags required)")
+	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "server private key for the control plane (mTLS)")
+	cmd.Flags().StringVar(&tlsCA, "tls-ca", "", "CA that signs worker client certs (mTLS)")
 	cmd.Flags().StringSliceVar(&pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
 
 	root.AddCommand(cmd)

@@ -22,6 +22,7 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/enrich"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -42,6 +43,10 @@ type RemoteConfig struct {
 	Logger      *slog.Logger
 	// MetricsAddr serves /metrics (Prometheus); empty disables it.
 	MetricsAddr string
+
+	// TLS is the mutual-TLS material matching the coordinator's control
+	// plane. Empty means plaintext.
+	TLS grpctls.Config
 
 	// FaultStopAck (test-only): commits normally but withholds the ack, so
 	// the coordinator's supervisor sees a stale worker — the crashloop
@@ -132,7 +137,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	// Control and Flight all die together — the split-brain correction of
 	// design §5.3. dialOpts carries the keepalive that turns a silently
 	// frozen coordinator into an error in ~15s.
-	conn, err := grpc.NewClient(cfg.Coordinator, dialOpts()...)
+	conn, err := grpc.NewClient(cfg.Coordinator, dialOpts(cfg.TLS)...)
 	if err != nil {
 		return fmt.Errorf("worker: dial: %w", err)
 	}
@@ -470,9 +475,15 @@ func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.
 // server GOAWAYs the client for pinging too much. The max message size must
 // cover a full snapshot window chunk (default 4Mi is too small for real
 // batches).
-func dialOpts() []grpc.DialOption {
+func dialOpts(tlsCfg grpctls.Config) []grpc.DialOption {
+	creds := grpc.WithTransportCredentials(insecure.NewCredentials())
+	if tlsCfg.Enabled() {
+		if c, err := tlsCfg.ClientCreds(); err == nil {
+			creds = grpc.WithTransportCredentials(c)
+		}
+	}
 	return []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		creds,
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                10 * time.Second,
 			Timeout:             5 * time.Second,

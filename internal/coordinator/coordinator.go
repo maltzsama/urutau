@@ -33,6 +33,7 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -48,6 +49,11 @@ import (
 type Config struct {
 	Spec       *spec.Spec
 	ListenAddr string // gRPC + Flight listen address ("host:port" or ":0")
+
+	// TLS is the mutual-TLS material for the control plane. Empty means
+	// plaintext — a loud warning is logged, because the Assignment carries
+	// the source DSN (CD-1b).
+	TLS grpctls.Config
 
 	ChunkSize     int
 	WindowTimeout time.Duration
@@ -389,7 +395,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	defer func() { _ = lis.Close() }()
 	c.log.Info("coordinator listening", "addr", lis.Addr().String())
 
-	grpcServer := grpc.NewServer(
+	opts := []grpc.ServerOption{
 		// Keepalive agreement with the worker: MinTime ≤ client Time, else
 		// the server GOAWAYs a healthy worker for pinging too much.
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -402,9 +408,20 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}),
 		// Flight batches can be a full snapshot chunk; 128Mi covers the
 		// default batching ceiling.
-		grpc.MaxRecvMsgSize(128<<20),
-		grpc.MaxSendMsgSize(128<<20),
-	)
+		grpc.MaxRecvMsgSize(128 << 20),
+		grpc.MaxSendMsgSize(128 << 20),
+	}
+	if c.cfg.TLS.Enabled() {
+		tlsOpt, err := c.cfg.TLS.ServerOption()
+		if err != nil {
+			return fmt.Errorf("coordinator: tls: %w", err)
+		}
+		opts = append(opts, tlsOpt)
+		c.log.Info("coordinator: control plane mTLS enabled")
+	} else {
+		c.log.Warn("coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA")
+	}
+	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterUrutauControlServer(grpcServer, &controlServer{c: c})
 	flight.RegisterFlightServiceServer(grpcServer, &flightServer{c: c})
 	go func() { _ = grpcServer.Serve(lis) }()

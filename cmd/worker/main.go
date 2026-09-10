@@ -12,6 +12,7 @@ import (
 
 	"github.com/maltzsama/urutau/driver"
 	_ "github.com/maltzsama/urutau/internal/builtin"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/sink"
 )
@@ -36,6 +37,9 @@ func main() {
 		maxInterval  time.Duration
 		metricsAddr  string
 		pluginPaths  []string
+		tlsCert      string
+		tlsKey       string
+		tlsCA        string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -66,6 +70,7 @@ func main() {
 				MaxRows:     maxRows,
 				MaxInterval: maxInterval,
 				MetricsAddr: metricsAddr,
+				TLS:         grpctls.Config{CertFile: tlsCert, KeyFile: tlsKey, ClientCAFile: tlsCA},
 			})
 		},
 	}
@@ -81,6 +86,9 @@ func main() {
 	cmd.Flags().DurationVar(&maxInterval, "max-interval", 2*time.Second, "flush cadence")
 	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "serve /metrics on this address (optional)")
 	cmd.Flags().StringSliceVar(&pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
+	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "client certificate for the control plane (mTLS; all three TLS flags required)")
+	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "client private key for the control plane (mTLS)")
+	cmd.Flags().StringVar(&tlsCA, "tls-ca", "", "CA that signs the coordinator's server cert (mTLS)")
 
 	root.AddCommand(cmd)
 	// SIGINT/SIGTERM cancel the command context: the remote session shuts
