@@ -85,13 +85,8 @@ func runCmd() *cobra.Command {
 				return err
 			}
 
-			// External plugin mode: spawn subprocesses and run via
-			// the supervisor + plugin adapters.
-			if sourcePlugin != "" || sinkPlugin != "" {
-				return runExternalPlugins(cmd.Context(), s, sourcePlugin, sinkPlugin)
-			}
-
-			// Built-in driver mode: run the collapsed pipeline.
+			// The runner config is shared by both modes, so a built-in side
+			// in the plugin path behaves identically to the collapsed run.
 			rc := runner.Config{
 				ServerID:          serverID,
 				Heartbeat:         5 * time.Second,
@@ -105,6 +100,14 @@ func runCmd() *cobra.Command {
 			if eventlogURI != "" {
 				rc.Eventlog = &eventlog.Config{URI: eventlogURI}
 			}
+
+			// External plugin mode: spawn subprocesses and run via
+			// the supervisor + plugin adapters.
+			if sourcePlugin != "" || sinkPlugin != "" {
+				return runExternalPlugins(cmd.Context(), s, rc, sourcePlugin, sinkPlugin)
+			}
+
+			// Built-in driver mode: run the collapsed pipeline.
 			r, err := runner.NewRunner(cmd.Context(), s, rc)
 			if err != nil {
 				return err
@@ -128,20 +131,14 @@ func runCmd() *cobra.Command {
 // Each side (source, sink) that names a plugin binary is spawned via the
 // supervisor and adapted to the public source.Source / sink.Sink contracts;
 // a side left empty falls back to the built-in driver registry. The runner
-// consumes both through the columnar seam (NewRunnerWithAdapters).
-func runExternalPlugins(ctx context.Context, s *spec.Spec, sourceBin, sinkBin string) error {
+// consumes both through the columnar seam (NewRunnerWithAdapters). rc carries
+// the shared knobs (server id, chunk size, window timeout, eventlog) so a
+// built-in side behaves identically to the collapsed runner.
+func runExternalPlugins(ctx context.Context, s *spec.Spec, rc runner.Config, sourceBin, sinkBin string) error {
 	logger := slog.Default()
 	token, err := generateToken()
 	if err != nil {
 		return err
-	}
-
-	rc := runner.Config{
-		Heartbeat:         5 * time.Second,
-		CaughtUpPoll:      time.Second,
-		MaxRows:           1000,
-		MaxInterval:       5 * time.Second,
-		MaxParallelChunks: 0, // plugin source declares no registry ceiling
 	}
 
 	var (
@@ -157,6 +154,9 @@ func runExternalPlugins(ctx context.Context, s *spec.Spec, sourceBin, sinkBin st
 
 	// Source side: plugin adapter or registry driver.
 	if sourceBin != "" {
+		// A plugin source owns its chunking; the registry ceiling (which
+		// bounds built-in chunk SELECTs) does not apply.
+		rc.MaxParallelChunks = 0
 		stage, err := spawnPluginStage(ctx, sourceBin, token, pipeline.StageSource, logger)
 		if err != nil {
 			return err
@@ -164,6 +164,9 @@ func runExternalPlugins(ctx context.Context, s *spec.Spec, sourceBin, sinkBin st
 		closers = append(closers, func() { _ = stage.Stop(context.Background()) })
 		src = plugin.NewSourceAdapter(stage.Client, s.Source, logger)
 	} else {
+		if err := driver.ValidateParallelism(s.Source.Kind, rc.MaxParallelChunks); err != nil {
+			return fmt.Errorf("runner: %w", err)
+		}
 		regSrc, err := driver.OpenSource(s, source.Runtime{
 			ServerID:  rc.ServerID,
 			Heartbeat: rc.Heartbeat,
