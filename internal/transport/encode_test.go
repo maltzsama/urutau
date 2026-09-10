@@ -119,6 +119,49 @@ func TestMergeSchemaGrowsNeverShrinks(t *testing.T) {
 	}
 }
 
+// TestPhaseBornAtSource — the encoder writes __phase on every row: the
+// producer's Phase when set, otherwise derived from the Snapshot boolean.
+// No downstream stage injects it.
+func TestPhaseBornAtSource(t *testing.T) {
+	cs := core.Schema{
+		Columns:    []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}},
+		PrimaryKey: []string{"id"},
+	}
+	rows := []rowchange.Change{
+		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(1)}, Position: "p1"},                    // live -> "stream"
+		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(2)}, Position: "p2", Snapshot: true},    // -> "snapshot"
+		{Op: rowchange.OpInsert, After: map[string]any{"id": int64(3)}, Position: "p3", Phase: "snapshot"}, // explicit
+	}
+	rec, err := RecordFromChanges(rows, cs, nil)
+	if err != nil {
+		t.Fatalf("RecordFromChanges: %v", err)
+	}
+	defer rec.Release()
+
+	if got := rec.Schema().Field(int(rec.NumCols()) - 1).Name; got != "__phase" {
+		t.Fatalf("last wire column = %q, want __phase", got)
+	}
+	br, err := NewBatchReader(rec, cs.PrimaryKey)
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	want := []string{core.PhaseStream, core.PhaseSnapshot, core.PhaseSnapshot}
+	for i, w := range want {
+		if got := br.Phase(i); got != w {
+			t.Fatalf("row %d phase = %q, want %q", i, got, w)
+		}
+	}
+
+	// The round-trip carries Phase back onto the change.
+	back, err := DecodeBatch(rec, "t", cs.PrimaryKey)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if back[1].Phase != core.PhaseSnapshot || back[0].Phase != core.PhaseStream {
+		t.Fatalf("decoded phases = %q,%q", back[0].Phase, back[1].Phase)
+	}
+}
+
 func TestRecordFromChangesEmpty(t *testing.T) {
 	_, cs := encodeFixture()
 	rec, err := RecordFromChanges(nil, cs, nil)

@@ -61,6 +61,7 @@ func wireBatch(t *testing.T, rows ...[3]any) *dataplane.Batch {
 		bld.Field(4).AppendNull()
 		bld.Field(5).AppendNull()
 		bld.Field(6).(*array.BooleanBuilder).Append(false)
+		bld.Field(7).(*array.StringBuilder).Append("stream")
 	}
 	rec := bld.NewRecordBatch()
 	return &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p"), Mode: dataplane.UpsertMode}

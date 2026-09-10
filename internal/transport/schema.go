@@ -51,10 +51,10 @@ func fieldTypeToCore(f arrow.Field) (core.ColumnType, error) {
 
 // CoreSchemaToArrow maps a canonical core.Schema into a typed Arrow schema.
 // Data columns appear in schema order, followed by the fixed metadata
-// columns (__op, __pos, __commit_ts, __ingest_ts, __snapshot). This is
-// the wire schema used by EncodeBatch/DecodeBatch.
+// columns (__op, __pos, __commit_ts, __ingest_ts, __snapshot, __phase).
+// This is the wire schema used by EncodeBatch/DecodeBatch.
 func CoreSchemaToArrow(cs core.Schema) (*arrow.Schema, error) {
-	fields := make([]arrow.Field, 0, len(cs.Columns)+5)
+	fields := make([]arrow.Field, 0, len(cs.Columns)+numWireMetadataFields)
 
 	// Data columns: typed per core.Kind. Reject reserved names.
 	for _, col := range cs.Columns {
@@ -217,9 +217,20 @@ func isReservedColumnName(name string) bool {
 	return false
 }
 
-// WireMetadataFields returns the 5 metadata fields appended to every
-// batch wire schema. Exported so the generator can emit the same fields
-// without duplicating the list (H-12).
+// numWireMetadataFields is the count of trailing metadata columns on every
+// wire-schema record. The single source of truth for the "- N" arithmetic
+// in validateWireSchema and the metadata-column offsets.
+const numWireMetadataFields = 6
+
+// WireMetadataFields returns the metadata fields appended to every batch
+// wire schema, in wire order. Exported so the generator can emit the same
+// fields without duplicating the list (H-12).
+//
+// __phase is "snapshot" for rows read by a DBLog chunk SELECT and "stream"
+// for live events — an axis orthogonal to __op and to the __snapshot
+// boolean (which predates it and is kept for the collapse/window paths that
+// read it by name). Nullable: a producer that does not set a phase leaves
+// it null.
 func WireMetadataFields() []arrow.Field {
 	return []arrow.Field{
 		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
@@ -227,13 +238,14 @@ func WireMetadataFields() []arrow.Field {
 		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
 		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
 		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
+		{Name: "__phase", Type: arrow.BinaryTypes.String, Nullable: true},
 	}
 }
 
 // SchemaFromArrow reconstructs a core.Schema from a typed Arrow schema.
 // Data columns (non-metadata) appear in schema order; metadata columns
-// (__op, __pos, __commit_ts, __ingest_ts, __snapshot) are excluded —
-// they travel outside the core schema.
+// (__op, __pos, __commit_ts, __ingest_ts, __snapshot, __phase) are
+// excluded — they travel outside the core schema.
 func SchemaFromArrow(as *arrow.Schema) (core.Schema, error) {
 	cols := make([]core.Column, 0, as.NumFields())
 	for i := range as.NumFields() {

@@ -133,6 +133,7 @@ func TestRecordsFromReader(t *testing.T) {
 		bld.Field(4).(*array.TimestampBuilder).Append(0)
 		bld.Field(5).(*array.TimestampBuilder).Append(0)
 		bld.Field(6).(*array.BooleanBuilder).Append(false)
+		bld.Field(7).(*array.StringBuilder).Append("stream")
 	}
 	appendRow(rowchange.OpInsert, 1, "alice")
 	appendRow(rowchange.OpUpdate, 2, "bob")
