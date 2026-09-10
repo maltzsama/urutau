@@ -315,6 +315,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		c.surfaceWarnings(ref.Source, srcWarns)
 		cast, err := coreCastOf(t)
 		if err != nil {
 			return err
@@ -323,9 +324,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		for _, w := range append(srcWarns, warns...) {
-			c.log.Warn("schema", "table", ref.Source, "warning", w.Message)
-		}
+		c.surfaceWarnings(ref.Source, warns)
 		refs = append(refs, ref)
 		canonical[t.Source] = core.WireSchema(srcSchema, res)
 		resolvedSchemas[t.Source] = res
@@ -1302,6 +1301,15 @@ func (c *Coordinator) snapshotDSN() string {
 		return u
 	}
 	return c.cfg.Spec.Source.URI
+}
+
+// surfaceWarnings logs the advisory warnings from source introspection and
+// cast resolution at boot — never swallowed, matching the runner (the
+// core.Warning contract is operator-facing).
+func (c *Coordinator) surfaceWarnings(table string, warns []core.Warning) {
+	for _, w := range warns {
+		c.log.Warn("schema", "table", table, "warning", w.Message)
+	}
 }
 
 // coreCastOf parses the table's declared cast policy, failing loud: a
