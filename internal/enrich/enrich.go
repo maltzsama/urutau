@@ -1,11 +1,12 @@
 // Package enrich is the table-level enrichment stage: a columnar broadcast
 // hash join against small reference tables (CR-069). The reference is read
-// WHOLE into a worker-local map (one map per reference), ColumnarJoin
-// matches a whole RecordBatch against it in O(rows) — Arrow in, Arrow out,
-// no rowchange in the path — and the map is swapped atomically on a full
-// periodic re-read. There is no lookup per event against a database, no
-// shuffle, no windowed state — the reference is small by contract, and if
-// it stops being small the answer is a different tool, not a cache.
+// WHOLE into a worker-local typed Arrow table (one per reference) plus a
+// key→row index; ColumnarJoin matches a whole RecordBatch against it in
+// O(rows) — Arrow in, Arrow out, no rowchange in the path — and the
+// snapshot is swapped atomically on a full periodic re-read. There is no
+// lookup per event against a database, no shuffle, no windowed state — the
+// reference is small by contract, and if it stops being small the answer
+// is a different tool, not a cache.
 //
 // Cold start (no snapshot loaded yet) is decided per batch: onColdStart=drop
 // drops the whole batch, buffer/pass miss every row. The row path's per-row
@@ -30,16 +31,15 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -90,19 +90,51 @@ type enrichMetrics struct {
 }
 
 // snapshot is the immutable reference state swapped atomically on refresh.
-// Bundling image, dests and refTypes ensures the hot path reads a consistent
-// view with a single atomic.Load — no lock, no partial reads.
+// A single atomic.Load gives the hot path a consistent view — no lock, no
+// partial reads.
 type snapshot struct {
-	image map[string]map[string]any // normalized join key → reference row
-	dests []dest                    // projected reference columns
-	// refTypes is the Arrow type each destination column lands as on the
-	// wire, derived from the first non-null value seen for it in the load.
-	// A destination that was NULL in every reference row gets a String
-	// placeholder; the next load carrying a real value swaps the whole
-	// snapshot and corrects it (a reference column changing Arrow type
-	// between loads — the sink tolerates the widening or the first load is
-	// synchronous).
-	refTypes map[string]arrow.DataType
+	// refTable holds the projected reference: column 0 is the join key,
+	// columns 1..N are the dests in `dests` order. Typed Arrow — the
+	// executor Take()s from it directly.
+	refTable arrow.RecordBatch
+	dests    []dest // projected reference columns, sorted by dest name
+	// keyIndex maps a typed join value (the canonical Go value read from
+	// the join-key column: string / int64 / uint64 / float64 / []byte
+	// rendered as string / time.Time) to its row in refTable. Built once
+	// per refresh — P4-config, not per-batch data. A cross-type mismatch
+	// between reference and wire fails at boot (P4), so the batch side
+	// reads the same Go type and hits here directly.
+	keyIndex map[any]int32
+}
+
+// refType returns the wire Arrow type of a destination column, or nil if
+// the destination is not projected by this snapshot.
+func (s *snapshot) refType(as string) arrow.DataType {
+	for i, d := range s.dests {
+		if d.as == as {
+			return s.refTable.Column(i + 1).DataType()
+		}
+	}
+	return nil
+}
+
+// rowAt returns the reference row keyed by the typed join value, or nil on
+// a miss. The returned map is keyed by dest name. Used by the current
+// executor row loop; P5 replaces this with a columnar Take.
+func (s *snapshot) rowAt(key any) map[string]any {
+	if s.refTable == nil {
+		return nil
+	}
+	idx, ok := s.keyIndex[normalizeKey(key)]
+	if !ok {
+		return nil
+	}
+	row := make(map[string]any, len(s.dests))
+	for i, d := range s.dests {
+		col := s.refTable.Column(i + 1)
+		row[d.as] = arrowValueAt(col, int(idx))
+	}
+	return row
 }
 
 // refJoin is one reference: its config and the hot lookup snapshot. The
@@ -434,6 +466,9 @@ func (s *Stage) Stop() {
 				_ = rj.loader.Close()
 			}
 		}
+		// The current snapshot's refTable is left to GC — the default
+		// allocator's buffers are plain Go memory, and a concurrent join
+		// may still hold the pointer past Stop in a badly-ordered shutdown.
 	})
 }
 
@@ -457,21 +492,25 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		return
 	}
 	defer rec.Release()
-	image, dests, refTypes, err := buildImage(rj, recordToRows(rec))
+	snap, err := buildImage(rj, rec)
 	if err != nil {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
 		return
 	}
 	// Atomic swap: the hot path reads this with a single Load(), no lock.
-	rj.snap.Store(&snapshot{image: image, dests: dests, refTypes: refTypes})
+	// The displaced snapshot's refTable is NOT released here — a concurrent
+	// ColumnarJoin may hold the old pointer, and the default (Go) allocator
+	// reclaims the buffers by GC once no reader references them. Explicit
+	// release only happens in Stop, when no join can be in flight.
+	rj.snap.Store(snap)
 	// Clear the sticky first-load error on ANY success: "Sticky ONLY before
 	// the first success" means a transient boot failure must not poison the
 	// stage forever once the reference comes hot (audit #1).
 	rj.mu.Lock()
 	rj.firstErr = nil
 	rj.mu.Unlock()
-	log.Info("enrich: reference loaded", "reference", rj.cfg.Table, "rows", len(image))
+	log.Info("enrich: reference loaded", "reference", rj.cfg.Table, "rows", len(snap.keyIndex))
 }
 
 // setFirstErr records a load failure. Sticky ONLY before the first
@@ -505,43 +544,43 @@ func (rj *refJoin) setFirstErr(err error) {
 //
 // The on-reference column is validated to exist and be unique; it is
 // projected only when explicitly listed in select or under "*".
-func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, []dest, map[string]arrow.DataType, error) {
+func buildImage(rj *refJoin, rec arrow.RecordBatch) (*snapshot, error) {
 	star := len(rj.cfg.Select) == 1 && rj.cfg.Select[0] == "*"
 
 	// A legitimately empty reference (every join misses) is not a broken
-	// load (audit #3): build an empty image so the stage goes hot with an
-	// all-miss map. The on/select columns cannot be validated against an
-	// empty result; a later non-empty refresh does.
-	if len(rows) == 0 {
-		return make(map[string]map[string]any), nil, nil, nil
+	// load (audit #3): go hot with an empty index. The on/select columns
+	// cannot be validated against an empty result; a later non-empty
+	// refresh does.
+	if rec == nil || rec.NumRows() == 0 {
+		return &snapshot{keyIndex: map[any]int32{}}, nil
 	}
 
-	if _, ok := rows[0][rj.onRef]; !ok {
-		return nil, nil, nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
+	schema := rec.Schema()
+	colIdx := make(map[string]int, schema.NumFields()) // P4-config: name → column index
+	for i := 0; i < schema.NumFields(); i++ {
+		colIdx[schema.Field(i).Name] = i
 	}
-	available := map[string]bool{}
-	for col := range rows[0] {
-		available[col] = true
+	if _, ok := colIdx[rj.onRef]; !ok {
+		return nil, fmt.Errorf("on: reference column %q is not in the query result", rj.onRef)
 	}
 	if !star {
 		for _, s := range rj.cfg.Select {
-			if !available[s] {
-				return nil, nil, nil, fmt.Errorf("select: reference column %q is not in the query result", s)
+			if _, ok := colIdx[s]; !ok {
+				return nil, fmt.Errorf("select: reference column %q is not in the query result", s)
 			}
 		}
 	}
 
 	// Resolve the projection: reference column → destination name. Under
-	// the star it is every column except the join key. Unrenamed columns
-	// get a table-prefixed name (Spark-style) to avoid silent collisions
-	// when multiple references inject columns with the same name. The "as"
-	// map is keyed by the prefixed name (e.g., "users.id") for consistency.
-	projection := map[string]string{}
+	// the star it is every column (including the join column). Unrenamed
+	// columns get a table-prefixed name (Spark-style); "as" overrides.
 	var dests []dest
 	destSeen := map[string]bool{}
 	addDest := func(refCol string) error {
-		if _, done := projection[refCol]; done {
-			return nil
+		for _, d := range dests {
+			if d.ref == refCol {
+				return nil
+			}
 		}
 		name := fmt.Sprintf("%s.%s", rj.cfg.Table, refCol)
 		if as, ok := rj.cfg.As[name]; ok {
@@ -550,90 +589,129 @@ func buildImage(rj *refJoin, rows []map[string]any) (map[string]map[string]any, 
 		if destSeen[name] {
 			return fmt.Errorf("reference %q: two columns project to the same destination %q", rj.cfg.Table, name)
 		}
-		projection[refCol] = name
 		destSeen[name] = true
 		dests = append(dests, dest{ref: refCol, as: name})
 		return nil
 	}
 	if star {
-		for col := range available {
-			if err := addDest(col); err != nil {
-				return nil, nil, nil, err
+		for i := 0; i < schema.NumFields(); i++ {
+			if err := addDest(schema.Field(i).Name); err != nil {
+				return nil, err
 			}
 		}
 	} else {
 		for _, s := range rj.cfg.Select {
 			if err := addDest(s); err != nil {
-				return nil, nil, nil, err
+				return nil, err
 			}
 		}
 	}
-	// Deterministic order: the join writes by name, but reproducible
-	// column order costs nothing and makes traces comparable.
 	sort.Slice(dests, func(i, j int) bool { return dests[i].as < dests[j].as })
 
-	// refTypes: the Arrow type each destination lands as, from the first
-	// non-null value seen. A dest that is null in every row falls back to
-	// String (a placeholder the next non-null load replaces). A value whose
-	// Go type has no wire mapping is a rejected load — teaching the way out.
-	refTypes := make(map[string]arrow.DataType, len(dests))
-	image := make(map[string]map[string]any, len(rows))
-	for _, row := range rows {
-		// A NULL join key never matches (SQL semantics): a reference row
-		// with a NULL on-column is unreachable by any event (audit #7).
-		if row[rj.onRef] == nil {
+	// Build the refTable: column 0 = join key, columns 1..N = dests. Each
+	// column is retained from the loaded record (zero-copy).
+	joinCol := rec.Column(colIdx[rj.onRef])
+	fields := make([]arrow.Field, len(dests)+1)
+	cols := make([]arrow.Array, len(dests)+1)
+	fields[0] = arrow.Field{Name: rj.onRef, Type: joinCol.DataType(), Nullable: true}
+	joinCol.Retain()
+	cols[0] = joinCol
+	for i, d := range dests {
+		c := rec.Column(colIdx[d.ref])
+		fields[i+1] = arrow.Field{Name: d.as, Type: c.DataType(), Nullable: true}
+		c.Retain()
+		cols[i+1] = c
+	}
+	refTable := array.NewRecordBatch(arrow.NewSchema(fields, nil), cols, rec.NumRows())
+	for _, c := range cols {
+		c.Release() // refTable holds its own refs
+	}
+
+	// keyIndex: typed join value → row. A NULL join key is unreachable
+	// (audit #7). A duplicate is a rejected load — the error cites the
+	// column and the count, never a value, never a position (P5).
+	keyIndex := make(map[any]int32, int(rec.NumRows()))
+	kc := refTable.Column(0)
+	dupCount := 0
+	//allow:rowloop snapshot key index; built once per refresh, not per batch.
+	for i := 0; i < int(rec.NumRows()); i++ {
+		if kc.IsNull(i) {
 			continue
 		}
-		k := joinKey(row[rj.onRef])
-		if _, dup := image[k]; dup {
-			return nil, nil, nil, fmt.Errorf("duplicate join key %v — the reference must be unique on %q", row[rj.onRef], rj.onRef)
+		k := normalizeKey(arrowValueAt(kc, i))
+		if _, dup := keyIndex[k]; dup {
+			dupCount++
+			continue
 		}
-		projected := make(map[string]any, len(dests))
-		for refCol, name := range projection {
-			v := row[refCol]
-			if v != nil {
-				if _, seen := refTypes[name]; !seen {
-					dt, err := refValueArrowType(v)
-					if err != nil {
-						return nil, nil, nil, fmt.Errorf("reference %q column %q: %w", rj.cfg.Table, refCol, err)
-					}
-					refTypes[name] = dt
-				}
-			}
-			projected[name] = v
-		}
-		image[k] = projected
+		keyIndex[k] = int32(i)
 	}
-	for _, d := range dests {
-		if _, ok := refTypes[d.as]; !ok {
-			refTypes[d.as] = arrow.BinaryTypes.String
-		}
+	if dupCount > 0 {
+		refTable.Release()
+		return nil, fmt.Errorf("enrich: reference %q: %d duplicate join key(s) in column %q",
+			rj.cfg.Table, dupCount, rj.onRef)
 	}
-	return image, dests, refTypes, nil
+
+	return &snapshot{refTable: refTable, dests: dests, keyIndex: keyIndex}, nil
 }
 
-// refValueArrowType maps a reference value's Go type to the Arrow type its
-// destination column lands as on the wire. The reference SQL loader yields
-// string / int64 / float64 / []byte / bool / time.Time (drivers may also
-// hand int/int32/uint64); anything else has no wire contract.
-func refValueArrowType(v any) (arrow.DataType, error) {
-	switch v.(type) {
-	case string:
-		return arrow.BinaryTypes.String, nil
+// normalizeKey collapses the driver's int-width variants so the same
+// logical key from a SQL reference (MySQL UNSIGNED → uint64) and from the
+// binlog (int64) hits the same index entry — the int family shares a
+// non-negative space. string vs int stay distinct; float widths stay
+// distinct (0.1f ≠ 0.1). []byte becomes string. A cross-type mismatch
+// between reference and wire is caught at boot (P4), so this only has to
+// reconcile the numeric-width noise.
+func normalizeKey(v any) any {
+	switch t := v.(type) {
 	case []byte:
-		return arrow.BinaryTypes.Binary, nil
-	case bool:
-		return arrow.FixedWidthTypes.Boolean, nil
-	case int, int32, int64:
-		return arrow.PrimitiveTypes.Int64, nil
-	case uint64:
-		return arrow.PrimitiveTypes.Uint64, nil
-	case float32, float64:
-		return arrow.PrimitiveTypes.Float64, nil
-	case time.Time:
-		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, nil
+		return string(t)
+	case int:
+		if t >= 0 {
+			return uint64(t)
+		}
+		return int64(t)
+	case int32:
+		if t >= 0 {
+			return uint64(t)
+		}
+		return int64(t)
+	case int64:
+		if t >= 0 {
+			return uint64(t)
+		}
+		return t
+	case uint32:
+		return uint64(t)
+	case uint:
+		return uint64(t)
 	default:
-		return nil, fmt.Errorf("value type %T is not representable on the wire", v)
+		return v
+	}
+}
+
+// arrowValueAt returns the canonical Go value at row i of an Arrow column,
+// nil when null. Only the reference value types are handled.
+func arrowValueAt(col arrow.Array, i int) any {
+	if col.IsNull(i) {
+		return nil
+	}
+	switch a := col.(type) {
+	case *array.String:
+		return a.Value(i)
+	case *array.Binary:
+		return a.Value(i)
+	case *array.Boolean:
+		return a.Value(i)
+	case *array.Int64:
+		return a.Value(i)
+	case *array.Uint64:
+		return a.Value(i)
+	case *array.Float64:
+		return a.Value(i)
+	case *array.Timestamp:
+		return a.Value(i).ToTime(arrow.Microsecond)
+	default:
+		return nil
 	}
 }
 
@@ -641,58 +719,4 @@ func (rj *refJoin) stickyErr() error {
 	rj.mu.Lock()
 	defer rj.mu.Unlock()
 	return rj.firstErr
-}
-
-// joinKey renders a join value into the map key. Numeric families
-// normalize (drivers disagree on int widths), []byte becomes string; a
-// string "5" and an int64 5 stay DISTINCT — the cast lives in the
-// reference query's SQL, not in silent coercion.
-// intKey places a signed integer in the shared non-negative space when it
-// is non-negative, else in its own negative space.
-//
-// float32 and float64 of the same literal are DIFFERENT VALUES (0.1f
-// upcasts to 0.10000000149011612, not 0.1) and therefore different keys.
-// Same doctrine as string-vs-int: the cast lives in the reference query's
-// SQL, not in silent coercion. The int family is the exception — signed
-// and unsigned share the non-negative space because the VALUE is the same
-// and only the width differs.
-func intKey(t int64) string {
-	if t >= 0 {
-		return "n:" + strconv.FormatInt(t, 10)
-	}
-	return "i:" + strconv.FormatInt(t, 10)
-}
-
-func joinKey(v any) string {
-	switch t := v.(type) {
-	case nil:
-		return "nil"
-	case string:
-		return "s:" + t
-	case []byte:
-		return "s:" + string(t)
-	// Signed and unsigned integers share one space for non-negative values:
-	// the same logical key loads as uint64 from a SQL reference (MySQL
-	// UNSIGNED) and decodes as int64 from the binlog, and a signed/unsigned
-	// split would make the join never match. Negative values have no
-	// unsigned counterpart, so they keep their own space.
-	case int:
-		return intKey(int64(t))
-	case int32:
-		return intKey(int64(t))
-	case int64:
-		return intKey(t)
-	case uint:
-		return "n:" + strconv.FormatUint(uint64(t), 10)
-	case uint32:
-		return "n:" + strconv.FormatUint(uint64(t), 10)
-	case uint64:
-		return "n:" + strconv.FormatUint(t, 10)
-	case float32:
-		return "f:" + strconv.FormatFloat(float64(t), 'g', -1, 64)
-	case float64:
-		return "f:" + strconv.FormatFloat(t, 'g', -1, 64)
-	default:
-		return rowchange.KeyString([]any{v})
-	}
 }

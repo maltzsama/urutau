@@ -110,27 +110,35 @@ func (s *Stage) ColumnarJoin(b *dataplane.Batch) (*dataplane.Batch, error) {
 		}
 
 		var dests []dest
-		var refTypes map[string]arrow.DataType
+		snapRefType := func(string) arrow.DataType { return nil }
 		if snap != nil {
-			dests, refTypes = snap.dests, snap.refTypes
+			dests = snap.dests
+			snapRefType = snap.refType
 		}
 		// With a wildcard select and no load yet, dests is empty and no
 		// column is injected (the documented drift exception). With an
-		// explicit select, fall back to the construction-time refDests
-		// typed as String so the batch keeps a stable shape.
+		// explicit select, or an empty reference, fall back to the
+		// construction-time refDests typed as String so the batch keeps a
+		// stable shape.
+		usingFallbackDests := false
 		if len(dests) == 0 && len(rj.refDests) > 0 {
 			dests = make([]dest, len(rj.refDests))
-			refTypes = make(map[string]arrow.DataType, len(rj.refDests))
 			for i, name := range rj.refDests {
 				dests[i] = dest{as: name}
-				refTypes[name] = arrow.BinaryTypes.String
 			}
+			usingFallbackDests = true
+		}
+		refType := func(as string) arrow.DataType {
+			if usingFallbackDests {
+				return arrow.BinaryTypes.String
+			}
+			return snapRefType(as)
 		}
 
 		inner := rj.cfg.JoinType == "inner"
 		builders := make([]array.Builder, len(dests))
 		for i, d := range dests {
-			builders[i] = array.NewBuilder(alloc, refTypes[d.as])
+			builders[i] = array.NewBuilder(alloc, refType(d.as))
 		}
 		relBuilders := func() {
 			for _, bl := range builders {
@@ -150,7 +158,7 @@ func (s *Stage) ColumnarJoin(b *dataplane.Batch) (*dataplane.Batch, error) {
 			var row map[string]any
 			if !isDelete(i) && snap != nil {
 				if kv := readArrowValue(keyArr, i); kv != nil {
-					row = snap.image[joinKey(kv)]
+					row = snap.rowAt(kv)
 				}
 			}
 			switch {
@@ -161,7 +169,7 @@ func (s *Stage) ColumnarJoin(b *dataplane.Batch) (*dataplane.Batch, error) {
 				}
 			case row != nil:
 				for bi, d := range dests {
-					if err := appendRefValue(builders[bi], refTypes[d.as], row[d.as]); err != nil {
+					if err := appendRefValue(builders[bi], refType(d.as), row[d.as]); err != nil {
 						relBuilders()
 						release()
 						return nil, fmt.Errorf("enrich: reference %q column %q: %w", rj.cfg.Table, d.as, err)
@@ -188,7 +196,7 @@ func (s *Stage) ColumnarJoin(b *dataplane.Batch) (*dataplane.Batch, error) {
 		for bi, d := range dests {
 			arr := builders[bi].NewArray()
 			builders[bi] = nil
-			f := arrow.Field{Name: d.as, Type: refTypes[d.as], Nullable: true}
+			f := arrow.Field{Name: d.as, Type: refType(d.as), Nullable: true}
 			if j, exists := fieldIdx[d.as]; exists {
 				if owned[j] {
 					dataArrs[j].Release()
@@ -283,7 +291,7 @@ func readArrowValue(col arrow.Array, i int) any {
 
 // appendRefValue appends one reference image value into the destination
 // builder. The image holds raw Go values from the SQL loader; the builder's
-// type came from refValueArrowType over the same value space, so the type
+// type came from the reference load over the same value space, so the type
 // switch mirrors it. A nil value appends null.
 func appendRefValue(bld array.Builder, dt arrow.DataType, v any) error {
 	if v == nil {
