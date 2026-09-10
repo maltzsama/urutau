@@ -5,6 +5,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -199,5 +200,29 @@ func TestSnapshotDSNPrefersScopedURI(t *testing.T) {
 	c2 := &Coordinator{cfg: Config{Spec: &spec.Spec{Source: spec.Source{URI: "mysql://repl@db/repl"}}}}
 	if got := c2.snapshotDSN(); got != "mysql://repl@db/repl" {
 		t.Fatalf("snapshotDSN fallback = %q, want the source URI", got)
+	}
+}
+
+// P3 / retention: confirmedPosition feeds the source's retention. When the
+// committed positions are not mutually comparable there is no safe minimum —
+// it must return nil (hold retention), never an arbitrary pick.
+func TestConfirmedPositionIncomparableHoldsRetention(t *testing.T) {
+	c := &Coordinator{
+		confirmed: map[string]position.Position{"a": opaquePos("x"), "b": opaquePos("y")},
+		log:       slog.New(slog.DiscardHandler),
+	}
+	if got := c.confirmedPosition(); got != nil {
+		t.Fatalf("incomparable committed positions must hold retention (nil), got %s", got)
+	}
+
+	// Comparable positions still fold to the minimum.
+	lo := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1")
+	hi := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:5")
+	c2 := &Coordinator{
+		confirmed: map[string]position.Position{"a": lo, "b": hi},
+		log:       slog.New(slog.DiscardHandler),
+	}
+	if got := c2.confirmedPosition(); got == nil || got.String() != lo.String() {
+		t.Fatalf("comparable fold = %v, want %s", got, lo)
 	}
 }

@@ -876,6 +876,11 @@ func (c *Coordinator) recordConfirmed(table string, pos position.Position) {
 
 // confirmedPosition returns the minimum committed position across all
 // target tables; nil while nothing is durably committed.
+//
+// MinSafe, not Min: if the committed positions are not mutually comparable
+// (never for one source, but a guard), there is no safe minimum — advancing
+// the source's retention to an arbitrary one could pass uncommitted data.
+// Nil means "nothing provably committed", which holds retention back.
 func (c *Coordinator) confirmedPosition() position.Position {
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
@@ -886,10 +891,22 @@ func (c *Coordinator) confirmedPosition() position.Position {
 	for _, p := range c.confirmed {
 		vals = append(vals, p)
 	}
-	return position.Min(vals)
+	best, err := position.MinSafe(vals)
+	if err != nil {
+		c.log.Warn("coordinator: incomparable committed positions; not advancing retention", "err", err)
+		return nil
+	}
+	return best
 }
 
 // waitChunkReady blocks until the worker reports the chunk SELECT done.
+//
+// KNOWN RESIDUAL (CD-5 follow-up, low risk): a ChunkReady is matched on
+// (table, chunkID) with no epoch tag, so a stale/replayed reply from a
+// superseded generation with the same ids would satisfy the wait. The CD-5
+// fail-fast (session loss during an active snapshot fails the run) removes
+// the session-loss path that produced stale replies; a same-epoch duplicate
+// is not rejected. Tag ChunkReady with the epoch if this ever surfaces.
 func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32) error {
 	for {
 		select {

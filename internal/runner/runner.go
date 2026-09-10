@@ -850,7 +850,16 @@ func (r *Runner) updateCommitted(table string, pos position.Position) {
 	for _, p := range r.committedPositions {
 		vals = append(vals, p)
 	}
-	r.minConfirmed = position.Min(vals)
+	// MinSafe: an incomparable pair has no safe minimum — nil holds the
+	// confirmed point back rather than advancing the slot past uncommitted
+	// data (same direction as StringPosition's incomparable).
+	best, err := position.MinSafe(vals)
+	if err != nil {
+		r.log.Warn("runner: incomparable committed positions; not advancing confirmed point", "err", err)
+		r.minConfirmed = nil
+		return
+	}
+	r.minConfirmed = best
 }
 
 // confirmedPosition returns the minimum committed position across all

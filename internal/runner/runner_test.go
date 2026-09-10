@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -197,3 +198,43 @@ func (p *pullTestReader) OpenWindow(context.Context, uint32)                {}
 func (p *pullTestReader) ClearWindow()                                      {}
 func (p *pullTestReader) Close()                                            {}
 func (p *pullTestReader) SetConfirmed(func() position.Position)             {}
+
+// P3 / retention: updateCommitted recomputes the confirmed point the Postgres
+// slot advances to. An incomparable pair must set it to nil (hold the slot
+// back), never an arbitrary minimum.
+func TestUpdateCommittedIncomparableHolds(t *testing.T) {
+	r := &Runner{
+		log:                slog.New(slog.DiscardHandler),
+		committedPositions: map[string]position.Position{},
+	}
+	r.updateCommitted("a", opaqueTestPos("x"))
+	r.updateCommitted("b", opaqueTestPos("y"))
+	if r.minConfirmed != nil {
+		t.Fatalf("incomparable positions must hold the confirmed point (nil), got %s", r.minConfirmed)
+	}
+
+	lo := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1")
+	hi := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:5")
+	r2 := &Runner{log: slog.New(slog.DiscardHandler), committedPositions: map[string]position.Position{}}
+	r2.updateCommitted("a", lo)
+	r2.updateCommitted("b", hi)
+	if r2.minConfirmed == nil || r2.minConfirmed.String() != lo.String() {
+		t.Fatalf("comparable fold = %v, want %s", r2.minConfirmed, lo)
+	}
+}
+
+// opaqueTestPos is identity-only: different values are Incomparable.
+type opaqueTestPos string
+
+func (o opaqueTestPos) String() string { return string(o) }
+func (o opaqueTestPos) Compare(other position.Position) int {
+	p, ok := other.(opaqueTestPos)
+	if ok && o == p {
+		return 0
+	}
+	return position.Incomparable
+}
+func (o opaqueTestPos) Contains(other position.Position) bool {
+	p, ok := other.(opaqueTestPos)
+	return ok && o == p
+}
