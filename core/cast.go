@@ -254,6 +254,15 @@ func CastWarning(from Kind, to CastTarget) string {
 
 // Convert applies an allowed cast to one value. It returns an error for a
 // value the cast cannot represent (invalid UUID text, invalid JSON).
+//
+// Convert is NOT a leftover from the pre-columnar design: it is the
+// per-value cast kernel the sinks apply on their write paths (clickhouse,
+// couchbase and iceberg coerce each column value through it before
+// serialization), where the unit of work is one value, not a column. The
+// dataplane's columnar Cast (transport.KindToArrow + compute) is the
+// batch-level executor; the two coexist by design (W-1 / D-4: the matrix is
+// the single policy, the arrow kernel and this value kernel are the two
+// executors). Deleting Convert would strand the sinks.
 func (t CastTarget) Convert(v any) (any, error) {
 	switch t.Type.Kind {
 	case KindString:
