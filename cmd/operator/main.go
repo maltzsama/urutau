@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -13,7 +14,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
-	_ "github.com/maltzsama/urutau/internal/builtin"
+	_ "github.com/maltzsama/urutau/internal/builtin" // register built-in drivers via init()
 	"github.com/maltzsama/urutau/internal/operator"
 )
 
@@ -25,6 +26,13 @@ func init() {
 }
 
 func main() {
+	if err := run(); err != nil {
+		ctrl.Log.WithName("setup").Error(err, "fatal")
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	var (
 		metricsAddr   string
 		probeAddr     string
@@ -33,55 +41,65 @@ func main() {
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe endpoint")
-	flag.StringVar(&image, "coordinator-image", "urutau:latest", "coordinator container image")
+	flag.StringVar(&image, "coordinator-image", "", "coordinator container image (required)")
 	flag.BoolVar(&enableWebhook, "enable-webhook", true, "enable the admission webhook")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
+	// SetLogger must precede WithName: ctrl.Log.WithName captures the logger
+	// in effect at call time, so naming first would bind the pre-zap default
+	// and silently drop every setupLog record.
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	if image == "" {
+		return fmt.Errorf("coordinator-image must not be empty")
+	}
+
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("unable to load kubeconfig: %w", err)
+	}
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
+		return fmt.Errorf("unable to start manager: %w", err)
 	}
 
-	if err := (&operator.CoordinatorReconciler{
+	// One reconciler instance serves both the controller and the webhook so
+	// any future state (caches, limits) is shared, not duplicated.
+	r := &operator.CoordinatorReconciler{
 		Client: mgr.GetClient(),
 		Image:  image,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller")
-		os.Exit(1)
 	}
-
+	if err := r.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create controller: %w", err)
+	}
 	if enableWebhook {
-		if err := (&operator.CoordinatorReconciler{
-			Client: mgr.GetClient(),
-			Image:  image,
-		}).SetupWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create webhook")
-			os.Exit(1)
+		if err := r.SetupWebhookWithManager(mgr); err != nil {
+			return fmt.Errorf("unable to create webhook: %w", err)
 		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
+		return fmt.Errorf("unable to set up health check: %w", err)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
+		return fmt.Errorf("unable to set up ready check: %w", err)
 	}
 
-	setupLog.Info("starting manager")
+	setupLog.Info("starting manager",
+		"coordinatorImage", image,
+		"webhookEnabled", enableWebhook,
+		"metricsAddr", metricsAddr,
+		"probeAddr", probeAddr,
+	)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
+		return fmt.Errorf("problem running manager: %w", err)
 	}
+	return nil
 }
