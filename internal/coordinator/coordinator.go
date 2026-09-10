@@ -24,6 +24,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -129,8 +131,15 @@ type Coordinator struct {
 
 	ready       chan struct{} // one send per attached session
 	sessionErrs chan error    // first exit wins
-	batchSeq    atomic.Uint64 // monotonic BatchMeta.batch_id
-	mu          sync.Mutex    // guards session attach/detach
+	// snapshotActive is true while the snapshot phase runs. A worker
+	// session lost during it (reset OR death) must fail the run fast: the
+	// worker's in-memory window died with it, so the protocol would either
+	// wait out AckTimeout/MaxResets (15min) or let a stale ChunkReady from
+	// the old generation satisfy the wait against an empty window — a
+	// silently incomplete snapshot.
+	snapshotActive atomic.Bool
+	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
+	mu             sync.Mutex    // guards session attach/detach
 
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
 	// on the worker, live events of that table are held here instead of
@@ -187,6 +196,12 @@ type workerState struct {
 	// committed: target table → position the worker reported after its last
 	// commit. Refreshed on every ready Hello (design §5.6.1).
 	committed map[string]string
+
+	// activeGet guards one DoGet stream per worker. Two concurrent streams
+	// on the same ticket would each pop the queue, splitting batches across
+	// readers — a batch sent to a dying stream is lost (the one-slot resend
+	// cannot cover two readers).
+	activeGet atomic.Bool
 }
 
 // workerName resolves the worker group of one spec table: the explicit
@@ -351,7 +366,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 		tbl := tableBySource[ref.Source]
 		// The cast policy must reach DDL: an empty policy here creates a
 		// table whose types diverge from the collapsed runner's (audit #8).
-		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], tbl.PartitionBy, coreCastOf(tbl), tbl.WriteMode.ChangeMode()); err != nil {
+		cast, err := coreCastOf(tbl)
+		if err != nil {
+			return err
+		}
+		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
@@ -449,8 +468,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// session error lands in sessionErrs, and nobody reads it (audit #1).
 	snapCtx, snapCancel := context.WithCancel(ctx)
 	defer snapCancel()
+	c.snapshotActive.Store(true)
 	snapDone := make(chan error, 1)
 	go func() {
+		defer c.snapshotActive.Store(false)
 		defer snapCancel()
 		defer close(snapDone)
 		snapCfg := snapshot.SnapshotConfig{
@@ -586,8 +607,14 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 	// lock still races the map write on boot (audit #13).
 	c.mu.Lock()
 	for name, w := range c.workers {
+		// Phase reflects reality: the field used to hardcode "attached" for
+		// every worker, which lied about detached/pending ones.
+		phase := "detached"
+		if w.attached {
+			phase = "attached"
+		}
 		ws[name] = &workerStatus{
-			Phase:     "attached",
+			Phase:     phase,
 			Epoch:     w.epoch,
 			Attached:  w.attached,
 			Inflight:  c.budget.inFlight(name),
@@ -921,6 +948,9 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if b != nil {
 		defer b.Release()
 	}
+	if b == nil && (meta == nil || meta.Table == "") {
+		return fmt.Errorf("coordinator: marker batch requires a table in meta")
+	}
 	if meta == nil {
 		meta = &pb.BatchMeta{}
 	}
@@ -941,13 +971,20 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	var err error
 	if b == nil {
 		// Resolve the canonical schema for typed wire encoding of the
-		// zero-row marker record.
+		// zero-row marker record. A marker whose table is not in refs would
+		// otherwise encode with a zero-value schema (0 data columns) and be
+		// rejected downstream with an error pointing at the wrong place.
 		var cs core.Schema
+		found := false
 		for _, ref := range c.refs {
 			if ref.Target == meta.Table {
 				cs = c.canonical[ref.Source]
+				found = true
 				break
 			}
+		}
+		if !found {
+			return fmt.Errorf("coordinator: marker batch: table %q has no canonical schema (not in refs)", meta.Table)
 		}
 		body, metaBytes, err = transport.EncodeBatch(nil, cs, meta, nil)
 		if err != nil {
@@ -1107,7 +1144,11 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		tbl, ok := c.specForSource(ref.Source)
 		if ok {
 			ta.WriteMode = writeModeToPB(tbl.WriteMode.ChangeMode())
-			if castB, err := json.Marshal(coreCastOf(tbl)); err != nil {
+			cast, cerr := coreCastOf(tbl)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if castB, err := json.Marshal(cast); err != nil {
 				return nil, fmt.Errorf("coordinator: cast %s: %w", ref.Source, err)
 			} else {
 				ta.CastPolicy = castB
@@ -1168,9 +1209,17 @@ func writeModeToPB(m dataplane.WriteMode) pb.WriteMode {
 // DDL and the worker's writes must both apply. Parse errors are ignored the
 // same way the collapsed runner ignores them (the cast is re-validated on
 // the write path); the coordinator must not diverge from the runner.
-func coreCastOf(tbl spec.Table) core.CastPolicy {
-	cast, _ := core.ParseCastPolicy(tbl.Cast)
-	return cast
+// coreCastOf parses the table's declared cast policy, failing loud: a
+// swallowed parse error would ship an empty policy, creating a sink table
+// whose types diverge from the spec (audit #8). The source Introspect
+// validates the same string at boot, so this cannot normally fail — but the
+// coordinator must not degrade silently if it ever does.
+func coreCastOf(tbl spec.Table) (core.CastPolicy, error) {
+	cast, err := core.ParseCastPolicy(tbl.Cast)
+	if err != nil {
+		return core.CastPolicy{}, fmt.Errorf("coordinator: table %s cast: %w", tbl.Target, err)
+	}
+	return cast, nil
 }
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
@@ -1269,6 +1318,11 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		// supervisor owns the outcome (crashloop or recovery).
 		if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(hello.WorkerName) {
 			c.sessionErrs <- retErr
+		} else if c.snapshotActive.Load() {
+			// A reset (or reset-death) mid-snapshot is not a worker failure,
+			// but the snapshot cannot continue: fail the run so it restarts
+			// and re-snapshots cleanly (CD-5).
+			c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", hello.WorkerName, retErr)
 		}
 	}()
 
@@ -1432,6 +1486,10 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 	if !ok {
 		return fmt.Errorf("coordinator: unknown flight ticket %q", string(req.Ticket))
 	}
+	if !w.activeGet.CompareAndSwap(false, true) {
+		return status.Error(codes.ResourceExhausted, "coordinator: a DoGet stream is already active for this worker")
+	}
+	defer w.activeGet.Store(false)
 	for {
 		// Deliver any resend first: it was popped ahead of the queue's head,
 		// so it must land ahead of it too.
@@ -1487,7 +1545,10 @@ func resumeOrNone(p position.Position) string {
 func randSuffix(n int) string {
 	b := make([]byte, n/2+1)
 	if _, err := rand.Read(b); err != nil {
-		return "000000"
+		// Same rule as randTicket: a deterministic fallback would make
+		// runIDs collide across restarts and overwrite a prior run's S3
+		// manifests. crypto/rand failure is fatal, not degraded.
+		panic(fmt.Sprintf("coordinator: crypto/rand: %v", err))
 	}
 	return hex.EncodeToString(b)[:n]
 }
