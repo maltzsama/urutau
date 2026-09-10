@@ -90,3 +90,17 @@ data (design §17.3). `internal/state` (bbolt) is the exception for external
 plugin sinks that cannot persist a position themselves; when both exist, the
 sink wins (see `docs/state-position.md`). Resume folds use `position.MinSafe`
 — an undefined order is an error, never an arbitrary pick (P1).
+
+## Registered for v2 (not v1 gaps)
+
+These are deliberate deferrals, recorded so they are not rediscovered as
+debt. None is a correctness gap in v1.
+
+- **Columnar enrich join** (CR-069 §3.4): the join is row-based by design
+  until the broadcast join lands; the worker consumes the seam columnar.
+- **Operator image/S3 planner**: the operator supports inline definitions
+  only; an image/S3 source is not implemented.
+- **ADD COLUMN propagation**: a schema change requires declare-and-resume;
+  live propagation is not automatic.
+- **Dead-letter queue** (and multi-destination DLQ): a poison batch is
+  terminal in v1; a DLQ with a manual skip valve is a v2 feature.
