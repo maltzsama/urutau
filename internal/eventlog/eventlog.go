@@ -274,9 +274,11 @@ func (r *Run) Close() {
 func newRunID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// Randomness is a nicety; the second-precision timestamp already
-		// separates boots.
-		return time.Now().UTC().Format("20060102T150405Z")
+		// crypto/rand failing means the boot environment is broken: a
+		// deterministic fallback would collide keys across boots in the
+		// same second and one trail would overwrite the other (the
+		// randTicket precedent — same policy, same reason).
+		panic(fmt.Sprintf("eventlog: crypto/rand: %v", err))
 	}
 	return time.Now().UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b[:])
 }
@@ -315,9 +317,10 @@ type s3Putter struct {
 
 func (p *s3Putter) Put(ctx context.Context, bucket, key string, body []byte) error {
 	_, err := p.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Body:   bytes.NewReader(body),
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(body),
+		ContentType: aws.String("application/x-ndjson"),
 	})
 	return err
 }
