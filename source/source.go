@@ -163,10 +163,11 @@ type Positioner interface {
 	ParsePosition(s string) (position.Position, error)
 }
 
-// Introspector resolves one spec table into its ref, the canonical schema
-// with the declared cast and metadata columns applied, and the advisory
-// cast warnings. The final target (Iceberg/Delta) schema is the sink's
-// concern, not the source's.
+// Introspector resolves one spec table into its ref and the SOURCE canonical
+// schema — the shape as the source emits it, before any cast or metadata
+// column is applied. The pipeline resolves the cast policy centrally (the
+// sink is the cast executor), so the source never applies it. The warnings
+// are source-level advisories; the cast warnings come from the resolver.
 type Introspector interface {
 	Introspect(ctx context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error)
 }

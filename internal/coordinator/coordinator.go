@@ -304,15 +304,28 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 
 	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
+	// canonical holds the WIRE shape (source types; the workers encode it
+	// and the sink casts). resolvedSchemas holds the sink's target shape
+	// (cast types + metadata columns) for DDL.
 	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
+	resolvedSchemas := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
 	tableBySource := make(map[string]spec.Table, len(c.cfg.Spec.Tables))
 	for _, t := range c.cfg.Spec.Tables {
-		ref, cs, _, err := src.Introspect(ctx, t)
+		ref, srcSchema, _, err := src.Introspect(ctx, t)
+		if err != nil {
+			return err
+		}
+		cast, err := coreCastOf(t)
+		if err != nil {
+			return err
+		}
+		res, _, err := core.ResolveSchema(srcSchema, cast, t.Metadata)
 		if err != nil {
 			return err
 		}
 		refs = append(refs, ref)
-		canonical[t.Source] = cs
+		canonical[t.Source] = core.WireSchema(srcSchema, res)
+		resolvedSchemas[t.Source] = res
 		tableBySource[t.Source] = t
 	}
 	c.refs = refs
@@ -397,7 +410,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := snk.EnsureTable(ctx, ref, canonical[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
+		if err := snk.EnsureTable(ctx, ref, resolvedSchemas[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}

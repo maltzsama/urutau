@@ -102,18 +102,7 @@ func (s Source) Introspect(_ context.Context, t spec.Table) (core.TableRef, core
 	}
 	cs := core.Schema{Columns: cols}
 
-	cast, err := core.ParseCastPolicy(t.Cast)
-	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil,
-			fmt.Errorf("kafka: table %q: %w", t.Source, err)
-	}
-	resolved, warns, err := core.ResolveSchema(cs, cast, t.Metadata)
-	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil,
-			fmt.Errorf("kafka: table %q: %w", t.Source, err)
-	}
-
-	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, warns, nil
+	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
 // NewReader builds the Kafka consumer. It subscribes to the topics

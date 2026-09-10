@@ -79,15 +79,7 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	if err != nil {
 		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: schema %s: %w", t.Source, err)
 	}
-	cast, err := core.ParseCastPolicy(t.Cast)
-	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: schema %s: %w", t.Source, err)
-	}
-	resolved, warns, err := core.ResolveSchema(cs, cast, t.Metadata)
-	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: schema %s: %w", t.Source, err)
-	}
-	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, resolved, warns, nil
+	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
 // NewChunker builds the chunk SELECT source for one table.

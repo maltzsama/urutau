@@ -832,6 +832,24 @@ func (p CastPolicy) Resolve(src Schema) (Schema, []Warning, error) {
 	return out, warns, nil
 }
 
+// WireSchema returns the shape a source encodes and the wire carries: the
+// SOURCE column types, so a sink's Kind-aware cast sees the true origin (a
+// date as Date32, binary as Binary — not the already-cast target). A
+// KindUnknown column has no Arrow representation of its own, so it takes its
+// resolved cast target; the sink then re-applies that cast idempotently.
+func WireSchema(source, resolved Schema) Schema {
+	out := Schema{PrimaryKey: append([]string(nil), source.PrimaryKey...), Columns: make([]Column, 0, len(source.Columns))}
+	for _, c := range source.Columns {
+		if c.Type.Kind == KindUnknown {
+			if rc, ok := resolved.Column(c.Name); ok {
+				c.Type = rc.Type
+			}
+		}
+		out.Columns = append(out.Columns, c)
+	}
+	return out
+}
+
 // inPrimaryKey reports whether name is a member of the key list.
 func inPrimaryKey(name string, pk []string) bool {
 	for _, k := range pk {

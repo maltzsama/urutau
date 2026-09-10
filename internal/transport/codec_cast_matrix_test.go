@@ -92,3 +92,28 @@ func TestEncoderAppliesCastMatrix(t *testing.T) {
 		})
 	}
 }
+
+// The pipeline now encodes the SOURCE schema (core.WireSchema) and the sink
+// casts with the wire Kind. These two cases were broken while the worker
+// pre-cast to the target type: binary lost its encoding (became a raw
+// string) and a date became an integer.
+func TestSourceSchemaCastHandoff(t *testing.T) {
+	// binary -> string(hex): the wire carries Binary, the sink hex-encodes.
+	rd := encodeOne(t, core.ColumnType{Kind: core.KindBinary}, []byte{0xde, 0xad})
+	kind, _ := rd.ColumnKind("c")
+	v, _ := rd.Value("c", 0)
+	got, err := (core.CastTarget{Type: core.ColumnType{Kind: core.KindString}, Encoding: "hex"}).Convert(kind, v)
+	if err != nil || got != "dead" {
+		t.Fatalf("binary -> string(hex) = %v, %v; want dead", got, err)
+	}
+
+	// date -> string: the wire carries Date32, the sink formats the date.
+	days := int32(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+	rd = encodeOne(t, core.ColumnType{Kind: core.KindDate}, days)
+	kind, _ = rd.ColumnKind("c")
+	v, _ = rd.Value("c", 0)
+	got, err = (core.CastTarget{Type: core.ColumnType{Kind: core.KindString}}).Convert(kind, v)
+	if err != nil || got != "2024-01-01" {
+		t.Fatalf("date -> string = %v, %v; want 2024-01-01", got, err)
+	}
+}
