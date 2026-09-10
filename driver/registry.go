@@ -246,12 +246,14 @@ func ValidateParallelism(kind string, maxParallelChunks int) error {
 	if maxParallelChunks < 0 {
 		return fmt.Errorf("driver: maxParallelChunks %d is negative", maxParallelChunks)
 	}
-	if maxParallelChunks == 0 {
-		return nil
-	}
+	// Resolve the kind BEFORE the zero short-circuit: an unknown source kind
+	// must error at boot regardless of the parallelism setting.
 	caps, err := CapsForKind(kind)
 	if err != nil {
 		return err
+	}
+	if maxParallelChunks == 0 {
+		return nil
 	}
 	if caps.MaxConnections > 0 && maxParallelChunks > caps.MaxConnections {
 		return fmt.Errorf("driver: maxParallelChunks (%d) exceeds the %s driver ceiling (%d connections)",

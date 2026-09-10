@@ -318,6 +318,22 @@ func (c *Coordinator) run(ctx context.Context) error {
 	c.refs = refs
 	c.canonical = canonical
 
+	// K4: a worker group name must not collide with another table's TARGET
+	// (an implicit worker name). "worker: payments" on one table plus a
+	// table targeting "payments" would silently merge two unrelated
+	// pipelines onto one worker.
+	explicitGroups := make(map[string]bool)
+	for _, t := range c.cfg.Spec.Tables {
+		if t.Worker != "" {
+			explicitGroups[t.Worker] = true
+		}
+	}
+	for _, t := range c.cfg.Spec.Tables {
+		if t.Worker == "" && explicitGroups[t.Target] {
+			return fmt.Errorf("coordinator: table %q targets %q, which is also an explicit worker group — rename the group or the target", t.Source, t.Target)
+		}
+	}
+
 	// Resolve worker groups: explicit worker= or the table's own pod.
 	for i, t := range c.cfg.Spec.Tables {
 		name := workerName(t)
@@ -657,7 +673,12 @@ func (c *Coordinator) emit(kind string, fields map[string]any) error {
 	if c.ev == nil {
 		return nil
 	}
-	if err := c.ev.Emit(context.Background(), kind, fields); err != nil {
+	// Bounded: the audit-trail upload must not hang the caller (the ack hot
+	// path already fires-and-forgets, but emit is also called synchronously
+	// on boot/terminal paths).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.ev.Emit(ctx, kind, fields); err != nil {
 		return err
 	}
 	return nil
