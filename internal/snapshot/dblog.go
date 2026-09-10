@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -210,6 +211,7 @@ func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, tar
 			After:    row,
 			Position: low.String(),
 			Snapshot: true,
+			Phase:    core.PhaseSnapshot,
 			IngestTS: time.Now(),
 		})
 		return nil

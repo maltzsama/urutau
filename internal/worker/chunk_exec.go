@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -122,6 +123,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 			Key:      key,
 			After:    row,
 			Snapshot: true,
+			Phase:    core.PhaseSnapshot,
 			IngestTS: time.Now(),
 		})
 		return nil
