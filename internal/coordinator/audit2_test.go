@@ -12,6 +12,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // CD-T1: a stall with unacked (in-flight) batches must TERMINATE, not reset.
@@ -181,5 +182,22 @@ func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
 	p2.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
 	if freed := p2.truncate("t", opaquePos("cookie-1")); freed != 5 {
 		t.Fatalf("identical ack freed %d, want 5", freed)
+	}
+}
+
+// DP1 / D-CD1: the worker's Assignment carries the scoped read-only
+// SnapshotURI when set, never the replication URI.
+func TestSnapshotDSNPrefersScopedURI(t *testing.T) {
+	c := &Coordinator{cfg: Config{Spec: &spec.Spec{Source: spec.Source{
+		URI:         "mysql://repl:secret@db/repl",
+		SnapshotURI: "mysql://readonly@db/ro",
+	}}}}
+	if got := c.snapshotDSN(); got != "mysql://readonly@db/ro" {
+		t.Fatalf("snapshotDSN = %q, want the scoped read-only URI", got)
+	}
+	// Fallback when unset: the pre-scoping behavior.
+	c2 := &Coordinator{cfg: Config{Spec: &spec.Spec{Source: spec.Source{URI: "mysql://repl@db/repl"}}}}
+	if got := c2.snapshotDSN(); got != "mysql://repl@db/repl" {
+		t.Fatalf("snapshotDSN fallback = %q, want the source URI", got)
 	}
 }

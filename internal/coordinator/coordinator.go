@@ -1164,7 +1164,7 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		RunId:      c.runID,
 		Ticket:     w.ticket,
 		SourceKind: c.cfg.Spec.Source.Kind,
-		SourceDsn:  c.cfg.Spec.Source.URI,
+		SourceDsn:  c.snapshotDSN(),
 		ChunkSize:  uint32(c.cfg.ChunkSize),
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
@@ -1257,6 +1257,18 @@ func writeModeToPB(m dataplane.WriteMode) pb.WriteMode {
 // DDL and the worker's writes must both apply. Parse errors are ignored the
 // same way the collapsed runner ignores them (the cast is re-validated on
 // the write path); the coordinator must not diverge from the runner.
+// snapshotDSN returns the connection string the WORKER uses for the snapshot
+// chunk SELECT: the scoped read-only SnapshotURI when set, else the full
+// source URI (pre-scoping behavior). The worker never opens a replication
+// connection, so a deployment can grant it a SELECT-only user and keep the
+// replication credential coordinator-side (D-CD1).
+func (c *Coordinator) snapshotDSN() string {
+	if u := c.cfg.Spec.Source.SnapshotURI; u != "" {
+		return u
+	}
+	return c.cfg.Spec.Source.URI
+}
+
 // coreCastOf parses the table's declared cast policy, failing loud: a
 // swallowed parse error would ship an empty policy, creating a sink table
 // whose types diverge from the spec (audit #8). The source Introspect
