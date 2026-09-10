@@ -1,13 +1,15 @@
-// Package eventlog writes a per-run JSONL audit trail to S3: one object
-// per run, lifecycle and commit events appended as they happen. The trail
-// is the post-mortem record — what ran, when, from where, with which
-// positions — cheap enough to keep forever. Emits are best-effort by
-// contract: a lost trail must never fail the pipeline.
+// Package eventlog writes a per-run JSONL audit trail to S3: lifecycle and
+// commit events appended as they happen, in objects rotated by size
+// (events.jsonl, then events-01.jsonl, events-02.jsonl, … in lexicographic
+// order). The trail is the post-mortem record — what ran, when, from where,
+// with which positions — cheap enough to keep forever. Emits are
+// best-effort by contract: a lost trail must never fail the pipeline.
 //
-// Every Emit uploads the whole buffer (one atomic PUT per event). At CDC
-// commit rates the object stays tiny and every upload replaces the last —
-// a crash at any instant leaves a consistent trail up to the previous
-// event, never a torn line.
+// Every Emit uploads the whole current object (one atomic PUT per event).
+// At CDC commit rates the object stays tiny and every upload replaces the
+// last — a crash at any instant leaves a consistent trail up to the
+// previous event, never a torn line. Rotation caps the cumulative bytes a
+// long run would otherwise re-upload quadratically.
 package eventlog
 
 import (
@@ -41,7 +43,17 @@ type Config struct {
 	// AccessKey/SecretKey override the credential chain when both set.
 	AccessKey string
 	SecretKey string
+	// MaxObjectBytes rotates the trail object once the buffer reaches this
+	// size: the crossing event travels in the object being closed, and the
+	// next Emit opens the next one. Zero or negative is clamped to the
+	// default (8 MiB) — never a rotation per event.
+	MaxObjectBytes int64
 }
+
+// defaultMaxObjectBytes is the rotation threshold when the config is
+// silent: large enough that a commit-rate run rotates rarely, small enough
+// that each PUT stays cheap.
+const defaultMaxObjectBytes = int64(8 << 20)
 
 // Event kinds emitted by the runner.
 const (
@@ -63,15 +75,22 @@ const (
 // per-commit goroutines while the run loop emits lifecycle events, so
 // multi-writer is the real shape, not a documentation nicety.
 type Run struct {
-	id      string
-	bucket  string
-	key     string
-	putter  putter
-	mu      sync.Mutex // buffer + closed + emitted
-	putMu   sync.Mutex // serializes PUTs (see Emit for the lock order)
-	buf     []byte
-	closed  bool
-	emitted int
+	id     string
+	bucket string
+	// baseKey is the run's key prefix (".../run-<id>/") — immutable after
+	// New. Rotated object keys are always derived from it: deriving from
+	// the current key corrupts from the second rotation on (the
+	// "events.jsonl" suffix no longer matches).
+	baseKey        string
+	key            string // current object; mutated under mu on rotation
+	seq            int    // rotations so far; 0 before the first
+	maxObjectBytes int64
+	putter         putter
+	mu             sync.Mutex // buffer + closed + emitted + key/seq
+	putMu          sync.Mutex // serializes PUTs (see Emit for the lock order)
+	buf            []byte
+	closed         bool
+	emitted        int
 }
 
 // putter abstracts the S3 PutObject call (unit tests use a fake).
@@ -102,30 +121,52 @@ func New(ctx context.Context, cfg Config) (*Run, error) {
 		}
 	})
 	id := newRunID()
+	max := cfg.MaxObjectBytes
+	if max <= 0 {
+		max = defaultMaxObjectBytes
+	}
+	base := strings.TrimSuffix(prefix, "/") + "/run-" + id + "/"
 	return &Run{
-		id:     id,
-		bucket: bucket,
-		key:    strings.TrimSuffix(prefix, "/") + "/run-" + id + "/events.jsonl",
-		putter: &s3Putter{client: client},
+		id:             id,
+		bucket:         bucket,
+		baseKey:        base,
+		key:            base + "events.jsonl",
+		seq:            0,
+		maxObjectBytes: max,
+		putter:         &s3Putter{client: client},
 	}, nil
 }
 
 // NewWithPutter builds a run around a custom putter (unit tests).
-func NewWithPutter(bucket, prefix string, p putter) *Run {
+// maxObjectBytes <= 0 is clamped to the default (8 MiB).
+func NewWithPutter(bucket, prefix string, maxObjectBytes int64, p putter) *Run {
+	if maxObjectBytes <= 0 {
+		maxObjectBytes = defaultMaxObjectBytes
+	}
 	id := newRunID()
+	base := strings.TrimSuffix(prefix, "/") + "/run-" + id + "/"
 	return &Run{
-		id:     id,
-		bucket: bucket,
-		key:    strings.TrimSuffix(prefix, "/") + "/run-" + id + "/events.jsonl",
-		putter: p,
+		id:             id,
+		bucket:         bucket,
+		baseKey:        base,
+		key:            base + "events.jsonl",
+		seq:            0,
+		maxObjectBytes: maxObjectBytes,
+		putter:         p,
 	}
 }
 
 // ID returns the run identifier.
 func (r *Run) ID() string { return r.id }
 
-// ObjectKey returns the S3 key the trail is written to.
-func (r *Run) ObjectKey() string { return r.key }
+// ObjectKey returns the S3 key of the trail object currently being written.
+// With rotation the key changes over the run's life, so it is read under
+// the append lock.
+func (r *Run) ObjectKey() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.key
+}
 
 // Emitted reports how many events the run accepted.
 func (r *Run) Emitted() int {
@@ -165,6 +206,17 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	r.emitted++
 	body := slices.Clone(r.buf)
 	key := r.key
+	// Rotation: the event that crosses the threshold travels in the object
+	// being closed; the next Emit opens the next one. One rotation = one
+	// PUT, zero extra. The key is ALWAYS derived from baseKey — deriving
+	// from the current key corrupts from the second rotation on (its
+	// "events.jsonl" suffix no longer matches). buf/key/seq mutate only
+	// under mu.
+	if len(r.buf) >= int(r.maxObjectBytes) {
+		r.seq++
+		r.buf = nil
+		r.key = r.baseKey + fmt.Sprintf("events-%02d.jsonl", r.seq)
+	}
 	// putMu is acquired BEFORE releasing mu. The race that forces this
 	// order is between two Emits: both clone the body under mu, and whoever
 	// releases mu first could reach putMu after the other — inverting the

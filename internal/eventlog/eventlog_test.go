@@ -63,11 +63,13 @@ func TestParseURIKeyFormat(t *testing.T) {
 
 // fakePutter captures Put calls for assertions.
 type fakePutter struct {
-	mu       sync.Mutex
-	calls    int
-	lastBody []byte
-	lastKey  string
-	err      error
+	mu        sync.Mutex
+	calls     int
+	lastBody  []byte
+	lastKey   string
+	putKeys   []string // every key, in PUT order
+	putBodies []string // every body, in PUT order
+	err       error
 }
 
 func (f *fakePutter) Put(_ context.Context, bucket, key string, body []byte) error {
@@ -77,6 +79,8 @@ func (f *fakePutter) Put(_ context.Context, bucket, key string, body []byte) err
 	f.lastBody = make([]byte, len(body))
 	copy(f.lastBody, body)
 	f.lastKey = key
+	f.putKeys = append(f.putKeys, key)
+	f.putBodies = append(f.putBodies, string(body))
 	return f.err
 }
 
@@ -88,7 +92,7 @@ func (f *fakePutter) Calls() int {
 
 func TestEmitAccumulatesAndUploads(t *testing.T) {
 	p := &fakePutter{}
-	r := NewWithPutter("bucket", "prefix", p)
+	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	ctx := context.Background()
 	if err := r.Emit(ctx, "job_started", map[string]any{"pipeline": "test"}); err != nil {
@@ -119,7 +123,7 @@ func TestEmitAccumulatesAndUploads(t *testing.T) {
 
 func TestEmitClosedReturnsError(t *testing.T) {
 	p := &fakePutter{}
-	r := NewWithPutter("bucket", "prefix", p)
+	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	r.Close()
 	if err := r.Emit(context.Background(), "job_stopped", nil); err == nil {
@@ -132,7 +136,7 @@ func TestEmitClosedReturnsError(t *testing.T) {
 
 func TestEmitBestEffort(t *testing.T) {
 	p := &fakePutter{err: context.DeadlineExceeded}
-	r := NewWithPutter("bucket", "prefix", p)
+	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	err := r.Emit(context.Background(), "job_started", nil)
 	// Emit returns the error (caller decides to log or ignore).
@@ -146,7 +150,7 @@ func TestEmitBestEffort(t *testing.T) {
 }
 
 func TestCloseIdempotent(t *testing.T) {
-	r := NewWithPutter("bucket", "prefix", &fakePutter{})
+	r := NewWithPutter("bucket", "prefix", 0, &fakePutter{})
 	r.Close()
 	r.Close() // should not panic
 }
@@ -167,7 +171,7 @@ func TestNewRunID(t *testing.T) {
 
 func TestEmitTimestamp(t *testing.T) {
 	p := &fakePutter{}
-	r := NewWithPutter("bucket", "prefix", p)
+	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	before := time.Now().UTC()
 	if err := r.Emit(context.Background(), "test_event", nil); err != nil {
@@ -227,7 +231,7 @@ func (p *orderPutter) snapshot() (keys, bodies []string) {
 // earlier events.
 func TestConcurrentEmitPreservesPUTOrder(t *testing.T) {
 	p := &orderPutter{delay: 50 * time.Millisecond}
-	r := NewWithPutter("bucket", "prefix", p)
+	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	const n = 20
 	var wg sync.WaitGroup
@@ -287,7 +291,7 @@ func (p *failNthPutter) Put(_ context.Context, _ string, key string, body []byte
 // loses exactly the final event otherwise.
 func TestCloseReFlushesFailedLastEvent(t *testing.T) {
 	p := &failNthPutter{failOn: 2} // third PUT fails
-	r := NewWithPutter("bucket", "prefix", p)
+	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	ctx := context.Background()
 	if err := r.Emit(ctx, "one", nil); err != nil {
@@ -318,7 +322,7 @@ func TestCloseReFlushesFailedLastEvent(t *testing.T) {
 // body overwriting a bigger in-flight PUT.
 func TestCloseSerializesWithInFlightEmits(t *testing.T) {
 	p := &orderPutter{delay: 5 * time.Millisecond}
-	r := NewWithPutter("bucket", "prefix", p)
+	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
@@ -350,5 +354,156 @@ func TestCloseSerializesWithInFlightEmits(t *testing.T) {
 	}
 	if maxLines != accepted {
 		t.Fatalf("largest PUT body has %d lines, want %d (accepted)", maxLines, accepted)
+	}
+}
+
+// ── E-3: rotation by size ─────────────────────────────────────────────
+
+// O(n × threshold), not O(n²): each PUT carries at most ~threshold bytes,
+// so the cumulative PUT bytes of a 10k-event run stay in the low MBs.
+func TestRotationKeepsBytesLinear(t *testing.T) {
+	const threshold = 1024
+	p := &fakePutter{}
+	r := NewWithPutter("bucket", "prefix", threshold, p)
+
+	const n = 10_000
+	for i := 0; i < n; i++ {
+		if err := r.Emit(context.Background(), "commit", map[string]any{"n": i}); err != nil {
+			t.Fatalf("emit %d: %v", i, err)
+		}
+	}
+	if r.Emitted() != n {
+		t.Fatalf("emitted = %d, want %d", r.Emitted(), n)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var total int
+	for _, b := range p.putBodies {
+		total += len(b)
+	}
+	// Linear bound: every body is at most ~threshold + one line.
+	if total > n*(threshold+128) {
+		t.Fatalf("cumulative PUT bytes = %d, want O(n × threshold) ≤ %d", total, n*(threshold+128))
+	}
+}
+
+// Three-plus rotations with the literal key sequence: the crossing event
+// travels in the object being closed, the next Emit opens the next object,
+// and the trail reads events.jsonl, events-01.jsonl, … in lexicographic
+// order.
+func TestRotationKeySequence(t *testing.T) {
+	const threshold = 256
+	p := &fakePutter{}
+	r := NewWithPutter("bucket", "prefix", threshold, p)
+
+	for i := 0; i < 40; i++ {
+		if err := r.Emit(context.Background(), "commit", map[string]any{
+			"n":   i,
+			"pad": "0123456789012345678901234567890123456789",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Distinct object keys in first-PUT order.
+	var objects []string
+	seen := map[string]bool{}
+	for _, k := range p.putKeys {
+		suffix := k[strings.LastIndex(k, "/")+1:]
+		if !seen[suffix] {
+			seen[suffix] = true
+			objects = append(objects, suffix)
+		}
+	}
+	want := []string{"events.jsonl", "events-01.jsonl", "events-02.jsonl", "events-03.jsonl"}
+	if len(objects) < len(want) {
+		t.Fatalf("rotations = %d objects, want at least %d: %v", len(objects), len(want), objects)
+	}
+	for i, w := range want {
+		if objects[i] != w {
+			t.Fatalf("object[%d] = %q, want %q", i, objects[i], w)
+		}
+	}
+	// The original object is not empty.
+	if strings.Count(p.putBodies[0], "\n") == 0 {
+		t.Fatal("events.jsonl is empty")
+	}
+	// The current object key is the latest rotated one.
+	if got := r.ObjectKey(); !strings.HasSuffix(got, fmt.Sprintf("events-%02d.jsonl", r.seq)) || r.seq == 0 {
+		t.Fatalf("ObjectKey = %q, seq = %d; want the current rotated object", got, r.seq)
+	}
+}
+
+// Close after a rotation re-flushes the buffer into the CURRENT object, not
+// back into events.jsonl.
+func TestCloseAfterRotationFlushesCurrentObject(t *testing.T) {
+	const threshold = 256
+	p := &fakePutter{}
+	r := NewWithPutter("bucket", "prefix", threshold, p)
+
+	// Rotate at least once.
+	for r.seq == 0 {
+		if err := r.Emit(context.Background(), "commit", map[string]any{
+			"n":   1,
+			"pad": "0123456789012345678901234567890123456789",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One small event in the fresh current object — below the threshold, so
+	// the buffer is non-empty at Close and the close PUT is observable.
+	if err := r.Emit(context.Background(), "final", nil); err != nil {
+		t.Fatal(err)
+	}
+	current := r.ObjectKey()
+
+	r.Close()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	lastKey, lastBody := p.putKeys[len(p.putKeys)-1], p.putBodies[len(p.putBodies)-1]
+	if lastKey != current {
+		t.Fatalf("close PUT went to %q, want the current object %q", lastKey, current)
+	}
+	if !strings.Contains(lastBody, `"kind":"final"`) {
+		t.Fatalf("close PUT body does not carry the last event: %s", lastBody)
+	}
+}
+
+// MaxObjectBytes <= 0 is clamped to the default in both constructors — a
+// misconfigured threshold must never degrade to a rotation per event.
+func TestMaxObjectBytesClampedToDefault(t *testing.T) {
+	for _, bad := range []int64{0, -1, -8 << 20} {
+		p := &fakePutter{}
+		r := NewWithPutter("bucket", "prefix", bad, p)
+		if r.maxObjectBytes != defaultMaxObjectBytes {
+			t.Fatalf("NewWithPutter(%d): maxObjectBytes = %d, want %d", bad, r.maxObjectBytes, defaultMaxObjectBytes)
+		}
+		// A burst of small events must not rotate: one object only.
+		for i := 0; i < 50; i++ {
+			if err := r.Emit(context.Background(), "commit", nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		p.mu.Lock()
+		keys := append([]string(nil), p.putKeys...)
+		p.mu.Unlock()
+		for _, k := range keys {
+			if !strings.HasSuffix(k, "events.jsonl") {
+				t.Fatalf("clamped run rotated to %q", k)
+			}
+		}
+	}
+
+	// New takes the same clamp (the AWS config loads offline; no client
+	// calls happen at construction).
+	r, err := New(context.Background(), Config{URI: "s3://bucket/prefix", MaxObjectBytes: -5})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if r.maxObjectBytes != defaultMaxObjectBytes {
+		t.Fatalf("New: maxObjectBytes = %d, want %d", r.maxObjectBytes, defaultMaxObjectBytes)
 	}
 }
