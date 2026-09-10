@@ -52,14 +52,17 @@ func searchEvent(id int64, userRef any) rowchange.Change {
 	}
 }
 
-// newTestStage builds a hot stage with a fake loader already loaded.
+// newTestStage builds a hot stage with a fake loader already loaded. The
+// rows fixtures stay column-value maps for readability; rowsToRec turns
+// them into the Arrow record the loader contract now returns.
 func newTestStage(t *testing.T, cfg spec.Enrich, rows []map[string]any) (*Stage, *fakeLoader) {
 	t.Helper()
 	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
 	if err != nil {
 		t.Fatalf("new stage: %v", err)
 	}
-	fl := &fakeLoader{rows: rows}
+	fl := &fakeLoader{}
+	fl.SetRec(rowsToRec(t, rows))
 	if err := s.UseLoader(cfg.Table, fl); err != nil {
 		t.Fatalf("use loader: %v", err)
 	}
@@ -232,7 +235,7 @@ func TestRefreshAtomicSwapUnderConcurrency(t *testing.T) {
 	}()
 	// Refresher: replaces the image repeatedly (bigger each time).
 	for i := range 5 {
-		fl.SetRows(append(fl.rows, map[string]any{"id": int64(100 + i), "name": fmt.Sprintf("x%d", i), "tier": "bronze"}))
+		fl.SetRows(t, append(usersRows(), map[string]any{"id": int64(100 + i), "name": fmt.Sprintf("x%d", i), "tier": "bronze"}))
 		time.Sleep(15 * time.Millisecond)
 	}
 	close(stop)
@@ -277,7 +280,7 @@ func TestFirstLoadRejectsBadReference(t *testing.T) {
 		t.Fatalf("new: %v", err)
 	}
 	// The query result has no "id" column (the on reference side).
-	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: []map[string]any{{"pk": int64(1), "name": "ana"}}})
+	_ = s.UseLoader(cfg.Table, fakeRows(t, []map[string]any{{"pk": int64(1), "name": "ana"}}))
 	s.Start(context.Background())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -533,7 +536,7 @@ func TestSelectColumnMissingFromQueryRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: refRows()})
+	_ = s.UseLoader(cfg.Table, fakeRows(t, refRows()))
 	s.Start(context.Background())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -579,17 +582,17 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 	}
 
 	// Load users reference.
-	fl1 := &fakeLoader{rows: []map[string]any{
+	fl1 := fakeRows(t, []map[string]any{
 		{"id": int64(1), "name": "ana"},
-	}}
+	})
 	if err := s.UseLoader(cfg1.Table, fl1); err != nil {
 		t.Fatalf("use loader 1: %v", err)
 	}
 
 	// Load products reference.
-	fl2 := &fakeLoader{rows: []map[string]any{
+	fl2 := fakeRows(t, []map[string]any{
 		{"id": int64(10), "name": "laptop"},
-	}}
+	})
 	if err := s.UseLoader(cfg2.Table, fl2); err != nil {
 		t.Fatalf("use loader 2: %v", err)
 	}
@@ -655,7 +658,7 @@ func pollUntil(t *testing.T, deadline time.Duration, cond func() bool, msg strin
 func TestFirstErrClearedOnSuccess(t *testing.T) {
 	// Build stage manually so we can fail the FIRST load (before hot).
 	// Use a fast refresh so the second load happens promptly.
-	fl := &fakeLoader{rows: nil, err: errors.New("db down")}
+	fl := fakeErr(errors.New("db down"))
 	cfg := refCfg(nil)
 	cfg.Refresh = "10ms"
 	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
@@ -674,7 +677,7 @@ func TestFirstErrClearedOnSuccess(t *testing.T) {
 
 	// Fix the loader; the next refresh tick clears firstErr (audit #1).
 	fl.SetErr(nil)
-	fl.SetRows(usersRows())
+	fl.SetRows(t, usersRows())
 	pollUntil(t, 2*time.Second, func() bool {
 		return s.refs[0].isHot() && s.refs[0].stickyErr() == nil
 	}, "firstErr not cleared after success")
@@ -763,7 +766,7 @@ func TestNullJoinKeyMiss(t *testing.T) {
 
 func TestStickyErrAtStart(t *testing.T) {
 	// Build stage manually so the first load fails (before hot).
-	fl := &fakeLoader{rows: nil, err: errors.New("broken")}
+	fl := fakeErr(errors.New("broken"))
 	s, err := New([]spec.Enrich{refCfg(nil)}, []string{"id", "user_ref", "q"}, nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -935,9 +938,9 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	loader := &fakeLoader{rows: []map[string]any{
+	loader := fakeRows(t, []map[string]any{
 		{"id": int64(1), "name": "ana", "tier": int64(3)},
-	}}
+	})
 	if err := s.UseLoader("users", loader); err != nil {
 		t.Fatal(err)
 	}
@@ -999,7 +1002,7 @@ func TestProjectedNonStringJoinKeyLandsTyped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	loader := &fakeLoader{rows: []map[string]any{{"id": int64(1), "name": "ana", "tier": "gold"}}}
+	loader := fakeRows(t, []map[string]any{{"id": int64(1), "name": "ana", "tier": "gold"}})
 	if err := s.UseLoader("users", loader); err != nil {
 		t.Fatal(err)
 	}

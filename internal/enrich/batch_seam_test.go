@@ -135,7 +135,7 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 		return &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	}
 
-	loader := &fakeLoader{} // first image: empty
+	loader := &fakeLoader{} // first image: empty (SetRec makes it hot)
 	if err := s.UseLoader("users", loader); err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 	sch1 := out1.Record.Schema()
 
 	// The reference goes hot with rows.
-	loader.SetRows(usersRows())
+	loader.SetRows(t, usersRows())
 	s.Start(context.Background())
 	defer s.Stop()
 	deadline := time.Now().Add(2 * time.Second)

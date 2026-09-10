@@ -134,7 +134,7 @@ func newHarnessStage(t *testing.T) *Stage {
 	if err != nil {
 		t.Fatalf("new stage: %v", err)
 	}
-	if err := s.UseLoader("users", &fakeLoader{rows: usersRows()}); err != nil {
+	if err := s.UseLoader("users", fakeRows(t, usersRows())); err != nil {
 		t.Fatalf("use loader: %v", err)
 	}
 	s.Start(context.Background())

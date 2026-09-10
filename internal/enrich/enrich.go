@@ -442,7 +442,7 @@ func (s *Stage) Stop() {
 // parking the cold-start queue for the next Apply to release.
 func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 	if rj.loader == nil {
-		l, err := NewSQLLoader(rj.cfg.Source.URI, rj.cfg.Source.Query)
+		l, err := NewSQLLoader(rj.cfg.Source.URI, rj.cfg.Source.Query, rj.onRef)
 		if err != nil {
 			rj.setFirstErr(err)
 			log.Error("enrich: reference loader failed (will retry)", "reference", rj.cfg.Table, "err", err)
@@ -450,13 +450,14 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		}
 		rj.loader = l
 	}
-	rows, err := rj.loader.Load(ctx)
+	rec, err := rj.loader.Load(ctx)
 	if err != nil {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference load failed (keeping previous image, will retry)", "reference", rj.cfg.Table, "err", err)
 		return
 	}
-	image, dests, refTypes, err := buildImage(rj, rows)
+	defer rec.Release()
+	image, dests, refTypes, err := buildImage(rj, recordToRows(rec))
 	if err != nil {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)

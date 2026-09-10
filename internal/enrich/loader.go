@@ -2,181 +2,63 @@ package enrich
 
 import (
 	"context"
-	"database/sql"
-	"database/sql/driver"
-	"fmt"
-	"net"
-	"net/url"
-	"strings"
-	"sync"
-	"time"
 
-	// The reference read is a plain SQL query against a second database —
-	// the same engines as the sources. Both are wired through
-	// driver.Connector (never a re-serialized DSN string).
-	"github.com/go-sql-driver/mysql"
-	pgx "github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
-// Loader reads one reference image. Load returns every row as a column →
-// value map with the driver's natural Go types (int64, float64, string,
-// []byte, time.Time) — the same canonical family the CDC sources decode
-// into, which is what lets the join key match without coercion theater.
+// Loader reads one reference image as a typed Arrow record. Every column
+// the query returns is a column of the record, in query order; the join
+// column and the projected data columns are separated by name in
+// buildImage. Load re-runs on every refresh; the caller owns and releases
+// the returned record.
+//
+// The SQL implementation lives in loader_sql.go and carries THE TWO ROWS —
+// the only per-row loop and the only value→builder switch in the system,
+// both imposed by database/sql and both scheduled to die with ADBC.
 type Loader interface {
-	Load(ctx context.Context) ([]map[string]any, error)
+	Load(ctx context.Context) (arrow.RecordBatch, error)
 	Close() error
 }
 
-// NewSQLLoader opens the reference connection. The URI scheme picks the
-// driver (mysql:// or postgres://); the query returns the full reference
-// image and is re-run on every refresh.
-func NewSQLLoader(uri, query string) (Loader, error) {
-	var connector driver.Connector
-	switch {
-	case strings.HasPrefix(uri, "mysql://"):
-		cfg, err := mysqlConfig(uri)
-		if err != nil {
-			return nil, fmt.Errorf("enrich: reference uri: %w", err)
-		}
-		c, err := mysql.NewConnector(cfg)
-		if err != nil {
-			return nil, fmt.Errorf("enrich: mysql connector: %w", err)
-		}
-		connector = c
-	case strings.HasPrefix(uri, "postgres://") || strings.HasPrefix(uri, "postgresql://"):
-		dsn, err := pgx.ParseConfig(uri)
-		if err != nil {
-			return nil, fmt.Errorf("enrich: reference uri: %w", err)
-		}
-		connector = stdlib.GetConnector(*dsn)
-	default:
-		return nil, fmt.Errorf("enrich: reference uri %q: unsupported scheme (mysql:// | postgres://)", uri)
+// recordToRows is a P2→P3 bridge: buildImage still consumes
+// []map[string]any until P3 rewrites it to consume the Arrow record
+// directly. Deleted in P3.
+//
+//allow:rowloop P2→P3 bridge; deleted when buildImage goes Arrow-native.
+func recordToRows(rec arrow.RecordBatch) []map[string]any {
+	if rec == nil || rec.NumRows() == 0 {
+		return nil
 	}
-	db := sql.OpenDB(connector)
-	db.SetMaxOpenConns(1) // one sequential re-read per refresh; no pool theater
-	db.SetConnMaxLifetime(5 * time.Minute)
-	return &sqlLoader{db: db, query: query}, nil
-}
-
-// mysqlConfig parses a mysql:// URI into the driver config — WITHOUT
-// ever re-serializing the credentials as a DSN string (RV-06): a password
-// decoded from the URI may contain ':', '@', '/' or '?' — any of them
-// corrupts a DSN the driver parses positionally. mysql.NewConfig defaults
-// apply (Loc: UTC, AllowNativePasswords, CheckConnLiveness); query params
-// from the URI carry through as driver system variables (RV-06b).
-func mysqlConfig(raw string) (*mysql.Config, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, err
-	}
-	if u.Scheme != "mysql" {
-		return nil, fmt.Errorf("mysql: uri scheme %q, want mysql", u.Scheme)
-	}
-	user := u.User.Username()
-	pass, _ := u.User.Password()
-	host := u.Hostname()
-	if host == "" {
-		return nil, fmt.Errorf("mysql: uri %q lacks host", raw)
-	}
-	port := u.Port()
-	if port == "" {
-		port = "3306"
-	}
-	db := strings.TrimPrefix(u.Path, "/")
-	if db == "" {
-		return nil, fmt.Errorf("mysql: uri %q lacks /db", raw)
-	}
-
-	cfg := mysql.NewConfig()
-	cfg.User = user
-	cfg.Passwd = pass
-	cfg.Net = "tcp"
-	cfg.Addr = net.JoinHostPort(host, port)
-	cfg.DBName = db
-	cfg.ParseTime = true // DATETIME decodes as time.Time, matching goTypeToCore
-	// URI query params survive (RV-06b): ?timeout=10s must not vanish.
-	if q := u.Query(); len(q) > 0 {
-		cfg.Params = make(map[string]string, len(q))
-		for k, vs := range q {
-			if len(vs) > 0 {
-				cfg.Params[k] = vs[0]
-			}
-		}
-	}
-	return cfg, nil
-}
-
-type sqlLoader struct {
-	db    *sql.DB
-	query string
-}
-
-func (l *sqlLoader) Load(ctx context.Context) ([]map[string]any, error) {
-	rows, err := l.db.QueryContext(ctx, l.query)
-	if err != nil {
-		return nil, fmt.Errorf("enrich: reference query: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-	var out []map[string]any
-	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			return nil, fmt.Errorf("enrich: reference row: %w", err)
-		}
-		row := make(map[string]any, len(cols))
-		for i, c := range cols {
-			if v, ok := vals[i].([]byte); ok {
-				row[c] = string(v) // TEXT/VARCHAR land as []byte; the join and the document want strings
+	schema := rec.Schema()
+	n := int(rec.NumRows())
+	out := make([]map[string]any, n)
+	for i := 0; i < n; i++ {
+		row := make(map[string]any, schema.NumFields())
+		for c := 0; c < schema.NumFields(); c++ {
+			col := rec.Column(c)
+			name := schema.Field(c).Name
+			if col.IsNull(i) {
 				continue
 			}
-			row[c] = vals[i]
+			switch a := col.(type) {
+			case *array.String:
+				row[name] = a.Value(i)
+			case *array.Binary:
+				row[name] = a.Value(i)
+			case *array.Boolean:
+				row[name] = a.Value(i)
+			case *array.Int64:
+				row[name] = a.Value(i)
+			case *array.Uint64:
+				row[name] = a.Value(i)
+			case *array.Float64:
+				row[name] = a.Value(i)
+			case *array.Timestamp:
+				row[name] = a.Value(i).ToTime(arrow.Microsecond)
+			}
 		}
-		out = append(out, row)
+		out[i] = row
 	}
-	return out, rows.Err()
+	return out
 }
-
-func (l *sqlLoader) Close() error { return l.db.Close() }
-
-// fakeLoader is the test seam (Load counter included — the O(N) proof is
-// "the loader ran once per refresh, never per event"). Thread-safe: the
-// concurrency test swaps rows while the refresher goroutine reads.
-type fakeLoader struct {
-	mu    sync.Mutex
-	rows  []map[string]any
-	err   error
-	loads int
-}
-
-func (f *fakeLoader) SetRows(rows []map[string]any) {
-	f.mu.Lock()
-	f.rows = rows
-	f.mu.Unlock()
-}
-
-func (f *fakeLoader) SetErr(err error) {
-	f.mu.Lock()
-	f.err = err
-	f.mu.Unlock()
-}
-
-func (f *fakeLoader) Load(context.Context) ([]map[string]any, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.loads++
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.rows, nil
-}
-
-func (f *fakeLoader) Close() error { return nil }
