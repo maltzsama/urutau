@@ -125,6 +125,9 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 
 		// __snapshot (boolean — false for live data)
 		bb.Field(9).(*array.BooleanBuilder).Append(false)
+
+		// __phase (string — "stream" for live data)
+		bb.Field(10).(*array.StringBuilder).Append("stream")
 	}
 
 	rec := bb.NewRecordBatch()
@@ -158,16 +161,11 @@ func AdversarialCompositeKey(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
-	schema := arrow.NewSchema([]arrow.Field{
+	schema := arrow.NewSchema(append([]arrow.Field{
 		{Name: "pk1", Type: arrow.BinaryTypes.String, Nullable: false},
 		{Name: "pk2", Type: arrow.BinaryTypes.String, Nullable: false},
 		{Name: "val", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
-	}, nil)
+	}, transport.WireMetadataFields()...), nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
 	bb.Field(0).(*array.StringBuilder).Append("ab")
@@ -178,6 +176,7 @@ func AdversarialCompositeKey(alloc memory.Allocator) *Batch {
 	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(7).(*array.BooleanBuilder).Append(false)
+	bb.Field(8).(*array.StringBuilder).Append("stream")
 
 	bb.Field(0).(*array.StringBuilder).Append("a")
 	bb.Field(1).(*array.StringBuilder).Append("bc")
@@ -187,6 +186,7 @@ func AdversarialCompositeKey(alloc memory.Allocator) *Batch {
 	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(7).(*array.BooleanBuilder).Append(false)
+	bb.Field(8).(*array.StringBuilder).Append("stream")
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -198,14 +198,9 @@ func AdversarialDeleteLast(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
-	schema := arrow.NewSchema([]arrow.Field{
+	schema := arrow.NewSchema(append([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
-	}, nil)
+	}, transport.WireMetadataFields()...), nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
@@ -214,6 +209,7 @@ func AdversarialDeleteLast(alloc memory.Allocator) *Batch {
 	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(5).(*array.BooleanBuilder).Append(false)
+	bb.Field(6).(*array.StringBuilder).Append("stream")
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.Uint8Builder).Append(2)
@@ -221,6 +217,7 @@ func AdversarialDeleteLast(alloc memory.Allocator) *Batch {
 	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(5).(*array.BooleanBuilder).Append(false)
+	bb.Field(6).(*array.StringBuilder).Append("stream")
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -233,14 +230,9 @@ func AdversarialInsertAfterDelete(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
-	schema := arrow.NewSchema([]arrow.Field{
+	schema := arrow.NewSchema(append([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
-	}, nil)
+	}, transport.WireMetadataFields()...), nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
@@ -249,6 +241,7 @@ func AdversarialInsertAfterDelete(alloc memory.Allocator) *Batch {
 	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(5).(*array.BooleanBuilder).Append(false)
+	bb.Field(6).(*array.StringBuilder).Append("stream")
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	bb.Field(1).(*array.Uint8Builder).Append(0)
@@ -256,6 +249,7 @@ func AdversarialInsertAfterDelete(alloc memory.Allocator) *Batch {
 	bb.Field(3).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(5).(*array.BooleanBuilder).Append(false)
+	bb.Field(6).(*array.StringBuilder).Append("stream")
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -268,15 +262,10 @@ func AdversarialInt64Overflow(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
-	schema := arrow.NewSchema([]arrow.Field{
+	schema := arrow.NewSchema(append([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "big", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
-	}, nil)
+	}, transport.WireMetadataFields()...), nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
 	big := int64(1) << 53
@@ -287,6 +276,7 @@ func AdversarialInt64Overflow(alloc memory.Allocator) *Batch {
 	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(6).(*array.BooleanBuilder).Append(false)
+	bb.Field(7).(*array.StringBuilder).Append("stream")
 
 	bb.Field(0).(*array.Int64Builder).Append(2)
 	bb.Field(1).(*array.Int64Builder).Append(math.MaxInt64)
@@ -295,6 +285,7 @@ func AdversarialInt64Overflow(alloc memory.Allocator) *Batch {
 	bb.Field(4).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(6).(*array.BooleanBuilder).Append(false)
+	bb.Field(7).(*array.StringBuilder).Append("stream")
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
@@ -308,16 +299,11 @@ func AdversarialNullBefore(alloc memory.Allocator) *Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
-	schema := arrow.NewSchema([]arrow.Field{
+	schema := arrow.NewSchema(append([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
 		{Name: "val", Type: arrow.BinaryTypes.String, Nullable: true},
 		{Name: "__before_val", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
-	}, nil)
+	}, transport.WireMetadataFields()...), nil)
 	bb := array.NewRecordBuilder(alloc, schema)
 
 	bb.Field(0).(*array.Int64Builder).Append(1)
@@ -328,6 +314,7 @@ func AdversarialNullBefore(alloc memory.Allocator) *Batch {
 	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(7).(*array.BooleanBuilder).Append(false)
+	bb.Field(8).(*array.StringBuilder).Append("stream")
 
 	bb.Field(0).(*array.Int64Builder).Append(2)
 	bb.Field(1).(*array.StringBuilder).Append("hello")
@@ -337,6 +324,7 @@ func AdversarialNullBefore(alloc memory.Allocator) *Batch {
 	bb.Field(5).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(6).(*array.TimestampBuilder).AppendTime(time.Unix(0, 0).UTC())
 	bb.Field(7).(*array.BooleanBuilder).Append(false)
+	bb.Field(8).(*array.StringBuilder).Append("stream")
 
 	rec := bb.NewRecordBatch()
 	bb.Release()

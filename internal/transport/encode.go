@@ -124,6 +124,17 @@ func RecordFromChanges(rows []rowchange.Change, cs core.Schema, alloc memory.All
 			bld.Field(numDataCols + 3).(*array.TimestampBuilder).AppendTime(r.IngestTS)
 		}
 		bld.Field(numDataCols + 4).(*array.BooleanBuilder).Append(r.Snapshot)
+		// __phase: the producer's value when set, otherwise derived from the
+		// Snapshot boolean so producers that predate the Phase field still
+		// land a phase on the wire. Empty and non-snapshot → null.
+		switch {
+		case r.Phase != "":
+			bld.Field(numDataCols + 5).(*array.StringBuilder).Append(r.Phase)
+		case r.Snapshot:
+			bld.Field(numDataCols + 5).(*array.StringBuilder).Append(core.PhaseSnapshot)
+		default:
+			bld.Field(numDataCols + 5).(*array.StringBuilder).Append(core.PhaseStream)
+		}
 	}
 
 	return bld.NewRecordBatch(), nil

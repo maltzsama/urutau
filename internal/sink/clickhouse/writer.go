@@ -292,6 +292,7 @@ type chRowMeta struct {
 	CommitTS   time.Time
 	IngestTS   time.Time
 	Snapshot   bool
+	Phase      string
 	EnrichMiss bool
 }
 
@@ -304,6 +305,7 @@ func clickhouseRowMetaOf(r *transport.BatchReader, i int) chRowMeta {
 		CommitTS: commitTS,
 		IngestTS: ingestTS,
 		Snapshot: r.Snapshot(i),
+		Phase:    r.Phase(i),
 	}
 }
 
@@ -327,10 +329,13 @@ func metaValue(key core.MetadataKey, c chRowMeta, sourceTable string) (any, erro
 	case core.MetaSourceTable:
 		return sourceTable, nil
 	case core.MetaPhase:
-		if c.Snapshot {
-			return "snapshot", nil
+		if c.Phase != "" {
+			return c.Phase, nil
 		}
-		return "stream", nil
+		if c.Snapshot {
+			return core.PhaseSnapshot, nil
+		}
+		return core.PhaseStream, nil
 	case core.MetaStream:
 		// Wire path: no transport envelope; the source table IS the stream.
 		return sourceTable, nil

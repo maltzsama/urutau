@@ -17,14 +17,9 @@ import (
 
 func wireRecordWithColumnType(t *testing.T, alloc memory.Allocator, name string, dt arrow.DataType) arrow.RecordBatch {
 	t.Helper()
-	schema := arrow.NewSchema([]arrow.Field{
+	schema := arrow.NewSchema(append([]arrow.Field{
 		{Name: name, Type: dt, Nullable: true},
-		{Name: "__op", Type: arrow.PrimitiveTypes.Uint8, Nullable: false},
-		{Name: "__pos", Type: arrow.BinaryTypes.String, Nullable: false},
-		{Name: "__commit_ts", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__ingest_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
-		{Name: "__snapshot", Type: arrow.FixedWidthTypes.Boolean, Nullable: false},
-	}, nil)
+	}, WireMetadataFields()...), nil)
 	bld := array.NewRecordBuilder(alloc, schema)
 	defer bld.Release()
 	bld.Field(0).AppendNull()
@@ -33,6 +28,7 @@ func wireRecordWithColumnType(t *testing.T, alloc memory.Allocator, name string,
 	bld.Field(3).(*array.TimestampBuilder).Append(0)
 	bld.Field(4).(*array.TimestampBuilder).Append(0)
 	bld.Field(5).(*array.BooleanBuilder).Append(false)
+	bld.Field(6).(*array.StringBuilder).Append("stream")
 	return bld.NewRecordBatch()
 }
 

@@ -133,7 +133,7 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 			}
 		}
 
-		// Metadata columns (last 5, fixed positions).
+		// Metadata columns (trailing, fixed positions).
 		opCol, _ := rec.Column(numDataCols).(*array.Uint8)
 		c.Op = rowchange.Op(opCol.Value(i))
 		posCol, _ := rec.Column(numDataCols + 1).(*array.String)
@@ -148,6 +148,10 @@ func DecodeBatch(rec arrow.RecordBatch, table string, primaryKey []string) ([]ro
 		}
 		snapCol, _ := rec.Column(numDataCols + 4).(*array.Boolean)
 		c.Snapshot = snapCol.Value(i)
+		phaseCol, _ := rec.Column(numDataCols + 5).(*array.String)
+		if !phaseCol.IsNull(i) {
+			c.Phase = phaseCol.Value(i)
+		}
 
 		rows = append(rows, c)
 	}
