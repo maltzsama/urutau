@@ -24,6 +24,7 @@ type chunkExecutor struct {
 	kind     string
 	dsn      string
 	chunkSz  int
+	epoch    uint64                         // the Assignment epoch; echoed on ChunkReady so a stale reply is ignored
 	bySource map[string]*pb.TableAssignment // source table → target/PK
 	qsrc     source.QuerySource
 	w        *Worker
@@ -40,6 +41,7 @@ func newChunkExecutor(assign *pb.Assignment, w *Worker, log *slog.Logger, send f
 		kind:     assign.SourceKind,
 		dsn:      assign.SourceDsn,
 		chunkSz:  int(assign.ChunkSize),
+		epoch:    assign.Epoch,
 		bySource: bySource,
 		w:        w,
 		log:      log,
@@ -144,5 +146,6 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		ChunkId:         req.ChunkId,
 		Rows:            uint64(len(rows)),
 		DroppedByWindow: uint64(x.w.DroppedByWindow(ta.TargetTable)),
+		Epoch:           x.epoch,
 	}}})
 }

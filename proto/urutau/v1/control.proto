@@ -144,6 +144,7 @@ message ChunkReady {
   uint32 chunk_id          = 2;
   uint64 rows              = 3;
   uint64 dropped_by_window = 4;  // proves DBLog is working
+  uint64 epoch             = 5;  // the Assignment epoch this reply belongs to; stale-epoch replies are ignored
 }
 
 message ChunkFailed {
