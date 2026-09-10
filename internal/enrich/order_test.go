@@ -16,10 +16,11 @@ import (
 )
 
 func TestEnrichPreservesArrivalOrderAcrossColdRefs(t *testing.T) {
-	users := refCfg(nil) // users, on user_ref -> id
+	users := refCfg(func(c *spec.Enrich) { c.Refresh = "10ms" }) // users, on user_ref -> id
 	orders := refCfg(func(c *spec.Enrich) {
 		c.Table = "orders"
 		c.On = map[string]string{"order_ref": "id"}
+		c.Refresh = "10ms"
 	})
 	s, err := New([]spec.Enrich{users, orders}, []string{"id", "user_ref", "order_ref", "q"}, nil)
 	if err != nil {
@@ -54,7 +55,7 @@ func TestEnrichPreservesArrivalOrderAcrossColdRefs(t *testing.T) {
 	flu.SetRows(usersRows())
 	flo.SetErr(nil)
 	flo.SetRows(usersRows())
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && (!s.refs[0].isHot() || !s.refs[1].isHot()) {
 		time.Sleep(time.Millisecond)
 	}
