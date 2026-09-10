@@ -17,7 +17,7 @@ It also writes natively. Some CDC-to-lakehouse tools hand the actual write off t
 
 Recovery follows from the same idea. Nothing durable lives in what can die — the coordinator and workers are replaceable; state lives only in the source's own log, the destination table, and the pipeline definition, all of which survive a total restart. Recovering from a dead cluster means `kubectl apply` and reading the committed position back out of the sink, not replaying a separate checkpoint log.
 
-**The engine is closed; the driver seam is open.** Sources and sinks are public Go contracts at the module root (`source`, `sink`, `driver`, `core`, `change`, `position`, `spec`) — a source or sink is a package that implements a handful of small interfaces and registers itself, never touching an `internal/` path. See [`docs/plugins.md`](docs/plugins.md) and the reference implementation in [`test/plugin`](test/plugin/fake.go), a source and sink written against nothing but those contracts.
+**The engine is closed; the driver seam is open.** Sources and sinks are public Go contracts at the module root (`source`, `sink`, `driver`, `core`, `dataplane`, `position`, `spec`) — a source or sink is a package that implements a handful of small interfaces and registers itself, never touching an `internal/` path. See [`docs/plugins.md`](docs/plugins.md) and the reference implementation in [`test/plugin`](test/plugin/fake.go), a source and sink written against nothing but those contracts.
 
 ## What it looks like
 
@@ -124,7 +124,7 @@ In: nested canonical types (`Struct`/`List`/`Map`) and `KindFixedBinary`; Kafka 
 
 ## Architecture
 
-Sources and sinks are decoupled behind public contracts at the module root — `source`, `sink`, `driver`, `core`, `change`, `position`, `spec` — not under `internal/`.
+Sources and sinks are decoupled behind public contracts at the module root — `source`, `sink`, `driver`, `core`, `dataplane`, `position`, `spec` — not under `internal/`.
 A canonical type system (`core`) crosses the source↔sink boundary, so N sources × M sinks cost N+M type mappings instead of N×M.
 The DBLog snapshot orchestrator is source-agnostic (`internal/snapshot`); each concrete driver is self-contained and registers itself with the driver registry (`driver`) from `init()` — the orchestration (`runner`/`coordinator`/`worker`) consumes only the contracts, never a concrete implementation. `internal/builtin` blank-imports the built-in drivers; a third-party driver registers the same way from its own module.
 
@@ -135,7 +135,7 @@ flowchart TB
     SNK["sink — contract"]
     SNAP["snapshot — generic DBLog"]
     WRK["worker"]
-    STD["spec / position / change"]
+    STD["spec / position / dataplane"]
 
     subgraph impls ["implementations — never import each other"]
         MYSQL["source/mysql"]
@@ -170,7 +170,7 @@ The dependency walls are enforced by a test (`internal/architecture`) that check
 | `source` | **public.** source contract (`Source`, `Reader`, `ChunkSource`, `Capabilities`, `Runtime`, `Chunk`) |
 | `sink` | **public.** sink contract (`Sink`, `TableWriter` with commit invariants, `Config`) |
 | `driver` | **public.** the driver registry — `RegisterSource`/`RegisterSink`, resolved by kind/type |
-| `change` | **public.** row change event, per-key collapse, batch, write mode |
+| `dataplane` | **public.** columnar batch (`Batch` — record, watermark, write mode, snapshot state) |
 | `position` | **public.** position contract (GTID/LSN/Kafka offsets, `Compare`/`Contains`) |
 | `spec` | **public.** resolvedSpec + single server-side validation |
 | `test/plugin` | reference external driver — a source + sink written against only the public contracts |
@@ -224,7 +224,7 @@ It exercises append, equality delete, the `cdc.position` snapshot/table properti
 
 ## Writing a driver
 
-The engine is closed; the driver seam is open. A source or sink is a Go package that implements the contracts in `source`/`sink`/`core`/`change`/ `position`, registers itself from `init()` via `driver.RegisterSource`/ `RegisterSink`, and never imports anything under `internal/`. Full guide, including the registration pattern and the capability negotiation (`Capabilities`, `MaxConnections`, `Modes`), in [`docs/plugins.md`](docs/plugins.md). The reference implementation — [`test/plugin`](test/plugin/fake.go) — is a working source and sink written against nothing but the public contracts, exercised end-to-end by its own test.
+The engine is closed; the driver seam is open. A source or sink is a Go package that implements the contracts in `source`/`sink`/`core`/`dataplane`/ `position`, registers itself from `init()` via `driver.RegisterSource`/ `RegisterSink`, and never imports anything under `internal/`. Full guide, including the registration pattern and the capability negotiation (`Capabilities`, `MaxConnections`, `Modes`), in [`docs/plugins.md`](docs/plugins.md). The reference implementation — [`test/plugin`](test/plugin/fake.go) — is a working source and sink written against nothing but the public contracts, exercised end-to-end by its own test.
 
 ## Companion repository
 

@@ -1,6 +1,6 @@
 package coordinator
 
-// CD-AUDIT v1 guardian tests.
+// Coordinator runtime correctness guards: session end, snapshot wait, supervisor reset, flow and retention invariants.
 
 import (
 	"context"
