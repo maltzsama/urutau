@@ -179,3 +179,112 @@ func benchRefRec() arrow.RecordBatch {
 	rb.Field(2).(*array.StringBuilder).AppendValues([]string{"gold", "silver"}, nil)
 	return rb.NewRecordBatch()
 }
+
+// ── semi / anti join ────────────────────────────────────────────────────
+
+func semiCfg(jt string) spec.Enrich {
+	c := refCfg(nil)
+	c.JoinType = jt
+	c.Select = nil // semi/anti emit no reference columns
+	return c
+}
+
+// TestSemiJoinKeepsMatchesWithoutRefColumns — left semi keeps the rows that
+// hit the reference, and adds NO reference columns.
+func TestSemiJoinKeepsMatchesWithoutRefColumns(t *testing.T) {
+	s, _ := newTestStage(t, semiCfg("left semi"), usersRows())
+	out, err := s.applyChanges(t, []rowchange.Change{
+		{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "user_ref": int64(1), "q": "x"}},  // hit
+		{Op: rowchange.OpInsert, Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "user_ref": int64(99), "q": "y"}}, // miss → dropped
+		{Op: rowchange.OpInsert, Key: []any{int64(3)}, After: map[string]any{"id": int64(3), "user_ref": int64(2), "q": "z"}},  // hit
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("semi survivors = %d, want 2 (misses dropped)", len(out))
+	}
+	for _, r := range out {
+		for k := range r.After {
+			if len(k) > 6 && k[:6] == "users." {
+				t.Fatalf("semi join must not emit reference columns, got %q", k)
+			}
+		}
+	}
+}
+
+// TestAntiJoinKeepsMissesWithoutRefColumns — left anti keeps the rows that
+// missed, and adds NO reference columns.
+func TestAntiJoinKeepsMissesWithoutRefColumns(t *testing.T) {
+	s, _ := newTestStage(t, semiCfg("left anti"), usersRows())
+	out, err := s.applyChanges(t, []rowchange.Change{
+		{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "user_ref": int64(1), "q": "x"}},  // hit → dropped
+		{Op: rowchange.OpInsert, Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "user_ref": int64(99), "q": "y"}}, // miss → kept
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out) != 1 || out[0].Key[0] != int64(2) {
+		t.Fatalf("anti survivors = %v, want [key 2]", out)
+	}
+	for k := range out[0].After {
+		if len(k) > 6 && k[:6] == "users." {
+			t.Fatalf("anti join must not emit reference columns, got %q", k)
+		}
+	}
+}
+
+// TestSemiAntiDeleteSurvives — a delete bypasses the join, so it survives
+// BOTH semi and anti (the v9 kernel-inversion bug would drop it from one).
+func TestSemiAntiDeleteSurvives(t *testing.T) {
+	for _, jt := range []string{"left semi", "left anti"} {
+		t.Run(jt, func(t *testing.T) {
+			s, _ := newTestStage(t, semiCfg(jt), usersRows())
+			out, err := s.applyChanges(t, []rowchange.Change{
+				{Op: rowchange.OpDelete, Key: []any{int64(7)}},
+			})
+			if err != nil {
+				t.Fatalf("apply: %v", err)
+			}
+			if len(out) != 1 || out[0].Op != rowchange.OpDelete {
+				t.Fatalf("%s: delete must survive, got %v", jt, out)
+			}
+		})
+	}
+}
+
+// TestSemiAntiColdStart — cold (no snapshot): semi drops non-deletes
+// (nothing matches), anti keeps everything.
+func TestSemiAntiColdStart(t *testing.T) {
+	changes := []rowchange.Change{
+		{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "user_ref": int64(1), "q": "x"}},
+		{Op: rowchange.OpDelete, Key: []any{int64(2)}},
+	}
+
+	semiCfgWithPass := semiCfg("left semi")
+	semiCfgWithPass.OnColdStart = "pass"
+	semi, err := New([]spec.Enrich{semiCfgWithPass}, evSchema("id", "user_ref", "q"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = semi.UseLoader("users", fakeErr(errNeverLoads))
+	out, err := semi.applyChanges(t, changes)
+	if err != nil {
+		t.Fatalf("semi cold: %v", err)
+	}
+	if len(out) != 1 || out[0].Op != rowchange.OpDelete {
+		t.Fatalf("semi cold must keep only the delete, got %v", out)
+	}
+
+	antiCfgWithPass := semiCfg("left anti")
+	antiCfgWithPass.OnColdStart = "pass"
+	anti, _ := New([]spec.Enrich{antiCfgWithPass}, evSchema("id", "user_ref", "q"), nil)
+	_ = anti.UseLoader("users", fakeErr(errNeverLoads))
+	out, err = anti.applyChanges(t, changes)
+	if err != nil {
+		t.Fatalf("anti cold: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("anti cold must keep everything, got %d", len(out))
+	}
+}

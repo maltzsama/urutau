@@ -362,11 +362,11 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 			*problems = append(*problems, ep+".on: required (event column → reference column)")
 		}
 		switch e.JoinType {
-		case "left", "inner":
+		case "left", "left outer", "inner", "left semi", "left anti":
 		case "":
-			*problems = append(*problems, ep+".joinType: required — there is no universal miss policy (left | inner)")
+			*problems = append(*problems, ep+".joinType: required — there is no universal miss policy (left | left outer | inner | left semi | left anti)")
 		default:
-			*problems = append(*problems, fmt.Sprintf("%s.joinType: unsupported %q (want left | inner)", ep, e.JoinType))
+			*problems = append(*problems, fmt.Sprintf("%s.joinType: unsupported %q (want left | left outer | inner | left semi | left anti)", ep, e.JoinType))
 		}
 		switch e.OnColdStart {
 		case "", "buffer", "pass", "drop":
@@ -386,10 +386,17 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 				*problems = append(*problems, fmt.Sprintf("%s.bufferLimits.maxWait: %q is not a duration (e.g. 30s)", ep, e.BufferLimits.MaxWait))
 			}
 		}
-		// select is REQUIRED: the user declares what the reference adds,
-		// so the sink never receives unlisted columns. "*" is the one
-		// sugar (documented as careful-use: it injects everything).
+		semiAnti := e.JoinType == "left semi" || e.JoinType == "left anti"
+		// select is REQUIRED (except for semi/anti, which emit no reference
+		// columns — a select there is a spec error): the user declares what
+		// the reference adds, so the sink never receives unlisted columns.
+		// "*" is the one sugar (documented as careful-use: it injects
+		// everything).
 		switch {
+		case semiAnti && len(e.Select) > 0:
+			*problems = append(*problems, fmt.Sprintf("%s.select: %s emits no reference columns — remove select", ep, e.JoinType))
+		case semiAnti:
+			// no select expected for semi/anti
 		case len(e.Select) == 0:
 			*problems = append(*problems, ep+`.select: required — declare the reference columns the event receives ("*" injects all of them; prefer an explicit list)`)
 		case len(e.Select) == 1 && e.Select[0] == "*":
