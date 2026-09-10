@@ -40,6 +40,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -142,11 +143,12 @@ func (s *snapshot) rowAt(key any) map[string]any {
 // old image, never a half-built one. The mutex only protects the sticky
 // first-load error; the hot path is lock-free.
 type refJoin struct {
-	cfg    spec.Enrich
-	loader Loader
-	onKey  string // event column name
-	onRef  string // reference column name
-	policy coldStartPolicy
+	cfg       spec.Enrich
+	loader    Loader
+	onKey     string         // event column name
+	onKeyType arrow.DataType // event join column's wire Arrow type (P4 boot check)
+	onRef     string         // reference column name
+	policy    coldStartPolicy
 	// refreshEvery is the validated re-read cadence, resolved once in New
 	// so Start never re-parses (and never ignores a parse error).
 	refreshEvery time.Duration
@@ -179,22 +181,26 @@ type dest struct {
 }
 
 // New builds the stage and validates the declarations against the event's
-// known columns — the checks spec.Validate cannot make without schemas:
-// the join's event side must exist, and the grammar is re-checked so a
-// spec that reached us unvalidated fails loudly here.
+// schema — the checks spec.Validate cannot make without schemas: the join's
+// event side must exist, and the grammar is re-checked so a spec that
+// reached us unvalidated fails loudly here. The event schema also carries
+// the join column's type: when a reference loads, its join column's Arrow
+// type is compared against the event join column's, and a mismatch fails
+// the load loudly (P4 — the operator casts in the reference query; the
+// join never coerces).
 //
 // Wildcard exception: with select ["*"] the reference destinations are only
 // known at load time, so RefColumns is empty and a miss before the first
 // non-empty load injects no columns — the table's schema can drift between
 // the first batches and the first load. Documented trade-off: the
 // cold-start policy governs it, or declare the columns explicitly.
-func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, error) {
+func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("enrich: no references declared")
 	}
-	evCols := make(map[string]bool, len(eventColumns))
-	for _, c := range eventColumns {
-		evCols[c] = true
+	evCols := make(map[string]bool, len(eventSchema.Columns))
+	for _, c := range eventSchema.Columns {
+		evCols[c.Name] = true
 	}
 	s := &Stage{stopped: make(chan struct{}), log: log}
 	if s.log == nil {
@@ -237,6 +243,15 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 				return nil, fmt.Errorf("enrich: reference %q: on: event column %q is not in the table's schema", cfg.Table, ev)
 			}
 			rj.onKey, rj.onRef = ev, ref
+			// The event join column's wire Arrow type — refresh compares the
+			// reference's join column against it (P4).
+			if col, ok := eventSchema.Column(ev); ok {
+				dt, aerr := transport.KindToArrow(col.Type)
+				if aerr != nil {
+					return nil, fmt.Errorf("enrich: reference %q: join column %q has no wire type: %w", cfg.Table, ev, aerr)
+				}
+				rj.onKeyType = dt
+			}
 		}
 		// Default destinations claim seenDests too (RV-07): a rename from
 		// ANOTHER reference must not steal a name a default projection
@@ -497,6 +512,20 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 		rj.setFirstErr(err)
 		log.Error("enrich: reference image rejected", "reference", rj.cfg.Table, "err", err)
 		return
+	}
+	// P4: the join never coerces. A non-empty reference whose join column's
+	// Arrow type differs from the event join column's is a rejected load —
+	// the operator casts in the reference query.
+	if snap.refTable != nil && rj.onKeyType != nil {
+		refKeyType := snap.refTable.Column(0).DataType()
+		if !arrow.TypeEqual(refKeyType, rj.onKeyType) {
+			jerr := fmt.Errorf(
+				"enrich: reference %q: join column %q is %s but the event column %q is %s — cast in the reference query so both sides match",
+				rj.cfg.Table, rj.onRef, refKeyType, rj.onKey, rj.onKeyType)
+			rj.setFirstErr(jerr)
+			log.Error("enrich: reference join column type mismatch", "reference", rj.cfg.Table, "err", jerr)
+			return
+		}
 	}
 	// Atomic swap: the hot path reads this with a single Load(), no lock.
 	// The displaced snapshot's refTable is NOT released here — a concurrent

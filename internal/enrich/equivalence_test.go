@@ -130,7 +130,7 @@ func pad4(n int) string {
 func newHarnessStage(t *testing.T) *Stage {
 	t.Helper()
 	cfg := refCfg(func(c *spec.Enrich) { c.OnColdStart = "pass" })
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new stage: %v", err)
 	}

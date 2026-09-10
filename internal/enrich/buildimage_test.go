@@ -16,7 +16,7 @@ import (
 // would leak a row, a position would need a mask loop).
 func TestDuplicateKeyErrorCitesColumnAndCount(t *testing.T) {
 	cfg := refCfg(nil) // joins on user_ref → id, selects name/tier
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestDuplicateKeyErrorCitesColumnAndCount(t *testing.T) {
 
 func TestBuildImageEmptyReferenceGoesHot(t *testing.T) {
 	cfg := refCfg(nil)
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}

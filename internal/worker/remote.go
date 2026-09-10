@@ -77,15 +77,6 @@ func enrichSpecs(refs []*pb.EnrichRef) []spec.Enrich {
 	return cfgs
 }
 
-// columnNames lists a schema's columns for the enrich boot validation.
-func columnNames(s core.Schema) []string {
-	names := make([]string, 0, len(s.Columns))
-	for _, c := range s.Columns {
-		names = append(names, c.Name)
-	}
-	return names
-}
-
 // sessionSender serializes Session sends: grpc client streams are not
 // concurrent-safe, and commits ack from per-table goroutines.
 type sessionSender struct {
@@ -221,12 +212,12 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		// (every sink projects by the table's own columns). Event columns
 		// are captured before the extension — they are not event columns.
 		var enrichCfgs []spec.Enrich
-		var eventCols []string
+		var eventSchema core.Schema
 		if len(ta.Enrich) > 0 {
 			enrichCfgs = enrichSpecs(ta.Enrich)
 			// SOURCE view, captured BEFORE the reference-column extension
 			// — see FT-1: the destinations are not event columns.
-			eventCols = columnNames(cs)
+			eventSchema = cs
 			cs = enrich.AddRefColumns(cs, enrichCfgs)
 		}
 		if ta.CreateIfNotExists {
@@ -245,7 +236,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		// and loads its references asynchronously (cold-start policy
 		// applies).
 		if len(enrichCfgs) > 0 {
-			st, err := enrich.New(enrichCfgs, eventCols, cfg.Logger)
+			st, err := enrich.New(enrichCfgs, eventSchema, cfg.Logger)
 			if err != nil {
 				return err
 			}

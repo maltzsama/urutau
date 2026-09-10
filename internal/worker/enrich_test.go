@@ -49,7 +49,7 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		t.Helper()
 		cfg := leftCfg
 		cfg.JoinType = joinType
-		s, err := enrich.New([]spec.Enrich{cfg}, []string{"id", "v", "user_ref"}, nil)
+		s, err := enrich.New([]spec.Enrich{cfg}, core.Schema{Columns: []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}, {Name: "v", Type: core.ColumnType{Kind: core.KindString}}, {Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}}}}, nil)
 		if err != nil {
 			t.Fatalf("enrich.New: %v", err)
 		}

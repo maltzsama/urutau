@@ -98,7 +98,7 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.OnColdStart = "pass"
 	})
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}

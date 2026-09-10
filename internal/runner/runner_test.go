@@ -275,7 +275,7 @@ func TestIntrospectAllExtendsBothShapesForEnrich(t *testing.T) {
 			As:     map[string]string{"users.name": "user_name"},
 		}},
 	}}}
-	_, resolved, wire, _, sourceCols, err := introspectAll(context.Background(), src, s, slog.New(slog.DiscardHandler))
+	_, resolved, wire, sourceSchemas, _, err := introspectAll(context.Background(), src, s, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("introspectAll: %v", err)
 	}
@@ -285,12 +285,10 @@ func TestIntrospectAllExtendsBothShapesForEnrich(t *testing.T) {
 			t.Fatalf("%s shape lacks the reference column as nullable string: %+v", name, col.Type)
 		}
 	}
-	// The event columns handed to enrich.New are the SOURCE view: the
+	// The event schema handed to enrich.New is the SOURCE view: the
 	// reference destination is not an event column.
-	for _, c := range sourceCols["db.users"] {
-		if c == "user_name" {
-			t.Fatal("sourceCols must not contain the reference destination")
-		}
+	if _, ok := sourceSchemas["db.users"].Column("user_name"); ok {
+		t.Fatal("sourceSchemas must not contain the reference destination")
 	}
 }
 

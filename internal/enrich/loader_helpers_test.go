@@ -10,7 +10,33 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+
+	"github.com/maltzsama/urutau/core"
 )
+
+// evSchema builds a nullable-Int64 event schema for the given columns —
+// the default a join test needs (join keys are ints). A test that joins on
+// a string column overrides via evSchemaTyped.
+func evSchema(cols ...string) core.Schema {
+	out := core.Schema{Columns: make([]core.Column, len(cols))}
+	for i, c := range cols {
+		out.Columns[i] = core.Column{Name: c, Type: core.ColumnType{Kind: core.KindInt64, Nullable: true}}
+	}
+	return out
+}
+
+// evSchemaTyped builds an event schema with per-column kinds.
+func evSchemaTyped(kinds map[string]core.Kind, cols ...string) core.Schema {
+	out := core.Schema{Columns: make([]core.Column, len(cols))}
+	for i, c := range cols {
+		k := core.KindInt64
+		if kk, ok := kinds[c]; ok {
+			k = kk
+		}
+		out.Columns[i] = core.Column{Name: c, Type: core.ColumnType{Kind: k, Nullable: true}}
+	}
+	return out
+}
 
 // fakeLoader is the test seam. It holds an Arrow record (not a Go map) and
 // counts Load calls — the O(N) proof is "the loader ran once per refresh,
