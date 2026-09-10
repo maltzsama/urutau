@@ -14,9 +14,10 @@
 // then Load becomes "read the reference as Arrow, done." Tracked; not this
 // wave.
 //
-// Every loop and every scalar temporary in this file carries a
-// //allow:rowloop marker with its reason. No //allow:rowloop marker exists
-// anywhere else in internal/enrich except columnar.go's index/overlay pass.
+// Every row loop in this file carries a //allow:rowloop marker with its
+// reason. The only other markers in internal/enrich are enrich.go's
+// snapshot key-index build (once per reference refresh) and columnar.go's
+// ref-column gather pass (arrow-go v18.7.0 has no index_in kernel).
 package enrich
 
 import (
