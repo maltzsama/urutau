@@ -288,10 +288,13 @@ func (t CastTarget) Convert(v any) (any, error) {
 	}
 }
 
-func castToString(v any, enc string) (any, error) {
+// StringifyScalar renders a non-binary scalar to its canonical string form.
+// It is shared by the value cast kernel and the columnar encoder so both
+// agree on the Go-type → string mapping for the "to string always" matrix.
+// Binary ([]byte) is deliberately absent: it needs an explicit encoding and
+// is handled by castToString and the encoder separately.
+func StringifyScalar(v any) (string, error) {
 	switch t := v.(type) {
-	case nil:
-		return nil, nil
 	case string:
 		return t, nil
 	case bool:
@@ -308,25 +311,36 @@ func castToString(v any, enc string) (any, error) {
 		return strconv.FormatFloat(float64(t), 'f', -1, 32), nil
 	case float64:
 		return strconv.FormatFloat(t, 'f', -1, 64), nil
-	case []byte:
-		switch enc {
-		case "hex":
-			return hex.EncodeToString(t), nil
-		case "base64":
-			return base64.StdEncoding.EncodeToString(t), nil
-		default:
-			return nil, fmt.Errorf("core: binary → string requires string(hex) or string(base64)")
-		}
+	case time.Time:
+		return t.Format(time.RFC3339Nano), nil
 	case map[string]any, []any:
 		// Composite value dumped as JSON — the struct/list/map → string cast.
 		b, err := json.Marshal(t)
 		if err != nil {
-			return nil, fmt.Errorf("core: cannot JSON-encode %T to string", v)
+			return "", fmt.Errorf("core: cannot JSON-encode %T to string", v)
 		}
 		return string(b), nil
 	default:
-		return nil, fmt.Errorf("core: cannot cast %T to string", v)
+		return "", fmt.Errorf("core: cannot cast %T to string", v)
 	}
+}
+
+func castToString(v any, enc string) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	// Binary needs the explicit encoding before the scalar path.
+	if b, ok := v.([]byte); ok {
+		switch enc {
+		case "hex":
+			return hex.EncodeToString(b), nil
+		case "base64":
+			return base64.StdEncoding.EncodeToString(b), nil
+		default:
+			return nil, fmt.Errorf("core: binary → string requires string(hex) or string(base64)")
+		}
+	}
+	return StringifyScalar(v)
 }
 
 func castToBinary(v any) (any, error) {
@@ -503,6 +517,13 @@ func castToUUID(v any) (any, error) {
 			return nil, fmt.Errorf("core: %q is not a valid uuid", t)
 		}
 		return strings.ToLower(t), nil
+	case []byte:
+		// The columnar representation of a UUID is 16 raw bytes; a value
+		// already in that form is valid as-is (idempotent re-cast).
+		if len(t) != 16 {
+			return nil, fmt.Errorf("core: uuid bytes must be 16 long, got %d", len(t))
+		}
+		return t, nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to uuid", v)
 	}
@@ -517,38 +538,77 @@ func castToJSON(v any) (any, error) {
 			return nil, fmt.Errorf("core: %q is not valid json", t)
 		}
 		return t, nil
+	case []byte:
+		if !json.Valid(t) {
+			return nil, fmt.Errorf("core: %q is not valid json", t)
+		}
+		return string(t), nil
+	case map[string]any, []any:
+		// A source that already decoded the JSON (message-log decoders)
+		// hands over a Go composite; re-encode it canonically.
+		b, err := json.Marshal(t)
+		if err != nil {
+			return nil, fmt.Errorf("core: cannot JSON-encode %T", v)
+		}
+		return string(b), nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to json", v)
 	}
 }
 
-// naiveTimestampLayouts are the source-native renderings a naive timestamp
-// may arrive in (MySQL DATETIME without fraction, Postgres with micros).
-var naiveTimestampLayouts = []string{
-	"2006-01-02 15:04:05.999999999",
-	"2006-01-02 15:04:05.999999",
-	"2006-01-02 15:04:05",
+// dateLayout, naiveTimestampLayout and timeOfDayLayout are the source-native
+// temporal renderings. The naive layout's trailing .999999999 makes the
+// fraction optional and strips trailing zeros, so it alone covers a naive
+// timestamp with or without a fraction — there is no separate layout for
+// "no fraction".
+const (
+	dateLayout           = "2006-01-02"
+	naiveTimestampLayout = "2006-01-02 15:04:05.999999999"
+	timeOfDayLayout      = "15:04:05.999999999"
+)
+
+// ParseTimestampText parses a temporal text into a time.Time: an RFC3339
+// instant (zone preserved), a bare date (midnight), or a naive timestamp
+// with an optional fraction.
+func ParseTimestampText(s string) (time.Time, error) {
+	if tm, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return tm, nil
+	}
+	if tm, err := time.Parse(dateLayout, s); err == nil {
+		return tm, nil
+	}
+	if tm, err := time.Parse(naiveTimestampLayout, s); err == nil {
+		return tm, nil
+	}
+	return time.Time{}, fmt.Errorf("core: %q is not a temporal value", s)
 }
 
-// castToTimestamp reinterprets a naive temporal text: date becomes midnight,
+// ParseTimeOfDayText parses "HH:MM:SS[.fraction]" into micros since midnight.
+func ParseTimeOfDayText(s string) (int64, error) {
+	tm, err := time.Parse(timeOfDayLayout, s)
+	if err != nil {
+		return 0, fmt.Errorf("core: %q is not a time-of-day value", s)
+	}
+	return int64(tm.Hour())*3_600_000_000 + int64(tm.Minute())*60_000_000 +
+		int64(tm.Second())*1_000_000 + int64(tm.Nanosecond())/1_000, nil
+}
+
+// castToTimestamp reinterprets a naive temporal value: date becomes midnight,
 // timestamptz drops its zone. Never parses a free-form string.
 func castToTimestamp(v any) (any, error) {
 	switch t := v.(type) {
 	case nil:
 		return nil, nil
+	case time.Time:
+		// Already a timestamp (the columnar representation); re-render it
+		// naive so the sink sees one consistent textual form.
+		return t.Format("2006-01-02 15:04:05.000000000"), nil
 	case string:
-		if tm, err := time.Parse("2006-01-02", t); err == nil {
-			return tm.Format("2006-01-02 15:04:05.000000000"), nil
+		tm, err := ParseTimestampText(t)
+		if err != nil {
+			return nil, fmt.Errorf("core: %q is not a naive timestamp or date", t)
 		}
-		for _, layout := range naiveTimestampLayouts {
-			if tm, err := time.Parse(layout, t); err == nil {
-				return tm.Format("2006-01-02 15:04:05.000000000"), nil
-			}
-		}
-		if tm, err := time.Parse(time.RFC3339Nano, t); err == nil {
-			return tm.Format("2006-01-02 15:04:05.000000000"), nil
-		}
-		return nil, fmt.Errorf("core: %q is not a naive timestamp or date", t)
+		return tm.Format("2006-01-02 15:04:05.000000000"), nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to timestamp", v)
 	}
@@ -558,22 +618,25 @@ func castToTimestampTZ(v any, assumeUTC bool) (any, error) {
 	switch t := v.(type) {
 	case nil:
 		return nil, nil
+	case time.Time:
+		// Already an instant (the columnar representation); keep it.
+		return t.Format(time.RFC3339Nano), nil
 	case string:
-		if tm, err := time.Parse("2006-01-02", t); err == nil && assumeUTC {
-			return tm.UTC().Format(time.RFC3339Nano), nil
-		}
-		for _, layout := range naiveTimestampLayouts {
-			if tm, err := time.Parse(layout, t); err == nil {
-				if !assumeUTC {
-					return nil, fmt.Errorf("core: naive timestamp → timestamptz requires timestamptz(assume_utc)")
-				}
-				return tm.UTC().Format(time.RFC3339Nano), nil
-			}
-		}
+		// A value that already carries a zone (RFC3339) is an instant and
+		// needs no assume_utc.
 		if tm, err := time.Parse(time.RFC3339Nano, t); err == nil {
 			return tm.Format(time.RFC3339Nano), nil
 		}
-		return nil, fmt.Errorf("core: %q is not a naive timestamp", t)
+		// Otherwise it is naive (date or naive timestamp) and requires
+		// assume_utc: the naive literal is asserted, not shifted.
+		tm, err := ParseTimestampText(t)
+		if err != nil {
+			return nil, fmt.Errorf("core: %q is not a naive timestamp", t)
+		}
+		if !assumeUTC {
+			return nil, fmt.Errorf("core: naive timestamp → timestamptz requires timestamptz(assume_utc)")
+		}
+		return tm.UTC().Format(time.RFC3339Nano), nil
 	default:
 		return nil, fmt.Errorf("core: cannot cast %T to timestamptz", v)
 	}
