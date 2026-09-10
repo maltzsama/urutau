@@ -369,6 +369,7 @@ func gatherRefColumns(alloc memory.Allocator, keyArr arrow.Array, effHit *array.
 			}
 		}
 	}
+	//allow:rowloop ref-column gather: arrow-go v18.7.0 has no index_in; one pass over the batch key, effHit-gated.
 	for i := 0; i < n; i++ {
 		if !effHit.Value(i) {
 			for _, bl := range builders {
