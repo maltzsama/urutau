@@ -43,11 +43,10 @@ func TestWorkerEnrichJoinsBeforeBuffering(t *testing.T) {
 		}
 		s.Start(context.Background())
 		t.Cleanup(s.Stop)
-		// Warm: wait until the join answers.
+		// Warm: wait until every reference has completed its first load.
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
-			out, _ := s.Enrich([]rowchange.Change{{Op: rowchange.OpInsert, After: map[string]any{"user_ref": int64(7)}}})
-			if len(out) == 1 && out[0].After["users.name"] == "ana" {
+			if s.Ready() {
 				return nil, s
 			}
 			time.Sleep(time.Millisecond)
