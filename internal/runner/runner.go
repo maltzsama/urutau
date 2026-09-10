@@ -349,10 +349,10 @@ func columnNames(s core.Schema) []string {
 	return names
 }
 
-// introspectAll resolves each spec table through the source, so the pipeline
-// knows the PK (equality key) and the resolved canonical shape before writing
-// anything. The canonical schema carries the declared cast and metadata
-// columns; the target schema is the sink's concern.
+// introspectAll resolves each spec table through the source, producing both
+// the RESOLVED shape (cast types + metadata columns, the sink's target) and
+// the WIRE shape (the source types the worker encodes). Cast warnings surface
+// here, once, from the resolver.
 func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire map[string]core.Schema, casts map[string]core.CastPolicy, err error) {
 	refs = make([]core.TableRef, 0, len(s.Tables))
 	resolved = make(map[string]core.Schema, len(s.Tables))
@@ -371,7 +371,10 @@ func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger 
 		if rerr != nil {
 			return nil, nil, nil, nil, rerr
 		}
-		for _, w := range append(warns, rwarns...) {
+		for _, w := range warns {
+			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
+		}
+		for _, w := range rwarns {
 			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
 		}
 		refs = append(refs, ref)

@@ -737,10 +737,11 @@ func castToTimestamp(from Kind, v any) (any, error) {
 		// naive so the sink sees one consistent textual form.
 		return t.Format(naiveTimestampTextLayout), nil
 	case int, int32, int64, uint64:
-		// Only a date (KindDate) carries days-since-epoch as an integer;
-		// any other source handing an integer here is a wire bug, not a
+		// Only a date (KindDate) carries days-since-epoch as an integer.
+		// Any other source — including an unknown Kind, which cannot tell
+		// days from micros — handing an integer here is a wire bug, not a
 		// guess (from exists to say which).
-		if from != KindDate && from != KindUnknown {
+		if from != KindDate {
 			return nil, fmt.Errorf("core: cannot render %T as %s text — wire representation ambiguous; fix the wire Kind", v, from)
 		}
 		days, err := asInt64(t)

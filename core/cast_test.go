@@ -522,9 +522,12 @@ func TestCastToTimestampAcceptsUint64(t *testing.T) {
 	if got != "2024-01-01 00:00:00.000000000" {
 		t.Fatalf("got %v", got)
 	}
-	// An integer under a non-date source is ambiguous (wire bug), not days.
-	if _, err := castToTimestamp(KindTimestamp, int64(42)); err == nil || !strings.Contains(err.Error(), "ambiguous") {
-		t.Fatalf("timestamp int must error as ambiguous, got %v", err)
+	// An integer under a non-date source is ambiguous (wire bug), not days —
+	// including KindUnknown, which cannot tell days from micros.
+	for _, from := range []Kind{KindTimestamp, KindUnknown} {
+		if _, err := castToTimestamp(from, int64(42)); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Fatalf("%s int must error as ambiguous, got %v", from, err)
+		}
 	}
 }
 

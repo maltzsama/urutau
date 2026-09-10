@@ -55,6 +55,11 @@ func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, m
 		}
 		v, present := r.Value(col.Name, i)
 		if !present {
+			if hasCast {
+				// ColumnKind said the column is on the wire; a divergence
+				// here is a bug, not a missing optional column.
+				return nil, nil, fmt.Errorf("couchbase: column %q: kind present but value absent from the wire", col.Name)
+			}
 			continue
 		}
 		if hasCast {
