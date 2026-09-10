@@ -311,7 +311,11 @@ func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []co
 	if len(positions) == 0 {
 		return nil, needsSnapshot, nil
 	}
-	return position.Min(positions), needsSnapshot, nil
+	best, err := position.MinSafe(positions)
+	if err != nil {
+		return nil, nil, fmt.Errorf("runner: %w", err)
+	}
+	return best, needsSnapshot, nil
 }
 
 // readSnapshotProgress reads the snapshot state from the sink's table

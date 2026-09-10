@@ -11,6 +11,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
 )
 
 // CD-T1: a stall with unacked (in-flight) batches must TERMINATE, not reset.
@@ -141,3 +142,44 @@ func TestSignalSessionEndDeathSurfaces(t *testing.T) {
 }
 
 var errWorkerDead = errors.New("stream died")
+
+// opaquePos is an identity-only position (plugin offset cookie): different
+// values are Incomparable.
+type opaquePos string
+
+func (o opaquePos) String() string { return string(o) }
+func (o opaquePos) Compare(other position.Position) int {
+	p, ok := other.(opaquePos)
+	if ok && o == p {
+		return 0
+	}
+	return position.Incomparable
+}
+func (o opaquePos) Contains(other position.Position) bool {
+	p, ok := other.(opaquePos)
+	return ok && o == p
+}
+
+// P2: an incomparable ack must NOT truncate the in-flight index — the safe
+// direction is "don't truncate" (the head batch stays queued until coverage
+// is certain). Truncating on an undefined order could free budget for
+// batches that were never committed.
+func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
+	// A different opaque cookie cannot prove coverage: the batch stays
+	// queued.
+	p := newPositionIndex("run-p2a")
+	p.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
+	if freed := p.truncate("t", opaquePos("cookie-2")); freed != 0 {
+		t.Fatalf("incomparable ack freed %d, want 0 (must not truncate)", freed)
+	}
+	if p.InFlight() != 1 {
+		t.Fatalf("in-flight = %d, want 1", p.InFlight())
+	}
+
+	// Identity DOES cover it (same cookie).
+	p2 := newPositionIndex("run-p2b")
+	p2.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
+	if freed := p2.truncate("t", opaquePos("cookie-1")); freed != 5 {
+		t.Fatalf("identical ack freed %d, want 5", freed)
+	}
+}

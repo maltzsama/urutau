@@ -1293,11 +1293,11 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	if len(positions) == 0 {
 		return nil, needsSnapshot, nil
 	}
-	best := positions[0]
-	for _, p := range positions[1:] {
-		if c := p.Compare(best); c != position.Incomparable && c < 0 {
-			best = p
-		}
+	// MinSafe: an incomparable pair (should not happen for one source) is an
+	// error — guessing a minimum could resume past uncommitted data (P1).
+	best, err := position.MinSafe(positions)
+	if err != nil {
+		return nil, nil, fmt.Errorf("coordinator: %w", err)
 	}
 	return best, needsSnapshot, nil
 }
