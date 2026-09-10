@@ -398,7 +398,8 @@ func asBytes(v any) ([]byte, error) {
 }
 
 // asInt64 interprets a value as an integer (the columnar representation of a
-// date is int32 days, of a time int64 micros).
+// date is int32 days, of a time int64 micros). A uint64 above MaxInt64 has no
+// exact int64 form and is rejected, never silently wrapped.
 func asInt64(v any) (int64, error) {
 	switch t := v.(type) {
 	case int:
@@ -408,6 +409,9 @@ func asInt64(v any) (int64, error) {
 	case int64:
 		return t, nil
 	case uint64:
+		if t > math.MaxInt64 {
+			return 0, fmt.Errorf("core: uint64 %d overflows int64", t)
+		}
 		return int64(t), nil
 	default:
 		return 0, fmt.Errorf("cannot interpret %T as an integer", v)

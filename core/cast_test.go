@@ -436,3 +436,13 @@ func TestParseTimeOfDayText(t *testing.T) {
 		t.Fatalf("micros = %d, want %d", got, want)
 	}
 }
+
+// asInt64 must reject a uint64 that has no exact int64 form (FIX-DOC v2 B).
+func TestAsInt64RejectsUint64Overflow(t *testing.T) {
+	if _, err := asInt64(uint64(math.MaxInt64) + 1); err == nil {
+		t.Fatal("uint64 above MaxInt64 must error")
+	}
+	if got, err := asInt64(uint64(42)); err != nil || got != 42 {
+		t.Fatalf("asInt64(uint64(42)) = %d, %v; want 42", got, err)
+	}
+}
