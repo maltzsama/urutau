@@ -36,6 +36,11 @@ import (
 )
 
 // DefaultRefresh re-reads a reference this often when the spec is silent.
+//
+// Behavior (not a limitation): a reference that boots late is first loaded
+// within one refresh interval, and a reference that goes down mid-run comes
+// hot again within one interval. At the default this is up to 5 minutes —
+// size cold-start expectations accordingly, or set `refresh` shorter.
 const DefaultRefresh = 5 * time.Minute
 
 // defaultMaxEvents caps the cold-start buffer when the spec leaves
@@ -110,6 +115,9 @@ type refJoin struct {
 	onKey  string // event column name
 	onRef  string // reference column name
 	policy coldStartPolicy
+	// refreshEvery is the validated re-read cadence, resolved once in New
+	// so Start never re-parses (and never ignores a parse error).
+	refreshEvery time.Duration
 
 	// snap is the hot-path state: image + dests + hot flag, swapped
 	// atomically on refresh. Load() is lock-free; Store() is called
@@ -255,9 +263,11 @@ func New(cfgs []spec.Enrich, eventColumns []string, log *slog.Logger) (*Stage, e
 		default:
 			return nil, fmt.Errorf("enrich: reference %q: onColdStart %q unknown (want buffer | pass | drop)", cfg.Table, cfg.OnColdStart)
 		}
-		if _, err := rj.refreshInterval(); err != nil {
+		interval, err := rj.refreshInterval()
+		if err != nil {
 			return nil, err
 		}
+		rj.refreshEvery = interval
 		rj.misses = &s.misses
 		s.refs = append(s.refs, rj)
 	}
@@ -305,8 +315,7 @@ func (s *Stage) Start(ctx context.Context) {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			interval, _ := rj.refreshInterval()
-			t := time.NewTicker(interval)
+			t := time.NewTicker(rj.refreshEvery)
 			defer t.Stop()
 			// First load immediately; a failure is sticky (it surfaces on
 			// the first event) and the ticker keeps retrying, so a
