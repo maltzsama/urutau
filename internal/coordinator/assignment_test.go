@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -215,8 +216,14 @@ const pbWriteModeAppend = 2
 func TestAssignmentTickLockOrderNoDeadlock(t *testing.T) {
 	c := &Coordinator{
 		workers: map[string]*workerState{"w": {name: "w"}},
+		log:     slog.New(slog.DiscardHandler),
 	}
 	s := newSupervisor(c)
+	c.supervisor = s // resetWorker reaches it via c.supervisor
+	// The worker has already acked, so the race between attached=true and
+	// noteAttach never reads it as stale — without this, the tight tick loop
+	// can drive resetWorker on an uninitialized Coordinator and panic.
+	s.noteAck("w", time.Now())
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
