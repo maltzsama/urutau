@@ -259,3 +259,96 @@ func TestConcurrentEmitPreservesPUTOrder(t *testing.T) {
 	}
 	_ = keys
 }
+
+// failNthPutter fails exactly one PUT (by call index), recording everything.
+type failNthPutter struct {
+	mu     sync.Mutex
+	failOn int // 0-based call index
+	call   int
+	keys   []string
+	bodies []string
+}
+
+func (p *failNthPutter) Put(_ context.Context, _ string, key string, body []byte) error {
+	p.mu.Lock()
+	n := p.call
+	p.call++
+	p.keys = append(p.keys, key)
+	p.bodies = append(p.bodies, string(body))
+	p.mu.Unlock()
+	if n == p.failOn {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// E-2 (1): the last Emit's PUT failed (best-effort contract), so its line is
+// still in the buffer. Close must re-upload the buffer — a graceful shutdown
+// loses exactly the final event otherwise.
+func TestCloseReFlushesFailedLastEvent(t *testing.T) {
+	p := &failNthPutter{failOn: 2} // third PUT fails
+	r := NewWithPutter("bucket", "prefix", p)
+
+	ctx := context.Background()
+	if err := r.Emit(ctx, "one", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Emit(ctx, "two", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Emit(ctx, "last", nil); err == nil {
+		t.Fatal("expected the failing PUT to error the emit")
+	}
+
+	r.Close()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	last := p.bodies[len(p.bodies)-1]
+	if !strings.Contains(last, `"kind":"last"`) {
+		t.Fatalf("close PUT does not carry the failed event: %s", last)
+	}
+	if !strings.Contains(p.keys[len(p.keys)-1], "events.jsonl") {
+		t.Fatalf("close PUT key = %q", p.keys[len(p.keys)-1])
+	}
+}
+
+// E-2 (2): a Close concurrent with in-flight Emits must produce a final
+// object containing every event accepted before the flip — never a smaller
+// body overwriting a bigger in-flight PUT.
+func TestCloseSerializesWithInFlightEmits(t *testing.T) {
+	p := &orderPutter{delay: 5 * time.Millisecond}
+	r := NewWithPutter("bucket", "prefix", p)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = r.Emit(context.Background(), "commit", map[string]any{"n": i}) // closed errors are fine
+		}(i)
+	}
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		r.Close()
+	}()
+	wg.Wait()
+	r.Close() // idempotent
+
+	accepted := r.Emitted()
+	if accepted == 0 {
+		t.Fatal("no events accepted")
+	}
+	// Every PUT body is a prefix of the final buffer (appends only grow it),
+	// so the largest body must carry exactly the accepted events.
+	_, bodies := p.snapshot()
+	maxLines := 0
+	for _, b := range bodies {
+		if c := strings.Count(b, "\n"); c > maxLines {
+			maxLines = c
+		}
+	}
+	if maxLines != accepted {
+		t.Fatalf("largest PUT body has %d lines, want %d (accepted)", maxLines, accepted)
+	}
+}

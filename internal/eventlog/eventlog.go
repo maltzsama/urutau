@@ -185,12 +185,38 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	return nil
 }
 
-// Close seals the run; further emits fail. The last Emit already uploaded
-// the final buffer, so Close only flips the flag.
+// Close seals the run: further emits fail, and the final buffer is
+// re-uploaded best-effort. A failed last Emit left its line in the buffer
+// (the contract is best-effort, the event stays accepted), and without the
+// re-flush a graceful shutdown would lose exactly that final event. The
+// close PUT is serialized against in-flight Emits through putMu, so the
+// object never lands smaller than what was accepted.
+//
+// Lock order: mu is released BEFORE putMu is taken — the inverse of Emit,
+// and safe here. The Emit race (both Emits clone the body and compete for
+// putMu) does not exist for the one-shot close, and the closed flag set
+// under mu prevents re-entry. Serializing with in-flight PUTs comes from
+// putMu itself; holding mu during the wait would pin the append lock for
+// up to one putTimeout for no additional correctness.
 func (r *Run) Close() {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
 	r.closed = true
+	body := slices.Clone(r.buf)
+	key := r.key
 	r.mu.Unlock()
+
+	r.putMu.Lock()
+	defer r.putMu.Unlock()
+	if len(body) == 0 {
+		return
+	}
+	putCtx, cancel := context.WithTimeout(context.Background(), putTimeout)
+	defer cancel()
+	_ = r.putter.Put(putCtx, r.bucket, key, body) // best-effort
 }
 
 func newRunID() string {
