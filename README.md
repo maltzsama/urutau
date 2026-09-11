@@ -15,10 +15,10 @@ from it.
 
 ## Why
 
-For the common case — one sink, no multi-consumer replay — Debezium+Kafka
-puts a broker in the data path to solve a problem you don't have. Urutau
-reads the replication log once and writes the destination directly, with
-no broker between the two.
+For the common case — one sink, no multi-consumer replay — Urutau reads
+from MySQL, Postgres, or an existing Kafka/Redpanda topic and writes the
+destination directly, without standing up any new broker or relay in
+between.
 
 It also writes natively. Some CDC-to-lakehouse tools hand the actual write
 off to a JVM sidecar process — a JAR, a gRPC hop, a second runtime to keep
@@ -35,7 +35,7 @@ not replaying a separate checkpoint log.
 **The engine is closed; the driver seam is open.** Sources and sinks are
 public Go contracts at the module root — a source or sink is a package
 that implements a handful of small interfaces and registers itself, never
-touching an `internal/` path. See [`docs/guides/plugins.md`](docs/guides/plugins.md).
+touching an `internal/` path. See [Writing a driver](https://maltzsama.github.io/urutau/docs/guides/plugins).
 
 ## Get started
 
@@ -68,7 +68,7 @@ urutau run -f pipeline.yaml
 `run` is the collapsed mode: coordinator and worker in one process against
 the sink — no Kubernetes required to try it.
 
-**→ [`docs/quickstart.md`](docs/quickstart.md)** walks through this end to
+**→ [Quickstart](https://maltzsama.github.io/urutau/docs/quickstart)** walks through this end to
 end on your machine — build the binary, stand up a real MySQL + Iceberg
 locally with Docker Compose, run the pipeline, read the result back
 through Trino, and watch a live change replicate.
@@ -80,21 +80,23 @@ Iceberg, ClickHouse, or Couchbase, single-process or distributed, with the
 k8s operator — and the commit path has been verified by reading back
 through Trino rather than trusting a successful write. Correctness-critical
 paths are still being actively hardened; read
-[`docs/reference/sinks-and-sources.md`](docs/reference/sinks-and-sources.md#known-limitations)
+[Sinks and sources](https://maltzsama.github.io/urutau/docs/reference/sinks-and-sources#known-limitations)
 before relying on this for anything you can't afford to lose.
 
 ## Documentation
 
+Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.github.io/urutau/)**.
+
 | Page | What's in it |
 | --- | --- |
-| [`docs/quickstart.md`](docs/quickstart.md) | Run a real pipeline on your machine, step by step |
-| [`docs/reference/semantics.md`](docs/reference/semantics.md) | **The behavior contract** — delivery guarantees, ordering, delete-image handling, enrich join grammar, poison-batch policy. Read this before depending on any behavior not shown in an example. |
-| [`docs/reference/sinks-and-sources.md`](docs/reference/sinks-and-sources.md) | Per-source and per-sink feature detail, enrichment reference, known limitations, roadmap |
-| [`docs/reference/plugin-contract.md`](docs/reference/plugin-contract.md) | The normative Arrow Flight subprocess plugin contract |
-| [`docs/guides/plugins.md`](docs/guides/plugins.md) | How to write a source or sink — both mechanisms (Go `.so` plugin and Arrow Flight subprocess) |
-| [`docs/architecture/overview.md`](docs/architecture/overview.md) | Package boundaries, the dependency diagram, repository map, E2E spike findings |
-| [`docs/architecture/encode-key.md`](docs/architecture/encode-key.md) | Design note: the collapse-stage key encoding |
-| [`docs/architecture/state-position.md`](docs/architecture/state-position.md) | Design note: where a committed position lives, and the sink-vs-store arbitration rule |
+| [Quickstart](https://maltzsama.github.io/urutau/docs/quickstart) | Run a real pipeline on your machine, step by step |
+| [Semantics](https://maltzsama.github.io/urutau/docs/reference/semantics) | **The behavior contract** — delivery guarantees, ordering, delete-image handling, enrich join grammar, poison-batch policy. Read this before depending on any behavior not shown in an example. |
+| [Sinks and sources](https://maltzsama.github.io/urutau/docs/reference/sinks-and-sources) | Per-source and per-sink feature detail, enrichment reference, known limitations, roadmap |
+| [Plugin contract](https://maltzsama.github.io/urutau/docs/reference/plugin-contract) | The normative Arrow Flight subprocess plugin contract |
+| [Writing a driver](https://maltzsama.github.io/urutau/docs/guides/plugins) | How to write a source or sink — both mechanisms (Go `.so` plugin and Arrow Flight subprocess) |
+| [Architecture](https://maltzsama.github.io/urutau/docs/architecture/overview) | Package boundaries, the dependency diagram, repository map, E2E spike findings |
+| [EncodeKey](https://maltzsama.github.io/urutau/docs/architecture/encode-key) | Design note: the collapse-stage key encoding |
+| [State position](https://maltzsama.github.io/urutau/docs/architecture/state-position) | Design note: where a committed position lives, and the sink-vs-store arbitration rule |
 
 ## Companion repository
 
@@ -119,6 +121,7 @@ make build            # bin/urutau, bin/urutau-coordinator, bin/urutau-worker, b
 make test             # go test -race ./... (operator envtest skipped without assets)
 make lint             # golangci-lint
 make proto            # buf lint + generate (generated code is committed)
+make docs-site        # install + serve docs at localhost:3000
 ```
 
 No `protoc` needed — generation uses `buf` with the `protoc-gen-go`/

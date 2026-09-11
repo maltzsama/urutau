@@ -1,3 +1,7 @@
+---
+sidebar_position: 3
+---
+
 # Urutau Plugin Contract
 
 **Protocol:** `arrow-flight` · **protocolVersion:** 1 · **Status:** normative

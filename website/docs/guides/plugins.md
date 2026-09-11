@@ -1,3 +1,7 @@
+---
+sidebar_position: 1
+---
+
 # Writing a driver
 
 The engine is closed; the driver seam is open. A source or sink is a package
@@ -21,7 +25,7 @@ implementer can follow without reading Urutau's source.
 
 ## Reference implementation
 
-[`test/plugin`](../../test/plugin/fake.go) is a working source and sink
+[`test/plugin`](https://github.com/maltzsama/urutau/tree/main/test/plugin/fake.go) is a working source and sink
 written against nothing but the public contracts (`source`, `sink`, `core`,
 `dataplane`, `position`), exercised end-to-end by its own test. It proves
 the contracts are implementable from outside `internal/` — it isn't wired
@@ -105,7 +109,7 @@ client. It runs as its own OS process, spawned and supervised by Urutau —
 restarted with backoff on crash, killed on an anti-orphan watchdog if
 Urutau itself dies.
 
-This is the **normative** contract: **[`docs/reference/plugin-contract.md`](../reference/plugin-contract.md)**.
+This is the **normative** contract: **[Plugin Contract](../reference/plugin-contract.md)**.
 If anything here (or anywhere else) conflicts with that document, the
 contract wins.
 

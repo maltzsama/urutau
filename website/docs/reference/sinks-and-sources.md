@@ -1,3 +1,7 @@
+---
+sidebar_position: 2
+---
+
 # Sources, sinks, and feature detail
 
 > **Staleness notice:** this page was carried over from the old README
@@ -118,7 +122,7 @@ source columns and position stay deterministic either way. A pipeline
 without `enrich` runs the identical code path it always did.
 
 Full semantics (join grammar, cold-start details, wildcard-select
-behavior): [`docs/reference/semantics.md`](semantics.md#enrich-columnar-broadcast-join).
+behavior): [Semantics](semantics.md#enrich-columnar-broadcast-join).
 
 **Single reference example:**
 ```yaml
