@@ -162,6 +162,31 @@ batch; `buffer` and `pass` both let every row through as a miss (reference
 columns NULL, or — for semi — every non-delete dropped, for anti —
 everything kept). The row path's per-row cold-start buffer is gone.
 
+### Wildcard select: no schema drift (issue #56)
+
+With `select: ["*"]` the reference's destination column names are only
+knowable by actually running the reference query — there is no static
+name to declare ahead of time. Every schema owner (coordinator, the
+collapsed runner, the worker) closes this at boot: a wildcard reference's
+first load runs **synchronously**, before the table's wire/sink schema is
+finalized and before `EnsureTable` creates the sink table, so the real
+columns are present from the first batch — there is no drift window.
+
+If that first load fails (the reference database is unreachable, the
+query is invalid), pipeline boot fails loudly, naming the reference and
+the underlying cause — never a silent fallback to an empty schema.
+
+An **explicit-select** reference is unaffected: its destination names are
+static (known from the config, no I/O needed), so it keeps loading fully
+asynchronously — the pipeline boots without waiting for it, and the
+cold-start policy governs whatever arrives before its first refresh
+completes, exactly as before this fix.
+
+In distributed mode (coordinator + worker), the coordinator's synchronous
+wildcard load and the worker's own long-lived load are two separate
+queries against the same reference — the two processes share no
+connection. This is an accepted, disclosed cost of the split, not a bug.
+
 ## Table-name convention
 
 The name fields are easy to confuse, and the confusion has caused real bugs:
@@ -214,13 +239,6 @@ debt. None is a correctness gap in v1.
   live propagation is not automatic.
 - **Dead-letter queue** (and multi-destination DLQ): a poison batch is
   terminal in v1; a DLQ with a manual skip valve is a v2 feature.
-- **Wildcard enrich drift** (issue #56a): with `select: ["*"]` the reference
-  destinations are only known at load time, so a miss before the first
-  non-empty load injects no columns and the table's schema can drift between
-  the first batches and the first load. Governed by the cold-start policy or
-  by declaring the reference columns explicitly. A synchronous pre-boot load
-  (or `Stage.AddRefColumnsFromSnapshot` feeding the resolved types into the
-  schema owners after warm-up) would close it.
 - **`enrich_miss` as a materializable column**: the columnar join marks a
   left-join miss by leaving the reference columns NULL — it does not emit a
   dedicated `__enrich_miss` wire column, so the `enrich_miss` metadata key

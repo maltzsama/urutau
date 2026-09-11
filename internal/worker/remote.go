@@ -206,19 +206,33 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			mode = dataplane.AppendMode
 		}
 		// Broadcast reference joins arrive with the assignment. Their
-		// destination columns (explicit selects — known at boot) join the
-		// assigned schema BEFORE EnsureTable: the sink table must have the
-		// column, or the first enriched batch's values are silently dropped
-		// (every sink projects by the table's own columns). Event columns
-		// are captured before the extension — they are not event columns.
-		var enrichCfgs []spec.Enrich
-		var eventSchema core.Schema
+		// destination columns join the assigned schema BEFORE EnsureTable:
+		// the sink table must have the column, or the first enriched
+		// batch's values are silently dropped (every sink projects by the
+		// table's own columns). Event columns are captured before the
+		// extension — they are not event columns.
+		//
+		// The stage is built and, for any wildcard reference, loaded
+		// SYNCHRONOUSLY here — before AddColumns/EnsureTable — so the real
+		// wildcard columns are known in time to extend cs (#56). An
+		// explicit-select reference is unaffected: LoadWildcards skips it,
+		// and Start (below) still loads it asynchronously exactly as
+		// before.
+		var st *enrich.Stage
 		if len(ta.Enrich) > 0 {
-			enrichCfgs = enrichSpecs(ta.Enrich)
+			enrichCfgs := enrichSpecs(ta.Enrich)
 			// SOURCE view, captured BEFORE the reference-column extension
 			// — see FT-1: the destinations are not event columns.
-			eventSchema = cs
-			cs = enrich.AddRefColumns(cs, enrichCfgs)
+			eventSchema := cs
+			var err error
+			st, err = enrich.New(enrichCfgs, eventSchema, cfg.Logger)
+			if err != nil {
+				return err
+			}
+			if err := st.LoadWildcards(ctx); err != nil {
+				return fmt.Errorf("worker: %s: enrich: %w", ta.TargetTable, err)
+			}
+			cs = enrich.AddColumns(cs, st.RefColumns())
 		}
 		if ta.CreateIfNotExists {
 			if err := snk.EnsureTable(ctx, ref, cs, nil, cast, mode); err != nil {
@@ -231,15 +245,10 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 		w.Register(ta.TargetTable, writer, mode)
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
-		// The stage validates the event side against the assigned schema
-		// (the SOURCE view, captured before the reference-column extension)
-		// and loads its references asynchronously (cold-start policy
-		// applies).
-		if len(enrichCfgs) > 0 {
-			st, err := enrich.New(enrichCfgs, eventSchema, cfg.Logger)
-			if err != nil {
-				return err
-			}
+		// Start's remaining first loads (any explicit-select reference,
+		// plus the refresh ticker for everything) stay asynchronous — the
+		// cold-start policy applies to whatever hasn't loaded yet.
+		if st != nil {
 			st.Start(ctx)
 			stages = append(stages, st)
 			w.SetEnricher(ta.TargetTable, st)

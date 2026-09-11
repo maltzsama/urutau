@@ -168,9 +168,9 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 		if snap != nil && len(snap.dests) > 0 {
 			dests = snap.dests
 			typeOf = snap.refType
-		} else if len(rj.refDests) > 0 {
-			dests = make([]dest, len(rj.refDests))
-			for i, name := range rj.refDests {
+		} else if names := rj.refDestNames(); len(names) > 0 {
+			dests = make([]dest, len(names))
+			for i, name := range names {
 				dests[i] = dest{as: name}
 			}
 		}

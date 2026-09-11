@@ -515,16 +515,50 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	// Lookup spec tables by source and target for plan parameters.
 	specBySource := make(map[string]spec.Table, len(s.Tables))
 	specByTarget := make(map[string]spec.Table, len(s.Tables))
-	sourceByTarget := make(map[string]string, len(s.Tables))
 	for _, t := range s.Tables {
 		specBySource[t.Source] = t
 		specByTarget[t.Target] = t
-		sourceByTarget[t.Target] = t.Source
+	}
+
+	// Enrich stages are built and, for any wildcard reference, loaded
+	// SYNCHRONOUSLY here — BEFORE EnsureTable — so a wildcard select's real
+	// destination columns are known in time to correct resolved/wire before
+	// the sink table is created (#56). An explicit-select reference is
+	// unaffected: LoadWildcards skips it, and Start (below, after the
+	// writer/EnsureTable loop) still loads it asynchronously exactly as
+	// before. Building the Stage here (rather than in the writer loop,
+	// where it lived before this fix) is what makes RefColumns() available
+	// before EnsureTable runs.
+	enrichStageByTarget := make(map[string]*enrich.Stage, len(s.Tables))
+	var enrichStages []*enrich.Stage
+	closeStages := func() {
+		for _, st := range enrichStages {
+			st.Stop()
+		}
+	}
+	for _, t := range s.Tables {
+		if len(t.Enrich) == 0 {
+			continue
+		}
+		st, serr := enrich.New(t.Enrich, sourceSchemas[t.Source], log)
+		if serr != nil {
+			return nil, fmt.Errorf("runner: %s: %w", t.Target, serr)
+		}
+		if serr := st.LoadWildcards(ctx); serr != nil {
+			closeStages()
+			return nil, fmt.Errorf("runner: %s: enrich: %w", t.Target, serr)
+		}
+		dests := st.RefColumns()
+		wire[t.Source] = enrich.AddColumns(wire[t.Source], dests)
+		resolved[t.Source] = enrich.AddColumns(resolved[t.Source], dests)
+		enrichStageByTarget[t.Target] = st
+		enrichStages = append(enrichStages, st)
 	}
 
 	// Writers, ensuring tables exist through the sink. The table's write
 	// shape is resolved once: the sink's DDL (where the engine is chosen)
-	// and the worker's collapse must agree on it.
+	// and the worker's collapse must agree on it. resolved[ref.Source] is
+	// now correct even for a wildcard reference, per the loop above.
 	writers := make(map[string]sink.TableWriter, len(refs))
 	modes := make(map[string]dataplane.WriteMode, len(refs))
 	for _, ref := range refs {
@@ -532,21 +566,16 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		cast := casts[ref.Source]
 		mode := t.WriteMode.ChangeMode()
 		if err := snk.EnsureTable(ctx, ref, resolved[ref.Source], t.PartitionBy, cast, mode); err != nil {
+			closeStages()
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)
 		}
 		wr, err := snk.Writer(ctx, ref, cast, t.Metadata)
 		if err != nil {
+			closeStages()
 			return nil, fmt.Errorf("runner: writer %s: %w", ref.Target, err)
 		}
 		writers[ref.Target] = wr
 		modes[ref.Target] = mode
-	}
-
-	var enrichStages []*enrich.Stage
-	closeStages := func() {
-		for _, st := range enrichStages {
-			st.Stop()
-		}
 	}
 
 	// Worker + ingest channel: the relay feeds columnar Ingest batches
@@ -564,21 +593,14 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		if cs := canonicalForTarget(wire, refs, target); len(cs.Columns) > 0 {
 			w.SetKnownSchema(target, cs)
 		}
-		// Enrichment: broadcast reference joins declared for this table.
-		// Event columns come from the SOURCE view (introspectAll captured
-		// them before the reference-destination extension) — a join on a
-		// column the table does not have fails boot, not the first event.
-		// Loads run asynchronously; the cold-start policy governs early
-		// traffic.
-		if t := specByTarget[target]; len(t.Enrich) > 0 {
-			st, err := enrich.New(t.Enrich, sourceSchemas[sourceByTarget[target]], log)
-			if err != nil {
-				closeQuery()
-				closeStages()
-				return nil, fmt.Errorf("runner: %s: %w", target, err)
-			}
+		// Enrichment: broadcast reference joins declared for this table,
+		// built and (for any wildcard reference) synchronously warmed
+		// above, before EnsureTable. Start's remaining first loads
+		// (explicit-select references, plus the refresh ticker for
+		// everything) stay asynchronous — the cold-start policy governs
+		// whatever hasn't loaded yet.
+		if st, ok := enrichStageByTarget[target]; ok {
 			st.Start(ctx)
-			enrichStages = append(enrichStages, st)
 			w.SetEnricher(target, st)
 		}
 	}
