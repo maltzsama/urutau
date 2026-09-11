@@ -116,10 +116,14 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		refBySource[ref.Source] = ref
 	}
 
+	// No ConsumeGroup: this is direct/manual partition consuming, so there
+	// is no group-coordinated autocommit to disable — kgo.DisableAutoCommit
+	// is only valid alongside a group, and errors client construction
+	// otherwise (issue #17 e2e round trip surfaced this: no Kafka pipeline
+	// had ever actually connected).
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(s.Spec.Source.URI),
 		kgo.ConsumeTopics(topics...),
-		kgo.DisableAutoCommit(),
 		kgo.WithLogger(newKgoLogger(s.Rt.Logger)),
 	}
 
@@ -262,6 +266,12 @@ func (r *Reader) consume(ctx context.Context) error {
 		}
 
 		fetches.EachRecord(func(rec *kgo.Record) {
+			// franz-go leaves Record.Context nil on the consume side (it is
+			// only populated by an explicit hook, or on the produce side) —
+			// a decoder that needs one (Avro's schema registry HTTP fetch)
+			// would otherwise fail every record with "net/http: nil
+			// Context". Give it this loop's ctx explicitly.
+			rec.Context = ctx
 			changes, err := r.dec.Decode(rec)
 			if err != nil {
 				r.logger.Error("kafka: decode", "topic", rec.Topic, "err", err)

@@ -19,7 +19,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed envtest-setup docs
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs
 
 all: lint test build
 
@@ -114,3 +114,17 @@ e2e-test-worker: e2e-up
 e2e-seed: e2e-up
 	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestMySQLPipeline$$' ./test/e2e
 	@echo "✓ MySQL pipeline rodado. Abra Trino: SELECT * FROM iceberg.raw.orders"
+
+# Kafka overlay (issue #17, decision 2): Redpanda (broker + Confluent-
+# compatible schema registry in one container), layered on top of the main
+# stack — only the Kafka+Avro tests need it, so it is not part of e2e-up.
+E2E_KAFKA_COMPOSE := test/e2e/docker-compose.kafka.yml
+
+e2e-kafka-up: e2e-up
+	docker compose -f $(E2E_COMPOSE) -f $(E2E_KAFKA_COMPOSE) up -d --wait
+
+e2e-kafka-down:
+	docker compose -f $(E2E_COMPOSE) -f $(E2E_KAFKA_COMPOSE) down
+
+e2e-test-kafka: e2e-kafka-up
+	URUTAU_E2E=1 URUTAU_E2E_KAFKA=1 $(GO) test $(E2E_FILTER) -run 'TestNestedStructRoundTrip' ./test/e2e
