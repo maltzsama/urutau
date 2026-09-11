@@ -225,7 +225,7 @@ snapshot is never trusted.
 The committed position lives **in the sink**, written atomically with the
 data (design §17.3). `internal/state` (bbolt) is the exception for external
 plugin sinks that cannot persist a position themselves; when both exist, the
-sink wins (see `docs/state-position.md`). Resume folds use `position.MinSafe`
+sink wins (see `docs/architecture/state-position.md`). Resume folds use `position.MinSafe`
 — an undefined order is an error, never an arbitrary pick (P1).
 
 ## Registered for v2 (not v1 gaps)
