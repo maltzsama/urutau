@@ -147,18 +147,18 @@ docker compose -f test/e2e/docker-compose.yml down
 ## Next steps
 
 - **Postgres or Kafka as the source** instead of MySQL: see
-  [Sources and sinks](reference/sinks-and-sources.md#sources)
-  for what each source needs (`serverId` is MySQL-specific; Postgres needs
-  `slotName`, Kafka needs `bootstrapServers`).
+  [Sources](reference/sources.md) for what each source needs (`serverId`
+  is MySQL-specific; Postgres needs `slotName`, Kafka needs
+  `bootstrapServers`).
 - **ClickHouse or Couchbase as the sink** instead of Iceberg: same spec
   shape, different `sink.type` and connection fields — see
-  [Sources and sinks](reference/sinks-and-sources.md#sinks).
+  [Sinks](reference/sinks.md).
 - **Distributed mode** (coordinator + worker, for when one process isn't
   enough): `urutau-coordinator` and `urutau-worker` instead of `urutau
   run`, plus the Kubernetes operator (`cmd/operator`) if you want a CRD
   instead of hand-run binaries.
 - **Enrichment** (joining events against a small reference table before
-  they land): see `enrich` in [Semantics](reference/semantics.md#enrich-columnar-broadcast-join).
+  they land): see [Enrichment](reference/enrichment.md).
 - **Writing your own source/sink**: [Plugins](guides/plugins.md).
 - **The full behavior contract** (delivery guarantees, ordering, what
   happens on a poison batch): [Semantics](reference/semantics.md).
