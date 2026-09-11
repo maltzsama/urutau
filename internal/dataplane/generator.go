@@ -349,7 +349,7 @@ func AdversarialNullBefore(alloc memory.Allocator) *Batch {
 // Collapse call and never persist or cross batches. If keys ever need to
 // persist or be compared across batches, this design must be revisited
 // (type widening across batches, e.g. int32→int64, would change keys).
-// See docs/encode-key.md.
+// See website/docs/architecture/encode-key.md.
 func EncodeKey(record arrow.RecordBatch, row int, pkIdxs []int, pkCols []string) ([]byte, error) {
 	const (
 		typeInt32   byte = 0x01

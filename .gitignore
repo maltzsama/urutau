@@ -372,3 +372,11 @@ $RECYCLE.BIN/
 /coordinator
 /worker
 /operator
+
+# Claude Code — no claude on repo
+.claude/
+
+### Docusaurus ###
+website/node_modules/
+website/build/
+website/.docusaurus/

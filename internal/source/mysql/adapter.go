@@ -158,8 +158,7 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 // source boundary owns the row-to-wire encode: the puller batches the
 // decoder's row-shaped output against the canonical schema (introspected at
 // Open) and gates on drift BEFORE encode — a field the schema does not know
-// is rejected where the native shape exists, never silently dropped. This is
-// the end-state of the columnar migration (see docs/quarantine.md): the row
+// is rejected where the native shape exists, never silently dropped. The row
 // universe ends at the CDC decoder; the worker is fully columnar.
 type stream struct {
 	*Reader

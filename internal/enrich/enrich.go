@@ -64,7 +64,7 @@ const DefaultMaxRows = 5_000_000
 // coldStartPolicy resolves the onColdStart grammar. The columnar join
 // decides cold start PER BATCH: coldDrop returns the whole batch as
 // dropped; coldBuffer and coldPass both miss every row (the per-row buffer
-// the row path kept is gone — see docs/semantics.md).
+// the row path kept is gone — see website/docs/reference/semantics.md).
 type coldStartPolicy int
 
 const (
@@ -234,7 +234,7 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 		// bufferLimits is still validated as grammar (a spec that reached us
 		// unvalidated fails loudly), but the cold-start row buffer it tuned
 		// is gone: the columnar join decides cold start per batch, not per
-		// row. See docs/semantics.md.
+		// row. See website/docs/reference/semantics.md.
 		if cfg.BufferLimits.MaxWait != "" {
 			if d, err := time.ParseDuration(cfg.BufferLimits.MaxWait); err != nil || d < 0 {
 				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a non-negative duration", cfg.Table, cfg.BufferLimits.MaxWait)
