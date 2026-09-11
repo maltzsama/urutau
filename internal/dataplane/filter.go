@@ -189,6 +189,9 @@ func compareEqual(ctx context.Context, alloc memory.Allocator, col arrow.Array, 
 	if err != nil {
 		return nil, err
 	}
+	if releasable, ok := sc.(scalar.Releasable); ok {
+		defer releasable.Release()
+	}
 	colDatum := compute.NewDatum(col)
 	defer colDatum.Release()
 	scDatum := compute.NewDatum(sc)

@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -245,6 +246,9 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 		if cfg.MaxRows < 0 {
 			return nil, fmt.Errorf("enrich: reference %q: maxRows %d must be >= 0", cfg.Table, cfg.MaxRows)
 		}
+		if cfg.MaxRows > math.MaxInt32 {
+			return nil, fmt.Errorf("enrich: reference %q: maxRows %d exceeds the int32 row-index limit (%d) — the broadcast join indexes rows as int32", cfg.Table, cfg.MaxRows, math.MaxInt32)
+		}
 		for ev, ref := range cfg.On {
 			if !evCols[ev] {
 				return nil, fmt.Errorf("enrich: reference %q: on: event column %q is not in the table's schema", cfg.Table, ev)
@@ -389,7 +393,11 @@ func LoadWildcardColumns(ctx context.Context, cfgs []spec.Enrich) ([]string, err
 		if !isWildcard(cfg) {
 			continue
 		}
-		l, err := NewSQLLoader(cfg.Source.URI, cfg.Source.Query, "")
+		maxRows := cfg.MaxRows
+		if maxRows == 0 {
+			maxRows = DefaultMaxRows
+		}
+		l, err := NewSQLLoader(cfg.Source.URI, cfg.Source.Query, "", maxRows)
 		if err != nil {
 			return nil, fmt.Errorf("enrich: reference %q: %w", cfg.Table, err)
 		}
@@ -609,7 +617,11 @@ func (s *Stage) Stop() {
 // parking the cold-start queue for the next Apply to release.
 func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 	if rj.loader == nil {
-		l, err := NewSQLLoader(rj.cfg.Source.URI, rj.cfg.Source.Query, rj.onRef)
+		maxRows := rj.cfg.MaxRows
+		if maxRows == 0 {
+			maxRows = DefaultMaxRows
+		}
+		l, err := NewSQLLoader(rj.cfg.Source.URI, rj.cfg.Source.Query, rj.onRef, maxRows)
 		if err != nil {
 			rj.setFirstErr(err)
 			log.Error("enrich: reference loader failed (will retry)", "reference", rj.cfg.Table, "err", err)
