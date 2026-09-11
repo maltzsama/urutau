@@ -147,10 +147,11 @@ func (s *Stage) applyChanges(t *testing.T, changes []rowchange.Change) ([]rowcha
 		}
 	}
 	ensure("order_ref", core.KindInt64)
-	for _, rj := range s.refs {
-		for _, name := range rj.refDests {
-			ensure(name, core.KindString)
-		}
+	// RefColumns(), not the bare rj.refDests field: refresh can write it
+	// concurrently now (LoadWildcards / the async ticker), so this test
+	// helper must go through the same lock RefColumns() uses.
+	for _, name := range s.RefColumns() {
+		ensure(name, core.KindString)
 	}
 	rec, err := transport.RecordFromChanges(changes, inferred, nil)
 	if err != nil {

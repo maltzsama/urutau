@@ -143,11 +143,12 @@ type refJoin struct {
 	// so Start never re-parses (and never ignores a parse error).
 	refreshEvery time.Duration
 	// refDests are the FINAL destination names (renames applied) this
-	// reference injects, known at construction for explicit selects.
-	// ColumnarJoin's miss fallback writes NULLs into them; Stage.RefColumns
-	// exposes them so the caller can extend the table's wire schema. Empty
-	// for a wildcard select — those destinations are only known at load
-	// time (the documented exception in New).
+	// reference injects. Known at construction for explicit selects; for a
+	// wildcard select, empty until refresh's first successful load
+	// resolves the real names (see New, LoadWildcards). ColumnarJoin's miss
+	// fallback writes NULLs into them; Stage.RefColumns exposes them so the
+	// caller can extend the table's wire schema. Guarded by mu once
+	// refresh can write it concurrently with a RefColumns() reader.
 	refDests []string
 
 	// snap is the hot-path state: image + dests + refTypes, swapped
@@ -155,8 +156,9 @@ type refJoin struct {
 	// refresh (one goroutine per reference).
 	snap atomic.Pointer[snapshot]
 
-	// mu protects the sticky first-load error — written rarely (first
-	// load), never on the hot path.
+	// mu protects the sticky first-load error and refDests — both written
+	// rarely (construction, and each successful refresh), never read on the
+	// per-batch hot path (RefColumns is a boot/schema-owner call).
 	mu       sync.Mutex
 	firstErr error // sticky: a broken reference surfaces on the first batch
 
@@ -179,11 +181,11 @@ type dest struct {
 // the load loudly (P4 — the operator casts in the reference query; the
 // join never coerces).
 //
-// Wildcard exception: with select ["*"] the reference destinations are only
-// known at load time, so RefColumns is empty and a miss before the first
-// non-empty load injects no columns — the table's schema can drift between
-// the first batches and the first load. Documented trade-off: the
-// cold-start policy governs it, or declare the columns explicitly.
+// Wildcard: with select ["*"] the reference destinations are only known at
+// load time, so RefColumns is empty until the first load resolves them.
+// The caller closes this drift window by calling LoadWildcards
+// synchronously, right after New, before extending the table's wire
+// schema and before Start — see LoadWildcards.
 func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("enrich: no references declared")
@@ -330,8 +332,10 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 // given declarations inject, for explicit selects — the wire-schema extension
 // a caller must apply BEFORE the pipeline starts, so every batch travels with
 // the full column set and the drift check sees one stable shape. Empty for a
-// wildcard select: those destinations are only known at load time (the
-// documented exception in New).
+// wildcard select: this function does no I/O and the real names are only
+// known once the reference query runs — see LoadWildcardColumns (no Stage)
+// or Stage.LoadWildcards + Stage.RefColumns (with a Stage) for the
+// wildcard-aware equivalent.
 //
 // Exported because the pipeline's three schema owners — the collapsed runner,
 // the worker's assignment path and the coordinator's assignment builder —
@@ -353,15 +357,71 @@ func RefColumnsFor(cfgs []spec.Enrich) []string {
 	return out
 }
 
-// AddRefColumns returns cs extended with the declarations' reference
-// destination columns (deduplicated; nullable strings — the registered type
-// decision until CR-069 resolves real types). Callers apply it to every
-// schema shape that feeds a sink table or a drift check BEFORE the pipeline
-// starts: without it, the first enriched batch carries columns the table
-// lacks and every sink silently drops them (they project by the table's own
-// columns, never by the wire's).
-func AddRefColumns(cs core.Schema, cfgs []spec.Enrich) core.Schema {
-	for _, dest := range RefColumnsFor(cfgs) {
+// LoadWildcardColumns runs the first load, synchronously, for every
+// WILDCARD reference in cfgs and returns the complete RefColumns set for
+// cfgs: RefColumnsFor's explicit-select names plus the real names just
+// discovered for each wildcard reference. For a caller with no Stage of
+// its own — the coordinator, which forwards enrich declarations to the
+// worker instead of running the join itself, so it has no long-lived
+// place to keep a Stage — but still needs the real wildcard columns before
+// it extends a table's wire schema for sink DDL.
+//
+// Each wildcard reference gets its own short-lived loader (opened and
+// closed here); this is deliberately independent of whatever Stage the
+// worker later builds for the same declarations — the two processes share
+// no connection, so the worker's real, long-lived load still runs a second
+// time. Accepted, disclosed cost of the coordinator/worker split; not
+// avoidable without a protocol change.
+func LoadWildcardColumns(ctx context.Context, cfgs []spec.Enrich) ([]string, error) {
+	out := RefColumnsFor(cfgs)
+	for _, cfg := range cfgs {
+		if !isWildcard(cfg) {
+			continue
+		}
+		l, err := NewSQLLoader(cfg.Source.URI, cfg.Source.Query, "")
+		if err != nil {
+			return nil, fmt.Errorf("enrich: reference %q: %w", cfg.Table, err)
+		}
+		rec, err := l.Load(ctx)
+		if err != nil {
+			_ = l.Close()
+			return nil, fmt.Errorf("enrich: reference %q: %w", cfg.Table, err)
+		}
+		snap, err := buildImage(&refJoin{cfg: cfg, onRef: onRefOf(cfg)}, rec)
+		rec.Release()
+		if err != nil {
+			_ = l.Close()
+			return nil, fmt.Errorf("enrich: reference %q: %w", cfg.Table, err)
+		}
+		if err := l.Close(); err != nil {
+			return nil, fmt.Errorf("enrich: reference %q: close: %w", cfg.Table, err)
+		}
+		for _, d := range snap.dests {
+			out = append(out, d.as)
+		}
+	}
+	return out, nil
+}
+
+// onRefOf returns the reference-side column name of cfg's single join
+// pair — New already validates cfg.On has exactly one entry; this mirrors
+// that resolution for a throwaway refJoin used only for column discovery.
+func onRefOf(cfg spec.Enrich) string {
+	for _, ref := range cfg.On {
+		return ref
+	}
+	return ""
+}
+
+// AddColumns returns cs extended with exactly the given destination names
+// (deduplicated; nullable strings — the registered type decision until
+// CR-069 resolves real types). The sibling of AddRefColumns for a caller
+// that already resolved the real destination names itself — e.g. via
+// LoadWildcardColumns, or Stage.RefColumns() after LoadWildcards — instead
+// of recomputing them from cfgs (which RefColumnsFor cannot do for a
+// wildcard select).
+func AddColumns(cs core.Schema, dests []string) core.Schema {
+	for _, dest := range dests {
 		if _, exists := cs.Column(dest); !exists {
 			cs.Columns = append(cs.Columns, core.Column{
 				Name: dest,
@@ -370,6 +430,19 @@ func AddRefColumns(cs core.Schema, cfgs []spec.Enrich) core.Schema {
 		}
 	}
 	return cs
+}
+
+// AddRefColumns returns cs extended with the declarations' EXPLICIT-select
+// reference destination columns — see RefColumnsFor for why a wildcard
+// select contributes nothing here. Callers apply it to every schema shape
+// that feeds a sink table or a drift check BEFORE the pipeline starts:
+// without it, the first enriched batch carries columns the table lacks and
+// every sink silently drops them (they project by the table's own columns,
+// never by the wire's). A caller with a wildcard reference must resolve its
+// real columns first (LoadWildcardColumns, or Stage.RefColumns() after
+// LoadWildcards) and use AddColumns instead.
+func AddRefColumns(cs core.Schema, cfgs []spec.Enrich) core.Schema {
+	return AddColumns(cs, RefColumnsFor(cfgs))
 }
 
 // SetMetrics wires Prometheus counters into the stage. Call after New;
@@ -396,17 +469,18 @@ func (s *Stage) Ready() bool {
 }
 
 // RefColumns returns the destination columns this stage injects — resolved
-// at construction for explicit selects, empty for a wildcard select (those
-// destinations are only known at load time; see New for the documented
-// exception). The caller adds them to the table's WIRE schema as nullable
-// columns BEFORE the pipeline starts, so every batch travels with the full
-// column set and the drift check sees one stable shape. A left-join miss
-// writes NULL into these columns; the schema declares them nullable, so the
-// wire is never violated.
+// at construction for explicit selects; for a wildcard select, empty until
+// the reference's first load resolves the real names (refresh updates them
+// — see LoadWildcards to force that load synchronously, before Start, so
+// RefColumns is correct from the first batch). The caller adds them to the
+// table's WIRE schema as nullable columns BEFORE the pipeline starts, so
+// every batch travels with the full column set and the drift check sees
+// one stable shape. A left-join miss writes NULL into these columns; the
+// schema declares them nullable, so the wire is never violated.
 func (s *Stage) RefColumns() []string {
 	var out []string
 	for _, rj := range s.refs {
-		out = append(out, rj.refDests...)
+		out = append(out, rj.refDestNames()...)
 	}
 	return out
 }
@@ -423,6 +497,37 @@ func (rj *refJoin) refreshInterval() (time.Duration, error) {
 	return d, nil
 }
 
+// isWildcard reports whether cfg selects every reference column ("*").
+func isWildcard(cfg spec.Enrich) bool {
+	return len(cfg.Select) == 1 && cfg.Select[0] == "*"
+}
+
+// LoadWildcards runs the first load, synchronously, for every WILDCARD
+// reference in the stage — explicit-select references are untouched; they
+// keep Start's fully asynchronous first load. Call after New (and any
+// UseLoader overrides), before Start: closing #56(a)'s schema-drift gap
+// means the caller reads RefColumns() (now resolved for wildcard too)
+// before extending the table's wire schema, which must happen before the
+// pipeline starts accepting batches.
+//
+// Returns the first error encountered, wrapped with the failing
+// reference's table name — the caller should fail boot rather than call
+// Start, exactly like any other boot-time schema error. References are
+// tried in declaration order so a repeated failure always names the same
+// reference first.
+func (s *Stage) LoadWildcards(ctx context.Context) error {
+	for _, rj := range s.refs {
+		if !isWildcard(rj.cfg) {
+			continue
+		}
+		rj.refresh(ctx, s.log)
+		if err := rj.stickyErr(); err != nil {
+			return fmt.Errorf("enrich: reference %q: %w", rj.cfg.Table, err)
+		}
+	}
+	return nil
+}
+
 // UseLoader overrides the SQL loader for one reference (test seam). Must be
 // called before Start — the loader field has no lock.
 func (s *Stage) UseLoader(refTable string, l Loader) error {
@@ -435,9 +540,11 @@ func (s *Stage) UseLoader(refTable string, l Loader) error {
 	return fmt.Errorf("enrich: no reference named %q", refTable)
 }
 
-// Start launches the first load and the refresh loop per reference —
-// asynchronously: the pipeline boots without waiting for the references,
-// and the cold-start policy governs whatever arrives early.
+// Start launches the first load (skipped for a reference LoadWildcards
+// already warmed) and the refresh loop per reference. For any reference
+// Start itself loads for the first time, this is asynchronous: the
+// pipeline boots without waiting for it, and the cold-start policy governs
+// whatever arrives early.
 func (s *Stage) Start(ctx context.Context) {
 	for _, rj := range s.refs {
 		s.wg.Add(1)
@@ -445,10 +552,15 @@ func (s *Stage) Start(ctx context.Context) {
 			defer s.wg.Done()
 			t := time.NewTicker(rj.refreshEvery)
 			defer t.Stop()
-			// First load immediately; a failure is sticky (it surfaces on
-			// the first event) and the ticker keeps retrying, so a
-			// reference database that boots late still comes hot.
-			rj.refresh(ctx, s.log)
+			// First load immediately, UNLESS LoadWildcards already warmed
+			// this reference — a wildcard ref loaded synchronously at boot
+			// must not pay a second, redundant query here. A failure is
+			// sticky (it surfaces on the first event) and the ticker keeps
+			// retrying, so a reference database that boots late still comes
+			// hot.
+			if rj.snap.Load() == nil {
+				rj.refresh(ctx, s.log)
+			}
 			for {
 				select {
 				case <-ctx.Done():
@@ -527,10 +639,23 @@ func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 	// reclaims the buffers by GC once no reader references them. Explicit
 	// release only happens in Stop, when no join can be in flight.
 	rj.snap.Store(snap)
+	// refDests was only ever set once, at New, from RefColumnsFor — empty
+	// for a wildcard select, because the real names are unknown without I/O.
+	// Now that a load just resolved them (buildImage's dests, star or not),
+	// refresh it here so Stage.RefColumns() (read by every schema owner)
+	// stops lying about a wildcard reference the moment it goes hot. Guarded
+	// by mu — the same lock firstErr already uses — because refresh's
+	// goroutine (Start's ticker) is the only writer, but RefColumns() can
+	// read concurrently from another goroutine.
+	names := make([]string, len(snap.dests))
+	for i, d := range snap.dests {
+		names[i] = d.as
+	}
+	rj.mu.Lock()
+	rj.refDests = names
 	// Clear the sticky first-load error on ANY success: "Sticky ONLY before
 	// the first success" means a transient boot failure must not poison the
 	// stage forever once the reference comes hot (audit #1).
-	rj.mu.Lock()
 	rj.firstErr = nil
 	rj.mu.Unlock()
 	log.Info("enrich: reference loaded", "reference", rj.cfg.Table, "rows", len(snap.keyIndex))
@@ -742,4 +867,13 @@ func (rj *refJoin) stickyErr() error {
 	rj.mu.Lock()
 	defer rj.mu.Unlock()
 	return rj.firstErr
+}
+
+// refDestNames reads refDests under mu — refresh can write it concurrently
+// (LoadWildcards, or the async refresh ticker) with the join's cold-start
+// fallback path reading it, so this is not a lock-free field any more.
+func (rj *refJoin) refDestNames() []string {
+	rj.mu.Lock()
+	defer rj.mu.Unlock()
+	return rj.refDests
 }

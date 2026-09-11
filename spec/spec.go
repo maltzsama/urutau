@@ -168,7 +168,9 @@ type Enrich struct {
 	// On maps event column → reference column (the join key pair). One
 	// pair today; a composite key is a future need, not a current one.
 	On map[string]string `json:"on"`
-	// Select limits the reference columns taken; empty takes all.
+	// Select limits the reference columns taken; ["*"] takes all (the
+	// wildcard sugar). Empty is rejected — declare the columns explicitly
+	// or use ["*"].
 	Select []string `json:"select,omitempty"`
 	// As renames reference columns on the way into the event (ref column
 	// → destination name). Keys must appear in Select when Select is set.

@@ -84,6 +84,16 @@ func (f *fakeLoader) Load(context.Context) (arrow.RecordBatch, error) {
 	return f.rec, nil
 }
 
+// loadsCount reads the call counter under the lock — races with a
+// concurrent Load from a refresh goroutine are otherwise real (-race
+// catches a bare field read here, unlike the single-threaded-by-then
+// reads elsewhere in this package's older tests).
+func (f *fakeLoader) loadsCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loads
+}
+
 func (f *fakeLoader) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
