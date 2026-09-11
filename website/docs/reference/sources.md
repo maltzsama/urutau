@@ -28,5 +28,5 @@ Message format is selected per pipeline via `source.format`:
 
 `avro` requires `source.schemaRegistry` (a Confluent-compatible HTTP
 registry URL). See
-[Writing a driver](../guides/plugins) if you're building a source that
+[Writing a plugin](../guides/plugins) if you're building a source that
 isn't one of these three.
