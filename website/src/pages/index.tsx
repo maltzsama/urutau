@@ -30,8 +30,8 @@ function HomepageHeader() {
 
 const features = [
   {
-    title: 'No Broker',
-    description: 'Read the replication log once and write the destination directly — nothing sits in between.',
+    title: 'No New Broker',
+    description: 'Reads from MySQL, Postgres, or an existing Kafka/Redpanda topic and writes the destination directly — no broker or relay stood up in between.',
   },
   {
     title: 'Upsert Reflects State',
