@@ -100,6 +100,17 @@ func TestValidateEnrich(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatalf("star + rename must validate: %v", err)
 	}
+
+	s = base()
+	s.Tables[0].Enrich[0].MaxRows = -1
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "maxRows") {
+		t.Fatalf("want maxRows must be positive, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].MaxRows = 1000
+	if err := s.Validate(); err != nil {
+		t.Fatalf("positive maxRows must validate: %v", err)
+	}
 }
 
 func TestValidateCommitMode(t *testing.T) {

@@ -386,6 +386,9 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 				*problems = append(*problems, fmt.Sprintf("%s.bufferLimits.maxWait: %q is not a duration (e.g. 30s)", ep, e.BufferLimits.MaxWait))
 			}
 		}
+		if e.MaxRows < 0 {
+			*problems = append(*problems, ep+".maxRows: must be positive")
+		}
 		semiAnti := e.JoinType == "left semi" || e.JoinType == "left anti"
 		// select is REQUIRED (except for semi/anti, which emit no reference
 		// columns — a select there is a spec error): the user declares what

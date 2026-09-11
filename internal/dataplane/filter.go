@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow/scalar"
 )
 
 // Op values matching the wire schema __op column (CR-021).
@@ -163,39 +164,76 @@ func evaluateColPredicate(ctx context.Context, alloc memory.Allocator, col arrow
 			return nil, err
 		}
 		defer eq.Release()
-		return invertBool(alloc, eq)
+		return invertBool(ctx, eq)
 	default:
 		return nil, fmt.Errorf("dataplane: unsupported predicate op %q (supported: \"=\", \"!=\")", pred.Op)
 	}
 }
 
-func compareEqual(_ context.Context, alloc memory.Allocator, col arrow.Array, val any, n int) (arrow.Array, error) {
-	switch a := col.(type) {
-	case *array.Int32:
+// compareEqual builds an equality mask via the arrow-go compute kernels
+// (compute.CallFunction "equal") instead of a hand-rolled per-type scan.
+// Two behaviors the kernel does NOT give us for free, so we still guard
+// them explicitly to match this package's documented semantics:
+//
+//   - Kleene null propagation: "equal" against a null input produces null,
+//     not false. coalesceFalse walks the result after the call and forces
+//     every null bit to false (M-14 — a null mask bit never passes a row).
+//   - Silent numeric overflow: casting an out-of-range int64 into an Int32
+//     scalar wraps instead of erroring. The explicit range check is kept
+//     for Int32 so an out-of-range predicate value still fails loudly.
+//   - Silent NaN acceptance: "equal" against NaN quietly returns false for
+//     every row instead of erroring. The explicit NaN check is kept so
+//     this stays a documented, loud error instead of a silent no-op.
+func compareEqual(ctx context.Context, alloc memory.Allocator, col arrow.Array, val any, n int) (arrow.Array, error) {
+	sc, err := scalarFor(col.DataType(), val)
+	if err != nil {
+		return nil, err
+	}
+	colDatum := compute.NewDatum(col)
+	defer colDatum.Release()
+	scDatum := compute.NewDatum(sc)
+	defer scDatum.Release()
+	res, err := compute.CallFunction(ctx, "equal", nil, colDatum, scDatum)
+	if err != nil {
+		return nil, fmt.Errorf("dataplane: equal: %w", err)
+	}
+	defer res.Release()
+	out := res.(*compute.ArrayDatum).MakeArray()
+	defer out.Release()
+	return coalesceFalse(alloc, out.(*array.Boolean)), nil
+}
+
+// scalarFor validates val against col's Arrow type and binds it to a
+// scalar.Scalar of that exact type, preserving the type-checking this
+// package documents (a predicate value type mismatch is a loud error, not
+// an implicit cast).
+func scalarFor(dt arrow.DataType, val any) (scalar.Scalar, error) {
+	switch dt.ID() {
+	case arrow.INT32:
 		switch v := val.(type) {
 		case int32:
-			return compareInt32Eq(alloc, a, v, n), nil
+			return scalar.MakeScalarParam(v, dt)
 		case int64:
 			if v < math.MinInt32 || v > math.MaxInt32 {
 				return nil, fmt.Errorf("dataplane: predicate value %d out of range for Int32", v)
 			}
-			return compareInt32Eq(alloc, a, int32(v), n), nil
+			return scalar.MakeScalarParam(int32(v), dt)
 		default:
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want int32/int64 for column of type Int32", val)
 		}
-	case *array.Int64:
+	case arrow.INT64:
 		v, ok := val.(int64)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want int64 for column of type Int64", val)
 		}
-		return compareInt64Eq(alloc, a, v, n), nil
-	case *array.Uint64:
+		return scalar.MakeScalarParam(v, dt)
+	case arrow.UINT64:
 		v, ok := val.(uint64)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want uint64 for column of type Uint64", val)
 		}
-		return compareUint64Eq(alloc, a, v, n), nil
-	case *array.Float64:
+		return scalar.MakeScalarParam(v, dt)
+	case arrow.FLOAT64:
 		v, ok := val.(float64)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want float64 for column of type Float64", val)
@@ -203,151 +241,61 @@ func compareEqual(_ context.Context, alloc memory.Allocator, col arrow.Array, va
 		if math.IsNaN(v) {
 			return nil, fmt.Errorf("dataplane: NaN predicate matches nothing (documented)")
 		}
-		return compareFloat64Eq(alloc, a, v, n), nil
-	case *array.String:
+		return scalar.MakeScalarParam(v, dt)
+	case arrow.STRING:
 		v, ok := val.(string)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want string for column of type String", val)
 		}
-		return compareStringEq(alloc, a, v, n), nil
-	case *array.Boolean:
+		return scalar.MakeScalarParam(v, dt)
+	case arrow.BOOL:
 		v, ok := val.(bool)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want bool for column of type Boolean", val)
 		}
-		return compareBoolEq(alloc, a, v, n), nil
-	case *array.Date32:
+		return scalar.MakeScalarParam(v, dt)
+	case arrow.DATE32:
 		v, ok := val.(int32)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want int32 (days) for column of type Date32", val)
 		}
-		return compareDate32Eq(alloc, a, v, n), nil
-	case *array.Time64:
+		return scalar.MakeScalarParam(v, dt)
+	case arrow.TIME64:
 		v, ok := val.(int64)
 		if !ok {
 			return nil, fmt.Errorf("dataplane: predicate value type %T, want int64 (micros) for column of type Time64", val)
 		}
-		return compareTime64Eq(alloc, a, v, n), nil
+		return scalar.MakeScalarParam(v, dt)
 	default:
-		return nil, fmt.Errorf("dataplane: unsupported column type %T for equality predicate", col)
+		return nil, fmt.Errorf("dataplane: unsupported column type %s for equality predicate", dt)
 	}
 }
 
-func compareInt64Eq(alloc memory.Allocator, col *array.Int64, val int64, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false) // coalesce null → false
-		} else {
-			bb.Append(col.Value(i) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func compareStringEq(alloc memory.Allocator, col *array.String, val string, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false)
-		} else {
-			bb.Append(col.Value(i) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func compareBoolEq(alloc memory.Allocator, col *array.Boolean, val bool, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false)
-		} else {
-			bb.Append(col.Value(i) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func compareInt32Eq(alloc memory.Allocator, col *array.Int32, val int32, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false)
-		} else {
-			bb.Append(col.Value(i) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func compareUint64Eq(alloc memory.Allocator, col *array.Uint64, val uint64, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false)
-		} else {
-			bb.Append(col.Value(i) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func compareFloat64Eq(alloc memory.Allocator, col *array.Float64, val float64, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false)
-		} else {
-			bb.Append(col.Value(i) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func compareDate32Eq(alloc memory.Allocator, col *array.Date32, val int32, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false)
-		} else {
-			bb.Append(int32(col.Value(i)) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func compareTime64Eq(alloc memory.Allocator, col *array.Time64, val int64, n int) arrow.Array {
-	bb := array.NewBooleanBuilder(alloc)
-	defer bb.Release()
-	for i := range n {
-		if col.IsNull(i) {
-			bb.Append(false)
-		} else {
-			bb.Append(int64(col.Value(i)) == val)
-		}
-	}
-	return bb.NewBooleanArray()
-}
-
-func invertBool(alloc memory.Allocator, col arrow.Array) (arrow.Array, error) {
-	b, ok := col.(*array.Boolean)
-	if !ok {
-		return nil, fmt.Errorf("dataplane: invertBool: type %T, want *array.Boolean", col)
-	}
+// coalesceFalse forces every null bit in a boolean mask to false (M-14):
+// a null mask bit never passes a row, so an absent predicate value drops
+// the row rather than admitting it by accident. The compute kernels
+// propagate null (Kleene logic); this package coalesces instead.
+func coalesceFalse(alloc memory.Allocator, b *array.Boolean) arrow.Array {
 	bb := array.NewBooleanBuilder(alloc)
 	defer bb.Release()
 	for i := range b.Len() {
-		bb.Append(!b.Value(i))
+		bb.Append(b.IsValid(i) && b.Value(i))
 	}
-	return bb.NewBooleanArray(), nil
+	return bb.NewBooleanArray()
+}
+
+func invertBool(ctx context.Context, col arrow.Array) (arrow.Array, error) {
+	if _, ok := col.(*array.Boolean); !ok {
+		return nil, fmt.Errorf("dataplane: invertBool: type %T, want *array.Boolean", col)
+	}
+	colDatum := compute.NewDatum(col)
+	defer colDatum.Release()
+	res, err := compute.CallFunction(ctx, "not", nil, colDatum)
+	if err != nil {
+		return nil, fmt.Errorf("dataplane: invert: %w", err)
+	}
+	defer res.Release()
+	return res.(*compute.ArrayDatum).MakeArray(), nil
 }
 
 // buildOpMask creates a boolean mask that is true only where the __op
@@ -492,17 +440,20 @@ func evalAll(ctx context.Context, alloc memory.Allocator, batch *Batch, preds []
 			combined = mask
 			continue
 		}
-		// AND: combined = combined AND mask
-		bb := array.NewBooleanBuilder(alloc)
-		cArr := combined.(*array.Boolean)
-		mArr := mask.(*array.Boolean)
-		for j := range cArr.Len() {
-			bb.Append(cArr.Value(j) && mArr.Value(j))
-		}
+		// Both masks are already coalesced (no nulls), so plain "and" and
+		// "and_kleene" agree here; "and" has the simpler signature.
+		combinedDatum := compute.NewDatum(combined)
+		maskDatum := compute.NewDatum(mask)
+		res, err := compute.CallFunction(ctx, "and", nil, combinedDatum, maskDatum)
+		combinedDatum.Release()
+		maskDatum.Release()
 		mask.Release()
 		combined.Release()
-		combined = bb.NewBooleanArray()
-		bb.Release() // explicit, not deferred — safe inside the loop
+		if err != nil {
+			return nil, fmt.Errorf("dataplane: transition: predicate %d: and: %w", i, err)
+		}
+		combined = res.(*compute.ArrayDatum).MakeArray()
+		res.Release()
 	}
 	return combined, nil
 }

@@ -52,6 +52,14 @@ import (
 // size cold-start expectations accordingly, or set `refresh` shorter.
 const DefaultRefresh = 5 * time.Minute
 
+// DefaultMaxRows caps a reference image's row count when the spec is
+// silent (MaxRows == 0). The broadcast join holds the reference whole —
+// refTable's Arrow buffers plus one keyIndex entry per row — so this is
+// the default backstop between "small by contract" and an unannounced
+// OOM. Override per reference via spec.Enrich.MaxRows when the reference
+// is legitimately larger (or smaller) than this.
+const DefaultMaxRows = 5_000_000
+
 // coldStartPolicy resolves the onColdStart grammar. The columnar join
 // decides cold start PER BATCH: coldDrop returns the whole batch as
 // dropped; coldBuffer and coldPass both miss every row (the per-row buffer
@@ -233,6 +241,9 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 		}
 		if cfg.BufferLimits.MaxEvents < 0 {
 			return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxEvents %d must be >= 0", cfg.Table, cfg.BufferLimits.MaxEvents)
+		}
+		if cfg.MaxRows < 0 {
+			return nil, fmt.Errorf("enrich: reference %q: maxRows %d must be >= 0", cfg.Table, cfg.MaxRows)
 		}
 		for ev, ref := range cfg.On {
 			if !evCols[ev] {
@@ -701,6 +712,16 @@ func buildImage(rj *refJoin, rec arrow.RecordBatch) (*snapshot, error) {
 	// refresh does.
 	if rec == nil || rec.NumRows() == 0 {
 		return &snapshot{keyIndex: map[any]int32{}}, nil
+	}
+
+	maxRows := rj.cfg.MaxRows
+	if maxRows == 0 {
+		maxRows = DefaultMaxRows
+	}
+	if int(rec.NumRows()) > maxRows {
+		return nil, fmt.Errorf(
+			"enrich: reference %q: %d rows exceeds maxRows %d — the broadcast join holds the whole reference in RAM; raise maxRows on the reference declaration or shrink the reference query",
+			rj.cfg.Table, rec.NumRows(), maxRows)
 	}
 
 	schema := rec.Schema()
