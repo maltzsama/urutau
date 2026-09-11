@@ -35,7 +35,7 @@ not replaying a separate checkpoint log.
 **The engine is closed; the driver seam is open.** Sources and sinks are
 public Go contracts at the module root — a source or sink is a package
 that implements a handful of small interfaces and registers itself, never
-touching an `internal/` path. See [Writing a driver](https://maltzsama.github.io/urutau/docs/guides/plugins).
+touching an `internal/` path. See [Writing a plugin](https://maltzsama.github.io/urutau/docs/guides/plugins).
 
 ## Get started
 
@@ -96,7 +96,7 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | [Enrichment](https://maltzsama.github.io/urutau/docs/reference/enrichment) | Broadcast reference join — grammar, cold start, examples |
 | [Known limitations and roadmap](https://maltzsama.github.io/urutau/docs/reference/roadmap) | What's genuinely missing today, kept current |
 | [Plugin contract](https://maltzsama.github.io/urutau/docs/reference/plugin-contract) | The normative Arrow Flight subprocess plugin contract |
-| [Writing a driver](https://maltzsama.github.io/urutau/docs/guides/plugins) | How to write a source or sink — both mechanisms (Go `.so` plugin and Arrow Flight subprocess) |
+| [Writing a plugin](https://maltzsama.github.io/urutau/docs/guides/plugins) | The Arrow Flight subprocess contract (normative), plus the narrower in-process Go `.so` alternative |
 | [Architecture](https://maltzsama.github.io/urutau/docs/architecture/overview) | Package boundaries, the dependency diagram, repository map, E2E spike findings |
 | [EncodeKey](https://maltzsama.github.io/urutau/docs/architecture/encode-key) | Design note: the collapse-stage key encoding |
 | [State position](https://maltzsama.github.io/urutau/docs/architecture/state-position) | Design note: where a committed position lives, and the sink-vs-store arbitration rule |
