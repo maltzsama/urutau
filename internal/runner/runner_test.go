@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -291,6 +297,114 @@ func TestIntrospectAllExtendsBothShapesForEnrich(t *testing.T) {
 		t.Fatal("sourceSchemas must not contain the reference destination")
 	}
 }
+
+// wildcardLoader satisfies enrich.Loader without a database: two columns
+// unknown to the config (id, tier) — the shape a select:["*"] reference
+// only discovers by actually running the query.
+type wildcardLoader struct{}
+
+func (l *wildcardLoader) Load(context.Context) (arrow.RecordBatch, error) {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "tier", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	b.Field(0).(*array.Int64Builder).Append(1)
+	b.Field(1).(*array.StringBuilder).Append("gold")
+	return b.NewRecordBatch(), nil
+}
+func (l *wildcardLoader) Close() error { return nil }
+
+// #56(a): a wildcard reference's real destination columns must land in
+// BOTH wire and resolved before EnsureTable runs, not only after the
+// first async refresh. This exercises the exact sequence newRunner now
+// runs — introspectAll, then enrich.New + LoadWildcards + AddColumns —
+// with a fake loader standing in for the reference query, since
+// LoadWildcards's whole point is to run that query synchronously right
+// here, before any sink DDL.
+func TestWildcardReferenceColumnsLandBeforeEnsureTable(t *testing.T) {
+	src := &introspectSource{schema: core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}},
+	}}}
+	cfg := spec.Enrich{
+		Table:  "users",
+		Source: spec.EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, tier FROM users"},
+		On:     map[string]string{"user_ref": "id"},
+		Select: []string{"*"},
+	}
+	s := &spec.Spec{Tables: []spec.Table{{
+		Source: "db.users", Target: "raw.users", Enrich: []spec.Enrich{cfg},
+	}}}
+	_, resolved, wire, sourceSchemas, _, err := introspectAll(context.Background(), src, s, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("introspectAll: %v", err)
+	}
+	// Before the fix's loop runs, a wildcard reference contributes nothing
+	// — this is the bug #56(a) describes.
+	if _, ok := wire["db.users"].Column("users.id"); ok {
+		t.Fatal("wildcard columns present before LoadWildcards ran — test setup is wrong")
+	}
+
+	// The sequence newRunner's boot now runs, before EnsureTable.
+	st, err := enrich.New([]spec.Enrich{cfg}, sourceSchemas["db.users"], slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("enrich.New: %v", err)
+	}
+	if err := st.UseLoader("users", &wildcardLoader{}); err != nil {
+		t.Fatalf("UseLoader: %v", err)
+	}
+	if err := st.LoadWildcards(context.Background()); err != nil {
+		t.Fatalf("LoadWildcards: %v", err)
+	}
+	dests := st.RefColumns()
+	wire["db.users"] = enrich.AddColumns(wire["db.users"], dests)
+	resolved["db.users"] = enrich.AddColumns(resolved["db.users"], dests)
+
+	for name, m := range map[string]core.Schema{"resolved": resolved["db.users"], "wire": wire["db.users"]} {
+		for _, want := range []string{"users.id", "users.tier"} {
+			if _, ok := m.Column(want); !ok {
+				t.Fatalf("%s shape missing wildcard-discovered column %q after LoadWildcards", name, want)
+			}
+		}
+	}
+}
+
+// A wildcard reference whose first load fails must fail boot loudly,
+// naming the reference — never a silent fallback to an empty schema.
+func TestWildcardReferenceLoadFailureFailsLoudly(t *testing.T) {
+	cfg := spec.Enrich{
+		Table:  "users",
+		Source: spec.EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, tier FROM users"},
+		On:     map[string]string{"user_ref": "id"},
+		Select: []string{"*"},
+	}
+	sourceSchema := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}},
+	}}
+	st, err := enrich.New([]spec.Enrich{cfg}, sourceSchema, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("enrich.New: %v", err)
+	}
+	if err := st.UseLoader("users", &failingLoader{err: errors.New("connection refused")}); err != nil {
+		t.Fatalf("UseLoader: %v", err)
+	}
+	err = st.LoadWildcards(context.Background())
+	if err == nil {
+		t.Fatal("LoadWildcards: want error for an unreachable reference, got nil")
+	}
+	got := err.Error()
+	if !strings.Contains(got, "users") || !strings.Contains(got, "connection refused") {
+		t.Fatalf("LoadWildcards error %q does not name the reference and the cause", got)
+	}
+}
+
+type failingLoader struct{ err error }
+
+func (l *failingLoader) Load(context.Context) (arrow.RecordBatch, error) { return nil, l.err }
+func (l *failingLoader) Close() error                                    { return nil }
 
 // FT-5: the golden-path integration — a spec with enrich, an empty→hot
 // loader, and a runner with fake source/sink producing one batch per phase,
