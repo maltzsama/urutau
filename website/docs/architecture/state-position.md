@@ -1,3 +1,7 @@
+---
+sidebar_position: 3
+---
+
 # Position: where the checkpoint lives
 
 > Answers the structural audit finding: *"the arbitration rule is not

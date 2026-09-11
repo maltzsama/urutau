@@ -1,3 +1,7 @@
+---
+sidebar_position: 1
+---
+
 # Quickstart
 
 Replicate one MySQL table into Apache Iceberg, on your machine, in one
@@ -143,21 +147,21 @@ docker compose -f test/e2e/docker-compose.yml down
 ## Next steps
 
 - **Postgres or Kafka as the source** instead of MySQL: see
-  [`docs/reference/sinks-and-sources.md`](reference/sinks-and-sources.md#sources)
+  [Sources and sinks](reference/sinks-and-sources.md#sources)
   for what each source needs (`serverId` is MySQL-specific; Postgres needs
   `slotName`, Kafka needs `bootstrapServers`).
 - **ClickHouse or Couchbase as the sink** instead of Iceberg: same spec
   shape, different `sink.type` and connection fields — see
-  [`docs/reference/sinks-and-sources.md`](reference/sinks-and-sources.md#sinks).
+  [Sources and sinks](reference/sinks-and-sources.md#sinks).
 - **Distributed mode** (coordinator + worker, for when one process isn't
   enough): `urutau-coordinator` and `urutau-worker` instead of `urutau
   run`, plus the Kubernetes operator (`cmd/operator`) if you want a CRD
   instead of hand-run binaries.
 - **Enrichment** (joining events against a small reference table before
-  they land): see `enrich` in [`docs/reference/semantics.md`](reference/semantics.md#enrich-columnar-broadcast-join).
-- **Writing your own source/sink**: [`docs/guides/plugins.md`](guides/plugins.md).
+  they land): see `enrich` in [Semantics](reference/semantics.md#enrich-columnar-broadcast-join).
+- **Writing your own source/sink**: [Plugins](guides/plugins.md).
 - **The full behavior contract** (delivery guarantees, ordering, what
-  happens on a poison batch): [`docs/reference/semantics.md`](reference/semantics.md).
+  happens on a poison batch): [Semantics](reference/semantics.md).
 
 If something in this page doesn't work as written, that's a doc bug — open
 an issue rather than silently working around it.

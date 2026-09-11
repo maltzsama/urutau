@@ -1,3 +1,7 @@
+---
+sidebar_position: 1
+---
+
 # Architecture overview
 
 Sources and sinks are decoupled behind public contracts at the module
