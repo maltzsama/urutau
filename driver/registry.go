@@ -84,14 +84,39 @@ func RegisterSink(scheme string, factory SinkFactory) error {
 	return nil
 }
 
+// PluginWrap turns a .so's raw registered factories into the actually-served
+// form. LoadPlugin calls it (when non-nil) on every source/sink kind a
+// plugin's Init newly registered, so a .so author's RegisterSource/
+// RegisterSink code never has to know or care what happens after — today
+// that means wrapping the real driver in an in-process Arrow Flight server
+// and handing back a Flight client adapter (internal/plugin/flightserver +
+// internal/plugin/client), so the .so speaks the SAME contract a subprocess
+// plugin speaks. This package stays free of that machinery on purpose
+// (TestContractsArePluginSafe): driver is a contract package an external
+// plugin module imports directly, and must not transitively import engine
+// internals. The concrete PluginWrap implementation lives in
+// internal/plugin/flightwrap; cmd/* wires it in.
+type PluginWrap interface {
+	WrapSource(path string, real SourceFactory) SourceFactory
+	WrapSink(path string, real SinkFactory) SinkFactory
+}
+
 // LoadPlugin opens a Go plugin (.so) and calls its exported Init function.
 // The plugin must export:
 //
 //	func Init() error
 //
-// Init is responsible for calling RegisterSource/RegisterSink.
+// Init is responsible for calling RegisterSource/RegisterSink exactly as a
+// built-in driver would. If wrap is non-nil, LoadPlugin then replaces every
+// source/sink kind the plugin newly registered with wrap's wrapped form —
+// see PluginWrap. A nil wrap registers the plugin's factories unwrapped
+// (test-only; production callers always pass a wrap so a .so's driver is
+// actually served over Arrow Flight, never called in-process by contract).
+//
 // Rules: same Go version, same dependency graph, Linux/macOS only.
-func LoadPlugin(path string) (err error) {
+func LoadPlugin(path string, wrap PluginWrap) (err error) {
+	beforeSources, beforeSinks := registeredKindSet(), registeredSinkSet()
+
 	// A panicking Init must not take down the host: registration is partial
 	// at that point and the error is far more actionable than a crash.
 	defer func() {
@@ -111,7 +136,60 @@ func LoadPlugin(path string) (err error) {
 	if !ok {
 		return fmt.Errorf("driver: plugin %s Init has wrong signature (want func() error)", path)
 	}
-	return initFunc()
+	if err := initFunc(); err != nil {
+		return err
+	}
+	if wrap == nil {
+		return nil
+	}
+
+	return wrapNewlyRegistered(path, wrap, beforeSources, beforeSinks)
+}
+
+// registeredKindSet/registeredSinkSet snapshot the registry's current keys —
+// used by LoadPlugin to diff what a .so's Init call newly registered.
+func registeredKindSet() map[string]bool {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	m := make(map[string]bool, len(reg.sources))
+	for k := range reg.sources {
+		m[k] = true
+	}
+	return m
+}
+
+func registeredSinkSet() map[string]bool {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	m := make(map[string]bool, len(reg.sinks))
+	for k := range reg.sinks {
+		m[k] = true
+	}
+	return m
+}
+
+// wrapNewlyRegistered replaces every source/sink kind a .so's Init call just
+// added with wrap's wrapped factory.
+func wrapNewlyRegistered(path string, wrap PluginWrap, beforeSources, beforeSinks map[string]bool) error {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	for kind, entry := range reg.sources {
+		if beforeSources[kind] {
+			continue
+		}
+		reg.sources[kind] = sourceEntry{
+			caps:    entry.caps,
+			factory: wrap.WrapSource(path, entry.factory),
+		}
+	}
+	for scheme, realFactory := range reg.sinks {
+		if beforeSinks[scheme] {
+			continue
+		}
+		reg.sinks[scheme] = wrap.WrapSink(path, realFactory)
+	}
+	return nil
 }
 
 // registeredKinds lists the registered source kinds, sorted so diagnostics

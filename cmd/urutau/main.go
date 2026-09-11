@@ -19,6 +19,7 @@ import (
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/pipeline"
 	"github.com/maltzsama/urutau/internal/plugin"
+	"github.com/maltzsama/urutau/internal/plugin/flightwrap"
 	"github.com/maltzsama/urutau/internal/runner"
 	"github.com/maltzsama/urutau/internal/supervisor"
 	"github.com/maltzsama/urutau/internal/version"
@@ -101,7 +102,7 @@ func runCmd() *cobra.Command {
 func (f *pipelineFlags) run(ctx context.Context) error {
 	// Load dynamic plugins before anything else.
 	for _, p := range f.pluginPaths {
-		if err := driver.LoadPlugin(p); err != nil {
+		if err := driver.LoadPlugin(p, flightwrap.Wrap{}); err != nil {
 			return err
 		}
 	}

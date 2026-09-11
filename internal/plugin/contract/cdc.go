@@ -23,7 +23,7 @@ func CDCRecordSchema(tableFields []arrow.Field) *arrow.Schema {
 		{Name: "before", Type: beforeAfter, Nullable: true},
 		{Name: "after", Type: beforeAfter, Nullable: true},
 		{Name: "offset", Type: arrow.BinaryTypes.Binary, Nullable: false},
-		{Name: "ts_source", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}, Nullable: true},
+		{Name: "ts_source", Type: &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}, Nullable: true},
 	}, nil)
 }
 
