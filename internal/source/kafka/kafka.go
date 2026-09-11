@@ -92,8 +92,7 @@ func (s Source) Introspect(_ context.Context, t spec.Table) (core.TableRef, core
 
 	cols := make([]core.Column, 0, len(t.Columns))
 	for _, name := range names {
-		typeStr := t.Columns[name]
-		ct, err := core.ParseColumnType(typeStr)
+		ct, err := t.Columns[name].Resolve()
 		if err != nil {
 			return core.TableRef{}, core.Schema{}, nil,
 				fmt.Errorf("kafka: table %q column %q: %w", t.Source, name, err)

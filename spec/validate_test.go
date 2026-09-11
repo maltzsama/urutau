@@ -362,7 +362,7 @@ func TestValidateKafkaPrimaryKeyByMode(t *testing.T) {
 	s.Tables[0].WriteMode = WriteModeAppend
 	s.Tables[0].PrimaryKey = nil
 	s.Tables[0].OnDelete = OnDeleteSkip
-	s.Tables[0].Columns = map[string]string{"id": "string"}
+	s.Tables[0].Columns = map[string]ColumnDecl{"id": {Scalar: "string"}}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("kafka append without primaryKey must validate: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestValidateKafkaAppendOnDelete(t *testing.T) {
 	s.Source.Kind = "kafka"
 	s.Tables[0].WriteMode = WriteModeAppend
 	s.Tables[0].PrimaryKey = nil
-	s.Tables[0].Columns = map[string]string{"id": "string"}
+	s.Tables[0].Columns = map[string]ColumnDecl{"id": {Scalar: "string"}}
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "onDelete") {
 		t.Fatalf("want onDelete problem for kafka append, got %v", err)
 	}
@@ -404,7 +404,7 @@ func TestValidateAppendIdempotent(t *testing.T) {
 	s.Source.Kind = "kafka"
 	s.Tables[0].WriteMode = WriteModeAppendIdempotent
 	s.Tables[0].PrimaryKey = nil
-	s.Tables[0].Columns = map[string]string{"payload": "string"}
+	s.Tables[0].Columns = map[string]ColumnDecl{"payload": {Scalar: "string"}}
 	s.Tables[0].OnDelete = OnDeleteSkip
 	s.Tables[0].Metadata = []core.MetadataColumn{
 		{From: core.MetaStream, As: "stream_name"},
@@ -438,7 +438,7 @@ func TestValidateAvroFormat(t *testing.T) {
 	s.Source.Kind = "kafka"
 	s.Tables[0].WriteMode = WriteModeAppend
 	s.Tables[0].OnDelete = OnDeleteSkip
-	s.Tables[0].Columns = map[string]string{"payload": "string"}
+	s.Tables[0].Columns = map[string]ColumnDecl{"payload": {Scalar: "string"}}
 	s.Source.Format = "avro"
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "schemaRegistry") {
 		t.Fatalf("want schemaRegistry problem, got %v", err)
