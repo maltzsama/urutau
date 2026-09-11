@@ -157,7 +157,8 @@ type Table struct {
 
 // Enrich declares one broadcast reference join. The reference table is
 // small by contract: it must fit the worker's RAM, because it is held
-// whole as a map keyed by the join column.
+// whole as a map keyed by the join column. MaxRows enforces the contract
+// with a hard, configurable cap instead of an unannounced OOM.
 type Enrich struct {
 	// Table names the reference (diagnostics and duplicate detection).
 	Table string `json:"table"`
@@ -193,6 +194,15 @@ type Enrich struct {
 	// (the oldest event is evacuated, and follows JoinType), MaxWait caps
 	// latency (an event queued longer follows JoinType at drain time).
 	BufferLimits EnrichBufferLimits `json:"bufferLimits,omitempty"`
+	// MaxRows caps the reference image's row count: the broadcast join
+	// holds the whole reference in RAM (refTable + a keyIndex entry per
+	// row), so an unbounded reference is an unbounded, unannounced OOM.
+	// Zero means the package default (enrich.DefaultMaxRows). A load that
+	// returns more rows than this is rejected loudly, not truncated
+	// silently — the reference is small by contract; a reference that
+	// outgrows this needs a raised limit or a different tool, not a
+	// silent truncation.
+	MaxRows int `json:"maxRows,omitempty"`
 }
 
 // EnrichSource is where a reference table is read from.

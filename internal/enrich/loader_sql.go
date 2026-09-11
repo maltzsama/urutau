@@ -46,8 +46,11 @@ import (
 // NewSQLLoader opens the reference connection. The URI scheme picks the
 // driver (mysql:// or postgres://); onRef is the reference-side join column
 // name — the loader appends ORDER BY onRef when the query has no ORDER BY,
-// so buildImage can detect duplicate keys by adjacent diff.
-func NewSQLLoader(uri, query, onRef string) (Loader, error) {
+// so buildImage can detect duplicate keys by adjacent diff. maxRows caps
+// the row count Load will materialize into Arrow builders — 0 means no
+// cap (buildImage still enforces its own default on the returned batch,
+// but a loader with no cap here can peak memory before that check runs).
+func NewSQLLoader(uri, query, onRef string, maxRows int) (Loader, error) {
 	var connector driver.Connector
 	switch {
 	case strings.HasPrefix(uri, "mysql://"):
@@ -72,7 +75,7 @@ func NewSQLLoader(uri, query, onRef string) (Loader, error) {
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1) // one sequential re-read per refresh; no pool theater
 	db.SetConnMaxLifetime(5 * time.Minute)
-	return &sqlLoader{db: db, query: query, onRef: onRef, alloc: memory.DefaultAllocator}, nil
+	return &sqlLoader{db: db, query: query, onRef: onRef, alloc: memory.DefaultAllocator, maxRows: maxRows}, nil
 }
 
 // mysqlConfig parses a mysql:// URI into the driver config — WITHOUT ever
@@ -120,10 +123,11 @@ func mysqlConfig(raw string) (*mysql.Config, error) {
 }
 
 type sqlLoader struct {
-	db    *sql.DB
-	query string
-	onRef string
-	alloc memory.Allocator
+	db      *sql.DB
+	query   string
+	onRef   string
+	alloc   memory.Allocator
+	maxRows int
 }
 
 var orderByRe = regexp.MustCompile(`(?is)\border\s+by\b[^)]*$`)
@@ -193,8 +197,13 @@ func (l *sqlLoader) Load(ctx context.Context) (arrow.RecordBatch, error) {
 		scanTargets[i] = new(any)
 	}
 
+	rowCount := 0
 	//allow:rowloop Row 1 — THE ONLY ROW LOOP IN THE SYSTEM (database/sql imposes it).
 	for rows.Next() {
+		rowCount++
+		if l.maxRows > 0 && rowCount > l.maxRows {
+			return nil, fmt.Errorf("enrich: reference: exceeds maxRows %d — the broadcast join holds the whole reference in RAM; raise maxRows on the reference declaration or shrink the reference query", l.maxRows)
+		}
 		if err := rows.Scan(scanTargets...); err != nil {
 			return nil, fmt.Errorf("enrich: reference scan: %w", err)
 		}

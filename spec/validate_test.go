@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -99,6 +100,22 @@ func TestValidateEnrich(t *testing.T) {
 	s.Tables[0].Enrich[0].As = map[string]string{"name": "user_name"}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("star + rename must validate: %v", err)
+	}
+
+	s = base()
+	s.Tables[0].Enrich[0].MaxRows = -1
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "maxRows") {
+		t.Fatalf("want maxRows must be positive, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].MaxRows = 1000
+	if err := s.Validate(); err != nil {
+		t.Fatalf("positive maxRows must validate: %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].MaxRows = math.MaxInt32 + 1
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "maxRows") {
+		t.Fatalf("want maxRows int32 bound, got %v", err)
 	}
 }
 

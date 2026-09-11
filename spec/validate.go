@@ -3,6 +3,7 @@ package spec
 import (
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -385,6 +386,12 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 			if _, err := time.ParseDuration(e.BufferLimits.MaxWait); err != nil {
 				*problems = append(*problems, fmt.Sprintf("%s.bufferLimits.maxWait: %q is not a duration (e.g. 30s)", ep, e.BufferLimits.MaxWait))
 			}
+		}
+		if e.MaxRows < 0 {
+			*problems = append(*problems, ep+".maxRows: must be positive")
+		}
+		if e.MaxRows > math.MaxInt32 {
+			*problems = append(*problems, fmt.Sprintf("%s.maxRows: %d exceeds the int32 row-index limit (%d) — the broadcast join indexes rows as int32", ep, e.MaxRows, math.MaxInt32))
 		}
 		semiAnti := e.JoinType == "left semi" || e.JoinType == "left anti"
 		// select is REQUIRED (except for semi/anti, which emit no reference

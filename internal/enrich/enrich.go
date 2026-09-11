@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -51,6 +52,14 @@ import (
 // hot again within one interval. At the default this is up to 5 minutes —
 // size cold-start expectations accordingly, or set `refresh` shorter.
 const DefaultRefresh = 5 * time.Minute
+
+// DefaultMaxRows caps a reference image's row count when the spec is
+// silent (MaxRows == 0). The broadcast join holds the reference whole —
+// refTable's Arrow buffers plus one keyIndex entry per row — so this is
+// the default backstop between "small by contract" and an unannounced
+// OOM. Override per reference via spec.Enrich.MaxRows when the reference
+// is legitimately larger (or smaller) than this.
+const DefaultMaxRows = 5_000_000
 
 // coldStartPolicy resolves the onColdStart grammar. The columnar join
 // decides cold start PER BATCH: coldDrop returns the whole batch as
@@ -234,6 +243,12 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 		if cfg.BufferLimits.MaxEvents < 0 {
 			return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxEvents %d must be >= 0", cfg.Table, cfg.BufferLimits.MaxEvents)
 		}
+		if cfg.MaxRows < 0 {
+			return nil, fmt.Errorf("enrich: reference %q: maxRows %d must be >= 0", cfg.Table, cfg.MaxRows)
+		}
+		if cfg.MaxRows > math.MaxInt32 {
+			return nil, fmt.Errorf("enrich: reference %q: maxRows %d exceeds the int32 row-index limit (%d) — the broadcast join indexes rows as int32", cfg.Table, cfg.MaxRows, math.MaxInt32)
+		}
 		for ev, ref := range cfg.On {
 			if !evCols[ev] {
 				return nil, fmt.Errorf("enrich: reference %q: on: event column %q is not in the table's schema", cfg.Table, ev)
@@ -378,7 +393,11 @@ func LoadWildcardColumns(ctx context.Context, cfgs []spec.Enrich) ([]string, err
 		if !isWildcard(cfg) {
 			continue
 		}
-		l, err := NewSQLLoader(cfg.Source.URI, cfg.Source.Query, "")
+		maxRows := cfg.MaxRows
+		if maxRows == 0 {
+			maxRows = DefaultMaxRows
+		}
+		l, err := NewSQLLoader(cfg.Source.URI, cfg.Source.Query, "", maxRows)
 		if err != nil {
 			return nil, fmt.Errorf("enrich: reference %q: %w", cfg.Table, err)
 		}
@@ -598,7 +617,11 @@ func (s *Stage) Stop() {
 // parking the cold-start queue for the next Apply to release.
 func (rj *refJoin) refresh(ctx context.Context, log *slog.Logger) {
 	if rj.loader == nil {
-		l, err := NewSQLLoader(rj.cfg.Source.URI, rj.cfg.Source.Query, rj.onRef)
+		maxRows := rj.cfg.MaxRows
+		if maxRows == 0 {
+			maxRows = DefaultMaxRows
+		}
+		l, err := NewSQLLoader(rj.cfg.Source.URI, rj.cfg.Source.Query, rj.onRef, maxRows)
 		if err != nil {
 			rj.setFirstErr(err)
 			log.Error("enrich: reference loader failed (will retry)", "reference", rj.cfg.Table, "err", err)
@@ -701,6 +724,16 @@ func buildImage(rj *refJoin, rec arrow.RecordBatch) (*snapshot, error) {
 	// refresh does.
 	if rec == nil || rec.NumRows() == 0 {
 		return &snapshot{keyIndex: map[any]int32{}}, nil
+	}
+
+	maxRows := rj.cfg.MaxRows
+	if maxRows == 0 {
+		maxRows = DefaultMaxRows
+	}
+	if int(rec.NumRows()) > maxRows {
+		return nil, fmt.Errorf(
+			"enrich: reference %q: %d rows exceeds maxRows %d — the broadcast join holds the whole reference in RAM; raise maxRows on the reference declaration or shrink the reference query",
+			rj.cfg.Table, rec.NumRows(), maxRows)
 	}
 
 	schema := rec.Schema()

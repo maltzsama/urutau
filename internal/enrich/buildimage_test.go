@@ -64,6 +64,45 @@ func TestDuplicateKeyErrorCitesColumnAndCount(t *testing.T) {
 	}
 }
 
+// TestMaxRowsRejectsOversizedReference — a reference load that returns
+// more rows than MaxRows (or DefaultMaxRows when unset) is a rejected
+// load, not a silent OOM risk: the broadcast join holds the whole
+// reference in RAM, so the cap must fail loudly at load time.
+func TestMaxRowsRejectsOversizedReference(t *testing.T) {
+	cfg := refCfg(func(c *spec.Enrich) { c.MaxRows = 2 })
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	loader := fakeRows(t, []map[string]any{
+		{"id": int64(1), "name": "ana", "tier": "gold"},
+		{"id": int64(2), "name": "beto", "tier": "silver"},
+		{"id": int64(3), "name": "caio", "tier": "bronze"},
+	})
+	if uerr := s.UseLoader("users", loader); uerr != nil {
+		t.Fatal(uerr)
+	}
+	s.Start(t.Context())
+	t.Cleanup(s.Stop)
+
+	var serr error
+	for i := 0; i < 200; i++ {
+		if serr = s.refs[0].stickyErr(); serr != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if serr == nil {
+		t.Fatal("reference exceeding maxRows did not fail the load")
+	}
+	if !strings.Contains(serr.Error(), "maxRows") {
+		t.Fatalf("error must cite maxRows: %v", serr)
+	}
+	if s.refs[0].isHot() {
+		t.Fatal("an oversized reference must not go hot")
+	}
+}
+
 func TestBuildImageEmptyReferenceGoesHot(t *testing.T) {
 	cfg := refCfg(nil)
 	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
