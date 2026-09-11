@@ -80,7 +80,7 @@ Iceberg, ClickHouse, or Couchbase, single-process or distributed, with the
 k8s operator — and the commit path has been verified by reading back
 through Trino rather than trusting a successful write. Correctness-critical
 paths are still being actively hardened; read
-[Sinks and sources](https://maltzsama.github.io/urutau/docs/reference/sinks-and-sources#known-limitations)
+[Known limitations and roadmap](https://maltzsama.github.io/urutau/docs/reference/roadmap)
 before relying on this for anything you can't afford to lose.
 
 ## Documentation
@@ -91,7 +91,10 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | --- | --- |
 | [Quickstart](https://maltzsama.github.io/urutau/docs/quickstart) | Run a real pipeline on your machine, step by step |
 | [Semantics](https://maltzsama.github.io/urutau/docs/reference/semantics) | **The behavior contract** — delivery guarantees, ordering, delete-image handling, enrich join grammar, poison-batch policy. Read this before depending on any behavior not shown in an example. |
-| [Sinks and sources](https://maltzsama.github.io/urutau/docs/reference/sinks-and-sources) | Per-source and per-sink feature detail, enrichment reference, known limitations, roadmap |
+| [Sources](https://maltzsama.github.io/urutau/docs/reference/sources) | MySQL, Postgres, Kafka — what each needs, Kafka's decoder formats |
+| [Sinks](https://maltzsama.github.io/urutau/docs/reference/sinks) | Iceberg, ClickHouse, Couchbase — commit mechanics, nested-column support, atomicity trade-offs |
+| [Enrichment](https://maltzsama.github.io/urutau/docs/reference/enrichment) | Broadcast reference join — grammar, cold start, examples |
+| [Known limitations and roadmap](https://maltzsama.github.io/urutau/docs/reference/roadmap) | What's genuinely missing today, kept current |
 | [Plugin contract](https://maltzsama.github.io/urutau/docs/reference/plugin-contract) | The normative Arrow Flight subprocess plugin contract |
 | [Writing a driver](https://maltzsama.github.io/urutau/docs/guides/plugins) | How to write a source or sink — both mechanisms (Go `.so` plugin and Arrow Flight subprocess) |
 | [Architecture](https://maltzsama.github.io/urutau/docs/architecture/overview) | Package boundaries, the dependency diagram, repository map, E2E spike findings |
