@@ -38,8 +38,8 @@ const features = [
     description: 'UPDATE/DELETE changes the row in the destination. No appended duplicates, no tombstone sprawl.',
   },
   {
-    title: 'One Binary',
-    description: 'Coordinator and worker in a single Go process. No JVM sidecar, no second runtime.',
+    title: 'No JVM Sidecar',
+    description: 'Writes natively from the same Go binary that reads the log — standalone in one process, or coordinator+worker distributed via the operator. No JAR, no gRPC hop to a second runtime.',
   },
 ];
 
