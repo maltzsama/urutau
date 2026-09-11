@@ -327,14 +327,29 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		c.surfaceWarnings(ref.Source, warns)
 		refs = append(refs, ref)
-		// Reference columns (explicit selects — known at boot) join BOTH
-		// shapes: the assignment/wire schema the worker encodes against and
-		// the resolved schema EnsureTable creates the table from. Without
-		// it, the first enriched batch carries a column the table lacks and
-		// every sink silently drops it. Registered decision: nullable
-		// strings until CR-069 resolves real types.
-		canonical[t.Source] = enrich.AddRefColumns(core.WireSchema(srcSchema, res), t.Enrich)
-		resolvedSchemas[t.Source] = enrich.AddRefColumns(res, t.Enrich)
+		// Reference columns join BOTH shapes: the assignment/wire schema
+		// the worker encodes against and the resolved schema EnsureTable
+		// creates the table from. Without it, the first enriched batch
+		// carries a column the table lacks and every sink silently drops
+		// it. Registered decision: nullable strings until CR-069 resolves
+		// real types.
+		//
+		// The coordinator has no Stage of its own (it forwards enrich
+		// declarations to the worker, which runs the real, long-lived
+		// join). For a wildcard select, the real column names are only
+		// known once the reference query runs — LoadWildcardColumns runs
+		// it synchronously here, at boot, so canonical/resolvedSchemas are
+		// correct before EnsureTable and before any worker session
+		// connects (#56). This is a second, short-lived query against the
+		// reference beyond the worker's own load — an accepted,
+		// disclosed cost of the coordinator/worker split (no shared
+		// connection between the two processes).
+		dests, err := enrich.LoadWildcardColumns(ctx, t.Enrich)
+		if err != nil {
+			return fmt.Errorf("coordinator: %s: enrich: %w", t.Source, err)
+		}
+		canonical[t.Source] = enrich.AddColumns(core.WireSchema(srcSchema, res), dests)
+		resolvedSchemas[t.Source] = enrich.AddColumns(res, dests)
 		tableBySource[t.Source] = t
 	}
 	c.refs = refs
