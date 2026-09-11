@@ -171,6 +171,7 @@ func (s *Spec) Validate() error {
 		validateFilter(tbl.Filter, p+".filter", &problems)
 		validateMetadata(tbl, p, &problems)
 		validateCast(tbl, p, &problems)
+		validateColumns(tbl, p, &problems)
 		validatePartitionBy(tbl, p, &problems)
 		validateBootstrap(tbl, p, &problems)
 		validateEnrich(tbl, p, &problems)
@@ -238,6 +239,23 @@ func validateCast(tbl Table, path string, problems *[]string) {
 		}
 		if _, err := core.ParseCastTarget(text); err != nil {
 			*problems = append(*problems, fmt.Sprintf("%s.cast.%s: %v", path, name, err))
+		}
+	}
+}
+
+// validateColumns resolves every declared column (scalar or nested
+// struct/list/map) at boot, so a grammar mistake — an unknown scalar type,
+// a malformed composite shape — fails loudly here instead of surfacing at
+// first use inside a source's Introspect (audit #10: every other textual
+// grammar in this package is validated at boot, not at runtime).
+func validateColumns(tbl Table, path string, problems *[]string) {
+	for name, decl := range tbl.Columns {
+		if name == "" {
+			*problems = append(*problems, fmt.Sprintf("%s.columns: empty column name", path))
+			continue
+		}
+		if _, err := decl.Resolve(); err != nil {
+			*problems = append(*problems, fmt.Sprintf("%s.columns.%s: %v", path, name, err))
 		}
 	}
 }

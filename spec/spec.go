@@ -141,10 +141,11 @@ type Table struct {
 	// "decimal(20,4)", "timestamptz(assume_utc)").
 	Cast map[string]string `json:"cast,omitempty"`
 	// Columns defines the source schema explicitly for sources that cannot
-	// be introspected (e.g. Kafka). Each entry maps a column name to its
-	// canonical type string. Ignored for SQL sources which introspect
-	// automatically.
-	Columns map[string]string `json:"columns,omitempty"`
+	// be introspected (e.g. Kafka). Each entry is either a scalar type
+	// string ("int64", "decimal(20,4)") or a composite declaration
+	// (struct/list/map, nested to any depth) — see ColumnDecl. Ignored for
+	// SQL sources which introspect automatically.
+	Columns map[string]ColumnDecl `json:"columns,omitempty"`
 	// Bootstrap configures how the initial snapshot is handled.
 	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
 	// Enrich joins each event against reference tables loaded in memory
