@@ -9,6 +9,8 @@ package main
 import (
 	"context"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -146,17 +148,70 @@ func (p pluginPos) Compare(o position.Position) int {
 
 // ── Sink ─────────────────────────────────────────────────────────────
 
-type pluginRecords struct{}
+// pluginRecords captures committed rows so a test loading this .so via
+// driver.LoadPlugin can assert data actually moved end-to-end.
+type pluginRecords struct {
+	mu   sync.Mutex
+	rows map[string][]map[string]any
+}
 
 func newPluginRecords() *pluginRecords {
-	return &pluginRecords{}
+	return &pluginRecords{rows: map[string][]map[string]any{}}
 }
 
 func (r *pluginRecords) commit(b *dataplane.Batch) {
-	// Compile-only example: this standalone demonstrates the sink contract
-	// shape; the real plugin sink (internal/plugin/sink.go) commits the
-	// RecordBatch columnar. Nothing is stored here on purpose.
-	_ = b
+	if b == nil || b.Record == nil {
+		return
+	}
+	schema := b.Record.Schema()
+	dataIdx := map[string]int{}
+	for i := range schema.NumFields() {
+		name := schema.Field(i).Name
+		if !strings.HasPrefix(name, "__") {
+			dataIdx[name] = i
+		}
+	}
+	n := int(b.Record.NumRows())
+	rows := make([]map[string]any, 0, n)
+	for row := 0; row < n; row++ {
+		m := make(map[string]any, len(dataIdx))
+		for name, ci := range dataIdx {
+			col := b.Record.Column(ci)
+			if col.IsNull(row) {
+				continue
+			}
+			m[name] = pluginArrowValue(col, row)
+		}
+		rows = append(rows, m)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rows[b.Table] = append(r.rows[b.Table], rows...)
+}
+
+func pluginArrowValue(col arrow.Array, row int) any {
+	switch c := col.(type) {
+	case *array.Int64:
+		return c.Value(row)
+	case *array.String:
+		return c.Value(row)
+	default:
+		return nil
+	}
+}
+
+// Rows returns a copy of the committed rows for a target table.
+// Exported so an out-of-process caller (a test that opened this .so via
+// driver.LoadPlugin) can read them back via the .so's own Lookup — but in
+// practice the flightserver-wrapped path never exposes this Go value
+// directly (it only speaks Flight), so tests assert via the sink contract
+// instead.
+func (r *pluginRecords) Rows(target string) []map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]map[string]any, len(r.rows[target]))
+	copy(out, r.rows[target])
+	return out
 }
 
 type pluginSink struct {
