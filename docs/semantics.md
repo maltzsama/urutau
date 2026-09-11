@@ -30,7 +30,7 @@ Within one table, changes are applied in **arrival order**, and the
 last-write-wins collapse picks the last operation per key. The worker's
 batch buffer preserves arrival order across source batches (the
 granularity-insensitivity property); the columnar enrich join preserves row
-order (it is a broadcast lookup, never a re-sort).
+order (a membership test plus a positional gather, never a re-sort).
 
 Across tables there is **no ordering guarantee**.
 
@@ -92,19 +92,75 @@ materializing it is the default.
 
 ## Enrich: columnar broadcast join
 
-The enrich stage (CR-069) is a **columnar** broadcast hash join: Arrow in,
-Arrow out, no per-row `rowchange` on the path. The reference table is read
-whole into a worker-local map, swapped atomically on a periodic re-read; a
-whole RecordBatch matches against it in one pass. Reference columns land
-**typed** (Int64, Float64, Timestamp, …) — the destination type is derived
-from the first non-null value seen in the reference load. A reference column
-that is NULL in every row falls back to a String placeholder that the next
-non-null load corrects.
+The enrich stage (CR-069) is a **columnar** broadcast join: Arrow in, Arrow
+out, no per-row `rowchange` on the path, no `map[string]any` inside the
+join. The reference is read whole into a worker-local **typed Arrow table**
+(join key as column 0, projected columns after it) plus a `key → row`
+index; the table is swapped atomically on a periodic re-read. A whole
+RecordBatch matches against it with the `is_in` compute kernel (hash
+membership); the matched reference columns are gathered in one Go pass
+(arrow-go v18.7.0 has no `index_in` / `if_else` kernel — that pass is the
+executor's only `//allow:rowloop`). Everything else — `__op == delete`,
+`is_not_null`, `and`/`or`/`not`, the final `FilterRecordBatch` — is a
+kernel. Reference columns land **typed**, straight from the loader's Arrow
+arrays; there is no "first non-null value" type inference any more.
 
-**Cold start is per batch, not per row.** Before the first reference load:
-`onColdStart: drop` drops the whole batch; `buffer` and `pass` both let
-every row through as a miss (reference columns NULL). The row path's per-row
-cold-start buffer — parking events until the reference warmed — is gone.
+### The loader: two rows, imposed by `database/sql`
+
+The SQL reference loader (`loader_sql.go`) has exactly two row-shaped
+loops, co-located in one loop body and marked in the source:
+
+- **Row 1 — `rows.Scan`.** The driver writes into `[]any` targets, one per
+  column, one call per source row.
+- **Row 2 — the value→builder switch (`appendTyped`).** `Scan` hands back
+  the driver's natural Go type per cell; something has to route it to a
+  typed Arrow builder.
+
+Both die together when an Arrow-native driver (ADBC) lands. No other row
+loop exists in the loader.
+
+The loader also appends an `ORDER BY` on the join key when the query has
+none (wrapping the query in a subselect if it already ends in `LIMIT` /
+`GROUP BY` / `UNION`), so the duplicate-key check downstream can compare
+adjacent rows.
+
+### Join-key type: matched at boot or the reference fails loud
+
+The reference's join-column Arrow type and the event's join-column Arrow
+type must be **equal**. A mismatch (e.g. reference `uint64`, event
+`int64`) is a **boot-time failure** naming both types — the reference
+never goes hot, the run does not start enriching against it. There is no
+automatic cast and no width-collapsing coercion: **the operator casts in
+the reference query** so both sides agree.
+
+### Duplicate join key: the error cites the column and the count
+
+A reference whose join key repeats is rejected. The message names the
+**column** and **how many** duplicate rows were seen — never a specific
+value, never a row position (both leak reference data into logs and shift
+between loads).
+
+### Join grammar
+
+`joinType` accepts `left` (alias `left outer`), `inner`, `left semi`,
+`left anti`.
+
+- **left / left outer:** a miss passes with the reference columns NULL and
+  bumps the miss counter.
+- **inner:** a miss drops the row.
+- **left semi:** a hit is kept, **without** the reference columns in the
+  output (a semi join emits no reference columns — `select` is rejected
+  as spec error).
+- **left anti:** a miss is kept, **without** the reference columns.
+- **A delete (`__op == OpDelete`) always survives** every join type — it
+  bypasses the lookup entirely, and its reference columns are NULL.
+
+### Cold start is per batch, not per row
+
+Before the first reference load: `onColdStart: drop` drops the whole
+batch; `buffer` and `pass` both let every row through as a miss (reference
+columns NULL, or — for semi — every non-delete dropped, for anti —
+everything kept). The row path's per-row cold-start buffer is gone.
 
 ## Table-name convention
 

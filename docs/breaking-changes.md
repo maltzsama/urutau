@@ -4,6 +4,63 @@ There is no CHANGELOG file; this page records changes that break wire
 compatibility, spec compatibility, or a documented contract. Ordered newest
 first.
 
+## Onda 2 — enrich Arrow-native inside the join (`feat/perf-onda2-enrich-arrow-native`)
+
+The enrich join no longer decodes a join key per row, computes a string
+`joinKey`, and probes a Go map. The `map[string]map[string]any` snapshot
+image and the `joinKey` / `intKey` helpers are **gone**. The reference is a
+typed Arrow table plus a `key → row` index; the batch matches with the
+`is_in` kernel and one marked Go gather pass.
+
+### `Loader.Load` returns an Arrow RecordBatch
+
+```go
+type Loader interface {
+    Load(ctx context.Context) (arrow.RecordBatch, error)
+    Close() error
+}
+```
+
+was `([]map[string]any, error)`. `NewSQLLoader` gained an `onRef` argument
+(the join column, so the loader can append an `ORDER BY`).
+
+### `enrich.New` takes the event schema
+
+`enrich.New(cfgs, eventSchema core.Schema, log)` — was
+`enrich.New(cfgs, eventColumns []string, log)`. It needs the join
+column's type to check it against the reference at boot. Call sites in
+`runner` and `worker/remote` pass the resolved source schema;
+`introspectAll` now returns `sourceSchemas map[string]core.Schema` in
+place of `sourceCols []string`.
+
+### Join-key type mismatch fails at boot
+
+If the reference's join column and the event's join column are different
+Arrow types, the reference **never goes hot** and the error names both
+types. No automatic cast. Cast in the reference query. The old
+signed/unsigned width-collapsing (`joinKey` treated `uint64` and `int64`
+as the same key space) is gone with it.
+
+### semi / anti joins
+
+`joinType` accepts `left semi` and `left anti` in addition to `left`,
+`left outer`, `inner`. Both emit **no reference columns** — `select` on a
+semi/anti join is a spec error. A delete always survives any join type.
+
+### `Enricher` takes a context
+
+`EnrichBatch(ctx context.Context, b *dataplane.Batch, primaryKey []string)`
+— and `Stage.ColumnarJoin(ctx, b)`. The context threads the allocator into
+the compute kernels.
+
+### `dataplane.Collapse` splits by kernel
+
+The `__op` split loop (a `[]bool` builder per row) is now `equal(__op,
+OpDelete)` + `not`. The composite-PK hashing and last-write-wins grouping
+loops stay — no kernel gives the row-index map — and are marked
+`//allow:rowloop`. `filter.go` (`EvaluatePredicate`, `SplitByOp`,
+`TransitionMatrix`, …) is untouched: it has no production callers.
+
 ## Onda 1 — Arrow end to end (`feat/arrow-onda1-columnar-enrich`)
 
 The data plane is now Arrow from the source encoder to the sink projection.

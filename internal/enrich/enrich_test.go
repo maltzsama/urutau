@@ -52,14 +52,32 @@ func searchEvent(id int64, userRef any) rowchange.Change {
 	}
 }
 
-// newTestStage builds a hot stage with a fake loader already loaded.
+// newTestStage builds a hot stage with a fake loader already loaded. The
+// rows fixtures stay column-value maps for readability; rowsToRec turns
+// them into the Arrow record the loader contract now returns. The event
+// join column's type is derived from the fixture's reference join column
+// so the P4 boot check (types must match) passes for string-keyed refs.
 func newTestStage(t *testing.T, cfg spec.Enrich, rows []map[string]any) (*Stage, *fakeLoader) {
 	t.Helper()
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	kinds := map[string]core.Kind{}
+	for ev, ref := range cfg.On {
+		if len(rows) > 0 {
+			switch rows[0][ref].(type) {
+			case string:
+				kinds[ev] = core.KindString
+			case float64, float32:
+				kinds[ev] = core.KindFloat64
+			case bool:
+				kinds[ev] = core.KindBool
+			}
+		}
+	}
+	s, err := New([]spec.Enrich{cfg}, evSchemaTyped(kinds, "id", "user_ref", "order_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new stage: %v", err)
 	}
-	fl := &fakeLoader{rows: rows}
+	fl := &fakeLoader{}
+	fl.SetRec(rowsToRec(t, rows))
 	if err := s.UseLoader(cfg.Table, fl); err != nil {
 		t.Fatalf("use loader: %v", err)
 	}
@@ -101,14 +119,33 @@ func (s *Stage) applyChanges(t *testing.T, changes []rowchange.Change) ([]rowcha
 	for _, c := range inferred.Columns {
 		seen[c.Name] = true
 	}
+	force := func(name string, kind core.Kind) {
+		for i := range inferred.Columns {
+			if inferred.Columns[i].Name == name {
+				inferred.Columns[i].Type = core.ColumnType{Kind: kind, Nullable: true}
+				return
+			}
+		}
+		inferred.Columns = append(inferred.Columns, core.Column{Name: name, Type: core.ColumnType{Kind: kind, Nullable: true}})
+		seen[name] = true
+	}
+	force("id", core.KindInt64)
+	// The join column's type must match the reference's (P4). The stage's
+	// only reference joins on user_ref → int64 unless the test overrode it;
+	// derive from the stage.
+	joinKind := core.KindInt64
+	for _, rj := range s.refs {
+		if rj.onKeyType != nil && rj.onKeyType.ID() == arrow.STRING {
+			joinKind = core.KindString
+		}
+	}
+	force("user_ref", joinKind)
 	ensure := func(name string, kind core.Kind) {
 		if !seen[name] {
 			inferred.Columns = append(inferred.Columns, core.Column{Name: name, Type: core.ColumnType{Kind: kind, Nullable: true}})
 			seen[name] = true
 		}
 	}
-	ensure("id", core.KindInt64)
-	ensure("user_ref", core.KindInt64)
 	ensure("order_ref", core.KindInt64)
 	for _, rj := range s.refs {
 		for _, name := range rj.refDests {
@@ -121,7 +158,7 @@ func (s *Stage) applyChanges(t *testing.T, changes []rowchange.Change) ([]rowcha
 	}
 	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
-	out, err := s.ColumnarJoin(in)
+	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +269,7 @@ func TestRefreshAtomicSwapUnderConcurrency(t *testing.T) {
 	}()
 	// Refresher: replaces the image repeatedly (bigger each time).
 	for i := range 5 {
-		fl.SetRows(append(fl.rows, map[string]any{"id": int64(100 + i), "name": fmt.Sprintf("x%d", i), "tier": "bronze"}))
+		fl.SetRows(t, append(usersRows(), map[string]any{"id": int64(100 + i), "name": fmt.Sprintf("x%d", i), "tier": "bronze"}))
 		time.Sleep(15 * time.Millisecond)
 	}
 	close(stop)
@@ -263,7 +300,7 @@ func TestNewRejectsUnknownEventColumn(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.On = map[string]string{"nope": "id"}
 	})
-	if _, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil); err == nil {
 		t.Fatal("unknown event column accepted")
 	}
 }
@@ -272,12 +309,12 @@ func TestNewRejectsUnknownEventColumn(t *testing.T) {
 // when the image is built, and the failure is sticky.
 func TestFirstLoadRejectsBadReference(t *testing.T) {
 	cfg := refCfg(nil)
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
 	// The query result has no "id" column (the on reference side).
-	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: []map[string]any{{"pk": int64(1), "name": "ana"}}})
+	_ = s.UseLoader(cfg.Table, fakeRows(t, []map[string]any{{"pk": int64(1), "name": "ana"}}))
 	s.Start(context.Background())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -311,16 +348,24 @@ func TestFailedRefreshKeepsPreviousImage(t *testing.T) {
 	}
 }
 
-// Join key typing: int64 and string do not bridge; int widths do.
-func TestJoinKeyTyping(t *testing.T) {
-	if joinKey(int64(5)) != joinKey(int32(5)) {
+// normalizeKey: int widths collapse (uint64 == int64 for non-negatives);
+// []byte becomes string; string and int stay distinct; float widths stay
+// distinct. The join-key type contract, now on the snapshot index.
+func TestNormalizeKey(t *testing.T) {
+	if normalizeKey(int64(5)) != normalizeKey(int32(5)) {
 		t.Fatal("int widths should normalize to one key")
 	}
-	if joinKey("5") == joinKey(int64(5)) {
+	if normalizeKey(int64(5)) != normalizeKey(uint64(5)) {
+		t.Fatal("int64 and uint64 non-negative should normalize (MySQL UNSIGNED case)")
+	}
+	if normalizeKey("5") == normalizeKey(int64(5)) {
 		t.Fatal("string and int must NOT bridge — cast in SQL instead")
 	}
-	if joinKey([]byte("x")) != joinKey("x") {
+	if normalizeKey([]byte("x")) != normalizeKey("x") {
 		t.Fatal("[]byte and string should normalize to one key")
+	}
+	if normalizeKey(int64(-1)) == normalizeKey(uint64(18446744073709551615)) {
+		t.Fatal("negative int must not collide with a large uint64")
 	}
 }
 
@@ -488,38 +533,35 @@ func TestStarWithRenameInjectsJoinColumnAsNewName(t *testing.T) {
 	}
 }
 
-// The image itself carries ONLY the projected columns, under their final
-// prefixed names — the memory contract of the map.
-func TestImageHoldsProjectedColumnsOnly(t *testing.T) {
+// The refTable carries ONLY the projected columns (plus the join key at
+// column 0), under their final prefixed/renamed names.
+func TestRefTableHoldsProjectedColumnsOnly(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.As = map[string]string{"users.name": "user_name"}
 	})
 	s, _ := newTestStage(t, cfg, refRows())
-	rj := s.refs[0]
-	snap := rj.snap.Load()
+	snap := s.refs[0].snap.Load()
 	if snap == nil {
 		t.Fatal("snapshot not loaded")
 	}
-	img := snap.image
-	for k, row := range img {
-		if len(row) != len(cfg.Select) {
-			t.Fatalf("key %s: image row has %d columns, want %d: %v", k, len(row), len(cfg.Select), row)
-		}
-		// Renamed column uses the custom name.
-		if _, ok := row["user_name"]; !ok {
-			t.Fatalf("image missing renamed column: %v", row)
-		}
-		// Unrenamed column uses prefixed name.
-		if _, ok := row["users.tier"]; !ok {
-			t.Fatalf("image missing prefixed column: %v", row)
-		}
-		// Original unprefixed name should not exist.
-		if _, ok := row["name"]; ok {
-			t.Fatalf("image holds the pre-rename name: %v", row)
-		}
-		if _, ok := row["tier"]; ok {
-			t.Fatalf("image holds unprefixed name: %v", row)
-		}
+	sch := snap.refTable.Schema()
+	// column 0 is the join key; 1..N are the dests.
+	if sch.NumFields() != len(cfg.Select)+1 {
+		t.Fatalf("refTable has %d columns, want %d (join key + %d dests)",
+			sch.NumFields(), len(cfg.Select)+1, len(cfg.Select))
+	}
+	names := map[string]bool{}
+	for i := 1; i < sch.NumFields(); i++ {
+		names[sch.Field(i).Name] = true
+	}
+	if !names["user_name"] {
+		t.Fatalf("refTable missing renamed column: %v", names)
+	}
+	if !names["users.tier"] {
+		t.Fatalf("refTable missing prefixed column: %v", names)
+	}
+	if names["name"] || names["tier"] {
+		t.Fatalf("refTable holds a pre-rename / unprefixed name: %v", names)
 	}
 }
 
@@ -529,11 +571,11 @@ func TestSelectColumnMissingFromQueryRejected(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"name", "nope"}
 	})
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	_ = s.UseLoader(cfg.Table, &fakeLoader{rows: refRows()})
+	_ = s.UseLoader(cfg.Table, fakeRows(t, refRows()))
 	s.Start(context.Background())
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -573,23 +615,23 @@ func TestMultiReferenceCollisionWithPrefix(t *testing.T) {
 		JoinType: "left",
 	}
 
-	s, err := New([]spec.Enrich{cfg1, cfg2}, []string{"id", "user_ref", "product_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg1, cfg2}, evSchema("id", "user_ref", "product_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
 
 	// Load users reference.
-	fl1 := &fakeLoader{rows: []map[string]any{
+	fl1 := fakeRows(t, []map[string]any{
 		{"id": int64(1), "name": "ana"},
-	}}
+	})
 	if err := s.UseLoader(cfg1.Table, fl1); err != nil {
 		t.Fatalf("use loader 1: %v", err)
 	}
 
 	// Load products reference.
-	fl2 := &fakeLoader{rows: []map[string]any{
+	fl2 := fakeRows(t, []map[string]any{
 		{"id": int64(10), "name": "laptop"},
-	}}
+	})
 	if err := s.UseLoader(cfg2.Table, fl2); err != nil {
 		t.Fatalf("use loader 2: %v", err)
 	}
@@ -655,10 +697,10 @@ func pollUntil(t *testing.T, deadline time.Duration, cond func() bool, msg strin
 func TestFirstErrClearedOnSuccess(t *testing.T) {
 	// Build stage manually so we can fail the FIRST load (before hot).
 	// Use a fast refresh so the second load happens promptly.
-	fl := &fakeLoader{rows: nil, err: errors.New("db down")}
+	fl := fakeErr(errors.New("db down"))
 	cfg := refCfg(nil)
 	cfg.Refresh = "10ms"
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -674,7 +716,7 @@ func TestFirstErrClearedOnSuccess(t *testing.T) {
 
 	// Fix the loader; the next refresh tick clears firstErr (audit #1).
 	fl.SetErr(nil)
-	fl.SetRows(usersRows())
+	fl.SetRows(t, usersRows())
 	pollUntil(t, 2*time.Second, func() bool {
 		return s.refs[0].isHot() && s.refs[0].stickyErr() == nil
 	}, "firstErr not cleared after success")
@@ -763,8 +805,8 @@ func TestNullJoinKeyMiss(t *testing.T) {
 
 func TestStickyErrAtStart(t *testing.T) {
 	// Build stage manually so the first load fails (before hot).
-	fl := &fakeLoader{rows: nil, err: errors.New("broken")}
-	s, err := New([]spec.Enrich{refCfg(nil)}, []string{"id", "user_ref", "q"}, nil)
+	fl := fakeErr(errors.New("broken"))
+	s, err := New([]spec.Enrich{refCfg(nil)}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
@@ -781,33 +823,33 @@ func TestStickyErrAtStart(t *testing.T) {
 }
 
 func TestJoinTypeValidation(t *testing.T) {
-	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.JoinType = "cross" })}, []string{"user_ref", "v"}, nil)
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.JoinType = "cross" })}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("unknown join_type must be rejected at boot (audit #10)")
 	}
 }
 
 func TestMaxWaitValidation(t *testing.T) {
-	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "not-a-duration" })}, []string{"user_ref", "v"}, nil)
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "not-a-duration" })}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("invalid maxWait must be rejected at boot (audit #10)")
 	}
 	// R-3: a negative duration parses but silently disables the cap at drain
 	// time — reject it too.
-	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "-1s" })}, []string{"user_ref", "v"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "-1s" })}, evSchema("user_ref", "v"), nil); err == nil {
 		t.Fatal("negative maxWait must be rejected at boot")
 	}
 	// "0s" and absent stay valid (both mean "no cap").
-	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "0s" })}, []string{"user_ref", "v"}, nil); err != nil {
+	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "0s" })}, evSchema("user_ref", "v"), nil); err != nil {
 		t.Fatalf("0s maxWait must boot: %v", err)
 	}
-	if _, err := New([]spec.Enrich{refCfg(nil)}, []string{"user_ref", "v"}, nil); err != nil {
+	if _, err := New([]spec.Enrich{refCfg(nil)}, evSchema("user_ref", "v"), nil); err != nil {
 		t.Fatalf("absent maxWait must boot: %v", err)
 	}
 }
 
 func TestMaxEventsValidation(t *testing.T) {
-	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxEvents = -1 })}, []string{"user_ref", "v"}, nil)
+	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxEvents = -1 })}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("negative maxEvents must be rejected at boot (audit #10)")
 	}
@@ -818,7 +860,7 @@ func TestDestCollisionRejected(t *testing.T) {
 	_, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) {
 		c.Select = []string{"*"}
 		c.As = map[string]string{"users.name": "collided", "users.tier": "collided"}
-	})}, []string{"user_ref", "v"}, nil)
+	})}, evSchema("user_ref", "v"), nil)
 	if err == nil {
 		t.Fatal("two renames to the same destination must be rejected (audit #11)")
 	}
@@ -834,7 +876,7 @@ func TestCrossRefDefaultCollisionRejected(t *testing.T) {
 		c.Select = []string{"id"}
 		c.As = map[string]string{"orders.id": "users.name"}
 	})
-	if _, err := New([]spec.Enrich{refA, refB}, []string{"user_ref", "v"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{refA, refB}, evSchema("user_ref", "v"), nil); err == nil {
 		t.Fatal("rename onto another ref's default destination must be rejected")
 	}
 
@@ -845,7 +887,7 @@ func TestCrossRefDefaultCollisionRejected(t *testing.T) {
 		c.Table = "users"
 		c.Select = []string{"name"}
 	})
-	if _, err := New([]spec.Enrich{refB, refC}, []string{"user_ref", "v"}, nil); err == nil {
+	if _, err := New([]spec.Enrich{refB, refC}, evSchema("user_ref", "v"), nil); err == nil {
 		t.Fatal("default projecting over another ref's rename must be rejected")
 	}
 }
@@ -931,13 +973,13 @@ func TestMySQLConfig(t *testing.T) {
 // sticky load error.
 func TestNonStringReferenceLandsTyped(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) { c.Select = []string{"name", "tier"} })
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	loader := &fakeLoader{rows: []map[string]any{
+	loader := fakeRows(t, []map[string]any{
 		{"id": int64(1), "name": "ana", "tier": int64(3)},
-	}}
+	})
 	if err := s.UseLoader("users", loader); err != nil {
 		t.Fatal(err)
 	}
@@ -950,7 +992,7 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 	if !s.refs[0].isHot() {
 		t.Fatalf("reference did not go hot: %v", s.refs[0].stickyErr())
 	}
-	if got := s.refs[0].snap.Load().refTypes["users.tier"]; got.ID() != arrow.INT64 {
+	if got := s.refs[0].snap.Load().refType("users.tier"); got.ID() != arrow.INT64 {
 		t.Fatalf("users.tier refType = %s, want int64", got)
 	}
 
@@ -974,7 +1016,7 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 	}
 	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
-	out, err := s.ColumnarJoin(in)
+	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
 		t.Fatalf("ColumnarJoin: %v", err)
 	}
@@ -995,11 +1037,11 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 // as an Int64 column, no load failure.
 func TestProjectedNonStringJoinKeyLandsTyped(t *testing.T) {
 	cfg := refCfg(func(c *spec.Enrich) { c.Select = []string{"*"} })
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	loader := &fakeLoader{rows: []map[string]any{{"id": int64(1), "name": "ana", "tier": "gold"}}}
+	loader := fakeRows(t, []map[string]any{{"id": int64(1), "name": "ana", "tier": "gold"}})
 	if err := s.UseLoader("users", loader); err != nil {
 		t.Fatal(err)
 	}
@@ -1012,7 +1054,7 @@ func TestProjectedNonStringJoinKeyLandsTyped(t *testing.T) {
 	if !s.refs[0].isHot() {
 		t.Fatalf("reference did not go hot: %v", s.refs[0].stickyErr())
 	}
-	if got := s.refs[0].snap.Load().refTypes["users.id"]; got.ID() != arrow.INT64 {
+	if got := s.refs[0].snap.Load().refType("users.id"); got.ID() != arrow.INT64 {
 		t.Fatalf("users.id refType = %s, want int64", got)
 	}
 }

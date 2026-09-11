@@ -130,11 +130,11 @@ func pad4(n int) string {
 func newHarnessStage(t *testing.T) *Stage {
 	t.Helper()
 	cfg := refCfg(func(c *spec.Enrich) { c.OnColdStart = "pass" })
-	s, err := New([]spec.Enrich{cfg}, []string{"id", "user_ref", "q"}, nil)
+	s, err := New([]spec.Enrich{cfg}, evSchema("id", "user_ref", "q"), nil)
 	if err != nil {
 		t.Fatalf("new stage: %v", err)
 	}
-	if err := s.UseLoader("users", &fakeLoader{rows: usersRows()}); err != nil {
+	if err := s.UseLoader("users", fakeRows(t, usersRows())); err != nil {
 		t.Fatalf("use loader: %v", err)
 	}
 	s.Start(context.Background())
@@ -160,7 +160,7 @@ func runColumnar(t *testing.T, s *Stage, changes []rowchange.Change) []rowchange
 	in := &dpint.Batch{Table: "t", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
 
-	out, err := s.ColumnarJoin(in)
+	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
 		t.Fatalf("ColumnarJoin: %v", err)
 	}

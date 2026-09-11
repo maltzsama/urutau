@@ -241,3 +241,48 @@ func TestEncodeKeyTypeAntiCollision(t *testing.T) {
 		t.Error("uuid(16×0x01) and binary(16×0x01) must NOT share a key")
 	}
 }
+
+// TestCollapseMasksByKernel — the split into upserts/deletes after collapse
+// is done by kernels (equal + not on __op), not a per-row builder loop.
+// One PK group per op: insert survives as upsert, update survives as
+// upsert, delete survives as delete.
+func TestCollapseMasksByKernel(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := buildWireBatch(t, alloc,
+		[]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}},
+		[]wireRow{
+			{op: dataplane.OpInsert, pos: "p1", data: map[string]any{"id": int64(1)}},
+			{op: dataplane.OpUpdate, pos: "p2", data: map[string]any{"id": int64(2)}},
+			{op: dataplane.OpDelete, pos: "p3", data: map[string]any{"id": int64(3)}},
+			{op: dataplane.OpInsert, pos: "p4", data: map[string]any{"id": int64(2)}}, // collapses onto id=2, wins as insert
+		},
+	)
+	defer b.Release()
+
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	if err != nil {
+		t.Fatalf("Collapse: %v", err)
+	}
+	defer func() {
+		if ups != nil {
+			ups.Release()
+		}
+		if dels != nil {
+			dels.Release()
+		}
+	}()
+
+	if ups == nil || ups.Record.NumRows() != 2 {
+		t.Fatalf("upserts = %v, want 2 (id=1 insert, id=2 last-write insert)", ups)
+	}
+	if dels == nil || dels.Record.NumRows() != 1 {
+		t.Fatalf("deletes = %v, want 1 (id=3)", dels)
+	}
+	upIds := ups.Record.Column(0).(*array.Int64)
+	if upIds.Value(0) != 1 || upIds.Value(1) != 2 {
+		t.Fatalf("upsert ids = %d,%d, want 1,2", upIds.Value(0), upIds.Value(1))
+	}
+	if dels.Record.Column(0).(*array.Int64).Value(0) != 3 {
+		t.Fatalf("delete id = %d, want 3", dels.Record.Column(0).(*array.Int64).Value(0))
+	}
+}
