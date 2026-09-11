@@ -30,12 +30,10 @@ import (
 // ts_source, all in the DESCRIPTOR's table.
 type SinkServer struct {
 	flight.BaseFlightServer
-	heartbeatState
 
-	snk    sink.Sink
-	alloc  memory.Allocator
-	mu     writerCache
-	logger func(format string, args ...any)
+	snk   sink.Sink
+	alloc memory.Allocator
+	mu    writerCache
 }
 
 // NewSinkServer wraps snk for in-process Flight serving.

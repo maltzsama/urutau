@@ -14,10 +14,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/maltzsama/urutau/driver"
 	pluginadapter "github.com/maltzsama/urutau/internal/plugin"
 	"github.com/maltzsama/urutau/internal/plugin/client"
 	"github.com/maltzsama/urutau/internal/plugin/flightserver"
-	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"

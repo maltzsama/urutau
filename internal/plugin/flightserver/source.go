@@ -33,7 +33,6 @@ import (
 // subprocess plugin.
 type SourceServer struct {
 	flight.BaseFlightServer
-	heartbeatState
 
 	src   source.Source
 	spec  *spec.Spec

@@ -17,7 +17,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
@@ -113,13 +112,6 @@ func hasBearer(ctx context.Context, token string) bool {
 		}
 	}
 	return false
-}
-
-// heartbeatState is shared by DoAction handlers so status/list_tables
-// answer consistently. Embedded (not re-declared) by sourceServer/sinkServer.
-type heartbeatState struct {
-	mu      sync.Mutex
-	started int64 // unix seconds, set on construction
 }
 
 // socketPath returns a fresh, unpredictable unix socket path under dir
