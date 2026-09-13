@@ -52,16 +52,23 @@ in isolation from the RPC plumbing.
 ## The alternative: in-process Go `.so`
 
 `driver.LoadPlugin` loads a Go plugin built with `-buildmode=plugin` into
-the same process — no gRPC, no subprocess, no isolation. It exists for
-one case: a driver you're building **in Go**, deployed **alongside**
-Urutau in the same build/release, where you don't need another language
-and don't need the crash containment a separate process buys you.
+the same process — **no subprocess, no separate binary to ship**. It
+exists for one case: a driver you're building **in Go**, deployed
+**alongside** Urutau in the same build/release, where you don't need
+another language and don't need the process-level crash containment a
+subprocess plugin buys you.
 
-It is not a second normative contract. There's no invariant checklist, no
-protocol version, no conformance suite — just Go interfaces
-(`source.Source`, `sink.Sink`) loaded at runtime. Treat it as a shortcut
-for internal use, not something to design a third-party integration
-around.
+It is not a second, lighter contract. Every `.so`-registered driver is
+wrapped in an **in-process Arrow Flight server** (`internal/plugin/
+flightwrap`) and served back through the same Flight client adapter a
+subprocess plugin uses — so a `.so` speaks the exact same RPC contract as
+[Plugin Contract](../reference/plugin-contract.md) describes, just
+without the process boundary. What you don't get compared to a subprocess
+plugin: another language, independent shipping/versioning, and crash
+isolation (a panic in your driver takes Urutau down with it — see below).
+There's still no separate invariant checklist to read; your `Init()` just
+registers Go interfaces (`source.Source`, `sink.Sink`) that the same Flight
+machinery wraps either way.
 
 ```go
 // package main
@@ -97,5 +104,6 @@ unloading once loaded.
 | `missing exported Init` | no `Init()` func | add `func Init() error` |
 
 If you're building anything you'll ship independently, in any language, or
-just don't want sharing a process with Urutau: use the Flight contract
-above instead.
+just don't want sharing a process with Urutau — including a Go driver
+that needs crash isolation from the engine — use a **subprocess** Flight
+plugin (the shape described at the top of this page) instead of a `.so`.

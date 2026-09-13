@@ -71,9 +71,15 @@ tables:
     createIfNotExists: true
 ```
 
-`serverId` is a string on purpose — it flows into the spec as written, and
-a UUID server id is legal. Each replicator connecting to the same MySQL
-needs a distinct one.
+A replicator reading a MySQL binlog identifies itself to the server with a
+**server id** — every client attached to the same MySQL, replicas and
+other CDC tools included, needs a distinct one. `serverId` is a string in
+the YAML (quoted, as above) but must hold a number that fits a `uint32`;
+`Validate` rejects it at boot otherwise. When set in the spec it wins over
+whatever `--server-id` the binary was started with — the flag is only a
+default for when the spec is silent. If you point a second pipeline at
+the same MySQL, give it a different `serverId`; there is no uniqueness
+check across pipelines, and a collision corrupts binlog state for both.
 
 ## 5. Run it
 
@@ -147,16 +153,16 @@ docker compose -f test/e2e/docker-compose.yml down
 ## Next steps
 
 - **Postgres or Kafka as the source** instead of MySQL: see
-  [Sources](reference/sources.md) for what each source needs (`serverId`
-  is MySQL-specific; Postgres needs `slotName`, Kafka needs
-  `bootstrapServers`).
+  [Sources](reference/sources.md) for what each source needs (Postgres
+  needs `slotName`; Kafka reads its brokers from `uri`, same as every
+  other source, and needs an explicit `columns:` block since it has
+  nothing to introspect).
 - **ClickHouse or Couchbase as the sink** instead of Iceberg: same spec
   shape, different `sink.type` and connection fields — see
   [Sinks](reference/sinks.md).
 - **Distributed mode** (coordinator + worker, for when one process isn't
   enough): `urutau-coordinator` and `urutau-worker` instead of `urutau
-  run`, plus the Kubernetes operator (`cmd/operator`) if you want a CRD
-  instead of hand-run binaries.
+  run`.
 - **Enrichment** (joining events against a small reference table before
   they land): see [Enrichment](reference/enrichment.md).
 - **Writing your own source/sink**: [Plugins](guides/plugins.md).
