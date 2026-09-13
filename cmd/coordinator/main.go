@@ -17,6 +17,7 @@ import (
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
+	"github.com/maltzsama/urutau/internal/plugin/flightwrap"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -79,7 +80,7 @@ func runCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Load dynamic plugins before anything else.
 			for _, p := range f.pluginPaths {
-				if err := driver.LoadPlugin(p); err != nil {
+				if err := driver.LoadPlugin(p, flightwrap.Wrap{}); err != nil {
 					return err
 				}
 			}
