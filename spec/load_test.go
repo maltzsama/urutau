@@ -136,3 +136,57 @@ func TestLoadYAMLEnvDoesNotOverrideInline(t *testing.T) {
 		t.Fatalf("source.uri = %q, want the inline value to win", s.Source.URI)
 	}
 }
+
+func TestResolveServerIDSpecWins(t *testing.T) {
+	s := &Spec{Source: Source{ServerID: "42"}}
+	got, err := s.ResolveServerID(1101)
+	if err != nil {
+		t.Fatalf("ResolveServerID: %v", err)
+	}
+	if got != 42 {
+		t.Fatalf("ResolveServerID = %d, want the spec's 42 to win over the flag default", got)
+	}
+}
+
+func TestResolveServerIDFallsBackToFlag(t *testing.T) {
+	s := &Spec{} // no source.serverId declared
+	got, err := s.ResolveServerID(7)
+	if err != nil {
+		t.Fatalf("ResolveServerID: %v", err)
+	}
+	if got != 7 {
+		t.Fatalf("ResolveServerID = %d, want the flag default 7 when the spec declares nothing", got)
+	}
+}
+
+func TestResolveServerIDRejectsNonNumeric(t *testing.T) {
+	s := &Spec{Source: Source{ServerID: "not-a-number"}}
+	if _, err := s.ResolveServerID(1101); err == nil {
+		t.Fatal("ResolveServerID: want error for a non-numeric source.serverId")
+	}
+}
+
+func TestValidateRejectsNonNumericServerID(t *testing.T) {
+	s, err := LoadYAML(strings.NewReader(sampleYAML))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	s.Source.ServerID = "not-a-number"
+	err = s.Validate()
+	if err == nil {
+		t.Fatal("Validate: want error for a non-numeric source.serverId")
+	}
+	if !strings.Contains(err.Error(), "serverId") {
+		t.Fatalf("Validate error %q does not mention serverId", err.Error())
+	}
+}
+
+func TestValidateAcceptsNumericServerID(t *testing.T) {
+	s, err := LoadYAML(strings.NewReader(sampleYAML))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("Validate: %v (sampleYAML's serverId: \"1101\" should be accepted)", err)
+	}
+}

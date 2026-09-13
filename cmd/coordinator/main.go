@@ -98,6 +98,13 @@ func runCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// The spec's source.serverId wins over --server-id when
+			// declared — the pipeline's own server id travels with it;
+			// the flag is a convenience default. loadSpec already ran
+			// Validate, so a non-numeric value would have failed there.
+			if f.serverID, err = s.ResolveServerID(f.serverID); err != nil {
+				return err
+			}
 			cfg := f.config(s, logger)
 			cfg.Logger.Info("starting coordinator",
 				"listen", cfg.ListenAddr,

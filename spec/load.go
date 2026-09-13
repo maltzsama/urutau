@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
@@ -52,6 +53,23 @@ func LoadYAML(r io.Reader) (*Spec, error) {
 	}
 	applyEnvFallback(&s)
 	return &s, nil
+}
+
+// ResolveServerID returns the MySQL replication server id to use: the
+// spec's source.serverId when declared, else flagDefault (the CLI's
+// --server-id, which itself defaults to 1101). The spec always wins when
+// present — it travels with the pipeline, while the flag is a
+// convenience for ad hoc runs. Validate must have already rejected a
+// non-numeric source.serverId; this only parses.
+func (s *Spec) ResolveServerID(flagDefault uint32) (uint32, error) {
+	if s.Source.ServerID == "" {
+		return flagDefault, nil
+	}
+	v, err := strconv.ParseUint(s.Source.ServerID, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("spec: source.serverId: %w", err)
+	}
+	return uint32(v), nil
 }
 
 // applyEnvFallback fills empty credential/URI fields from the environment.

@@ -114,6 +114,13 @@ func (f *pipelineFlags) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The spec's source.serverId wins over --server-id when declared — the
+	// pipeline's own server id travels with it; the flag is a convenience
+	// default for ad hoc runs. Validate already rejected a non-numeric
+	// value at spec load time.
+	if cfg.ServerID, err = s.ResolveServerID(cfg.ServerID); err != nil {
+		return err
+	}
 
 	// External plugin mode: spawn subprocesses and run via the supervisor
 	// + plugin adapters. A side left empty falls back to the registry.

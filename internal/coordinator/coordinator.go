@@ -226,6 +226,19 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	// The spec's source.serverId wins over cfg.ServerID when declared —
+	// the pipeline's own server id travels with it; cfg.ServerID is only
+	// a default for when the spec is silent. Spec.Validate (already run
+	// by every caller that loaded this spec from YAML) rejects a
+	// non-numeric serverId, so this only fails for a Spec built
+	// programmatically with a bad value.
+	if cfg.Spec != nil {
+		serverID, err := cfg.Spec.ResolveServerID(cfg.ServerID)
+		if err != nil {
+			return err
+		}
+		cfg.ServerID = serverID
+	}
 	// Defaults land before the struct captures cfg (audit #16): a later read
 	// of c.cfg must never see the zero flow knobs.
 	if cfg.FlowTotalBytes <= 0 {
