@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -96,37 +95,15 @@ func TestMySQLPipeline(t *testing.T) {
 	t.Log("resume ok: no loss, no duplicate after downtime DML")
 }
 
+// loadPipeline loads the same spec examples/mysql-iceberg.yaml documents,
+// from disk — overriding the catalog URI/warehouse when the CI stack
+// differs from the file's local-compose defaults.
 func loadPipeline(t *testing.T) *spec.Spec {
 	t.Helper()
-	s, err := spec.LoadYAML(strings.NewReader(mysqlPipelineYAML()))
-	if err != nil {
-		t.Fatalf("load pipeline: %v", err)
-	}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("validate pipeline: %v", err)
-	}
-	return s
-}
-
-func mysqlPipelineYAML() string {
-	return `
-pipeline: e2e-mysql
-source:
-  kind: mysql
-  uri: mysql://repl:replpass@127.0.0.1:3306/shop
-sink:
-  uri: ` + env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog") + `
-  namespace: raw
-  warehouse: ` + env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog") + `
-  clientId: root
-  clientSecret: s3cr3t
-  scope: PRINCIPAL_ROLE:ALL
-tables:
-  - source: shop.orders
-    target: raw.orders
-    primaryKey: [id]
-    createIfNotExists: true
-`
+	return loadExampleSpec(t, "mysql-iceberg.yaml", func(s *spec.Spec) {
+		s.Sink.URI = env("URUTAU_E2E_CATALOG", s.Sink.URI)
+		s.Sink.Warehouse = env("URUTAU_E2E_WAREHOUSE", s.Sink.Warehouse)
+	})
 }
 
 func testConfig() runner.Config {

@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +14,6 @@ import (
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
-	"github.com/maltzsama/urutau/spec"
 )
 
 // localIngestFromChanges is the e2e feed mirror for the worker's former
@@ -65,27 +63,12 @@ func TestWorkerEndToEnd(t *testing.T) {
 	// Isolated from other e2e tests sharing the stack: drop the target table.
 	dropIcebergTable(t, ctx)
 
-	yamlSpec := `
-pipeline: e2e
-source:
-  kind: mysql
-  uri: mysql://repl@mysql:3306/e2e
-sink:
-  uri: polaris://localhost:8181/api/catalog
-  namespace: raw
-tables:
-  - source: e2e.orders
-    target: raw.orders
-    primaryKey: [id]
-    createIfNotExists: true
-`
-	s, err := spec.LoadYAML(strings.NewReader(yamlSpec))
-	if err != nil {
-		t.Fatalf("load yaml: %v", err)
-	}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
-	}
+	// Loads examples/distributed.yaml only to prove it's a well-formed
+	// spec — this test then builds the worker by hand below (a synthetic
+	// Iceberg catalog/writer fed synthetic changes), not driven through
+	// this spec the way the other e2e tests are. See the comment at the
+	// top of that file.
+	_ = loadExampleSpec(t, "distributed.yaml", nil)
 
 	cfg := urutauiceberg.Config{
 		URI:          env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog"),

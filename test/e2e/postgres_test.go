@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -96,38 +95,16 @@ func TestPostgresPipeline(t *testing.T) {
 	t.Log("resume ok: no loss, no duplicate after downtime DML (LSN position)")
 }
 
+// loadPostgresPipeline loads the same spec examples/postgres-iceberg.yaml
+// documents, from disk — overriding connection strings when the CI stack
+// differs from the file's local-compose defaults.
 func loadPostgresPipeline(t *testing.T) *spec.Spec {
 	t.Helper()
-	s, err := spec.LoadYAML(strings.NewReader(postgresPipelineYAML()))
-	if err != nil {
-		t.Fatalf("load pipeline: %v", err)
-	}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("validate pipeline: %v", err)
-	}
-	return s
-}
-
-func postgresPipelineYAML() string {
-	return `
-pipeline: e2e-postgres
-source:
-  kind: postgres
-  uri: ` + env("URUTAU_E2E_PG_URI", "postgres://repl:replpass@127.0.0.1:5433/shop?sslmode=disable") + `
-  slotName: urutau_e2e
-sink:
-  uri: ` + env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog") + `
-  namespace: raw
-  warehouse: ` + env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog") + `
-  clientId: root
-  clientSecret: s3cr3t
-  scope: PRINCIPAL_ROLE:ALL
-tables:
-  - source: public.orders
-    target: raw.orders
-    primaryKey: [id]
-    createIfNotExists: true
-`
+	return loadExampleSpec(t, "postgres-iceberg.yaml", func(s *spec.Spec) {
+		s.Source.URI = env("URUTAU_E2E_PG_URI", s.Source.URI)
+		s.Sink.URI = env("URUTAU_E2E_CATALOG", s.Sink.URI)
+		s.Sink.Warehouse = env("URUTAU_E2E_WAREHOUSE", s.Sink.Warehouse)
+	})
 }
 
 func pgConn(t *testing.T) *sql.DB {

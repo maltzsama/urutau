@@ -1,0 +1,25 @@
+# The minimal spec shape for distributed mode (coordinator + worker).
+#
+# Extracted from test/e2e/worker_test.go's TestWorkerEndToEnd — but note
+# that test only uses this spec up to spec.Validate(); the worker itself
+# is then built by hand in the test (a synthetic Iceberg catalog/writer,
+# fed synthetic changes), not driven end to end through the collapsed
+# runner or a real coordinator+worker pair the way the other three
+# examples are. Treat this as a validated shape, not a tested pipeline —
+# it proves the YAML is well-formed, not that this exact spec replicates
+# correctly in distributed mode. Run it with:
+#
+#   urutau-coordinator run -f distributed.yaml
+#   urutau-worker run --coordinator 127.0.0.1:50051
+pipeline: e2e
+source:
+  kind: mysql
+  uri: mysql://repl@mysql:3306/e2e
+sink:
+  uri: http://localhost:8181/api/catalog
+  namespace: raw
+tables:
+  - source: e2e.orders
+    target: raw.orders
+    primaryKey: [id]
+    createIfNotExists: true

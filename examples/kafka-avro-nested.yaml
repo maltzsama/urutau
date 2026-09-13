@@ -1,0 +1,41 @@
+# Kafka + Confluent Avro -> Apache Iceberg, append-only, with a nested
+# struct/list column shape.
+#
+# This is the exact spec test/e2e/nested_kafka_avro_test.go runs
+# (extracted into this file, read from disk) — TestNestedStructRoundTrip
+# exercises it end to end against a real Kafka + schema registry +
+# Iceberg stack, proving nested Avro records/arrays round-trip through
+# the canonical type system. If this file stops validating or the e2e
+# test stops passing, this example is out of date.
+#
+# Kafka has nothing to introspect, so columns: is required and explicit
+# — this is the only worked example of the nested struct/list grammar
+# (ColumnDecl) in the docs. writeMode: append + onDelete: skip is
+# required for Kafka: it carries no before-image on deletes.
+pipeline: e2e-kafka-avro
+source:
+  kind: kafka
+  uri: 127.0.0.1:19092
+  format: avro
+  schemaRegistry: http://localhost:18081
+sink:
+  uri: http://localhost:8181/api/catalog
+  namespace: kafka_avro
+  warehouse: quickstart_catalog
+  clientId: root
+  clientSecret: s3cr3t
+  scope: PRINCIPAL_ROLE:ALL
+tables:
+  - source: shop.orders-avro
+    target: kafka_avro.orders
+    writeMode: append
+    onDelete: skip
+    createIfNotExists: true
+    columns:
+      id: int64
+      cust:
+        struct:
+          name: string
+          age: int64
+      tags:
+        list: string

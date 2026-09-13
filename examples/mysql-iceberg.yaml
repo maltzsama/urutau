@@ -1,0 +1,29 @@
+# MySQL binlog -> Apache Iceberg, upsert.
+#
+# This is the exact spec test/e2e/mysql_test.go runs (extracted into this
+# file, read from disk) — TestMySQLPipeline exercises it end to end
+# against a real MySQL + Iceberg (Polaris REST catalog) stack: DBLog
+# snapshot under concurrent load, live binlog streaming, and resume after
+# a stop/restart. If this file stops validating or the e2e test stops
+# passing, this example is out of date.
+#
+# Values point at the repo's e2e docker-compose stack
+# (test/e2e/docker-compose.yml); adjust uri/sink for your own MySQL and
+# Iceberg catalog.
+pipeline: e2e-mysql
+source:
+  kind: mysql
+  uri: mysql://repl:replpass@127.0.0.1:3306/shop
+  serverId: "1101"
+sink:
+  uri: http://localhost:8181/api/catalog
+  namespace: raw
+  warehouse: quickstart_catalog
+  clientId: root
+  clientSecret: s3cr3t
+  scope: PRINCIPAL_ROLE:ALL
+tables:
+  - source: shop.orders
+    target: raw.orders
+    primaryKey: [id]
+    createIfNotExists: true
