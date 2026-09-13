@@ -1,3 +1,7 @@
+---
+sidebar_position: 2
+---
+
 # EncodeKey — design and invariant (supersedes the v4 `n:`/`f:` table)
 
 > **Status:** implemented in `internal/dataplane/generator.go` (`EncodeKey`).

@@ -431,6 +431,17 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	// The spec's source.serverId wins over cfg.ServerID when declared — the
+	// pipeline's own server id travels with it; cfg.ServerID is only a
+	// default for when the spec is silent. Spec.Validate (already run by
+	// every caller that loaded this spec from YAML) rejects a non-numeric
+	// serverId, so this only fails for a Spec built programmatically with
+	// a bad value.
+	serverID, err := s.ResolveServerID(cfg.ServerID)
+	if err != nil {
+		return nil, err
+	}
+	cfg.ServerID = serverID
 	src, err := driver.OpenSource(s, source.Runtime{
 		ServerID:  cfg.ServerID,
 		Heartbeat: cfg.Heartbeat,

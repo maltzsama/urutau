@@ -128,3 +128,12 @@ e2e-kafka-down:
 
 e2e-test-kafka: e2e-kafka-up
 	URUTAU_E2E=1 URUTAU_E2E_KAFKA=1 $(GO) test $(E2E_FILTER) -run 'TestNestedStructRoundTrip' ./test/e2e
+
+# ── Docs (Docusaurus) ────────────────────────────────────────────────────
+docs-site: ## Install deps + serve docs at localhost:3000
+	npm --prefix website install
+	npm --prefix website start
+
+docs-build: ## Build static docs into website/build/
+	npm --prefix website install
+	npm --prefix website build

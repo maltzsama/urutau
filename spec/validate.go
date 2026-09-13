@@ -46,6 +46,11 @@ func (s *Spec) Validate() error {
 	if s.Source.Kind == "postgres" && s.Source.SlotName == "" {
 		problems = append(problems, "source.slotName: required for postgres (logical replication slot)")
 	}
+	if s.Source.ServerID != "" {
+		if _, err := strconv.ParseUint(s.Source.ServerID, 10, 32); err != nil {
+			problems = append(problems, fmt.Sprintf("source.serverId: %q is not a valid uint32 (the MySQL replication server id)", s.Source.ServerID))
+		}
+	}
 	// Decoder format: raw is a message-log landing mode (kafka only) and it
 	// has no upsert semantics — every message is an insert.
 	switch s.Source.Format {

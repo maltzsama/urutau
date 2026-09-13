@@ -1,0 +1,27 @@
+# Postgres logical replication -> Apache Iceberg, upsert.
+#
+# This is the exact spec test/e2e/postgres_test.go runs (extracted into
+# this file, read from disk) — TestPostgresPipeline exercises it end to
+# end against a real Postgres (pgoutput logical replication) + Iceberg
+# stack. If this file stops validating or the e2e test stops passing,
+# this example is out of date.
+#
+# slotName is required for postgres — it names the logical replication
+# slot the source creates and reads from.
+pipeline: e2e-postgres
+source:
+  kind: postgres
+  uri: postgres://repl:replpass@127.0.0.1:5433/shop?sslmode=disable
+  slotName: urutau_e2e
+sink:
+  uri: http://localhost:8181/api/catalog
+  namespace: raw
+  warehouse: quickstart_catalog
+  clientId: root
+  clientSecret: s3cr3t
+  scope: PRINCIPAL_ROLE:ALL
+tables:
+  - source: public.orders
+    target: raw.orders
+    primaryKey: [id]
+    createIfNotExists: true

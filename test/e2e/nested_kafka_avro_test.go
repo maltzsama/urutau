@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 
@@ -107,49 +106,25 @@ func TestNestedStructRoundTrip(t *testing.T) {
 	}
 }
 
-// loadKafkaAvroPipeline declares the same nested shape the Avro schema
-// carries (cust: struct{name,age}, tags: list<string>) via the spec's
-// nested ColumnDecl syntax (issue #17 decision 1) — this is what makes
-// Introspect resolve the correct composite core.Schema for the encoder.
+// loadKafkaAvroPipeline loads the same spec examples/kafka-avro-nested.yaml
+// documents, from disk — it declares the same nested shape the Avro
+// schema carries (cust: struct{name,age}, tags: list<string>) via the
+// spec's nested ColumnDecl syntax (issue #17 decision 1), which is what
+// makes Introspect resolve the correct composite core.Schema for the
+// encoder. topic must match the example file's tables[0].source
+// ("shop.orders-avro") — overridden here only if it ever needs to differ
+// per run.
 func loadKafkaAvroPipeline(t *testing.T, brokerAddr, registryURL, topic string) *spec.Spec {
 	t.Helper()
-	yaml := `
-pipeline: e2e-kafka-avro
-source:
-  kind: kafka
-  uri: ` + brokerAddr + `
-  format: avro
-  schemaRegistry: ` + registryURL + `
-sink:
-  uri: ` + env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog") + `
-  namespace: kafka_avro
-  warehouse: ` + env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog") + `
-  clientId: root
-  clientSecret: s3cr3t
-  scope: PRINCIPAL_ROLE:ALL
-tables:
-  - source: ` + topic + `
-    target: kafka_avro.orders
-    writeMode: append
-    onDelete: skip
-    createIfNotExists: true
-    columns:
-      id: int64
-      cust:
-        struct:
-          name: string
-          age: int64
-      tags:
-        list: string
-`
-	s, err := spec.LoadYAML(strings.NewReader(yaml))
-	if err != nil {
-		t.Fatalf("load pipeline: %v", err)
-	}
-	if err := s.Validate(); err != nil {
-		t.Fatalf("validate pipeline: %v", err)
-	}
-	return s
+	return loadExampleSpec(t, "kafka-avro-nested.yaml", func(s *spec.Spec) {
+		s.Source.URI = brokerAddr
+		s.Source.SchemaRegistry = registryURL
+		s.Sink.URI = env("URUTAU_E2E_CATALOG", s.Sink.URI)
+		s.Sink.Warehouse = env("URUTAU_E2E_WAREHOUSE", s.Sink.Warehouse)
+		if len(s.Tables) > 0 {
+			s.Tables[0].Source = topic
+		}
+	})
 }
 
 // registerAvroSchema posts schemaJSON to the registry under subject and
