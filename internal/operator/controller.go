@@ -332,16 +332,37 @@ func coordinatorServiceAccount(cr *urutauv1alpha1.CDCPipeline) *corev1.ServiceAc
 // status subresource only (resourceNames) — not every pipeline in the
 // namespace. The contract is that the coordinator, not the operator, writes
 // its status.
+//
+// It also grants Deployment management and reading its own Pod: the
+// coordinator, not the operator, provisions the worker Deployments it
+// needs (spec.Table.WorkerGroupNames), and reads its own Pod to set the
+// ownerReference that cascades their GC when the coordinator dies. This
+// is namespace-wide on deployments (no resourceNames) because a
+// Deployment doesn't exist yet when the coordinator boots and needs to
+// create it — an accepted scope matching the same pattern the operator's
+// own ClusterRole already uses for statefulsets/configmaps/services.
 func coordinatorRole(cr *urutauv1alpha1.CDCPipeline) *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: coordinatorName(cr), Namespace: cr.Namespace,
 			Labels: selectorLabels(cr)},
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups:     []string{"urutau.io"},
-			Resources:     []string{"cdcpipelines", "cdcpipelines/status"},
-			ResourceNames: []string{cr.Name},
-			Verbs:         []string{"get", "update", "patch"},
-		}},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups:     []string{"urutau.io"},
+				Resources:     []string{"cdcpipelines", "cdcpipelines/status"},
+				ResourceNames: []string{cr.Name},
+				Verbs:         []string{"get", "update", "patch"},
+			},
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"deployments"},
+				Verbs:     []string{"get", "create", "update"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"get"},
+			},
+		},
 	}
 }
 
