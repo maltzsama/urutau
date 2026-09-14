@@ -12,12 +12,14 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -28,6 +30,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	urutauspec "github.com/maltzsama/urutau/spec"
 )
 
 const finalizer = "urutau.io/finalizer"
@@ -147,7 +150,8 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	cm, err := coordinatorConfigMap(cr)
+	image := r.resolveImage(cr)
+	cm, err := coordinatorConfigMap(cr, image)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -166,7 +170,7 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	sts := coordinatorStatefulSet(cr, r.Image)
+	sts := coordinatorStatefulSet(cr, image)
 	if err := controllerutil.SetControllerReference(cr, sts, r.Scheme()); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -380,7 +384,17 @@ func coordinatorService(cr *urutauv1alpha1.CDCPipeline) *corev1.Service {
 // boot. For an inline definition the spec is rendered verbatim (credentials
 // left empty — they arrive as env from the mounted Secrets). A planner
 // (image/s3 definitions) will render the same artifact.
-func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline) (*corev1.ConfigMap, error) {
+//
+// The same ConfigMap also carries one worker pod template per table —
+// "worker-pod-template.<target>.yaml" — the coordinator reads at boot to
+// provision that table's worker group(s) (spec.Table.WorkerGroupNames):
+// the coordinator only ever copies this template and stamps a derived
+// --name onto it, it never builds a PodSpec of its own (mirrors Spark:
+// the driver clones the executor pod template, it doesn't assemble one
+// field by field). Emitted only when cr.Spec.Image is resolvable —
+// without an image there is nothing to provision, and every existing
+// pipeline that never sets spec.image is completely unaffected.
+func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline, image string) (*corev1.ConfigMap, error) {
 	name := coordinatorName(cr)
 	inline := cr.Spec.Definition.Inline
 	if len(inline) == 0 {
@@ -390,11 +404,74 @@ func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline) (*corev1.ConfigMap, er
 	if err != nil {
 		return nil, fmt.Errorf("render inline spec: %w", err)
 	}
+	data := map[string]string{"pipeline.yaml": string(payload)}
+
+	if image != "" {
+		s, err := urutauspec.LoadYAML(strings.NewReader(string(payload)))
+		if err != nil {
+			return nil, fmt.Errorf("parse inline spec for worker provisioning: %w", err)
+		}
+		for _, t := range s.Tables {
+			tmpl := workerPodTemplate(cr, image, t)
+			b, err := yaml.Marshal(tmpl)
+			if err != nil {
+				return nil, fmt.Errorf("render worker pod template for %s: %w", t.Target, err)
+			}
+			data[workerPodTemplateKey(t.Target)] = string(b)
+		}
+	}
+
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace,
 			Labels: selectorLabels(cr)},
-		Data: map[string]string{"pipeline.yaml": string(payload)},
+		Data: data,
 	}, nil
+}
+
+// workerPodTemplateKey names one table's worker pod template key in the
+// coordinator ConfigMap. The coordinator derives this same key from
+// spec.Table.Target when reading it back — never invented independently.
+func workerPodTemplateKey(target string) string {
+	return "worker-pod-template." + target + ".yaml"
+}
+
+// workerPodTemplate builds one table's worker Pod template. It carries NO
+// --name — the coordinator stamps that on when it clones this template
+// per worker group (spec.Table.WorkerGroupNames), since the coordinator,
+// not the operator, knows how many partitions exist and what their
+// derived names are.
+func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspec.Table) corev1.PodTemplateSpec {
+	labels := map[string]string{"app": "urutau-worker", "urutau.io/pipeline": cr.Name, "urutau.io/table": t.Target}
+	return corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Labels: labels},
+		Spec: corev1.PodSpec{
+			ServiceAccountName: coordinatorSAName(cr),
+			Containers: []corev1.Container{{
+				Name:      "worker",
+				Image:     image,
+				Command:   []string{"urutau-worker", "run", "--coordinator", coordinatorClusterAddr(cr)},
+				Env:       coordinatorEnv(cr),
+				Resources: workerResources(cr, t),
+			}},
+		},
+	}
+}
+
+// coordinatorClusterAddr is the in-cluster address a worker Pod dials —
+// the coordinator's own headless Service DNS name.
+func coordinatorClusterAddr(cr *urutauv1alpha1.CDCPipeline) string {
+	return fmt.Sprintf("%s.%s.svc.cluster.local:50051", coordinatorName(cr), cr.Namespace)
+}
+
+// resolveImage returns the CR's own Image when declared, else the
+// operator's own default (--coordinator-image) — a per-pipeline override
+// over a cluster-wide default, the same precedence spec.Source.SnapshotURI
+// has over URI elsewhere in this codebase.
+func (r *CoordinatorReconciler) resolveImage(cr *urutauv1alpha1.CDCPipeline) string {
+	if cr.Spec.Image != "" {
+		return cr.Spec.Image
+	}
+	return r.Image
 }
 
 // coordinatorStatefulSet builds the coordinator workload from the CR. The
@@ -417,6 +494,7 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 				Image:        image,
 				Command:      coordinatorCommand(cr),
 				Env:          coordinatorEnv(cr),
+				Resources:    resourceRequirements(cr.Spec.Coordinator.CPU, "", cr.Spec.Coordinator.Memory, ""),
 				VolumeMounts: []corev1.VolumeMount{{Name: "spec", MountPath: "/etc/urutau"}},
 			}},
 			Volumes: []corev1.Volume{{
@@ -505,6 +583,64 @@ func coordinatorEnv(cr *urutauv1alpha1.CDCPipeline) []corev1.EnvVar {
 		}
 	}
 	return env
+}
+
+// resourceRequirements builds a container's resource request/limit from
+// Kubernetes quantity strings. cpu/memory become the request; cpu+overhead/
+// memory+overhead become the limit — the request alone when no overhead is
+// given (limit == request), matching CoordinatorSpec, which has no
+// overhead knob. Empty cpu/memory returns an empty ResourceRequirements
+// (no request or limit at all — the container is BestEffort), which is
+// the caller's responsibility to avoid for anything but an explicit,
+// deliberate default (see workerResources).
+func resourceRequirements(cpu, cpuOverhead, memory, memOverhead string) corev1.ResourceRequirements {
+	if cpu == "" && memory == "" {
+		return corev1.ResourceRequirements{}
+	}
+	req := corev1.ResourceList{}
+	lim := corev1.ResourceList{}
+	if cpu != "" {
+		req[corev1.ResourceCPU] = resource.MustParse(cpu)
+		lim[corev1.ResourceCPU] = addQuantity(cpu, cpuOverhead)
+	}
+	if memory != "" {
+		req[corev1.ResourceMemory] = resource.MustParse(memory)
+		lim[corev1.ResourceMemory] = addQuantity(memory, memOverhead)
+	}
+	return corev1.ResourceRequirements{Requests: req, Limits: lim}
+}
+
+// addQuantity adds an optional overhead quantity to a base quantity;
+// overhead=="" returns base unchanged (limit == request).
+func addQuantity(base, overhead string) resource.Quantity {
+	b := resource.MustParse(base)
+	if overhead == "" {
+		return b
+	}
+	o := resource.MustParse(overhead)
+	b.Add(o)
+	return b
+}
+
+// workerResources resolves one table's effective worker resources: the
+// table's own spec.Table.Workers.CPU/Memory when set, else the
+// pipeline-wide spec.worker default — matching CoordinatorSpec.CPU/Memory,
+// a table-level override always wins over the fallback. The default
+// carries WorkerDefaults' overhead; a table override does not declare its
+// own overhead (spec.WorkerSpec has no overhead field), so it inherits the
+// pipeline default's overhead too.
+func workerResources(cr *urutauv1alpha1.CDCPipeline, t urutauspec.Table) corev1.ResourceRequirements {
+	wd := cr.Spec.Worker
+	cpu, memory := wd.CPU, wd.Memory
+	if t.Workers != nil {
+		if t.Workers.CPU != "" {
+			cpu = t.Workers.CPU
+		}
+		if t.Workers.Memory != "" {
+			memory = t.Workers.Memory
+		}
+	}
+	return resourceRequirements(cpu, wd.CPUOverhead, memory, wd.MemoryOverhead)
 }
 
 func int32Ptr(v int32) *int32 { return &v }
