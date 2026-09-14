@@ -1,10 +1,12 @@
 // Package coordinator drives the source side of the split pipeline: it owns
 // the replication reader and the DBLog snapshot, serves the control plane
 // (Session/Assignment) and the Arrow Flight data plane, and streams change
-// batches to the connected workers. Tables map to worker groups
-// (spec.Tables[].Worker; a table without a group owns its own worker), each
-// group gets its own Flight queue, and one batch always routes to exactly
-// one worker.
+// batches to the connected workers. A table maps to one or more worker
+// groups (spec.Tables[].Workers; 0 or 1 means a single group, N splits the
+// table's primary-key domain into N contiguous ranges — see
+// spec.Table.WorkerGroupNames), each group gets its own Flight queue, and a
+// batch is routed — whole, or split by primary-key range across the
+// table's partitions — to the worker group(s) that own its rows.
 package coordinator
 
 import (
@@ -22,7 +24,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -120,13 +126,18 @@ type Coordinator struct {
 	snk       sink.Sink
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
-	// Worker registry: groups resolved at boot from the spec, one queue and
-	// one ticket each; route maps every target table to its owning worker.
-	route    map[string]*workerState
-	workers  map[string]*workerState
-	byTicket map[string]*workerState
-	budget   *flowBudget
-	index    map[string]*positionIndex
+	// Worker registry: groups resolved at boot from the spec, one queue
+	// and one ticket each. route maps every target table to its N
+	// partition owners, in partition order (route[target][i] owns
+	// partitionRanges[target][i]) — a table with Workers<=1 has exactly
+	// one entry, an unbounded range, matching today's single-worker
+	// behavior byte for byte.
+	route           map[string][]*workerState
+	partitionRanges map[string][]source.Chunk
+	workers         map[string]*workerState
+	byTicket        map[string]*workerState
+	budget          *flowBudget
+	index           map[string]*positionIndex
 
 	// runCtx outlives the helper goroutines that need cancellation (the
 	// wireRelay) but are called outside run's select.
@@ -153,16 +164,26 @@ type Coordinator struct {
 	// being shipped — a live event racing ahead of the chunk's rows would
 	// miss the window delete and duplicate the row. On ChunkReady the held
 	// events are released InWindow-tagged, then the Closes marker.
+	//
+	// Keyed by gateKey(target, partition), not just target: a partitioned
+	// table's N workers each run their own independent DBLog pass over
+	// their own PK range concurrently, so N windows can be open on the
+	// same table at once — one worker's chunk boundary must never gate
+	// (or release) a live batch that belongs to a DIFFERENT partition of
+	// the same table. An unpartitioned table (the overwhelming common
+	// case) has exactly one key, gateKey(target, 0), and this collapses
+	// to the previous single-window-per-table behavior exactly.
 	gateMu  sync.Mutex
-	gateOn  bool
-	gateTgt string
-	// gateBuf holds source batches (live changes) while their table's
-	// snapshot window is open. Raw pre-encode batches: released by
-	// flushWindow/closeWindow after they are queued.
-	gateBuf []*dataplane.Batch
+	gateOn  map[string]bool
+	gateWin map[string]gateWindow // key -> target/partition, for gateHold's row->key routing
+	// gateBuf holds source batches (live changes) per open window. Raw
+	// pre-encode batches: released by flushWindow/closeWindow after they
+	// are queued.
+	gateBuf map[string][]*dataplane.Batch
 	// gateDrain wakes a pump blocked on a full gate when flushWindow/
 	// closeWindow drains it (audit #5: the gate was the only buffer without
-	// a structural bound).
+	// a structural bound). One shared channel: any drain (of any window)
+	// wakes every waiter, which re-checks its own window's state.
 	gateDrain chan struct{}
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
@@ -211,15 +232,6 @@ type workerState struct {
 	activeGet atomic.Bool
 }
 
-// workerName resolves the worker group of one spec table: the explicit
-// worker= grouping, or the table's own pod (1:1 default).
-func workerName(t spec.Table) string {
-	if t.Worker != "" {
-		return t.Worker
-	}
-	return t.Target
-}
-
 // Run boots the pipeline and blocks until ctx is cancelled or a terminal
 // error occurs.
 func Run(ctx context.Context, cfg Config) error {
@@ -250,13 +262,16 @@ func Run(ctx context.Context, cfg Config) error {
 	c := &Coordinator{
 		cfg:         cfg,
 		log:         cfg.Logger,
-		route:       map[string]*workerState{},
+		route:       map[string][]*workerState{},
 		workers:     map[string]*workerState{},
 		byTicket:    map[string]*workerState{},
 		index:       map[string]*positionIndex{},
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
+		gateOn:      map[string]bool{},
+		gateWin:     map[string]gateWindow{},
+		gateBuf:     map[string][]*dataplane.Batch{},
 		gateDrain:   make(chan struct{}),
 		confirmed:   make(map[string]position.Position),
 	}
@@ -368,48 +383,57 @@ func (c *Coordinator) run(ctx context.Context) error {
 	c.refs = refs
 	c.canonical = canonical
 
-	// K4: a worker group name must not collide with another table's TARGET
-	// (an implicit worker name). "worker: payments" on one table plus a
-	// table targeting "payments" would silently merge two unrelated
-	// pipelines onto one worker.
-	explicitGroups := make(map[string]bool)
-	for _, t := range c.cfg.Spec.Tables {
-		if t.Worker != "" {
-			explicitGroups[t.Worker] = true
-		}
-	}
-	for _, t := range c.cfg.Spec.Tables {
-		if t.Worker == "" && explicitGroups[t.Target] {
-			return fmt.Errorf("coordinator: table %q targets %q, which is also an explicit worker group — rename the group or the target", t.Source, t.Target)
-		}
-	}
-
-	// Resolve worker groups: explicit worker= or the table's own pod.
+	// Resolve worker groups: one per partition, derived
+	// "<pipeline>-<target>-<index>" name (spec.Table.WorkerGroupNames) —
+	// there is no operator-chosen worker name, so two tables can never
+	// collide on one (each name embeds its own unique target).
+	//
+	// A table's partition RANGES are computed here, at boot, for every
+	// table — not only the ones needing a snapshot — because live-stream
+	// routing (enqueueBatch) depends on them from the first batch, resume
+	// or not. Workers<=1 short-circuits to a single unbounded range with
+	// no chunker query at all, so this is a no-op for every unpartitioned
+	// table (the overwhelming common case today).
+	c.partitionRanges = make(map[string][]source.Chunk, len(c.cfg.Spec.Tables))
 	for i, t := range c.cfg.Spec.Tables {
-		name := workerName(t)
-		w, ok := c.workers[name]
-		if !ok {
-			// A 128-bit random ticket colliding is ~0, but the queue-lookup
-			// map is keyed by it — a collision would silently orphan a
-			// worker's stream, so regenerate rather than assume.
-			for {
-				ticket := randTicket()
-				if _, taken := c.byTicket[string(ticket)]; taken {
-					continue
-				}
-				w = &workerState{
-					name:   name,
-					queue:  make(chan queuedBatch, workerQueueCap),
-					ticket: ticket,
-				}
-				c.byTicket[string(ticket)] = w
-				break
-			}
-			c.workers[name] = w
-			c.index[name] = newPositionIndex(c.runID)
+		names := t.WorkerGroupNames(c.cfg.Spec.Pipeline)
+		ranges, err := c.resolvePartitionRanges(ctx, t, refs[i])
+		if err != nil {
+			return fmt.Errorf("coordinator: %s: %w", t.Source, err)
 		}
-		w.refs = append(w.refs, refs[i])
-		c.route[t.Target] = w
+		if len(ranges) != len(names) {
+			return fmt.Errorf("coordinator: %s: resolved %d partition ranges for %d worker groups", t.Source, len(ranges), len(names))
+		}
+		c.partitionRanges[t.Target] = ranges
+
+		owners := make([]*workerState, len(names))
+		for p, name := range names {
+			w, ok := c.workers[name]
+			if !ok {
+				// A 128-bit random ticket colliding is ~0, but the
+				// queue-lookup map is keyed by it — a collision would
+				// silently orphan a worker's stream, so regenerate
+				// rather than assume.
+				for {
+					ticket := randTicket()
+					if _, taken := c.byTicket[string(ticket)]; taken {
+						continue
+					}
+					w = &workerState{
+						name:   name,
+						queue:  make(chan queuedBatch, workerQueueCap),
+						ticket: ticket,
+					}
+					c.byTicket[string(ticket)] = w
+					break
+				}
+				c.workers[name] = w
+				c.index[name] = newPositionIndex(c.runID)
+			}
+			w.refs = append(w.refs, refs[i])
+			owners[p] = w
+		}
+		c.route[t.Target] = owners
 	}
 	for _, w := range c.workers {
 		c.log.Info("coordinator worker group", "worker", w.name, "tables", len(w.refs))
@@ -652,6 +676,34 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 }
 
+// resolvePartitionRanges returns the ordered, contiguous PK ranges one
+// table's Workers count requires — the SAME ranges the DBLog snapshot
+// (each chunk aligned within its owning range) and live-stream routing
+// both use, so a key never switches partition ownership between the two
+// phases. Workers<=1 returns a single unbounded range without touching
+// the database at all — the common, unpartitioned case pays no extra
+// cost. Workers>1 requires the source's chunker to implement
+// source.PartitionSource; a source that doesn't (Postgres, today) fails
+// the boot loudly rather than silently running unpartitioned.
+func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, error) {
+	if t.Workers <= 1 {
+		return []source.Chunk{{}}, nil
+	}
+	chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
+	if err != nil {
+		return nil, fmt.Errorf("workers: %d: chunker: %w", t.Workers, err)
+	}
+	ps, ok := chunker.(source.PartitionSource)
+	if !ok {
+		return nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", t.Workers)
+	}
+	ranges, err := ps.Partitions(ctx, t.Workers)
+	if err != nil {
+		return nil, fmt.Errorf("workers: %d: %w", t.Workers, err)
+	}
+	return ranges, nil
+}
+
 // supervisionConfig maps the Config knobs to the supervisor defaults.
 func supervisionConfig(cfg Config) SupervisorConfig {
 	return SupervisorConfig{
@@ -813,10 +865,34 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 // held is bounded by gateMaxEvents × batchTarget.
 const gateMaxEvents = 1024
 
-// gateHold buffers a batch when a window is open for its table. A full
-// gate blocks the pump until the snapshot drains it, instead of growing the
-// buffer without bound. Ownership: when gateHold returns true the batch is
-// in the gate and released by flushWindow/closeWindow.
+// gateWindow identifies one open DBLog window: a table's Nth partition.
+// An unpartitioned table's sole window is always {target, 0}.
+type gateWindow struct {
+	target    string
+	partition int
+}
+
+// gateKey renders a gateWindow into the map key gateOn/gateBuf/gateWin use.
+func gateKey(target string, partition int) string {
+	return fmt.Sprintf("%s#%d", target, partition)
+}
+
+// gateHold buffers a batch when a window is open for a partition its rows
+// could belong to. A full gate blocks the pump until the snapshot drains
+// it, instead of growing the buffer without bound. Ownership: when
+// gateHold returns true the batch is in the gate and released by
+// flushWindow/closeWindow.
+//
+// A table with only one partition (the common case) always gates on
+// gateKey(target, 0) — the same single-window behavior as before
+// partitioning existed. A partitioned table's batch is gated by EVERY
+// open window that its PK range could overlap: gateHold does not decode
+// rows to know precisely which partitions a batch touches, so it
+// conservatively holds a batch against any open window for its table
+// rather than risk releasing a row whose partition's snapshot chunk
+// hasn't confirmed caught-up yet. This can hold a batch slightly longer
+// than strictly necessary (extra latency, never data loss) when multiple
+// partitions of the same table snapshot concurrently.
 //
 // If the context dies while the pump waits on a full gate, gateHold returns
 // false and the batch is treated as live (not gated). That is only reachable
@@ -824,11 +900,12 @@ const gateMaxEvents = 1024
 // must not be relied on in any live path.
 func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 	c.gateMu.Lock()
-	if !c.gateOn || b.Table != c.gateTgt {
+	key, held := c.openKeyForTableLocked(b.Table)
+	if !held {
 		c.gateMu.Unlock()
 		return false
 	}
-	full := len(c.gateBuf) >= gateMaxEvents
+	full := len(c.gateBuf[key]) >= gateMaxEvents
 	c.gateMu.Unlock()
 	if full {
 		select {
@@ -839,42 +916,73 @@ func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 	}
 	c.gateMu.Lock()
 	// Re-check after the wait: the gate may have drained, closed, or the
-	// table changed while the pump was asleep.
-	if !c.gateOn || b.Table != c.gateTgt {
+	// table's window may have changed while the pump was asleep.
+	key, held = c.openKeyForTableLocked(b.Table)
+	if !held {
 		c.gateMu.Unlock()
 		return false
 	}
-	c.gateBuf = append(c.gateBuf, b)
+	c.gateBuf[key] = append(c.gateBuf[key], b)
 	c.gateMu.Unlock()
 	return true
 }
 
-// openWindow pauses the pump for one table, tagging the current chunk. The
-// gate stays open for the WHOLE snapshot of the table (design §3.1: the
-// coordinator pauses relaying while it works the table); flushWindow drains
-// per chunk without closing it, and closeWindow seals it at the end. A gate
-// that opened and closed per chunk would let gap events (positioned AFTER
-// the gate's backlog) flow straight through, then release older backlog
-// after them — a reordering that resurrects old values.
-func (c *Coordinator) openWindow(target string) {
+// openKeyForTableLocked returns the first open gate key for target, if
+// any. Callers must hold gateMu. A table has at most as many
+// simultaneously-open keys as it has partitions actively snapshotting;
+// gateHold only needs to know "is ANY window for this table open" since
+// it gates conservatively at the whole-table (not per-row) level.
+func (c *Coordinator) openKeyForTableLocked(target string) (string, bool) {
+	for k, on := range c.gateOn {
+		if !on {
+			continue
+		}
+		if w, ok := c.gateWin[k]; ok && w.target == target {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// openWindow pauses the pump for one table's partition, tagging the
+// current chunk. The gate stays open for the WHOLE snapshot of that
+// partition (design §3.1: the coordinator pauses relaying while it works
+// the table); flushWindow drains per chunk without closing it, and
+// closeWindow seals it at the end. A gate that opened and closed per
+// chunk would let gap events (positioned AFTER the gate's backlog) flow
+// straight through, then release older backlog after them — a
+// reordering that resurrects old values.
+func (c *Coordinator) openWindow(target string, partition int) {
 	c.gateMu.Lock()
-	c.gateOn, c.gateTgt = true, target
+	key := gateKey(target, partition)
+	if c.gateOn == nil {
+		c.gateOn = map[string]bool{}
+		c.gateWin = map[string]gateWindow{}
+		c.gateBuf = map[string][]*dataplane.Batch{}
+	}
+	c.gateOn[key] = true
+	c.gateWin[key] = gateWindow{target: target, partition: partition}
 	c.gateMu.Unlock()
 }
 
-// flushWindow drains the gated batches collected since the last drain,
-// each InWindow-tagged for the given chunk, then returns (gate stays open).
-// Batch ownership transfers to enqueueBatch per drain.
-func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
+// flushWindow drains the gated batches collected since the last drain for
+// one partition's window, each InWindow-tagged for the given chunk, then
+// returns (that window stays open). Batch ownership transfers to
+// enqueueBatch per drain. enqueueBatch itself splits a batch across
+// partition owners by PK range when the table is partitioned, so a
+// drained batch reaches only the rows' actual owning worker(s) even
+// though the gate held it at whole-table granularity.
+func (c *Coordinator) flushWindow(ctx context.Context, target string, partition int, chunkID uint32) error {
+	key := gateKey(target, partition)
 	c.gateMu.Lock()
-	buf, tgt := c.gateBuf, c.gateTgt
-	c.gateBuf = nil
+	buf := c.gateBuf[key]
+	c.gateBuf[key] = nil
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
 
 	meta := &pb.BatchMeta{
-		Table:  tgt,
+		Table:  target,
 		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
 	}
 	for i, b := range buf {
@@ -888,18 +996,22 @@ func (c *Coordinator) flushWindow(ctx context.Context, chunkID uint32) error {
 	return nil
 }
 
-// closeWindow releases any remaining gated batches (post-last-chunk) and
-// closes the gate. The trailing events are ordinary live changes: no window
-// tag.
-func (c *Coordinator) closeWindow(ctx context.Context) error {
+// closeWindow releases any remaining gated batches (post-last-chunk) for
+// one partition's window and closes just that window — other partitions
+// of the same table still snapshotting keep their own windows open. The
+// trailing events are ordinary live changes: no window tag.
+func (c *Coordinator) closeWindow(ctx context.Context, target string, partition int) error {
+	key := gateKey(target, partition)
 	c.gateMu.Lock()
-	buf, tgt := c.gateBuf, c.gateTgt
-	c.gateOn, c.gateBuf = false, nil
+	buf := c.gateBuf[key]
+	delete(c.gateOn, key)
+	delete(c.gateWin, key)
+	delete(c.gateBuf, key)
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
 
-	meta := &pb.BatchMeta{Table: tgt}
+	meta := &pb.BatchMeta{Table: target}
 	for i, b := range buf {
 		if err := c.enqueueBatch(ctx, b, meta); err != nil {
 			for _, rest := range buf[i+1:] {
@@ -975,14 +1087,46 @@ func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID 
 // Closes marker. The worker holds the chunk rows in its window; the window
 // is what InWindow events drain and the Closes marker flushes.
 func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
+	owners, ok := c.route[ref.Target]
+	if !ok {
+		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
+	}
+	ranges := c.partitionRanges[ref.Target]
+	if len(ranges) != len(owners) {
+		return fmt.Errorf("coordinator: snapshot: table %s: %d partition ranges for %d owners", ref.Target, len(ranges), len(owners))
+	}
+
+	// One partition at a time: all partitions of a table share the same
+	// replication reader (rdr) — there is one binlog/WAL connection per
+	// pipeline, not per partition — so this is sequential I/O today, not
+	// parallel. Each partition still gets its own correct, independent
+	// window (design requirement; the parallelism this feature is FOR is
+	// steady-state live-stream throughput, which the per-partition
+	// worker processes already give — see enqueueBatch's PK-range split).
+	// A future iteration could parallelize the chunk SELECTs themselves
+	// (they run on the WORKER, not rdr) while keeping rdr's caught-up
+	// proof sequential; not needed for this to be correct.
+	for p, w := range owners {
+		if err := c.snapshotPartition(ctx, rdr, chunker, ref, ranges[p], p, w, cfg); err != nil {
+			return fmt.Errorf("partition %d: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// snapshotPartition runs the DBLog snapshot for one partition of one
+// table: only chunks that fall within partitionRange are sent to w, and
+// the window/gate lifecycle (openWindow/flushWindow/closeWindow) is
+// scoped to this partition alone, so a different partition's concurrent
+// snapshot (if any) is never gated or released by this one's chunks.
+func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
 	bounds, err := chunker.Bounds(ctx)
 	if err != nil {
 		return err
 	}
-	chunks := snapshot.Chunks(bounds)
-	w, ok := c.route[ref.Target]
-	if !ok {
-		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
+	chunks := clipChunksToRange(snapshot.Chunks(bounds), partitionRange)
+	if len(chunks) == 0 {
+		return nil // this partition's range contains no rows right now
 	}
 	// The epoch the ChunkRequests are sent under; the worker echoes it on
 	// ChunkReady so a reply from a superseded generation is ignored.
@@ -996,7 +1140,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 			return err
 		}
 		if i == 0 {
-			c.openWindow(ref.Target)
+			c.openWindow(ref.Target, partition)
 		}
 
 		boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
@@ -1014,7 +1158,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 		if err := c.waitChunkReady(ctx, ref.Source, chunkID, epoch); err != nil {
 			return err
 		}
-		c.log.Info("chunk ready", "table", ref.Source, "chunk", chunkID)
+		c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID)
 
 		// The worker has the chunk rows in its window; prove the reader is
 		// caught up before releasing anything that touches this window. The
@@ -1033,10 +1177,13 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 		// Release this chunk's gated live events (InWindow-tagged) ahead of
 		// the Closes marker — FIFO keeps them before it. The gate stays
 		// open: the next chunk's backlog must not race ahead of these.
-		if err := c.flushWindow(ctx, chunkID); err != nil {
+		if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
 			return err
 		}
-		if err := c.enqueueBatch(ctx, nil, &pb.BatchMeta{
+		// The Closes marker belongs to exactly this partition's worker —
+		// not routed through enqueueBatch's table-wide lookup, since a
+		// marker carries no rows for enqueueBatch to route by key.
+		if err := c.enqueueTo(ctx, w, nil, &pb.BatchMeta{
 			Table:  ref.Target,
 			LowPos: at.String(),
 			Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
@@ -1044,8 +1191,38 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 			return err
 		}
 	}
-	// Seal the gate and release anything collected after the last chunk.
-	return c.closeWindow(ctx)
+	// Seal this partition's gate and release anything collected after its
+	// last chunk. Other partitions' gates (if any) are untouched.
+	return c.closeWindow(ctx, ref.Target, partition)
+}
+
+// clipChunksToRange keeps only the chunks that intersect partitionRange,
+// clamping each kept chunk's own Low/High to the range's bounds so a
+// chunk straddling the partition boundary never sends rows outside it.
+// An empty partitionRange (the unpartitioned {} zero value) matches
+// everything unchanged.
+func clipChunksToRange(chunks []source.Chunk, partitionRange source.Chunk) []source.Chunk {
+	if partitionRange.Low == nil && partitionRange.High == nil {
+		return chunks
+	}
+	var out []source.Chunk
+	for _, ch := range chunks {
+		if partitionRange.High != nil && ch.Low != nil && comparePK(ch.Low, partitionRange.High) >= 0 {
+			continue // chunk starts at/after the range ends
+		}
+		if partitionRange.Low != nil && ch.High != nil && comparePK(ch.High, partitionRange.Low) <= 0 {
+			continue // chunk ends at/before the range starts — both are half-open [Low,High)
+		}
+		clipped := ch
+		if partitionRange.Low != nil && (ch.Low == nil || comparePK(ch.Low, partitionRange.Low) < 0) {
+			clipped.Low = partitionRange.Low
+		}
+		if partitionRange.High != nil && (ch.High == nil || comparePK(ch.High, partitionRange.High) > 0) {
+			clipped.High = partitionRange.High
+		}
+		out = append(out, clipped)
+	}
+	return out
 }
 
 // enqueueBatch queues ONE serialized batch on a worker's Flight stream and
@@ -1071,15 +1248,93 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if meta == nil {
 		meta = &pb.BatchMeta{}
 	}
-	w, ok := c.route[meta.Table]
+	owners, ok := c.route[meta.Table]
 	if !ok {
 		if b != nil {
 			meta.Table = b.Table
 		}
-		w, ok = c.route[meta.Table]
+		owners, ok = c.route[meta.Table]
 		if !ok {
 			return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
 		}
+	}
+
+	if b == nil {
+		// A marker with no target worker specified goes to every
+		// partition owner — used by callers with no single partition in
+		// mind (there are none of these left in this codebase; every
+		// window-lifecycle marker now goes through snapshotTable's
+		// explicit per-partition enqueueTo calls instead). Kept as the
+		// safe default for any other caller of the plain enqueueBatch
+		// marker path, rather than silently picking one owner.
+		for _, w := range owners {
+			if err := c.enqueueTo(ctx, w, nil, cloneBatchMeta(meta)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if len(owners) == 1 {
+		return c.enqueueTo(ctx, owners[0], b, meta)
+	}
+
+	// Partitioned table: split b's rows by primary-key range, one
+	// sub-batch per owning partition — the SAME ranges the DBLog
+	// snapshot uses (c.partitionRanges), so a key is always routed to
+	// the one worker that also owns it during bootstrap.
+	pk := c.primaryKeyFor(meta.Table)
+	if len(pk) == 0 {
+		return fmt.Errorf("coordinator: table %s has %d partition owners but no primary key to route by", meta.Table, len(owners))
+	}
+	ranges := c.partitionRanges[meta.Table]
+	if len(ranges) != len(owners) {
+		return fmt.Errorf("coordinator: table %s: %d partition ranges for %d owners", meta.Table, len(ranges), len(owners))
+	}
+	reader, err := transport.NewBatchReader(b.Record, pk)
+	if err != nil {
+		return fmt.Errorf("coordinator: table %s: partition routing: %w", meta.Table, err)
+	}
+	nrows := reader.NumRows()
+	owner := make([]int, nrows)
+	for i := 0; i < nrows; i++ {
+		p := partitionOwner(ranges, reader.Key(i))
+		if p < 0 {
+			return fmt.Errorf("coordinator: table %s: row %d's key %v matches no partition range", meta.Table, i, reader.Key(i))
+		}
+		owner[i] = p
+	}
+	subBatches, err := splitByOwner(ctx, b.Record, owner, len(owners))
+	if err != nil {
+		return fmt.Errorf("coordinator: table %s: split by partition: %w", meta.Table, err)
+	}
+	for p, sub := range subBatches {
+		if sub == nil {
+			continue // no rows for this partition in this batch
+		}
+		subMeta := cloneBatchMeta(meta)
+		subMeta.HighPos = "" // recomputed per sub-batch below
+		subBatch := &dataplane.Batch{Table: b.Table, Record: sub, Watermark: b.Watermark, Mode: b.Mode}
+		if err := c.enqueueTo(ctx, owners[p], subBatch, subMeta); err != nil {
+			sub.Release()
+			return err
+		}
+	}
+	return nil
+}
+
+// enqueueTo serializes and queues ONE batch (or a nil-record marker) on
+// ONE worker's Flight stream, charging its share of the global flow
+// budget. A full budget blocks here — the backpressure that stalls the
+// pump and, through it, the reader. The charge is released when the
+// worker's Ack covers the batch's position (onAck).
+//
+// OWNERSHIP: releases b (if non-nil) on every exit — the caller must not
+// use b again after this returns, matching enqueueBatch's existing
+// single-owner contract.
+func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplane.Batch, meta *pb.BatchMeta) error {
+	if b != nil {
+		defer b.Release()
 	}
 	meta.BatchId = c.batchSeq.Add(1)
 
@@ -1155,6 +1410,133 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		c.budget.release(w.name, n)
 		return ctx.Err()
 	}
+}
+
+// primaryKeyFor returns the primary key columns for the table targeted
+// by target (a TARGET table name, matching c.refs' shape).
+func (c *Coordinator) primaryKeyFor(target string) []string {
+	for _, ref := range c.refs {
+		if ref.Target == target {
+			return ref.PrimaryKey
+		}
+	}
+	return nil
+}
+
+// cloneBatchMeta returns a shallow copy of meta — enqueueTo mutates
+// BatchId/HighPos on the instance it's given, and a marker sent to every
+// partition owner (or a sub-batch's per-partition meta) must not share
+// one struct across concurrent-ish sends.
+func cloneBatchMeta(meta *pb.BatchMeta) *pb.BatchMeta {
+	return proto.Clone(meta).(*pb.BatchMeta)
+}
+
+// partitionOwner returns the index of the partition range containing key
+// — the range r such that r.Low <= key < r.High (nil bounds are open).
+// Ranges must be contiguous and ordered (as Partitions/the single-range
+// default always produce); returns -1 only if no range matches, which
+// never happens for a correctly resolved table.
+func partitionOwner(ranges []source.Chunk, key []any) int {
+	if len(ranges) == 1 {
+		return 0 // the common, unpartitioned case — skip the comparison
+	}
+	for i, r := range ranges {
+		if r.Low != nil && comparePK(key, r.Low) < 0 {
+			continue
+		}
+		if r.High != nil && comparePK(key, r.High) >= 0 {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// comparePK compares two same-shaped primary-key tuples column by
+// column, the same row-constructor semantics the chunkers' own bounds
+// comparisons use (lexicographic over the tuple). Supports the ordered
+// scalar types a partition key can be: int64-family, float64, and
+// string/[]byte (partitioning today only supports a single-column key —
+// see source.PartitionSource — so in practice these tuples always have
+// exactly one element, but the comparison is written for the general
+// tuple shape to match Chunk's own []any convention).
+func comparePK(a, b []any) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if c := compareScalar(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	return len(a) - len(b)
+}
+
+func compareScalar(a, b any) int {
+	af, aok := toFloat(a)
+	bf, bok := toFloat(b)
+	if aok && bok {
+		switch {
+		case af < bf:
+			return -1
+		case af > bf:
+			return 1
+		default:
+			return 0
+		}
+	}
+	as, bs := fmt.Sprint(a), fmt.Sprint(b)
+	return strings.Compare(as, bs)
+}
+
+func toFloat(v any) (float64, bool) {
+	switch t := v.(type) {
+	case int64:
+		return float64(t), true
+	case int32:
+		return float64(t), true
+	case int:
+		return float64(t), true
+	case float64:
+		return t, true
+	case float32:
+		return float64(t), true
+	default:
+		return 0, false
+	}
+}
+
+// splitByOwner filters rec into len(nOwners) sub-records, one per
+// partition index in owner (owner[i] is the partition row i belongs to).
+// A partition with zero matching rows gets a nil entry (skipped by the
+// caller) rather than an empty-but-non-nil record — enqueueTo's
+// zero-row marker path is for markers only, not empty data batches.
+func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwners int) ([]arrow.RecordBatch, error) {
+	out := make([]arrow.RecordBatch, nOwners)
+	for p := 0; p < nOwners; p++ {
+		idxBuilder := array.NewInt64Builder(memory.DefaultAllocator)
+		for i, o := range owner {
+			if o == p {
+				idxBuilder.Append(int64(i))
+			}
+		}
+		if idxBuilder.Len() == 0 {
+			idxBuilder.Release()
+			continue
+		}
+		idxArr := idxBuilder.NewInt64Array()
+		idxBuilder.Release()
+		datum, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
+			&compute.RecordDatum{Value: rec}, &compute.ArrayDatum{Value: idxArr.Data()})
+		idxArr.Release()
+		if err != nil {
+			for _, r := range out {
+				if r != nil {
+					r.Release()
+				}
+			}
+			return nil, fmt.Errorf("partition %d: %w", p, err)
+		}
+		out[p] = datum.(*compute.RecordDatum).Value
+	}
+	return out, nil
 }
 
 // onHello processes a worker's ready Hello: it carries the phase and the
