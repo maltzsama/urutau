@@ -10,8 +10,6 @@ func (in *CDCPipelineSpec) DeepCopyInto(out *CDCPipelineSpec) {
 	if in.Definition.Inline != nil {
 		out.Definition.Inline = deepCopyAny(in.Definition.Inline).(map[string]any)
 	}
-	in.Coordinator.Resources.DeepCopyInto(&out.Coordinator.Resources)
-	in.WorkerDefaults.Resources.DeepCopyInto(&out.WorkerDefaults.Resources)
 }
 
 // DeepCopy copies the spec.
@@ -40,34 +38,6 @@ func (in *CDCPipelineStatus) DeepCopy() *CDCPipelineStatus {
 	}
 	out := new(CDCPipelineStatus)
 	in.DeepCopyInto(out)
-	return out
-}
-
-// DeepCopyInto copies resource requirements.
-func (in *ResourceRequirements) DeepCopyInto(out *ResourceRequirements) {
-	*out = *in
-	out.Requests = copyMap(in.Requests)
-	out.Limits = copyMap(in.Limits)
-}
-
-// DeepCopy copies resource requirements.
-func (in *ResourceRequirements) DeepCopy() *ResourceRequirements {
-	if in == nil {
-		return nil
-	}
-	out := new(ResourceRequirements)
-	in.DeepCopyInto(out)
-	return out
-}
-
-func copyMap(m map[string]string) map[string]string {
-	if m == nil {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
 	return out
 }
 
