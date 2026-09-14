@@ -2,8 +2,8 @@
 // the replication reader and the DBLog snapshot, serves the control plane
 // (Session/Assignment) and the Arrow Flight data plane, and streams change
 // batches to the connected workers. A table maps to one or more worker
-// groups (spec.Tables[].Workers; 0 or 1 means a single group, N splits the
-// table's primary-key domain into N contiguous ranges — see
+// groups (spec.Tables[].Workers.Number; nil or <=1 means a single group, N
+// splits the table's primary-key domain into N contiguous ranges — see
 // spec.Table.WorkerGroupNames), each group gets its own Flight queue, and a
 // batch is routed — whole, or split by primary-key range across the
 // table's partitions — to the worker group(s) that own its rows.
@@ -686,20 +686,21 @@ func (c *Coordinator) run(ctx context.Context) error {
 // source.PartitionSource; a source that doesn't (Postgres, today) fails
 // the boot loudly rather than silently running unpartitioned.
 func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, error) {
-	if t.Workers <= 1 {
+	n := t.WorkerCount()
+	if n <= 1 {
 		return []source.Chunk{{}}, nil
 	}
 	chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 	if err != nil {
-		return nil, fmt.Errorf("workers: %d: chunker: %w", t.Workers, err)
+		return nil, fmt.Errorf("workers: %d: chunker: %w", n, err)
 	}
 	ps, ok := chunker.(source.PartitionSource)
 	if !ok {
-		return nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", t.Workers)
+		return nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", n)
 	}
-	ranges, err := ps.Partitions(ctx, t.Workers)
+	ranges, err := ps.Partitions(ctx, n)
 	if err != nil {
-		return nil, fmt.Errorf("workers: %d: %w", t.Workers, err)
+		return nil, fmt.Errorf("workers: %d: %w", n, err)
 	}
 	return ranges, nil
 }
