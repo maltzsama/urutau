@@ -105,13 +105,13 @@ type ChunkSource interface {
 
 // PartitionSource is the optional chunker capability that splits a
 // table's primary-key domain into n contiguous, ordered ranges for
-// worker partitioning (spec.Table.Workers > 1) — the SAME range values
-// govern both the DBLog snapshot (each chunk falls within its owning
-// partition's range) and live-stream routing, so a key can never switch
-// partition ownership between the two phases. Not every ChunkSource
-// implements this; the coordinator fails boot loudly, rather than
-// silently skipping partitioning, when Workers > 1 is declared for a
-// table whose source chunker doesn't.
+// worker partitioning (spec.Table.WorkerCount() > 1) — the SAME range
+// values govern both the DBLog snapshot (each chunk falls within its
+// owning partition's range) and live-stream routing, so a key can never
+// switch partition ownership between the two phases. Not every
+// ChunkSource implements this; the coordinator fails boot loudly, rather
+// than silently skipping partitioning, when a table declares more than
+// one worker and its source chunker doesn't support this.
 type PartitionSource interface {
 	// Partitions returns n contiguous ranges covering the table's whole
 	// primary-key domain, in order (Partitions(ctx,1)[0] is always the

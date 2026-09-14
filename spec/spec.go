@@ -135,13 +135,15 @@ type Table struct {
 	// Workers partitions this table's work across N worker groups by a
 	// contiguous primary-key range — like Spark/Flink partition an
 	// executor pool over a hot table, instead of capping it at one
-	// worker's throughput. 0 or 1 means today's single-worker behavior:
-	// no partitioning, one group. A worker group's name is always
-	// derived (see Table.WorkerGroupNames) — there is no operator-chosen
-	// worker name.
-	Workers           int  `json:"workers,omitempty"`
-	CreateIfNotExists bool `json:"createIfNotExists,omitempty"`
-	FilterImmutable   bool `json:"filterImmutable,omitempty"`
+	// worker's throughput. Nil or Number<=1 means today's single-worker
+	// behavior: no partitioning, one group. A worker group's name is
+	// always derived (see Table.WorkerGroupNames) — there is no
+	// operator-chosen worker name. CPU/Memory are Kubernetes resource
+	// quantities (e.g. "2", "4Gi") applied to every worker Deployment
+	// this table provisions; ignored outside Kubernetes provisioning.
+	Workers           *WorkerSpec `json:"workers,omitempty"`
+	CreateIfNotExists bool        `json:"createIfNotExists,omitempty"`
+	FilterImmutable   bool        `json:"filterImmutable,omitempty"`
 	// Metadata lands pipeline metadata columns (op, commit_ts, position, ...)
 	// in the target table. The destination name is explicit via As.
 	Metadata []core.MetadataColumn `json:"metadata,omitempty"`
@@ -165,17 +167,33 @@ type Table struct {
 	Enrich []Enrich `json:"enrich,omitempty"`
 }
 
+// WorkerSpec declares a table's partition count and the Kubernetes
+// resources given to each partition's worker — the per-table equivalent
+// of Spark's spark.executor.cores/memory, scoped to one hot table instead
+// of the whole job.
+type WorkerSpec struct {
+	Number int    `json:"number,omitempty"`
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
+}
+
+// WorkerCount returns this table's partition count — Number, or 1 when
+// Workers is nil or Number<=1 (today's single-worker behavior).
+func (t Table) WorkerCount() int {
+	if t.Workers == nil || t.Workers.Number < 1 {
+		return 1
+	}
+	return t.Workers.Number
+}
+
 // WorkerGroupNames returns this table's derived worker group names — one
 // per partition, "<pipeline>-<target>-<index>" for index in
-// [0, max(Workers,1)). This is the ONLY way a worker group is named:
-// there is no operator-chosen name (Workers is a count, not a list of
+// [0, WorkerCount()). This is the ONLY way a worker group is named: there
+// is no operator-chosen name (Workers.Number is a count, not a list of
 // names), so the coordinator's routing and its Kubernetes worker
 // provisioning always derive the same names from the same inputs.
 func (t Table) WorkerGroupNames(pipeline string) []string {
-	n := t.Workers
-	if n < 1 {
-		n = 1
-	}
+	n := t.WorkerCount()
 	names := make([]string, n)
 	for i := 0; i < n; i++ {
 		names[i] = fmt.Sprintf("%s-%s-%d", pipeline, t.Target, i)

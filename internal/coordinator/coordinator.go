@@ -2,8 +2,8 @@
 // the replication reader and the DBLog snapshot, serves the control plane
 // (Session/Assignment) and the Arrow Flight data plane, and streams change
 // batches to the connected workers. A table maps to one or more worker
-// groups (spec.Tables[].Workers; 0 or 1 means a single group, N splits the
-// table's primary-key domain into N contiguous ranges — see
+// groups (spec.Tables[].Workers.Number; nil or <=1 means a single group, N
+// splits the table's primary-key domain into N contiguous ranges — see
 // spec.Table.WorkerGroupNames), each group gets its own Flight queue, and a
 // batch is routed — whole, or split by primary-key range across the
 // table's partitions — to the worker group(s) that own its rows.
@@ -395,6 +395,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// no chunker query at all, so this is a no-op for every unpartitioned
 	// table (the overwhelming common case today).
 	c.partitionRanges = make(map[string][]source.Chunk, len(c.cfg.Spec.Tables))
+	// workerTarget maps every derived worker group name back to the table
+	// target it belongs to — provisionWorkers uses it to pick that
+	// table's own worker Pod template (one per table, rendered by the
+	// operator into the coordinator's ConfigMap).
+	workerTarget := make(map[string]string, len(c.cfg.Spec.Tables))
 	for i, t := range c.cfg.Spec.Tables {
 		names := t.WorkerGroupNames(c.cfg.Spec.Pipeline)
 		ranges, err := c.resolvePartitionRanges(ctx, t, refs[i])
@@ -432,8 +437,12 @@ func (c *Coordinator) run(ctx context.Context) error {
 			}
 			w.refs = append(w.refs, refs[i])
 			owners[p] = w
+			workerTarget[name] = t.Target
 		}
 		c.route[t.Target] = owners
+	}
+	if err := c.provisionWorkers(ctx, workerTarget); err != nil {
+		return fmt.Errorf("coordinator: %w", err)
 	}
 	for _, w := range c.workers {
 		c.log.Info("coordinator worker group", "worker", w.name, "tables", len(w.refs))
@@ -686,20 +695,21 @@ func (c *Coordinator) run(ctx context.Context) error {
 // source.PartitionSource; a source that doesn't (Postgres, today) fails
 // the boot loudly rather than silently running unpartitioned.
 func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, error) {
-	if t.Workers <= 1 {
+	n := t.WorkerCount()
+	if n <= 1 {
 		return []source.Chunk{{}}, nil
 	}
 	chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 	if err != nil {
-		return nil, fmt.Errorf("workers: %d: chunker: %w", t.Workers, err)
+		return nil, fmt.Errorf("workers: %d: chunker: %w", n, err)
 	}
 	ps, ok := chunker.(source.PartitionSource)
 	if !ok {
-		return nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", t.Workers)
+		return nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", n)
 	}
-	ranges, err := ps.Partitions(ctx, t.Workers)
+	ranges, err := ps.Partitions(ctx, n)
 	if err != nil {
-		return nil, fmt.Errorf("workers: %d: %w", t.Workers, err)
+		return nil, fmt.Errorf("workers: %d: %w", n, err)
 	}
 	return ranges, nil
 }

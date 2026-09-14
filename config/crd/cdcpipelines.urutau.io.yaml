@@ -23,6 +23,7 @@ spec:
             spec:
               type: object
               properties:
+                image: {type: string}
                 definition:
                   type: object
                   properties:
@@ -53,15 +54,15 @@ spec:
                         window: {type: string}
                     statusInterval: {type: string}
                     metricsAddr: {type: string}
-                    resources:
-                      type: object
-                      x-kubernetes-preserve-unknown-fields: true
-                workerDefaults:
+                    cpu: {type: string}
+                    memory: {type: string}
+                worker:
                   type: object
                   properties:
-                    resources:
-                      type: object
-                      x-kubernetes-preserve-unknown-fields: true
+                    cpu: {type: string}
+                    cpu_overhead: {type: string}
+                    memory: {type: string}
+                    memory_overhead: {type: string}
             status:
               type: object
               properties:

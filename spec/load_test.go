@@ -31,7 +31,10 @@ tables:
         - {col: status, op: neq, value: draft}
         - any:
             - {col: type, op: in, value: [web, mobile]}
-    workers: 3
+    workers:
+      number: 3
+      cpu: "2"
+      memory: "4Gi"
     writeMode: append
     filterImmutable: true
   - source: shop.order_items
@@ -58,7 +61,8 @@ func TestLoadYAML(t *testing.T) {
 	}
 
 	orders := s.Tables[1]
-	if orders.Workers != 3 || orders.WriteMode != WriteModeAppend || !orders.FilterImmutable {
+	if orders.WorkerCount() != 3 || orders.Workers.CPU != "2" || orders.Workers.Memory != "4Gi" ||
+		orders.WriteMode != WriteModeAppend || !orders.FilterImmutable {
 		t.Fatalf("orders = %+v", orders)
 	}
 	wantGroups := []string{"shop-mysql-raw.orders-0", "shop-mysql-raw.orders-1", "shop-mysql-raw.orders-2"}
