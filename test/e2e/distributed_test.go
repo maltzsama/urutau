@@ -40,8 +40,9 @@ func TestDistributedPipeline(t *testing.T) {
 	_ = lis.Close()
 
 	s := loadPipeline(t)
-	// Name the worker group so the Hello ("w1") matches the registry.
-	s.Tables[0].Worker = "w1"
+	// The worker group name is always derived (<pipeline>-<target>-0 for
+	// an unpartitioned table) — the Hello a worker sends must match it.
+	w1 := s.Tables[0].WorkerGroupNames(s.Pipeline)[0]
 	db := mysqlConn(t)
 	resetBinlog(t, db)
 	dropIcebergTable(t, ctx)
@@ -52,7 +53,7 @@ func TestDistributedPipeline(t *testing.T) {
 		return bootPipeline(t, ctx, addr, s, workers...)
 	}
 
-	stop, waitDone := boot("w1")
+	stop, waitDone := boot(w1)
 
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(30))
 	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (101, 'live1', 1.5)`)
@@ -74,7 +75,7 @@ func TestDistributedPipeline(t *testing.T) {
 	dml(t, db, `UPDATE orders SET v = 'after-down' WHERE id = 1`)
 	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (200, 'resumed', 9.0)`)
 
-	stop2, waitDone2 := boot("w1")
+	stop2, waitDone2 := boot(w1)
 	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 1`, "after-down")
 	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 200`, "resumed")
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(31))
@@ -139,7 +140,7 @@ func TestWorkerSuicide(t *testing.T) {
 	_ = lis.Close()
 
 	s := loadPipeline(t)
-	s.Tables[0].Worker = "w1"
+	w1 := s.Tables[0].WorkerGroupNames(s.Pipeline)[0]
 	db := mysqlConn(t)
 	resetBinlog(t, db)
 	dropIcebergTable(t, ctx)
@@ -153,7 +154,7 @@ func TestWorkerSuicide(t *testing.T) {
 	wErr := make(chan error, 1)
 	cErr := make(chan error, 1)
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second})
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second})
 	}()
 	go func() {
 		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
@@ -204,7 +205,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 	_ = lis.Close()
 
 	s := loadPipeline(t)
-	s.Tables[0].Worker = "w1"
+	w1 := s.Tables[0].WorkerGroupNames(s.Pipeline)[0]
 	db := mysqlConn(t)
 	resetBinlog(t, db)
 	dropIcebergTable(t, ctx)
@@ -221,7 +222,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 	// buffer (not committed by a timer) when the shutdown signal arrives;
 	// the drain must commit it.
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 10000, MaxInterval: 30 * time.Second})
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 10000, MaxInterval: 30 * time.Second})
 	}()
 	go func() {
 		// AckTimeout generous: this test exercises the drain, not
@@ -332,18 +333,20 @@ func TestDistributedMultiWorker(t *testing.T) {
 	_ = lis.Close()
 
 	s := loadPipeline(t)
-	// Two tables, two worker groups: orders→w1, order_items→w2.
+	// Two tables, two derived worker groups: orders and order_items each
+	// get their own single-partition group (no explicit worker: name —
+	// that field is gone; a worker group name is always derived).
 	s.Tables = append(s.Tables, spec.Table{
 		Source:            "shop.order_items",
 		Target:            "raw.order_items",
 		PrimaryKey:        []string{"order_id", "line_no"},
 		CreateIfNotExists: true,
-		Worker:            "w2",
 	})
-	s.Tables[0].Worker = "w1"
 	if err := s.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
+	w1 := s.Tables[0].WorkerGroupNames(s.Pipeline)[0]
+	w2 := s.Tables[1].WorkerGroupNames(s.Pipeline)[0]
 
 	db := mysqlConn(t)
 	resetBinlog(t, db)
@@ -366,7 +369,7 @@ func TestDistributedMultiWorker(t *testing.T) {
 		dml(t, db, fmt.Sprintf("INSERT INTO order_items (order_id, line_no, sku, qty) VALUES (%d, 1, 'sku%d', %d)", i, i, i%7+1))
 	}
 
-	stop, waitDone := bootPipeline(t, ctx, addr, s, "w1", "w2")
+	stop, waitDone := bootPipeline(t, ctx, addr, s, w1, w2)
 
 	// Concurrent burst: touch orders while chunks are being SELECTed by w1.
 	// Bounded in time (not iterations): under -race the pipeline is slower,
@@ -508,7 +511,7 @@ func TestCrashloopKillsJob(t *testing.T) {
 	_ = lis.Close()
 
 	s := loadPipeline(t)
-	s.Tables[0].Worker = "w1"
+	w1 := s.Tables[0].WorkerGroupNames(s.Pipeline)[0]
 	db := mysqlConn(t)
 	resetBinlog(t, db)
 	dropIcebergTable(t, ctx)
@@ -522,7 +525,7 @@ func TestCrashloopKillsJob(t *testing.T) {
 	cErr := make(chan error, 1)
 	wErr := make(chan error, 1)
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: true})
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: true})
 	}()
 	// Aggressive supervision: stale after 5s, only 2 resets allowed, 1m window.
 	go func() {
@@ -573,7 +576,7 @@ func TestObservabilityEndpoints(t *testing.T) {
 	_ = workerMetricsLis.Close()
 
 	s := loadPipeline(t)
-	s.Tables[0].Worker = "w1"
+	w1 := s.Tables[0].WorkerGroupNames(s.Pipeline)[0]
 	db := mysqlConn(t)
 	resetBinlog(t, db)
 	dropIcebergTable(t, ctx)
@@ -584,7 +587,7 @@ func TestObservabilityEndpoints(t *testing.T) {
 	defer wStop()
 	cCtx, cStop := context.WithCancel(ctx)
 	go func() {
-		_ = worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
+		_ = worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
 	}()
 	go func() {
 		_ = coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, MetricsAddr: metricsAddr, AckTimeout: 2 * time.Minute})
@@ -627,7 +630,7 @@ func TestObservabilityEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("statusz: %v", err)
 	}
-	if !strings.Contains(statusBody, `"run_id"`) || !strings.Contains(statusBody, `"w1"`) {
+	if !strings.Contains(statusBody, `"run_id"`) || !strings.Contains(statusBody, `"`+w1+`"`) {
 		t.Fatalf("statusz missing state:\n%s", statusBody)
 	}
 	t.Log("observability ok: /metrics and /statusz served")
@@ -653,7 +656,7 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 	_ = lis.Close()
 
 	s := loadPipeline(t)
-	s.Tables[0].Worker = "w1"
+	w1 := s.Tables[0].WorkerGroupNames(s.Pipeline)[0]
 	db := mysqlConn(t)
 	resetBinlog(t, db)
 	dropIcebergTable(t, ctx)
@@ -673,7 +676,7 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 		t.Cleanup(wStop)
 		wErr := make(chan error, 1)
 		go func() {
-			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: "w1", Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: fault})
+			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: fault})
 		}()
 		return wErr
 	}

@@ -10,11 +10,11 @@ import (
 
 func validSpec() *Spec {
 	return &Spec{
-		Pipeline: "ibe",
+		Pipeline: "shop",
 		Source:   Source{Kind: "mysql", URI: "mysql://user@localhost:3306/db"},
 		Sink:     Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
 		Tables: []Table{
-			{Source: "ibe.orders", Target: "raw.orders", PrimaryKey: []string{"id"}},
+			{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}},
 		},
 	}
 }
@@ -177,7 +177,7 @@ func TestValidateDefaultsToUpsert(t *testing.T) {
 
 func TestValidateDuplicateTargets(t *testing.T) {
 	s := validSpec()
-	s.Tables = append(s.Tables, Table{Source: "ibe.other", Target: "raw.orders", PrimaryKey: []string{"id"}})
+	s.Tables = append(s.Tables, Table{Source: "shop.other", Target: "raw.orders", PrimaryKey: []string{"id"}})
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicated") {
 		t.Fatalf("want duplication problem, got %v", err)
 	}

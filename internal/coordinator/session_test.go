@@ -64,7 +64,7 @@ func TestSupervisorResetWithoutInFlightRecovers(t *testing.T) {
 // worker rejects with a misleading column error.
 func TestEnqueueBatchMarkerUnknownTableErrors(t *testing.T) {
 	c := &Coordinator{
-		route:     map[string]*workerState{"t": {name: "w1", queue: make(chan queuedBatch, 1)}},
+		route:     map[string][]*workerState{"t": {{name: "w1", queue: make(chan queuedBatch, 1)}}},
 		refs:      nil,
 		canonical: map[string]core.Schema{},
 	}
@@ -76,7 +76,7 @@ func TestEnqueueBatchMarkerUnknownTableErrors(t *testing.T) {
 
 // CD-T4 negative: a marker with an empty table is rejected up front.
 func TestEnqueueBatchMarkerEmptyTableErrors(t *testing.T) {
-	c := &Coordinator{route: map[string]*workerState{}, canonical: map[string]core.Schema{}}
+	c := &Coordinator{route: map[string][]*workerState{}, canonical: map[string]core.Schema{}}
 	err := c.enqueueBatch(context.Background(), nil, &pb.BatchMeta{})
 	if err == nil || !strings.Contains(err.Error(), "requires a table") {
 		t.Fatalf("err = %v, want a marker-table error", err)

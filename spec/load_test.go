@@ -6,10 +6,10 @@ import (
 )
 
 const sampleYAML = `
-pipeline: ibe-mysql
+pipeline: shop-mysql
 source:
   kind: mysql
-  uri: mysql://repl@mysql:3306/ibe
+  uri: mysql://repl@mysql:3306/shop
   serverId: "1101"
 sink:
   uri: polaris://polaris:8181/api/catalog
@@ -18,12 +18,12 @@ sink:
     writeMode: upsert
     targetFileSize: 128Mi
 tables:
-  - source: ibe.bookings
+  - source: shop.bookings
     target: raw.bookings
     primaryKey: [id]
     partitionBy: [day(created_at)]
     createIfNotExists: true
-  - source: ibe.orders
+  - source: shop.orders
     target: raw.orders
     primaryKey: [id]
     filter:
@@ -31,13 +31,12 @@ tables:
         - {col: status, op: neq, value: draft}
         - any:
             - {col: type, op: in, value: [web, mobile]}
-    worker: orders-grp
+    workers: 3
     writeMode: append
     filterImmutable: true
-  - source: ibe.order_items
+  - source: shop.order_items
     target: raw.order_items
     primaryKey: [order_id, line_no]
-    worker: orders-grp
 `
 
 func TestLoadYAML(t *testing.T) {
@@ -45,7 +44,7 @@ func TestLoadYAML(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if s.Pipeline != "ibe-mysql" {
+	if s.Pipeline != "shop-mysql" {
 		t.Fatalf("pipeline = %q", s.Pipeline)
 	}
 	if s.Source.Kind != "mysql" || s.Source.ServerID != "1101" {
@@ -59,8 +58,18 @@ func TestLoadYAML(t *testing.T) {
 	}
 
 	orders := s.Tables[1]
-	if orders.Worker != "orders-grp" || orders.WriteMode != WriteModeAppend || !orders.FilterImmutable {
+	if orders.Workers != 3 || orders.WriteMode != WriteModeAppend || !orders.FilterImmutable {
 		t.Fatalf("orders = %+v", orders)
+	}
+	wantGroups := []string{"shop-mysql-raw.orders-0", "shop-mysql-raw.orders-1", "shop-mysql-raw.orders-2"}
+	gotGroups := orders.WorkerGroupNames(s.Pipeline)
+	if len(gotGroups) != len(wantGroups) {
+		t.Fatalf("WorkerGroupNames = %v, want %v", gotGroups, wantGroups)
+	}
+	for i, g := range wantGroups {
+		if gotGroups[i] != g {
+			t.Fatalf("WorkerGroupNames[%d] = %q, want %q", i, gotGroups[i], g)
+		}
 	}
 	if orders.Filter == nil || len(orders.Filter.All) != 2 {
 		t.Fatalf("orders filter = %+v", orders.Filter)

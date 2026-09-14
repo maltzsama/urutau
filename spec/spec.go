@@ -5,6 +5,8 @@
 package spec
 
 import (
+	"fmt"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 )
@@ -129,10 +131,17 @@ type Table struct {
 	// append-idempotent table logically idempotent. Each entry is the
 	// destination column (as) of a transport metadata column declared in
 	// Metadata. Empty outside append-idempotent.
-	Identity          []string `json:"identity,omitempty"`
-	Worker            string   `json:"worker,omitempty"`
-	CreateIfNotExists bool     `json:"createIfNotExists,omitempty"`
-	FilterImmutable   bool     `json:"filterImmutable,omitempty"`
+	Identity []string `json:"identity,omitempty"`
+	// Workers partitions this table's work across N worker groups by a
+	// contiguous primary-key range — like Spark/Flink partition an
+	// executor pool over a hot table, instead of capping it at one
+	// worker's throughput. 0 or 1 means today's single-worker behavior:
+	// no partitioning, one group. A worker group's name is always
+	// derived (see Table.WorkerGroupNames) — there is no operator-chosen
+	// worker name.
+	Workers           int  `json:"workers,omitempty"`
+	CreateIfNotExists bool `json:"createIfNotExists,omitempty"`
+	FilterImmutable   bool `json:"filterImmutable,omitempty"`
 	// Metadata lands pipeline metadata columns (op, commit_ts, position, ...)
 	// in the target table. The destination name is explicit via As.
 	Metadata []core.MetadataColumn `json:"metadata,omitempty"`
@@ -154,6 +163,24 @@ type Table struct {
 	// Applied in declaration order; an inner-join miss at any reference
 	// drops the event.
 	Enrich []Enrich `json:"enrich,omitempty"`
+}
+
+// WorkerGroupNames returns this table's derived worker group names — one
+// per partition, "<pipeline>-<target>-<index>" for index in
+// [0, max(Workers,1)). This is the ONLY way a worker group is named:
+// there is no operator-chosen name (Workers is a count, not a list of
+// names), so the coordinator's routing and its Kubernetes worker
+// provisioning always derive the same names from the same inputs.
+func (t Table) WorkerGroupNames(pipeline string) []string {
+	n := t.Workers
+	if n < 1 {
+		n = 1
+	}
+	names := make([]string, n)
+	for i := 0; i < n; i++ {
+		names[i] = fmt.Sprintf("%s-%s-%d", pipeline, t.Target, i)
+	}
+	return names
 }
 
 // Enrich declares one broadcast reference join. The reference table is
