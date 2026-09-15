@@ -90,6 +90,12 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | Page | What's in it |
 | --- | --- |
 | [Quickstart](https://maltzsama.github.io/urutau/docs/quickstart) | Run a real pipeline on your machine, step by step |
+| [Deploy on Kubernetes](https://maltzsama.github.io/urutau/docs/guides/deploy-kubernetes) | Submit one `CDCPipeline`; the operator runs the coordinator and its workers |
+| [Distributed mode](https://maltzsama.github.io/urutau/docs/guides/distributed) | Coordinator + worker without Kubernetes — the same engine, by hand |
+| [Operations](https://maltzsama.github.io/urutau/docs/guides/operations) | Metrics, `/statusz`, audit log, checkpoints, supervision, TLS |
+| [Troubleshooting](https://maltzsama.github.io/urutau/docs/guides/troubleshooting) | Symptom-first fixes for the failures you'll actually hit |
+| [CLI reference](https://maltzsama.github.io/urutau/docs/reference/cli) | All four binaries and every flag |
+| [Specification](https://maltzsama.github.io/urutau/docs/reference/spec) | The pipeline YAML schema, field by field |
 | [Semantics](https://maltzsama.github.io/urutau/docs/reference/semantics) | **The behavior contract** — delivery guarantees, ordering, delete-image handling, enrich join grammar, poison-batch policy. Read this before depending on any behavior not shown in an example. |
 | [Sources](https://maltzsama.github.io/urutau/docs/reference/sources) | MySQL, Postgres, Kafka — what each needs, Kafka's decoder formats |
 | [Sinks](https://maltzsama.github.io/urutau/docs/reference/sinks) | Iceberg, ClickHouse, Couchbase — commit mechanics, nested-column support, atomicity trade-offs |
@@ -98,6 +104,7 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | [Plugin contract](https://maltzsama.github.io/urutau/docs/reference/plugin-contract) | The normative Arrow Flight subprocess plugin contract |
 | [Writing a plugin](https://maltzsama.github.io/urutau/docs/guides/plugins) | The Arrow Flight subprocess contract (normative), plus the narrower in-process Go `.so` alternative |
 | [Architecture](https://maltzsama.github.io/urutau/docs/architecture/overview) | Package boundaries, the dependency diagram, repository map, E2E spike findings |
+| [Operator](https://maltzsama.github.io/urutau/docs/architecture/operator) | How a `CDCPipeline` becomes a coordinator StatefulSet plus worker Deployments |
 | [EncodeKey](https://maltzsama.github.io/urutau/docs/architecture/encode-key) | Design note: the collapse-stage key encoding |
 | [State position](https://maltzsama.github.io/urutau/docs/architecture/state-position) | Design note: where a committed position lives, and the sink-vs-store arbitration rule |
 
@@ -125,7 +132,12 @@ make test             # go test -race ./... (operator envtest skipped without as
 make lint             # golangci-lint
 make proto            # buf lint + generate (generated code is committed)
 make docs-site        # install + serve docs at localhost:3000
+make k8s-load         # build the image into minikube's docker daemon
+make k8s-deploy       # apply the operator + CRD (needs cert-manager)
 ```
+
+`make k8s-load`/`k8s-deploy` are the local Kubernetes loop; see
+[Deploy on Kubernetes](https://maltzsama.github.io/urutau/docs/guides/deploy-kubernetes).
 
 No `protoc` needed — generation uses `buf` with the `protoc-gen-go`/
 `protoc-gen-go-grpc` plugins pinned as `go tool`.
