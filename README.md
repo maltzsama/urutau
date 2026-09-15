@@ -16,9 +16,9 @@ from it.
 ## Why
 
 For the common case — one sink, no multi-consumer replay — Urutau reads
-from MySQL, Postgres, or an existing Kafka/Redpanda topic and writes the
-destination directly, without standing up any new broker or relay in
-between.
+from MySQL, Postgres, or an existing Kafka/Redpanda topic and writes
+straight to the destination, without standing up any new broker or relay
+in between.
 
 It also writes natively. Some CDC-to-lakehouse tools hand the actual write
 off to a JVM sidecar process — a JAR, a gRPC hop, a second runtime to keep

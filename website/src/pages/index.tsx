@@ -31,7 +31,7 @@ function HomepageHeader() {
 const features = [
   {
     title: 'No New Broker',
-    description: 'Reads from MySQL, Postgres, or an existing Kafka/Redpanda topic and writes the destination directly — no broker or relay stood up in between.',
+    description: 'Reads from MySQL, Postgres, or an existing Kafka/Redpanda topic and writes straight to the destination — no new broker or relay to stand up.',
   },
   {
     title: 'Upsert Reflects State',
