@@ -28,6 +28,15 @@ upserts land as rows, deletes as tombstones hidden from `FINAL` reads.
 Resume reads the position from the data itself (`argMax(position, seq)`),
 never a separate control table.
 
+**Partitioned tables (`workers: N`) keep the position per partition.** A
+collapsed pipeline (`workers: 1`) writes one position scalar into the data
+rows, as above. When a table is split across N workers, each owner records
+its own coordinate in a side table `<target>_urutau_position`
+(`owner, position, seq`), and `Position()` returns the **minimum safe**
+across owners — never one partition's `argMax`, which would resume past a
+lagging partition. Both paths share the same data table; only the resume
+read differs.
+
 Nested columns map natively: `List` → `Array`, `Map` → `Map`, `Struct` →
 `Tuple`.
 
