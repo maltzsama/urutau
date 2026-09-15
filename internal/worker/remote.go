@@ -248,6 +248,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
 		w.Register(ta.TargetTable, writer, mode)
+		if ta.Staged {
+			if err := w.SetStaged(ta.TargetTable); err != nil {
+				return err
+			}
+		}
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
 		// Start's remaining first loads (any explicit-select reference,
 		// plus the refresh ticker for everything) stay asynchronous — the
@@ -323,6 +328,21 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			Epoch:    assign.Epoch,
 			Position: string(b.Watermark),
 			Rows:     uint64(rows),
+		}}})
+	})
+
+	// Staged deliveries (WK-001 C5): the data files are written but not
+	// committed; the coordinator groups them by cycle and commits. seq 0 is
+	// a worker-generated snapshot/window batch, committed on arrival.
+	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32) {
+		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Staged{Staged: &pb.StagedBatch{
+			Table:           table,
+			Seq:             seq,
+			Descriptor_:     desc,
+			Position:        pos,
+			SnapshotState:   state,
+			SnapshotPending: pending,
+			Epoch:           assign.Epoch,
 		}}})
 	})
 

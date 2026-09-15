@@ -101,6 +101,7 @@ message TableAssignment {
   repeated EnrichRef enrich      = 9;  // broadcast reference joins, applied in order
   bytes     cast_policy          = 10; // JSON core.CastPolicy — writes must apply the same overrides as the coordinator's DDL
   bytes     metadata             = 11; // JSON []core.MetadataColumn — pipeline metadata columns land in the target
+  bool      staged               = 12; // workers>1 on a staging sink: stage data files, let the coordinator commit the cycle (WK-001 C5.5)
 }
 
 message BatchConfig {

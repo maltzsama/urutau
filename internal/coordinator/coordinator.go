@@ -1743,6 +1743,9 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			PrimaryKey:        ref.PrimaryKey,
 			CreateIfNotExists: true,
 			SchemaArrow:       schemaB,
+			// A partitioned table on a staging sink: the worker stages its
+			// data files and the coordinator commits the cycle (WK-001 C5).
+			Staged: c.stagesCycles() && len(c.route[ref.Target]) > 1,
 		}
 		// The table's write shape travels with the assignment so the worker's
 		// collapse and the coordinator's DDL agree: the per-table write mode

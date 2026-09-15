@@ -771,6 +771,7 @@ type TableAssignment struct {
 	Enrich            []*EnrichRef           `protobuf:"bytes,9,rep,name=enrich,proto3" json:"enrich,omitempty"`                              // broadcast reference joins, applied in order
 	CastPolicy        []byte                 `protobuf:"bytes,10,opt,name=cast_policy,json=castPolicy,proto3" json:"cast_policy,omitempty"`   // JSON core.CastPolicy — writes must apply the same overrides as the coordinator's DDL
 	Metadata          []byte                 `protobuf:"bytes,11,opt,name=metadata,proto3" json:"metadata,omitempty"`                         // JSON []core.MetadataColumn — pipeline metadata columns land in the target
+	Staged            bool                   `protobuf:"varint,12,opt,name=staged,proto3" json:"staged,omitempty"`                            // workers>1 on a staging sink: stage data files, let the coordinator commit the cycle (WK-001 C5.5)
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -880,6 +881,13 @@ func (x *TableAssignment) GetMetadata() []byte {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *TableAssignment) GetStaged() bool {
+	if x != nil {
+		return x.Staged
+	}
+	return false
 }
 
 type BatchConfig struct {
@@ -1842,7 +1850,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a5\n" +
 	"\aAsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb6\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xce\x03\n" +
 	"\x0fTableAssignment\x12!\n" +
 	"\fsource_table\x18\x01 \x01(\tR\vsourceTable\x12!\n" +
 	"\ftarget_table\x18\x02 \x01(\tR\vtargetTable\x123\n" +
@@ -1858,7 +1866,8 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\vcast_policy\x18\n" +
 	" \x01(\fR\n" +
 	"castPolicy\x12\x1a\n" +
-	"\bmetadata\x18\v \x01(\fR\bmetadata\"h\n" +
+	"\bmetadata\x18\v \x01(\fR\bmetadata\x12\x16\n" +
+	"\x06staged\x18\f \x01(\bR\x06staged\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
 	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xda\x02\n" +

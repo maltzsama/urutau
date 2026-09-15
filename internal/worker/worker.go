@@ -43,9 +43,16 @@ type OnCommit func(b *dataplane.Batch, rows int)
 // source carried no before image for that message.
 type OnDroppedDelete func(table, pos string)
 
+// OnStaged observes a staged write (WK-001 C5): the batch's data files were
+// written but not committed, and the descriptor must reach the coordinator,
+// which commits the whole cycle. seq is the cycle key (0 for a worker-
+// generated snapshot/window batch, committed on arrival).
+type OnStaged func(table string, seq uint64, descriptor []byte, pos, state string, pending []uint32)
+
 type Worker struct {
 	cfg             Config
 	onCommit        OnCommit
+	onStaged        OnStaged
 	onDroppedDelete OnDroppedDelete
 	schemaDrift     func(SchemaDrift)
 	tables          map[string]*tablePipeline
@@ -56,7 +63,12 @@ type tablePipeline struct {
 	target    string
 	committer sink.TableWriter
 	mode      dataplane.WriteMode
-	ch        chan Ingest
+	// staged is true when the coordinator owns this table's commit: the
+	// worker stages each batch's data files and ships the descriptor, and
+	// the coordinator commits the cycle (WK-001 C5). Requires committer to
+	// implement sink.StagingWriter.
+	staged bool
+	ch     chan Ingest
 
 	// appendDropDeletes implements onDelete: skip — every DELETE in an
 	// append-only table is dropped (counted) instead of appended from its
@@ -156,6 +168,26 @@ func New(cfg Config) *Worker {
 
 // OnCommit installs the commit observer.
 func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
+
+// OnStaged installs the staged-delivery observer (WK-001 C5). The remote
+// layer must install one for a staged assignment: with no observer the
+// descriptor is dropped and the cycle never commits.
+func (w *Worker) OnStaged(f OnStaged) { w.onStaged = f }
+
+// SetStaged marks a table's pipeline as staged (WK-001 C5). It refuses when
+// the writer cannot stage, so a misconfigured assignment fails loudly instead
+// of committing data the coordinator will never see.
+func (w *Worker) SetStaged(target string) error {
+	p := w.tables[target]
+	if p == nil {
+		return fmt.Errorf("worker: staged table %s not registered", target)
+	}
+	if _, ok := p.committer.(sink.StagingWriter); !ok {
+		return fmt.Errorf("worker: staged table %s: writer does not implement StagingWriter", target)
+	}
+	p.staged = true
+	return nil
+}
 
 // Register wires a per-table writer to a target table. The writer is any
 // sink.TableWriter implementation — the worker knows nothing about the sink.
@@ -476,10 +508,26 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 			rb.batch.Release()
 			return fmt.Errorf("worker: table %s: batch has no write mode set", p.target)
 		}
+		// The Ack fires here, BEFORE the data is durable — it already did
+		// with one worker (the sink Commit follows). In staged mode the
+		// durable point moves to the coordinator's CommitStaged, so the
+		// window ack→durable widens from one call to a whole cycle: a
+		// discarded cycle or a coordinator crash before the commit leaves
+		// the ack counted and the source slot advanced over data that never
+		// reached the table (WK-001 C5, documented in the plan). The
+		// protocol is deliberately unchanged.
 		if w.onCommit != nil {
 			w.onCommit(rb.batch, rb.rows)
 		}
-		if err := p.committer.Commit(ctx, rb.batch); err != nil {
+		if p.staged {
+			if err := w.stageBatch(ctx, p, rb.batch); err != nil {
+				rb.batch.Release()
+				if w.metrics != nil {
+					w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
+				}
+				return err
+			}
+		} else if err := p.committer.Commit(ctx, rb.batch); err != nil {
 			rb.batch.Release()
 			if w.metrics != nil {
 				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
@@ -492,6 +540,24 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(rb.upserts))
 			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(rb.deletes))
 		}
+	}
+	return nil
+}
+
+// stageBatch writes a batch's data files without committing them and ships
+// the descriptor to the coordinator, which commits the whole cycle (WK-001
+// C5). Nothing is visible in the table until that commit.
+func (w *Worker) stageBatch(ctx context.Context, p *tablePipeline, b *dataplane.Batch) error {
+	sw, ok := p.committer.(sink.StagingWriter)
+	if !ok {
+		return fmt.Errorf("worker: table %s: staged assignment but writer cannot stage", p.target)
+	}
+	desc, err := sw.WriteStaged(ctx, b)
+	if err != nil {
+		return fmt.Errorf("worker: table %s: stage: %w", p.target, err)
+	}
+	if w.onStaged != nil {
+		w.onStaged(p.target, b.Seq, desc, string(b.Watermark), b.SnapshotState, b.SnapshotPending)
 	}
 	return nil
 }

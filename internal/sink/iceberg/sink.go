@@ -90,9 +90,11 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 func (s *Sink) Close() error { return nil }
 
 // SupportsConcurrentWriters reports whether N workers may commit to one
-// table. False until the coordinator-side staged committer lands (WK-001
-// C5): today each worker writes cdc.position and the last writer wins.
-func (s *Sink) SupportsConcurrentWriters() bool { return false }
+// table. True since WK-001 C5: partitioned writers stage their data files
+// (WriteStaged) and the coordinator commits each binlog batch's cycle as one
+// unit (CommitStaged), so no worker writes cdc.position and the last writer
+// no longer wins.
+func (s *Sink) SupportsConcurrentWriters() bool { return true }
 
 func init() {
 	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
