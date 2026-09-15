@@ -39,6 +39,10 @@ spec:
       serviceAccountName: urutau-operator
       securityContext:
         runAsNonRoot: true
+        # The distroless image's USER is the non-numeric `nonroot`, which
+        # runAsNonRoot alone cannot verify — pin its UID/GID (65532).
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -46,6 +50,10 @@ spec:
           image: urutau:dev
           imagePullPolicy: IfNotPresent
           command: ["urutau-operator"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             # Kept equal to this container's image by the kustomize
             # replacement in ../default; referenced from --coordinator-image
