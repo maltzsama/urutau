@@ -159,6 +159,13 @@ type Coordinator struct {
 	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
 	mu             sync.Mutex    // guards session attach/detach
 
+	// WK-001 C5: open staged cycles (a partitioned table's sub-batches
+	// grouped by binlog batch). stagedLocks serializes CommitStaged per
+	// table so two cycles of the same table never race on the catalog.
+	staged      *stagedCycles
+	stagedLocks map[string]*sync.Mutex
+	stagedMu    sync.Mutex
+
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
 	// on the worker, live events of that table are held here instead of
 	// being shipped — a live event racing ahead of the chunk's rows would
@@ -282,6 +289,8 @@ func Run(ctx context.Context, cfg Config) error {
 		gateBuf:     map[string][]*dataplane.Batch{},
 		gateDrain:   make(chan struct{}),
 		confirmed:   make(map[string]position.Position),
+		staged:      newStagedCycles(),
+		stagedLocks: map[string]*sync.Mutex{},
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
@@ -1347,6 +1356,14 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		return c.enqueueTo(ctx, owners[0], b, meta)
 	}
 
+	// Partitioned table: one cycle id for the whole binlog batch. Every
+	// sub-batch sent below shares it, so the staged deliveries group back
+	// into the one cycle that must commit atomically (WK-001 C5). The
+	// expected count is the number of partitions that actually have rows
+	// — a nil sub-batch is never sent, so it is never expected.
+	if meta.BatchId == 0 {
+		meta.BatchId = c.batchSeq.Add(1)
+	}
 	// Partitioned table: split b's rows by primary-key range, one
 	// sub-batch per owning partition — the SAME ranges the DBLog
 	// snapshot uses (c.partitionRanges), so a key is always routed to
@@ -1376,6 +1393,24 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if err != nil {
 		return fmt.Errorf("coordinator: table %s: split by partition: %w", meta.Table, err)
 	}
+	total := 0
+	for _, sub := range subBatches {
+		if sub != nil {
+			total++
+		}
+	}
+	cycleOwners := make([]string, 0, total)
+	for p, sub := range subBatches {
+		if sub != nil {
+			cycleOwners = append(cycleOwners, owners[p].name)
+		}
+	}
+	// Only a staging sink commits per cycle; for any other concurrent sink
+	// (ClickHouse, Couchbase) the workers commit their own sub-batches, so
+	// no cycle is tracked and none can leak.
+	if c.stagesCycles() {
+		c.staged.expect(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners)
+	}
 	for p, sub := range subBatches {
 		if sub == nil {
 			continue // no rows for this partition in this batch
@@ -1404,7 +1439,12 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if b != nil {
 		defer b.Release()
 	}
-	meta.BatchId = c.batchSeq.Add(1)
+	// A partitioned table's sub-batches all share one cycle id, assigned
+	// once by enqueueBatch (WK-001 C5): the staged cycle key. Every other
+	// caller gets its own id here.
+	if meta.BatchId == 0 {
+		meta.BatchId = c.batchSeq.Add(1)
+	}
 
 	var body []byte
 	var metaBytes []byte
@@ -1937,6 +1977,8 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			switch m := msg.Msg.(type) {
 			case *pb.WorkerMessage_Ack:
 				c.onAck(hello.WorkerName, m.Ack)
+			case *pb.WorkerMessage_Staged:
+				c.onStagedBatch(hello.WorkerName, m.Staged)
 			case *pb.WorkerMessage_Hello:
 				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_ChunkReady:
@@ -1988,6 +2030,15 @@ var errSessionReset = errors.New("session reset")
 // silently incomplete snapshot). Fail the run instead, so it restarts and
 // re-snapshots cleanly (CD-5).
 func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
+	// A lost worker leaves the staged cycles it owed permanently incomplete:
+	// discard them (never commit a partial cycle) and commit any cycle that
+	// was blocked behind them and is now complete.
+	if ready, n := c.staged.discardWorker(worker); n > 0 {
+		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
+		for _, cy := range ready {
+			c.commitStagedCycle(cy)
+		}
+	}
 	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {

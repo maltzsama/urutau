@@ -1,0 +1,110 @@
+package coordinator
+
+import (
+	"fmt"
+	"sync"
+
+	"github.com/maltzsama/urutau/core"
+	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/sink"
+)
+
+// stagesCycles reports whether this run's sink commits staged cycles: only
+// then do a partitioned table's sub-batches form cycles the coordinator
+// groups and commits.
+func (c *Coordinator) stagesCycles() bool {
+	_, ok := c.snk.(sink.StagedCommitter)
+	return ok
+}
+
+// onStagedBatch handles one StagedBatch from a worker (WK-001 C5): it records
+// the delivery and commits every cycle that is now complete and in turn. A
+// delivery from a superseded generation is dropped — accepting it would open
+// a fresh cycle for an already-committed seq and commit its data twice.
+func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
+	if sb == nil {
+		return
+	}
+	w := c.workers[worker]
+	if w == nil {
+		c.log.Warn("coordinator: staged batch from unknown worker", "worker", worker)
+		return
+	}
+	if sb.Epoch != w.epoch {
+		c.log.Warn("coordinator: stale staged epoch", "worker", worker, "have", w.epoch, "got", sb.Epoch)
+		return
+	}
+	ref := core.TableRef{Target: sb.Table, Owner: worker}
+	for _, cy := range c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending) {
+		c.commitStagedCycle(cy)
+	}
+}
+
+// commitStagedCycle commits one complete cycle through the sink's
+// StagedCommitter, serialized per table. The commit position is the minimum
+// safe position over the cycle's deliveries: every partition's watermark is
+// durable in the same commit, so the lowest one is the new checkpoint floor.
+func (c *Coordinator) commitStagedCycle(cy *stagedCycle) {
+	pos, err := c.minSafePositions(cy.positions)
+	if err != nil {
+		c.fail(fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err))
+		return
+	}
+	committer, ok := c.snk.(sink.StagedCommitter)
+	if !ok {
+		c.fail(fmt.Errorf("coordinator: table %s: sink does not stage commits", cy.ref.Target))
+		return
+	}
+	mu := c.stagedLock(cy.ref.Target)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {
+		c.fail(fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err))
+	}
+}
+
+// stagedLock returns the mutex serializing staged commits for one table.
+func (c *Coordinator) stagedLock(table string) *sync.Mutex {
+	c.stagedMu.Lock()
+	defer c.stagedMu.Unlock()
+	mu := c.stagedLocks[table]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		c.stagedLocks[table] = mu
+	}
+	return mu
+}
+
+// minSafePositions parses each delivery's watermark and returns the lowest one
+// as the cycle's commit position. An empty position set yields "".
+func (c *Coordinator) minSafePositions(positions []string) (string, error) {
+	vals := make([]position.Position, 0, len(positions))
+	for _, s := range positions {
+		if s == "" {
+			continue
+		}
+		p, err := c.src.ParsePosition(s)
+		if err != nil {
+			return "", err
+		}
+		vals = append(vals, p)
+	}
+	if len(vals) == 0 {
+		return "", nil
+	}
+	best, err := position.MinSafe(vals)
+	if err != nil {
+		return "", err
+	}
+	return best.String(), nil
+}
+
+// fail reports a terminal coordinator error without blocking if one is
+// already pending.
+func (c *Coordinator) fail(err error) {
+	select {
+	case c.terminate <- err:
+	default:
+	}
+}
