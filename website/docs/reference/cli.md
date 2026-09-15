@@ -14,7 +14,7 @@ Urutau ships **four binaries** from one image (`build/Dockerfile`):
 | `urutau-operator` | Reconciles `CDCPipeline` CRs on Kubernetes | [Deploy on Kubernetes](../guides/deploy-kubernetes.md) |
 
 All three pipeline binaries read the same YAML spec — see
-[Specification](../reference/spec.md) — and share the logging flags:
+[Pipeline specification](pipeline-spec.md) — and share the logging flags:
 
 - `--log-level` — `debug` | `info` | `warn` | `error` (default `info`)
 - `--log-format` — `text` | `json` (default `text`)
@@ -81,7 +81,7 @@ server, not a one-shot.
 Without them the control plane is **plaintext**, and the coordinator warns
 loudly at startup — the Flight assignment carries the source DSN, so
 plaintext leaks credentials on the wire. Always use mTLS outside a trusted
-network. See [Operations](../guides/operations.md).
+network. See [Distributed mode](../guides/distributed.md#secure-the-control-plane).
 
 ## `urutau-worker`
 

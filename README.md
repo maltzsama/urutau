@@ -90,13 +90,15 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | Page | What's in it |
 | --- | --- |
 | [Quickstart](https://maltzsama.github.io/urutau/docs/quickstart) | Run a real pipeline on your machine, step by step |
+| [Concepts](https://maltzsama.github.io/urutau/docs/concepts) | The mental model — reflect source state, coordinator/worker, snapshot→stream, position-in-sink |
 | [Deploy on Kubernetes](https://maltzsama.github.io/urutau/docs/guides/deploy-kubernetes) | Submit one `CDCPipeline`; the operator runs the coordinator and its workers |
 | [Distributed mode](https://maltzsama.github.io/urutau/docs/guides/distributed) | Coordinator + worker without Kubernetes — the same engine, by hand |
-| [Operations](https://maltzsama.github.io/urutau/docs/guides/operations) | Metrics, `/statusz`, audit log, checkpoints, supervision, TLS |
-| [Troubleshooting](https://maltzsama.github.io/urutau/docs/guides/troubleshooting) | Symptom-first fixes for the failures you'll actually hit |
+| [Monitoring](https://maltzsama.github.io/urutau/docs/guides/monitoring) | Metrics, `/statusz`, logs, what to alert on |
+| [Reliability](https://maltzsama.github.io/urutau/docs/guides/reliability) | Audit trail, checkpoints, supervision, resume |
+| [Troubleshooting](https://maltzsama.github.io/urutau/docs/guides/troubleshooting) | Symptom → cause → fix, grouped by area |
 | [CLI reference](https://maltzsama.github.io/urutau/docs/reference/cli) | All four binaries and every flag |
-| [Specification](https://maltzsama.github.io/urutau/docs/reference/spec) | The pipeline YAML schema, field by field |
-| [Semantics](https://maltzsama.github.io/urutau/docs/reference/semantics) | **The behavior contract** — delivery guarantees, ordering, delete-image handling, enrich join grammar, poison-batch policy. Read this before depending on any behavior not shown in an example. |
+| [Pipeline specification](https://maltzsama.github.io/urutau/docs/reference/pipeline-spec) | The pipeline YAML schema, field by field |
+| [Delivery guarantees](https://maltzsama.github.io/urutau/docs/reference/guarantees) | **The behavior contract** — at-least-once, per-table atomicity, ordering, deletes, poison-batch policy. Read this before depending on any behavior not shown in an example. |
 | [Sources](https://maltzsama.github.io/urutau/docs/reference/sources) | MySQL, Postgres, Kafka — what each needs, Kafka's decoder formats |
 | [Sinks](https://maltzsama.github.io/urutau/docs/reference/sinks) | Iceberg, ClickHouse, Couchbase — commit mechanics, nested-column support, atomicity trade-offs |
 | [Enrichment](https://maltzsama.github.io/urutau/docs/reference/enrichment) | Broadcast reference join — grammar, cold start, examples |

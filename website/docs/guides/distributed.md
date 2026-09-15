@@ -71,7 +71,35 @@ and speaks plaintext:
 WARN coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA
 ```
 
-See [Operations](operations.md#tls) for generating the certificates.
+A minimal CA plus a server certificate for the coordinator and a client
+certificate for each worker:
+
+```sh
+# CA
+openssl req -x509 -newkey rsa:4096 -days 365 -nodes \
+  -keyout ca.key -out ca.crt -subj "/CN=urutau-ca"
+
+# Coordinator server cert — the SAN must match how workers dial it
+openssl req -newkey rsa:4096 -nodes -keyout server.key -out server.csr \
+  -subj "/CN=urutau-coordinator"
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -out server.crt \
+  -extfile <(printf "subjectAltName=DNS:urutau-coordinator,DNS:localhost,IP:127.0.0.1")
+
+# Worker client cert
+openssl req -newkey rsa:4096 -nodes -keyout client.key -out client.csr \
+  -subj "/CN=urutau-worker"
+openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -out client.crt
+```
+
+```sh
+urutau-coordinator run -f pipeline.yaml \
+  --tls-cert server.crt --tls-key server.key --tls-ca ca.crt
+
+urutau-worker run --coordinator urutau-coordinator:50051 \
+  --tls-cert client.crt --tls-key client.key --tls-ca ca.crt
+```
 
 ## Supervision and resets
 
@@ -110,5 +138,6 @@ has the details.
 ## Next steps
 
 - **Automate the lifecycle**: [Deploy on Kubernetes](deploy-kubernetes.md).
-- **Metrics, audit log, checkpoints**: [Operations](operations.md).
+- **Live signals**: [Monitoring](monitoring.md).
+- **Audit log, checkpoints, supervision**: [Reliability](reliability.md).
 - **All flags**: [CLI reference](../reference/cli.md).

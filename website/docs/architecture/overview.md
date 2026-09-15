@@ -87,6 +87,48 @@ can't quietly grow an `internal/` dependency either.
 | `config/` | CRD + RBAC manifests |
 | `proto/` | coordinator↔worker wire contract |
 
+## Data-plane invariants
+
+Three internal conventions that have caused real bugs; a contributor
+touching the wire or the sinks must know them.
+
+### Source names vs. target names
+
+The name fields are easy to confuse:
+
+- A table is named on the **source** side by its source name (`db.table`).
+- `ChunkRequest.Table` is the **source** table (what to `SELECT`).
+- `BatchMeta.Table` and `dataplane.Batch.Table` are the **target** table
+  (where the batch is written).
+- Routing and the worker registry are keyed by **target**; the canonical
+  schema map is keyed by **source** and resolved to target when a batch or
+  marker is built.
+
+### Context columns are born at the source
+
+The fixed tail (`__op`, `__pos`, `__commit_ts`, `__ingest_ts`,
+`__snapshot`, `__phase`) is created as columns by the encoder that turns
+decoded events into the `RecordBatch`. They ride the same batch as the data,
+aligned by construction; nothing downstream injects them.
+
+`__phase` is `"snapshot"` for a DBLog chunk row and `"stream"` for a live
+event — an axis orthogonal to `__op` (a snapshot row is semantically an
+insert).
+
+### A delete's image lives in one of two places
+
+A delete's row image depends on where the change came from:
+
+- **wire-decoded** (through `DecodeBatch`): the image is in **`After`** —
+  the wire carries the before image in the flat columns, and `Before` is
+  nil.
+- **in-process** (a source decoder that filled it): the image may be in
+  **`Before`**.
+
+A consumer selecting a delete's image MUST handle both: **prefer `Before`
+when non-empty, else `After`**. Two consumers that assumed one location
+produced mirrored data-loss bugs.
+
 ## E2E spike
 
 The suite proves the write path by **reading it back** — Iceberg through

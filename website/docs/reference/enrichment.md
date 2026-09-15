@@ -36,13 +36,13 @@ shuffle, no windowed state.
   spec grammar but tunes nothing today.
 - **A wildcard reference's real columns are known before boot completes**,
   not just after the first refresh — see
-  [Semantics](semantics#wildcard-select-no-schema-drift-issue-56).
+  [Enrich internals](../architecture/enrich-internals.md#wildcard-select-closes-schema-drift-at-boot).
 - **Point-in-time, and it says so.** Enriched columns are not reproducible
   by replay (the reference is a snapshot, not CDC); source columns and
   position stay deterministic either way.
 
 Full grammar detail, the boot-time join-key type check, duplicate-key
-rejection, and cold-start semantics: [Semantics](semantics#enrich-columnar-broadcast-join).
+rejection, and cold-start internals: [Enrich internals](../architecture/enrich-internals.md).
 
 ## Examples
 

@@ -322,6 +322,6 @@ make k8s-undeploy                        # removes the operator + CRD
 - **How the pieces fit, and why**: [Operator](../architecture/operator.md).
 - **The same engine without Kubernetes**: [Distributed mode](distributed.md).
 - **Running it for real** (metrics, audit log, checkpoints):
-  [Operations](operations.md).
+  [Monitoring](monitoring.md) and [Reliability](reliability.md).
 - **Every field**: [CLI reference](../reference/cli.md) and the
   [CRD type](../architecture/operator.md).

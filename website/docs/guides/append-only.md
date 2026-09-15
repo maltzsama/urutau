@@ -88,5 +88,5 @@ row before `op` can ever be read back as `"delete"` — if you need to see
 that a row was deleted, not just that it's gone, you want `append`.
 
 See [Sinks](../reference/sinks.md) for how each destination represents
-write mode physically, and [Semantics](../reference/semantics.md) for the
+write mode physically, and [Delivery guarantees](../reference/guarantees.md) for the
 full `writeMode`/`onDelete` grammar.

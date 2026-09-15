@@ -1,131 +1,185 @@
 ---
-sidebar_position: 8
+sidebar_position: 9
 ---
 
 # Troubleshooting
 
-Symptom first. Each entry says what to check and what it usually means.
+Every entry follows the same shape:
 
-## The process exits immediately with a list of problems
+> **Symptom** — what you see. **Cause** — why. **Fix** — what to do.
 
-Validation failed at boot. The messages name the exact field path:
+Start from the symptom. Entries are grouped by where the problem lives:
+[Startup](#startup), [Kubernetes](#kubernetes), [Workers](#workers),
+[Data](#data).
 
-```
-spec: tables[0].primaryKey: required when writeMode is upsert
-```
+## Startup
 
-Fix the spec. The same rules run in the webhook, so a spec that passes
-admission will not fail here for *shape* reasons — only for connectivity
-or a missing Secret. See [Specification](../reference/spec.md#validation).
+### The process exits immediately with a list of problems
 
-## `driver: unknown source kind` / `unknown sink type`
+**Symptom** — `urutau run` or the coordinator exits at boot, printing
+lines like `spec: tables[0].primaryKey: required when writeMode is upsert`.
 
-The kind/type is not a registered driver. Check the spelling, and that the
-driver's package is blank-imported in `internal/builtin` (or loaded with
-`--plugin`). The error lists what is registered:
+**Cause** — validation failed. The messages name the exact field path.
 
-```
-driver: unknown source kind "bogus" (registered: [kafka mysql postgres])
-```
+**Fix** — correct the spec. The same rules run in the Kubernetes webhook,
+so a spec that passes admission will not fail here for *shape* reasons —
+only for connectivity or a missing Secret. See
+[Pipeline specification](../reference/pipeline-spec.md#validation).
 
-## Kubernetes: the operator Pod is in `CreateContainerConfigError`
+### `driver: unknown source kind` / `unknown sink type`
 
-The kubelet cannot verify the container's user. The distroless image's
-`USER` is the **non-numeric** `nonroot`, which `runAsNonRoot: true` alone
-cannot check. The shipped manifest pins `runAsUser: 65532` /
-`runAsGroup: 65532`; if you copied the Deployment elsewhere, carry those
+**Symptom** — boot fails with
+`driver: unknown source kind "bogus" (registered: [kafka mysql postgres])`.
+
+**Cause** — the `kind`/`type` names a driver that is not registered.
+
+**Fix** — check the spelling. If it is a third-party driver, make sure its
+package is blank-imported in `internal/builtin` or loaded with `--plugin`.
+The error lists what is registered.
+
+## Kubernetes
+
+### The operator Pod is in `CreateContainerConfigError`
+
+**Symptom** — the operator Pod never starts; the event says
+`container has runAsNonRoot and image has non-numeric user (nonroot)`.
+
+**Cause** — the distroless image's `USER` is the non-numeric `nonroot`,
+which `runAsNonRoot: true` alone cannot verify.
+
+**Fix** — the shipped manifest pins `runAsUser: 65532` /
+`runAsGroup: 65532`. If you copied the Deployment elsewhere, carry those
 fields.
 
-```
-Error: container has runAsNonRoot and image has non-numeric user (nonroot),
-cannot verify user is non-root
-```
+### A worker crashloops with `required flag(s) ... not set`
 
-## Kubernetes: the webhook rejects a spec that has no `uri`
+**Symptom** — a worker Pod restarts with
+`urutau-worker: required flag(s) "client-id", "client-secret" not set`.
 
-The inline spec is *supposed* to omit the URIs — the operator mounts the
-Secrets and the coordinator resolves them at boot. The webhook validates
-with `spec.WithoutCredentials()`, so it must accept that shape. If it
-rejects an empty `uri`, you are running an operator older than that fix;
-rebuild the image.
+**Cause** — the worker could not read its catalog credentials.
 
-## Kubernetes: a worker crashloops with `required flag(s) ... not set`
-
-A worker gets its catalog credentials from the `URUTAU_SINK_*` env the
-operator mounts from the Secret — it cannot be passed as a flag, because
+**Fix** — a worker gets its catalog settings from the `URUTAU_SINK_*` env
+the operator mounts from the Secret; it cannot be passed as a flag, because
 the operator does not know a Secret's value. If a worker demands
-`--client-id`, you are running an older image. The current worker falls
-back to the environment.
+`--client-id`, you are running an image older than the env fallback —
+rebuild. Otherwise check that the catalog Secret exists and carries the
+expected keys ([key convention](deploy-kubernetes.md#3-provide-credentials-as-secrets)).
 
-## Kubernetes: `no such host` for `host.minikube.internal`
+### The webhook rejects a spec that has no `uri`
 
-Some minikube builds put `host.minikube.internal` in the node's
-`/etc/hosts` but not in CoreDNS, so Pods cannot resolve it. Either patch
-CoreDNS or use the gateway IP (`192.168.49.1`) directly — see
-[Local end-to-end](../guides/deploy-kubernetes.md#local-end-to-end-with-minikube).
+**Symptom** — `kubectl apply` fails with
+`spec.definition.inline: source.uri: required`, even though the inline spec
+is supposed to leave it empty.
 
-## Kubernetes: `minikube image load` reports a conflict
+**Cause** — the inline spec is *supposed* to omit the URIs; the operator
+mounts the Secrets and the coordinator resolves them at boot.
 
-A running Pod still holds the tag, so the node will not replace it. Build
-into the daemon instead, which retags regardless:
+**Fix** — the webhook validates with `spec.WithoutCredentials()`, so it must
+accept that shape. If it rejects an empty `uri`, you are running an operator
+older than that fix — rebuild the image.
+
+### `no such host` for `host.minikube.internal`
+
+**Symptom** — a Pod cannot resolve `host.minikube.internal`.
+
+**Cause** — some minikube builds put the name in the node's `/etc/hosts`
+but not in CoreDNS, so Pods cannot see it.
+
+**Fix** — patch CoreDNS, or use the gateway IP (`192.168.49.1`) directly.
+See [Local end-to-end](deploy-kubernetes.md#local-end-to-end-with-minikube).
+
+### `minikube image load` reports a conflict
+
+**Symptom** — `minikube image load` fails because a container is using the
+image.
+
+**Cause** — a running Pod still holds the tag, so the node will not replace
+it.
+
+**Fix** — build into the daemon instead, which retags regardless:
 
 ```sh
 make k8s-load      # eval $(minikube docker-env) && docker build -t urutau:dev .
 ```
 
-## A worker never connects and the coordinator times out
+## Workers
 
-The coordinator waits `--wait-worker` for **exactly** the derived worker
-names, then fails. Check:
+### A worker never connects and the coordinator times out
 
-- The worker's `--name` matches the derived name
-  `<pipeline>-<target>-<index>`.
-- The worker can reach `--coordinator` (address, firewall, Service DNS).
-- Under mTLS, all three TLS flags are set on both sides.
+**Symptom** — the coordinator waits `--wait-worker` and then fails, with no
+session for one of the expected workers.
+
+**Cause** — the derived worker name never showed up.
+
+**Fix** — check:
+
+- the worker's `--name` matches the derived name
+  `<pipeline>-<target>-<index>`;
+- the worker can reach `--coordinator` (address, firewall, Service DNS);
+- under mTLS, all three TLS flags are set on both sides.
 
 The coordinator logs every `worker session` as it arrives; the missing one
 is the problem.
 
-## `coordinator: reset worker` keeps appearing
+### `coordinator: reset worker` keeps appearing
 
-A worker is not acking within `--ack-timeout`, so the coordinator re-routes
-its partition. Some resets are normal (a worker restart). A steady stream
-means the worker is slow or dying — usually the sink, not the network.
-After `--max-resets` within `--reset-window` the job terminates by design.
-See [Operations](../guides/operations.md#supervision).
+**Symptom** — a steady stream of `coordinator: reset worker` log lines.
 
-## `urutau_worker_commit_failures_total` is rising
+**Cause** — a worker is not acking within `--ack-timeout`, so the
+coordinator re-routes its partition. A few resets are normal (a worker
+restart); a steady stream means the worker is slow or dying — usually the
+sink, not the network.
 
-The catalog is rejecting commits. Check catalog reachability, credentials,
-and the warehouse's storage (S3/rustfs) health. Persisted failures are a
-data-loss risk: commits are how the position advances.
+**Fix** — check the sink. After `--max-resets` within `--reset-window` the
+job terminates by design; tune those in
+[Reliability](reliability.md#supervision-the-coordinator-heals-workers).
 
-## Data is not showing up, but the process is running
+## Data
 
-Work through it in order:
+### Data is not showing up, but the process is running
+
+**Symptom** — the process is healthy, the destination table is empty or
+stale.
+
+**Cause** — several possibilities, in order of likelihood.
+
+**Fix** — work through it in order:
 
 1. **Is the snapshot done?** Watch `urutau_worker_snapshot_progress_ratio`.
    Streaming starts after the snapshot.
 2. **Is the position advancing?** `urutau_coordinator_lag_seconds` and
-   `/statusz`.
+   `/statusz` (see [Monitoring](monitoring.md)).
 3. **Is the commit landing?** `urutau_coordinator_commits_total` and
    `urutau_worker_commit_duration_seconds`.
 4. **Read it back through a real engine.** A `SELECT` in Trino/ClickHouse
    is the only proof; the engine's own logs are not.
 
 An `UPDATE`/`DELETE` takes a commit interval to appear — the worker batches
-changes, it is not row-by-row instant. See
-[Semantics](../reference/semantics.md).
+changes, it is not row-by-row instant.
 
-## The pipeline re-snapshots on every restart
+### `urutau_worker_commit_failures_total` is rising
 
-It should not: the position lives in the sink, and a restart resumes from
-it. If it re-snapshots, the sink is not persisting the position — check
-that the target table is the same (a changed `target` is a new table) and
-that the sink is the one you think it is.
+**Symptom** — the commit-failure counter climbs.
+
+**Cause** — the catalog is rejecting commits.
+
+**Fix** — check catalog reachability, credentials, and the warehouse's
+storage (S3/rustfs) health. Persisted failures are a data-loss risk: commits
+are how the position advances.
+
+### The pipeline re-snapshots on every restart
+
+**Symptom** — every restart re-reads all rows instead of resuming.
+
+**Cause** — the position is not being read back from the destination.
+
+**Fix** — check that the `target` table is the same (a changed `target` is
+a new table, so it has no position) and that the sink is the one you think
+it is. The position lives in the destination; see
+[Position](../architecture/state-position.md).
 
 ## Still stuck
 
-Open an issue with: the spec (redact credentials), the exact error, and
-the relevant logs (`--log-format json` helps). If a doc page did not work
-as written, that is a doc bug — say so in the issue.
+Open an issue with the spec (redact credentials), the exact error, and the
+relevant logs (`--log-format json` helps). If a doc page did not work as
+written, that is a doc bug — say so in the issue.

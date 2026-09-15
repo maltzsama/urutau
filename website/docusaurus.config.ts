@@ -75,7 +75,7 @@ const config: Config = {
           items: [
             {label: 'Quickstart', to: '/docs/quickstart'},
             {label: 'Architecture', to: '/docs/architecture/overview'},
-            {label: 'Semantics', to: '/docs/reference/semantics'},
+            {label: 'Delivery guarantees', to: '/docs/reference/guarantees'},
           ],
         },
         {

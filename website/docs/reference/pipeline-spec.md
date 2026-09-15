@@ -2,9 +2,10 @@
 sidebar_position: 6
 ---
 
-# Specification
+# Pipeline specification (`pipeline.yaml`)
 
-The pipeline YAML is the single artifact that describes a replication job.
+This page is the field-by-field reference for the pipeline YAML — the
+single artifact that describes a replication job.
 `urutau run -f`, `urutau-coordinator run -f`, and the `definition.inline`
 field of a `CDCPipeline` all consume the **same** format, and it is
 validated by the **same** server-side rules (`spec.Validate`) — there is no
@@ -136,5 +137,5 @@ An inline value always wins; the environment only fills what is empty.
 ## Related
 
 - [Sources](sources.md) · [Sinks](sinks.md) · [Enrichment](enrichment.md) ·
-  [Semantics](semantics.md)
+  [Delivery guarantees](guarantees.md)
 - [CLI reference](cli.md) — the flags each binary adds.
