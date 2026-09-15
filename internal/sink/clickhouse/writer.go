@@ -41,6 +41,10 @@ type tableWriter struct {
 	// now is injectable so the seq guard is testable deterministically.
 	now     func() time.Time
 	lastSeq uint64
+	// seed is max(seq) read at open, kept so a coordinator-assigned batch
+	// sequence (b.Seq) can be placed ABOVE every seq this table ever saw:
+	// seq = seed + b.Seq. It never changes after open (WK-001 C3).
+	seed uint64
 }
 
 // openTableWriter loads the target column list and seeds the seq floor from
@@ -101,6 +105,7 @@ func openTableWriter(ctx context.Context, conn ch.Conn, ident tableIdent, ref co
 		cols:        cols,
 		now:         now,
 		lastSeq:     seed,
+		seed:        seed,
 	}, nil
 }
 
@@ -120,6 +125,19 @@ func (w *tableWriter) nextSeq() uint64 {
 	return now
 }
 
+// versionSeq resolves a batch's version coordinate (WK-001 C3). batchSeq is
+// the coordinator's monotonic sequence (dataplane.Batch.Seq); 0 means no
+// coordinator. It always calls nextSeq so lastSeq advances on both paths,
+// then overrides with seed+batchSeq — above every seq this table ever saw,
+// and monotonic per key because a key stays in one partition.
+func (w *tableWriter) versionSeq(batchSeq uint64) uint64 {
+	seq := w.nextSeq()
+	if batchSeq != 0 {
+		seq = w.seed + batchSeq
+	}
+	return seq
+}
+
 // Commit writes the collapsed batch as ONE insert: upserts as rows, deletes
 // as tombstones. Atomic if — and only if — every row lands in the same
 // partition, which is why the default table has no PARTITION BY.
@@ -137,7 +155,14 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		return err
 	}
 
-	seq := w.nextSeq()
+	// The version coordinate. A coordinator-assigned batch sequence (b.Seq,
+	// WK-001 C2) is the global order across the N workers of a partitioned
+	// table; placing it above the seed keeps it increasing across boots and
+	// monotonic per key (a key always belongs to one partition). Without a
+	// coordinator (b.Seq == 0) the clock-based nextSeq is used, preserving
+	// the collapsed behavior. nextSeq still runs in both branches so lastSeq
+	// stays coherent if a mixed stream ever alternates.
+	seq := w.versionSeq(b.Seq)
 	batchPos := string(b.Watermark)
 	batch, err := w.conn.PrepareBatch(ctx, "INSERT INTO "+w.quoted)
 	if err != nil {

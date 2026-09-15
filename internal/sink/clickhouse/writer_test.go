@@ -99,3 +99,42 @@ func TestBindResolversErrorsOnMissingCastColumn(t *testing.T) {
 		t.Fatalf("missing cast column must error citing the column, got %v", err)
 	}
 }
+
+// WK-001 C3 (1): a coordinator-assigned batch seq is placed ABOVE the seed,
+// so it can never be smaller than a seq already written to the table — a
+// raw b.Seq would be, since the coordinator's counter resets at boot.
+func TestSeqFromBatchIsAboveSeed(t *testing.T) {
+	w := &tableWriter{seed: 100, now: func() time.Time { return time.Unix(0, 0) }}
+	if got := w.versionSeq(1); got <= w.seed {
+		t.Fatalf("versionSeq(1) = %d, want > seed %d", got, w.seed)
+	}
+}
+
+// WK-001 C3 (2): increasing batch seqs yield increasing version coordinates,
+// which is what ReplacingMergeTree needs per key.
+func TestSeqFromBatchIsMonotonic(t *testing.T) {
+	w := &tableWriter{seed: 7, now: func() time.Time { return time.Unix(0, 0) }}
+	prev := w.versionSeq(1)
+	for _, s := range []uint64{2, 3, 10, 11} {
+		got := w.versionSeq(s)
+		if got <= prev {
+			t.Fatalf("versionSeq(%d) = %d, not > previous %d", s, got, prev)
+		}
+		prev = got
+	}
+}
+
+// WK-001 C3 (3): with no coordinator (b.Seq == 0) the clock-based nextSeq is
+// used, preserving the collapsed behavior. A frozen clock still steps forward
+// via the lastSeq guard.
+func TestSeqFallsBackToClockWhenNoCoordinator(t *testing.T) {
+	frozen := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	w := &tableWriter{now: func() time.Time { return frozen }}
+	first := w.versionSeq(0)
+	if first != uint64(frozen.UnixNano()) {
+		t.Fatalf("versionSeq(0) = %d, want the clock value %d", first, frozen.UnixNano())
+	}
+	if second := w.versionSeq(0); second != first+1 {
+		t.Fatalf("versionSeq(0) again = %d, want %d (guard)", second, first+1)
+	}
+}
