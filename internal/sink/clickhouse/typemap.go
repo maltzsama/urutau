@@ -325,8 +325,11 @@ func intValue(base string, v any) (int64, error) {
 		}
 		return int64(t), nil
 	case float64:
-		if t != math.Trunc(t) {
+		if math.IsNaN(t) || math.IsInf(t, 0) || t != math.Trunc(t) {
 			return 0, fmt.Errorf("value %v is not integral for %s", t, base)
+		}
+		if t < math.MinInt64 || t >= math.MaxInt64 {
+			return 0, fmt.Errorf("value %v overflows %s", t, base)
 		}
 		return int64(t), nil
 	case string:
@@ -379,7 +382,7 @@ func uintValue(base string, v any) (uint64, error) {
 	case uint64:
 		return t, nil
 	case float64:
-		if t != math.Trunc(t) || t < 0 {
+		if math.IsNaN(t) || math.IsInf(t, 0) || t != math.Trunc(t) || t < 0 || t >= math.MaxUint64 {
 			return 0, fmt.Errorf("value %v is not an unsigned integer for %s", t, base)
 		}
 		return uint64(t), nil
