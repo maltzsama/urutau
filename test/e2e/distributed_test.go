@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -522,10 +523,16 @@ func TestCrashloopKillsJob(t *testing.T) {
 	defer wStop()
 	cCtx, cStop := context.WithCancel(ctx)
 
+	// The worker acks the snapshot normally; the gate then stops its acks.
+	// With nothing owed (in-flight == 0) the supervisor resets it — and
+	// keeps resetting until the window is exhausted, terminating the job.
+	// Stopping the acks from the start would instead owe in-flight batches
+	// and take the terminate-for-replay path (CD-2).
+	gate := &atomic.Bool{}
 	cErr := make(chan error, 1)
 	wErr := make(chan error, 1)
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: true})
+		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultAckGate: gate})
 	}()
 	// Aggressive supervision: stale after 5s, only 2 resets allowed, 1m window.
 	go func() {
@@ -533,6 +540,9 @@ func TestCrashloopKillsJob(t *testing.T) {
 	}()
 
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(10))
+	// Snapshot landed and acked: stop the acks so the now-idle worker goes
+	// stale while owing nothing.
+	gate.Store(true)
 
 	// The supervisor must terminate the job with a crashloop error.
 	select {
@@ -669,25 +679,29 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 10 * time.Second, MaxResets: 10, ResetWindow: time.Minute})
 	}()
 
-	// First worker: commits but stops acking after the snapshot, so the
-	// supervisor resets it (session cancelled → it suicides).
-	startWorker := func(fault bool) <-chan error {
+	// First worker: acks the snapshot normally, then the gate stops its
+	// acks. With nothing owed the supervisor resets it (session cancelled
+	// → it suicides).
+	startWorker := func(gate *atomic.Bool) <-chan error {
 		wCtx, wStop := context.WithCancel(ctx)
 		t.Cleanup(wStop)
 		wErr := make(chan error, 1)
 		go func() {
-			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultStopAck: fault})
+			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultAckGate: gate})
 		}()
 		return wErr
 	}
-	firstErr := startWorker(true)
+	firstGate := &atomic.Bool{}
+	firstErr := startWorker(firstGate)
 
-	// Snapshot lands, then the supervisor resets the silent worker.
+	// Snapshot lands and is acked; stop the acks so the idle worker goes
+	// stale while owing nothing, and the supervisor resets it.
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(20))
+	firstGate.Store(true)
 	select {
 	case err := <-firstErr:
 		if err == nil {
-			t.Fatal("first worker exited cleanly despite the fault")
+			t.Fatal("first worker exited cleanly despite the reset")
 		}
 		t.Logf("first worker suicides after reset: %v", err)
 	case <-time.After(60 * time.Second):
@@ -695,7 +709,7 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 	}
 
 	// A fresh, healthy worker reconnects with the next epoch and resumes.
-	secondErr := startWorker(false)
+	secondErr := startWorker(nil)
 	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (500, 'resumed', 5.0)`)
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(21))
 	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 500`, "resumed")

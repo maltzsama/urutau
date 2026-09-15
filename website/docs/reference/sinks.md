@@ -28,6 +28,15 @@ upserts land as rows, deletes as tombstones hidden from `FINAL` reads.
 Resume reads the position from the data itself (`argMax(position, seq)`),
 never a separate control table.
 
+**Partitioned tables (`workers: N`) keep the position per partition.** A
+collapsed pipeline (`workers: 1`) writes one position scalar into the data
+rows, as above. When a table is split across N workers, each owner records
+its own coordinate in a side table `<target>_urutau_position`
+(`owner, position, seq`), and `Position()` returns the **minimum safe**
+across owners — never one partition's `argMax`, which would resume past a
+lagging partition. Both paths share the same data table; only the resume
+read differs.
+
 Nested columns map natively: `List` → `Array`, `Map` → `Map`, `Struct` →
 `Tuple`.
 
@@ -63,6 +72,15 @@ where nesting needs no special case.
 Every write acknowledges at synchronous-durability `majority`; on a single
 node that requires a 0-replica bucket (which is what the sink creates) —
 `DurabilityImpossible` is a loud error, never a silent downgrade.
+
+**Partitioned tables (`workers > 1`) require `commitMode: atomic`.** The
+`fast` path reads and rewrites the control document outside any
+transaction, so two workers of the same table lose each other's position
+and snapshot properties. `atomic` runs that read-modify-write inside the
+distributed transaction, which serializes across pods. The coordinator
+refuses to boot a partitioned Couchbase table whose sink is not in atomic
+mode. (Append and upsert share the same commit path here, so the rule is
+identical for both.)
 
 ## Cross-cutting
 

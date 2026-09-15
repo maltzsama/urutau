@@ -43,9 +43,18 @@ type OnCommit func(b *dataplane.Batch, rows int)
 // source carried no before image for that message.
 type OnDroppedDelete func(table, pos string)
 
+// OnStaged ships a staged write's descriptor (WK-001 C5): the batch's data
+// files were written but not committed, and the descriptor must reach the
+// coordinator, which commits the whole cycle. seq is the cycle key (0 for a
+// worker-generated snapshot/window batch, committed on arrival). The error
+// matters: a dropped descriptor leaves the cycle uncommittable, so the
+// worker must fail rather than report a successful stage.
+type OnStaged func(table string, seq uint64, descriptor []byte, pos, state string, pending []uint32) error
+
 type Worker struct {
 	cfg             Config
 	onCommit        OnCommit
+	onStaged        OnStaged
 	onDroppedDelete OnDroppedDelete
 	schemaDrift     func(SchemaDrift)
 	tables          map[string]*tablePipeline
@@ -56,7 +65,12 @@ type tablePipeline struct {
 	target    string
 	committer sink.TableWriter
 	mode      dataplane.WriteMode
-	ch        chan Ingest
+	// staged is true when the coordinator owns this table's commit: the
+	// worker stages each batch's data files and ships the descriptor, and
+	// the coordinator commits the cycle (WK-001 C5). Requires committer to
+	// implement sink.StagingWriter.
+	staged bool
+	ch     chan Ingest
 
 	// appendDropDeletes implements onDelete: skip — every DELETE in an
 	// append-only table is dropped (counted) instead of appended from its
@@ -156,6 +170,26 @@ func New(cfg Config) *Worker {
 
 // OnCommit installs the commit observer.
 func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
+
+// OnStaged installs the staged-delivery observer (WK-001 C5). The remote
+// layer must install one for a staged assignment: with no observer the
+// descriptor is dropped and the cycle never commits.
+func (w *Worker) OnStaged(f OnStaged) { w.onStaged = f }
+
+// SetStaged marks a table's pipeline as staged (WK-001 C5). It refuses when
+// the writer cannot stage, so a misconfigured assignment fails loudly instead
+// of committing data the coordinator will never see.
+func (w *Worker) SetStaged(target string) error {
+	p := w.tables[target]
+	if p == nil {
+		return fmt.Errorf("worker: staged table %s not registered", target)
+	}
+	if _, ok := p.committer.(sink.StagingWriter); !ok {
+		return fmt.Errorf("worker: staged table %s: writer does not implement StagingWriter", target)
+	}
+	p.staged = true
+	return nil
+}
 
 // Register wires a per-table writer to a target table. The writer is any
 // sink.TableWriter implementation — the worker knows nothing about the sink.
@@ -476,10 +510,26 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 			rb.batch.Release()
 			return fmt.Errorf("worker: table %s: batch has no write mode set", p.target)
 		}
+		// The Ack fires here, BEFORE the data is durable — it already did
+		// with one worker (the sink Commit follows). In staged mode the
+		// durable point moves to the coordinator's CommitStaged, so the
+		// window ack→durable widens from one call to a whole cycle: a
+		// discarded cycle or a coordinator crash before the commit leaves
+		// the ack counted and the source slot advanced over data that never
+		// reached the table (WK-001 C5, documented in the plan). The
+		// protocol is deliberately unchanged.
 		if w.onCommit != nil {
 			w.onCommit(rb.batch, rb.rows)
 		}
-		if err := p.committer.Commit(ctx, rb.batch); err != nil {
+		if p.staged {
+			if err := w.stageBatch(ctx, p, rb.batch); err != nil {
+				rb.batch.Release()
+				if w.metrics != nil {
+					w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
+				}
+				return err
+			}
+		} else if err := p.committer.Commit(ctx, rb.batch); err != nil {
 			rb.batch.Release()
 			if w.metrics != nil {
 				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
@@ -496,6 +546,27 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 	return nil
 }
 
+// stageBatch writes a batch's data files without committing them and ships
+// the descriptor to the coordinator, which commits the whole cycle (WK-001
+// C5). Nothing is visible in the table until that commit.
+func (w *Worker) stageBatch(ctx context.Context, p *tablePipeline, b *dataplane.Batch) error {
+	sw, ok := p.committer.(sink.StagingWriter)
+	if !ok {
+		return fmt.Errorf("worker: table %s: staged assignment but writer cannot stage", p.target)
+	}
+	desc, err := sw.WriteStaged(ctx, b)
+	if err != nil {
+		return fmt.Errorf("worker: table %s: stage: %w", p.target, err)
+	}
+	if w.onStaged == nil {
+		return fmt.Errorf("worker: table %s: staged assignment without a delivery callback", p.target)
+	}
+	if err := w.onStaged(p.target, b.Seq, desc, string(b.Watermark), b.SnapshotState, b.SnapshotPending); err != nil {
+		return fmt.Errorf("worker: table %s: ship staged descriptor: %w", p.target, err)
+	}
+	return nil
+}
+
 // runBatcher collects changes, collapses them, and sends ready batches to
 // the committer. When the channel closes, the committer drains and exits.
 func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
@@ -506,6 +577,11 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	// through to the columnar flush untouched.
 	var pending []*dataplane.Batch
 	pendingRows := 0
+	// pendingSeq is the coordinator cycle key shared by every batch in
+	// pending. A batch with a different Seq belongs to a different cycle and
+	// must be flushed on its own (WK-001 C5.4): the coordinator tracks each
+	// Seq as one cycle and expects exactly one delivery per (table, seq).
+	pendingSeq := uint64(0)
 	ticker := time.NewTicker(w.cfg.MaxInterval)
 	defer ticker.Stop()
 
@@ -517,6 +593,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		}
 		pending = nil
 		pendingRows = 0
+		pendingSeq = 0
 	}
 
 	// ready sends a prepared batch to the committer (ownership transfers).
@@ -528,6 +605,16 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			b.Release()
 			return ctx.Err()
 		}
+	}
+
+	// deliverEmpty ships an empty descriptor for a cycle whose sub-batch
+	// produced no data; Seq 0 is a worker-generated snapshot batch, not a
+	// cycle, and needs no delivery.
+	deliverEmpty := func(b *dataplane.Batch) error {
+		if !p.staged || b.Seq == 0 {
+			return nil
+		}
+		return ready(emptyBatch(b, p.mode), 0, 0, 0)
 	}
 
 	flush := func() error {
@@ -608,6 +695,12 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			if err != nil {
 				return fmt.Errorf("worker: table %s: select append: %w", p.target, err)
 			}
+			// Every row was dropped (e.g. an append flush of delete
+			// tombstones with no before image): nothing to commit, but the
+			// coordinator's cycle still needs its delivery.
+			if out == nil {
+				return deliverEmpty(merged)
+			}
 			return ready(out, rows, len(keepIdx), 0)
 		default:
 			// Upsert: collapse the whole buffer columnar, merge survivors
@@ -622,6 +715,27 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		}
 	}
 
+	// addPending buffers one batch, flushing first when its coordinator cycle
+	// (Seq) differs from the buffered one. Snapshot/window batches carry Seq 0
+	// and merge freely; each live binlog batch's sub-batch is its own cycle.
+	// Ownership of b transfers to pending.
+	addPending := func(b *dataplane.Batch, rows int) error {
+		// Only a staged table's sub-batches are coordinator cycles: for
+		// every other table the flush stays on MaxRows/MaxInterval.
+		if p.staged && len(pending) > 0 && b.Seq != pendingSeq {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		pending = append(pending, b)
+		pendingSeq = b.Seq
+		pendingRows += rows
+		if w.cfg.MaxRows > 0 && pendingRows >= w.cfg.MaxRows {
+			return flush()
+		}
+		return nil
+	}
+
 	for {
 		select {
 		case ing, ok := <-p.ch:
@@ -632,8 +746,14 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// stored snapshot batch minus the keys live events touched),
 			// adopting the marker's position.
 			if ing.Win != nil && ing.Win.Closes {
-				if err := closeWindow(p, ing, &pending, &pendingRows); err != nil {
+				cb, err := closeWindow(p, ing)
+				if err != nil {
 					return err
+				}
+				if cb != nil {
+					if err := addPending(cb, int(cb.Record.NumRows())); err != nil {
+						return err
+					}
 				}
 				continue
 			}
@@ -691,12 +811,8 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				return err
 			}
 
-			pending = append(pending, batch)
-			pendingRows += int(batch.Record.NumRows())
-			if w.cfg.MaxRows > 0 && pendingRows >= w.cfg.MaxRows {
-				if err := flush(); err != nil {
-					return err
-				}
+			if err := addPending(batch, int(batch.Record.NumRows())); err != nil {
+				return err
 			}
 		case <-ticker.C:
 			if err := flush(); err != nil {
@@ -739,6 +855,11 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 		return 0, 0, fmt.Errorf("worker: table %s: merge: %w", p.target, err)
 	}
 	if combined == nil {
+		// Nothing survived the collapse: the cycle still needs its delivery
+		// so the coordinator does not leave it open (WK-001 C5.4).
+		if p.staged && b.Seq != 0 {
+			return 0, 0, ready(emptyBatch(b, p.mode), 0, 0, 0)
+		}
 		return 0, 0, nil
 	}
 	combined.Watermark = []byte(pos)
@@ -751,26 +872,28 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	return upCount, delCount, nil
 }
 
-// closeWindow emits the stored chunk batch minus the keys live InWindow
-// events touched, with every row's __pos adopted to the marker position.
-func closeWindow(p *tablePipeline, ing Ingest, pending *[]*dataplane.Batch, pendingRows *int) error {
+// closeWindow returns the stored chunk batch minus the keys live InWindow
+// events touched, with every row's __pos adopted to the marker position. The
+// caller owns the returned batch (nil when the window is empty or fully
+// touched) and buffers it through the cycle-aware path.
+func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
 	p.winMu.Lock()
 	win := p.windows[ing.Win.ChunkID]
 	if win == nil {
 		p.winMu.Unlock()
-		return nil
+		return nil, nil
 	}
 	delete(p.windows, ing.Win.ChunkID)
 	p.winMu.Unlock()
 
 	if win.batch.Record == nil || win.batch.Record.NumRows() == 0 {
 		win.batch.Release()
-		return nil
+		return nil, nil
 	}
 	reader, err := transport.NewBatchReader(win.batch.Record, p.knownSchema.PrimaryKey)
 	if err != nil {
 		win.batch.Release()
-		return fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
+		return nil, fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
 	}
 	// Keep every row whose key was not touched by a live InWindow event.
 	var keepIdx []int32
@@ -782,21 +905,19 @@ func closeWindow(p *tablePipeline, ing Ingest, pending *[]*dataplane.Batch, pend
 	}
 	if len(keepIdx) == 0 {
 		win.batch.Release()
-		return nil
+		return nil, nil
 	}
 	sel, err := selectRows(win.batch, keepIdx, "", dataplane.AppendMode, "", nil)
 	win.batch.Release() // the window is consumed; selectRows retained its columns
 	if err != nil {
-		return err
+		return nil, err
 	}
 	out, err := adoptWindowPos(sel, ing.Position)
 	sel.Release()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	*pending = append(*pending, out)
-	*pendingRows += int(out.Record.NumRows())
-	return nil
+	return out, nil
 }
 
 // adoptWindowPos rebuilds a batch with __pos replaced by a constant — the
@@ -835,7 +956,7 @@ func adoptWindowPos(b *dataplane.Batch, pos string) (*dataplane.Batch, error) {
 	for _, c := range cols {
 		c.Release()
 	}
-	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: []byte(pos), Mode: dataplane.AppendMode}, nil
+	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: []byte(pos), Mode: dataplane.AppendMode, Seq: b.Seq}, nil
 }
 
 // markBatchSideEffects applies the per-row, side-effect-only decisions for a
@@ -1105,7 +1226,33 @@ func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.Writ
 		Mode:            mode,
 		SnapshotState:   snapState,
 		SnapshotPending: snapPending,
+		// Seq is the coordinator cycle key (WK-001 C5): a reconstruction
+		// that dropped it sent live batches back as seq-0 snapshot cycles.
+		Seq: b.Seq,
 	}, nil
+}
+
+// emptyBatch returns a 0-row batch with b's schema, carrying b's Seq and
+// watermark. A staged cycle must still deliver a descriptor when its
+// sub-batch produced no data — e.g. an append-mode delete with no before
+// image: the coordinator expects exactly one delivery per (table, seq), and
+// a missing one leaves the cycle open, blocking every cycle behind it in the
+// table's send order.
+func emptyBatch(b *dataplane.Batch, mode dataplane.WriteMode) *dataplane.Batch {
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, b.Record.Schema())
+	rec := bld.NewRecordBatch()
+	bld.Release()
+	return &dataplane.Batch{
+		Table:     b.Table,
+		Record:    rec,
+		Watermark: b.Watermark,
+		// The pipeline's write mode, not the wire batch's: the wire batch
+		// carries ModeUnset, and the committer rejects an unset mode.
+		Mode:            mode,
+		SnapshotState:   b.SnapshotState,
+		SnapshotPending: b.SnapshotPending,
+		Seq:             b.Seq,
+	}
 }
 
 // countOps returns the number of upsert and delete rows in a batch by
@@ -1153,12 +1300,12 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		}
 		b.Record.Retain()
 		return &dataplane.Batch{Table: b.Table, Record: b.Record, Watermark: b.Watermark,
-			Mode: b.Mode, SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending}, nil
+			Mode: b.Mode, SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq}, nil
 	}
 	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
 		a.Record.Retain()
 		return &dataplane.Batch{Table: a.Table, Record: a.Record, Watermark: a.Watermark,
-			Mode: a.Mode, SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending}, nil
+			Mode: a.Mode, SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending, Seq: a.Seq}, nil
 	}
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
@@ -1188,5 +1335,6 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		Mode:            a.Mode,
 		SnapshotState:   a.SnapshotState,
 		SnapshotPending: a.SnapshotPending,
+		Seq:             a.Seq,
 	}, nil
 }

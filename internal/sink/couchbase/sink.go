@@ -42,6 +42,9 @@ type Sink struct {
 	scope      string // fallback scope for bare targets
 	dur        gocb.DurabilityLevel
 	txns       *gocb.Transactions // non-nil only in atomic commit mode
+	// sourceKind decodes the opaque per-partition positions in the control
+	// document (WK-001 C7). A hint from the spec, not a coupling.
+	sourceKind string
 
 	mu    sync.Mutex
 	plans map[string]core.Schema // ref.Target → resolved schema (EnsureTable)
@@ -91,6 +94,7 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 		bucketName: cfg.Namespace,
 		scope:      defaultScope,
 		dur:        gocb.DurabilityLevelMajority,
+		sourceKind: cfg.SourceKind,
 		plans:      map[string]core.Schema{},
 		now:        time.Now,
 	}
@@ -282,7 +286,7 @@ func (s *Sink) Writer(ctx context.Context, ref core.TableRef, cast core.CastPoli
 	if s.txns != nil {
 		txr = &realTx{txns: s.txns, coll: s.collection(scope, coll), dur: s.dur}
 	}
-	return newTableWriter(kv, txr, plan, s.now), nil
+	return newTableWriter(kv, txr, plan, ref.Owner, s.now), nil
 }
 
 // Position reads the committed CDC position from the control document — one
@@ -292,7 +296,7 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur})
+	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind, ref.OwnerCount)
 }
 
 // SetProperties merges snapshot-progress properties into the control
@@ -316,6 +320,19 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 
 // Close releases the cluster connection.
 func (s *Sink) Close() error { return s.cluster.Close(nil) }
+
+// SupportsConcurrentWriters reports whether N workers may commit to one
+// table. Concurrent writers are safe ONLY in commitMode: atomic — the
+// control document read-modify-write in commitFast (writer.go) has no
+// protection, so two workers lose each other's position and snapshot
+// properties (WK-001 §2.4); commitAtomic runs that RMW inside a gocb
+// transaction, which serializes across pods.
+//
+// True only in commitMode: atomic — and only since WK-001 C7, which keeps
+// one position per partition in the control document and reads their
+// MinSafe, so a partitioned table no longer resumes from one partition's
+// position (§2.6). s.txns is non-nil only in atomic mode.
+func (s *Sink) SupportsConcurrentWriters() bool { return s.txns != nil }
 
 // realKV is the production kvStore: a gocb collection with synchronous
 // durability on every mutation. Majority is the floor for "commit ok means

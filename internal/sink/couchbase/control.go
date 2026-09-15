@@ -8,6 +8,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/snapshot"
+	"github.com/maltzsama/urutau/position"
 )
 
 // controlKey is the single control document per collection: it carries the
@@ -24,6 +25,7 @@ const controlKey = "_urutau::position"
 // position only advances after the batch's data is durably in place.
 type controlDoc struct {
 	Position   string            `json:"position,omitempty"`
+	Positions  map[string]string `json:"positions,omitempty"` // owner → position (WK-001 C7)
 	UpdatedAt  time.Time         `json:"updated_at,omitempty"`
 	Properties map[string]string `json:"properties,omitempty"`
 }
@@ -35,12 +37,29 @@ type controlDoc struct {
 // single-insert-per-partition rule. Existing properties are preserved:
 // the control document is the merge point of the commit path and the
 // snapshot orchestrator's SetProperties calls.
+//
+// The per-partition map (WK-001 C7) holds one position per worker group.
+// Under commitMode: atomic the read-modify-write runs inside the
+// transaction, so two partitions cannot lose each other's entry. The scalar
+// Position is kept alongside for compatibility (workers==1, and a downgrade
+// that only reads it).
 func controlWrite(prev *controlDoc, info batchInfo, now time.Time) *controlDoc {
 	ctrl := &controlDoc{Properties: map[string]string{}}
-	if prev != nil && prev.Properties != nil {
-		ctrl.Properties = prev.Properties
+	if prev != nil {
+		if prev.Properties != nil {
+			ctrl.Properties = prev.Properties
+		}
+		if prev.Positions != nil {
+			ctrl.Positions = prev.Positions
+		}
 	}
 	ctrl.Position = info.Position
+	if info.Owner != "" {
+		if ctrl.Positions == nil {
+			ctrl.Positions = map[string]string{}
+		}
+		ctrl.Positions[info.Owner] = info.Position
+	}
 	ctrl.UpdatedAt = now
 	if info.SnapshotState != "" {
 		ctrl.Properties[snapshot.PropSnapshotState] = info.SnapshotState
@@ -66,12 +85,37 @@ func readControl(ctx context.Context, kv kvStore) (*controlDoc, error) {
 }
 
 // positionOf reads the committed position for one collection from the
-// control document — one Get, O(1), no scan, no aggregation. Empty string
-// means the collection was never written and needs the snapshot.
-func positionOf(ctx context.Context, kv kvStore) (string, error) {
+// control document — one Get, O(1), no scan, no aggregation. When the
+// per-partition map is present (WK-001 C7) it returns the MinSafe across
+// owners, so a lagging partition is never resumed past; otherwise the scalar
+// (a pre-C7 document, or workers==1). Empty string means the collection was
+// never written and needs the snapshot. When ownerCount > 1 and the map is
+// incomplete, it returns "" — no safe minimum — rather than a MinSafe over a
+// subset that could advance past the missing owner.
+func positionOf(ctx context.Context, kv kvStore, sourceKind string, ownerCount int) (string, error) {
 	doc, err := readControl(ctx, kv)
 	if err != nil || doc == nil {
 		return "", err
+	}
+	if len(doc.Positions) > 0 {
+		if ownerCount > 1 && len(doc.Positions) < ownerCount {
+			return "", nil
+		}
+		parsed := make([]position.Position, 0, len(doc.Positions))
+		for owner, p := range doc.Positions {
+			pp, perr := position.Parse(sourceKind, p)
+			if perr != nil {
+				return "", fmt.Errorf("couchbase: position owner %s: %w", owner, perr)
+			}
+			parsed = append(parsed, pp)
+		}
+		best, err := position.MinSafe(parsed)
+		if err != nil {
+			return "", err
+		}
+		if best != nil {
+			return best.String(), nil
+		}
 	}
 	return doc.Position, nil
 }

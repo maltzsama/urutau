@@ -159,6 +159,13 @@ type Coordinator struct {
 	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
 	mu             sync.Mutex    // guards session attach/detach
 
+	// WK-001 C5: open staged cycles (a partitioned table's sub-batches
+	// grouped by binlog batch). stagedLocks serializes CommitStaged per
+	// table so two cycles of the same table never race on the catalog.
+	staged      *stagedCycles
+	stagedLocks map[string]*sync.Mutex
+	stagedMu    sync.Mutex
+
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
 	// on the worker, live events of that table are held here instead of
 	// being shipped — a live event racing ahead of the chunk's rows would
@@ -189,9 +196,17 @@ type Coordinator struct {
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
 
-	// confirmed tracks the latest position each target table durably
-	// committed (from worker Acks). The minimum across tables is reported
-	// to the source so its retention never advances past uncommitted data.
+	// confirmed tracks the latest position each WORKER durably committed
+	// (from worker Acks). The minimum across workers is reported to the
+	// source so its retention never advances past uncommitted data.
+	//
+	// Keyed by worker, not by table: a partitioned table (workers>1) has N
+	// workers committing different primary-key ranges, and a per-table key
+	// let the last acker overwrite the others — advancing the Postgres slot
+	// past WAL a lagging partition had not read (WK-001 §2.2). This is safe
+	// only because one worker serves exactly one table (WorkerGroupNames
+	// embeds the target); a shared worker would fold two tables' positions
+	// into one minimum. See TestWorkerGroupNamesEmbedTarget.
 	confirmedMu sync.Mutex
 	confirmed   map[string]position.Position
 
@@ -274,6 +289,8 @@ func Run(ctx context.Context, cfg Config) error {
 		gateBuf:     map[string][]*dataplane.Batch{},
 		gateDrain:   make(chan struct{}),
 		confirmed:   make(map[string]position.Position),
+		staged:      newStagedCycles(),
+		stagedLocks: map[string]*sync.Mutex{},
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
@@ -401,6 +418,9 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// operator into the coordinator's ConfigMap).
 	workerTarget := make(map[string]string, len(c.cfg.Spec.Tables))
 	for i, t := range c.cfg.Spec.Tables {
+		if err := requirePartitionKey(t, refs[i]); err != nil {
+			return err
+		}
 		names := t.WorkerGroupNames(c.cfg.Spec.Pipeline)
 		ranges, err := c.resolvePartitionRanges(ctx, t, refs[i])
 		if err != nil {
@@ -472,6 +492,18 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// The sink is opened on every error path between here and the defers;
 	// Close on every exit, not just the happy one (audit #14).
 	defer func() { _ = c.snk.Close() }()
+
+	// (2) A partitioned table needs a sink that can serve N concurrent
+	// writers. Checked by CAPABILITY, not by sink type name: a plugin
+	// registers whatever name it wants. The capability must be declared
+	// false until the sink's concurrent path is actually built, so this
+	// refuses the boot instead of letting N writers corrupt one table.
+	for _, t := range c.cfg.Spec.Tables {
+		if err := requireConcurrentSink(t, c.snk); err != nil {
+			return err
+		}
+	}
+
 	for _, ref := range refs {
 		tbl := tableBySource[ref.Source]
 		// The cast policy must reach DDL: an empty policy here creates a
@@ -490,6 +522,18 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	c.log.Info("coordinator resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
+
+	// Baseline every worker's confirmed position to the run's resume point.
+	// confirmedPosition() takes the min over the map, so a worker that has
+	// not acked yet must be IN the map holding that min back — omitting it
+	// let the source slot advance past data a worker had not committed
+	// (WK-001 §2.2). resume is nil on a fresh boot, which correctly holds the
+	// slot until every worker has committed at least once.
+	c.confirmedMu.Lock()
+	for name := range c.workers {
+		c.confirmed[name] = resume
+	}
+	c.confirmedMu.Unlock()
 
 	// Serve gRPC (control) + Flight (data) on one listener.
 	lis, err := net.Listen("tcp", c.cfg.ListenAddr)
@@ -694,6 +738,37 @@ func (c *Coordinator) run(ctx context.Context) error {
 // cost. Workers>1 requires the source's chunker to implement
 // source.PartitionSource; a source that doesn't (Postgres, today) fails
 // the boot loudly rather than silently running unpartitioned.
+// requirePartitionKey rejects workers>1 for a table with no primary key:
+// partitioning splits the key range, and a table without one has no way to
+// divide it. Checked before resolvePartitionRanges so the error names the
+// real cause instead of the chunker's cryptic empty-key failure.
+func requirePartitionKey(t spec.Table, ref core.TableRef) error {
+	if t.WorkerCount() > 1 && len(ref.PrimaryKey) == 0 {
+		return fmt.Errorf("coordinator: %s: workers>1 requires a primary key: "+
+			"partitioning splits the key range, and a table without one has no "+
+			"way to divide it", t.Target)
+	}
+	return nil
+}
+
+// requireConcurrentSink rejects workers>1 when the sink does not declare the
+// ConcurrentWriter capability (or declares it false). snk is taken as any so
+// the check is a pure capability probe — the coordinator never reaches into a
+// concrete sink.
+func requireConcurrentSink(t spec.Table, snk any) error {
+	if t.WorkerCount() <= 1 {
+		return nil
+	}
+	cw, ok := snk.(sink.ConcurrentWriter)
+	if !ok || !cw.SupportsConcurrentWriters() {
+		return fmt.Errorf("coordinator: %s: workers>1 is not supported by "+
+			"this sink (it cannot order concurrent writers to one table); "+
+			"use workers: 1, or for couchbase set sink.commitMode: atomic",
+			t.Target)
+	}
+	return nil
+}
+
 func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, error) {
 	n := t.WorkerCount()
 	if n <= 1 {
@@ -1033,21 +1108,25 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 	return nil
 }
 
-// recordConfirmed stores a table's latest durably-committed position and
+// recordConfirmed stores a worker's latest durably-committed position and
 // recomputes the pipeline-wide minimum. The minimum uses the position's own
 // ordering — LSNs and GTID sets are not lexicographically ordered, and a
 // wrong minimum would advance the source slot past data still in flight.
-func (c *Coordinator) recordConfirmed(table string, pos position.Position) {
+//
+// Keyed by worker (not table): for a partitioned table the N workers commit
+// disjoint key ranges and must each hold their own position; a per-table key
+// would let the last acker overwrite the lagging partitions (WK-001 §2.2).
+func (c *Coordinator) recordConfirmed(worker string, pos position.Position) {
 	if pos == nil {
 		return
 	}
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
-	c.confirmed[table] = pos
+	c.confirmed[worker] = pos
 }
 
 // confirmedPosition returns the minimum committed position across all
-// target tables; nil while nothing is durably committed.
+// workers; nil while nothing is durably committed.
 //
 // MinSafe, not Min: if the committed positions are not mutually comparable
 // (never for one source, but a guard), there is no safe minimum — advancing
@@ -1061,6 +1140,12 @@ func (c *Coordinator) confirmedPosition() position.Position {
 	}
 	vals := make([]position.Position, 0, len(c.confirmed))
 	for _, p := range c.confirmed {
+		if p == nil {
+			// A registered worker with no committed position yet (its boot
+			// baseline): nothing is provably committed past the resume point,
+			// so hold retention back rather than advance over its data.
+			return nil
+		}
 		vals = append(vals, p)
 	}
 	best, err := position.MinSafe(vals)
@@ -1289,6 +1374,14 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		return c.enqueueTo(ctx, owners[0], b, meta)
 	}
 
+	// Partitioned table: one cycle id for the whole binlog batch. Every
+	// sub-batch sent below shares it, so the staged deliveries group back
+	// into the one cycle that must commit atomically (WK-001 C5). The
+	// expected count is the number of partitions that actually have rows
+	// — a nil sub-batch is never sent, so it is never expected.
+	if meta.BatchId == 0 {
+		meta.BatchId = c.batchSeq.Add(1)
+	}
 	// Partitioned table: split b's rows by primary-key range, one
 	// sub-batch per owning partition — the SAME ranges the DBLog
 	// snapshot uses (c.partitionRanges), so a key is always routed to
@@ -1318,6 +1411,24 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if err != nil {
 		return fmt.Errorf("coordinator: table %s: split by partition: %w", meta.Table, err)
 	}
+	total := 0
+	for _, sub := range subBatches {
+		if sub != nil {
+			total++
+		}
+	}
+	cycleOwners := make([]string, 0, total)
+	for p, sub := range subBatches {
+		if sub != nil {
+			cycleOwners = append(cycleOwners, owners[p].name)
+		}
+	}
+	// Only a staging sink commits per cycle; for any other concurrent sink
+	// (ClickHouse, Couchbase) the workers commit their own sub-batches, so
+	// no cycle is tracked and none can leak.
+	if c.stagesCycles() {
+		c.staged.expect(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners)
+	}
 	for p, sub := range subBatches {
 		if sub == nil {
 			continue // no rows for this partition in this batch
@@ -1346,7 +1457,12 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if b != nil {
 		defer b.Release()
 	}
-	meta.BatchId = c.batchSeq.Add(1)
+	// A partitioned table's sub-batches all share one cycle id, assigned
+	// once by enqueueBatch (WK-001 C5): the staged cycle key. Every other
+	// caller gets its own id here.
+	if meta.BatchId == 0 {
+		meta.BatchId = c.batchSeq.Add(1)
+	}
 
 	var body []byte
 	var metaBytes []byte
@@ -1583,8 +1699,10 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.budget.release(worker, freed)
 	}
 	// The ack is evidence of a durable commit: record it and recompute the
-	// pipeline-wide minimum the source's retention may advance to.
-	c.recordConfirmed(ack.Table, pos)
+	// pipeline-wide minimum the source's retention may advance to. Keyed by
+	// worker, so a partitioned table's N partitions each hold their own
+	// position and the minimum is the lagging one (WK-001 §2.2).
+	c.recordConfirmed(worker, pos)
 	if c.metrics != nil {
 		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()
@@ -1643,6 +1761,9 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			PrimaryKey:        ref.PrimaryKey,
 			CreateIfNotExists: true,
 			SchemaArrow:       schemaB,
+			// A partitioned table on a staging sink: the worker stages its
+			// data files and the coordinator commits the cycle (WK-001 C5).
+			Staged: c.stagesCycles() && len(c.route[ref.Target]) > 1,
 		}
 		// The table's write shape travels with the assignment so the worker's
 		// collapse and the coordinator's DDL agree: the per-table write mode
@@ -1758,6 +1879,10 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	var positions []position.Position
 	var needsSnapshot []source.TableRef
 	for _, ref := range refs {
+		// The expected partition count travels to the sink: a per-partition
+		// Position() must not return a MinSafe over an incomplete owner set,
+		// or an owner with no committed position yet is resumed past (§2.6).
+		ref.OwnerCount = len(c.route[ref.Target])
 		pos, err := c.snk.Position(ctx, ref)
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
@@ -1877,6 +2002,8 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			switch m := msg.Msg.(type) {
 			case *pb.WorkerMessage_Ack:
 				c.onAck(hello.WorkerName, m.Ack)
+			case *pb.WorkerMessage_Staged:
+				c.onStagedBatch(hello.WorkerName, m.Staged)
 			case *pb.WorkerMessage_Hello:
 				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_ChunkReady:
@@ -1928,6 +2055,13 @@ var errSessionReset = errors.New("session reset")
 // silently incomplete snapshot). Fail the run instead, so it restarts and
 // re-snapshots cleanly (CD-5).
 func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
+	// A lost worker leaves the staged cycles it owed permanently incomplete:
+	// discard them (never commit a partial cycle). The run terminates below
+	// and replays every partition from the committed position, so no later
+	// cycle may be committed over the gap.
+	if n := c.staged.discardWorker(worker); n > 0 {
+		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
+	}
 	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {

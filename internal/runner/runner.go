@@ -431,6 +431,12 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	// Reject collapsed partitioning BEFORE opening any adapter: NewRunner
+	// owns the sink it opens, and an error after OpenSink would leak it
+	// (newRunner installs the cleanup, and it never runs on this path).
+	if err := rejectCollapsedPartitioning(s); err != nil {
+		return nil, err
+	}
 	// The spec's source.serverId wins over cfg.ServerID when declared — the
 	// pipeline's own server id travels with it; cfg.ServerID is only a
 	// default for when the spec is silent. Spec.Validate (already run by
@@ -473,8 +479,34 @@ func NewRunnerWithAdapters(ctx context.Context, s *spec.Spec, cfg Config, src so
 	return newRunner(ctx, s, cfg, src, snk)
 }
 
+// rejectCollapsedPartitioning refuses workers>1 in the collapsed runner: it
+// has a single in-process worker per table and would silently ignore the
+// partition count, giving the user one worker when they declared N (WK-001
+// C0). The distributed coordinator accepts it (and validates the sink
+// capability); here it is a boot error.
+func rejectCollapsedPartitioning(s *spec.Spec) error {
+	for _, t := range s.Tables {
+		if t.WorkerCount() > 1 {
+			return fmt.Errorf("runner: %s: workers.number > 1 requires "+
+				"distributed mode (coordinator + workers); the collapsed run is "+
+				"single-worker", t.Target)
+		}
+	}
+	return nil
+}
+
 func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source, snk sink.Sink) (r *Runner, err error) {
 	log := cfg.Logger
+
+	// workers>1 is a distributed-mode contract: the collapsed runner has a
+	// single in-process worker per table and would silently ignore the
+	// partition count, giving the user one worker when they declared N
+	// (WK-001 C0). The distributed coordinator accepts it (and validates the
+	// sink capability); here it is a boot error. NewRunnerWithAdapters reaches
+	// this path with caller-owned adapters, so the guard lives here too.
+	if err := rejectCollapsedPartitioning(s); err != nil {
+		return nil, err
+	}
 
 	// Audit trail first: job_started marks the boot, and a startup failure
 	// still seals the trail with job_stopped.

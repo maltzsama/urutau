@@ -333,7 +333,7 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 	if kept == int64(nrows) {
 		return &dataplane.Batch{
 			Table: b.Table, Record: joined, Watermark: b.Watermark, Mode: b.Mode,
-			SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending,
+			SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq,
 		}, nil
 	}
 	filtered, err := compute.FilterRecordBatch(ctx, joined, keep, compute.DefaultFilterOptions())
@@ -347,7 +347,7 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 	}
 	return &dataplane.Batch{
 		Table: b.Table, Record: filtered, Watermark: b.Watermark, Mode: b.Mode,
-		SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending,
+		SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq,
 	}, nil
 }
 

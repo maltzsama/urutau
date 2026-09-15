@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -48,10 +49,14 @@ type RemoteConfig struct {
 	// plane. Empty means plaintext.
 	TLS grpctls.Config
 
-	// FaultStopAck (test-only): commits normally but withholds the ack, so
-	// the coordinator's supervisor sees a stale worker — the crashloop
-	// proof.
-	FaultStopAck bool
+	// FaultAckGate (test-only): commits normally but withholds the ack
+	// while the gate is set. A test flips it AFTER the snapshot, so the
+	// worker goes stale while owing nothing (in-flight == 0) — the
+	// supervisor's safe-reset path. CD-2: a stale worker WITH in-flight
+	// batches terminates for replay instead of resetting, so stopping the
+	// acks from the start would only prove the terminate path. Nil
+	// disables it.
+	FaultAckGate *atomic.Bool
 }
 
 // enrichSpecs converts the assignment's reference joins into the spec shape
@@ -171,6 +176,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		URI:       cfg.Sink.URI,
 		Namespace: cfg.Namespace,
 		Options:   cfg.Sink.Options,
+		// The sink parses the opaque position strings it stores with this
+		// kind (position.Parse): an empty kind defaults to MySQL GTID, so a
+		// Postgres LSN or Kafka offset read back on restart would be parsed
+		// as a GTID set and resume from the wrong point.
+		SourceKind: assign.SourceKind,
 	})
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
@@ -187,7 +197,17 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
 		}
 		cs.PrimaryKey = ta.PrimaryKey
-		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey}
+		// The SOURCE schema (before enrich extends it), for the drift check
+		// and the columnar collapse. The remote path built the pipeline
+		// without it, so a distributed upsert snapshot collapsed every row
+		// into one — an empty PK groups them all (WK-001 e2e). Mirrors the
+		// runner's SetKnownSchema.
+		knownSchema := cs
+		// Owner is the worker group name (cfg.Name), stable across restarts
+		// and rollouts. Sinks that persist a durable position per partition
+		// (ClickHouse, Couchbase) use it to keep one position per partition
+		// instead of a single last-writer scalar (WK-001 §2.6/C7).
+		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey, Owner: cfg.Name}
 		// The write shape arrives with the assignment: the coordinator's DDL
 		// and this worker's writes must agree on the cast policy, the
 		// metadata columns, and the write mode — a hardcoded UPSERT or empty
@@ -244,6 +264,14 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
 		w.Register(ta.TargetTable, writer, mode)
+		if len(knownSchema.Columns) > 0 {
+			w.SetKnownSchema(ta.TargetTable, knownSchema)
+		}
+		if ta.Staged {
+			if err := w.SetStaged(ta.TargetTable); err != nil {
+				return err
+			}
+		}
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
 		// Start's remaining first loads (any explicit-select reference,
 		// plus the refresh ticker for everything) stay asynchronous — the
@@ -274,7 +302,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	committed := make(map[string]position.Position, len(assign.Tables))
 	phase := pb.WorkerPhase_WORKER_PHASE_SNAPSHOTTING
 	for _, ta := range assign.Tables {
-		pos, err := snk.Position(ctx, core.TableRef{Target: ta.TargetTable})
+		pos, err := snk.Position(ctx, core.TableRef{Target: ta.TargetTable, Owner: cfg.Name})
 		if err != nil {
 			return fmt.Errorf("worker: committed %s: %w", ta.TargetTable, err)
 		}
@@ -311,7 +339,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	defer chunks.Close()
 
 	w.OnCommit(func(b *dataplane.Batch, rows int) {
-		if cfg.FaultStopAck {
+		if cfg.FaultAckGate != nil && cfg.FaultAckGate.Load() {
 			return
 		}
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
@@ -319,6 +347,22 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			Epoch:    assign.Epoch,
 			Position: string(b.Watermark),
 			Rows:     uint64(rows),
+		}}})
+	})
+
+	// Staged deliveries (WK-001 C5): the data files are written but not
+	// committed; the coordinator groups them by cycle and commits. seq 0 is
+	// a worker-generated snapshot/window batch, committed on arrival. A send
+	// failure must surface — a dropped descriptor is an uncommittable cycle.
+	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32) error {
+		return sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Staged{Staged: &pb.StagedBatch{
+			Table:           table,
+			Seq:             seq,
+			Descriptor_:     desc,
+			Position:        pos,
+			SnapshotState:   state,
+			SnapshotPending: pending,
+			Epoch:           assign.Epoch,
 		}}})
 	})
 
@@ -590,6 +634,9 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		Table:     meta.Table,
 		Record:    rec,
 		Watermark: []byte(meta.HighPos),
+		// The coordinator's monotonic batch sequence (WK-001 C2): the sink
+		// uses it to order N concurrent writers of a partitioned table.
+		Seq: meta.BatchId,
 	}
 
 	switch {
@@ -618,16 +665,10 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 // parsePosition returns the parser for the assignment's source kind.
 // Getting this wrong is not a minor inconvenience: a Kafka pipeline whose
 // committed positions were parsed as GTID sets would fail the worker boot
-// the moment the first cdc.position existed.
+// the moment the first cdc.position existed. Delegates to position.Parse so
+// the sink's per-partition read (WK-001 C7) shares one mapping.
 func parsePosition(kind string) func(string) (position.Position, error) {
-	switch kind {
-	case "postgres":
-		return func(s string) (position.Position, error) { return position.ParseLSN(s) }
-	case "kafka":
-		return func(s string) (position.Position, error) { return position.ParseOffsets(s) }
-	default:
-		return func(s string) (position.Position, error) { return position.ParseGTID(s) }
-	}
+	return func(s string) (position.Position, error) { return position.Parse(kind, s) }
 }
 
 // committedStrings renders the committed map for the wire Hello.

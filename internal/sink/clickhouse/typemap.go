@@ -151,9 +151,9 @@ func coerce(base string, v any) (any, error) {
 			}
 		}
 	case base == "Int32" || base == "Int64" || strings.HasPrefix(base, "Int") || strings.HasPrefix(base, "UInt"):
-		return toInt64(base, v)
+		return toInt(base, v)
 	case base == "Float32" || base == "Float64":
-		return toFloat64(v)
+		return toFloat(base, v)
 	case base == "Date":
 		return toTime(v, "2006-01-02")
 	case strings.HasPrefix(base, "DateTime64"):
@@ -200,7 +200,9 @@ func zeroOf(base string) any {
 		return ""
 	case base == "Bool":
 		return false
-	case base == "Float32" || base == "Float64":
+	case base == "Float32":
+		return float32(0)
+	case base == "Float64":
 		return float64(0)
 	case base == "Date" || strings.HasPrefix(base, "DateTime64"):
 		return time.Unix(0, 0).UTC()
@@ -212,42 +214,200 @@ func zeroOf(base string) any {
 		return map[any]any{}
 	case strings.HasPrefix(base, "Tuple"):
 		return []any{}
+	case strings.HasPrefix(base, "Int") || strings.HasPrefix(base, "UInt"):
+		return zeroInt(base)
 	default:
 		return int64(0)
 	}
 }
 
-func toInt64(base string, v any) (any, error) {
+// zeroInt is zeroOf's integer arm: the exact Go type clickhouse-go's typed
+// column expects (AppendRow is type-exact).
+func zeroInt(base string) any {
+	switch base {
+	case "Int8":
+		return int8(0)
+	case "Int16":
+		return int16(0)
+	case "Int32":
+		return int32(0)
+	case "Int64":
+		return int64(0)
+	case "UInt8":
+		return uint8(0)
+	case "UInt16":
+		return uint16(0)
+	case "UInt32":
+		return uint32(0)
+	case "UInt64":
+		return uint64(0)
+	}
+	return int64(0)
+}
+
+func toInt(base string, v any) (any, error) {
+	if base == "UInt64" {
+		u, err := uintValue(base, v)
+		if err != nil {
+			return nil, err
+		}
+		return u, nil
+	}
+	n, err := intValue(base, v)
+	if err != nil {
+		return nil, err
+	}
+	switch base {
+	case "Int8":
+		if n < math.MinInt8 || n > math.MaxInt8 {
+			return nil, fmt.Errorf("value %d overflows %s", n, base)
+		}
+		return int8(n), nil
+	case "Int16":
+		if n < math.MinInt16 || n > math.MaxInt16 {
+			return nil, fmt.Errorf("value %d overflows %s", n, base)
+		}
+		return int16(n), nil
+	case "Int32":
+		if n < math.MinInt32 || n > math.MaxInt32 {
+			return nil, fmt.Errorf("value %d overflows %s", n, base)
+		}
+		return int32(n), nil
+	case "Int64":
+		return n, nil
+	case "UInt8":
+		if n < 0 || n > math.MaxUint8 {
+			return nil, fmt.Errorf("value %d overflows %s", n, base)
+		}
+		return uint8(n), nil
+	case "UInt16":
+		if n < 0 || n > math.MaxUint16 {
+			return nil, fmt.Errorf("value %d overflows %s", n, base)
+		}
+		return uint16(n), nil
+	case "UInt32":
+		if n < 0 || n > math.MaxUint32 {
+			return nil, fmt.Errorf("value %d overflows %s", n, base)
+		}
+		return uint32(n), nil
+	}
+	return n, nil
+}
+
+// intValue normalizes any Go integer, an integral float, or a decimal string
+// to int64 — the shared front half of toInt.
+func intValue(base string, v any) (int64, error) {
 	switch t := v.(type) {
-	case int64:
-		return t, nil
 	case int:
+		return int64(t), nil
+	case int8:
+		return int64(t), nil
+	case int16:
 		return int64(t), nil
 	case int32:
 		return int64(t), nil
-	case uint64:
-		if t > math.MaxInt64 {
-			return nil, fmt.Errorf("value %d overflows %s", t, base)
+	case int64:
+		return t, nil
+	case uint:
+		if uint64(t) > math.MaxInt64 {
+			return 0, fmt.Errorf("value %d overflows %s", t, base)
 		}
+		return int64(t), nil
+	case uint8:
+		return int64(t), nil
+	case uint16:
 		return int64(t), nil
 	case uint32:
 		return int64(t), nil
+	case uint64:
+		if t > math.MaxInt64 {
+			return 0, fmt.Errorf("value %d overflows %s", t, base)
+		}
+		return int64(t), nil
 	case float64:
-		if t != math.Trunc(t) {
-			return nil, fmt.Errorf("value %v is not integral for %s", t, base)
+		if math.IsNaN(t) || math.IsInf(t, 0) || t != math.Trunc(t) {
+			return 0, fmt.Errorf("value %v is not integral for %s", t, base)
+		}
+		if t < math.MinInt64 || t >= math.MaxInt64 {
+			return 0, fmt.Errorf("value %v overflows %s", t, base)
 		}
 		return int64(t), nil
 	case string:
 		n, err := strconv.ParseInt(t, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("value %q is not an integer for %s", t, base)
+			return 0, fmt.Errorf("value %q is not an integer for %s", t, base)
 		}
 		return n, nil
 	}
-	return nil, fmt.Errorf("cannot encode %T as %s", v, base)
+	return 0, fmt.Errorf("cannot encode %T as %s", v, base)
 }
 
-func toFloat64(v any) (any, error) {
+// uintValue is intValue's unsigned twin: it keeps the full uint64 range that
+// int64 cannot hold (a BIGINT UNSIGNED source column).
+func uintValue(base string, v any) (uint64, error) {
+	switch t := v.(type) {
+	case int:
+		if t < 0 {
+			return 0, fmt.Errorf("value %d overflows %s", t, base)
+		}
+		return uint64(t), nil
+	case int8:
+		if t < 0 {
+			return 0, fmt.Errorf("value %d overflows %s", t, base)
+		}
+		return uint64(t), nil
+	case int16:
+		if t < 0 {
+			return 0, fmt.Errorf("value %d overflows %s", t, base)
+		}
+		return uint64(t), nil
+	case int32:
+		if t < 0 {
+			return 0, fmt.Errorf("value %d overflows %s", t, base)
+		}
+		return uint64(t), nil
+	case int64:
+		if t < 0 {
+			return 0, fmt.Errorf("value %d overflows %s", t, base)
+		}
+		return uint64(t), nil
+	case uint:
+		return uint64(t), nil
+	case uint8:
+		return uint64(t), nil
+	case uint16:
+		return uint64(t), nil
+	case uint32:
+		return uint64(t), nil
+	case uint64:
+		return t, nil
+	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) || t != math.Trunc(t) || t < 0 || t >= math.MaxUint64 {
+			return 0, fmt.Errorf("value %v is not an unsigned integer for %s", t, base)
+		}
+		return uint64(t), nil
+	case string:
+		n, err := strconv.ParseUint(t, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("value %q is not an unsigned integer for %s", t, base)
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("cannot encode %T as %s", v, base)
+}
+
+func toFloat(base string, v any) (any, error) {
+	f, err := floatValue(v)
+	if err != nil {
+		return nil, err
+	}
+	if base == "Float32" {
+		return float32(f), nil
+	}
+	return f, nil
+}
+
+func floatValue(v any) (float64, error) {
 	switch t := v.(type) {
 	case float64:
 		return t, nil
@@ -260,11 +420,11 @@ func toFloat64(v any) (any, error) {
 	case string:
 		f, err := strconv.ParseFloat(t, 64)
 		if err != nil {
-			return nil, fmt.Errorf("value %q is not a number", t)
+			return 0, fmt.Errorf("value %q is not a number", t)
 		}
 		return f, nil
 	}
-	return nil, fmt.Errorf("cannot encode %T as Float", v)
+	return 0, fmt.Errorf("cannot encode %T as Float", v)
 }
 
 func toTime(v any, layout string) (any, error) {

@@ -19,6 +19,12 @@ type Config struct {
 	URI       string // REST catalog endpoint / connection string
 	Namespace string
 	Options   map[string]string // warehouse, client_id, client_secret, scope, …
+	// SourceKind is the pipeline's source driver kind ("mysql", "postgres",
+	// "kafka"). It is a hint for decoding the opaque position strings a sink
+	// persists, not a coupling: a sink that keeps one position per partition
+	// (WK-001 §2.6) uses it to compare positions with position.Parse.
+	// Empty means the default (MySQL GTID).
+	SourceKind string
 }
 
 // secretOptionKeys are the Options keys whose values are credentials. They
@@ -114,6 +120,41 @@ type PropertyGetter interface {
 // Closer releases the sink's catalog connection.
 type Closer interface {
 	Close() error
+}
+
+// ConcurrentWriter is implemented by sinks that can accept writes from more
+// than one worker for the same table. A sink that cannot durably order or
+// serialize concurrent writers to one table MUST NOT implement it: the
+// coordinator refuses to boot a partitioned table (workers>1) whose sink
+// does not.
+//
+// It is a declarative capability, deliberately separate from the data-plane
+// interfaces: a sink may implement it while still returning false (its
+// concurrent path not yet built), and the coordinator checks the VALUE, not
+// the interface's presence.
+type ConcurrentWriter interface {
+	// SupportsConcurrentWriters reports whether this sink can serve N
+	// workers writing the same table. It may inspect its own configuration
+	// (e.g. Couchbase only in atomic commit mode).
+	SupportsConcurrentWriters() bool
+}
+
+// StagingWriter is implemented by a sink whose data files can be written
+// without committing them, so the coordinator can aggregate the N workers of
+// a partitioned table into ONE commit cycle (WK-001 C5, the Flink
+// IcebergStreamWriter/IcebergFilesCommitter model). Only the Iceberg sink
+// implements it; the descriptor is opaque to the caller.
+type StagingWriter interface {
+	// WriteStaged writes the batch's data files and returns an opaque
+	// descriptor. Nothing is visible in the table until CommitStaged.
+	WriteStaged(ctx context.Context, b *dataplane.Batch) ([]byte, error)
+}
+
+// StagedCommitter commits one cycle's descriptors as a single unit: all the
+// delete files across the cycle first, then all the data files, with the
+// cycle's position on the last commit (WK-001 C5).
+type StagedCommitter interface {
+	CommitStaged(ctx context.Context, ref core.TableRef, staged [][]byte, pos string) error
 }
 
 // Sink is a destination catalog. It is the composition of the small
