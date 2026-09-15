@@ -1,0 +1,39 @@
+# The kustomize root: everything needed to run the operator on a cluster.
+#
+#   kubectl apply -k config/default
+#
+# It applies the CRD, the operator's cluster RBAC, the operator Deployment,
+# the webhook Service + cert-manager Certificate, and the ValidatingWebhook.
+# The CRs themselves are NOT applied — create one from config/samples.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: urutau-system
+
+resources:
+  - namespace.yaml
+  - ../crd
+  - ../rbac
+  - ../manager
+  - ../webhook
+
+# The one image that carries every binary. Point it at your registry with:
+#   kustomize edit set image urutau=ghcr.io/you/urutau:v1.2.3
+# The replacement below then carries the same image into the operator's
+# --coordinator-image, so the coordinator StatefulSet and every worker
+# Deployment it provisions run it too.
+images:
+  - name: urutau
+    newTag: dev
+
+replacements:
+  - source:
+      kind: Deployment
+      name: urutau-operator
+      fieldPath: spec.template.spec.containers.[name=operator].image
+    targets:
+      - select:
+          kind: Deployment
+          name: urutau-operator
+        fieldPaths:
+          - spec.template.spec.containers.[name=operator].env.[name=COORDINATOR_IMAGE].value

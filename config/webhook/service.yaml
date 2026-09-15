@@ -1,0 +1,18 @@
+# The webhook Service the ValidatingWebhookConfiguration points at. The
+# operator's webhook server listens on 9443 (controller-runtime's default);
+# the Service fronts it on 443, which is what the apiserver dials.
+apiVersion: v1
+kind: Service
+metadata:
+  name: urutau-operator-webhook
+  labels:
+    app.kubernetes.io/name: urutau-operator
+    app.kubernetes.io/part-of: urutau
+spec:
+  selector:
+    app.kubernetes.io/name: urutau-operator
+    control-plane: controller-manager
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook

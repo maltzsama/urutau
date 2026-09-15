@@ -1,0 +1,41 @@
+# The validating webhook: every CDCPipeline CREATE/UPDATE is validated with
+# the SAME server-side rules the coordinator runs at boot (spec.LoadYAML +
+# Validate + the driver registry), so a bad spec is rejected at admission
+# instead of surfacing as a CrashLoopBackOff. The reconciler still validates
+# (validateSpec/validateSecrets), so `--enable-webhook=false` only loses the
+# admission-time check, not correctness.
+#
+# The path is controller-runtime's generated validator path for this GVK:
+# /validate-<group dots→dashes>-<version>-<lowercased kind>.
+#
+# cert-manager injects the CA bundle (from the Certificate's ca.crt) via the
+# inject-ca-from annotation. The namespace appears three times and is NOT
+# rewritten by kustomize's namespace transformer for the annotation — if you
+# move the operator to another namespace, update it here, in the
+# Certificate's dnsNames, and in clientConfig.service.namespace.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: urutau-operator-validating-webhook
+  annotations:
+    cert-manager.io/inject-ca-from: urutau-system/urutau-operator-webhook-cert
+  labels:
+    app.kubernetes.io/name: urutau-operator
+    app.kubernetes.io/part-of: urutau
+webhooks:
+  - name: vcdcpipeline.urutau.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    clientConfig:
+      service:
+        name: urutau-operator-webhook
+        namespace: urutau-system
+        path: /validate-urutau-io-v1alpha1-cdcpipeline
+        port: 443
+    rules:
+      - apiGroups: ["urutau.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["cdcpipelines"]
+        scope: Namespaced
