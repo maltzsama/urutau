@@ -299,6 +299,31 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind, ref.OwnerCount)
 }
 
+// SeedPositions records a baseline for every expected owner that has no
+// committed position, using the minimum of the owners that do, so the owner
+// set is complete and Position() can require coverage (WK-001 §2.6). A fresh
+// table (no owner committed) is left alone — it snapshots. Called by the
+// coordinator after a table's snapshot completes, for the owners whose
+// partition had no rows.
+func (s *Sink) SeedPositions(ctx context.Context, ref core.TableRef, owners []string) error {
+	scope, coll, err := s.ident(ref.Target)
+	if err != nil {
+		return err
+	}
+	kv := &realKV{coll: s.collection(scope, coll), dur: s.dur}
+	if s.txns != nil {
+		// A concurrent worker commit must not be lost to the seed's
+		// read-modify-write: run it in a transaction (optimistic, retries on
+		// conflict) so the merge always sees the latest document. Partitioned
+		// tables require atomic mode, so this is the real path.
+		tx := &realTx{txns: s.txns, coll: kv.coll, dur: s.dur}
+		return tx.run(ctx, func(tx kvStore) error {
+			return seedPositions(ctx, tx, s.sourceKind, owners)
+		})
+	}
+	return seedPositions(ctx, kv, s.sourceKind, owners)
+}
+
 // SetProperties merges snapshot-progress properties into the control
 // document.
 func (s *Sink) SetProperties(ctx context.Context, ref core.TableRef, props map[string]string) error {

@@ -120,6 +120,55 @@ func positionOf(ctx context.Context, kv kvStore, sourceKind string, ownerCount i
 	return doc.Position, nil
 }
 
+// seedPositions records a baseline for every owner in owners that has no
+// committed position, using the minimum of the owners that do. A fresh table
+// (no owner committed) is left alone — it snapshots. The caller runs this in
+// a transaction when the sink is in atomic mode, so the read-modify-write
+// cannot lose a concurrent worker commit.
+func seedPositions(ctx context.Context, kv kvStore, sourceKind string, owners []string) error {
+	if len(owners) < 2 {
+		return nil
+	}
+	doc, err := readControl(ctx, kv)
+	if err != nil {
+		return err
+	}
+	if doc == nil || len(doc.Positions) == 0 {
+		return nil // fresh table: nothing to seed
+	}
+	parsed := make([]position.Position, 0, len(doc.Positions))
+	for _, p := range doc.Positions {
+		pp, err := position.Parse(sourceKind, p)
+		if err != nil {
+			return fmt.Errorf("couchbase: seed: %w", err)
+		}
+		parsed = append(parsed, pp)
+	}
+	best, err := position.MinSafe(parsed)
+	if err != nil {
+		return err
+	}
+	baseline := best.String()
+
+	merged := make(map[string]string, len(doc.Positions)+len(owners))
+	for o, p := range doc.Positions {
+		merged[o] = p
+	}
+	changed := false
+	for _, owner := range owners {
+		if _, ok := merged[owner]; ok {
+			continue
+		}
+		merged[owner] = baseline
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	doc.Positions = merged
+	return kv.upsert(ctx, controlKey, doc)
+}
+
 // propertiesOf reads the property map (snapshot progress resume). Missing
 // control document yields an empty map with no error — the contract the
 // PropertyGetter declares.

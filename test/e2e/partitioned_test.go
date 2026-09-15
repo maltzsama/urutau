@@ -1,9 +1,15 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
+	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -272,4 +278,75 @@ func TestDistributedPartitionedWorkerKilled(t *testing.T) {
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(240))
 	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, 240)
 	t.Log("partitioned recovery ok: one worker killed, fail loud, restart, no loss, no duplicate")
+}
+
+// captureBuffer is a mutex-guarded io.Writer the coordinator's slog handler
+// writes into, so an e2e can assert on a coordinator log line (e.g. the
+// resume's snapshot_tables).
+type captureBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *captureBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *captureBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// TestDistributedPartitionedEmptyRangeResume: a partitioned table with a gap
+// in its key range leaves one partition empty, so its worker never commits
+// and never records a position. A restart must RESUME, not re-snapshot — the
+// coordinator seeds a baseline for the empty owner before it reads Position()
+// (WK-001 §2.6). Proven by the restart's resume log (snapshot_tables=0);
+// without the seed, Position() would see an incomplete owner set and the
+// table would re-snapshot.
+func TestDistributedPartitionedEmptyRangeResume(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	addr := reserveAddr(t)
+	s := loadPipeline(t)
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 3}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	groups := s.Tables[0].WorkerGroupNames(s.Pipeline)
+
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	// Ids 0/10 land in partition 0's range [0,70) and 200/210 in partition
+	// 2's [140,∞); partition 1's [70,140) gets no rows.
+	for _, id := range []int{0, 10, 200, 210} {
+		dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'seed%d', %d.0)", id, id, id))
+	}
+
+	stop, waitDone := bootPipeline(t, ctx, addr, s, groups...)
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(4))
+	stop()
+	if err := waitDone(); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	cap := &captureBuffer{}
+	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stderr, cap), nil))
+	stop2, waitDone2 := bootPipelineLogged(t, ctx, addr, s, logger, groups...)
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(4))
+	stop2()
+	if err := waitDone2(); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+
+	if !strings.Contains(cap.String(), "snapshot_tables=0") {
+		t.Fatalf("restart did not resume — the empty owner was not seeded:\n%s", cap.String())
+	}
 }

@@ -634,3 +634,38 @@ func TestPositionOfHoldsBackOnIncompleteOwners(t *testing.T) {
 		t.Fatalf("incomplete owner set = %q, %v; want no safe position", got, err)
 	}
 }
+
+// WK-001 §2.6: seeding fills a baseline for owners that never committed, so
+// Position() covers the full owner set and an empty partition does not force
+// a re-snapshot on every boot.
+func TestSeedPositionsFillsMissingOwners(t *testing.T) {
+	kv := newFakeKV()
+	_ = kv.upsert(context.Background(), controlKey, controlDoc{
+		Position:  "0/100",
+		Positions: map[string]string{"w0": "0/100"}, // only w0 committed
+	})
+	// Seed w1 and w2 with the minimum of the present owners.
+	if err := seedPositions(context.Background(), kv, "postgres", []string{"w0", "w1", "w2"}); err != nil {
+		t.Fatalf("seedPositions: %v", err)
+	}
+	doc, err := readControl(context.Background(), kv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Positions["w1"] != "0/100" || doc.Positions["w2"] != "0/100" {
+		t.Fatalf("seeded positions = %v, want w1/w2 = 0/100", doc.Positions)
+	}
+	// Position() now covers the full owner set.
+	if got, err := positionOf(context.Background(), kv, "postgres", 3); err != nil || got != "0/100" {
+		t.Fatalf("positionOf after seed = %q, %v; want 0/100", got, err)
+	}
+
+	// A fresh table (no owner committed) is left alone — it snapshots.
+	fresh := newFakeKV()
+	if err := seedPositions(context.Background(), fresh, "postgres", []string{"w0", "w1"}); err != nil {
+		t.Fatal(err)
+	}
+	if doc, _ := readControl(context.Background(), fresh); doc != nil {
+		t.Fatalf("seed wrote a fresh table: %+v", doc)
+	}
+}
