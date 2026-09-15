@@ -581,7 +581,7 @@ func TestPositionOfMinSafeAcrossOwners(t *testing.T) {
 		Position:  "0/100",
 		Positions: map[string]string{"w0": "0/100", "w1": "0/2"},
 	})
-	got, err := positionOf(context.Background(), kv, "postgres")
+	got, err := positionOf(context.Background(), kv, "postgres", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +593,7 @@ func TestPositionOfMinSafeAcrossOwners(t *testing.T) {
 	_ = kv1.upsert(context.Background(), controlKey, controlDoc{
 		Position: "0/2", Positions: map[string]string{"w0": "0/2"},
 	})
-	if got, err := positionOf(context.Background(), kv1, "postgres"); err != nil || got != "0/2" {
+	if got, err := positionOf(context.Background(), kv1, "postgres", 1); err != nil || got != "0/2" {
 		t.Fatalf("single owner = %q, %v; want 0/2", got, err)
 	}
 }
@@ -602,7 +602,7 @@ func TestPositionOfMinSafeAcrossOwners(t *testing.T) {
 func TestPositionOfFallsBackToScalar(t *testing.T) {
 	kv := newFakeKV()
 	_ = kv.upsert(context.Background(), controlKey, controlDoc{Position: "g1:9"})
-	got, err := positionOf(context.Background(), kv, "mysql")
+	got, err := positionOf(context.Background(), kv, "mysql", 0)
 	if err != nil || got != "g1:9" {
 		t.Fatalf("positionOf = %q, %v; want g1:9", got, err)
 	}
@@ -618,5 +618,19 @@ func TestControlWriteMergesOwnerPositions(t *testing.T) {
 	}
 	if doc.Position != "0/20" {
 		t.Fatalf("scalar = %q, want the last writer 0/20", doc.Position)
+	}
+}
+
+// WK-001 §2.6: an incomplete owner set must yield no safe position, not a
+// MinSafe over a subset that could resume past the owner that has not
+// committed yet.
+func TestPositionOfHoldsBackOnIncompleteOwners(t *testing.T) {
+	kv := newFakeKV()
+	_ = kv.upsert(context.Background(), controlKey, controlDoc{
+		Position:  "0/100",
+		Positions: map[string]string{"w0": "0/100"}, // 1 of 2 owners
+	})
+	if got, err := positionOf(context.Background(), kv, "postgres", 2); err != nil || got != "" {
+		t.Fatalf("incomplete owner set = %q, %v; want no safe position", got, err)
 	}
 }

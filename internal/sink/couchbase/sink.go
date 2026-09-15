@@ -296,7 +296,7 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind)
+	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind, ref.OwnerCount)
 }
 
 // SetProperties merges snapshot-progress properties into the control

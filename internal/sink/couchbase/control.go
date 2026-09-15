@@ -89,13 +89,18 @@ func readControl(ctx context.Context, kv kvStore) (*controlDoc, error) {
 // per-partition map is present (WK-001 C7) it returns the MinSafe across
 // owners, so a lagging partition is never resumed past; otherwise the scalar
 // (a pre-C7 document, or workers==1). Empty string means the collection was
-// never written and needs the snapshot.
-func positionOf(ctx context.Context, kv kvStore, sourceKind string) (string, error) {
+// never written and needs the snapshot. When ownerCount > 1 and the map is
+// incomplete, it returns "" — no safe minimum — rather than a MinSafe over a
+// subset that could advance past the missing owner.
+func positionOf(ctx context.Context, kv kvStore, sourceKind string, ownerCount int) (string, error) {
 	doc, err := readControl(ctx, kv)
 	if err != nil || doc == nil {
 		return "", err
 	}
 	if len(doc.Positions) > 0 {
+		if ownerCount > 1 && len(doc.Positions) < ownerCount {
+			return "", nil
+		}
 		parsed := make([]position.Position, 0, len(doc.Positions))
 		for owner, p := range doc.Positions {
 			pp, perr := position.Parse(sourceKind, p)

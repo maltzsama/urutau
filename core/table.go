@@ -253,6 +253,12 @@ type TableRef struct {
 	// last-writer scalar (WK-001 §2.6). Derived from the spec, so it is
 	// stable across restarts and k8s rollouts — unlike the pod name.
 	Owner string
+	// OwnerCount is the number of partitions the table is split across
+	// (spec.Table.WorkerCount). A per-partition Position() read uses it to
+	// refuse a MinSafe over an incomplete owner set: an owner with no
+	// committed position would otherwise be resumed past. 0 or 1 means the
+	// collapsed single-owner path.
+	OwnerCount int
 }
 
 // ParseColumnType parses a textual canonical type string into a

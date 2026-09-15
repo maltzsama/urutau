@@ -146,7 +146,7 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	if exists == 0 {
 		return "", nil
 	}
-	if pos, ok, err := s.partitionPosition(ctx, ident); err != nil {
+	if pos, ok, err := s.partitionPosition(ctx, ident, ref.OwnerCount); err != nil {
 		return "", err
 	} else if ok {
 		return pos, nil
@@ -161,7 +161,10 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 // partitionPosition reads the latest position per owner from the control
 // table and returns their MinSafe. ok is false when the table is absent or
 // has no rows (a pre-C7 table), so the caller falls back to the legacy read.
-func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent) (pos string, ok bool, err error) {
+// When ownerCount > 1 and fewer owners have committed, it returns ok=true
+// with an empty position — no safe minimum — so the caller snapshots rather
+// than resume past the missing owner (WK-001 §2.6).
+func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent, ownerCount int) (pos string, ok bool, err error) {
 	var exists uint8
 	if err := s.conn.QueryRow(ctx, "EXISTS TABLE "+ident.posQuoted()).Scan(&exists); err != nil {
 		return "", false, fmt.Errorf("exists %s: %w", ident.posQuoted(), err)
@@ -192,6 +195,12 @@ func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent) (pos str
 	}
 	if len(positions) == 0 {
 		return "", false, nil
+	}
+	if ownerCount > 1 && len(positions) < ownerCount {
+		// An owner has not committed a position yet. A MinSafe over the
+		// present owners could advance past it, so there is no safe minimum:
+		// report "no position" and let the caller snapshot (idempotent).
+		return "", true, nil
 	}
 	pos, err = minSafePosition(s.sourceKind, positions)
 	if err != nil {
