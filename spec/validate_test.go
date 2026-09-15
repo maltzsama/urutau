@@ -66,11 +66,24 @@ func TestValidateEnrich(t *testing.T) {
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "source.query") {
 		t.Fatalf("want source.query required, got %v", err)
 	}
+	// issue #65: an unprefixed as key ("tier") must fail Validate() the same
+	// way enrich.New() rejects it at boot (internal/enrich/enrich.go) — not
+	// pass validation and fail two layers deeper.
+	s = base()
+	s.Tables[0].Enrich[0].As = map[string]string{"tier": "user_tier"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "not prefixed") {
+		t.Fatalf("want as-not-prefixed problem, got %v", err)
+	}
 	s = base()
 	s.Tables[0].Enrich[0].Select = []string{"name"}
-	s.Tables[0].Enrich[0].As = map[string]string{"tier": "user_tier"}
-	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "as") {
+	s.Tables[0].Enrich[0].As = map[string]string{"users.tier": "user_tier"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "not in select") {
 		t.Fatalf("want as-not-in-select problem, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].As = map[string]string{"users.tier": "user_tier"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("prefixed as key matching select must validate, got %v", err)
 	}
 	s = base()
 	s.Tables[0].Enrich = append(s.Tables[0].Enrich, s.Tables[0].Enrich[0])
