@@ -137,13 +137,21 @@ func (w *tableWriter) nextSeq() uint64 {
 
 // versionSeq resolves a batch's version coordinate (WK-001 C3). batchSeq is
 // the coordinator's monotonic sequence (dataplane.Batch.Seq); 0 means no
-// coordinator. It always calls nextSeq so lastSeq advances on both paths,
-// then overrides with seed+batchSeq — above every seq this table ever saw,
-// and monotonic per key because a key stays in one partition.
+// coordinator. It always calls nextSeq (so lastSeq advances) and returns the
+// HIGHER of that and seed+batchSeq, then records the result in lastSeq: the
+// two sources are on different scales — the clock is ~1.7e18 while seed is 0
+// on a first boot — so without taking the max a coordinator batch could
+// land BELOW the snapshot batch that preceded it, and ReplacingMergeTree
+// would resurrect the snapshot row over the live one.
 func (w *tableWriter) versionSeq(batchSeq uint64) uint64 {
 	seq := w.nextSeq()
 	if batchSeq != 0 {
-		seq = w.seed + batchSeq
+		if cand := w.seed + batchSeq; cand > seq {
+			seq = cand
+		}
+	}
+	if seq > w.lastSeq {
+		w.lastSeq = seq
 	}
 	return seq
 }

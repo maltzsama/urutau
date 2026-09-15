@@ -139,6 +139,23 @@ func TestSeqFallsBackToClockWhenNoCoordinator(t *testing.T) {
 	}
 }
 
+// WK-001 C3 (4): the clock and coordinator sequences share one monotonic
+// line. On a first boot seed is 0, so seed+batchSeq is tiny next to the
+// snapshot's clock seq — a coordinator batch after the snapshot must still
+// land ABOVE it, or ReplacingMergeTree resurrects the snapshot row.
+func TestSeqStaysMonotonicAcrossSnapshotAndCoordinator(t *testing.T) {
+	frozen := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	w := &tableWriter{seed: 0, now: func() time.Time { return frozen }}
+	snap := w.versionSeq(0) // snapshot batch, no coordinator
+	live := w.versionSeq(1) // first coordinator batch
+	if live <= snap {
+		t.Fatalf("live seq %d must exceed the snapshot seq %d", live, snap)
+	}
+	if again := w.versionSeq(2); again <= live {
+		t.Fatalf("next coordinator seq %d must exceed %d", again, live)
+	}
+}
+
 // WK-001 C7: the durable position is the MinSafe across partitions — never
 // the argMax (one partition's row) nor the last writer's. A resume must not
 // start past the lagging partition.
