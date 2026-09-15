@@ -139,6 +139,24 @@ type ConcurrentWriter interface {
 	SupportsConcurrentWriters() bool
 }
 
+// StagingWriter is implemented by a sink whose data files can be written
+// without committing them, so the coordinator can aggregate the N workers of
+// a partitioned table into ONE commit cycle (WK-001 C5, the Flink
+// IcebergStreamWriter/IcebergFilesCommitter model). Only the Iceberg sink
+// implements it; the descriptor is opaque to the caller.
+type StagingWriter interface {
+	// WriteStaged writes the batch's data files and returns an opaque
+	// descriptor. Nothing is visible in the table until CommitStaged.
+	WriteStaged(ctx context.Context, b *dataplane.Batch) ([]byte, error)
+}
+
+// StagedCommitter commits one cycle's descriptors as a single unit: all the
+// delete files across the cycle first, then all the data files, with the
+// cycle's position on the last commit (WK-001 C5).
+type StagedCommitter interface {
+	CommitStaged(ctx context.Context, ref core.TableRef, staged [][]byte, pos string) error
+}
+
 // Sink is a destination catalog. It is the composition of the small
 // capability interfaces above; a sink must satisfy all of them.
 type Sink interface {
