@@ -1725,7 +1725,15 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	// pipeline-wide minimum the source's retention may advance to. Keyed by
 	// worker, so a partitioned table's N partitions each hold their own
 	// position and the minimum is the lagging one (WK-001 §2.2).
-	c.recordConfirmed(worker, pos)
+	//
+	// EXCEPT on a staged table, where the ack precedes the coordinator's
+	// CommitStaged: there the confirmed position advances from
+	// commitStagedCycle, after the cycle is durable, so source retention
+	// never passes data the cycle still owes (WK-001 §2.2/F2). The ack still
+	// released the budget above.
+	if !c.isStagedTable(ack.Table) {
+		c.recordConfirmed(worker, pos)
+	}
 	if c.metrics != nil {
 		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()

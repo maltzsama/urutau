@@ -18,6 +18,15 @@ func (c *Coordinator) stagesCycles() bool {
 	return ok
 }
 
+// isStagedTable reports whether target's commits are owned by the
+// coordinator's staged cycle — a partitioned table on a staging sink. On such
+// a table the worker's ack precedes the durable commit, so it must NOT
+// advance the confirmed position; commitStagedCycle does, after the cycle is
+// durable (WK-001 §2.2/F2).
+func (c *Coordinator) isStagedTable(target string) bool {
+	return c.stagesCycles() && len(c.route[target]) > 1
+}
+
 // onStagedBatch handles one StagedBatch from a worker (WK-001 C5): it records
 // the delivery and commits every cycle that is now complete and in turn. A
 // delivery from a superseded generation is dropped — accepting it would open
@@ -66,6 +75,20 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	defer mu.Unlock()
 	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {
 		return fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err)
+	}
+	// The cycle is durable: only now may source retention advance. Record the
+	// cycle's position for every owner it covered, so confirmedPosition (the
+	// min) reflects the whole cycle — the worker's per-batch ack does not
+	// advance it on a staged table (WK-001 §2.2/F2).
+	if pos != "" {
+		p, perr := c.src.ParsePosition(pos)
+		if perr != nil {
+			c.log.Warn("coordinator: staged cycle position", "table", cy.ref.Target, "pos", pos, "err", perr)
+		} else {
+			for owner := range cy.owners {
+				c.recordConfirmed(owner, p)
+			}
+		}
 	}
 	return nil
 }
