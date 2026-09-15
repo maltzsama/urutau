@@ -476,6 +476,19 @@ func NewRunnerWithAdapters(ctx context.Context, s *spec.Spec, cfg Config, src so
 func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source, snk sink.Sink) (r *Runner, err error) {
 	log := cfg.Logger
 
+	// workers>1 is a distributed-mode contract: the collapsed runner has a
+	// single in-process worker per table and would silently ignore the
+	// partition count, giving the user one worker when they declared N
+	// (WK-001 C0). The distributed coordinator accepts it (and validates the
+	// sink capability); here it is a boot error.
+	for _, t := range s.Tables {
+		if t.WorkerCount() > 1 {
+			return nil, fmt.Errorf("runner: %s: workers.number > 1 requires "+
+				"distributed mode (coordinator + workers); the collapsed run is "+
+				"single-worker", t.Target)
+		}
+	}
+
 	// Audit trail first: job_started marks the boot, and a startup failure
 	// still seals the trail with job_stopped.
 	var ev *eventlog.Run

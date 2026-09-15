@@ -130,6 +130,12 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 // Close releases the connection pool.
 func (s *Sink) Close() error { return s.conn.Close() }
 
+// SupportsConcurrentWriters reports whether N workers may commit to one
+// table. False until the per-partition durable position lands (WK-001 C7):
+// Position() is an argMax over one row, and the per-process seq does not
+// order concurrent writers.
+func (s *Sink) SupportsConcurrentWriters() bool { return false }
+
 func init() {
 	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
 		return Open(ctx, cfg)

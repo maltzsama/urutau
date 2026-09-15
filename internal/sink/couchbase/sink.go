@@ -317,6 +317,11 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 // Close releases the cluster connection.
 func (s *Sink) Close() error { return s.cluster.Close(nil) }
 
+// SupportsConcurrentWriters reports whether N workers may commit to one
+// table. False until the per-partition durable position lands (WK-001 C7):
+// the control document's position is last-writer-wins in both commit modes.
+func (s *Sink) SupportsConcurrentWriters() bool { return false }
+
 // realKV is the production kvStore: a gocb collection with synchronous
 // durability on every mutation. Majority is the floor for "commit ok means
 // the write survived" — with 0 replicas it reduces to the active node's

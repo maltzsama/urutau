@@ -401,6 +401,9 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// operator into the coordinator's ConfigMap).
 	workerTarget := make(map[string]string, len(c.cfg.Spec.Tables))
 	for i, t := range c.cfg.Spec.Tables {
+		if err := requirePartitionKey(t, refs[i]); err != nil {
+			return err
+		}
 		names := t.WorkerGroupNames(c.cfg.Spec.Pipeline)
 		ranges, err := c.resolvePartitionRanges(ctx, t, refs[i])
 		if err != nil {
@@ -472,6 +475,18 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// The sink is opened on every error path between here and the defers;
 	// Close on every exit, not just the happy one (audit #14).
 	defer func() { _ = c.snk.Close() }()
+
+	// (2) A partitioned table needs a sink that can serve N concurrent
+	// writers. Checked by CAPABILITY, not by sink type name: a plugin
+	// registers whatever name it wants. The capability must be declared
+	// false until the sink's concurrent path is actually built, so this
+	// refuses the boot instead of letting N writers corrupt one table.
+	for _, t := range c.cfg.Spec.Tables {
+		if err := requireConcurrentSink(t, c.snk); err != nil {
+			return err
+		}
+	}
+
 	for _, ref := range refs {
 		tbl := tableBySource[ref.Source]
 		// The cast policy must reach DDL: an empty policy here creates a
@@ -694,6 +709,37 @@ func (c *Coordinator) run(ctx context.Context) error {
 // cost. Workers>1 requires the source's chunker to implement
 // source.PartitionSource; a source that doesn't (Postgres, today) fails
 // the boot loudly rather than silently running unpartitioned.
+// requirePartitionKey rejects workers>1 for a table with no primary key:
+// partitioning splits the key range, and a table without one has no way to
+// divide it. Checked before resolvePartitionRanges so the error names the
+// real cause instead of the chunker's cryptic empty-key failure.
+func requirePartitionKey(t spec.Table, ref core.TableRef) error {
+	if t.WorkerCount() > 1 && len(ref.PrimaryKey) == 0 {
+		return fmt.Errorf("coordinator: %s: workers>1 requires a primary key: "+
+			"partitioning splits the key range, and a table without one has no "+
+			"way to divide it", t.Target)
+	}
+	return nil
+}
+
+// requireConcurrentSink rejects workers>1 when the sink does not declare the
+// ConcurrentWriter capability (or declares it false). snk is taken as any so
+// the check is a pure capability probe — the coordinator never reaches into a
+// concrete sink.
+func requireConcurrentSink(t spec.Table, snk any) error {
+	if t.WorkerCount() <= 1 {
+		return nil
+	}
+	cw, ok := snk.(sink.ConcurrentWriter)
+	if !ok || !cw.SupportsConcurrentWriters() {
+		return fmt.Errorf("coordinator: %s: workers>1 is not supported by "+
+			"this sink (it cannot order concurrent writers to one table); "+
+			"use workers: 1, or for couchbase set sink.commitMode: atomic",
+			t.Target)
+	}
+	return nil
+}
+
 func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, error) {
 	n := t.WorkerCount()
 	if n <= 1 {

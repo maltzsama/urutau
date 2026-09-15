@@ -419,3 +419,16 @@ func (l *failingLoader) Close() error                                    { retur
 func TestGoldenPathEnrichRunnerIntegration(t *testing.T) {
 	t.Skip("needs a fake streaming source.Reader + sink.Sink harness; tracked in the PR body")
 }
+
+// C0 (WK-001): the collapsed runner has a single in-process worker per
+// table; workers>1 is a distributed-only contract and must fail at boot
+// instead of silently running one worker.
+func TestCollapsedRejectsPartitionedTable(t *testing.T) {
+	s := &spec.Spec{Tables: []spec.Table{
+		{Target: "raw.orders", Workers: &spec.WorkerSpec{Number: 3}},
+	}}
+	_, err := newRunner(context.Background(), s, Config{}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "distributed") {
+		t.Fatalf("collapsed run with workers>1 must fail citing distributed mode, got: %v", err)
+	}
+}

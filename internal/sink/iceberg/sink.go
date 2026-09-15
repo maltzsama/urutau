@@ -89,6 +89,11 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 // Close is a no-op: the REST catalog is stateless and holds no connection.
 func (s *Sink) Close() error { return nil }
 
+// SupportsConcurrentWriters reports whether N workers may commit to one
+// table. False until the coordinator-side staged committer lands (WK-001
+// C5): today each worker writes cdc.position and the last writer wins.
+func (s *Sink) SupportsConcurrentWriters() bool { return false }
+
 func init() {
 	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
 		return Open(ctx, cfg)

@@ -116,6 +116,23 @@ type Closer interface {
 	Close() error
 }
 
+// ConcurrentWriter is implemented by sinks that can accept writes from more
+// than one worker for the same table. A sink that cannot durably order or
+// serialize concurrent writers to one table MUST NOT implement it: the
+// coordinator refuses to boot a partitioned table (workers>1) whose sink
+// does not.
+//
+// It is a declarative capability, deliberately separate from the data-plane
+// interfaces: a sink may implement it while still returning false (its
+// concurrent path not yet built), and the coordinator checks the VALUE, not
+// the interface's presence.
+type ConcurrentWriter interface {
+	// SupportsConcurrentWriters reports whether this sink can serve N
+	// workers writing the same table. It may inspect its own configuration
+	// (e.g. Couchbase only in atomic commit mode).
+	SupportsConcurrentWriters() bool
+}
+
 // Sink is a destination catalog. It is the composition of the small
 // capability interfaces above; a sink must satisfy all of them.
 type Sink interface {
