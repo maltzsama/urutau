@@ -44,3 +44,16 @@ func TestConfirmedPositionEmptyIsNil(t *testing.T) {
 		t.Fatal("confirmed = non-nil with no acks, want nil")
 	}
 }
+
+// WK-001 §2.2 (C6 baseline): a registered worker that has not acked yet must
+// hold confirmedPosition back, not be omitted. The boot baseline seeds every
+// worker's entry, so the min never advances over a worker that owes data.
+func TestConfirmedPositionHoldsBackForUnackedWorker(t *testing.T) {
+	c := &Coordinator{confirmed: map[string]position.Position{
+		"orders-raw.orders-0": position.MustLSN("0/100"), // acked
+		"orders-raw.orders-1": nil,                       // registered, not acked
+	}}
+	if c.confirmedPosition() != nil {
+		t.Fatal("an unacked registered worker must hold confirmed at nil")
+	}
+}

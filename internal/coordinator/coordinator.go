@@ -523,6 +523,18 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 	c.log.Info("coordinator resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
 
+	// Baseline every worker's confirmed position to the run's resume point.
+	// confirmedPosition() takes the min over the map, so a worker that has
+	// not acked yet must be IN the map holding that min back — omitting it
+	// let the source slot advance past data a worker had not committed
+	// (WK-001 §2.2). resume is nil on a fresh boot, which correctly holds the
+	// slot until every worker has committed at least once.
+	c.confirmedMu.Lock()
+	for name := range c.workers {
+		c.confirmed[name] = resume
+	}
+	c.confirmedMu.Unlock()
+
 	// Serve gRPC (control) + Flight (data) on one listener.
 	lis, err := net.Listen("tcp", c.cfg.ListenAddr)
 	if err != nil {
@@ -1128,6 +1140,12 @@ func (c *Coordinator) confirmedPosition() position.Position {
 	}
 	vals := make([]position.Position, 0, len(c.confirmed))
 	for _, p := range c.confirmed {
+		if p == nil {
+			// A registered worker with no committed position yet (its boot
+			// baseline): nothing is provably committed past the resume point,
+			// so hold retention back rather than advance over its data.
+			return nil
+		}
 		vals = append(vals, p)
 	}
 	best, err := position.MinSafe(vals)
@@ -1861,6 +1879,10 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	var positions []position.Position
 	var needsSnapshot []source.TableRef
 	for _, ref := range refs {
+		// The expected partition count travels to the sink: a per-partition
+		// Position() must not return a MinSafe over an incomplete owner set,
+		// or an owner with no committed position yet is resumed past (§2.6).
+		ref.OwnerCount = len(c.route[ref.Target])
 		pos, err := c.snk.Position(ctx, ref)
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
@@ -2034,13 +2056,11 @@ var errSessionReset = errors.New("session reset")
 // re-snapshots cleanly (CD-5).
 func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	// A lost worker leaves the staged cycles it owed permanently incomplete:
-	// discard them (never commit a partial cycle) and commit any cycle that
-	// was blocked behind them and is now complete.
-	if ready, n := c.staged.discardWorker(worker); n > 0 {
+	// discard them (never commit a partial cycle). The run terminates below
+	// and replays every partition from the committed position, so no later
+	// cycle may be committed over the gap.
+	if n := c.staged.discardWorker(worker); n > 0 {
 		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
-		for _, cy := range ready {
-			c.commitStagedCycle(cy)
-		}
 	}
 	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
 		c.sessionErrs <- retErr
