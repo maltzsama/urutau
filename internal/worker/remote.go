@@ -187,6 +187,12 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
 		}
 		cs.PrimaryKey = ta.PrimaryKey
+		// The SOURCE schema (before enrich extends it), for the drift check
+		// and the columnar collapse. The remote path built the pipeline
+		// without it, so a distributed upsert snapshot collapsed every row
+		// into one — an empty PK groups them all (WK-001 e2e). Mirrors the
+		// runner's SetKnownSchema.
+		knownSchema := cs
 		// Owner is the worker group name (cfg.Name), stable across restarts
 		// and rollouts. Sinks that persist a durable position per partition
 		// (ClickHouse, Couchbase) use it to keep one position per partition
@@ -248,6 +254,9 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
 		w.Register(ta.TargetTable, writer, mode)
+		if len(knownSchema.Columns) > 0 {
+			w.SetKnownSchema(ta.TargetTable, knownSchema)
+		}
 		if ta.Staged {
 			if err := w.SetStaged(ta.TargetTable); err != nil {
 				return err
