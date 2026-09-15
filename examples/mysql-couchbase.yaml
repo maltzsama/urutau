@@ -1,0 +1,27 @@
+# MySQL binlog -> Couchbase, upsert.
+#
+# Sink config matches test/e2e/couchbase_test.go's real fixture. namespace
+# maps to the Couchbase BUCKET (not a catalog namespace); clientId/
+# clientSecret are cluster credentials, required. Target names are
+# "scope.collection" (one dot) or a bare collection name, which falls back
+# to sink.scope (default "_default").
+#
+# Values point at the repo's e2e docker-compose stack
+# (test/e2e/docker-compose.yml); adjust uri/sink for your own MySQL and
+# Couchbase cluster.
+pipeline: e2e-mysql-couchbase
+source:
+  kind: mysql
+  uri: mysql://repl:replpass@127.0.0.1:3306/shop
+  serverId: "1101"
+sink:
+  type: couchbase
+  uri: couchbase://localhost
+  namespace: lakehouse
+  clientId: urutau
+  clientSecret: urutaupass
+tables:
+  - source: shop.orders
+    target: cb_orders
+    primaryKey: [id]
+    createIfNotExists: true
