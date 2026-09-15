@@ -25,6 +25,23 @@ func TestValidateAcceptsMinimalUpsert(t *testing.T) {
 	}
 }
 
+// The admission webhook validates the inline CDCPipeline spec before the
+// operator mounts the referenced Secrets, so it must skip the URI
+// requirements (WithoutCredentials); the coordinator still enforces them on
+// the resolved spec.
+func TestValidateWithoutCredentials(t *testing.T) {
+	s := validSpec()
+	s.Source.URI = ""
+	s.Sink.URI = ""
+
+	if err := s.Validate(); err == nil {
+		t.Fatal("Validate accepted a spec with no source.uri/sink.uri")
+	}
+	if err := s.Validate(WithoutCredentials()); err != nil {
+		t.Fatalf("WithoutCredentials rejected a spec whose URIs come from Secrets: %v", err)
+	}
+}
+
 func TestValidateEnrich(t *testing.T) {
 	base := func() *Spec {
 		s := validSpec()

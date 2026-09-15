@@ -167,7 +167,7 @@ docker compose -f test/e2e/docker-compose.yml down
   they land): see [Enrichment](reference/enrichment.md).
 - **Writing your own source/sink**: [Plugins](guides/plugins.md).
 - **The full behavior contract** (delivery guarantees, ordering, what
-  happens on a poison batch): [Semantics](reference/semantics.md).
+  happens on a poison batch): [Delivery guarantees](reference/guarantees.md).
 
 If something in this page doesn't work as written, that's a doc bug — open
 an issue rather than silently working around it.

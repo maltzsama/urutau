@@ -1,0 +1,74 @@
+# A CDCPipeline: MySQL → Iceberg, three workers on the orders table.
+#
+# The operator turns this into a per-pipeline ServiceAccount, a headless
+# Service, a ConfigMap holding this definition, and a coordinator
+# StatefulSet; the coordinator provisions the three worker Deployments.
+#
+# Create it:
+#   kubectl create secret generic shop-mysql-creds \
+#     --from-literal=uri='mysql://repl:replpass@host.minikube.internal:3306/shop'
+#   kubectl create secret generic polaris-creds \
+#     --from-literal=uri='http://host.minikube.internal:8181/api/catalog' \
+#     --from-literal=clientId=root --from-literal=clientSecret=s3cr3t \
+#     --from-literal=scope=PRINCIPAL_ROLE:ALL
+#   kubectl apply -f config/samples/cdcpipeline.yaml
+apiVersion: urutau.io/v1alpha1
+kind: CDCPipeline
+metadata:
+  name: shop-mysql
+  namespace: default
+spec:
+  # ONE image for the coordinator and every worker it provisions — the same
+  # coordinator/worker split that ships as four binaries in one image
+  # (build/Dockerfile); only the Command differs per Pod.
+  image: urutau:dev
+
+  # Credentials are never inline. The operator mounts:
+  #   source  → URUTAU_SOURCE_URI
+  #   catalog → URUTAU_SINK_URI, URUTAU_SINK_CLIENT_ID,
+  #             URUTAU_SINK_CLIENT_SECRET, URUTAU_SINK_SCOPE
+  secrets:
+    source: shop-mysql-creds
+    catalog: polaris-creds
+
+  coordinator:
+    cpu: "1"
+    memory: "1Gi"
+    metricsAddr: ":8080"
+    snapshot:
+      chunkSize: 10000
+      maxParallelChunks: 4
+    supervision:
+      ackTimeout: 30s
+      maxResets: 5
+      window: 15m
+
+  # The resource default for every worker Deployment; a table's own
+  # workers.cpu/memory overrides it. cpu/memory are the request,
+  # cpu+cpu_overhead / memory+memory_overhead the limit.
+  worker:
+    cpu: "500m"
+    cpu_overhead: "100m"
+    memory: "1Gi"
+    memory_overhead: "256Mi"
+
+  # The inline pipeline spec. source.uri and sink.uri are deliberately
+  # absent — the Secrets above fill them at coordinator boot. Everything
+  # else is the same YAML `urutau run -f` accepts.
+  definition:
+    inline:
+      pipeline: shop-mysql
+      source:
+        kind: mysql
+        serverId: "1101"
+      sink:
+        type: iceberg+rest
+        namespace: raw
+        warehouse: quickstart_catalog
+      tables:
+        - source: shop.orders
+          target: raw.orders
+          primaryKey: [id]
+          createIfNotExists: true
+          workers:
+            number: 3

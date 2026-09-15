@@ -36,13 +36,13 @@ shuffle, no windowed state.
   spec grammar but tunes nothing today.
 - **A wildcard reference's real columns are known before boot completes**,
   not just after the first refresh — see
-  [Semantics](semantics#wildcard-select-no-schema-drift-issue-56).
+  [Enrich internals](../architecture/enrich-internals.md#wildcard-select-closes-schema-drift-at-boot).
 - **Point-in-time, and it says so.** Enriched columns are not reproducible
   by replay (the reference is a snapshot, not CDC); source columns and
   position stay deterministic either way.
 
 Full grammar detail, the boot-time join-key type check, duplicate-key
-rejection, and cold-start semantics: [Semantics](semantics#enrich-columnar-broadcast-join).
+rejection, and cold-start internals: [Enrich internals](../architecture/enrich-internals.md).
 
 ## Examples
 
@@ -115,17 +115,8 @@ enrich:
 → `{..., client_name: "Ana", customers.tier: "gold"}` — `name` renamed,
 `tier` keeps its prefix. `as` keys must be the **table-prefixed** column
 name (`customers.name`, not `name`) and must name a column in `select`.
-
-:::caution Blocked by [issue #65](https://github.com/maltzsama/urutau/issues/65)
-`spec.Validate()` currently rejects this exact example — it checks `as`
-keys against the *unprefixed* column name instead of the prefixed one
-`internal/enrich` actually requires at boot. Right now neither form of
-`as` passes end to end: the unprefixed form passes `Validate()` but fails
-later at `enrich.New()`; the prefixed form shown above is what the join
-itself requires but `Validate()` rejects it first. The prefixed form is
-correct — document it here so it's ready the moment #65 lands; until
-then, a pipeline using `as` will not boot.
-:::
+`spec.Validate()` and `enrich.New()` agree on this rule (fixed by #78);
+the example above boots and runs as shown.
 
 `joinType` is required on every reference — there is no default miss
 policy; see [Rules](#rules) above for the five accepted values.

@@ -81,7 +81,13 @@ func validatePipeline(obj runtime.Object) error {
 		if err != nil {
 			return fmt.Errorf("spec.definition.inline: %w", err)
 		}
-		if err := s.Validate(); err != nil {
+		// The inline spec deliberately leaves the URI/credential fields
+		// empty: the operator mounts the referenced Secrets into the
+		// coordinator pod and the coordinator resolves them at boot. The
+		// webhook has no access to those Secrets, so it validates everything
+		// EXCEPT the credential-field requirements (WithoutCredentials); the
+		// coordinator still enforces them on the resolved spec.
+		if err := s.Validate(spec.WithoutCredentials()); err != nil {
 			return fmt.Errorf("spec.definition.inline: %w", err)
 		}
 		// The known kinds/types come from the driver registry, not a

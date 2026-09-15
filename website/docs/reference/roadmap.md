@@ -35,3 +35,20 @@ Kafka `raw`/Confluent-Avro decoders, transport-native metadata columns,
 and `append-idempotent` write mode were all on this list at one point —
 they've since shipped and moved into [Sources](sources),
 [Sinks](sinks), and [Enrichment](enrichment).
+
+### Registered for v2 (not v1 gaps)
+
+Deliberate deferrals, recorded so they are not rediscovered as debt. None
+is a correctness gap in v1.
+
+- **Operator image/S3 planner**: the operator supports inline definitions
+  only; an image or S3 pipeline definition is not implemented.
+- **ADD COLUMN propagation**: a schema change requires declare-and-resume;
+  live propagation is not automatic.
+- **Dead-letter queue** (and multi-destination DLQ): a poison batch is
+  terminal in v1 — see [Delivery guarantees](guarantees.md#poison-batch-terminal-no-dead-letter-queue).
+- **`enrich_miss` as a materializable column**: the columnar join marks a
+  left-join miss by leaving the reference columns NULL; it does not emit a
+  dedicated wire column, so the `enrich_miss` metadata key cannot be
+  materialized yet.
+

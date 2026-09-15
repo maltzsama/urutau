@@ -183,13 +183,25 @@ Two separate roles are involved:
 - **The operator's ClusterRole** (`config/rbac/operator.yaml`):
   cluster-wide CRUD on `cdcpipelines` (+ `status`/`finalizers`), full CRUD
   on `statefulsets`, read on `secrets`, CRUD on `configmaps`/`services`,
-  and create on `serviceaccounts`/`roles`/`rolebindings` (it mints a
+  and CRUD on `serviceaccounts`/`roles`/`rolebindings` (it mints a
   per-pipeline identity dynamically).
 - **Each coordinator Pod's own per-pipeline `Role`+`RoleBinding`**
   (created by the operator, scoped by `resourceNames` to that one CR):
   additionally grants `apps/deployments` get/create/update and
   `core/pods` get — this is what lets the coordinator provision worker
-  Deployments without the operator needing a broader ClusterRole for it.
+  Deployments.
+
+Two details are easy to get wrong when writing this RBAC by hand:
+
+- **`list`/`watch`, not just `get`/`create`.** The controller-runtime
+  manager caches every type it creates, so a role that grants only
+  `get`/`create` on `serviceaccounts`/`roles`/`rolebindings` never syncs
+  its informers and the reconciler stalls.
+- **You cannot grant what you do not hold.** RBAC forbids a subject from
+  creating a Role that carries permissions it lacks, so the operator's
+  ClusterRole must itself hold `apps/deployments` get/create/update and
+  `core/pods` get — even though the operator never touches a Deployment or
+  a Pod. The coordinator does, through the per-pipeline Role.
 
 ## Concurrent writers: two different fixes for the same problem
 

@@ -47,7 +47,7 @@ const config: Config = {
   themes: ['@docusaurus/theme-mermaid'],
 
   themeConfig: {
-    image: 'img/social-card.png',
+    image: 'img/docusaurus-social-card.jpg',
     colorMode: {
       respectPrefersColorScheme: true,
     },
@@ -59,6 +59,11 @@ const config: Config = {
           sidebarId: 'docs',
           position: 'left',
           label: 'Docs',
+        },
+        {
+          href: 'https://pkg.go.dev/github.com/maltzsama/urutau',
+          label: 'Go API',
+          position: 'right',
         },
         {
           href: 'https://github.com/maltzsama/urutau',
@@ -75,7 +80,8 @@ const config: Config = {
           items: [
             {label: 'Quickstart', to: '/docs/quickstart'},
             {label: 'Architecture', to: '/docs/architecture/overview'},
-            {label: 'Semantics', to: '/docs/reference/semantics'},
+            {label: 'Delivery guarantees', to: '/docs/reference/guarantees'},
+            {label: 'Go API reference', href: 'https://pkg.go.dev/github.com/maltzsama/urutau'},
           ],
         },
         {

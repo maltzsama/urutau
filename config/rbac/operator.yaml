@@ -24,18 +24,30 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
+  # The per-pipeline coordinator Role grants these to the coordinator's own
+  # ServiceAccount. RBAC forbids granting what you do not hold, so the
+  # operator must hold them too — it never uses deployments/pods itself (the
+  # coordinator creates the worker Deployments and reads worker Pods).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
   # ConfigMap carries the resolved spec; the Service is the coordinator's
   # headless stable identity. Delete flows through owner-reference GC.
   - apiGroups: [""]
     resources: ["configmaps", "services"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   # Per-pipeline coordinator identity, created dynamically at reconcile.
+  # list/watch are required because the manager caches every type it
+  # creates/owns, not just the ones it watches by name.
   - apiGroups: [""]
     resources: ["serviceaccounts"]
-    verbs: ["get", "create"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
-    verbs: ["get", "create"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

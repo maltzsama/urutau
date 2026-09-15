@@ -1,0 +1,8 @@
+# The operator's own namespace. The CRD, the ClusterRole and the
+# ClusterRoleBinding are cluster-scoped; everything else lands here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: urutau-system
+  labels:
+    app.kubernetes.io/part-of: urutau

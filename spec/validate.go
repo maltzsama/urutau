@@ -23,10 +23,34 @@ var (
 	)
 )
 
+// ValidateOption tunes Validate for callers that cannot see the whole spec.
+type ValidateOption func(*validateOptions)
+
+type validateOptions struct {
+	// credentialsFromEnv skips the URI requirements because the caller
+	// validates an inline spec whose URIs are filled from mounted Secrets at
+	// coordinator boot. Used by the admission webhook, which runs before the
+	// Secrets exist in the pod it validates for.
+	credentialsFromEnv bool
+}
+
+// WithoutCredentials makes Validate skip the source.uri and sink.uri
+// requirements. The admission webhook needs this: it validates the inline
+// CDCPipeline spec, which deliberately leaves the URI/credential fields empty
+// (the operator mounts Secrets and the coordinator resolves them at boot).
+// Every other caller validates a resolved spec and must NOT use this.
+func WithoutCredentials() ValidateOption {
+	return func(o *validateOptions) { o.credentialsFromEnv = true }
+}
+
 // Validate applies the hard, server-side rules. The same code must validate
 // inline specs and resolved specs — validation is single and server-side by
 // design.
-func (s *Spec) Validate() error {
+func (s *Spec) Validate(opts ...ValidateOption) error {
+	o := validateOptions{}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	var problems []string
 
 	if s.Pipeline == "" {
@@ -69,11 +93,11 @@ func (s *Spec) Validate() error {
 			problems = append(problems, "source.schemaRegistry: required when format is avro (Confluent-compatible registry base URL)")
 		}
 	}
-	if s.Source.URI == "" {
+	if !o.credentialsFromEnv && s.Source.URI == "" {
 		problems = append(problems, "source.uri: required")
 	}
 
-	if s.Sink.URI == "" {
+	if !o.credentialsFromEnv && s.Sink.URI == "" {
 		problems = append(problems, "sink.uri: required")
 	}
 	if s.Sink.Namespace == "" {

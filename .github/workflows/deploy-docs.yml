@@ -20,9 +20,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Sets the Pages base URL and fails early with a clear message if
+      # Pages is not enabled or not set to the GitHub Actions source,
+      # instead of a bare 404 at the deploy step.
+      - uses: actions/configure-pages@v5
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: website/package-lock.json
 

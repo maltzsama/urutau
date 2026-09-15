@@ -1,0 +1,102 @@
+# The urutau-operator Deployment: a single controller-runtime process that
+# reconciles CDCPipeline CRs into per-pipeline coordinator StatefulSets.
+#
+# One image carries every binary (build/Dockerfile); this Pod overrides the
+# container command to run the operator. The SAME image is passed to the
+# operator as --coordinator-image — it is what the coordinator StatefulSet
+# and every worker Deployment the coordinator provisions will run. The
+# kustomize `replacements` rule in ../default keeps COORDINATOR_IMAGE in sync
+# with this container's own image, so `kustomize edit set image` moves both.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: urutau-operator
+  labels:
+    app.kubernetes.io/name: urutau-operator
+    app.kubernetes.io/part-of: urutau
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: urutau-operator
+  labels:
+    app.kubernetes.io/name: urutau-operator
+    app.kubernetes.io/part-of: urutau
+    control-plane: controller-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: urutau-operator
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: urutau-operator
+        app.kubernetes.io/part-of: urutau
+        control-plane: controller-manager
+    spec:
+      serviceAccountName: urutau-operator
+      securityContext:
+        runAsNonRoot: true
+        # The distroless image's USER is the non-numeric `nonroot`, which
+        # runAsNonRoot alone cannot verify — pin its UID/GID (65532).
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: urutau:dev
+          imagePullPolicy: IfNotPresent
+          command: ["urutau-operator"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # Kept equal to this container's image by the kustomize
+            # replacement in ../default; referenced from --coordinator-image
+            # below via Kubernetes' $(VAR) argument expansion.
+            - name: COORDINATOR_IMAGE
+              value: urutau:dev
+          args:
+            - --coordinator-image=$(COORDINATOR_IMAGE)
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --enable-webhook=true
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+            - name: webhook
+              containerPort: 9443
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            # controller-runtime's default webhook cert directory.
+            - name: webhook-cert
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+      volumes:
+        - name: webhook-cert
+          secret:
+            secretName: urutau-operator-webhook-cert

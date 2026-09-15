@@ -368,6 +368,7 @@ $RECYCLE.BIN/
 
 ### Urutau ###
 /bin/
+/dist/
 /urutau
 /coordinator
 /worker

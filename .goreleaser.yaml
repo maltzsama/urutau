@@ -1,0 +1,68 @@
+# GoReleaser builds the four binaries and attaches them to the GitHub
+# Release that release-please created. It does NOT create the release
+# itself (release.mode: append) and does NOT own the changelog
+# (release-please does) — see .github/workflows/release.yml.
+version: 2
+
+project_name: urutau
+
+builds:
+  - id: urutau
+    main: ./cmd/urutau
+    binary: urutau
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: &ldflags
+      - -s -w
+      - -X github.com/maltzsama/urutau/internal/version.Version={{ .Version }}
+      - -X github.com/maltzsama/urutau/internal/version.Commit={{ .Commit }}
+      - -X github.com/maltzsama/urutau/internal/version.Date={{ .Date }}
+
+  - id: urutau-coordinator
+    main: ./cmd/coordinator
+    binary: urutau-coordinator
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: *ldflags
+
+  - id: urutau-worker
+    main: ./cmd/worker
+    binary: urutau-worker
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: *ldflags
+
+  - id: urutau-operator
+    main: ./cmd/operator
+    binary: urutau-operator
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: *ldflags
+
+# One archive per OS/arch holding all four binaries — they ship together
+# (the operator runs the coordinator and worker from the same image).
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  mode: append

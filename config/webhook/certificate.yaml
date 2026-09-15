@@ -1,0 +1,36 @@
+# The webhook's serving certificate, issued by cert-manager with a
+# self-signed issuer (no external CA needed for an in-cluster webhook). The
+# Certificate's `ca.crt` is injected into the ValidatingWebhookConfiguration
+# by the `cert-manager.io/inject-ca-from` annotation on it, and the serving
+# key pair lands in the `urutau-operator-webhook-cert` Secret the operator
+# Deployment mounts at controller-runtime's default cert directory.
+#
+# dnsNames MUST match the webhook Service's in-cluster DNS name (Service name
+# + namespace): urutau-operator-webhook.urutau-system.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: urutau-operator-selfsigned
+  labels:
+    app.kubernetes.io/name: urutau-operator
+    app.kubernetes.io/part-of: urutau
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: urutau-operator-webhook-cert
+  labels:
+    app.kubernetes.io/name: urutau-operator
+    app.kubernetes.io/part-of: urutau
+spec:
+  secretName: urutau-operator-webhook-cert
+  duration: 8760h # 1 year
+  renewBefore: 720h # 30 days
+  dnsNames:
+    - urutau-operator-webhook.urutau-system.svc
+    - urutau-operator-webhook.urutau-system.svc.cluster.local
+  issuerRef:
+    name: urutau-operator-selfsigned
+    kind: Issuer

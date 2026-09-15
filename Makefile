@@ -10,7 +10,10 @@ BUF_VERSION ?= v1.72.0
 GOLANGCI_LINT_VERSION ?= v2.13.2
 ENVTEST_VERSION ?= latest
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# release-please tags vX.Y.Z; strip the leading v so the string matches
+# internal/version.Version and what GoReleaser embeds.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
+VERSION := $(if $(VERSION),$(VERSION),dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -19,7 +22,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-deploy k8s-undeploy k8s-status
 
 all: lint test build
 
@@ -77,6 +80,28 @@ clean:
 
 docker:
 	docker build -f build/Dockerfile -t urutau:dev .
+
+# ── Kubernetes (operator + CRDs) ────────────────────────────────────────
+# Local cluster (minikube): build the one image STRAIGHT into minikube's
+# docker daemon, then apply the kustomize root. Building into the daemon
+# retags even while a Pod holds the old image, which `minikube image load`
+# refuses to do. cert-manager must already be installed — the webhook
+# Certificate is issued by it. See docs/guides/deploy-kubernetes.md.
+KUBECTL ?= kubectl
+OPERATOR_IMAGE ?= urutau:dev
+
+k8s-load: ## Build the image into minikube's docker daemon (no registry)
+	eval $$(minikube docker-env) && docker build -f build/Dockerfile -t $(OPERATOR_IMAGE) .
+
+k8s-deploy:
+	$(KUBECTL) apply -k config/default
+
+k8s-undeploy:
+	$(KUBECTL) delete -k config/default --ignore-not-found
+
+k8s-status:
+	$(KUBECTL) -n urutau-system get deploy,sts,pod
+	$(KUBECTL) get cdcpipelines -A
 
 E2E_COMPOSE := test/e2e/docker-compose.yml
 
@@ -136,4 +161,4 @@ docs-site: ## Install deps + serve docs at localhost:3000
 
 docs-build: ## Build static docs into website/build/
 	npm --prefix website install
-	npm --prefix website build
+	npm --prefix website run build

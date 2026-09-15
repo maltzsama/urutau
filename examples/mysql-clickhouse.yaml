@@ -1,0 +1,24 @@
+# MySQL binlog -> ClickHouse, upsert.
+#
+# Sink config matches test/e2e/clickhouse_test.go's real fixture — ClickHouse
+# is a native-protocol DSN (clickhouse-go v2), not a REST catalog like
+# Iceberg. sink.type must be set explicitly; it isn't auto-detected the way
+# Iceberg is the default.
+#
+# Values point at the repo's e2e docker-compose stack
+# (test/e2e/docker-compose.yml); adjust uri/sink for your own MySQL and
+# ClickHouse instance.
+pipeline: e2e-mysql-clickhouse
+source:
+  kind: mysql
+  uri: mysql://repl:replpass@127.0.0.1:3306/shop
+  serverId: "1101"
+sink:
+  type: clickhouse
+  uri: clickhouse://localhost:9002?password=clickpass
+  namespace: lakehouse
+tables:
+  - source: shop.orders
+    target: raw.orders
+    primaryKey: [id]
+    createIfNotExists: true
