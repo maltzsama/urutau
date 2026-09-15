@@ -61,6 +61,11 @@ const config: Config = {
           label: 'Docs',
         },
         {
+          href: 'https://pkg.go.dev/github.com/maltzsama/urutau',
+          label: 'Go API',
+          position: 'right',
+        },
+        {
           href: 'https://github.com/maltzsama/urutau',
           label: 'GitHub',
           position: 'right',
@@ -76,6 +81,7 @@ const config: Config = {
             {label: 'Quickstart', to: '/docs/quickstart'},
             {label: 'Architecture', to: '/docs/architecture/overview'},
             {label: 'Delivery guarantees', to: '/docs/reference/guarantees'},
+            {label: 'Go API reference', href: 'https://pkg.go.dev/github.com/maltzsama/urutau'},
           ],
         },
         {
