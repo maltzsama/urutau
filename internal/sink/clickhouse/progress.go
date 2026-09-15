@@ -18,12 +18,22 @@ import (
 // carry the position.
 const progressTable = "urutau_progress"
 
+// progressIdent is the progress table's fully-qualified name. Open connects
+// to the server default (not the namespace), so the table is qualified
+// explicitly — bare only when the sink has no namespace.
+func (s *Sink) progressIdent() string {
+	if s.ns == "" {
+		return quoteIdent(progressTable)
+	}
+	return quoteIdent(s.ns) + "." + quoteIdent(progressTable)
+}
+
 // ensureProgressTable creates the progress side table if absent.
 func (s *Sink) ensureProgressTable(ctx context.Context) error {
 	q := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s "+
 		"(`target` String, `k` String, `v` String, `ver` UInt64) "+
 		"ENGINE = ReplacingMergeTree(ver) ORDER BY (target, k)",
-		quoteIdent(progressTable))
+		s.progressIdent())
 	if err := s.conn.Exec(ctx, q); err != nil {
 		return fmt.Errorf("create %s: %w", progressTable, err)
 	}
@@ -42,7 +52,7 @@ func (s *Sink) SetProperties(ctx context.Context, ref core.TableRef, props map[s
 		return err
 	}
 	ver := uint64(time.Now().UnixNano())
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO "+quoteIdent(progressTable))
+	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO "+s.progressIdent())
 	if err != nil {
 		return fmt.Errorf("progress insert: %w", err)
 	}
@@ -67,7 +77,7 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 		return nil, err
 	}
 	rows, err := s.conn.Query(ctx,
-		fmt.Sprintf("SELECT k, argMax(v, ver) FROM %s WHERE target = ? GROUP BY k", quoteIdent(progressTable)),
+		fmt.Sprintf("SELECT k, argMax(v, ver) FROM %s WHERE target = ? GROUP BY k", s.progressIdent()),
 		target)
 	if err != nil {
 		return nil, fmt.Errorf("progress read: %w", err)

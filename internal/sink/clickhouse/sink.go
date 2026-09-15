@@ -49,14 +49,23 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	if opt.Auth.Username == "" {
 		opt.Auth.Username = "default"
 	}
-	if opt.Auth.Database == "" {
-		opt.Auth.Database = cfg.Namespace
+	// The sink's fallback namespace: an explicit DSN database wins, else the
+	// spec namespace.
+	ns := opt.Auth.Database
+	if ns == "" {
+		ns = cfg.Namespace
 	}
+	// Never point the CONNECTION's default database at the namespace: the
+	// server validates it during the handshake, so a not-yet-created
+	// database fails the connection (UNKNOWN_DATABASE, code 81) before
+	// CREATE DATABASE can run. Connect to the server default and qualify
+	// every statement (ident() and progressIdent()).
+	opt.Auth.Database = ""
 	conn, err := ch.Open(opt)
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse: open: %w", err)
 	}
-	s := &Sink{conn: conn, ns: opt.Auth.Database, sourceKind: cfg.SourceKind}
+	s := &Sink{conn: conn, ns: ns, sourceKind: cfg.SourceKind}
 	if s.ns != "" {
 		if err := conn.Exec(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdent(s.ns)); err != nil {
 			_ = conn.Close()
