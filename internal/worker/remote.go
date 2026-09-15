@@ -590,6 +590,9 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		Table:     meta.Table,
 		Record:    rec,
 		Watermark: []byte(meta.HighPos),
+		// The coordinator's monotonic batch sequence (WK-001 C2): the sink
+		// uses it to order N concurrent writers of a partitioned table.
+		Seq: meta.BatchId,
 	}
 
 	switch {

@@ -98,6 +98,18 @@ type Batch struct {
 	// atomically with position so a crash resumes from the right
 	// chunk. Nil when not in snapshot phase.
 	SnapshotPending []uint32
+
+	// Seq is the coordinator's monotonic batch sequence (BatchMeta.batch_id),
+	// assigned once per sub-batch in binlog order. Sinks use it to order
+	// concurrent writes from the N workers of one partitioned table.
+	//
+	// Zero in two cases: the collapsed mode (no coordinator), and the
+	// worker-generated snapshot/window batches, which never see BatchMeta.
+	// Only the ClickHouse sink consumes it today (as the ReplacingMergeTree
+	// version column); Iceberg orders via the coordinator's staged cycle,
+	// Couchbase via its transaction, and the plugin sink is blocked from
+	// workers>1. Do not look for other consumers.
+	Seq uint64
 }
 
 // Release frees the Arrow buffers held by the Record. Safe to call on a
