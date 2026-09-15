@@ -674,6 +674,12 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			if err != nil {
 				return fmt.Errorf("worker: table %s: select append: %w", p.target, err)
 			}
+			// Every row was dropped (e.g. an append flush of delete
+			// tombstones with no before image): nothing to commit. ready(nil)
+			// would panic the committer on the unset mode.
+			if out == nil {
+				return nil
+			}
 			return ready(out, rows, len(keepIdx), 0)
 		default:
 			// Upsert: collapse the whole buffer columnar, merge survivors
