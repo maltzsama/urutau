@@ -166,13 +166,20 @@ func cbWriter(t *testing.T, ctx context.Context, s sink.Sink, ref core.TableRef,
 	return w
 }
 
-// toDPBatch encodes a rowchange.Batch into a wire batch via the transport
-// encoder — the same encoder sources and the coordinator use.
-func toDPBatch(b rowchange.Batch) *dataplane.Batch {
+// toDPBatch bridges a rowchange batch into the wire record the sink reads
+// (the same encoder sources and the coordinator use). The optional schema
+// is the table's resolved schema: without it the record is inferred from
+// the Go values, which flattens a nested struct or list to a String — the
+// sink then stores it as a JSON string instead of a nested document.
+// Callers with composites pass the real schema.
+func toDPBatch(b rowchange.Batch, schema ...core.Schema) *dataplane.Batch {
 	cs := core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
 		{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
 	}, PrimaryKey: []string{"id"}}
+	if len(schema) > 0 {
+		cs = schema[0]
+	}
 	rec, err := transport.RecordFromChanges(b.Changes, transport.MergeSchema(b.Changes, cs), nil)
 	if err != nil {
 		panic(err)
@@ -324,24 +331,31 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 
 	s := cbSink(t, ctx, spec.CommitModeAtomic)
 	defer func() { _ = s.Close() }()
-	schema, ref := cbOrdersSchema()
-	ref.Target = "cb_atomic"
+	// A string primary key so the key itself can be oversized: the sink
+	// addresses a document by its PK, and only a string can exceed the
+	// document-key limit (an int64 PK could never be unaddressable).
+	schema := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindString}},
+		{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+	}}
+	ref := core.TableRef{Source: "src.orders", Target: "cb_atomic", PrimaryKey: []string{"id"}}
 	if err := s.EnsureTable(ctx, ref, schema, nil, core.CastPolicy{}, dataplane.UpsertMode); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	w := cbWriter(t, ctx, s, ref, nil)
 
+	oversized := strings.Repeat("x", 300)
 	bad := rowchange.Batch{
 		Table: ref.Target, Position: "0/1", Mode: rowchange.UpsertMode,
 		Changes: []rowchange.Change{
-			{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
-			{Op: rowchange.OpInsert, Key: []any{strings.Repeat("x", 300)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
+			{Op: rowchange.OpInsert, Key: []any{"1"}, After: map[string]any{"id": "1", "v": "a"}, IngestTS: time.Now()},
+			{Op: rowchange.OpInsert, Key: []any{oversized}, After: map[string]any{"id": oversized, "v": "b"}, IngestTS: time.Now()},
 		},
 	}
-	if err := w.Commit(ctx, toDPBatch(bad)); err == nil {
+	if err := w.Commit(ctx, toDPBatch(bad, schema)); err == nil {
 		t.Fatal("oversized key must fail the batch")
 	}
-	if _, ok := cbDoc(t, b, "cb_atomic", "[1]"); ok {
+	if _, ok := cbDoc(t, b, "cb_atomic", `["1"]`); ok {
 		t.Fatal("staged upsert survived a rolled-back transaction")
 	}
 	if _, ok := cbReadPosition(t, b, "cb_atomic"); ok {
@@ -351,14 +365,14 @@ func TestCouchbaseSinkAtomicMode(t *testing.T) {
 	good := rowchange.Batch{
 		Table: ref.Target, Position: "0/2", Mode: rowchange.UpsertMode,
 		Changes: []rowchange.Change{
-			{Op: rowchange.OpInsert, Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, IngestTS: time.Now()},
-			{Op: rowchange.OpInsert, Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}, IngestTS: time.Now()},
+			{Op: rowchange.OpInsert, Key: []any{"1"}, After: map[string]any{"id": "1", "v": "a"}, IngestTS: time.Now()},
+			{Op: rowchange.OpInsert, Key: []any{"2"}, After: map[string]any{"id": "2", "v": "b"}, IngestTS: time.Now()},
 		},
 	}
-	if err := w.Commit(ctx, toDPBatch(good)); err != nil {
+	if err := w.Commit(ctx, toDPBatch(good, schema)); err != nil {
 		t.Fatalf("atomic commit: %v", err)
 	}
-	if _, ok := cbDoc(t, b, "cb_atomic", "[2]"); !ok {
+	if _, ok := cbDoc(t, b, "cb_atomic", `["2"]`); !ok {
 		t.Fatal("atomic batch data missing")
 	}
 	pos, ok := cbReadPosition(t, b, "cb_atomic")
@@ -421,7 +435,7 @@ func TestCouchbaseSinkNestedTypes(t *testing.T) {
 			IngestTS: time.Now(),
 		}},
 	}
-	if err := w.Commit(ctx, toDPBatch(batch)); err != nil {
+	if err := w.Commit(ctx, toDPBatch(batch, schema)); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	doc, ok := cbDoc(t, b, "cb_nested", "[1]")
