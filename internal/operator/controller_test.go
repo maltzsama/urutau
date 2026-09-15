@@ -320,6 +320,21 @@ func TestWebhookRejectsEmptyOrAmbiguousDefinition(t *testing.T) {
 		t.Fatal("webhook accepted an inline spec without primaryKey on an upsert table")
 	}
 
+	// The inline spec may leave the URI/credential fields empty — the
+	// operator mounts the referenced Secrets and the coordinator resolves
+	// them at boot. The webhook cannot see those Secrets, so it must accept
+	// the shape (WithoutCredentials).
+	cr4 := pipelineCR("secret-creds", "test-ops-unique")
+	cr4.Spec.Definition.Inline = map[string]any{
+		"pipeline": "secret-creds",
+		"source":   map[string]any{"kind": "mysql"},
+		"sink":     map[string]any{"namespace": "raw"},
+		"tables":   []any{map[string]any{"source": "shop.orders", "target": "raw.orders", "primaryKey": []any{"id"}}},
+	}
+	if _, err := v.ValidateCreate(testCtx, cr4); err != nil {
+		t.Fatalf("webhook rejected an inline spec whose URIs come from Secrets: %v", err)
+	}
+
 	// The well-formed CR passes.
 	ok := pipelineCR("ok", "test-ops-unique")
 	if _, err := v.ValidateCreate(testCtx, ok); err != nil {
