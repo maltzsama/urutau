@@ -447,19 +447,20 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 				}
 				sel[s] = true
 			}
-			// For explicit select, validate that as keys match the prefixed
-			// column names (e.g., "users.name") since buildImage uses prefixed
-			// names as the as map keys.
+			// as keys must be prefixed with the reference table name (e.g.,
+			// "customers.name"), matching enrich.New()'s actual boot-time
+			// check (internal/enrich/enrich.go) — a key without the prefix,
+			// or one whose unprefixed suffix isn't in select, passes here
+			// silently and fails two layers deeper at enrich boot (issue #65).
+			prefix := e.Table + "."
 			for ref := range e.As {
-				found := false
-				for s := range sel {
-					if s == ref {
-						found = true
-						break
-					}
+				if !strings.HasPrefix(ref, prefix) {
+					*problems = append(*problems, fmt.Sprintf("%s.as: renames %q which is not prefixed with %q", ep, ref, prefix))
+					continue
 				}
-				if !found {
-					*problems = append(*problems, fmt.Sprintf("%s.as: renames %q which is not in select (use prefixed name like %q)", ep, ref, "table.column"))
+				refCol := strings.TrimPrefix(ref, prefix)
+				if !sel[refCol] {
+					*problems = append(*problems, fmt.Sprintf("%s.as: renames %q whose column %q is not in select", ep, ref, refCol))
 				}
 			}
 		}
