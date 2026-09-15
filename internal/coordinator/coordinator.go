@@ -517,26 +517,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 	}
 
-	// Seed a baseline for every partition owner that has no committed
-	// position yet, so Position() covers the full owner set. An owner whose
-	// partition has no rows never commits, and without the seed the resume
-	// would see an incomplete set and re-snapshot the table on every boot
-	// (WK-001 §2.6). Runs BEFORE resumeFrom, which reads Position().
-	if seeder, ok := snk.(sink.PositionSeeder); ok {
-		for target, owners := range c.route {
-			if len(owners) < 2 {
-				continue
-			}
-			names := make([]string, len(owners))
-			for i, w := range owners {
-				names[i] = w.name
-			}
-			if err := seeder.SeedPositions(ctx, core.TableRef{Target: target}, names); err != nil {
-				return fmt.Errorf("coordinator: seed %s: %w", target, err)
-			}
-		}
-	}
-
 	resume, needsSnapshot, err := c.resumeFrom(ctx, refs)
 	if err != nil {
 		return err
@@ -1221,9 +1201,32 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	// A future iteration could parallelize the chunk SELECTs themselves
 	// (they run on the WORKER, not rdr) while keeping rdr's caught-up
 	// proof sequential; not needed for this to be correct.
+	//
+	// A partition whose range has no rows gets no chunks and its owner never
+	// commits, so it would never record a position. Collect those owners and
+	// seed their baseline AFTER the snapshot — here "empty" is provable (no
+	// chunks at snapshot time), unlike at boot, where an owner with no
+	// position could equally be one interrupted mid-snapshot (whose partition
+	// MUST re-snapshot, not be resumed past). WK-001 §2.6.
+	bounds, err := chunker.Bounds(ctx)
+	if err != nil {
+		return err
+	}
+	allChunks := snapshot.Chunks(bounds)
+	var emptyOwners []string
 	for p, w := range owners {
+		if len(clipChunksToRange(allChunks, ranges[p])) == 0 {
+			emptyOwners = append(emptyOwners, w.name)
+		}
 		if err := c.snapshotPartition(ctx, rdr, chunker, ref, ranges[p], p, w, cfg); err != nil {
 			return fmt.Errorf("partition %d: %w", p, err)
+		}
+	}
+	if len(emptyOwners) > 0 {
+		if seeder, ok := c.snk.(sink.PositionSeeder); ok {
+			if err := seeder.SeedPositions(ctx, core.TableRef{Target: ref.Target}, emptyOwners); err != nil {
+				return fmt.Errorf("coordinator: seed %s: %w", ref.Target, err)
+			}
 		}
 	}
 	return nil

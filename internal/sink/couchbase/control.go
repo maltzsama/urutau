@@ -122,8 +122,9 @@ func positionOf(ctx context.Context, kv kvStore, sourceKind string, ownerCount i
 
 // seedPositions records a baseline for every owner in owners that has no
 // committed position, using the minimum of the owners that do. A fresh table
-// (no owner committed) is left alone — it snapshots. Called at boot, before
-// any worker commits, so the read-modify-write is safe.
+// (no owner committed) is left alone — it snapshots. The caller runs this in
+// a transaction when the sink is in atomic mode, so the read-modify-write
+// cannot lose a concurrent worker commit.
 func seedPositions(ctx context.Context, kv kvStore, sourceKind string, owners []string) error {
 	if len(owners) < 2 {
 		return nil

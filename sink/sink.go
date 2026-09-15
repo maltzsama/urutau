@@ -166,8 +166,8 @@ type PositionSeeder interface {
 	// SeedPositions records a baseline for every owner in owners that has no
 	// committed position yet, using the minimum of the owners that do. It
 	// must never overwrite a real commit, and is a no-op when no owner has a
-	// position (a fresh table). Called by the coordinator at boot, before it
-	// reads Position().
+	// position (a fresh table). Called by the coordinator after a table's
+	// snapshot completes, for the owners whose partition had no rows.
 	SeedPositions(ctx context.Context, ref core.TableRef, owners []string) error
 }
 
