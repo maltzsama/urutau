@@ -189,9 +189,17 @@ type Coordinator struct {
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
 
-	// confirmed tracks the latest position each target table durably
-	// committed (from worker Acks). The minimum across tables is reported
-	// to the source so its retention never advances past uncommitted data.
+	// confirmed tracks the latest position each WORKER durably committed
+	// (from worker Acks). The minimum across workers is reported to the
+	// source so its retention never advances past uncommitted data.
+	//
+	// Keyed by worker, not by table: a partitioned table (workers>1) has N
+	// workers committing different primary-key ranges, and a per-table key
+	// let the last acker overwrite the others — advancing the Postgres slot
+	// past WAL a lagging partition had not read (WK-001 §2.2). This is safe
+	// only because one worker serves exactly one table (WorkerGroupNames
+	// embeds the target); a shared worker would fold two tables' positions
+	// into one minimum. See TestWorkerGroupNamesEmbedTarget.
 	confirmedMu sync.Mutex
 	confirmed   map[string]position.Position
 
@@ -1079,21 +1087,25 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 	return nil
 }
 
-// recordConfirmed stores a table's latest durably-committed position and
+// recordConfirmed stores a worker's latest durably-committed position and
 // recomputes the pipeline-wide minimum. The minimum uses the position's own
 // ordering — LSNs and GTID sets are not lexicographically ordered, and a
 // wrong minimum would advance the source slot past data still in flight.
-func (c *Coordinator) recordConfirmed(table string, pos position.Position) {
+//
+// Keyed by worker (not table): for a partitioned table the N workers commit
+// disjoint key ranges and must each hold their own position; a per-table key
+// would let the last acker overwrite the lagging partitions (WK-001 §2.2).
+func (c *Coordinator) recordConfirmed(worker string, pos position.Position) {
 	if pos == nil {
 		return
 	}
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
-	c.confirmed[table] = pos
+	c.confirmed[worker] = pos
 }
 
 // confirmedPosition returns the minimum committed position across all
-// target tables; nil while nothing is durably committed.
+// workers; nil while nothing is durably committed.
 //
 // MinSafe, not Min: if the committed positions are not mutually comparable
 // (never for one source, but a guard), there is no safe minimum — advancing
@@ -1629,8 +1641,10 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.budget.release(worker, freed)
 	}
 	// The ack is evidence of a durable commit: record it and recompute the
-	// pipeline-wide minimum the source's retention may advance to.
-	c.recordConfirmed(ack.Table, pos)
+	// pipeline-wide minimum the source's retention may advance to. Keyed by
+	// worker, so a partitioned table's N partitions each hold their own
+	// position and the minimum is the lagging one (WK-001 §2.2).
+	c.recordConfirmed(worker, pos)
 	if c.metrics != nil {
 		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()

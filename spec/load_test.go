@@ -203,3 +203,22 @@ func TestValidateAcceptsNumericServerID(t *testing.T) {
 		t.Fatalf("Validate: %v (sampleYAML's serverId: \"1101\" should be accepted)", err)
 	}
 }
+
+// WK-001 C6 invariant: the coordinator keys its per-worker confirmed position
+// by worker name and folds them into one minimum. That is only correct while
+// a worker serves exactly ONE table, which holds because WorkerGroupNames
+// embeds the target. This test fails the day the derivation stops embedding
+// it (a worker group shared across tables), which would silently fold two
+// tables' positions into the same minimum.
+func TestWorkerGroupNamesEmbedTarget(t *testing.T) {
+	tbl := Table{Target: "raw.orders"}
+	names := tbl.WorkerGroupNames("shop-mysql")
+	if len(names) == 0 {
+		t.Fatal("no worker group names")
+	}
+	for _, name := range names {
+		if !strings.Contains(name, tbl.Target) {
+			t.Fatalf("worker group %q does not embed the target %q — the coordinator's per-worker confirmed key would fold two tables", name, tbl.Target)
+		}
+	}
+}
