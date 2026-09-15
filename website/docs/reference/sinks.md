@@ -49,6 +49,16 @@ Tombstone physical cleanup is operator maintenance
 (`OPTIMIZE ... FINAL CLEANUP`); reads stay correct under `FINAL` whether or
 not cleanup has run.
 
+**Partitioned append is at-least-once.** With `workers: 1` the position
+travels in the data rows, so one `INSERT` carries both and a crash is atomic.
+A partitioned table (`workers: N`) commits the data and its per-owner
+position in two separate statements; a crash between them leaves the rows
+durable with the position un-advanced, and the restart replays the batch.
+Upsert collapses the replay onto the same row (`ReplacingMergeTree(seq)`);
+append has no key to collapse on, so the rows land a second time. That is the
+at-least-once contract (`semantics.md`: duplicates are possible, loss is not)
+— a table that must not duplicate should use `writeMode: upsert`.
+
 ## Couchbase
 
 Key-document writes where upsert-by-key *is* the native operation — one
