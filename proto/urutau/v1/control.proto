@@ -20,6 +20,7 @@ message WorkerMessage {
     ChunkReady  chunk_ready  = 3;
     ChunkFailed chunk_failed = 4;
     WorkerError error        = 5;
+    StagedBatch staged       = 6;  // staged data files, one per delivery (WK-001 C5)
   }
 }
 
@@ -152,6 +153,22 @@ message ChunkFailed {
   uint32     chunk_id = 2;
   ErrorClass class    = 3;
   string     detail   = 4;
+}
+
+// ── Staged commits (WK-001 C5) ───────────────────────────────────────────
+// A worker of a partitioned table writes its parquet data files and sends
+// the opaque descriptor here instead of committing; the coordinator
+// aggregates every delivery of one binlog batch (a cycle) and commits it
+// once via StagedCommitter. Carries no data — only the descriptor and the
+// batch metadata needed to close the cycle.
+message StagedBatch {
+  string          table            = 1;  // target table
+  uint64          seq              = 2;  // BatchMeta.batch_id — the cycle key
+  bytes           descriptor       = 3;  // opaque payload from WriteStaged (DataFile codec)
+  string          position         = 4;  // the batch's high position (watermark)
+  string          snapshot_state   = 5;  // resumable-backfill state ("" when not in snapshot)
+  repeated uint32 snapshot_pending = 6;  // chunk ids still to process
+  uint64          epoch            = 7;  // stale-epoch guards, like Ack
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────
