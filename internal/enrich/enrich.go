@@ -217,9 +217,12 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 		// Grammar validated at boot, not on the first event (audit #10): an
 		// unknown join type silently became left, a bad maxWait silently
 		// became "no limit", and a negative maxEvents silently became the
-		// 100k default.
+		// 100k default. joinType has no universal miss policy (issue #66):
+		// spec.Validate() rejects "" as required, so this must too, or a
+		// spec built and run without going through Validate() (a caller
+		// constructing *spec.Spec directly) would silently get "left".
 		switch cfg.JoinType {
-		case "", "left", "left outer", "inner", "left semi", "left anti":
+		case "left", "left outer", "inner", "left semi", "left anti":
 		default:
 			return nil, fmt.Errorf("enrich: reference %q: join_type %q unknown (want left | left outer | inner | left semi | left anti)", cfg.Table, cfg.JoinType)
 		}
