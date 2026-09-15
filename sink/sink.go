@@ -157,6 +157,20 @@ type StagedCommitter interface {
 	CommitStaged(ctx context.Context, ref core.TableRef, staged [][]byte, pos string) error
 }
 
+// PositionSeeder is an optional capability: a sink that keeps a durable
+// position per partition can seed a baseline for owners that have none, so
+// the owner set is complete. Without it, an owner whose partition has no rows
+// never records a position, and a Position() that requires complete coverage
+// would re-snapshot the table on every boot (WK-001 §2.6).
+type PositionSeeder interface {
+	// SeedPositions records a baseline for every owner in owners that has no
+	// committed position yet, using the minimum of the owners that do. It
+	// must never overwrite a real commit, and is a no-op when no owner has a
+	// position (a fresh table). Called by the coordinator at boot, before it
+	// reads Position().
+	SeedPositions(ctx context.Context, ref core.TableRef, owners []string) error
+}
+
 // Sink is a destination catalog. It is the composition of the small
 // capability interfaces above; a sink must satisfy all of them.
 type Sink interface {

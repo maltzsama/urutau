@@ -158,6 +158,36 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	return pos.String, nil
 }
 
+// readOwnerPositions reads the latest position per owner from the control
+// table. A missing table or no rows yields an empty map (a pre-C7 table).
+func (s *Sink) readOwnerPositions(ctx context.Context, ident tableIdent) (map[string]string, error) {
+	var exists uint8
+	if err := s.conn.QueryRow(ctx, "EXISTS TABLE "+ident.posQuoted()).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("exists %s: %w", ident.posQuoted(), err)
+	}
+	if exists == 0 {
+		return nil, nil
+	}
+	rows, err := s.conn.Query(ctx,
+		"SELECT owner, argMax(position, seq) FROM "+ident.posQuoted()+" GROUP BY owner")
+	if err != nil {
+		return nil, fmt.Errorf("positions %s: %w", ident.posQuoted(), err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]string{}
+	for rows.Next() {
+		var owner string
+		var p sql.NullString
+		if err := rows.Scan(&owner, &p); err != nil {
+			return nil, err
+		}
+		if p.Valid {
+			out[owner] = p.String
+		}
+	}
+	return out, rows.Err()
+}
+
 // partitionPosition reads the latest position per owner from the control
 // table and returns their MinSafe. ok is false when the table is absent or
 // has no rows (a pre-C7 table), so the caller falls back to the legacy read.
@@ -165,48 +195,69 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 // with an empty position — no safe minimum — so the caller snapshots rather
 // than resume past the missing owner (WK-001 §2.6).
 func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent, ownerCount int) (pos string, ok bool, err error) {
-	var exists uint8
-	if err := s.conn.QueryRow(ctx, "EXISTS TABLE "+ident.posQuoted()).Scan(&exists); err != nil {
-		return "", false, fmt.Errorf("exists %s: %w", ident.posQuoted(), err)
-	}
-	if exists == 0 {
-		return "", false, nil
-	}
-	rows, err := s.conn.Query(ctx,
-		"SELECT owner, argMax(position, seq) FROM "+ident.posQuoted()+" GROUP BY owner")
+	owners, err := s.readOwnerPositions(ctx, ident)
 	if err != nil {
-		return "", false, fmt.Errorf("positions %s: %w", ident.posQuoted(), err)
-	}
-	defer func() { _ = rows.Close() }()
-	var positions []string
-	for rows.Next() {
-		var owner string
-		var p sql.NullString
-		if err := rows.Scan(&owner, &p); err != nil {
-			return "", false, err
-		}
-		if !p.Valid {
-			continue
-		}
-		positions = append(positions, p.String)
-	}
-	if err := rows.Err(); err != nil {
 		return "", false, err
 	}
-	if len(positions) == 0 {
+	if len(owners) == 0 {
 		return "", false, nil
 	}
-	if ownerCount > 1 && len(positions) < ownerCount {
+	if ownerCount > 1 && len(owners) < ownerCount {
 		// An owner has not committed a position yet. A MinSafe over the
 		// present owners could advance past it, so there is no safe minimum:
 		// report "no position" and let the caller snapshot (idempotent).
 		return "", true, nil
+	}
+	positions := make([]string, 0, len(owners))
+	for _, p := range owners {
+		positions = append(positions, p)
 	}
 	pos, err = minSafePosition(s.sourceKind, positions)
 	if err != nil {
 		return "", false, fmt.Errorf("positions %s: %w", ident.posQuoted(), err)
 	}
 	return pos, true, nil
+}
+
+// SeedPositions records a baseline for every expected owner that has no
+// committed position, using the minimum of the owners that do, so the owner
+// set is complete and Position() can require coverage (WK-001 §2.6). A fresh
+// table (no owner committed) is left alone — it snapshots. The seed row uses
+// seq 0, below any real commit, so ReplacingMergeTree keeps the real one.
+func (s *Sink) SeedPositions(ctx context.Context, ref core.TableRef, owners []string) error {
+	if len(owners) < 2 {
+		return nil
+	}
+	ident, err := s.ident(ref.Target)
+	if err != nil {
+		return err
+	}
+	present, err := s.readOwnerPositions(ctx, ident)
+	if err != nil {
+		return err
+	}
+	if len(present) == 0 {
+		return nil // fresh table: nothing to seed
+	}
+	positions := make([]string, 0, len(present))
+	for _, p := range present {
+		positions = append(positions, p)
+	}
+	baseline, err := minSafePosition(s.sourceKind, positions)
+	if err != nil {
+		return err
+	}
+	for _, owner := range owners {
+		if _, ok := present[owner]; ok {
+			continue
+		}
+		if err := s.conn.Exec(ctx,
+			"INSERT INTO "+ident.posQuoted()+" (owner, position, seq) VALUES (?, ?, 0)",
+			owner, baseline); err != nil {
+			return fmt.Errorf("seed %s owner %s: %w", ident.posQuoted(), owner, err)
+		}
+	}
+	return nil
 }
 
 // minSafePosition parses one committed position string per owner and returns

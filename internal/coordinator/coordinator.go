@@ -517,6 +517,26 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 	}
 
+	// Seed a baseline for every partition owner that has no committed
+	// position yet, so Position() covers the full owner set. An owner whose
+	// partition has no rows never commits, and without the seed the resume
+	// would see an incomplete set and re-snapshot the table on every boot
+	// (WK-001 §2.6). Runs BEFORE resumeFrom, which reads Position().
+	if seeder, ok := snk.(sink.PositionSeeder); ok {
+		for target, owners := range c.route {
+			if len(owners) < 2 {
+				continue
+			}
+			names := make([]string, len(owners))
+			for i, w := range owners {
+				names[i] = w.name
+			}
+			if err := seeder.SeedPositions(ctx, core.TableRef{Target: target}, names); err != nil {
+				return fmt.Errorf("coordinator: seed %s: %w", target, err)
+			}
+		}
+	}
+
 	resume, needsSnapshot, err := c.resumeFrom(ctx, refs)
 	if err != nil {
 		return err

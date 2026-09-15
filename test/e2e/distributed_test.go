@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -267,10 +268,20 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 // process exited). Early exits are reported via t.Errorf.
 func bootPipeline(t *testing.T, ctx context.Context, addr string, s *spec.Spec, workers ...string) (func(), func() error) {
 	t.Helper()
+	return bootPipelineLogged(t, ctx, addr, s, nil, workers...)
+}
+
+// bootPipelineLogged is bootPipeline with a coordinator logger: an e2e that
+// needs to observe a coordinator log line (e.g. the resume's
+// snapshot_tables) passes a capturing handler. Nil uses the default logger.
+func bootPipelineLogged(t *testing.T, ctx context.Context, addr string, s *spec.Spec, logger *slog.Logger, workers ...string) (func(), func() error) {
+	t.Helper()
 	n := len(workers) + 1 // + coordinator
 	done := make(chan error, n)
+	var wStops []context.CancelFunc
 	for _, name := range workers {
 		wCtx, wStop := context.WithCancel(ctx)
+		wStops = append(wStops, wStop)
 		go func(name string) {
 			done <- worker.RunRemote(wCtx, worker.RemoteConfig{
 				Coordinator: addr,
@@ -294,6 +305,7 @@ func bootPipeline(t *testing.T, ctx context.Context, addr string, s *spec.Spec, 
 			WindowTimeout: 2 * time.Minute,
 			CaughtUpPoll:  300 * time.Millisecond,
 			WaitWorker:    2 * time.Minute,
+			Logger:        logger,
 		})
 	}()
 
@@ -311,10 +323,18 @@ func bootPipeline(t *testing.T, ctx context.Context, addr string, s *spec.Spec, 
 		close(exitedCh)
 	}()
 
-	return func() { cStop() }, func() error {
-		<-exitedCh
-		return nil
-	}
+	return func() {
+			// Cancel the workers too: a coordinator-only stop leaves them
+			// retrying the dead address, and they would race the next boot's
+			// workers for the same group names.
+			cStop()
+			for _, s := range wStops {
+				s()
+			}
+		}, func() error {
+			<-exitedCh
+			return nil
+		}
 }
 
 // TestDistributedMultiWorker runs two worker groups off one source: orders

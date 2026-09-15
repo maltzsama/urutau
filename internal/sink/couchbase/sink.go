@@ -299,6 +299,19 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind, ref.OwnerCount)
 }
 
+// SeedPositions records a baseline for every expected owner that has no
+// committed position, using the minimum of the owners that do, so the owner
+// set is complete and Position() can require coverage (WK-001 §2.6). A fresh
+// table (no owner committed) is left alone — it snapshots. The seed runs at
+// boot, before any worker commits, so the read-modify-write is safe.
+func (s *Sink) SeedPositions(ctx context.Context, ref core.TableRef, owners []string) error {
+	scope, coll, err := s.ident(ref.Target)
+	if err != nil {
+		return err
+	}
+	return seedPositions(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind, owners)
+}
+
 // SetProperties merges snapshot-progress properties into the control
 // document.
 func (s *Sink) SetProperties(ctx context.Context, ref core.TableRef, props map[string]string) error {
