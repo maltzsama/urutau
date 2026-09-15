@@ -19,12 +19,15 @@ import (
 type joinKind int
 
 const (
-	joinLeftOuter joinKind = iota // "" | "left" | "left outer" — miss passes with NULL ref columns
+	joinLeftOuter joinKind = iota // "left" | "left outer" — miss passes with NULL ref columns
 	joinInner                     // "inner" — miss drops the row
 	joinLeftSemi                  // "left semi" — hit kept, NO ref columns in output
 	joinLeftAnti                  // "left anti" — miss kept, NO ref columns in output
 )
 
+// s is always one of the five values enrich.New's grammar accepts (empty is
+// rejected there — issue #66, joinType has no universal miss policy); the
+// default case only covers "left"/"left outer", never "".
 func normalizeJoinType(s string) joinKind {
 	switch s {
 	case "inner":
@@ -33,7 +36,7 @@ func normalizeJoinType(s string) joinKind {
 		return joinLeftSemi
 	case "left anti":
 		return joinLeftAnti
-	default: // "", "left", "left outer"
+	default: // "left", "left outer"
 		return joinLeftOuter
 	}
 }

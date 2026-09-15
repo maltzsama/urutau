@@ -329,10 +329,11 @@ func TestWildcardReferenceColumnsLandBeforeEnsureTable(t *testing.T) {
 		{Name: "user_ref", Type: core.ColumnType{Kind: core.KindInt64}},
 	}}}
 	cfg := spec.Enrich{
-		Table:  "users",
-		Source: spec.EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, tier FROM users"},
-		On:     map[string]string{"user_ref": "id"},
-		Select: []string{"*"},
+		Table:    "users",
+		Source:   spec.EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, tier FROM users"},
+		On:       map[string]string{"user_ref": "id"},
+		Select:   []string{"*"},
+		JoinType: "left",
 	}
 	s := &spec.Spec{Tables: []spec.Table{{
 		Source: "db.users", Target: "raw.users", Enrich: []spec.Enrich{cfg},
@@ -375,10 +376,11 @@ func TestWildcardReferenceColumnsLandBeforeEnsureTable(t *testing.T) {
 // naming the reference — never a silent fallback to an empty schema.
 func TestWildcardReferenceLoadFailureFailsLoudly(t *testing.T) {
 	cfg := spec.Enrich{
-		Table:  "users",
-		Source: spec.EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, tier FROM users"},
-		On:     map[string]string{"user_ref": "id"},
-		Select: []string{"*"},
+		Table:    "users",
+		Source:   spec.EnrichSource{URI: "mysql://refdb/internal", Query: "SELECT id, tier FROM users"},
+		On:       map[string]string{"user_ref": "id"},
+		Select:   []string{"*"},
+		JoinType: "left",
 	}
 	sourceSchema := core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
