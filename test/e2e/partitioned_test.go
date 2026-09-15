@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/coordinator"
+	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -159,4 +161,115 @@ func TestDistributedPartitionedAppend(t *testing.T) {
 	if err := waitDone2(); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
+}
+
+// TestDistributedPartitionedWorkerKilled kills ONE of the three worker groups
+// of a partitioned table mid-stream — the WK-001 §2.1 regression: a worker's
+// death must not silently discard its own batches while the others carry on.
+//
+// A worker session loss is a job failure (fail loud), never a silent reset:
+// the run terminates and the restart replays every partition from the
+// coordinator's committed position. The killed partition's uncommitted batch
+// and the two live partitions must all converge — no loss, no duplicate.
+func TestDistributedPartitionedWorkerKilled(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	addr := reserveAddr(t)
+	s := loadPipeline(t)
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 3}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	groups := s.Tables[0].WorkerGroupNames(s.Pipeline)
+
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 200)
+
+	// boot starts the coordinator and the three worker groups over real
+	// sockets. It returns the coordinator's exit channel, a per-worker kill
+	// switch, and each worker's exit channel.
+	boot := func() (<-chan error, []func(), []<-chan error) {
+		cCtx, cStop := context.WithCancel(ctx)
+		t.Cleanup(cStop)
+		cErr := make(chan error, 1)
+		go func() {
+			cErr <- coordinator.Run(cCtx, coordinator.Config{
+				Spec: s, ListenAddr: addr, ServerID: 1102,
+				Heartbeat: 5 * time.Second, ChunkSize: 10,
+				WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond,
+				WaitWorker: 2 * time.Minute,
+			})
+		}()
+		kills := make([]func(), len(groups))
+		wErrs := make([]<-chan error, len(groups))
+		for i, name := range groups {
+			wCtx, wStop := context.WithCancel(ctx)
+			t.Cleanup(wStop)
+			kills[i] = wStop
+			ch := make(chan error, 1)
+			wErrs[i] = ch
+			go func(name string, ch chan<- error) {
+				ch <- worker.RunRemote(wCtx, worker.RemoteConfig{
+					Coordinator: addr, Name: name, Namespace: "raw", Sink: workerSink(),
+					MaxRows: 100, MaxInterval: time.Second,
+				})
+			}(name, ch)
+		}
+		return cErr, kills, wErrs
+	}
+
+	cErr, kills, wErrs := boot()
+
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
+	// Live inserts extend past the snapshot's max id, so they land in the
+	// open-ended last range; the updates below carry the per-partition proof.
+	for i := 200; i < 230; i++ {
+		dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'live%d', %d.0)", i, i, i))
+	}
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(230))
+
+	// Kill partition 0's worker. The job must fail loud, not limp along with
+	// the dead partition's uncommitted batch dropped.
+	kills[0]()
+	select {
+	case err := <-cErr:
+		if err == nil {
+			t.Fatal("coordinator returned nil after a worker was killed — a silent loss")
+		}
+		t.Logf("killed worker failed the job loud: %v", err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("coordinator did not fail after a worker was killed")
+	}
+	// Every process of the failed run must exit before the restart binds the
+	// same address.
+	for _, ch := range wErrs {
+		select {
+		case <-ch:
+		case <-time.After(30 * time.Second):
+			t.Fatal("a worker did not exit after the job failed")
+		}
+	}
+
+	// DML during the outage: the restart replays every partition from the
+	// committed position, so none of this is lost.
+	dml(t, db, `UPDATE orders SET v = 'p0-after' WHERE id = 5`)   // range [0,66)
+	dml(t, db, `UPDATE orders SET v = 'p1-after' WHERE id = 100`) // range [66,132)
+	dml(t, db, `UPDATE orders SET v = 'p2-after' WHERE id = 180`) // range [132,∞)
+	for i := 300; i < 310; i++ {
+		dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'gap%d', %d.0)", i, i, i))
+	}
+
+	boot()
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 5`, "p0-after")
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 100`, "p1-after")
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 180`, "p2-after")
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 300`, "gap300")
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(240))
+	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, 240)
+	t.Log("partitioned recovery ok: one worker killed, fail loud, restart, no loss, no duplicate")
 }
