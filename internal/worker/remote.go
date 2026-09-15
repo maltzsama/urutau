@@ -176,6 +176,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		URI:       cfg.Sink.URI,
 		Namespace: cfg.Namespace,
 		Options:   cfg.Sink.Options,
+		// The sink parses the opaque position strings it stores with this
+		// kind (position.Parse): an empty kind defaults to MySQL GTID, so a
+		// Postgres LSN or Kafka offset read back on restart would be parsed
+		// as a GTID set and resume from the wrong point.
+		SourceKind: assign.SourceKind,
 	})
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
@@ -347,9 +352,10 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 
 	// Staged deliveries (WK-001 C5): the data files are written but not
 	// committed; the coordinator groups them by cycle and commits. seq 0 is
-	// a worker-generated snapshot/window batch, committed on arrival.
-	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32) {
-		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Staged{Staged: &pb.StagedBatch{
+	// a worker-generated snapshot/window batch, committed on arrival. A send
+	// failure must surface — a dropped descriptor is an uncommittable cycle.
+	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32) error {
+		return sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Staged{Staged: &pb.StagedBatch{
 			Table:           table,
 			Seq:             seq,
 			Descriptor_:     desc,
