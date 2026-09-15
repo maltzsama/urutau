@@ -10,7 +10,10 @@ BUF_VERSION ?= v1.72.0
 GOLANGCI_LINT_VERSION ?= v2.13.2
 ENVTEST_VERSION ?= latest
 
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# release-please tags vX.Y.Z; strip the leading v so the string matches
+# internal/version.Version and what GoReleaser embeds.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
+VERSION := $(if $(VERSION),$(VERSION),dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
