@@ -64,6 +64,15 @@ Every write acknowledges at synchronous-durability `majority`; on a single
 node that requires a 0-replica bucket (which is what the sink creates) —
 `DurabilityImpossible` is a loud error, never a silent downgrade.
 
+**Partitioned tables (`workers > 1`) require `commitMode: atomic`.** The
+`fast` path reads and rewrites the control document outside any
+transaction, so two workers of the same table lose each other's position
+and snapshot properties. `atomic` runs that read-modify-write inside the
+distributed transaction, which serializes across pods. The coordinator
+refuses to boot a partitioned Couchbase table whose sink is not in atomic
+mode. (Append and upsert share the same commit path here, so the rule is
+identical for both.)
+
 ## Cross-cutting
 
 - **Metadata columns** — closed catalog, CDC (`op`, `commit_ts`,

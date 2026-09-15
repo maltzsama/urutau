@@ -318,8 +318,18 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 func (s *Sink) Close() error { return s.cluster.Close(nil) }
 
 // SupportsConcurrentWriters reports whether N workers may commit to one
-// table. False until the per-partition durable position lands (WK-001 C7):
-// the control document's position is last-writer-wins in both commit modes.
+// table. Concurrent writers are safe ONLY in commitMode: atomic — the
+// control document read-modify-write in commitFast (writer.go) has no
+// protection, so two workers lose each other's position and snapshot
+// properties (WK-001 §2.4); commitAtomic runs that RMW inside a gocb
+// transaction, which serializes across pods.
+//
+// It returns FALSE until C7: the transaction resolves the write race, but
+// the control document's position is last-writer-wins in both modes, so a
+// partitioned table would still resume from one partition's position
+// (§2.6). C7 makes Position() the MinSafe across per-partition positions;
+// only then does this become `return s.txns != nil` (non-nil only in atomic
+// mode, sink.go above).
 func (s *Sink) SupportsConcurrentWriters() bool { return false }
 
 // realKV is the production kvStore: a gocb collection with synchronous
