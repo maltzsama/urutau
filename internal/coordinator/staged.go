@@ -158,51 +158,52 @@ func (s *stagedCycles) discardTable(table string) int {
 
 // discardWorker drops every cycle that needed a delivery from worker — on
 // session loss those cycles can never complete, and an incomplete cycle must
-// never be committed. Cycles of the same table that did not involve the lost
-// worker are left alone, and any of those now unblocked are returned for
-// commit (a discarded head must not strand the cycles behind it). Returns the
-// committable run and the number discarded, for logging.
-func (s *stagedCycles) discardWorker(worker string) ([]*stagedCycle, int) {
+// never be committed — and then every remaining cycle of each affected table.
+// A cycle still queued for that table sits BEHIND the discarded one in send
+// order: committing it would advance the durable position over the discarded
+// cycle's gap, and that gap's data would never be replayed. Returns the
+// number discarded, for logging.
+//
+// A worker that owed nothing (the safe-reset case) leaves no open cycle
+// here, so an affected table never arises and nothing is discarded.
+func (s *stagedCycles) discardWorker(worker string) int {
 	if s == nil {
-		return nil, 0
+		return 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	discarded := 0
 	tables := map[string]bool{}
+	discarded := 0
 	for k, cy := range s.open {
 		if cy.owners[worker] {
-			delete(s.open, k)
-			s.removeOrderLocked(k)
 			tables[k.table] = true
+			delete(s.open, k)
 			discarded++
 		}
 	}
 	for k, cy := range s.done {
 		if cy.owners[worker] {
-			delete(s.done, k)
-			s.removeOrderLocked(k)
 			tables[k.table] = true
+			delete(s.done, k)
 			discarded++
 		}
 	}
-	var ready []*stagedCycle
-	for table := range tables {
-		ready = append(ready, s.drainLocked(table)...)
-	}
-	return ready, discarded
-}
-
-// removeOrderLocked drops k.seq from its table's send order — a discarded
-// cycle must not keep blocking the cycles behind it. Caller holds s.mu.
-func (s *stagedCycles) removeOrderLocked(k cycleKey) {
-	q := s.order[k.table]
-	for i, seq := range q {
-		if seq == k.seq {
-			s.order[k.table] = append(q[:i], q[i+1:]...)
-			return
+	for k := range s.open {
+		if tables[k.table] {
+			delete(s.open, k)
+			discarded++
 		}
 	}
+	for k := range s.done {
+		if tables[k.table] {
+			delete(s.done, k)
+			discarded++
+		}
+	}
+	for table := range tables {
+		delete(s.order, table)
+	}
+	return discarded
 }
 
 // len reports the number of tracked cycles (tests).

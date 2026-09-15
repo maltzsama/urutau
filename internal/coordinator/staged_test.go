@@ -99,23 +99,24 @@ func TestStagedCyclesDiscardTable(t *testing.T) {
 	}
 }
 
-func TestStagedCyclesDiscardWorkerUnblocksQueue(t *testing.T) {
+func TestStagedCyclesDiscardWorkerDropsAffectedTable(t *testing.T) {
 	s := newStagedCycles()
 	r := ref(t, "orders")
 	// Cycle 1 needs worker "a"; cycle 2 needs "b". Cycle 2 arrives first and
-	// waits; worker "a" dies, so cycle 1 is discarded and cycle 2 — which did
-	// not involve "a" — must be unblocked and returned for commit.
+	// waits. Worker "a" dies owing cycle 1: cycle 1 is discarded, and cycle 2
+	// — though complete and owned only by "b" — sits BEHIND cycle 1 in send
+	// order, so committing it would advance the position over cycle 1's gap
+	// and cycle 1's data would never be replayed. Both are discarded.
 	s.expect(r, 1, []string{"a"})
 	s.expect(r, 2, []string{"b"})
 
 	if got := s.deliver(r, 2, []byte("2"), "200", "", nil); got != nil {
 		t.Fatalf("cycle 2 committed before cycle 1: %v", got)
 	}
-	ready, n := s.discardWorker("a")
-	if n != 1 {
-		t.Fatalf("discarded %d cycles, want 1", n)
+	if n := s.discardWorker("a"); n != 2 {
+		t.Fatalf("discarded %d cycles, want 2 (the owed cycle and the one behind it)", n)
 	}
-	if len(ready) != 1 || ready[0].seq != 2 {
-		t.Fatalf("worker loss did not unblock cycle 2: %v", ready)
+	if s.len() != 0 {
+		t.Fatalf("%d cycles tracked after the discard, want 0", s.len())
 	}
 }

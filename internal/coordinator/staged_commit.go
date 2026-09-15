@@ -37,7 +37,14 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 	}
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
 	for _, cy := range c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending) {
-		c.commitStagedCycle(cy)
+		// Cycles commit in send order; the first failure must stop the run
+		// here — committing a later cycle would advance the durable position
+		// past the gap the failed cycle left, and its data would never be
+		// replayed (WK-001 C5.4).
+		if err := c.commitStagedCycle(cy); err != nil {
+			c.fail(err)
+			return
+		}
 	}
 }
 
@@ -45,23 +52,22 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 // StagedCommitter, serialized per table. The commit position is the minimum
 // safe position over the cycle's deliveries: every partition's watermark is
 // durable in the same commit, so the lowest one is the new checkpoint floor.
-func (c *Coordinator) commitStagedCycle(cy *stagedCycle) {
+func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	pos, err := c.minSafePositions(cy.positions)
 	if err != nil {
-		c.fail(fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err))
-		return
+		return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err)
 	}
 	committer, ok := c.snk.(sink.StagedCommitter)
 	if !ok {
-		c.fail(fmt.Errorf("coordinator: table %s: sink does not stage commits", cy.ref.Target))
-		return
+		return fmt.Errorf("coordinator: table %s: sink does not stage commits", cy.ref.Target)
 	}
 	mu := c.stagedLock(cy.ref.Target)
 	mu.Lock()
 	defer mu.Unlock()
 	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {
-		c.fail(fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err))
+		return fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err)
 	}
+	return nil
 }
 
 // stagedLock returns the mutex serializing staged commits for one table.
