@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -48,10 +49,14 @@ type RemoteConfig struct {
 	// plane. Empty means plaintext.
 	TLS grpctls.Config
 
-	// FaultStopAck (test-only): commits normally but withholds the ack, so
-	// the coordinator's supervisor sees a stale worker — the crashloop
-	// proof.
-	FaultStopAck bool
+	// FaultAckGate (test-only): commits normally but withholds the ack
+	// while the gate is set. A test flips it AFTER the snapshot, so the
+	// worker goes stale while owing nothing (in-flight == 0) — the
+	// supervisor's safe-reset path. CD-2: a stale worker WITH in-flight
+	// batches terminates for replay instead of resetting, so stopping the
+	// acks from the start would only prove the terminate path. Nil
+	// disables it.
+	FaultAckGate *atomic.Bool
 }
 
 // enrichSpecs converts the assignment's reference joins into the spec shape
@@ -329,7 +334,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	defer chunks.Close()
 
 	w.OnCommit(func(b *dataplane.Batch, rows int) {
-		if cfg.FaultStopAck {
+		if cfg.FaultAckGate != nil && cfg.FaultAckGate.Load() {
 			return
 		}
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
