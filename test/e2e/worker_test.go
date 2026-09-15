@@ -19,7 +19,11 @@ import (
 // localIngestFromChanges is the e2e feed mirror for the worker's former
 // row batcher (removed in G2): bridge each change into an Ingest batch.
 // The worker is granularity-insensitive, so per-change batches are faithful.
-func localIngestFromChanges(ctx context.Context, changes <-chan rowchange.Change) <-chan worker.Ingest {
+// cs is the table's canonical schema (PK included): a delete with no row
+// image carries only its key, and RecordFromChanges projects that key onto
+// the PK columns only when the schema names them — inferring per change
+// leaves the delete batch with no PK column and the worker rejects it.
+func localIngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, cs core.Schema) <-chan worker.Ingest {
 	out := make(chan worker.Ingest, 64)
 	go func() {
 		defer close(out)
@@ -30,7 +34,7 @@ func localIngestFromChanges(ctx context.Context, changes <-chan rowchange.Change
 					return
 				}
 				one := []rowchange.Change{c}
-				rec, err := transport.RecordFromChanges(one, transport.MergeSchema(one, core.Schema{}), nil)
+				rec, err := transport.RecordFromChanges(one, cs, nil)
 				if err != nil {
 					continue
 				}
@@ -102,16 +106,17 @@ func TestWorkerEndToEnd(t *testing.T) {
 	}
 
 	var committed []*dataplane.Batch
-	w := worker.New(worker.Config{MaxRows: 8, MaxInterval: 200 * time.Millisecond})
-	w.Register("raw.orders", wr, dataplane.UpsertMode)
-	w.SetKnownSchema("raw.orders", core.Schema{Columns: []core.Column{
+	tableSchema := core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
 		{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
-	}, PrimaryKey: []string{"id"}})
+	}, PrimaryKey: []string{"id"}}
+	w := worker.New(worker.Config{MaxRows: 8, MaxInterval: 200 * time.Millisecond})
+	w.Register("raw.orders", wr, dataplane.UpsertMode)
+	w.SetKnownSchema("raw.orders", tableSchema)
 	w.OnCommit(func(b *dataplane.Batch, _ int) { committed = append(committed, b) })
 
 	rawIngest := make(chan rowchange.Change, 32)
-	ingest := localIngestFromChanges(ctx, rawIngest)
+	ingest := localIngestFromChanges(ctx, rawIngest, tableSchema)
 	done := make(chan error, 1)
 	go func() { done <- w.Run(ctx, ingest) }()
 
