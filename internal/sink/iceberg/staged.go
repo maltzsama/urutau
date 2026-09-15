@@ -158,28 +158,21 @@ func (s *Sink) CommitStaged(ctx context.Context, ref core.TableRef, staged [][]b
 			snapPend = p.snapshotPending
 		}
 	}
-	// Position on the last commit only: the append when there is one, else
-	// the delete (a delete-only cycle).
-	delPos := ""
-	if len(appends) == 0 {
-		delPos = pos
-	}
-	if len(deletes) > 0 {
-		if err := s.commitStagedDeletes(ctx, ident, deletes, delPos, snapState, snapPend); err != nil {
-			return err
+	if len(deletes) == 0 && len(appends) == 0 {
+		// The cycle carried no data (e.g. an append-mode delete dropped by
+		// the worker): still record the position so the resume advances past
+		// it, instead of re-reading the same event on every boot.
+		if pos == "" && snapState == "" && snapPend == nil {
+			return nil
 		}
+		return s.commitStagedProps(ctx, ident, pos, snapState, snapPend)
 	}
-	if len(appends) > 0 {
-		if err := s.commitStagedAppends(ctx, ident, appends, pos, snapState, snapPend); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.commitStaged(ctx, ident, deletes, appends, pos, snapState, snapPend)
 }
 
-// commitStagedDeletes adds pre-built equality-delete files to the table in
-// one snapshot, retrying the catalog on a retryable error.
-func (s *Sink) commitStagedDeletes(ctx context.Context, ident table.Identifier, files []iceberg.DataFile, pos, snapshotState string, snapshotPending []uint32) error {
+// commitStagedProps records a cycle's position and snapshot state when the
+// cycle carried no data files, retrying the catalog on a retryable error.
+func (s *Sink) commitStagedProps(ctx context.Context, ident table.Identifier, pos, snapshotState string, snapshotPending []uint32) error {
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
 
@@ -199,59 +192,6 @@ func (s *Sink) commitStagedDeletes(ctx context.Context, ident table.Identifier, 
 			continue
 		}
 		txn := tbl.NewTransaction()
-		if err := txn.NewRowDelta(p).AddDeletes(files...).Commit(ctx); err != nil {
-			if !isRetryableError(err) {
-				return err
-			}
-			lastErr = err
-			continue
-		}
-		if pos != "" {
-			if err := txn.SetProperties(p); err != nil {
-				return err
-			}
-		}
-		if _, err := txn.Commit(ctx); err != nil {
-			if !isRetryableError(err) {
-				return err
-			}
-			lastErr = err
-			continue
-		}
-		return nil
-	}
-	return fmt.Errorf("%w: staged delete commit on %v: %v", ErrCommitExhausted, ident, lastErr)
-}
-
-// commitStagedAppends adds pre-built data files to the table in one snapshot,
-// retrying the catalog on a retryable error.
-func (s *Sink) commitStagedAppends(ctx context.Context, ident table.Identifier, files []iceberg.DataFile, pos, snapshotState string, snapshotPending []uint32) error {
-	p := props(pos)
-	addSnapshotProps(p, snapshotState, snapshotPending)
-
-	var lastErr error
-	for attempt := 0; attempt < maxCommitTries; attempt++ {
-		if attempt > 0 {
-			if err := sleepCtx(ctx, backoffDuration(stagedBackoff, attempt)); err != nil {
-				return err
-			}
-		}
-		tbl, err := s.cat.LoadTable(ctx, ident)
-		if err != nil {
-			if !isRetryableError(err) {
-				return err
-			}
-			lastErr = err
-			continue
-		}
-		txn := tbl.NewTransaction()
-		if err := txn.AddDataFiles(ctx, files, p); err != nil {
-			if !isRetryableError(err) {
-				return err
-			}
-			lastErr = err
-			continue
-		}
 		if err := txn.SetProperties(p); err != nil {
 			return err
 		}
@@ -264,7 +204,66 @@ func (s *Sink) commitStagedAppends(ctx context.Context, ident table.Identifier, 
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: staged append commit on %v: %v", ErrCommitExhausted, ident, lastErr)
+	return fmt.Errorf("%w: staged property commit on %v: %v", ErrCommitExhausted, ident, lastErr)
+}
+
+// commitStaged commits a cycle's delete AND data files as ONE atomic snapshot
+// with the cycle's position, retrying the catalog on a retryable error. One
+// RowDelta carrying both kinds is the atomic unit: a crash between a separate
+// delete commit and append commit would leave the deletes visible without
+// their fresh rows. Within the snapshot every file shares the snapshot's
+// sequence, so the equality delete (sequence S) applies only to rows written
+// before it (sequence < S) and never erases the rows committed with it.
+func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes, appends []iceberg.DataFile, pos, snapshotState string, snapshotPending []uint32) error {
+	p := props(pos)
+	addSnapshotProps(p, snapshotState, snapshotPending)
+
+	var lastErr error
+	for attempt := 0; attempt < maxCommitTries; attempt++ {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, backoffDuration(stagedBackoff, attempt)); err != nil {
+				return err
+			}
+		}
+		tbl, err := s.cat.LoadTable(ctx, ident)
+		if err != nil {
+			if !isRetryableError(err) {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		txn := tbl.NewTransaction()
+		rd := txn.NewRowDelta(p)
+		if len(deletes) > 0 {
+			rd.AddDeletes(deletes...)
+		}
+		if len(appends) > 0 {
+			rd.AddRows(appends...)
+		}
+		if err := rd.Commit(ctx); err != nil {
+			if !isRetryableError(err) {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		// The position is also a table property (the fast read path); it is
+		// already in the snapshot summary, so losing this commit only costs
+		// the walk-back.
+		if err := txn.SetProperties(p); err != nil {
+			return err
+		}
+		if _, err := txn.Commit(ctx); err != nil {
+			if !isRetryableError(err) {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: staged commit on %v: %v", ErrCommitExhausted, ident, lastErr)
 }
 
 // maxCommitTries and stagedBackoff mirror the TableWriter's retry policy for
@@ -340,7 +339,11 @@ func readString(r *bytes.Reader) (string, error) {
 	if _, err := io.ReadFull(r, n[:]); err != nil {
 		return "", fmt.Errorf("staged descriptor: %w", err)
 	}
-	b := make([]byte, binary.BigEndian.Uint32(n[:]))
+	size := int(binary.BigEndian.Uint32(n[:]))
+	if size > r.Len() {
+		return "", fmt.Errorf("staged descriptor: string length %d exceeds %d remaining bytes", size, r.Len())
+	}
+	b := make([]byte, size)
 	if _, err := io.ReadFull(r, b); err != nil {
 		return "", fmt.Errorf("staged descriptor: %w", err)
 	}
@@ -362,9 +365,14 @@ func readUint32List(r *bytes.Reader) ([]uint32, error) {
 	if _, err := io.ReadFull(r, n[:]); err != nil {
 		return nil, fmt.Errorf("staged descriptor: %w", err)
 	}
-	count := binary.BigEndian.Uint32(n[:])
+	count := int(binary.BigEndian.Uint32(n[:]))
+	// Each entry is 4 bytes: a count that cannot fit in what remains is
+	// corrupt, and must not drive an allocation.
+	if count > r.Len()/4 {
+		return nil, fmt.Errorf("staged descriptor: list count %d exceeds %d remaining bytes", count, r.Len())
+	}
 	xs := make([]uint32, 0, count)
-	for i := uint32(0); i < count; i++ {
+	for i := 0; i < count; i++ {
 		if _, err := io.ReadFull(r, n[:]); err != nil {
 			return nil, fmt.Errorf("staged descriptor: %w", err)
 		}
@@ -397,13 +405,22 @@ func readFileList(r *bytes.Reader, spec iceberg.PartitionSpec, schema *iceberg.S
 	if _, err := io.ReadFull(r, n[:]); err != nil {
 		return nil, fmt.Errorf("staged descriptor: %w", err)
 	}
-	count := binary.BigEndian.Uint32(n[:])
+	count := int(binary.BigEndian.Uint32(n[:]))
+	// Each entry carries at least its 4-byte length: reject a count that
+	// cannot fit before allocating.
+	if count > r.Len()/4 {
+		return nil, fmt.Errorf("staged descriptor: file count %d exceeds %d remaining bytes", count, r.Len())
+	}
 	files := make([]iceberg.DataFile, 0, count)
-	for i := uint32(0); i < count; i++ {
+	for i := 0; i < count; i++ {
 		if _, err := io.ReadFull(r, n[:]); err != nil {
 			return nil, fmt.Errorf("staged descriptor: %w", err)
 		}
-		b := make([]byte, binary.BigEndian.Uint32(n[:]))
+		size := int(binary.BigEndian.Uint32(n[:]))
+		if size > r.Len() {
+			return nil, fmt.Errorf("staged descriptor: data file %d length %d exceeds %d remaining bytes", i, size, r.Len())
+		}
+		b := make([]byte, size)
 		if _, err := io.ReadFull(r, b); err != nil {
 			return nil, fmt.Errorf("staged descriptor: %w", err)
 		}

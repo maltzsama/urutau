@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -46,5 +47,29 @@ func TestEncodeDecodeStagedState(t *testing.T) {
 func TestDecodeStagedRejectsBadMagic(t *testing.T) {
 	if _, err := decodeStaged([]byte{0x00, 0, 0, 0, 0}, iceberg.PartitionSpec{}, nil, 2); err == nil {
 		t.Fatal("a descriptor without the magic must be rejected")
+	}
+}
+
+func TestDecodeStagedRejectsOversizedLengths(t *testing.T) {
+	// A length field that claims far more bytes than the payload holds must
+	// be rejected before it drives an allocation.
+	buf := []byte{stagedMagic}
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], 1<<30) // 1 GiB claimed, nothing follows
+	buf = append(buf, n[:]...)
+	if _, err := decodeStaged(buf, iceberg.PartitionSpec{}, nil, 2); err == nil {
+		t.Fatal("an oversized string length must be rejected")
+	}
+
+	// Same for a file-list count: it cannot exceed the remaining bytes / 4.
+	buf = []byte{stagedMagic}
+	binary.BigEndian.PutUint32(n[:], 0) // empty snapshot state
+	buf = append(buf, n[:]...)
+	binary.BigEndian.PutUint32(n[:], 0) // empty pending list
+	buf = append(buf, n[:]...)
+	binary.BigEndian.PutUint32(n[:], 1<<30) // delete-file count
+	buf = append(buf, n[:]...)
+	if _, err := decodeStaged(buf, iceberg.PartitionSpec{}, nil, 2); err == nil {
+		t.Fatal("an oversized file count must be rejected")
 	}
 }
