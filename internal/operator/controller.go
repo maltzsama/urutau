@@ -463,6 +463,13 @@ func workerPodTemplateKey(target string) string {
 // derived names are.
 func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspec.Table) corev1.PodTemplateSpec {
 	labels := map[string]string{"app": "urutau-worker", "urutau.io/pipeline": cr.Name, "urutau.io/table": t.Target}
+	env := coordinatorEnv(cr)
+	// The catalog URI and credentials reach the worker as env from the
+	// mounted Secret (coordinatorEnv); the warehouse is not a credential and
+	// lives in the inline spec, so carry it across as its own env.
+	if wh := inlineSinkWarehouse(cr); wh != "" {
+		env = append(env, corev1.EnvVar{Name: "URUTAU_SINK_WAREHOUSE", Value: wh})
+	}
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
 		Spec: corev1.PodSpec{
@@ -471,11 +478,22 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 				Name:      "worker",
 				Image:     image,
 				Command:   []string{"urutau-worker", "run", "--coordinator", coordinatorClusterAddr(cr)},
-				Env:       coordinatorEnv(cr),
+				Env:       env,
 				Resources: workerResources(cr, t),
 			}},
 		},
 	}
+}
+
+// inlineSinkWarehouse reads sink.warehouse out of the inline definition —
+// the one catalog setting the worker needs that is NOT in a Secret.
+func inlineSinkWarehouse(cr *urutauv1alpha1.CDCPipeline) string {
+	sink, ok := cr.Spec.Definition.Inline["sink"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	wh, _ := sink["warehouse"].(string)
+	return wh
 }
 
 // coordinatorClusterAddr is the in-cluster address a worker Pod dials —

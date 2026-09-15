@@ -96,11 +96,15 @@ func runCmd() *cobra.Command {
 	fl := cmd.Flags()
 	fl.StringVar(&f.coordinator, "coordinator", "127.0.0.1:50051", "coordinator address (host:port)")
 	fl.StringVar(&f.name, "name", os.Getenv("HOSTNAME"), "worker name (Hello); defaults to $HOSTNAME")
-	fl.StringVar(&f.catalogURI, "catalog-uri", "http://localhost:8181/api/catalog", "Iceberg REST catalog URI")
-	fl.StringVar(&f.warehouse, "warehouse", "quickstart_catalog", "catalog warehouse name")
-	fl.StringVar(&f.clientID, "client-id", "", "catalog OAuth2 client id (required)")
-	fl.StringVar(&f.clientSecret, "client-secret", "", "catalog OAuth2 client secret (required)")
-	fl.StringVar(&f.scope, "scope", "PRINCIPAL_ROLE:ALL", "catalog OAuth2 scope")
+	// The catalog settings fall back to the URUTAU_SINK_* environment the
+	// operator mounts from the CDCPipeline's Secrets (see
+	// internal/operator.coordinatorEnv): in-cluster the worker never sees a
+	// flag, only env. A flag always wins over the environment.
+	fl.StringVar(&f.catalogURI, "catalog-uri", envOr("URUTAU_SINK_URI", "http://localhost:8181/api/catalog"), "Iceberg REST catalog URI")
+	fl.StringVar(&f.warehouse, "warehouse", envOr("URUTAU_SINK_WAREHOUSE", "quickstart_catalog"), "catalog warehouse name")
+	fl.StringVar(&f.clientID, "client-id", os.Getenv("URUTAU_SINK_CLIENT_ID"), "catalog OAuth2 client id")
+	fl.StringVar(&f.clientSecret, "client-secret", os.Getenv("URUTAU_SINK_CLIENT_SECRET"), "catalog OAuth2 client secret")
+	fl.StringVar(&f.scope, "scope", envOr("URUTAU_SINK_SCOPE", "PRINCIPAL_ROLE:ALL"), "catalog OAuth2 scope")
 	fl.StringVar(&f.namespace, "namespace", "raw", "fallback namespace for bare targets")
 	fl.IntVar(&f.maxRows, "max-rows", 1000, "flush the batch once this many rows are buffered")
 	fl.DurationVar(&f.maxInterval, "max-interval", 2*time.Second, "flush cadence")
@@ -111,9 +115,15 @@ func runCmd() *cobra.Command {
 	fl.StringVar(&f.tlsCA, "tls-ca", "", "CA that signs the coordinator's server cert (mTLS)")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	fl.StringVar(&f.logFormat, "log-format", "text", "log format: text|json")
-	_ = cmd.MarkFlagRequired("client-id")
-	_ = cmd.MarkFlagRequired("client-secret")
 	return cmd
+}
+
+// envOr returns the environment value, or fallback when it is unset or empty.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func (f *workerFlags) config() (worker.RemoteConfig, error) {

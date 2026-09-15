@@ -120,6 +120,24 @@ func TestCoordinatorConfigMapRendersOneTemplatePerTable(t *testing.T) {
 	}
 }
 
+// The worker reads its catalog settings from the URUTAU_SINK_* env the
+// operator mounts; the warehouse is the one that is NOT a Secret and so
+// must be carried across from the inline spec.
+func TestWorkerPodTemplateCarriesWarehouse(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Definition.Inline["sink"] = map[string]any{"namespace": "raw", "warehouse": "my_warehouse"}
+	tmpl := workerPodTemplate(cr, "urutau:v1", urutauspec.Table{Source: "shop.orders", Target: "raw.orders"})
+	got := ""
+	for _, e := range tmpl.Spec.Containers[0].Env {
+		if e.Name == "URUTAU_SINK_WAREHOUSE" {
+			got = e.Value
+		}
+	}
+	if got != "my_warehouse" {
+		t.Fatalf("URUTAU_SINK_WAREHOUSE = %q, want my_warehouse", got)
+	}
+}
+
 func keysOf(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
