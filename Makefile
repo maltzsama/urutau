@@ -79,15 +79,16 @@ docker:
 	docker build -f build/Dockerfile -t urutau:dev .
 
 # ── Kubernetes (operator + CRDs) ────────────────────────────────────────
-# Local cluster (minikube): build the one image, load it into the node so
-# imagePullPolicy: IfNotPresent finds it without a registry, then apply the
-# kustomize root. cert-manager must already be installed — the webhook
+# Local cluster (minikube): build the one image STRAIGHT into minikube's
+# docker daemon, then apply the kustomize root. Building into the daemon
+# retags even while a Pod holds the old image, which `minikube image load`
+# refuses to do. cert-manager must already be installed — the webhook
 # Certificate is issued by it. See docs/guides/deploy-kubernetes.md.
 KUBECTL ?= kubectl
 OPERATOR_IMAGE ?= urutau:dev
 
-k8s-load: docker
-	minikube image load $(OPERATOR_IMAGE)
+k8s-load: ## Build the image into minikube's docker daemon (no registry)
+	eval $$(minikube docker-env) && docker build -f build/Dockerfile -t $(OPERATOR_IMAGE) .
 
 k8s-deploy:
 	$(KUBECTL) apply -k config/default
@@ -157,4 +158,4 @@ docs-site: ## Install deps + serve docs at localhost:3000
 
 docs-build: ## Build static docs into website/build/
 	npm --prefix website install
-	npm --prefix website build
+	npm --prefix website run build
