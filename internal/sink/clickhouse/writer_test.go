@@ -138,3 +138,24 @@ func TestSeqFallsBackToClockWhenNoCoordinator(t *testing.T) {
 		t.Fatalf("versionSeq(0) again = %d, want %d (guard)", second, first+1)
 	}
 }
+
+// WK-001 C7: the durable position is the MinSafe across partitions — never
+// the argMax (one partition's row) nor the last writer's. A resume must not
+// start past the lagging partition.
+func TestMinSafePositionAcrossPartitions(t *testing.T) {
+	got, err := minSafePosition("postgres", []string{"0/100", "0/2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "0/2" {
+		t.Fatalf("minSafePosition = %q, want 0/2 (the lagging partition)", got)
+	}
+	// One partition: identical to the legacy single-scalar read.
+	if got, err := minSafePosition("postgres", []string{"0/2"}); err != nil || got != "0/2" {
+		t.Fatalf("single partition = %q, %v; want 0/2", got, err)
+	}
+	// The default kind is MySQL GTID (containment order).
+	if got, err := minSafePosition("", []string{"3e11fa47-71ca-11e1-9e33-c80aa9429562:1-90", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50"}); err != nil || got != "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50" {
+		t.Fatalf("gtid min = %q, %v", got, err)
+	}
+}

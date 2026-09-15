@@ -68,13 +68,17 @@ type tableWriter struct {
 	txns txRunner // nil in fast mode
 	plan *tablePlan
 	now  func() time.Time
+	// owner is the worker group that owns this partition (ref.Owner); empty
+	// in collapsed mode. When set, the control document records this
+	// partition's position in its per-owner map (WK-001 C7).
+	owner string
 }
 
-func newTableWriter(kv kvStore, txns txRunner, plan *tablePlan, now func() time.Time) *tableWriter {
+func newTableWriter(kv kvStore, txns txRunner, plan *tablePlan, owner string, now func() time.Time) *tableWriter {
 	if now == nil {
 		now = time.Now
 	}
-	return &tableWriter{kv: kv, txns: txns, plan: plan, now: now}
+	return &tableWriter{kv: kv, txns: txns, plan: plan, owner: owner, now: now}
 }
 
 // docKey renders a change's primary key tuple as the document ID. JSON
@@ -106,6 +110,7 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	}
 	info := batchInfo{
 		Position:        string(b.Watermark),
+		Owner:           w.owner,
 		SnapshotState:   b.SnapshotState,
 		SnapshotPending: b.SnapshotPending,
 	}
@@ -117,9 +122,11 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 }
 
 // batchInfo carries the batch-level control metadata the commit paths
-// persist with the data: the position and the resumable-backfill state.
+// persist with the data: the position, the owning worker group, and the
+// resumable-backfill state.
 type batchInfo struct {
 	Position        string
+	Owner           string
 	SnapshotState   string
 	SnapshotPending []uint32
 }

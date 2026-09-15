@@ -67,3 +67,20 @@ func MinSafe(positions []Position) (Position, error) {
 	}
 	return best, nil
 }
+
+// Parse decodes a committed position string using the parser for a source
+// kind ("mysql", "postgres", "kafka"); an unknown or empty kind parses as a
+// MySQL GTID set, the default. The position format is a property of the
+// source, so a caller that stores opaque position strings but must compare
+// them (a sink keeping one position per partition, WK-001 §2.6) carries the
+// kind as a hint instead of reimplementing the format.
+func Parse(kind, s string) (Position, error) {
+	switch kind {
+	case "postgres":
+		return ParseLSN(s)
+	case "kafka":
+		return ParseOffsets(s)
+	default:
+		return ParseGTID(s)
+	}
+}

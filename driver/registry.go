@@ -298,6 +298,9 @@ func SinkConfig(s *spec.Spec) sink.Config {
 			OptScope:        s.Sink.Scope,
 			OptCommitMode:   string(s.Sink.CommitMode),
 		},
+		// Position decoding hint for sinks that compare per-partition
+		// positions (WK-001 C7). Not a source coupling — a string hint.
+		SourceKind: s.Source.Kind,
 	}
 }
 

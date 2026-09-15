@@ -195,7 +195,7 @@ func deleteBatch(pos string, ids ...int64) *dataplane.Batch {
 // contract says it is.
 func TestFastCommitDataThenControl(t *testing.T) {
 	kv := newFakeKV()
-	w := newTableWriter(kv, nil, plan(metaIngest()), nil)
+	w := newTableWriter(kv, nil, plan(metaIngest()), "", nil)
 
 	if err := w.Commit(context.Background(), upsertBatch("g1:42", 1, 2)); err != nil {
 		t.Fatalf("commit: %v", err)
@@ -236,7 +236,7 @@ func TestFastCommitDataThenControl(t *testing.T) {
 // position. This is the fast-mode recovery contract.
 func TestFastCrashBeforeControlKeepsPositionBack(t *testing.T) {
 	kv := newFakeKV()
-	w := newTableWriter(kv, nil, plan(metaIngest()), nil)
+	w := newTableWriter(kv, nil, plan(metaIngest()), "", nil)
 
 	kv.hook = func(op, id string) error {
 		if id == controlKey {
@@ -254,7 +254,7 @@ func TestFastCrashBeforeControlKeepsPositionBack(t *testing.T) {
 
 	// Restart: replay the same batch with no fault.
 	kv.hook = nil
-	w2 := newTableWriter(kv, nil, plan(metaIngest()), nil)
+	w2 := newTableWriter(kv, nil, plan(metaIngest()), "", nil)
 	if err := w2.Commit(context.Background(), upsertBatch("g1:42", 1, 2)); err != nil {
 		t.Fatalf("replay commit: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestFastCrashBeforeControlKeepsPositionBack(t *testing.T) {
 // success — the replay story re-runs deletes that already landed.
 func TestFastDeleteToleratesReplay(t *testing.T) {
 	kv := newFakeKV()
-	w := newTableWriter(kv, nil, plan(metaIngest()), nil)
+	w := newTableWriter(kv, nil, plan(metaIngest()), "", nil)
 	if err := w.Commit(context.Background(), upsertBatch("g1:1", 7)); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestFastDeleteToleratesReplay(t *testing.T) {
 func TestAtomicFailureLeavesNoTrace(t *testing.T) {
 	kv := newFakeKV()
 	tx := &fakeTx{store: kv, hook: func() error { return errors.New("commit-phase failure") }}
-	w := newTableWriter(kv, tx, plan(metaIngest()), nil)
+	w := newTableWriter(kv, tx, plan(metaIngest()), "", nil)
 
 	if err := w.Commit(context.Background(), upsertBatch("g1:9", 1, 2, 3)); err == nil {
 		t.Fatal("atomic commit should fail")
@@ -323,7 +323,7 @@ func TestAtomicFailureLeavesNoTrace(t *testing.T) {
 // two writers (commit path and SetProperties).
 func TestControlPreservesProperties(t *testing.T) {
 	kv := newFakeKV()
-	w := newTableWriter(kv, nil, plan(nil), nil)
+	w := newTableWriter(kv, nil, plan(nil), "", nil)
 	ctx := context.Background()
 
 	if err := setProperties(ctx, kv, core.TableRef{Target: "orders"}, map[string]string{"cdc.snapshot.state": "in_progress", "cdc.snapshot.bounds": `{"chunk":1}`}, time.Now); err != nil {
@@ -569,5 +569,54 @@ func TestBuildDocErrorsOnMissingCastColumn(t *testing.T) {
 	_, _, err = p.buildDoc(reader, 0)
 	if err == nil || !strings.Contains(err.Error(), `"ghost"`) || !strings.Contains(err.Error(), "kind not found") {
 		t.Fatalf("missing cast column must error citing the column, got %v", err)
+	}
+}
+
+// WK-001 C7: the durable position is the MinSafe across the per-partition
+// map, not the scalar (last writer). A resume must not start past the
+// lagging partition.
+func TestPositionOfMinSafeAcrossOwners(t *testing.T) {
+	kv := newFakeKV()
+	_ = kv.upsert(context.Background(), controlKey, controlDoc{
+		Position:  "0/100",
+		Positions: map[string]string{"w0": "0/100", "w1": "0/2"},
+	})
+	got, err := positionOf(context.Background(), kv, "postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "0/2" {
+		t.Fatalf("positionOf = %q, want 0/2 (the lagging partition)", got)
+	}
+	// One partition (workers==1): identical to the legacy scalar read.
+	kv1 := newFakeKV()
+	_ = kv1.upsert(context.Background(), controlKey, controlDoc{
+		Position: "0/2", Positions: map[string]string{"w0": "0/2"},
+	})
+	if got, err := positionOf(context.Background(), kv1, "postgres"); err != nil || got != "0/2" {
+		t.Fatalf("single owner = %q, %v; want 0/2", got, err)
+	}
+}
+
+// C7 compat: a pre-C7 control document (scalar only, no map) still resolves.
+func TestPositionOfFallsBackToScalar(t *testing.T) {
+	kv := newFakeKV()
+	_ = kv.upsert(context.Background(), controlKey, controlDoc{Position: "g1:9"})
+	got, err := positionOf(context.Background(), kv, "mysql")
+	if err != nil || got != "g1:9" {
+		t.Fatalf("positionOf = %q, %v; want g1:9", got, err)
+	}
+}
+
+// C7: controlWrite merges one entry per owner and keeps the scalar as the
+// last writer's (compat with a downgrade that only reads Position).
+func TestControlWriteMergesOwnerPositions(t *testing.T) {
+	doc := controlWrite(nil, batchInfo{Position: "0/10", Owner: "w0"}, time.Now())
+	doc = controlWrite(doc, batchInfo{Position: "0/20", Owner: "w1"}, time.Now())
+	if doc.Positions["w0"] != "0/10" || doc.Positions["w1"] != "0/20" {
+		t.Fatalf("positions = %v, want w0=0/10 w1=0/20", doc.Positions)
+	}
+	if doc.Position != "0/20" {
+		t.Fatalf("scalar = %q, want the last writer 0/20", doc.Position)
 	}
 }

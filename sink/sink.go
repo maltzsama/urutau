@@ -19,6 +19,12 @@ type Config struct {
 	URI       string // REST catalog endpoint / connection string
 	Namespace string
 	Options   map[string]string // warehouse, client_id, client_secret, scope, …
+	// SourceKind is the pipeline's source driver kind ("mysql", "postgres",
+	// "kafka"). It is a hint for decoding the opaque position strings a sink
+	// persists, not a coupling: a sink that keeps one position per partition
+	// (WK-001 §2.6) uses it to compare positions with position.Parse.
+	// Empty means the default (MySQL GTID).
+	SourceKind string
 }
 
 // secretOptionKeys are the Options keys whose values are credentials. They

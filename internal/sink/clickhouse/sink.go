@@ -13,6 +13,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
 )
 
@@ -21,6 +22,10 @@ import (
 type Sink struct {
 	conn ch.Conn
 	ns   string // default database for bare targets
+	// sourceKind decodes the opaque position strings stored in the
+	// per-partition control table (WK-001 C7). A hint from the spec, not a
+	// coupling — see sink.Config.SourceKind.
+	sourceKind string
 }
 
 // Open dials the native port. The DSN is the connection truth
@@ -51,7 +56,7 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse: open: %w", err)
 	}
-	s := &Sink{conn: conn, ns: opt.Auth.Database}
+	s := &Sink{conn: conn, ns: opt.Auth.Database, sourceKind: cfg.SourceKind}
 	if s.ns != "" {
 		if err := conn.Exec(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdent(s.ns)); err != nil {
 			_ = conn.Close()
@@ -94,6 +99,15 @@ func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.S
 	if err := s.conn.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure %s: %w", ident.quoted(), err)
 	}
+	// The per-partition position table (WK-001 C7). One row per worker
+	// group; created alongside the data table so Position() can read the
+	// MinSafe across partitions. Idempotent, like the data DDL above.
+	posDDL := "CREATE TABLE IF NOT EXISTS " + ident.posQuoted() +
+		" (owner String, position String, seq UInt64) " +
+		"ENGINE = ReplacingMergeTree(seq) ORDER BY owner"
+	if err := s.conn.Exec(ctx, posDDL); err != nil {
+		return fmt.Errorf("ensure %s: %w", ident.posQuoted(), err)
+	}
 	return nil
 }
 
@@ -106,8 +120,11 @@ func (s *Sink) Writer(ctx context.Context, ref core.TableRef, cast core.CastPoli
 	return openTableWriter(ctx, s.conn, ident, ref, cast, meta, ref.Source, nil)
 }
 
-// Position reads the committed CDC position: the commit coordinate on the
-// row with the highest seq. An absent or empty table means never written.
+// Position reads the committed CDC position. When the per-partition control
+// table exists (WK-001 C7) it is the MinSafe across partitions — a lagging
+// partition must never be resumed past. Otherwise (a table written before
+// C7, or the collapsed runner) it falls back to the legacy argMax over the
+// data rows. An absent or empty table means never written.
 func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) {
 	ident, err := s.ident(ref.Target)
 	if err != nil {
@@ -120,6 +137,11 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	if exists == 0 {
 		return "", nil
 	}
+	if pos, ok, err := s.partitionPosition(ctx, ident); err != nil {
+		return "", err
+	} else if ok {
+		return pos, nil
+	}
 	var pos sql.NullString
 	if err := s.conn.QueryRow(ctx, "SELECT argMax(position, seq) FROM "+ident.quoted()).Scan(&pos); err != nil {
 		return "", fmt.Errorf("position %s: %w", ident.quoted(), err)
@@ -127,14 +149,80 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	return pos.String, nil
 }
 
+// partitionPosition reads the latest position per owner from the control
+// table and returns their MinSafe. ok is false when the table is absent or
+// has no rows (a pre-C7 table), so the caller falls back to the legacy read.
+func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent) (pos string, ok bool, err error) {
+	var exists uint8
+	if err := s.conn.QueryRow(ctx, "EXISTS TABLE "+ident.posQuoted()).Scan(&exists); err != nil {
+		return "", false, fmt.Errorf("exists %s: %w", ident.posQuoted(), err)
+	}
+	if exists == 0 {
+		return "", false, nil
+	}
+	rows, err := s.conn.Query(ctx,
+		"SELECT owner, argMax(position, seq) FROM "+ident.posQuoted()+" GROUP BY owner")
+	if err != nil {
+		return "", false, fmt.Errorf("positions %s: %w", ident.posQuoted(), err)
+	}
+	defer func() { _ = rows.Close() }()
+	var positions []string
+	for rows.Next() {
+		var owner string
+		var p sql.NullString
+		if err := rows.Scan(&owner, &p); err != nil {
+			return "", false, err
+		}
+		if !p.Valid {
+			continue
+		}
+		positions = append(positions, p.String)
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, err
+	}
+	if len(positions) == 0 {
+		return "", false, nil
+	}
+	pos, err = minSafePosition(s.sourceKind, positions)
+	if err != nil {
+		return "", false, fmt.Errorf("positions %s: %w", ident.posQuoted(), err)
+	}
+	return pos, true, nil
+}
+
+// minSafePosition parses one committed position string per owner and returns
+// their MinSafe (WK-001 C7). It is the pure core of partitionPosition: the
+// per-partition minimum is what a resume must use, never one partition's
+// (argMax) or the last writer's.
+func minSafePosition(sourceKind string, positions []string) (string, error) {
+	parsed := make([]position.Position, 0, len(positions))
+	for _, p := range positions {
+		pp, err := position.Parse(sourceKind, p)
+		if err != nil {
+			return "", err
+		}
+		parsed = append(parsed, pp)
+	}
+	best, err := position.MinSafe(parsed)
+	if err != nil {
+		return "", err
+	}
+	if best == nil {
+		return "", nil
+	}
+	return best.String(), nil
+}
+
 // Close releases the connection pool.
 func (s *Sink) Close() error { return s.conn.Close() }
 
 // SupportsConcurrentWriters reports whether N workers may commit to one
-// table. False until the per-partition durable position lands (WK-001 C7):
-// Position() is an argMax over one row, and the per-process seq does not
-// order concurrent writers.
-func (s *Sink) SupportsConcurrentWriters() bool { return false }
+// table. True since WK-001 C7: the ReplacingMergeTree version column is the
+// coordinator's shared sequence (C3), and the durable position is kept per
+// partition and read as a MinSafe (Position), so N workers neither fight
+// over the version nor resume past a lagging partition.
+func (s *Sink) SupportsConcurrentWriters() bool { return true }
 
 func init() {
 	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {

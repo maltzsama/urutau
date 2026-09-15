@@ -187,7 +187,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			return fmt.Errorf("worker: schema %s: %w", ta.TargetTable, err)
 		}
 		cs.PrimaryKey = ta.PrimaryKey
-		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey}
+		// Owner is the worker group name (cfg.Name), stable across restarts
+		// and rollouts. Sinks that persist a durable position per partition
+		// (ClickHouse, Couchbase) use it to keep one position per partition
+		// instead of a single last-writer scalar (WK-001 §2.6/C7).
+		ref := core.TableRef{Target: ta.TargetTable, PrimaryKey: ta.PrimaryKey, Owner: cfg.Name}
 		// The write shape arrives with the assignment: the coordinator's DDL
 		// and this worker's writes must agree on the cast policy, the
 		// metadata columns, and the write mode — a hardcoded UPSERT or empty
@@ -274,7 +278,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	committed := make(map[string]position.Position, len(assign.Tables))
 	phase := pb.WorkerPhase_WORKER_PHASE_SNAPSHOTTING
 	for _, ta := range assign.Tables {
-		pos, err := snk.Position(ctx, core.TableRef{Target: ta.TargetTable})
+		pos, err := snk.Position(ctx, core.TableRef{Target: ta.TargetTable, Owner: cfg.Name})
 		if err != nil {
 			return fmt.Errorf("worker: committed %s: %w", ta.TargetTable, err)
 		}
@@ -621,16 +625,10 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 // parsePosition returns the parser for the assignment's source kind.
 // Getting this wrong is not a minor inconvenience: a Kafka pipeline whose
 // committed positions were parsed as GTID sets would fail the worker boot
-// the moment the first cdc.position existed.
+// the moment the first cdc.position existed. Delegates to position.Parse so
+// the sink's per-partition read (WK-001 C7) shares one mapping.
 func parsePosition(kind string) func(string) (position.Position, error) {
-	switch kind {
-	case "postgres":
-		return func(s string) (position.Position, error) { return position.ParseLSN(s) }
-	case "kafka":
-		return func(s string) (position.Position, error) { return position.ParseOffsets(s) }
-	default:
-		return func(s string) (position.Position, error) { return position.ParseGTID(s) }
-	}
+	return func(s string) (position.Position, error) { return position.Parse(kind, s) }
 }
 
 // committedStrings renders the committed map for the wire Hello.

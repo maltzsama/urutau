@@ -45,6 +45,11 @@ type tableWriter struct {
 	// sequence (b.Seq) can be placed ABOVE every seq this table ever saw:
 	// seq = seed + b.Seq. It never changes after open (WK-001 C3).
 	seed uint64
+	// owner is the worker group that owns this partition (ref.Owner). Empty
+	// in collapsed mode; when set, every commit records this partition's
+	// position in posQuoted (WK-001 C7).
+	owner     string
+	posQuoted string // per-partition position table, "" when unpartitioned
 }
 
 // openTableWriter loads the target column list and seeds the seq floor from
@@ -94,7 +99,7 @@ func openTableWriter(ctx context.Context, conn ch.Conn, ident tableIdent, ref co
 	if now == nil {
 		now = time.Now
 	}
-	return &tableWriter{
+	w := &tableWriter{
 		conn:        conn,
 		ident:       ident,
 		quoted:      ident.quoted(),
@@ -106,7 +111,12 @@ func openTableWriter(ctx context.Context, conn ch.Conn, ident tableIdent, ref co
 		now:         now,
 		lastSeq:     seed,
 		seed:        seed,
-	}, nil
+	}
+	if ref.Owner != "" {
+		w.owner = ref.Owner
+		w.posQuoted = ident.posQuoted()
+	}
+	return w, nil
 }
 
 // nextSeq returns the next commit's version coordinate: strictly increasing
@@ -194,6 +204,18 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	if err := batch.Send(); err != nil {
 		_ = batch.Abort()
 		return fmt.Errorf("insert %s: %w", w.quoted, err)
+	}
+	// Per-partition position (WK-001 C7): record this worker's committed
+	// coordinate so Position() can take the MinSafe across partitions. Only
+	// when the worker has an owner — the collapsed runner writes none and
+	// Position() falls back to the legacy argMax. A ReplacingMergeTree keyed
+	// by owner keeps the latest seq per partition.
+	if w.owner != "" {
+		if err := w.conn.Exec(ctx,
+			"INSERT INTO "+w.posQuoted+" (owner, position, seq) VALUES (?, ?, ?)",
+			w.owner, batchPos, seq); err != nil {
+			return fmt.Errorf("insert %s: %w", w.posQuoted, err)
+		}
 	}
 	return nil
 }

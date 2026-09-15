@@ -19,6 +19,14 @@ func (t tableIdent) quoted() string {
 	return quoteIdent(t.db) + "." + quoteIdent(t.table)
 }
 
+// posQuoted names the per-partition position table for this target: the
+// target table's name suffixed with _urutau_position (WK-001 C7). It holds
+// one row per worker group (owner, position, seq); Position() reads the
+// MinSafe across owners so a lagging partition is never resumed past.
+func (t tableIdent) posQuoted() string {
+	return quoteIdent(t.db) + "." + quoteIdent(t.table+"_urutau_position")
+}
+
 func quoteIdent(id string) string {
 	return "`" + strings.ReplaceAll(id, "`", "\\`") + "`"
 }
