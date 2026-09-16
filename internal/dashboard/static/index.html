@@ -48,6 +48,15 @@
     </template>
   </nav>
 
+  <div class="card" x-show="!loaded" aria-busy="true">
+    <span class="muted">Loading coordinator state…</span>
+  </div>
+
+  <div class="banner fail" x-show="loaded && error" x-cloak>
+    <div><b x-text="error"></b> <span class="muted">— showing the last known state</span></div>
+    <div class="actions"><button @click="refresh()">Retry</button></div>
+  </div>
+
   <!-- ── Overview ─────────────────────────────────────────────────────── -->
   <section x-show="view === 'overview'">
     <div class="banner" :class="bannerClass()">
@@ -188,6 +197,7 @@
             <span class="red" x-show="t.commit_failures" x-text="' · ' + t.commit_failures + ' failures'"></span></strong></div>
           <div class="metricline" x-show="t.equality_deletes"><span>Equality deletes</span><strong x-text="fmt(t.equality_deletes)"></strong></div>
           <div class="metricline" x-show="t.deletes_dropped"><span>Deletes dropped</span><strong x-text="fmt(t.deletes_dropped)"></strong></div>
+          <div class="metricline"><span>Commit latency</span><strong x-text="ms(t.commit_latency_ms)"></strong></div>
           <div x-show="t.snapshot_progress > 0 && t.snapshot_progress < 1">
             <div class="bar"><i :style="'width:' + (t.snapshot_progress * 100) + '%'"></i></div>
             <div class="small muted" x-text="Math.round(t.snapshot_progress * 100) + '% snapshot'"></div>
@@ -223,6 +233,11 @@
             </template>
             <div class="muted small" x-show="!w.committed || Object.keys(w.committed).length === 0">None</div>
           </details>
+          <div class="small muted" x-show="workerTransitions(w.name).length > 1">
+            <template x-for="(tr, i) in workerTransitions(w.name)" :key="i">
+              <span><span x-text="tr.status"></span><span x-show="i < workerTransitions(w.name).length - 1" x-text="' → '"></span></span>
+            </template>
+          </div>
           <div class="actions">
             <button :disabled="w.status === 'pending'" @click="confirmRestart(w.name)">Restart</button>
             <button class="copy-btn" type="button" aria-label="Copy kubectl logs command"
@@ -304,26 +319,33 @@
 <div class="overlay" x-show="drawer.open" @click.self="drawer.open = false">
   <aside class="drawer">
     <div class="row">
-      <h2 x-text="drawer.title"></h2>
+      <h2 x-text="drawerTable() ? drawerTable().source + ' → ' + drawerTable().target : 'Details'"></h2>
       <button class="copy-btn" type="button" aria-label="Close" @click="drawer.open = false">✕</button>
     </div>
-    <template x-if="drawer.table">
+    <template x-if="drawerTable()">
       <div>
         <div class="topline">
-          <span class="badge" x-text="drawer.table.write_mode"></span>
-          <span class="pill" :class="streamStatusClass(drawer.table)" x-text="streamStatus(drawer.table)"></span>
+          <span class="badge" x-text="drawerTable().write_mode"></span>
+          <span class="pill" :class="streamStatusClass(drawerTable())" x-text="streamStatus(drawerTable())"></span>
         </div>
         <p class="muted small section">Current position</p>
-        <p class="mono inline-copy"><span x-text="drawer.table.position || '—'"></span>
-          <button class="copy-btn" type="button" aria-label="Copy position" @click="copy(drawer.table.position)">⧉</button></p>
-        <div class="section"><h3>Throughput</h3><div class="chart"><canvas id="chart-drawer"></canvas></div></div>
+        <p class="mono inline-copy"><span x-text="drawerTable().position || '—'"></span>
+          <button class="copy-btn" type="button" aria-label="Copy position" @click="copy(drawerTable().position)">⧉</button></p>
+        <div class="grid two section">
+          <div class="metricline"><span>Lag</span><strong x-text="drawerTable().lag_s.toFixed(1) + 's'"></strong></div>
+          <div class="metricline"><span>Commit latency</span><strong x-text="ms(drawerTable().commit_latency_ms)"></strong></div>
+          <div class="metricline"><span>Commits</span><strong x-text="fmt(drawerTable().commits)"></strong></div>
+          <div class="metricline" x-show="drawerTable().commit_failures"><span>Failures</span><strong class="red" x-text="drawerTable().commit_failures"></strong></div>
+        </div>
+        <div class="section"><h3>Throughput &amp; lag</h3><div class="chart"><canvas id="chart-drawer"></canvas></div></div>
         <div class="section"><h3>Maintenance</h3>
-          <div class="metricline" x-show="drawer.table.maintenance?.compaction">
-            <span>Compaction</span><strong x-text="drawer.table.maintenance?.compaction?.runs + ' runs'"></strong></div>
-          <div class="metricline" x-show="drawer.table.maintenance?.expiry">
-            <span>Snapshot expiry</span><strong x-text="drawer.table.maintenance?.expiry?.snapshots_removed + ' removed'"></strong></div>
-          <div class="metricline" x-show="drawer.table.maintenance?.orphan">
-            <span>Orphan cleanup</span><strong x-text="bytes(drawer.table.maintenance?.orphan?.bytes_freed)"></strong></div>
+          <div class="metricline" x-show="drawerTable().maintenance?.compaction">
+            <span>Compaction</span><strong x-text="drawerTable().maintenance?.compaction?.runs + ' runs'"></strong></div>
+          <div class="metricline" x-show="drawerTable().maintenance?.expiry">
+            <span>Snapshot expiry</span><strong x-text="drawerTable().maintenance?.expiry?.snapshots_removed + ' removed'"></strong></div>
+          <div class="metricline" x-show="drawerTable().maintenance?.orphan">
+            <span>Orphan cleanup</span><strong x-text="bytes(drawerTable().maintenance?.orphan?.bytes_freed)"></strong></div>
+          <div class="muted small" x-show="!drawerTable().maintenance">Maintenance is off or has not run yet.</div>
         </div>
       </div>
     </template>

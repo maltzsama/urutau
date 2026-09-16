@@ -1,11 +1,12 @@
 // Dashboard SPA: Alpine.js components + Chart.js rendering. All data comes
 // from the coordinator's /api/v1/* endpoints (client-side polling; no
 // WebSocket). Charts are Chart.js instances kept per canvas and updated in
-// place; KPI sparklines share a generic mini-line config.
+// place; the KPI sparklines share a generic mini-line config.
 function app() {
   const API = '/api/v1';
   const HISTORY = 720; // 1h at a 5s sample
   const HISTORY_MS = 5000;
+  const COLORS = ['#2563eb', '#16a34a', '#d97706', '#c0392b', '#7c3aed'];
 
   return {
     view: 'overview',
@@ -24,13 +25,17 @@ function app() {
     query: '',
     paused: false,
     failures: 0,
+    loaded: false,
+    error: '',
     lastPoll: '',
     window: '30m',
-    drawer: { open: false, title: '', table: null },
+    drawer: { open: false, target: '' },
     modal: { open: false, title: '', text: '', action: null, error: '' },
     toastMsg: '',
     charts: {},
-    history: {},
+    history: {},       // global series: throughput, lag, commits, errors, workers, snapshot
+    series: {},        // per-stream series: target -> { lag: [], rate: [] }
+    workerTimeline: {}, // worker -> [{ t, status }]
     lastHistoryAt: 0,
     timers: [],
 
@@ -94,11 +99,15 @@ function app() {
         this.events = events || [];
         this.logs = logs || [];
         this.failures = 0;
+        this.error = '';
+        this.loaded = true;
         this.lastPoll = new Date().toLocaleTimeString('en-GB');
         this.pushHistory();
         this.$nextTick(() => this.renderCharts());
       } catch (e) {
+        // Keep the last valid state; surface the outage.
         this.failures++;
+        this.error = 'Coordinator unreachable';
         this.lastPoll = 'stale';
       }
     },
@@ -108,27 +117,40 @@ function app() {
       const now = Date.now();
       if (this.lastHistoryAt && now - this.lastHistoryAt < HISTORY_MS) return;
       this.lastHistoryAt = now;
-      const push = (k, v) => {
-        const h = this.history[k] || (this.history[k] = []);
+      const ring = (obj, k, v) => {
+        const h = obj[k] || (obj[k] = []);
         h.push(v);
         if (h.length > HISTORY) h.shift();
       };
-      push('throughput', this.totalRate());
-      push('lag', this.totalLag());
-      push('commits', this.totalCommits());
-      push('errors', this.errorCount());
-      push('workers', this.workersOnline());
-      push('snapshot', this.snapshotDone());
+      ring(this.history, 'throughput', this.totalRate());
+      ring(this.history, 'lag', this.totalLag());
+      ring(this.history, 'commits', this.totalCommits());
+      ring(this.history, 'errors', this.errorCount());
+      ring(this.history, 'workers', this.attachedCount());
+      ring(this.history, 'snapshot', this.snapshotDone());
+
+      for (const t of this.tables) {
+        const s = this.series[t.target] || (this.series[t.target] = { lag: [], rate: [] });
+        s.lag.push(t.lag_s || 0);
+        s.rate.push(t.rows_rate || 0);
+        if (s.lag.length > HISTORY) { s.lag.shift(); s.rate.shift(); }
+      }
+      for (const w of this.workers) {
+        const tl = this.workerTimeline[w.name] || (this.workerTimeline[w.name] = []);
+        if (!tl.length || tl[tl.length - 1].status !== w.status) {
+          tl.push({ t: now, status: w.status });
+          if (tl.length > 50) tl.shift();
+        }
+      }
     },
 
     // ── derived ───────────────────────────────────────────────────────────
-    workersOnline() {
-      return this.workers.filter((w) => w.status === 'attached').length + '/' + this.workers.length;
-    },
+    attachedCount() { return this.workers.filter((w) => w.status === 'attached').length; },
+    workersOnline() { return this.attachedCount() + '/' + this.workers.length; },
     totalLag() { return this.tables.reduce((a, t) => a + (t.lag_s || 0), 0); },
     totalRate() { return this.tables.reduce((a, t) => a + (t.rows_rate || 0), 0); },
     totalCommits() { return this.tables.reduce((a, t) => a + (t.commits || 0), 0); },
-    errorCount() { return this.events.filter((e) => e.severity === 'error' || e.type === 'schema_drift' || e.type === 'worker_reset' || e.type === 'job_terminated').length; },
+    errorCount() { return this.events.filter((e) => this.eventClass(e) === 'error').length; },
     snapshotDone() { return this.tables.filter((t) => t.lag_s < 30).length; },
     maintenance() {
       const agg = { compaction: null, expiry: null, orphan: null };
@@ -174,14 +196,25 @@ function app() {
     workerClass(w) {
       return w.status === 'attached' ? 'green' : w.status === 'pending' ? 'amber' : 'red';
     },
-    streamStatus(t) { return t.lag_s > 30 ? 'degraded' : 'ok'; },
-    streamStatusClass(t) { return t.lag_s > 30 ? 'amber' : 'green'; },
+    streamStatus(t) {
+      if (t.lag_s > 30) return 'degraded';
+      if (t.snapshot_progress > 0 && t.snapshot_progress < 1) return 'snapshotting';
+      return 'ok';
+    },
+    streamStatusClass(t) {
+      const s = this.streamStatus(t);
+      return s === 'ok' ? 'green' : s === 'degraded' ? 'red' : 'amber';
+    },
     eventClass(e) {
       if (['schema_drift', 'worker_reset', 'job_terminated'].includes(e.type)) return 'error';
       if (e.type === 'delete_dropped') return 'warning';
       return '';
     },
     logClass(l) { return l.level === 'ERROR' ? 'error' : l.level === 'WARN' ? 'warning' : ''; },
+    drawerTable() { return this.tables.find((t) => t.target === this.drawer.target) || null; },
+    workerTransitions(name) {
+      return (this.workerTimeline[name] || []).slice(-5);
+    },
 
     filteredStreams() {
       let arr = this.tables.slice();
@@ -210,7 +243,7 @@ function app() {
         return !q || JSON.stringify(l).toLowerCase().includes(q);
       });
     },
-    recentEvents() { return this.events.slice(0, 5); },
+    recentEvents() { return this.events.filter((e) => e.type !== 'commit').slice(0, 5); },
 
     // ── view / drawer / modal ─────────────────────────────────────────────
     setView(v) {
@@ -219,7 +252,7 @@ function app() {
       this.$nextTick(() => this.renderCharts());
     },
     openStream(t) {
-      this.drawer = { open: true, title: t.source + ' → ' + t.target, table: t };
+      this.drawer = { open: true, target: t.target };
       this.$nextTick(() => this.renderDrawerChart());
     },
     openStreamByName(name) {
@@ -230,7 +263,7 @@ function app() {
       this.openModal('Cancel pipeline',
         'This sends Shutdown to every worker and terminates the pipeline.',
         async () => {
-          await this.fetchJSON(API + '/actions/cancel').catch((e) => { throw e; });
+          await this.post(API + '/actions/cancel');
           this.toast('Shutdown requested');
         });
     },
@@ -291,28 +324,39 @@ function app() {
       return s >= 3600 ? Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm'
         : s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
     },
+    ms(n) { return n ? n.toFixed(0) + ' ms' : '—'; },
 
     // ── charts (Chart.js) ─────────────────────────────────────────────────
+    windowPoints() {
+      return this.window === '5m' ? 60 : this.window === '1h' ? 720 : 360;
+    },
+    tail(arr) {
+      const n = this.windowPoints();
+      return arr && arr.length > n ? arr.slice(arr.length - n) : (arr || []);
+    },
     renderCharts() {
       if (typeof Chart === 'undefined') return;
       const grid = getComputedStyle(document.documentElement).getPropertyValue('--pico-muted-border-color') || '#ddd';
       if (this.view === 'overview') {
-        this.line('chart-throughput', 'throughput', [this.history.throughput || []], ['Throughput'], grid);
-        const series = this.filteredStreams().slice(0, 5).map((t) => ({ name: t.source, data: [t.lag_s] }));
-        this.line('chart-lag', 'lag', series.map((s) => s.data), series.map((s) => s.name), grid);
+        this.line('chart-throughput', [this.tail(this.history.throughput)], ['Throughput'], grid);
+        const streams = this.filteredStreams().slice(0, 5);
+        this.line('chart-lag',
+          streams.map((t) => this.tail((this.series[t.target] || {}).lag)),
+          streams.map((t) => t.source), grid);
       }
       for (const id of ['spark-throughput', 'spark-lag', 'spark-commits', 'spark-errors', 'spark-workers', 'spark-snapshot']) {
         const key = id.replace('spark-', '');
-        this.spark(id, this.history[key] || []);
+        this.spark(id, this.tail(this.history[key]));
       }
+      if (this.drawer.open) this.renderDrawerChart();
     },
-    line(id, kind, datasets, labels, grid) {
+    line(id, datasets, labels, grid) {
       const el = document.getElementById(id);
       if (!el) return;
       const data = {
         labels: datasets[0] ? datasets[0].map((_, i) => i) : [],
         datasets: datasets.map((d, i) => ({
-          label: labels[i], data: d, borderColor: ['#2563eb', '#16a34a', '#d97706', '#c0392b', '#7c3aed'][i % 5],
+          label: labels[i], data: d || [], borderColor: COLORS[i % COLORS.length],
           backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2,
         })),
       };
@@ -335,8 +379,8 @@ function app() {
       const el = document.getElementById(id);
       if (!el) return;
       const cfg = {
-        labels: data.map((_, i) => i),
-        datasets: [{ data, borderColor: '#2563eb', backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 1.8 }],
+        labels: (data || []).map((_, i) => i),
+        datasets: [{ data: data || [], borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 1.8 }],
       };
       const opts = {
         responsive: true, maintainAspectRatio: false, animation: false,
@@ -351,20 +395,34 @@ function app() {
       }
     },
     renderDrawerChart() {
-      if (typeof Chart === 'undefined' || !this.drawer.table) return;
+      if (typeof Chart === 'undefined') return;
       const el = document.getElementById('chart-drawer');
       if (!el) return;
-      const h = this.history.throughput || [];
+      const s = this.series[this.drawer.target] || {};
+      const rate = this.tail(s.rate);
+      const lag = this.tail(s.lag);
+      const data = {
+        labels: rate.map((_, i) => i),
+        datasets: [
+          { label: 'Rows/s', data: rate, borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
+          { label: 'Lag (s)', data: lag, borderColor: COLORS[2], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
+        ],
+      };
+      const opts = {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: { legend: { display: true, labels: { boxWidth: 10 } } },
+        scales: {
+          x: { display: false },
+          y: { position: 'left', grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--pico-muted-border-color') } },
+          y1: { position: 'right', grid: { drawOnChartArea: false } },
+        },
+      };
       if (this.charts['chart-drawer']) {
-        this.charts['chart-drawer'].data.datasets[0].data = h;
+        this.charts['chart-drawer'].data = data;
         this.charts['chart-drawer'].update('none');
-        return;
+      } else {
+        this.charts['chart-drawer'] = new Chart(el, { type: 'line', data, options: opts });
       }
-      this.charts['chart-drawer'] = new Chart(el, {
-        type: 'line',
-        data: { labels: h.map((_, i) => i), datasets: [{ data: h, borderColor: '#2563eb', backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2 }] },
-        options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: true } } },
-      });
     },
   };
 }
