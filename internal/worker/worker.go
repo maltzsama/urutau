@@ -497,6 +497,7 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 		rb.batch.Release()
 		if w.metrics != nil {
 			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
+			w.metrics.CommitLatencyMs.WithLabelValues(p.target).Set(float64(time.Since(start).Milliseconds()))
 			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(rb.upserts))
 			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(rb.deletes))
 		}

@@ -74,6 +74,7 @@ func TestOnWorkerMetricsFoldsTotals(t *testing.T) {
 		CommitFailures:   4,
 		DeletesDropped:   2,
 		SnapshotProgress: 0.3,
+		CommitLatencyMs:  150,
 	}}})
 
 	got := dashState{c}.Tables()
@@ -82,5 +83,29 @@ func TestOnWorkerMetricsFoldsTotals(t *testing.T) {
 	}
 	if got[0].CommitFailures != 4 || got[0].DeletesDropped != 2 || got[0].SnapshotProgress != 0.3 {
 		t.Errorf("worker metrics not folded: %+v", got[0])
+	}
+	if got[0].CommitLatencyMs != 150 {
+		t.Errorf("commit latency not folded: %+v", got[0])
+	}
+}
+
+// The per-table rows/s rate is a sliding-window delta; the first ack seeds the
+// window baseline, so its rows do not count toward the first rate.
+func TestDashStateTablesRowsRate(t *testing.T) {
+	c := &Coordinator{
+		cfg: Config{Spec: &spec.Spec{Tables: []spec.Table{
+			{Source: "shop.orders", Target: "raw.orders"},
+		}}},
+	}
+	base := time.Now()
+	c.recordTableStats("w-0", "raw.orders", 10, 0, 0, base)                     // baseline
+	c.recordTableStats("w-0", "raw.orders", 40, 0, 0, base.Add(10*time.Second)) // +40 rows over 10s
+
+	got := dashState{c}.Tables()
+	if len(got) != 1 {
+		t.Fatalf("Tables = %d, want 1", len(got))
+	}
+	if rate := got[0].RowsRate; rate < 3.5 || rate > 4.5 {
+		t.Errorf("RowsRate = %v, want ~4 rows/s (40 rows over 10s)", rate)
 	}
 }

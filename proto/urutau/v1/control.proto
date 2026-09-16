@@ -130,6 +130,7 @@ message TableMetrics {
   int64          deletes_dropped   = 3;
   double         snapshot_progress = 4;
   repeated EnrichMetrics enrich    = 5;
+  double         commit_latency_ms = 6;  // last Iceberg commit latency, per table
 }
 
 message EnrichMetrics {

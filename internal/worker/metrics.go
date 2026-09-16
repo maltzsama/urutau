@@ -67,6 +67,9 @@ func (w *Worker) MetricsSnapshot() *pb.WorkerMetricsReport {
 	for t, v := range snap.SnapshotProgress {
 		get(t).SnapshotProgress = v
 	}
+	for t, v := range snap.CommitLatencyMs {
+		get(t).CommitLatencyMs = v
+	}
 	for key, ec := range snap.Enrich {
 		t, ref, _ := strings.Cut(key, "\x00")
 		tm := get(t)

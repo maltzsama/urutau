@@ -27,7 +27,16 @@ type tableStats struct {
 	commitFailures   int64
 	deletesDropped   int64
 	snapshotProgress float64
+
+	// rows/s over a sliding window, recomputed every rateWindow and carried
+	// forward between recomputations so the number stays stable between acks.
+	rateWindowStart time.Time
+	rateWindowRows  int64
+	rowsRate        float64
 }
+
+// rateWindow is how often the per-table rows/s rate is recomputed.
+const rateWindow = 5 * time.Second
 
 // maintStats is the per-table, per-operation maintenance aggregate, folded from
 // each maintenance worker's reported MaintenanceResult.
@@ -104,6 +113,7 @@ func (s dashState) Tables() []dashboard.TableStatus {
 		if ts := c.tableStats[t.Target]; ts != nil {
 			st.Commits = ts.commits
 			st.RowsTotal = ts.rows
+			st.RowsRate = ts.rowsRate
 			st.EqualityDeletes = ts.deletes
 			st.CommitFailures = ts.commitFailures
 			st.CommitLatencyMs = ts.commitLatencyMs
@@ -232,8 +242,25 @@ func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64
 	ts.commits++
 	ts.rows += rows
 	ts.deletes += deletes
-	ts.commitLatencyMs = commitLatencyMs
+	// The ack never carries a real commit duration (it precedes the commit),
+	// so only fold a non-zero one; the worker's metrics report is the real
+	// source and must not be clobbered by the always-zero ack value.
+	if commitLatencyMs > 0 {
+		ts.commitLatencyMs = commitLatencyMs
+	}
 	ts.lastCommit = at
+	// rows/s: recompute over the window once it has elapsed, then restart the
+	// window. Before the first window elapses the rate reads 0.
+	if ts.rateWindowStart.IsZero() {
+		ts.rateWindowStart = at
+		ts.rateWindowRows = ts.rows
+	} else if at.Sub(ts.rateWindowStart) >= rateWindow {
+		if dt := at.Sub(ts.rateWindowStart).Seconds(); dt > 0 {
+			ts.rowsRate = float64(ts.rows-ts.rateWindowRows) / dt
+		}
+		ts.rateWindowStart = at
+		ts.rateWindowRows = ts.rows
+	}
 	c.lastAck[worker] = at
 	c.statsMu.Unlock()
 	c.pushDashState()
@@ -284,6 +311,9 @@ func (c *Coordinator) onWorkerMetrics(rep *pb.WorkerMetricsReport) {
 		ts.commitFailures = tm.CommitFailures
 		ts.deletesDropped = tm.DeletesDropped
 		ts.snapshotProgress = tm.SnapshotProgress
+		if tm.CommitLatencyMs > 0 {
+			ts.commitLatencyMs = tm.CommitLatencyMs
+		}
 	}
 	c.statsMu.Unlock()
 	c.pushDashState()

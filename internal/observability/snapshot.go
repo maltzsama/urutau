@@ -11,6 +11,7 @@ type WorkerSnapshot struct {
 	CommitFailures   map[string]int64
 	DeletesDropped   map[string]int64
 	SnapshotProgress map[string]float64
+	CommitLatencyMs  map[string]float64
 	Enrich           map[string]EnrichCounts // key: table + "\x00" + reference
 }
 
@@ -27,6 +28,7 @@ func (m *Metrics) WorkerSnapshot() WorkerSnapshot {
 		CommitFailures:   map[string]int64{},
 		DeletesDropped:   map[string]int64{},
 		SnapshotProgress: map[string]float64{},
+		CommitLatencyMs:  map[string]float64{},
 		Enrich:           map[string]EnrichCounts{},
 	}
 	fams, err := m.reg.Gather()
@@ -46,6 +48,10 @@ func (m *Metrics) WorkerSnapshot() WorkerSnapshot {
 		case "urutau_worker_snapshot_progress_ratio":
 			for _, mt := range f.GetMetric() {
 				snap.SnapshotProgress[labelValue(mt, "table")] = mt.GetGauge().GetValue()
+			}
+		case "urutau_worker_commit_latency_ms":
+			for _, mt := range f.GetMetric() {
+				snap.CommitLatencyMs[labelValue(mt, "table")] = mt.GetGauge().GetValue()
 			}
 		case "urutau_enrich_misses_total", "urutau_enrich_inner_dropped_total", "urutau_enrich_evicted_total":
 			for _, mt := range f.GetMetric() {

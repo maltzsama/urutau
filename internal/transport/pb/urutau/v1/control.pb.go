@@ -1101,6 +1101,7 @@ type TableMetrics struct {
 	DeletesDropped   int64                  `protobuf:"varint,3,opt,name=deletes_dropped,json=deletesDropped,proto3" json:"deletes_dropped,omitempty"`
 	SnapshotProgress float64                `protobuf:"fixed64,4,opt,name=snapshot_progress,json=snapshotProgress,proto3" json:"snapshot_progress,omitempty"`
 	Enrich           []*EnrichMetrics       `protobuf:"bytes,5,rep,name=enrich,proto3" json:"enrich,omitempty"`
+	CommitLatencyMs  float64                `protobuf:"fixed64,6,opt,name=commit_latency_ms,json=commitLatencyMs,proto3" json:"commit_latency_ms,omitempty"` // last Iceberg commit latency, per table
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -1168,6 +1169,13 @@ func (x *TableMetrics) GetEnrich() []*EnrichMetrics {
 		return x.Enrich
 	}
 	return nil
+}
+
+func (x *TableMetrics) GetCommitLatencyMs() float64 {
+	if x != nil {
+		return x.CommitLatencyMs
+	}
+	return 0
 }
 
 type EnrichMetrics struct {
@@ -2515,13 +2523,14 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"bytesFreed\x12\x14\n" +
 	"\x05error\x18\x03 \x01(\tR\x05error\"F\n" +
 	"\x13WorkerMetricsReport\x12/\n" +
-	"\x06tables\x18\x01 \x03(\v2\x17.urutau.v1.TableMetricsR\x06tables\"\xd5\x01\n" +
+	"\x06tables\x18\x01 \x03(\v2\x17.urutau.v1.TableMetricsR\x06tables\"\x81\x02\n" +
 	"\fTableMetrics\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12'\n" +
 	"\x0fcommit_failures\x18\x02 \x01(\x03R\x0ecommitFailures\x12'\n" +
 	"\x0fdeletes_dropped\x18\x03 \x01(\x03R\x0edeletesDropped\x12+\n" +
 	"\x11snapshot_progress\x18\x04 \x01(\x01R\x10snapshotProgress\x120\n" +
-	"\x06enrich\x18\x05 \x03(\v2\x18.urutau.v1.EnrichMetricsR\x06enrich\"\x84\x01\n" +
+	"\x06enrich\x18\x05 \x03(\v2\x18.urutau.v1.EnrichMetricsR\x06enrich\x12*\n" +
+	"\x11commit_latency_ms\x18\x06 \x01(\x01R\x0fcommitLatencyMs\"\x84\x01\n" +
 	"\rEnrichMetrics\x12\x1c\n" +
 	"\treference\x18\x01 \x01(\tR\treference\x12\x16\n" +
 	"\x06misses\x18\x02 \x01(\x03R\x06misses\x12#\n" +

@@ -24,6 +24,7 @@ type Metrics struct {
 	// Worker.
 	RowsWritten      *prometheus.CounterVec
 	CommitDuration   *prometheus.HistogramVec
+	CommitLatencyMs  *prometheus.GaugeVec
 	CommitFailures   *prometheus.CounterVec
 	EqualityDeletes  *prometheus.CounterVec
 	SnapshotProgress *prometheus.GaugeVec
@@ -77,6 +78,9 @@ func New() *Metrics {
 		Name:    "urutau_worker_commit_duration_seconds",
 		Help:    "Iceberg commit latency per table.",
 		Buckets: prometheus.DefBuckets},
+		[]string{"table"})
+	m.CommitLatencyMs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "urutau_worker_commit_latency_ms", Help: "last Iceberg commit latency per table."},
 		[]string{"table"})
 	m.CommitFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_worker_commit_failures_total", Help: "failed commits per table."},
@@ -136,7 +140,7 @@ func New() *Metrics {
 		[]string{"table"})
 
 	reg.MustRegister(m.LagSeconds, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
-	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
+	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitLatencyMs, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	reg.MustRegister(m.EnrichMisses, m.EnrichDropped, m.EnrichEvicted)
 	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,
 		m.IcebergCompactionBytesBefore, m.IcebergCompactionBytesAfter)
