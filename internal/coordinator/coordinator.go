@@ -333,6 +333,10 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		c.dash = dashboard.New(dashState{c}, c.dashEvents, logSrc, c.log)
 		c.dash.Register(mux)
+		// Every new log line is pushed to the SSE subscribers.
+		if cfg.LogBuffer != nil {
+			cfg.LogBuffer.SetOnAppend(c.dash.PublishLog)
+		}
 		go func() {
 			// A busy port silently disables observability otherwise — say so.
 			if err := observability.ServeMux(cfg.MetricsAddr, mux); err != nil {
@@ -915,7 +919,10 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 // even when no audit trail is configured.
 func (c *Coordinator) emit(kind string, fields map[string]any) error {
 	if c.dashEvents != nil {
-		c.dashEvents.Record(kind, fields)
+		ev := c.dashEvents.Record(kind, fields)
+		if c.dash != nil {
+			c.dash.PublishEvent(ev)
+		}
 	}
 	if c.ev == nil {
 		return nil
@@ -2059,6 +2066,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		// invert the order supervisor.tick uses (supervisor.mu → c.mu) and
 		// deadlock the two (audit #3).
 		c.supervisor.noteAttach(hello.WorkerName)
+		c.pushDashState() // the worker attached
 	}
 	if !known {
 		sessCancel()
@@ -2166,6 +2174,7 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	if n := c.staged.discardWorker(worker); n > 0 {
 		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
 	}
+	c.pushDashState() // the worker is no longer attached
 	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {

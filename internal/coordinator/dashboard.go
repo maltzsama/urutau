@@ -205,11 +205,19 @@ func (s dashState) RestartWorker(name string) error {
 	return nil
 }
 
+// pushDashState pushes the current pipeline/tables/workers to the dashboard's
+// SSE subscribers. Call it after a state mutation, OUTSIDE any statsMu lock:
+// PublishState reads back through State, which takes that lock.
+func (c *Coordinator) pushDashState() {
+	if c.dash != nil {
+		c.dash.PublishState()
+	}
+}
+
 // recordTableStats folds one ack into the per-table aggregate. The maps are
 // lazily initialized so a zero Coordinator (tests) is safe.
 func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64, commitLatencyMs float64, at time.Time) {
 	c.statsMu.Lock()
-	defer c.statsMu.Unlock()
 	if c.tableStats == nil {
 		c.tableStats = map[string]*tableStats{}
 	}
@@ -227,6 +235,8 @@ func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64
 	ts.commitLatencyMs = commitLatencyMs
 	ts.lastCommit = at
 	c.lastAck[worker] = at
+	c.statsMu.Unlock()
+	c.pushDashState()
 }
 
 // recordMaintStats folds one maintenance operation result into the per-table,
@@ -262,7 +272,6 @@ func (c *Coordinator) onWorkerMetrics(rep *pb.WorkerMetricsReport) {
 		return
 	}
 	c.statsMu.Lock()
-	defer c.statsMu.Unlock()
 	if c.tableStats == nil {
 		c.tableStats = map[string]*tableStats{}
 	}
@@ -276,6 +285,8 @@ func (c *Coordinator) onWorkerMetrics(rep *pb.WorkerMetricsReport) {
 		ts.deletesDropped = tm.DeletesDropped
 		ts.snapshotProgress = tm.SnapshotProgress
 	}
+	c.statsMu.Unlock()
+	c.pushDashState()
 }
 
 // maintenanceView renders the per-op aggregate for the API.

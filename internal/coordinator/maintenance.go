@@ -263,6 +263,7 @@ func (m *maintenanceScheduler) recordResult(table string, res *pb.MaintenanceRes
 			})
 		}
 	}
+	m.c.pushDashState()
 }
 
 // provisionMaintenanceWorkers ensures one maintenance worker Deployment per
