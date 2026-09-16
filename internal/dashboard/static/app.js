@@ -4,7 +4,8 @@
 // place; KPI sparklines share a generic mini-line config.
 function app() {
   const API = '/api/v1';
-  const HISTORY = 120; // ~4 min at the 2s poll
+  const HISTORY = 720; // 1h at a 5s sample
+  const HISTORY_MS = 5000;
 
   return {
     view: 'overview',
@@ -30,6 +31,7 @@ function app() {
     toastMsg: '',
     charts: {},
     history: {},
+    lastHistoryAt: 0,
     timers: [],
 
     tabs: [
@@ -101,6 +103,11 @@ function app() {
       }
     },
     pushHistory() {
+      // Sample the series every 5s (not on every 2s poll), so the 720-point
+      // ring spans ~1h.
+      const now = Date.now();
+      if (this.lastHistoryAt && now - this.lastHistoryAt < HISTORY_MS) return;
+      this.lastHistoryAt = now;
       const push = (k, v) => {
         const h = this.history[k] || (this.history[k] = []);
         h.push(v);
