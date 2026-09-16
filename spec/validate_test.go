@@ -149,15 +149,39 @@ func TestValidateEnrich(t *testing.T) {
 	}
 }
 
+// commitMode is Couchbase-only (see the field's doc): an unknown value is
+// rejected anywhere, and a known value is rejected on any sink but Couchbase.
+// The rejection is what makes "fail fast" work — without it the knob
+// validates and is then silently dropped by every other sink.
 func TestValidateCommitMode(t *testing.T) {
+	// Unknown value: rejected regardless of sink type.
 	s := validSpec()
-	s.Sink.CommitMode = CommitModeAtomic
-	if err := s.Validate(); err != nil {
-		t.Fatalf("atomic commit mode must validate: %v", err)
-	}
 	s.Sink.CommitMode = CommitMode("eventual")
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "commitMode") {
 		t.Fatalf("want commitMode problem, got %v", err)
+	}
+
+	// Known value on a non-Couchbase sink (the default: empty type is
+	// normalized to iceberg+rest) must be rejected.
+	s = validSpec()
+	s.Sink.CommitMode = CommitModeAtomic
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "commitMode") {
+		t.Fatalf("want commitMode problem for a non-Couchbase sink, got %v", err)
+	}
+
+	// The Couchbase sink accepts both values.
+	for _, mode := range []CommitMode{CommitModeFast, CommitModeAtomic} {
+		s := validSpec()
+		s.Sink.Type = "couchbase"
+		s.Sink.CommitMode = mode
+		if err := s.Validate(); err != nil {
+			t.Errorf("couchbase commitMode %q must validate: %v", mode, err)
+		}
+	}
+
+	// An empty commitMode stays valid on any sink (it means "sink default").
+	if err := validSpec().Validate(); err != nil {
+		t.Fatalf("empty commitMode on the default sink must validate: %v", err)
 	}
 }
 

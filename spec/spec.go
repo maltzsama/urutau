@@ -94,11 +94,13 @@ type Sink struct {
 	Scope        string   `json:"scope,omitempty"`
 	Defaults     Defaults `json:"defaults"`
 	// CommitMode selects how a sink that cannot commit data and position in
-	// one atomic write sequences the two (Couchbase today). Empty means the
-	// sink's own default ("fast": data first, control document last —
-	// recovery replays the batch idempotently). "atomic" wraps data and
-	// control document in a distributed transaction, closing the recovery
-	// window at the cost of transaction overhead per batch.
+	// one atomic write sequences the two. Couchbase-only: any other sink
+	// type rejects a non-empty commitMode in Validate rather than silently
+	// ignoring it. Empty means the sink's own default ("fast": data first,
+	// control document last — recovery replays the batch idempotently).
+	// "atomic" wraps data and control document in a distributed transaction,
+	// closing the recovery window at the cost of transaction overhead per
+	// batch.
 	CommitMode CommitMode `json:"commitMode,omitempty"`
 	// Maintenance configures background Iceberg table maintenance
 	// (compaction, snapshot expiry, orphan cleanup). Iceberg-only: any

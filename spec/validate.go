@@ -113,6 +113,13 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	default:
 		problems = append(problems, fmt.Sprintf("sink.commitMode: unknown %q (fast | atomic)", s.Sink.CommitMode))
 	}
+	// commitMode is Couchbase-only: a non-empty value on any other sink type
+	// is rejected here, not silently ignored at runtime, so the operator
+	// learns the knob does nothing instead of discovering it later.
+	if s.Sink.CommitMode != "" && !sinkSupportsCommitMode(s.Sink.Type) {
+		problems = append(problems, fmt.Sprintf(
+			"sink.commitMode: only the Couchbase sink uses commitMode, not sink.type %q", s.Sink.Type))
+	}
 	if s.Sink.Defaults.TargetFileSize != "" {
 		if _, err := ParseBytes(s.Sink.Defaults.TargetFileSize); err != nil {
 			problems = append(problems, fmt.Sprintf("sink.defaults.targetFileSize: %v", err))
@@ -641,6 +648,18 @@ func validateMaintenance(m *Maintenance, sinkType string, problems *[]string) {
 // kafka-only format rules above match "kafka" literally.
 func sinkSupportsMaintenance(sinkType string) bool {
 	return sinkType == "iceberg" || strings.HasPrefix(sinkType, "iceberg+")
+}
+
+// sinkSupportsCommitMode reports whether a sink type uses sink.commitMode.
+// Only the Couchbase sink does: it is the one sink whose data and position
+// commits are two separate writes without a distributed transaction, so the
+// knob (fast | atomic) is meaningful only there. Unlike the Iceberg family
+// there is no "<engine>+<catalog>" variant, so the name is matched exactly.
+// spec cannot ask the driver registry (driver imports spec, not the
+// reverse), so the sink-type name is matched here, the same way the
+// Iceberg-only maintenance rule and the kafka-only format rules do.
+func sinkSupportsCommitMode(sinkType string) bool {
+	return sinkType == "couchbase"
 }
 
 // byteUnits are the binary (Ki/Mi/Gi/Ti) suffixes ParseBytes accepts, in the
