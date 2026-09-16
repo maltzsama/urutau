@@ -8,6 +8,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/dashboard"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // errOperatorCancel marks a run terminated by the dashboard's Cancel action —
@@ -98,7 +99,7 @@ func (s dashState) Tables() []dashboard.TableStatus {
 		st := dashboard.TableStatus{
 			Source:    t.Source,
 			Target:    t.Target,
-			WriteMode: string(t.WriteMode),
+			WriteMode: writeModeLabel(t.WriteMode),
 		}
 		if ts := c.tableStats[t.Target]; ts != nil {
 			st.Commits = ts.commits
@@ -302,6 +303,15 @@ func maintenanceView(m map[string]*maintStats) *dashboard.Maintenance {
 		return nil
 	}
 	return out
+}
+
+// writeModeLabel renders a table's write mode, defaulting to upsert (the
+// engine's default) when the spec left it unset.
+func writeModeLabel(m spec.WriteMode) string {
+	if m == "" {
+		return string(spec.WriteModeUpsert)
+	}
+	return string(m)
 }
 
 func tsOrEmpty(t time.Time) string {
