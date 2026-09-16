@@ -1,13 +1,24 @@
-// Dashboard SPA: Alpine.js components + Chart.js rendering. All data comes
-// from the coordinator's /api/v1/* endpoints (client-side polling; no
-// WebSocket). Charts are Chart.js instances kept per canvas and updated in
-// place; the KPI sparklines share a generic mini-line config.
+// Dashboard SPA: Alpine.js components + Chart.js rendering. Live updates come
+// from the coordinator's /api/v1/stream SSE endpoint (snapshot + deltas); the
+// REST endpoints are a one-shot fallback. Charts are Chart.js instances kept
+// per canvas and updated in place; the KPI sparklines share a generic
+// mini-line config.
+function cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name);
+  return (v && v.trim()) || fallback;
+}
+
 function app() {
   const API = '/api/v1';
   const HISTORY = 720; // 1h at a 5s sample
   const HISTORY_MS = 5000;
   const COLORS = ['#2563eb', '#16a34a', '#d97706', '#c0392b', '#7c3aed'];
   let es = null; // the EventSource, kept outside Alpine's reactive data
+  const charts = {}; // Chart.js instances, kept outside Alpine's reactive data
+  const samples = {}; // global series buffers (chart data, non-reactive)
+  const series = {}; // per-stream series buffers (chart data, non-reactive)
+  const workerTimeline = {}; // worker -> [{ t, status }] (non-reactive)
+  let lastHistoryAt = 0;
 
   return {
     view: 'overview',
@@ -33,11 +44,6 @@ function app() {
     drawer: { open: false, target: '' },
     modal: { open: false, title: '', text: '', action: null, error: '' },
     toastMsg: '',
-    charts: {},
-    history: {},       // global series: throughput, lag, commits, errors, workers, snapshot
-    series: {},        // per-stream series: target -> { lag: [], rate: [] }
-    workerTimeline: {}, // worker -> [{ t, status }]
-    lastHistoryAt: 0,
 
     tabs: [
       { id: 'overview', label: 'Overview' },
@@ -55,16 +61,16 @@ function app() {
       });
       const v = new URLSearchParams(location.search).get('view');
       if (v) this.view = v;
-      this.openStream();
+      this.connectStream();
       window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') { this.drawer.open = false; this.modal.open = false; }
       });
     },
 
-    // openStream subscribes to the coordinator's SSE stream: a full snapshot on
-    // connect, then live 'state', 'event' and 'log' pushes. No polling. The
+    // connectStream subscribes to the coordinator's SSE stream: a full snapshot
+    // on connect, then live 'state', 'event' and 'log' pushes. No polling. The
     // browser's EventSource reconnects on its own when the stream drops.
-    openStream() {
+    connectStream() {
       if (es) es.close();
       es = new EventSource(API + '/stream');
       es.addEventListener('snapshot', (e) => {
@@ -163,28 +169,28 @@ function app() {
       // Sample the series every 5s (not on every 2s poll), so the 720-point
       // ring spans ~1h.
       const now = Date.now();
-      if (this.lastHistoryAt && now - this.lastHistoryAt < HISTORY_MS) return;
-      this.lastHistoryAt = now;
+      if (lastHistoryAt && now - lastHistoryAt < HISTORY_MS) return;
+      lastHistoryAt = now;
       const ring = (obj, k, v) => {
         const h = obj[k] || (obj[k] = []);
         h.push(v);
         if (h.length > HISTORY) h.shift();
       };
-      ring(this.history, 'throughput', this.totalRate());
-      ring(this.history, 'lag', this.totalLag());
-      ring(this.history, 'commits', this.totalCommits());
-      ring(this.history, 'errors', this.errorCount());
-      ring(this.history, 'workers', this.attachedCount());
-      ring(this.history, 'snapshot', this.snapshotDone());
+      ring(samples, 'throughput', this.totalRate());
+      ring(samples, 'lag', this.totalLag());
+      ring(samples, 'commits', this.totalCommits());
+      ring(samples, 'errors', this.errorCount());
+      ring(samples, 'workers', this.attachedCount());
+      ring(samples, 'snapshot', this.snapshotDone());
 
       for (const t of this.tables) {
-        const s = this.series[t.target] || (this.series[t.target] = { lag: [], rate: [] });
+        const s = series[t.target] || (series[t.target] = { lag: [], rate: [] });
         s.lag.push(t.lag_s || 0);
         s.rate.push(t.rows_rate || 0);
         if (s.lag.length > HISTORY) { s.lag.shift(); s.rate.shift(); }
       }
       for (const w of this.workers) {
-        const tl = this.workerTimeline[w.name] || (this.workerTimeline[w.name] = []);
+        const tl = workerTimeline[w.name] || (workerTimeline[w.name] = []);
         if (!tl.length || tl[tl.length - 1].status !== w.status) {
           tl.push({ t: now, status: w.status });
           if (tl.length > 50) tl.shift();
@@ -261,7 +267,7 @@ function app() {
     logClass(l) { return l.level === 'ERROR' ? 'error' : l.level === 'WARN' ? 'warning' : ''; },
     drawerTable() { return this.tables.find((t) => t.target === this.drawer.target) || null; },
     workerTransitions(name) {
-      return (this.workerTimeline[name] || []).slice(-5);
+      return (workerTimeline[name] || []).slice(-5);
     },
 
     filteredStreams() {
@@ -384,20 +390,17 @@ function app() {
     },
     renderCharts() {
       if (typeof Chart === 'undefined') return;
-      const css = (name, fallback) =>
-        (getComputedStyle(document.documentElement).getPropertyValue(name) || '').trim() || fallback;
-      const grid = css('--pico-muted-border-color', '#ddd');
-      const axis = css('--pico-muted-color', '#888');
+      const grid = cssVar('--pico-muted-border-color', '#ddd');
       if (this.view === 'overview') {
-        this.line('chart-throughput', [this.tail(this.history.throughput)], ['Throughput'], grid);
+        this.line('chart-throughput', [this.tail(samples.throughput)], ['Throughput'], grid);
         const streams = this.filteredStreams().slice(0, 5);
         this.line('chart-lag',
-          streams.map((t) => this.tail((this.series[t.target] || {}).lag)),
+          streams.map((t) => this.tail((series[t.target] || {}).lag)),
           streams.map((t) => t.source), grid);
       }
       for (const id of ['spark-throughput', 'spark-lag', 'spark-commits', 'spark-errors', 'spark-workers', 'spark-snapshot']) {
         const key = id.replace('spark-', '');
-        this.spark(id, this.tail(this.history[key]));
+        this.spark(id, this.tail(samples[key]));
       }
       if (this.drawer.open) this.renderDrawerChart();
     },
@@ -417,14 +420,14 @@ function app() {
         scales: {
           x: { display: false },
           y: { beginAtZero: true, grid: { color: grid },
-               ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
+               ticks: { color: cssVar('--pico-muted-color', '#888'), maxTicksLimit: 5, font: { size: 10 } } },
         },
       };
-      if (this.charts[id]) {
-        this.charts[id].data = data;
-        this.charts[id].update('none');
+      if (charts[id]) {
+        charts[id].data = data;
+        charts[id].update('none');
       } else {
-        this.charts[id] = new Chart(el, { type: 'line', data, options: opts });
+        charts[id] = new Chart(el, { type: 'line', data, options: opts });
       }
     },
     spark(id, data) {
@@ -439,18 +442,18 @@ function app() {
         plugins: { legend: { display: false } },
         scales: { x: { display: false }, y: { display: false } },
       };
-      if (this.charts[id]) {
-        this.charts[id].data = cfg;
-        this.charts[id].update('none');
+      if (charts[id]) {
+        charts[id].data = cfg;
+        charts[id].update('none');
       } else {
-        this.charts[id] = new Chart(el, { type: 'line', data: cfg, options: opts });
+        charts[id] = new Chart(el, { type: 'line', data: cfg, options: opts });
       }
     },
     renderDrawerChart() {
       if (typeof Chart === 'undefined') return;
       const el = document.getElementById('chart-drawer');
       if (!el) return;
-      const s = this.series[this.drawer.target] || {};
+      const s = series[this.drawer.target] || {};
       const rate = this.tail(s.rate);
       const lag = this.tail(s.lag);
       const data = {
@@ -460,25 +463,23 @@ function app() {
           { label: 'Lag (s)', data: lag, borderColor: COLORS[2], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
         ],
       };
-      const css = (name, fallback) =>
-        (getComputedStyle(document.documentElement).getPropertyValue(name) || '').trim() || fallback;
-      const axis = css('--pico-muted-color', '#888');
+      const axis = cssVar('--pico-muted-color', '#888');
       const opts = {
         responsive: true, maintainAspectRatio: false, animation: false,
         plugins: { legend: { display: true, labels: { boxWidth: 10 } } },
         scales: {
           x: { display: false },
-          y: { position: 'left', beginAtZero: true, grid: { color: css('--pico-muted-border-color', '#ddd') },
+          y: { position: 'left', beginAtZero: true, grid: { color: cssVar('--pico-muted-border-color', '#ddd') },
                ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
           y1: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false },
                 ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
         },
       };
-      if (this.charts['chart-drawer']) {
-        this.charts['chart-drawer'].data = data;
-        this.charts['chart-drawer'].update('none');
+      if (charts['chart-drawer']) {
+        charts['chart-drawer'].data = data;
+        charts['chart-drawer'].update('none');
       } else {
-        this.charts['chart-drawer'] = new Chart(el, { type: 'line', data, options: opts });
+        charts['chart-drawer'] = new Chart(el, { type: 'line', data, options: opts });
       }
     },
   };
