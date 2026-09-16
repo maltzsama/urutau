@@ -24,17 +24,19 @@ type PipelineSummary struct {
 
 // TableStatus is one stream (source → target) as the Streams view shows it.
 type TableStatus struct {
-	Source          string       `json:"source"`
-	Target          string       `json:"target"`
-	WriteMode       string       `json:"write_mode"`
-	Position        string       `json:"position,omitempty"`
-	LagS            float64      `json:"lag_s"`
-	RowsTotal       int64        `json:"rows_total"`
-	RowsRate        float64      `json:"rows_rate"`
-	Commits         int64        `json:"commits"`
-	CommitFailures  int64        `json:"commit_failures"`
-	EqualityDeletes int64        `json:"equality_deletes"`
-	Maintenance     *Maintenance `json:"maintenance,omitempty"`
+	Source           string       `json:"source"`
+	Target           string       `json:"target"`
+	WriteMode        string       `json:"write_mode"`
+	Position         string       `json:"position,omitempty"`
+	LagS             float64      `json:"lag_s"`
+	RowsTotal        int64        `json:"rows_total"`
+	RowsRate         float64      `json:"rows_rate"`
+	Commits          int64        `json:"commits"`
+	CommitFailures   int64        `json:"commit_failures"`
+	EqualityDeletes  int64        `json:"equality_deletes"`
+	DeletesDropped   int64        `json:"deletes_dropped"`
+	SnapshotProgress float64      `json:"snapshot_progress"`
+	Maintenance      *Maintenance `json:"maintenance,omitempty"`
 }
 
 // Maintenance is the per-stream Iceberg housekeeping block.

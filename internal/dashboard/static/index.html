@@ -187,6 +187,11 @@
           <div class="metricline"><span>Commits</span><strong><span x-text="fmt(t.commits)"></span>
             <span class="red" x-show="t.commit_failures" x-text="' · ' + t.commit_failures + ' failures'"></span></strong></div>
           <div class="metricline" x-show="t.equality_deletes"><span>Equality deletes</span><strong x-text="fmt(t.equality_deletes)"></strong></div>
+          <div class="metricline" x-show="t.deletes_dropped"><span>Deletes dropped</span><strong x-text="fmt(t.deletes_dropped)"></strong></div>
+          <div x-show="t.snapshot_progress > 0 && t.snapshot_progress < 1">
+            <div class="bar"><i :style="'width:' + (t.snapshot_progress * 100) + '%'"></i></div>
+            <div class="small muted" x-text="Math.round(t.snapshot_progress * 100) + '% snapshot'"></div>
+          </div>
         </article>
       </template>
     </div>

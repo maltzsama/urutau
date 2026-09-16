@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -54,5 +55,29 @@ func TestRecordStatsLazyInit(t *testing.T) {
 	c.recordMaintStats("t", "compaction", time.Now(), func(*maintStats) {})
 	if len(dashState{c}.Tables()) != 0 {
 		t.Error("no spec tables, so no rows")
+	}
+}
+
+// The worker metrics report folds the series the coordinator cannot derive
+// from acks into the per-table aggregate.
+func TestOnWorkerMetricsFoldsTotals(t *testing.T) {
+	c := &Coordinator{
+		cfg: Config{Spec: &spec.Spec{Tables: []spec.Table{
+			{Source: "shop.orders", Target: "raw.orders"},
+		}}},
+	}
+	c.onWorkerMetrics(&pb.WorkerMetricsReport{Tables: []*pb.TableMetrics{{
+		Table:            "raw.orders",
+		CommitFailures:   4,
+		DeletesDropped:   2,
+		SnapshotProgress: 0.3,
+	}}})
+
+	got := dashState{c}.Tables()
+	if len(got) != 1 {
+		t.Fatalf("Tables = %d, want 1", len(got))
+	}
+	if got[0].CommitFailures != 4 || got[0].DeletesDropped != 2 || got[0].SnapshotProgress != 0.3 {
+		t.Errorf("worker metrics not folded: %+v", got[0])
 	}
 }

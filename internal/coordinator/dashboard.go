@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/dashboard"
+	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
 // errOperatorCancel marks a run terminated by the dashboard's Cancel action —
@@ -14,13 +15,16 @@ import (
 var errOperatorCancel = errors.New("coordinator: cancelled by operator")
 
 // tableStats is the per-table aggregate the dashboard serves. Updated on every
-// ack: the Ack already carries rows/deletes/commit-duration, so no worker
-// scrape is needed for these.
+// ack (rows/deletes/commits) and by the worker's metrics report (the series the
+// coordinator cannot derive from acks).
 type tableStats struct {
-	commits    int64
-	rows       int64
-	deletes    int64
-	lastCommit time.Time
+	commits          int64
+	rows             int64
+	deletes          int64
+	lastCommit       time.Time
+	commitFailures   int64
+	deletesDropped   int64
+	snapshotProgress float64
 }
 
 // maintStats is the per-table, per-operation maintenance aggregate, folded from
@@ -99,6 +103,9 @@ func (s dashState) Tables() []dashboard.TableStatus {
 			st.Commits = ts.commits
 			st.RowsTotal = ts.rows
 			st.EqualityDeletes = ts.deletes
+			st.CommitFailures = ts.commitFailures
+			st.DeletesDropped = ts.deletesDropped
+			st.SnapshotProgress = ts.snapshotProgress
 			if !ts.lastCommit.IsZero() {
 				st.LagS = time.Since(ts.lastCommit).Seconds()
 			}
@@ -239,6 +246,32 @@ func (c *Coordinator) recordMaintStats(table, op string, at time.Time, apply fun
 	s.runs++
 	s.lastRun = at
 	apply(s)
+}
+
+// onWorkerMetrics folds a worker's reported series into the per-table
+// aggregate the dashboard serves. It does not duplicate into the coordinator's
+// Prometheus registry: the worker's own /metrics is the Prometheus source for
+// these series, and the report exists for the dashboard, which cannot scrape
+// the worker.
+func (c *Coordinator) onWorkerMetrics(rep *pb.WorkerMetricsReport) {
+	if rep == nil {
+		return
+	}
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	if c.tableStats == nil {
+		c.tableStats = map[string]*tableStats{}
+	}
+	for _, tm := range rep.Tables {
+		ts := c.tableStats[tm.Table]
+		if ts == nil {
+			ts = &tableStats{}
+			c.tableStats[tm.Table] = ts
+		}
+		ts.commitFailures = tm.CommitFailures
+		ts.deletesDropped = tm.DeletesDropped
+		ts.snapshotProgress = tm.SnapshotProgress
+	}
 }
 
 // maintenanceView renders the per-op aggregate for the API.
