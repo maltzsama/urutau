@@ -84,7 +84,7 @@ func runCmd() *cobra.Command {
 					return err
 				}
 			}
-			logger, err := logging.New(f.logLevel, f.logFormat)
+			logger, logBuffer, err := logging.NewBuffered(f.logLevel, f.logFormat, 2000)
 			if err != nil {
 				return err
 			}
@@ -105,7 +105,7 @@ func runCmd() *cobra.Command {
 			if f.serverID, err = s.ResolveServerID(f.serverID); err != nil {
 				return err
 			}
-			cfg := f.config(s, logger)
+			cfg := f.config(s, logger, logBuffer)
 			cfg.Logger.Info("starting coordinator",
 				"listen", cfg.ListenAddr,
 				"serverID", cfg.ServerID,
@@ -173,7 +173,7 @@ func (f *coordinatorFlags) validate() error {
 	return nil
 }
 
-func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger) coordinator.Config {
+func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger, logBuffer *logging.Buffer) coordinator.Config {
 	return coordinator.Config{
 		Spec:              s,
 		ListenAddr:        f.listen,
@@ -192,6 +192,7 @@ func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger) coordinator
 		MaxResets:         f.maxResets,
 		ResetWindow:       f.resetWindow,
 		MetricsAddr:       f.metricsAddr,
+		LogBuffer:         logBuffer,
 		TLS:               grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA},
 		Logger:            logger,
 	}

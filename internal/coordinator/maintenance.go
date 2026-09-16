@@ -214,35 +214,53 @@ func (m *maintenanceScheduler) assignment(table string, ops []sink.MaintenanceOp
 }
 
 // recordResult folds one maintenance pass's reported outcome into the
-// coordinator's Prometheus registry. The pass ran in the worker's process,
-// which exits right after — its own /metrics is gone by the time Prometheus
-// would scrape it — so the counts are recorded here, mirroring how an Ack
-// drives CommitsTotal. A nil registry (no --metrics-addr) is a no-op.
+// coordinator's Prometheus registry and the dashboard's per-table aggregate.
+// The pass ran in the worker's process, which exits right after — its own
+// /metrics is gone by the time Prometheus would scrape it — so the counts are
+// recorded here, mirroring how an Ack drives CommitsTotal. Both sinks are
+// optional (a nil registry records no metrics; the aggregate is always kept).
 func (m *maintenanceScheduler) recordResult(table string, res *pb.MaintenanceResult) {
-	if m.c.metrics == nil {
-		return
-	}
+	now := time.Now()
 	for _, op := range res.Ops {
 		switch r := op.Op.(type) {
 		case *pb.MaintenanceOpResult_Compaction:
-			m.c.metrics.IcebergCompactionRuns.WithLabelValues(table).Inc()
-			if r.Compaction.Error == "" {
-				m.c.metrics.IcebergCompactionFilesRemoved.WithLabelValues(table).Add(float64(r.Compaction.FilesRemoved))
-				m.c.metrics.IcebergCompactionFilesAdded.WithLabelValues(table).Add(float64(r.Compaction.FilesAdded))
-				m.c.metrics.IcebergCompactionBytesBefore.WithLabelValues(table).Add(float64(r.Compaction.BytesBefore))
-				m.c.metrics.IcebergCompactionBytesAfter.WithLabelValues(table).Add(float64(r.Compaction.BytesAfter))
+			if m.c.metrics != nil {
+				m.c.metrics.IcebergCompactionRuns.WithLabelValues(table).Inc()
+				if r.Compaction.Error == "" {
+					m.c.metrics.IcebergCompactionFilesRemoved.WithLabelValues(table).Add(float64(r.Compaction.FilesRemoved))
+					m.c.metrics.IcebergCompactionFilesAdded.WithLabelValues(table).Add(float64(r.Compaction.FilesAdded))
+					m.c.metrics.IcebergCompactionBytesBefore.WithLabelValues(table).Add(float64(r.Compaction.BytesBefore))
+					m.c.metrics.IcebergCompactionBytesAfter.WithLabelValues(table).Add(float64(r.Compaction.BytesAfter))
+				}
 			}
+			m.c.recordMaintStats(table, "compaction", now, func(s *maintStats) {
+				s.filesRemoved += r.Compaction.FilesRemoved
+				s.filesAdded += r.Compaction.FilesAdded
+				s.bytesBefore += r.Compaction.BytesBefore
+				s.bytesAfter += r.Compaction.BytesAfter
+			})
 		case *pb.MaintenanceOpResult_Expiry:
-			m.c.metrics.IcebergSnapshotExpiryRuns.WithLabelValues(table).Inc()
-			if r.Expiry.Error == "" {
-				m.c.metrics.IcebergSnapshotExpirySnapshots.WithLabelValues(table).Add(float64(r.Expiry.SnapshotsRemoved))
+			if m.c.metrics != nil {
+				m.c.metrics.IcebergSnapshotExpiryRuns.WithLabelValues(table).Inc()
+				if r.Expiry.Error == "" {
+					m.c.metrics.IcebergSnapshotExpirySnapshots.WithLabelValues(table).Add(float64(r.Expiry.SnapshotsRemoved))
+				}
 			}
+			m.c.recordMaintStats(table, "snapshot_expiry", now, func(s *maintStats) {
+				s.snapshots += r.Expiry.SnapshotsRemoved
+			})
 		case *pb.MaintenanceOpResult_Orphan:
-			m.c.metrics.IcebergOrphanCleanupRuns.WithLabelValues(table).Inc()
-			if r.Orphan.Error == "" {
-				m.c.metrics.IcebergOrphanCleanupFiles.WithLabelValues(table).Add(float64(r.Orphan.FilesDeleted))
-				m.c.metrics.IcebergOrphanCleanupBytes.WithLabelValues(table).Add(float64(r.Orphan.BytesFreed))
+			if m.c.metrics != nil {
+				m.c.metrics.IcebergOrphanCleanupRuns.WithLabelValues(table).Inc()
+				if r.Orphan.Error == "" {
+					m.c.metrics.IcebergOrphanCleanupFiles.WithLabelValues(table).Add(float64(r.Orphan.FilesDeleted))
+					m.c.metrics.IcebergOrphanCleanupBytes.WithLabelValues(table).Add(float64(r.Orphan.BytesFreed))
+				}
 			}
+			m.c.recordMaintStats(table, "orphan_cleanup", now, func(s *maintStats) {
+				s.filesDeleted += r.Orphan.FilesDeleted
+				s.bytesFreed += r.Orphan.BytesFreed
+			})
 		}
 	}
 }
