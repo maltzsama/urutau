@@ -23,10 +23,20 @@ type Record struct {
 // unchanged while the last N lines stay available to the dashboard. Safe for
 // concurrent use.
 type Buffer struct {
-	mu   sync.Mutex
-	buf  []Record
-	next int
-	full bool
+	mu       sync.Mutex
+	buf      []Record
+	next     int
+	full     bool
+	onAppend func(Record)
+}
+
+// SetOnAppend installs a hook called after every record is appended (outside
+// the buffer lock). The dashboard uses it to push new log lines to its SSE
+// subscribers. Nil disables it.
+func (b *Buffer) SetOnAppend(f func(Record)) {
+	b.mu.Lock()
+	b.onAppend = f
+	b.mu.Unlock()
 }
 
 // NewBuffer returns a Buffer holding at most capacity records. A non-positive
@@ -39,14 +49,19 @@ func NewBuffer(capacity int) *Buffer {
 	return &Buffer{buf: make([]Record, capacity)}
 }
 
-// add appends one record, evicting the oldest once full.
+// add appends one record, evicting the oldest once full, then fires the append
+// hook (if any) outside the lock.
 func (b *Buffer) add(r Record) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.buf[b.next] = r
 	b.next = (b.next + 1) % len(b.buf)
 	if b.next == 0 {
 		b.full = true
+	}
+	f := b.onAppend
+	b.mu.Unlock()
+	if f != nil {
+		f(r)
 	}
 }
 

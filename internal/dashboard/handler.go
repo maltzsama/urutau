@@ -3,6 +3,7 @@ package dashboard
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -24,14 +25,15 @@ type logEntry struct {
 	Attrs map[string]any `json:"attrs,omitempty"`
 }
 
-// Handler serves the dashboard's JSON API and the embedded SPA. It reads
-// coordinator state through State and the coordinator's log tail through
-// LogSource; it never imports the coordinator.
+// Handler serves the dashboard's JSON API, the SSE stream, and the embedded
+// SPA. It reads coordinator state through State and the coordinator's log tail
+// through LogSource; it never imports the coordinator.
 type Handler struct {
 	state  State
 	events *Events
 	logs   LogSource
 	log    *slog.Logger
+	hub    *Hub
 }
 
 // New builds a Handler. logs may be nil (no log tail).
@@ -39,12 +41,12 @@ func New(state State, events *Events, logs LogSource, log *slog.Logger) *Handler
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Handler{state: state, events: events, logs: logs, log: log}
+	return &Handler{state: state, events: events, logs: logs, log: log, hub: NewHub()}
 }
 
-// Register mounts every route on mux: the /api/v1/* endpoints, the probes, and
-// the SPA catch-all. /metrics and /statusz are registered separately by the
-// caller and win over the catch-all (more specific patterns).
+// Register mounts every route on mux: the /api/v1/* endpoints, the SSE stream,
+// the probes, and the SPA catch-all. /metrics and /statusz are registered
+// separately by the caller and win over the catch-all (more specific patterns).
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/pipeline", h.pipeline)
 	mux.HandleFunc("GET /api/v1/tables", h.tables)
@@ -53,11 +55,47 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/workers/{name}", h.worker)
 	mux.HandleFunc("GET /api/v1/events", h.listEvents)
 	mux.HandleFunc("GET /api/v1/logs", h.listLogs)
+	mux.HandleFunc("GET /api/v1/stream", h.stream)
 	mux.HandleFunc("POST /api/v1/actions/cancel", h.cancel)
 	mux.HandleFunc("POST /api/v1/actions/restart/{worker}", h.restart)
 	mux.HandleFunc("GET /healthz", h.ok)
 	mux.HandleFunc("GET /readyz", h.ok)
 	mux.Handle("/", spaHandler())
+}
+
+// PublishState pushes the current pipeline/tables/workers snapshot to every
+// connected SSE subscriber. The coordinator calls it when that state changes
+// (an ack, a worker-metrics report, a maintenance result, a session change).
+func (h *Handler) PublishState() {
+	h.hub.Publish("state", h.statePayload())
+}
+
+// PublishEvent pushes one new event.
+func (h *Handler) PublishEvent(e Event) {
+	h.hub.Publish("event", e)
+}
+
+// PublishLog pushes one new coordinator log line.
+func (h *Handler) PublishLog(r logging.Record) {
+	h.hub.Publish("log", logEntryOf(r))
+}
+
+// statePayload is the pipeline/tables/workers snapshot shared by the SSE
+// "snapshot" and "state" events.
+func (h *Handler) statePayload() map[string]any {
+	return map[string]any{
+		"pipeline": h.state.Summary(),
+		"tables":   h.state.Tables(),
+		"workers":  h.state.Workers(),
+	}
+}
+
+// snapshot is the full state a subscriber receives on connect.
+func (h *Handler) snapshot() map[string]any {
+	snap := h.statePayload()
+	snap["events"] = h.events.List("", "", 200)
+	snap["logs"] = h.logTail(500)
+	return snap
 }
 
 func (h *Handler) pipeline(w http.ResponseWriter, _ *http.Request) {
@@ -112,14 +150,73 @@ func (h *Handler) listLogs(w http.ResponseWriter, r *http.Request) {
 	recs := h.logs.Tail(minLevel, queryInt(r, "limit", 500))
 	out := make([]logEntry, len(recs))
 	for i, rec := range recs {
-		out[i] = logEntry{
-			TS:    rec.Time.UTC().Format(time.RFC3339Nano),
-			Level: rec.Level.String(),
-			Msg:   rec.Message,
-			Attrs: jsonSafeAttrs(rec.Attrs),
-		}
+		out[i] = logEntryOf(rec)
 	}
 	writeJSON(w, out)
+}
+
+// logTail renders the last n log records as wire entries (nil with no source).
+func (h *Handler) logTail(n int) []logEntry {
+	if h.logs == nil {
+		return nil
+	}
+	recs := h.logs.Tail(slog.LevelDebug, n)
+	out := make([]logEntry, len(recs))
+	for i, rec := range recs {
+		out[i] = logEntryOf(rec)
+	}
+	return out
+}
+
+func logEntryOf(rec logging.Record) logEntry {
+	return logEntry{
+		TS:    rec.Time.UTC().Format(time.RFC3339Nano),
+		Level: rec.Level.String(),
+		Msg:   rec.Message,
+		Attrs: jsonSafeAttrs(rec.Attrs),
+	}
+}
+
+// stream is the Server-Sent Events endpoint: it sends a full snapshot on
+// connect and then forwards every state/event/log change until the client
+// goes away. The browser's EventSource reconnects on its own.
+func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // don't let a proxy buffer the stream
+
+	if b, err := json.Marshal(h.snapshot()); err == nil {
+		writeSSE(w, "snapshot", b)
+		flusher.Flush()
+	}
+
+	ch, unsubscribe := h.hub.Subscribe()
+	defer unsubscribe()
+	// A periodic comment keeps idle proxies from timing the stream out.
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case msg := <-ch:
+			writeSSE(w, msg.event, msg.data)
+			flusher.Flush()
+		case <-ticker.C:
+			_, _ = io.WriteString(w, ": ping\n\n")
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func writeSSE(w io.Writer, event string, data []byte) {
+	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
 }
 
 // jsonSafeAttrs recursively replaces values json.Marshal cannot encode (maps

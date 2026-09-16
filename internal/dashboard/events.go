@@ -33,9 +33,10 @@ func NewEvents(capacity int) *Events {
 	return &Events{buf: make([]Event, capacity)}
 }
 
-// Record captures one event. worker/table are lifted out of fields when
-// present; the rest stay as Fields for the UI's chips.
-func (e *Events) Record(kind string, fields map[string]any) {
+// Record captures one event and returns it, so the caller can publish it to
+// the SSE subscribers. worker/table are lifted out of fields when present;
+// the rest stay as Fields for the UI's chips.
+func (e *Events) Record(kind string, fields map[string]any) Event {
 	ev := Event{
 		TS:      time.Now().UTC().Format(time.RFC3339Nano),
 		Type:    kind,
@@ -55,6 +56,7 @@ func (e *Events) Record(kind string, fields map[string]any) {
 		e.full = true
 	}
 	e.mu.Unlock()
+	return ev
 }
 
 // List returns up to limit events, newest first, filtered by type and worker

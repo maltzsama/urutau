@@ -1,11 +1,15 @@
 package dashboard
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/maltzsama/urutau/internal/logging"
 )
@@ -119,5 +123,51 @@ func TestHandlerEndpoints(t *testing.T) {
 
 	if rec := do("GET", "/api/v1/workers/nope"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown worker = %d, want 404", rec.Code)
+	}
+}
+
+// The SSE stream must open with a full snapshot, so the SPA renders without a
+// separate fetch (and clears its loading state).
+func TestStreamSendsSnapshot(t *testing.T) {
+	st := &fakeState{
+		summary: PipelineSummary{Pipeline: "shop"},
+		tables:  []TableStatus{{Target: "raw.orders"}},
+	}
+	h := New(st, NewEvents(8), nil, slog.Default())
+	srv := httptest.NewServer(http.HandlerFunc(h.stream))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q, want text/event-stream", ct)
+	}
+
+	br := bufio.NewReader(resp.Body)
+	var got strings.Builder
+	for i := 0; i < 40; i++ {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			break
+		}
+		got.WriteString(line)
+		if line == "\n" {
+			break
+		}
+	}
+	if !strings.Contains(got.String(), "event: snapshot") {
+		t.Fatalf("stream did not start with a snapshot: %q", got.String())
+	}
+	if !strings.Contains(got.String(), `"pipeline":"shop"`) {
+		t.Fatalf("snapshot missing the pipeline: %q", got.String())
 	}
 }
