@@ -121,7 +121,7 @@ function app() {
       this.$nextTick(() => this.renderCharts());
     },
     themeLabel() {
-      return this.theme === 'auto' ? '◐ auto' : this.theme === 'light' ? '☀ light' : '☾ dark';
+      return 'Theme: ' + this.theme;
     },
 
     // ── data ──────────────────────────────────────────────────────────────
@@ -384,7 +384,10 @@ function app() {
     },
     renderCharts() {
       if (typeof Chart === 'undefined') return;
-      const grid = getComputedStyle(document.documentElement).getPropertyValue('--pico-muted-border-color') || '#ddd';
+      const css = (name, fallback) =>
+        (getComputedStyle(document.documentElement).getPropertyValue(name) || '').trim() || fallback;
+      const grid = css('--pico-muted-border-color', '#ddd');
+      const axis = css('--pico-muted-color', '#888');
       if (this.view === 'overview') {
         this.line('chart-throughput', [this.tail(this.history.throughput)], ['Throughput'], grid);
         const streams = this.filteredStreams().slice(0, 5);
@@ -413,7 +416,8 @@ function app() {
         plugins: { legend: { display: datasets.length > 1, labels: { boxWidth: 10 } } },
         scales: {
           x: { display: false },
-          y: { grid: { color: grid }, ticks: { color: grid } },
+          y: { beginAtZero: true, grid: { color: grid },
+               ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
         },
       };
       if (this.charts[id]) {
@@ -456,13 +460,18 @@ function app() {
           { label: 'Lag (s)', data: lag, borderColor: COLORS[2], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
         ],
       };
+      const css = (name, fallback) =>
+        (getComputedStyle(document.documentElement).getPropertyValue(name) || '').trim() || fallback;
+      const axis = css('--pico-muted-color', '#888');
       const opts = {
         responsive: true, maintainAspectRatio: false, animation: false,
         plugins: { legend: { display: true, labels: { boxWidth: 10 } } },
         scales: {
           x: { display: false },
-          y: { position: 'left', grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--pico-muted-border-color') } },
-          y1: { position: 'right', grid: { drawOnChartArea: false } },
+          y: { position: 'left', beginAtZero: true, grid: { color: css('--pico-muted-border-color', '#ddd') },
+               ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
+          y1: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false },
+                ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
         },
       };
       if (this.charts['chart-drawer']) {

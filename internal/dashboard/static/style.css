@@ -1,112 +1,136 @@
 /* Custom layer on top of Pico.css: only the pieces Pico does not cover.
-   Colors come from Pico's CSS variables, so light/dark just work. */
+   Colors come from Pico's CSS variables, so light/dark just work. Pico's
+   defaults are larger than a dense monitoring UI wants, so the base size and
+   the form/button spacing are dialed down here. */
 
-:root { --ok: #198754; --warn: #b7791f; --err: #c0392b; --accent: #2563eb; }
+:root {
+  --ok: #198754;
+  --warn: #b7791f;
+  --err: #c0392b;
+  --accent: #2563eb;
+  /* Pico scale-downs: base type + form controls (buttons/inputs inherit). */
+  --pico-font-size: 14px;
+  --pico-form-element-spacing-vertical: .4rem;
+  --pico-form-element-spacing-horizontal: .65rem;
+  --pico-border-radius: 6px;
+}
 [data-theme="dark"] { --ok: #4ade80; --warn: #fbbf24; --err: #f87171; --accent: #60a5fa; }
 
 .container { max-width: 1500px; }
 
+h1 { font-size: 1.25rem; }
+h2 { font-size: 1.05rem; }
+h3 { font-size: .95rem; }
+
 /* ── header / nav ─────────────────────────────────────────────────────── */
-.topbar { display: flex; gap: 20px; align-items: center; justify-content: space-between;
-  flex-wrap: wrap; margin-bottom: 16px; }
-.topbar h1 { margin: 0; font-size: 1.35rem; }
+.topbar { display: flex; gap: 16px; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; margin-bottom: 12px; }
+.topbar h1 { margin: 0; }
 .topline { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-.inline-copy { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; }
+.inline-copy { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; line-height: 1; }
 .mono { font-family: var(--pico-font-family-monospace, monospace); }
 .small { font-size: .78rem; }
 .muted { color: var(--pico-muted-color); }
 
 nav { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--pico-muted-border-color);
-  margin-bottom: 18px; }
-nav a { padding: 10px 14px; color: var(--pico-muted-color); border-bottom: 3px solid transparent;
-  text-decoration: none; }
+  margin-bottom: 14px; }
+nav a { padding: 7px 12px; color: var(--pico-muted-color); border-bottom: 3px solid transparent;
+  text-decoration: none; font-size: .88rem; }
 nav a.active { color: var(--pico-color); border-color: var(--accent); font-weight: 700; }
 
 /* ── pills / badges ───────────────────────────────────────────────────── */
-.pill, .badge { display: inline-flex; align-items: center; gap: 6px;
+.pill, .badge { display: inline-flex; align-items: center; gap: 5px;
   border: 1px solid var(--pico-muted-border-color); border-radius: 999px;
-  padding: 3px 9px; font-size: .75rem; font-weight: 650; white-space: nowrap; }
-.pill:before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  padding: 2px 8px; font-size: .72rem; font-weight: 650; white-space: nowrap; }
+.pill:before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .badge { background: var(--pico-card-background-color); }
 .green { color: var(--ok); } .amber { color: var(--warn); }
 .red { color: var(--err); } .gray { color: var(--pico-muted-color); }
 
 /* ── grids / cards ────────────────────────────────────────────────────── */
-.grid { display: grid; gap: 14px; }
+.grid { display: grid; gap: 12px; }
 .kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .streamgrid, .workgrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.section { margin-top: 20px; }
+.section { margin-top: 16px; }
 .sectionhead { display: flex; justify-content: space-between; align-items: center; gap: 12px;
-  margin-bottom: 10px; flex-wrap: wrap; }
-.sectionhead h2 { margin: 0; font-size: 1.1rem; }
+  margin-bottom: 8px; flex-wrap: wrap; }
+.sectionhead h2 { margin: 0; }
 
 .card { margin: 0; }
 .card.clickable { cursor: pointer; }
-.kpi .label { font-size: .68rem; text-transform: uppercase; letter-spacing: .08em;
+.kpi .label { font-size: .66rem; text-transform: uppercase; letter-spacing: .07em;
   color: var(--pico-muted-color); font-weight: 750; }
-.hero { font-size: 1.8rem; font-weight: 750; letter-spacing: -.03em;
-  font-variant-numeric: tabular-nums; margin: 6px 0; }
-.delta { font-size: .75rem; }
-.spark { height: 34px; margin-top: 8px; }
+.hero { font-size: 1.5rem; font-weight: 750; letter-spacing: -.03em;
+  font-variant-numeric: tabular-nums; margin: 4px 0; }
+.delta { font-size: .73rem; }
+.spark { height: 30px; margin-top: 6px; }
 .metricline { display: flex; justify-content: space-between; gap: 8px;
-  color: var(--pico-muted-color); font-size: .82rem; margin-top: 4px; }
+  color: var(--pico-muted-color); font-size: .8rem; margin-top: 3px; }
 .metricline strong { color: var(--pico-color); }
 .row { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
-.bar { height: 7px; border-radius: 99px; background: var(--pico-muted-border-color);
-  overflow: hidden; margin-top: 8px; }
+.bar { height: 6px; border-radius: 99px; background: var(--pico-muted-border-color);
+  overflow: hidden; margin-top: 6px; }
 .bar > i { display: block; height: 100%; background: var(--ok); }
 
 /* ── charts / tables ──────────────────────────────────────────────────── */
-.chart { height: 230px; position: relative; }
+.chart { height: 220px; position: relative; }
 .tablewrap { overflow: auto; }
 
 /* ── banner / toolbar / actions ───────────────────────────────────────── */
-.banner { border: 1px solid var(--pico-muted-border-color); border-left: 5px solid var(--ok);
-  background: var(--pico-card-background-color); padding: 12px 16px; border-radius: 10px;
+.banner { border: 1px solid var(--pico-muted-border-color); border-left: 4px solid var(--ok);
+  background: var(--pico-card-background-color); padding: 10px 14px; border-radius: 8px;
   display: flex; justify-content: space-between; gap: 12px; align-items: center;
-  margin-bottom: 16px; flex-wrap: wrap; }
+  margin-bottom: 12px; flex-wrap: wrap; }
 .banner.warn { border-left-color: var(--warn); }
 .banner.fail { border-left-color: var(--err); }
-.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .actions.end { justify-content: flex-end; }
-.toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.toolbar input { flex: 1; min-width: 160px; margin: 0; }
+.toolbar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.toolbar input, .toolbar select { margin: 0; font-size: .82rem; }
+.toolbar input { flex: 1; min-width: 150px; }
+
+/* ── buttons: compact, and the variants Pico does not color ───────────── */
+button, .button { font-size: .82rem; padding: .38rem .7rem; }
+button.danger { background: var(--err); border-color: var(--err); color: #fff; }
+button.danger:hover { filter: brightness(.92); }
+button.warning { background: var(--warn); border-color: var(--warn); color: #fff; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 /* ── events / logs ────────────────────────────────────────────────────── */
-.event { border: 1px solid var(--pico-muted-border-color); border-left: 4px solid var(--pico-muted-border-color);
-  background: var(--pico-card-background-color); padding: 10px 12px; border-radius: 8px;
-  margin-bottom: 8px; }
+.event { border: 1px solid var(--pico-muted-border-color); border-left: 3px solid var(--pico-muted-border-color);
+  background: var(--pico-card-background-color); padding: 8px 11px; border-radius: 6px;
+  margin-bottom: 6px; }
 .event.error { border-left-color: var(--err); }
 .event.warning { border-left-color: var(--warn); }
-.event .msg { margin-top: 4px; }
+.event .msg { margin-top: 3px; }
 
 /* ── copy button / theme toggle ───────────────────────────────────────── */
-.copy-btn { width: auto; min-width: 34px; height: 34px; padding: 0 8px;
-  display: inline-grid; place-items: center; border-radius: 9px;
+.copy-btn { width: auto; min-width: 22px; height: 22px; padding: 0 6px;
+  display: inline-grid; place-items: center; border-radius: 6px; font-size: .72rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
-  color: var(--pico-muted-color); cursor: pointer; }
+  color: var(--pico-muted-color); cursor: pointer; line-height: 1; }
 .copy-btn:hover { color: var(--pico-color); }
-.theme-toggle { width: auto; padding: 4px 10px; border-radius: 999px; font-size: .75rem;
+.theme-toggle { width: auto; padding: 3px 9px; border-radius: 999px; font-size: .74rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
   color: var(--pico-color); cursor: pointer; }
 
 /* ── drawer / modal / toast ───────────────────────────────────────────── */
 .overlay { position: fixed; inset: 0; background: #0008; display: flex; align-items: stretch;
   justify-content: flex-end; z-index: 50; }
-.drawer { width: min(650px, 100%); background: var(--pico-background-color); padding: 22px;
+.drawer { width: min(620px, 100%); background: var(--pico-background-color); padding: 18px;
   overflow: auto; border-left: 1px solid var(--pico-muted-border-color); }
 .modal { position: fixed; inset: 0; background: #0008; display: flex; align-items: center;
   justify-content: center; z-index: 60; padding: 20px; }
 .modalbox { background: var(--pico-background-color); border: 1px solid var(--pico-muted-border-color);
-  border-radius: 12px; padding: 22px; max-width: 480px; width: 100%; }
+  border-radius: 10px; padding: 18px; max-width: 440px; width: 100%; }
 .toast { position: fixed; right: 20px; bottom: 20px; background: var(--pico-color);
-  color: var(--pico-background-color); padding: 12px 16px; border-radius: 8px; z-index: 70; }
+  color: var(--pico-background-color); padding: 10px 14px; border-radius: 6px; z-index: 70; }
 
 footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-  border-top: 1px solid var(--pico-muted-border-color); margin-top: 28px; padding: 16px 0;
-  color: var(--pico-muted-color); font-size: .78rem; }
+  border-top: 1px solid var(--pico-muted-border-color); margin-top: 24px; padding: 14px 0;
+  color: var(--pico-muted-color); font-size: .76rem; }
 
 [x-cloak] { display: none !important; }
 

@@ -124,12 +124,18 @@
       </article>
     </div>
 
-    <section class="card section" x-show="summary.maintenance_enabled">
+    <section class="card section">
       <div class="sectionhead">
         <div><h2>Maintenance</h2><div class="small muted">Iceberg housekeeping · coordinator-reported totals</div></div>
-        <button @click="setView('streams')">View streams →</button>
+        <div class="topline">
+          <span class="badge" x-text="summary.maintenance_enabled ? 'enabled' : 'disabled'"></span>
+          <button @click="setView('streams')">View streams →</button>
+        </div>
       </div>
-      <div class="grid three" x-show="maintenance()">
+      <div class="muted small" x-show="!summary.maintenance_enabled">
+        Maintenance is off for this pipeline. Enable <code>sink.maintenance</code> to run compaction, snapshot expiry and orphan cleanup.
+      </div>
+      <div class="grid three" x-show="summary.maintenance_enabled && maintenance()">
         <div class="card" x-show="maintenance().compaction">
           <div class="row"><span class="small muted">COMPACTION</span>
             <span class="badge" x-text="maintenance().compaction?.runs + ' runs'"></span></div>
@@ -310,13 +316,14 @@
   </section>
 
   <footer>
-    <span>urutau coordinator</span>
+    <span>urutau coordinator ·
+      <a href="https://github.com/maltzsama/urutau" target="_blank" rel="noopener">GitHub</a></span>
     <span><a href="/metrics">/metrics</a> · <a href="/statusz">/statusz</a></span>
   </footer>
 </main>
 
 <!-- Stream detail drawer -->
-<div class="overlay" x-show="drawer.open" @click.self="drawer.open = false">
+<div class="overlay" x-show="drawer.open" x-cloak @click.self="drawer.open = false">
   <aside class="drawer">
     <div class="row">
       <h2 x-text="drawerTable() ? drawerTable().source + ' → ' + drawerTable().target : 'Details'"></h2>
@@ -353,7 +360,7 @@
 </div>
 
 <!-- Confirmation modal -->
-<div class="modal" x-show="modal.open">
+<div class="modal" x-show="modal.open" x-cloak @click.self="modal.open = false">
   <div class="modalbox">
     <h2 x-text="modal.title"></h2>
     <p class="muted" x-text="modal.text"></p>
@@ -365,7 +372,7 @@
   </div>
 </div>
 
-<div class="toast" x-show="toastMsg" x-text="toastMsg" role="status"></div>
+<div class="toast" x-show="toastMsg" x-cloak x-text="toastMsg" role="status"></div>
 
 <script defer src="/vendor/chart.umd.min.js"></script>
 <script defer src="/app.js"></script>
