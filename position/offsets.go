@@ -9,9 +9,10 @@ import (
 )
 
 // Offsets is a Kafka consumer position: one topic with per-partition
-// offsets. It implements Position with partial ordering — two positions
-// are comparable only when they share the same topic and partition set.
-// The wire form is JSON; the canonical text form is
+// offsets. It implements Position with a PARTIAL order — two positions of
+// the same topic are ordered only when one contains the other; positions
+// whose partitions diverge are Incomparable, and Meet gives their greatest
+// lower bound. The wire form is JSON; the canonical text form is
 // "topic:p0=10,p1=20".
 type Offsets struct {
 	Topic string
@@ -68,30 +69,63 @@ func (o *Offsets) String() string {
 	return b.String()
 }
 
-// Compare implements a total order for Offsets to satisfy the Position
-// interface. Offsets with different topics are compared lexicographically
-// on topic name — an artificial order with no semantic meaning. Within the
-// same topic, the position with the higher maximum partition offset is
-// greater. This is a heuristic: two positions with different partition
-// sets but the same maxOffset are treated as equal. For correctness
-// decisions (e.g. "does this position cover that one?"), use Contains
-// instead of Compare.
+// Compare implements the PARTIAL order of Offsets: containment. A position
+// is greater when it contains the other (every partition at or beyond the
+// other's offset), and the two are equal when each contains the other.
+// Anything else has no defined order and returns Incomparable — notably two
+// positions whose partitions diverge ({p0:100,p1:5} vs {p0:5,p1:100}), and
+// any two positions of different topics.
+//
+// It does NOT fall back to the maximum partition offset. That heuristic
+// reported 0 for divergent positions, which made covered() (coordinator/
+// flow.go) treat an uncovered batch as covered and skip data that was never
+// replayed. Incomparable is the value every caller already handles as
+// "cannot decide — never skip".
+//
+// Because the order is partial, Min/MinSafe cannot pick a safe minimum by
+// selection alone; Meet computes the greatest lower bound instead.
 func (o *Offsets) Compare(other Position) int {
 	oth, ok := other.(*Offsets)
 	if !ok {
 		panic(fmt.Sprintf("position: cannot compare Offsets to %T", other))
 	}
 	if o.Topic != oth.Topic {
-		return strings.Compare(o.Topic, oth.Topic)
+		return Incomparable
 	}
-	diff := o.maxOffset() - oth.maxOffset()
-	if diff > 0 {
+	switch fwd, rev := o.Contains(oth), oth.Contains(o); {
+	case fwd && rev:
+		return 0
+	case fwd:
 		return 1
-	}
-	if diff < 0 {
+	case rev:
 		return -1
+	default:
+		return Incomparable
 	}
-	return 0
+}
+
+// Meet returns the greatest lower bound of o and other: the per-partition
+// minimum offset. It is the only safe resume point when two partitioned
+// positions diverge — selecting either one would resume PAST the partitions
+// where the other is behind, and that data would never be read.
+//
+// A partition missing from one side is absent from the meet: an unknown
+// offset cannot be bounded, so the resume must not assume progress on it.
+// Offsets of different topics have no meet.
+func (o *Offsets) Meet(other Position) (Position, bool) {
+	oth, ok := other.(*Offsets)
+	if !ok || o.Topic != oth.Topic {
+		return nil, false
+	}
+	parts := make(map[int32]int64, len(o.Parts))
+	for p, mine := range o.Parts {
+		theirs, ok := oth.Parts[p]
+		if !ok {
+			continue
+		}
+		parts[p] = min(mine, theirs)
+	}
+	return &Offsets{Topic: o.Topic, Parts: parts}, true
 }
 
 // Contains returns true when o's offsets are all at least as large as
@@ -111,16 +145,6 @@ func (o *Offsets) Contains(other Position) bool {
 		}
 	}
 	return true
-}
-
-func (o *Offsets) maxOffset() int64 {
-	var mx int64
-	for _, off := range o.Parts {
-		if off > mx {
-			mx = off
-		}
-	}
-	return mx
 }
 
 // MarshalJSON serializes the offsets as a JSON object.
