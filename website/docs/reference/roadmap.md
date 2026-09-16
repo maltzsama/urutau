@@ -27,8 +27,9 @@ silently — they're tracked, not forgotten.
 parent-child shard lineage is a position-contract problem Kafka doesn't
 have, and it isn't modeled yet.
 
-**Post-0.1.0 sync modes** (`incremental`, `backfill-only`) — declared as a
-future part of the contract, not implemented.
+**Incremental and backfill-only sync modes** (`incremental`,
+`backfill-only`) — declared as a future part of the contract, not
+implemented.
 
 Nested canonical types (`Struct`/`List`/`Map`), `KindFixedBinary`, the
 Kafka `raw`/Confluent-Avro decoders, transport-native metadata columns,
