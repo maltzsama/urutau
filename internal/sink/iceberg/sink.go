@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 
 	"github.com/apache/iceberg-go/catalog"
@@ -11,6 +12,7 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/sink"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // Sink adapts the Iceberg REST catalog to the neutral sink.Sink contract. It
@@ -95,6 +97,28 @@ func (s *Sink) Close() error { return nil }
 // unit (CommitStaged), so no worker writes cdc.position and the last writer
 // no longer wins.
 func (s *Sink) SupportsConcurrentWriters() bool { return true }
+
+// Sink is the only sink that supports background table maintenance today.
+var _ sink.Maintainable = (*Sink)(nil)
+
+// Maintainer implements sink.Maintainer (just Run) — the orchestration only
+// ever calls that one method through the interface.
+var _ sink.Maintainer = (*Maintainer)(nil)
+
+// Maintain implements sink.Maintainable: it builds a Maintainer for one
+// target table, so the runner and coordinator can launch background
+// compaction/snapshot-expiry/orphan-cleanup through the neutral sink
+// contract, never importing this package directly (the architecture wall
+// internal/architecture enforces). cat/ident stay private, per the Sink type
+// doc. currentPosition and metrics are passed straight through to
+// NewMaintainer — see its doc for what a nil value means for each. Callers
+// are responsible for running `go m.Run(ctx)` and for only calling this when
+// Maintenance is non-nil and Enabled (Maintainer.Run itself already no-ops
+// on a disabled config, but callers should not pay for a goroutine per table
+// when maintenance is off entirely).
+func (s *Sink) Maintain(ref core.TableRef, cfg spec.Maintenance, log *slog.Logger, currentPosition func() string, metrics sink.MaintainerMetrics) sink.Maintainer {
+	return NewMaintainer(s.cat, s.ident(ref.Target), cfg, log, currentPosition, metrics)
+}
 
 func init() {
 	factory := func(ctx context.Context, cfg sink.Config) (sink.Sink, error) {
