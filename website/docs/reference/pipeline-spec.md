@@ -50,6 +50,10 @@ See [Sources](sources.md) for driver-specific behavior.
 | `commitMode` | couchbase | `fast` (default) or `atomic` |
 | `defaults.writeMode` | no | Pipeline-wide `writeMode` default |
 | `defaults.targetFileSize` | no | Target data-file size |
+| `maintenance.enabled` | no | Background Iceberg table maintenance. `false` by default — omitting the whole `maintenance` block, or leaving `enabled` unset, is the same as `false` |
+| `maintenance.compaction.interval` / `.targetFileSize` / `.minInputFiles` | no | Small-file compaction. Defaults `5m` / `512Mi` / `5` |
+| `maintenance.snapshotExpiry.interval` / `.retainLast` / `.maxAge` | no | Snapshot history pruning. Defaults `10m` / `1` / `168h`. `maxAge` is a safety window, not just a retention count — see [Sinks](sinks.md#table-maintenance) |
+| `maintenance.orphanCleanup.interval` / `.olderThan` | no | Unreferenced-file deletion. Defaults `1h` / `72h` |
 
 See [Sinks](sinks.md) for each sink's semantics and limits.
 

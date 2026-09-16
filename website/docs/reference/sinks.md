@@ -20,6 +20,61 @@ round-trip correctly (proven end to end against a real catalog + Trino).
 at write time. Cast a `Map` column to `string` (JSON) until iceberg-go
 fixes this upstream.
 
+### Table maintenance
+
+`sink.maintenance` runs background compaction, snapshot expiry, and orphan
+file cleanup, one goroutine per target table, disabled by default:
+
+```yaml
+sink:
+  maintenance:
+    enabled: true
+    compaction:
+      interval: 5m
+      targetFileSize: 512Mi
+      minInputFiles: 5
+    snapshotExpiry:
+      interval: 10m
+      retainLast: 1
+      maxAge: 168h
+    orphanCleanup:
+      interval: 1h
+      olderThan: 72h
+```
+
+Each sub-block is independently optional — a table declaring only
+`snapshotExpiry` never runs compaction or orphan cleanup.
+
+**Compaction** rewrites small files into `targetFileSize`-sized ones once a
+partition group has at least `minInputFiles` candidates. It needs no
+safety window: a concurrent CDC commit that deletes a row in a file being
+rewritten is caught by `iceberg-go`'s own rewrite conflict validator, and
+the same retry path an ordinary commit uses resolves it — this holds for
+both `upsert` and `append` tables (an append-only table never produces
+delete files, so there is nothing to conflict with in the first place).
+Every compaction commit also re-attaches the table's current `cdc.position`
+property, so resume stays on the O(1) fast path instead of falling back to
+the snapshot-summary walk-back.
+
+**Snapshot expiry**'s `maxAge` is the one setting in this feature that is a
+genuine safety window, not just a retention knob. It protects the
+`cdc.position` **table property** (the fast-resume path above) from being
+pruned before a stopped pipeline has had a chance to recover: expiring the
+snapshot that carries the only surviving copy of that property can strand
+recovery, or resume further ahead than what was actually committed. Set
+`maxAge` to cover the longest downtime you're willing to tolerate before
+giving up on resuming from where the pipeline left off — this applies
+identically to `upsert` and `append` tables.
+
+**Orphan cleanup**'s `olderThan` is a different, narrower safety window: it
+protects a file a concurrent read or in-flight commit might still
+reference, using `iceberg-go`'s own default (`72h`) unless overridden.
+
+The three operations serialize against each other per table: a tick that
+fires while a sibling operation is still running queues instead of racing
+the catalog directly, so a long compaction pass never turns a
+shorter-interval `snapshotExpiry` tick into a wasted failed attempt.
+
 ## ClickHouse
 
 Upsert via `ReplacingMergeTree(seq, is_deleted)` (`ORDER BY` the declared
