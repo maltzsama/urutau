@@ -368,50 +368,6 @@ func (w *Worker) KnownSchema(target string) core.Schema {
 	return p.knownSchema
 }
 
-// checkDrift compares an incoming row's columns against the known schema,
-// recursing into struct columns. It returns the first drifted path (with its
-// full dotted name, e.g. "address.complement") and whether drift was found.
-func checkDrift(after map[string]any, schema core.Schema) (SchemaDrift, bool) {
-	for name, v := range after {
-		col, ok := schema.Column(name)
-		if !ok {
-			return SchemaDrift{Column: name, Kind: "added"}, true
-		}
-		if col.Type.Kind == core.KindStruct {
-			if nested, isMap := v.(map[string]any); isMap {
-				if d, hit := checkDriftNested(name, nested, col.Type.Fields); hit {
-					return d, true
-				}
-			}
-		}
-	}
-	return SchemaDrift{}, false
-}
-
-// checkDriftNested descends one level into a struct value, comparing its
-// keys against the struct's declared fields.
-func checkDriftNested(path string, m map[string]any, fields []core.Column) (SchemaDrift, bool) {
-	for name, v := range m {
-		full := path + "." + name
-		var f *core.Column
-		for i := range fields {
-			if fields[i].Name == name {
-				f = &fields[i]
-				break
-			}
-		}
-		if f == nil {
-			return SchemaDrift{Column: full, Kind: "added"}, true
-		}
-		if f.Type.Kind == core.KindStruct {
-			if nested, isMap := v.(map[string]any); isMap {
-				return checkDriftNested(full, nested, f.Type.Fields)
-			}
-		}
-	}
-	return SchemaDrift{}, false
-}
-
 // SchemaDrift is emitted when the batcher detects a column in the change
 // stream that was not present at introspection time.
 type SchemaDrift struct {
@@ -1096,6 +1052,12 @@ func rowHasImage(r *transport.BatchReader, nonPK []string, i int) bool {
 // artifact of schema merging (e.g. a reference column declared but not yet
 // populated), not a source column; only a column the batch actually
 // populates counts as drift.
+//
+// Declared struct columns are descended into: a field added INSIDE a struct
+// is drift too, reported by its dotted path ("address.complement"). Without
+// that, a nested addition was silently dropped while an equivalent
+// top-level column stopped the table — the opposite of the fail-closed
+// contract, and invisible to the operator.
 func schemaDrift(b *dataplane.Batch, schema core.Schema) (SchemaDrift, bool, error) {
 	rec := b.Record
 	for i := range rec.Schema().NumFields() {
@@ -1103,16 +1065,75 @@ func schemaDrift(b *dataplane.Batch, schema core.Schema) (SchemaDrift, bool, err
 		if isMetadataName(name) {
 			continue
 		}
-		if _, ok := schema.Column(name); ok {
+		col := rec.Column(i)
+		declared, ok := schema.Column(name)
+		if !ok {
+			if col.IsNull(0) {
+				continue // padding artifact — no source value, no drift
+			}
+			return SchemaDrift{Column: name, Kind: "added"}, true, nil
+		}
+		if declared.Type.Kind != core.KindStruct {
 			continue
 		}
-		col := rec.Column(i)
-		if col.IsNull(0) {
-			continue // padding artifact — no source value, no drift
+		st, ok := col.(*array.Struct)
+		if !ok {
+			continue // declared a struct but not carried as one: a cast concern
 		}
-		return SchemaDrift{Column: name, Kind: "added"}, true, nil
+		if d, hit := nestedDrift(name, st, declared.Type.Fields); hit {
+			return d, true, nil
+		}
 	}
 	return SchemaDrift{}, false, nil
+}
+
+// nestedDrift descends one struct level, comparing the record's child fields
+// against the declared ones and recursing into declared child structs. path
+// is the dotted prefix of the struct being descended.
+//
+// The null rule matches the top level: an all-null extra field is padding,
+// not a source value.
+//
+// The leading null-struct check is defensive. A builder nulls a struct's
+// children along with the parent, so the per-field check below already
+// covers that case; but Arrow permits a null parent over populated child
+// buffers, and those values belong to no row.
+func nestedDrift(path string, st *array.Struct, declared []core.Column) (SchemaDrift, bool) {
+	if st.IsNull(0) {
+		return SchemaDrift{}, false
+	}
+	stType, ok := st.DataType().(*arrow.StructType)
+	if !ok {
+		return SchemaDrift{}, false
+	}
+	for i, f := range stType.Fields() {
+		full := path + "." + f.Name
+		child := st.Field(i)
+		var decl *core.Column
+		for j := range declared {
+			if declared[j].Name == f.Name {
+				decl = &declared[j]
+				break
+			}
+		}
+		if decl == nil {
+			if child.IsNull(0) {
+				continue // padding artifact — no source value, no drift
+			}
+			return SchemaDrift{Column: full, Kind: "added"}, true
+		}
+		if decl.Type.Kind != core.KindStruct {
+			continue
+		}
+		nested, ok := child.(*array.Struct)
+		if !ok {
+			continue
+		}
+		if d, hit := nestedDrift(full, nested, decl.Type.Fields); hit {
+			return d, true
+		}
+	}
+	return SchemaDrift{}, false
 }
 
 // isMetadataName reports the reserved wire metadata columns.
