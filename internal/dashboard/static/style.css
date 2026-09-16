@@ -109,11 +109,11 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .event .msg { margin-top: 3px; }
 
 /* ── copy button / theme toggle ───────────────────────────────────────── */
-.copy-btn { width: auto; min-width: 22px; height: 22px; padding: 0 6px; margin: 0;
-  display: inline-grid; place-items: center; border-radius: 6px; font-size: .72rem;
+.copy-btn { width: auto; min-width: 28px; height: 28px; padding: 0 8px; margin: 0;
+  display: inline-grid; place-items: center; border-radius: 6px; font-size: .9rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
-  color: var(--pico-muted-color); cursor: pointer; line-height: 1; }
-.copy-btn:hover { color: var(--pico-color); }
+  color: var(--pico-color); cursor: pointer; line-height: 1; }
+.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
 .theme-toggle { width: auto; padding: 3px 9px; margin: 0; border-radius: 999px; font-size: .74rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
   color: var(--pico-color); cursor: pointer; }

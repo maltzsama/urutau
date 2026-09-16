@@ -351,9 +351,28 @@ function app() {
     },
     copy(s) {
       if (!s) return;
-      navigator.clipboard?.writeText(String(s))
-        .then(() => this.toast('Copied'))
-        .catch(() => this.toast('Copy unavailable'));
+      const text = String(s);
+      const ok = () => this.toast('Copied');
+      const bad = () => this.toast('Copy unavailable');
+      // navigator.clipboard is only available in a secure context (HTTPS or
+      // localhost); on plain HTTP fall back to a temp textarea + execCommand.
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(ok).catch(bad);
+        return;
+      }
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      try {
+        document.execCommand('copy') ? ok() : bad();
+      } catch (_) {
+        bad();
+      }
+      document.body.removeChild(ta);
     },
 
     // ── formatting ────────────────────────────────────────────────────────
