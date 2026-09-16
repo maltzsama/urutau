@@ -99,6 +99,91 @@ type Sink struct {
 	// control document in a distributed transaction, closing the recovery
 	// window at the cost of transaction overhead per batch.
 	CommitMode CommitMode `json:"commitMode,omitempty"`
+	// Maintenance configures background Iceberg table maintenance
+	// (compaction, snapshot expiry, orphan cleanup). Iceberg-only: ignored
+	// by every other sink. Nil disables it entirely.
+	Maintenance *Maintenance `json:"maintenance,omitempty"`
+}
+
+// MaintenanceEnabled reports whether the operator turned maintenance on.
+// Disabled by default in both ways a spec can express that: no maintenance
+// block at all (Maintenance is nil — the ordinary case, since no existing
+// spec fixture mentions the key), or a block present but Enabled left at
+// its bool zero value (false). The runner and coordinator both gate their
+// Maintainer goroutine on this exact call, so a change here changes both.
+func (s Sink) MaintenanceEnabled() bool {
+	return s.Maintenance != nil && s.Maintenance.Enabled
+}
+
+// Maintenance enables and configures the three Iceberg table-maintenance
+// operations. Each sub-config is independently optional: a nil one disables
+// that operation while leaving the others active.
+type Maintenance struct {
+	Enabled        bool                  `json:"enabled,omitempty"`
+	Compaction     *CompactionConfig     `json:"compaction,omitempty"`
+	SnapshotExpiry *SnapshotExpiryConfig `json:"snapshotExpiry,omitempty"`
+	OrphanCleanup  *OrphanCleanupConfig  `json:"orphanCleanup,omitempty"`
+}
+
+// CompactionConfig tunes small-file compaction (iceberg-go
+// table/compaction.Config.PlanCompaction + Transaction.RewriteDataFiles).
+// There is no safety-window field here: a concurrent CDC commit that
+// deletes a row in a file being rewritten is caught by iceberg-go's own
+// rewrite conflict validator, which the retry loop already handles the same
+// way it handles any other commit conflict — no time-based avoidance is
+// needed, in either write mode. See issue #96 for the analysis (append-only
+// tables never produce delete files, so there is no conflict surface to
+// protect there either).
+type CompactionConfig struct {
+	// Interval between compaction runs. Go duration syntax. Default "5m".
+	Interval string `json:"interval,omitempty"`
+	// TargetFileSize is the desired output file size after compaction, e.g.
+	// "512Mi". Default "512Mi" (iceberg-go's own default).
+	TargetFileSize string `json:"targetFileSize,omitempty"`
+	// MinInputFiles is the minimum number of small files in a partition
+	// group before compaction rewrites it. Default 5. 0 also means
+	// "unset, use the default" — omitempty means the wire form cannot
+	// distinguish an explicit 0 from an absent field, so "compact every
+	// group down to a single file" is not expressible here. Use 1 for
+	// "almost always compact" if that is the intent.
+	MinInputFiles uint `json:"minInputFiles,omitempty"`
+}
+
+// SnapshotExpiryConfig tunes snapshot history pruning
+// (Transaction.ExpireSnapshots). This is the ONE operation in Maintenance
+// that needs an operator-chosen safety window: expiring the snapshot that
+// carries the only surviving cdc.position table property, before a crashed
+// pipeline has had a chance to recover, can strand position recovery or
+// resume from a point further ahead than what was actually committed. This
+// applies identically in append-only and upsert mode — the position
+// property is written the same way in both.
+//
+// MaxAge (and RetainLast) together ARE that window: set it to cover the
+// worst-case time your pipeline could be down before you give up on
+// resuming it from where it left off, not just "how much snapshot history
+// to keep for time-travel queries."
+type SnapshotExpiryConfig struct {
+	// Interval between expiry runs. Go duration syntax. Default "10m".
+	Interval string `json:"interval,omitempty"`
+	// RetainLast is the minimum number of snapshots kept regardless of age.
+	// Default 1.
+	RetainLast int `json:"retainLast,omitempty"`
+	// MaxAge is the safety window described above: no snapshot younger than
+	// this is ever expired. Go duration syntax. Default "168h" (7 days).
+	MaxAge string `json:"maxAge,omitempty"`
+}
+
+// OrphanCleanupConfig tunes unreferenced-file removal (Table.DeleteOrphanFiles).
+// OlderThan is iceberg-go's own native safety window: it protects against
+// deleting a file a concurrent read or in-flight commit might still
+// reference, which is a different hazard than SnapshotExpiryConfig.MaxAge
+// (that one protects position recovery, not file references).
+type OrphanCleanupConfig struct {
+	// Interval between cleanup runs. Go duration syntax. Default "1h".
+	Interval string `json:"interval,omitempty"`
+	// OlderThan: only files older than this are eligible for deletion. Go
+	// duration syntax. Default "72h" (3 days) — iceberg-go's own default.
+	OlderThan string `json:"olderThan,omitempty"`
 }
 
 // CommitMode is the data-vs-position commit sequencing selector.

@@ -113,6 +113,12 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	default:
 		problems = append(problems, fmt.Sprintf("sink.commitMode: unknown %q (fast | atomic)", s.Sink.CommitMode))
 	}
+	if s.Sink.Defaults.TargetFileSize != "" {
+		if _, err := ParseBytes(s.Sink.Defaults.TargetFileSize); err != nil {
+			problems = append(problems, fmt.Sprintf("sink.defaults.targetFileSize: %v", err))
+		}
+	}
+	validateMaintenance(s.Sink.Maintenance, &problems)
 
 	if len(s.Tables) == 0 {
 		problems = append(problems, "tables: at least one required")
@@ -560,6 +566,90 @@ func validateFilter(f *Filter, path string, problems *[]string) {
 	if count > 1 {
 		*problems = append(*problems, fmt.Sprintf("%s: %v", path, ErrAmbiguousFilterNode))
 	}
+}
+
+// validateMaintenance checks Sink.Maintenance's duration and size strings.
+// A nil Maintenance or a nil sub-config disables that operation — nothing
+// to validate. Interval/duration/age defaults are applied at the point of
+// use (the Maintainer), not here: Validate only rejects malformed strings.
+func validateMaintenance(m *Maintenance, problems *[]string) {
+	if m == nil {
+		return
+	}
+	if c := m.Compaction; c != nil {
+		if c.Interval != "" {
+			if _, err := time.ParseDuration(c.Interval); err != nil {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.compaction.interval: %q is not a duration (e.g. 5m)", c.Interval))
+			}
+		}
+		if c.TargetFileSize != "" {
+			if _, err := ParseBytes(c.TargetFileSize); err != nil {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.compaction.targetFileSize: %v", err))
+			}
+		}
+	}
+	if e := m.SnapshotExpiry; e != nil {
+		if e.Interval != "" {
+			if _, err := time.ParseDuration(e.Interval); err != nil {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.snapshotExpiry.interval: %q is not a duration (e.g. 10m)", e.Interval))
+			}
+		}
+		if e.MaxAge != "" {
+			if _, err := time.ParseDuration(e.MaxAge); err != nil {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.snapshotExpiry.maxAge: %q is not a duration (e.g. 168h)", e.MaxAge))
+			}
+		}
+		if e.RetainLast < 0 {
+			*problems = append(*problems, "sink.maintenance.snapshotExpiry.retainLast: must be positive")
+		}
+	}
+	if o := m.OrphanCleanup; o != nil {
+		if o.Interval != "" {
+			if _, err := time.ParseDuration(o.Interval); err != nil {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.orphanCleanup.interval: %q is not a duration (e.g. 1h)", o.Interval))
+			}
+		}
+		if o.OlderThan != "" {
+			if _, err := time.ParseDuration(o.OlderThan); err != nil {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.orphanCleanup.olderThan: %q is not a duration (e.g. 72h)", o.OlderThan))
+			}
+		}
+	}
+}
+
+// byteUnits are the binary (Ki/Mi/Gi/Ti) suffixes ParseBytes accepts, in the
+// same style as sink.defaults.targetFileSize's existing "128Mi" spelling —
+// matching Kubernetes resource-quantity convention, which operators writing
+// this spec are already used to. Longest suffix first so "Ki" is tried
+// before a bare unitless match would wrongly consume the "K".
+var byteUnits = []struct {
+	suffix string
+	mult   int64
+}{
+	{"Ti", 1 << 40},
+	{"Gi", 1 << 30},
+	{"Mi", 1 << 20},
+	{"Ki", 1 << 10},
+}
+
+// ParseBytes parses a binary byte-size string ("512Mi", "128Ki", "1Gi", or a
+// bare integer for plain bytes) into its value in bytes. Used for
+// sink.defaults.targetFileSize and sink.maintenance.compaction.targetFileSize.
+func ParseBytes(s string) (int64, error) {
+	for _, u := range byteUnits {
+		if strings.HasSuffix(s, u.suffix) {
+			n, err := strconv.ParseInt(strings.TrimSuffix(s, u.suffix), 10, 64)
+			if err != nil || n < 0 {
+				return 0, fmt.Errorf("%q is not a valid byte size (e.g. 512Mi)", s)
+			}
+			return n * u.mult, nil
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%q is not a valid byte size (e.g. 512Mi)", s)
+	}
+	return n, nil
 }
 
 func validatePredicate(p *Predicate, path string, problems *[]string) {
