@@ -470,6 +470,13 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 	if wh := inlineSinkWarehouse(cr); wh != "" {
 		env = append(env, corev1.EnvVar{Name: "URUTAU_SINK_WAREHOUSE", Value: wh})
 	}
+	// The metrics endpoint is off unless the operator opts in: an empty
+	// Worker.MetricsAddr must not start a listener, so the flag is only
+	// passed when set (defaults live in the binary).
+	cmd := []string{"urutau-worker", "run", "--coordinator", coordinatorClusterAddr(cr)}
+	if cr.Spec.Worker.MetricsAddr != "" {
+		cmd = append(cmd, "--metrics-addr", cr.Spec.Worker.MetricsAddr)
+	}
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
 		Spec: corev1.PodSpec{
@@ -477,7 +484,7 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 			Containers: []corev1.Container{{
 				Name:      "worker",
 				Image:     image,
-				Command:   []string{"urutau-worker", "run", "--coordinator", coordinatorClusterAddr(cr)},
+				Command:   cmd,
 				Env:       env,
 				Resources: workerResources(cr, t),
 			}},

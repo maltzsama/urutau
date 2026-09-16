@@ -53,10 +53,9 @@ func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenance
 // nothing to launch — the collapsed runner's in-process path is the only
 // option there, and it is not this code.
 //
-// Metrics: the pass runs in the worker's process, so the maintenance
-// Prometheus counters are not aggregated into the coordinator's registry.
-// The worker logs the outcome; wiring the worker's metrics back is a
-// follow-up.
+// Metrics: the pass runs in the worker's process, which is ephemeral, so the
+// worker reports the outcome back over the control stream and recordResult
+// folds it into the coordinator's long-lived registry.
 func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[string]string) error {
 	if !c.cfg.Spec.Sink.MaintenanceEnabled() {
 		return nil
@@ -122,15 +121,19 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	}()
 	m.c.log.Info("coordinator: maintenance worker connected", "worker", name, "table", table)
 
-	// The worker only ever sends its Hello; detect it leaving (after the
-	// pass) so the deferred deregistration runs and its restart reconnects
-	// cleanly.
+	// The worker sends its Hello and, after the pass, a MaintenanceResult;
+	// detect it leaving (the stream closing) so the deferred deregistration
+	// runs and its restart reconnects cleanly.
 	done := make(chan error, 1)
 	go func() {
 		for {
-			if _, err := stream.Recv(); err != nil {
+			msg, err := stream.Recv()
+			if err != nil {
 				done <- err
 				return
+			}
+			if res := msg.GetMaintenanceResult(); res != nil {
+				m.recordResult(table, res)
 			}
 		}
 	}()
@@ -208,6 +211,40 @@ func (m *maintenanceScheduler) assignment(table string, ops []sink.MaintenanceOp
 			MaintenanceConfig: cfgJSON,
 		},
 	}}, nil
+}
+
+// recordResult folds one maintenance pass's reported outcome into the
+// coordinator's Prometheus registry. The pass ran in the worker's process,
+// which exits right after — its own /metrics is gone by the time Prometheus
+// would scrape it — so the counts are recorded here, mirroring how an Ack
+// drives CommitsTotal. A nil registry (no --metrics-addr) is a no-op.
+func (m *maintenanceScheduler) recordResult(table string, res *pb.MaintenanceResult) {
+	if m.c.metrics == nil {
+		return
+	}
+	for _, op := range res.Ops {
+		switch r := op.Op.(type) {
+		case *pb.MaintenanceOpResult_Compaction:
+			m.c.metrics.IcebergCompactionRuns.WithLabelValues(table).Inc()
+			if r.Compaction.Error == "" {
+				m.c.metrics.IcebergCompactionFilesRemoved.WithLabelValues(table).Add(float64(r.Compaction.FilesRemoved))
+				m.c.metrics.IcebergCompactionFilesAdded.WithLabelValues(table).Add(float64(r.Compaction.FilesAdded))
+				m.c.metrics.IcebergCompactionBytesBefore.WithLabelValues(table).Add(float64(r.Compaction.BytesBefore))
+				m.c.metrics.IcebergCompactionBytesAfter.WithLabelValues(table).Add(float64(r.Compaction.BytesAfter))
+			}
+		case *pb.MaintenanceOpResult_Expiry:
+			m.c.metrics.IcebergSnapshotExpiryRuns.WithLabelValues(table).Inc()
+			if r.Expiry.Error == "" {
+				m.c.metrics.IcebergSnapshotExpirySnapshots.WithLabelValues(table).Add(float64(r.Expiry.SnapshotsRemoved))
+			}
+		case *pb.MaintenanceOpResult_Orphan:
+			m.c.metrics.IcebergOrphanCleanupRuns.WithLabelValues(table).Inc()
+			if r.Orphan.Error == "" {
+				m.c.metrics.IcebergOrphanCleanupFiles.WithLabelValues(table).Add(float64(r.Orphan.FilesDeleted))
+				m.c.metrics.IcebergOrphanCleanupBytes.WithLabelValues(table).Add(float64(r.Orphan.BytesFreed))
+			}
+		}
+	}
 }
 
 // provisionMaintenanceWorkers ensures one maintenance worker Deployment per

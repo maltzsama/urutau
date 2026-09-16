@@ -4,8 +4,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/maltzsama/urutau/internal/observability"
+	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
 func TestMaintenanceWorkerNameSanitizes(t *testing.T) {
@@ -81,4 +85,66 @@ func hasArgPair(args []string, flag, value string) bool {
 		}
 	}
 	return false
+}
+
+// recordResult folds a maintenance worker's reported pass into the
+// coordinator's registry — the worker is ephemeral, so this is the only place
+// the counts survive to a scrape.
+func TestRecordResultFoldsIntoRegistry(t *testing.T) {
+	metrics := observability.New()
+	m := &maintenanceScheduler{c: &Coordinator{metrics: metrics}}
+
+	m.recordResult("raw.orders", &pb.MaintenanceResult{Ops: []*pb.MaintenanceOpResult{
+		{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{
+			FilesRemoved: 3, FilesAdded: 1, BytesBefore: 100, BytesAfter: 40}}},
+		{Op: &pb.MaintenanceOpResult_Expiry{Expiry: &pb.ExpiryResult{SnapshotsRemoved: 2}}},
+		{Op: &pb.MaintenanceOpResult_Orphan{Orphan: &pb.OrphanResult{FilesDeleted: 5, BytesFreed: 500}}},
+	}})
+
+	cases := []struct {
+		name string
+		got  float64
+		want float64
+	}{
+		{"compaction runs", testutil.ToFloat64(metrics.IcebergCompactionRuns), 1},
+		{"compaction files removed", testutil.ToFloat64(metrics.IcebergCompactionFilesRemoved), 3},
+		{"compaction files added", testutil.ToFloat64(metrics.IcebergCompactionFilesAdded), 1},
+		{"compaction bytes before", testutil.ToFloat64(metrics.IcebergCompactionBytesBefore), 100},
+		{"compaction bytes after", testutil.ToFloat64(metrics.IcebergCompactionBytesAfter), 40},
+		{"expiry runs", testutil.ToFloat64(metrics.IcebergSnapshotExpiryRuns), 1},
+		{"expiry snapshots", testutil.ToFloat64(metrics.IcebergSnapshotExpirySnapshots), 2},
+		{"orphan runs", testutil.ToFloat64(metrics.IcebergOrphanCleanupRuns), 1},
+		{"orphan files", testutil.ToFloat64(metrics.IcebergOrphanCleanupFiles), 5},
+		{"orphan bytes", testutil.ToFloat64(metrics.IcebergOrphanCleanupBytes), 500},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// A failed operation still counts as a run — that counter is what makes a
+// stalled maintainer visible — but records no counts.
+func TestRecordResultFailedOpCountsRunOnly(t *testing.T) {
+	metrics := observability.New()
+	m := &maintenanceScheduler{c: &Coordinator{metrics: metrics}}
+	m.recordResult("t", &pb.MaintenanceResult{Ops: []*pb.MaintenanceOpResult{
+		{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{FilesRemoved: 9, Error: "boom"}}},
+	}})
+
+	if got := testutil.ToFloat64(metrics.IcebergCompactionRuns); got != 1 {
+		t.Errorf("compaction runs = %v, want 1", got)
+	}
+	if n := testutil.CollectAndCount(metrics.IcebergCompactionFilesRemoved); n != 0 {
+		t.Errorf("failed compaction recorded %d files-removed series, want 0", n)
+	}
+}
+
+// A nil registry (no --metrics-addr) must be a silent no-op, not a panic.
+func TestRecordResultNilRegistryNoop(t *testing.T) {
+	m := &maintenanceScheduler{c: &Coordinator{}}
+	m.recordResult("t", &pb.MaintenanceResult{Ops: []*pb.MaintenanceOpResult{
+		{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{FilesRemoved: 1}}},
+	}})
 }

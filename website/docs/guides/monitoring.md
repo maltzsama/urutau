@@ -14,7 +14,10 @@ checkpoints — see [Reliability](reliability.md).
 
 Pass `--metrics-addr :9090` (coordinator) or `--metrics-addr :9091`
 (worker) to serve Prometheus metrics on `/metrics`. Empty disables the
-endpoint.
+endpoint. In Kubernetes the operator stamps the same flags from
+`spec.coordinator.metricsAddr` and `spec.worker.metricsAddr` — each Pod
+binds its own IP, so the same value works for both roles, but the knobs are
+separate. Scrape the Pods directly (no aggregation happens between them).
 
 **Coordinator**
 
@@ -37,6 +40,22 @@ endpoint.
 | `urutau_worker_snapshot_progress_ratio` | gauge (table) | Snapshot progress, 0..1 |
 | `urutau_worker_dblog_dropped_by_window_total` | counter (table) | Snapshot rows discarded by DBLog windows |
 | `urutau_worker_deletes_dropped_total` | counter (table) | Append-only deletes dropped |
+
+**Maintenance** (recorded by the **coordinator**, not the worker — the
+maintenance worker is ephemeral and reports its pass back before exiting)
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `urutau_iceberg_compaction_runs_total` | counter (table) | Compaction attempts, success or failure |
+| `urutau_iceberg_compaction_files_removed_total` | counter (table) | Data files removed by compaction |
+| `urutau_iceberg_compaction_files_added_total` | counter (table) | Data files added by compaction |
+| `urutau_iceberg_compaction_bytes_before` | counter (table) | Input bytes rewritten by compaction |
+| `urutau_iceberg_compaction_bytes_after` | counter (table) | Output bytes written by compaction |
+| `urutau_iceberg_snapshot_expiry_runs_total` | counter (table) | Snapshot expiry attempts |
+| `urutau_iceberg_snapshot_expiry_snapshots_removed_total` | counter (table) | Snapshots removed by expiry |
+| `urutau_iceberg_orphan_cleanup_runs_total` | counter (table) | Orphan cleanup attempts |
+| `urutau_iceberg_orphan_cleanup_files_deleted_total` | counter (table) | Unreferenced files deleted |
+| `urutau_iceberg_orphan_cleanup_bytes_freed_total` | counter (table) | Storage bytes freed |
 
 **Enrichment**
 

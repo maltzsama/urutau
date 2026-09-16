@@ -110,6 +110,12 @@ type WorkerDefaults struct {
 	CPUOverhead    string `json:"cpu_overhead,omitempty"`
 	Memory         string `json:"memory,omitempty"`
 	MemoryOverhead string `json:"memory_overhead,omitempty"`
+	// MetricsAddr is the address every worker Pod serves Prometheus metrics
+	// on (`--metrics-addr`), e.g. ":9091". Empty disables the endpoint.
+	// Separate from Coordinator.MetricsAddr because coordinator and workers
+	// are different Pods: each binds its own IP, so the same value is fine,
+	// but the knob is per-role.
+	MetricsAddr string `json:"metricsAddr,omitempty"`
 }
 
 // CDCPipelineStatus is written only by the coordinator (§9).

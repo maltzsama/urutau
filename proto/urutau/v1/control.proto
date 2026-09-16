@@ -21,6 +21,7 @@ message WorkerMessage {
     ChunkFailed chunk_failed = 4;
     WorkerError error        = 5;
     StagedBatch staged       = 6;  // staged data files, one per delivery (WK-001 C5)
+    MaintenanceResult maintenance_result = 7;  // one ephemeral maintenance pass's outcome
   }
 }
 
@@ -75,6 +76,42 @@ message MaintenanceAssignment {
   string          target_table       = 1;  // "raw.orders"
   repeated string ops                = 2;  // "compaction", "snapshot_expiry", "orphan_cleanup"
   bytes           maintenance_config = 3;  // JSON spec.Maintenance (parameters; intervals ignored)
+}
+
+// MaintenanceResult is what an ephemeral maintenance worker reports after a
+// pass: one entry per operation that actually ran, in execution order, with
+// raw counts and the error (empty on success). The coordinator records them
+// in its own long-lived registry — the worker's own /metrics dies with the
+// worker, so this is what makes the counts survive to a scrape.
+message MaintenanceResult {
+  repeated MaintenanceOpResult ops = 1;
+}
+
+message MaintenanceOpResult {
+  oneof op {
+    CompactionResult compaction = 1;
+    ExpiryResult     expiry     = 2;
+    OrphanResult     orphan     = 3;
+  }
+}
+
+message CompactionResult {
+  int64  files_removed = 1;
+  int64  files_added   = 2;
+  int64  bytes_before  = 3;
+  int64  bytes_after   = 4;
+  string error         = 5;  // empty on success
+}
+
+message ExpiryResult {
+  int64  snapshots_removed = 1;
+  string error             = 2;  // empty on success
+}
+
+message OrphanResult {
+  int64  files_deleted = 1;
+  int64  bytes_freed   = 2;
+  string error         = 3;  // empty on success
 }
 
 message ChunkIds {
