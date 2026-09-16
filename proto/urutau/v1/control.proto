@@ -26,8 +26,9 @@ message WorkerMessage {
 
 message CoordinatorMessage {
   oneof msg {
-    Assignment   assign = 1;
-    ChunkRequest chunk  = 2;
+    Assignment            assign      = 1;
+    ChunkRequest          chunk       = 2;
+    MaintenanceAssignment maintenance = 3;
   }
 }
 
@@ -58,6 +59,22 @@ message Hello {
   // Chunk ids already completed, per source table. Lets the coordinator
   // re-issue only what is pending after a mid-snapshot restart.
   map<string, ChunkIds> completed_chunks = 7;
+
+  // maintenance marks an ephemeral maintenance worker: it runs ONE
+  // maintenance pass for one table and exits. The coordinator answers with a
+  // MaintenanceAssignment (never a data Assignment), and does not supervise
+  // it for acks — it has no data plane.
+  bool maintenance = 8;
+}
+
+// MaintenanceAssignment is the maintenance worker's whole job: the table to
+// maintain, the operations to run (in order), and the operation parameters.
+// Intervals are NOT here: the coordinator already decided which operations
+// are due.
+message MaintenanceAssignment {
+  string          target_table       = 1;  // "raw.orders"
+  repeated string ops                = 2;  // "compaction", "snapshot_expiry", "orphan_cleanup"
+  bytes           maintenance_config = 3;  // JSON spec.Maintenance (parameters; intervals ignored)
 }
 
 message ChunkIds {

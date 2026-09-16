@@ -39,23 +39,27 @@ func TestMaintenanceExample(t *testing.T) {
 	// A handful of separately-committed live changes on top of the
 	// snapshot, so compaction (minInputFiles: 2) has more than one small
 	// file to work with — the same one-commit-per-write shape ordinary CDC
-	// traffic produces.
+	// traffic produces. nCommits is the un-compacted file count the
+	// assertion below measures against.
+	const nCommits = 4 // 1 snapshot + 3 live changes
 	waitTrino(t, ctx, `SELECT count(*) FROM orders_maintained`, int64(20))
 	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (301, 'm1', 1.0)`)
 	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (302, 'm2', 2.0)`)
 	dml(t, db, `UPDATE orders SET v = 'm3' WHERE id = 1`)
 	waitTrino(t, ctx, `SELECT count(*) FROM orders_maintained`, int64(22))
+	// The UPDATE does not change the row count, so the count alone can pass
+	// while v is still stale — confirm the write actually landed.
+	waitTrino(t, ctx, `SELECT v FROM orders_maintained WHERE id = 1`, "m3")
 
-	// Stop the runner before inspecting file count: compaction and the
-	// runner's own commits both mutate the table concurrently, and this
-	// only needs to observe the steady state compaction already reached,
-	// not race it.
+	// Wait for compaction WHILE the runner is still up: it runs on its own
+	// interval, and stopping first could freeze the table before it ever
+	// fired — making the assertion pass or fail on timing, not on compaction.
+	waitCompacted(t, ctx, "orders_maintained", nCommits)
+
 	stop()
 	if err := <-runErr; err != nil && err != context.Canceled {
 		t.Fatalf("run: %v", err)
 	}
-
-	waitCompacted(t, ctx, "orders_maintained")
 }
 
 // loadMaintenanceExample loads examples/iceberg-maintenance.yaml, the same
@@ -69,10 +73,11 @@ func loadMaintenanceExample(t *testing.T) *spec.Spec {
 }
 
 // waitCompacted polls tableName's data-file count until sink.maintenance.
-// compaction has visibly run: fewer files than the number of separate
-// commits this test makes (well above maxUncompactedFiles), or the test
-// fails naming what it saw.
-func waitCompacted(t *testing.T, ctx context.Context, tableName string) {
+// compaction has visibly run: strictly fewer files than the un-compacted
+// count (the number of separate commits this test makes), or the test fails
+// naming what it saw. A strict reduction is the signal — a threshold close to
+// the commit count could pass without compaction ever firing.
+func waitCompacted(t *testing.T, ctx context.Context, tableName string, unCompacted int) {
 	t.Helper()
 	cfg := icebergsink.Config{
 		URI:          env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog"),
@@ -86,7 +91,6 @@ func waitCompacted(t *testing.T, ctx context.Context, tableName string) {
 		t.Fatalf("catalog: %v", err)
 	}
 
-	const maxUncompactedFiles = 3 // below this test's 4 separate commits
 	deadline := time.Now().Add(30 * time.Second)
 	var lastCount int
 	for time.Now().Before(deadline) {
@@ -99,11 +103,11 @@ func waitCompacted(t *testing.T, ctx context.Context, tableName string) {
 			t.Fatalf("plan files: %v", err)
 		}
 		lastCount = len(tasks)
-		if lastCount <= maxUncompactedFiles {
-			t.Logf("maintenance ok: %s compacted to %d data files", tableName, lastCount)
+		if lastCount < unCompacted {
+			t.Logf("maintenance ok: %s compacted to %d data files (from %d commits)", tableName, lastCount, unCompacted)
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatalf("%s still has %d data files after 30s — sink.maintenance.compaction did not run", tableName, lastCount)
+	t.Fatalf("%s still has %d data files after 30s (want fewer than %d) — sink.maintenance.compaction did not run", tableName, lastCount, unCompacted)
 }

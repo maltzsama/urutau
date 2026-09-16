@@ -333,6 +333,7 @@ type CoordinatorMessage struct {
 	//
 	//	*CoordinatorMessage_Assign
 	//	*CoordinatorMessage_Chunk
+	//	*CoordinatorMessage_Maintenance
 	Msg           isCoordinatorMessage_Msg `protobuf_oneof:"msg"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -393,6 +394,15 @@ func (x *CoordinatorMessage) GetChunk() *ChunkRequest {
 	return nil
 }
 
+func (x *CoordinatorMessage) GetMaintenance() *MaintenanceAssignment {
+	if x != nil {
+		if x, ok := x.Msg.(*CoordinatorMessage_Maintenance); ok {
+			return x.Maintenance
+		}
+	}
+	return nil
+}
+
 type isCoordinatorMessage_Msg interface {
 	isCoordinatorMessage_Msg()
 }
@@ -405,9 +415,15 @@ type CoordinatorMessage_Chunk struct {
 	Chunk *ChunkRequest `protobuf:"bytes,2,opt,name=chunk,proto3,oneof"`
 }
 
+type CoordinatorMessage_Maintenance struct {
+	Maintenance *MaintenanceAssignment `protobuf:"bytes,3,opt,name=maintenance,proto3,oneof"`
+}
+
 func (*CoordinatorMessage_Assign) isCoordinatorMessage_Msg() {}
 
 func (*CoordinatorMessage_Chunk) isCoordinatorMessage_Msg() {}
+
+func (*CoordinatorMessage_Maintenance) isCoordinatorMessage_Msg() {}
 
 type ControlMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -503,8 +519,13 @@ type Hello struct {
 	// Chunk ids already completed, per source table. Lets the coordinator
 	// re-issue only what is pending after a mid-snapshot restart.
 	CompletedChunks map[string]*ChunkIds `protobuf:"bytes,7,rep,name=completed_chunks,json=completedChunks,proto3" json:"completed_chunks,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// maintenance marks an ephemeral maintenance worker: it runs ONE
+	// maintenance pass for one table and exits. The coordinator answers with a
+	// MaintenanceAssignment (never a data Assignment), and does not supervise
+	// it for acks — it has no data plane.
+	Maintenance   bool `protobuf:"varint,8,opt,name=maintenance,proto3" json:"maintenance,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Hello) Reset() {
@@ -586,6 +607,77 @@ func (x *Hello) GetCompletedChunks() map[string]*ChunkIds {
 	return nil
 }
 
+func (x *Hello) GetMaintenance() bool {
+	if x != nil {
+		return x.Maintenance
+	}
+	return false
+}
+
+// MaintenanceAssignment is the maintenance worker's whole job: the table to
+// maintain, the operations to run (in order), and the operation parameters.
+// Intervals are NOT here: the coordinator already decided which operations
+// are due.
+type MaintenanceAssignment struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	TargetTable       string                 `protobuf:"bytes,1,opt,name=target_table,json=targetTable,proto3" json:"target_table,omitempty"`                   // "raw.orders"
+	Ops               []string               `protobuf:"bytes,2,rep,name=ops,proto3" json:"ops,omitempty"`                                                      // "compaction", "snapshot_expiry", "orphan_cleanup"
+	MaintenanceConfig []byte                 `protobuf:"bytes,3,opt,name=maintenance_config,json=maintenanceConfig,proto3" json:"maintenance_config,omitempty"` // JSON spec.Maintenance (parameters; intervals ignored)
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *MaintenanceAssignment) Reset() {
+	*x = MaintenanceAssignment{}
+	mi := &file_urutau_v1_control_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MaintenanceAssignment) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MaintenanceAssignment) ProtoMessage() {}
+
+func (x *MaintenanceAssignment) ProtoReflect() protoreflect.Message {
+	mi := &file_urutau_v1_control_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MaintenanceAssignment.ProtoReflect.Descriptor instead.
+func (*MaintenanceAssignment) Descriptor() ([]byte, []int) {
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *MaintenanceAssignment) GetTargetTable() string {
+	if x != nil {
+		return x.TargetTable
+	}
+	return ""
+}
+
+func (x *MaintenanceAssignment) GetOps() []string {
+	if x != nil {
+		return x.Ops
+	}
+	return nil
+}
+
+func (x *MaintenanceAssignment) GetMaintenanceConfig() []byte {
+	if x != nil {
+		return x.MaintenanceConfig
+	}
+	return nil
+}
+
 type ChunkIds struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ids           []uint32               `protobuf:"varint,1,rep,packed,name=ids,proto3" json:"ids,omitempty"`
@@ -595,7 +687,7 @@ type ChunkIds struct {
 
 func (x *ChunkIds) Reset() {
 	*x = ChunkIds{}
-	mi := &file_urutau_v1_control_proto_msgTypes[4]
+	mi := &file_urutau_v1_control_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -607,7 +699,7 @@ func (x *ChunkIds) String() string {
 func (*ChunkIds) ProtoMessage() {}
 
 func (x *ChunkIds) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[4]
+	mi := &file_urutau_v1_control_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -620,7 +712,7 @@ func (x *ChunkIds) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkIds.ProtoReflect.Descriptor instead.
 func (*ChunkIds) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{4}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ChunkIds) GetIds() []uint32 {
@@ -653,7 +745,7 @@ type EnrichRef struct {
 
 func (x *EnrichRef) Reset() {
 	*x = EnrichRef{}
-	mi := &file_urutau_v1_control_proto_msgTypes[5]
+	mi := &file_urutau_v1_control_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -665,7 +757,7 @@ func (x *EnrichRef) String() string {
 func (*EnrichRef) ProtoMessage() {}
 
 func (x *EnrichRef) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[5]
+	mi := &file_urutau_v1_control_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -678,7 +770,7 @@ func (x *EnrichRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnrichRef.ProtoReflect.Descriptor instead.
 func (*EnrichRef) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{5}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *EnrichRef) GetTable() string {
@@ -778,7 +870,7 @@ type TableAssignment struct {
 
 func (x *TableAssignment) Reset() {
 	*x = TableAssignment{}
-	mi := &file_urutau_v1_control_proto_msgTypes[6]
+	mi := &file_urutau_v1_control_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -790,7 +882,7 @@ func (x *TableAssignment) String() string {
 func (*TableAssignment) ProtoMessage() {}
 
 func (x *TableAssignment) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[6]
+	mi := &file_urutau_v1_control_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -803,7 +895,7 @@ func (x *TableAssignment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableAssignment.ProtoReflect.Descriptor instead.
 func (*TableAssignment) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{6}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *TableAssignment) GetSourceTable() string {
@@ -900,7 +992,7 @@ type BatchConfig struct {
 
 func (x *BatchConfig) Reset() {
 	*x = BatchConfig{}
-	mi := &file_urutau_v1_control_proto_msgTypes[7]
+	mi := &file_urutau_v1_control_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -912,7 +1004,7 @@ func (x *BatchConfig) String() string {
 func (*BatchConfig) ProtoMessage() {}
 
 func (x *BatchConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[7]
+	mi := &file_urutau_v1_control_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -925,7 +1017,7 @@ func (x *BatchConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchConfig.ProtoReflect.Descriptor instead.
 func (*BatchConfig) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{7}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *BatchConfig) GetMaxBytes() int64 {
@@ -960,7 +1052,7 @@ type Assignment struct {
 
 func (x *Assignment) Reset() {
 	*x = Assignment{}
-	mi := &file_urutau_v1_control_proto_msgTypes[8]
+	mi := &file_urutau_v1_control_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -972,7 +1064,7 @@ func (x *Assignment) String() string {
 func (*Assignment) ProtoMessage() {}
 
 func (x *Assignment) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[8]
+	mi := &file_urutau_v1_control_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -985,7 +1077,7 @@ func (x *Assignment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Assignment.ProtoReflect.Descriptor instead.
 func (*Assignment) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{8}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Assignment) GetWorkerName() string {
@@ -1074,7 +1166,7 @@ type Ack struct {
 
 func (x *Ack) Reset() {
 	*x = Ack{}
-	mi := &file_urutau_v1_control_proto_msgTypes[9]
+	mi := &file_urutau_v1_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1086,7 +1178,7 @@ func (x *Ack) String() string {
 func (*Ack) ProtoMessage() {}
 
 func (x *Ack) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[9]
+	mi := &file_urutau_v1_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1099,7 +1191,7 @@ func (x *Ack) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ack.ProtoReflect.Descriptor instead.
 func (*Ack) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{9}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *Ack) GetBatchId() uint64 {
@@ -1164,7 +1256,7 @@ type ChunkRequest struct {
 
 func (x *ChunkRequest) Reset() {
 	*x = ChunkRequest{}
-	mi := &file_urutau_v1_control_proto_msgTypes[10]
+	mi := &file_urutau_v1_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1176,7 +1268,7 @@ func (x *ChunkRequest) String() string {
 func (*ChunkRequest) ProtoMessage() {}
 
 func (x *ChunkRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[10]
+	mi := &file_urutau_v1_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1189,7 +1281,7 @@ func (x *ChunkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkRequest.ProtoReflect.Descriptor instead.
 func (*ChunkRequest) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{10}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ChunkRequest) GetTable() string {
@@ -1233,7 +1325,7 @@ type ChunkReady struct {
 
 func (x *ChunkReady) Reset() {
 	*x = ChunkReady{}
-	mi := &file_urutau_v1_control_proto_msgTypes[11]
+	mi := &file_urutau_v1_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1245,7 +1337,7 @@ func (x *ChunkReady) String() string {
 func (*ChunkReady) ProtoMessage() {}
 
 func (x *ChunkReady) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[11]
+	mi := &file_urutau_v1_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1258,7 +1350,7 @@ func (x *ChunkReady) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkReady.ProtoReflect.Descriptor instead.
 func (*ChunkReady) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{11}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ChunkReady) GetTable() string {
@@ -1308,7 +1400,7 @@ type ChunkFailed struct {
 
 func (x *ChunkFailed) Reset() {
 	*x = ChunkFailed{}
-	mi := &file_urutau_v1_control_proto_msgTypes[12]
+	mi := &file_urutau_v1_control_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1320,7 +1412,7 @@ func (x *ChunkFailed) String() string {
 func (*ChunkFailed) ProtoMessage() {}
 
 func (x *ChunkFailed) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[12]
+	mi := &file_urutau_v1_control_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1333,7 +1425,7 @@ func (x *ChunkFailed) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkFailed.ProtoReflect.Descriptor instead.
 func (*ChunkFailed) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{12}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ChunkFailed) GetTable() string {
@@ -1385,7 +1477,7 @@ type StagedBatch struct {
 
 func (x *StagedBatch) Reset() {
 	*x = StagedBatch{}
-	mi := &file_urutau_v1_control_proto_msgTypes[13]
+	mi := &file_urutau_v1_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1397,7 +1489,7 @@ func (x *StagedBatch) String() string {
 func (*StagedBatch) ProtoMessage() {}
 
 func (x *StagedBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[13]
+	mi := &file_urutau_v1_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1410,7 +1502,7 @@ func (x *StagedBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StagedBatch.ProtoReflect.Descriptor instead.
 func (*StagedBatch) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{13}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *StagedBatch) GetTable() string {
@@ -1474,7 +1566,7 @@ type WorkerError struct {
 
 func (x *WorkerError) Reset() {
 	*x = WorkerError{}
-	mi := &file_urutau_v1_control_proto_msgTypes[14]
+	mi := &file_urutau_v1_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1486,7 +1578,7 @@ func (x *WorkerError) String() string {
 func (*WorkerError) ProtoMessage() {}
 
 func (x *WorkerError) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[14]
+	mi := &file_urutau_v1_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1499,7 +1591,7 @@ func (x *WorkerError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerError.ProtoReflect.Descriptor instead.
 func (*WorkerError) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{14}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *WorkerError) GetClass() ErrorClass {
@@ -1541,7 +1633,7 @@ type Pause struct {
 
 func (x *Pause) Reset() {
 	*x = Pause{}
-	mi := &file_urutau_v1_control_proto_msgTypes[15]
+	mi := &file_urutau_v1_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1553,7 +1645,7 @@ func (x *Pause) String() string {
 func (*Pause) ProtoMessage() {}
 
 func (x *Pause) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[15]
+	mi := &file_urutau_v1_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1566,7 +1658,7 @@ func (x *Pause) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Pause.ProtoReflect.Descriptor instead.
 func (*Pause) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{15}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *Pause) GetReason() string {
@@ -1595,7 +1687,7 @@ type Shutdown struct {
 
 func (x *Shutdown) Reset() {
 	*x = Shutdown{}
-	mi := &file_urutau_v1_control_proto_msgTypes[16]
+	mi := &file_urutau_v1_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1607,7 +1699,7 @@ func (x *Shutdown) String() string {
 func (*Shutdown) ProtoMessage() {}
 
 func (x *Shutdown) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[16]
+	mi := &file_urutau_v1_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1620,7 +1712,7 @@ func (x *Shutdown) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Shutdown.ProtoReflect.Descriptor instead.
 func (*Shutdown) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{16}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Shutdown) GetGrace() *durationpb.Duration {
@@ -1654,7 +1746,7 @@ type BatchMeta struct {
 
 func (x *BatchMeta) Reset() {
 	*x = BatchMeta{}
-	mi := &file_urutau_v1_control_proto_msgTypes[17]
+	mi := &file_urutau_v1_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1666,7 +1758,7 @@ func (x *BatchMeta) String() string {
 func (*BatchMeta) ProtoMessage() {}
 
 func (x *BatchMeta) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[17]
+	mi := &file_urutau_v1_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1679,7 +1771,7 @@ func (x *BatchMeta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchMeta.ProtoReflect.Descriptor instead.
 func (*BatchMeta) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{17}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *BatchMeta) GetTable() string {
@@ -1736,7 +1828,7 @@ type WindowTag struct {
 
 func (x *WindowTag) Reset() {
 	*x = WindowTag{}
-	mi := &file_urutau_v1_control_proto_msgTypes[18]
+	mi := &file_urutau_v1_control_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1748,7 +1840,7 @@ func (x *WindowTag) String() string {
 func (*WindowTag) ProtoMessage() {}
 
 func (x *WindowTag) ProtoReflect() protoreflect.Message {
-	mi := &file_urutau_v1_control_proto_msgTypes[18]
+	mi := &file_urutau_v1_control_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1761,7 +1853,7 @@ func (x *WindowTag) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WindowTag.ProtoReflect.Descriptor instead.
 func (*WindowTag) Descriptor() ([]byte, []int) {
-	return file_urutau_v1_control_proto_rawDescGZIP(), []int{18}
+	return file_urutau_v1_control_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *WindowTag) GetInWindow() bool {
@@ -1805,15 +1897,16 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\fchunk_failed\x18\x04 \x01(\v2\x16.urutau.v1.ChunkFailedH\x00R\vchunkFailed\x12.\n" +
 	"\x05error\x18\x05 \x01(\v2\x16.urutau.v1.WorkerErrorH\x00R\x05error\x120\n" +
 	"\x06staged\x18\x06 \x01(\v2\x16.urutau.v1.StagedBatchH\x00R\x06stagedB\x05\n" +
-	"\x03msg\"}\n" +
+	"\x03msg\"\xc3\x01\n" +
 	"\x12CoordinatorMessage\x12/\n" +
 	"\x06assign\x18\x01 \x01(\v2\x15.urutau.v1.AssignmentH\x00R\x06assign\x12/\n" +
-	"\x05chunk\x18\x02 \x01(\v2\x17.urutau.v1.ChunkRequestH\x00R\x05chunkB\x05\n" +
+	"\x05chunk\x18\x02 \x01(\v2\x17.urutau.v1.ChunkRequestH\x00R\x05chunk\x12D\n" +
+	"\vmaintenance\x18\x03 \x01(\v2 .urutau.v1.MaintenanceAssignmentH\x00R\vmaintenanceB\x05\n" +
 	"\x03msg\"t\n" +
 	"\x0eControlMessage\x12(\n" +
 	"\x05pause\x18\x01 \x01(\v2\x10.urutau.v1.PauseH\x00R\x05pause\x121\n" +
 	"\bshutdown\x18\x02 \x01(\v2\x13.urutau.v1.ShutdownH\x00R\bshutdownB\x05\n" +
-	"\x03msg\"\xd0\x03\n" +
+	"\x03msg\"\xf2\x03\n" +
 	"\x05Hello\x12\x1f\n" +
 	"\vworker_name\x18\x01 \x01(\tR\n" +
 	"workerName\x12\x17\n" +
@@ -1822,13 +1915,18 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05phase\x18\x04 \x01(\x0e2\x16.urutau.v1.WorkerPhaseR\x05phase\x12!\n" +
 	"\fimage_digest\x18\x05 \x01(\tR\vimageDigest\x12=\n" +
 	"\tcommitted\x18\x06 \x03(\v2\x1f.urutau.v1.Hello.CommittedEntryR\tcommitted\x12P\n" +
-	"\x10completed_chunks\x18\a \x03(\v2%.urutau.v1.Hello.CompletedChunksEntryR\x0fcompletedChunks\x1a<\n" +
+	"\x10completed_chunks\x18\a \x03(\v2%.urutau.v1.Hello.CompletedChunksEntryR\x0fcompletedChunks\x12 \n" +
+	"\vmaintenance\x18\b \x01(\bR\vmaintenance\x1a<\n" +
 	"\x0eCommittedEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aW\n" +
 	"\x14CompletedChunksEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12)\n" +
-	"\x05value\x18\x02 \x01(\v2\x13.urutau.v1.ChunkIdsR\x05value:\x028\x01\"\x1c\n" +
+	"\x05value\x18\x02 \x01(\v2\x13.urutau.v1.ChunkIdsR\x05value:\x028\x01\"{\n" +
+	"\x15MaintenanceAssignment\x12!\n" +
+	"\ftarget_table\x18\x01 \x01(\tR\vtargetTable\x12\x10\n" +
+	"\x03ops\x18\x02 \x03(\tR\x03ops\x12-\n" +
+	"\x12maintenance_config\x18\x03 \x01(\fR\x11maintenanceConfig\"\x1c\n" +
 	"\bChunkIds\x12\x10\n" +
 	"\x03ids\x18\x01 \x03(\rR\x03ids\"\xf4\x03\n" +
 	"\tEnrichRef\x12\x14\n" +
@@ -1980,72 +2078,74 @@ func file_urutau_v1_control_proto_rawDescGZIP() []byte {
 }
 
 var file_urutau_v1_control_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_urutau_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_urutau_v1_control_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_urutau_v1_control_proto_goTypes = []any{
-	(WorkerPhase)(0),            // 0: urutau.v1.WorkerPhase
-	(WriteMode)(0),              // 1: urutau.v1.WriteMode
-	(ErrorClass)(0),             // 2: urutau.v1.ErrorClass
-	(*WorkerMessage)(nil),       // 3: urutau.v1.WorkerMessage
-	(*CoordinatorMessage)(nil),  // 4: urutau.v1.CoordinatorMessage
-	(*ControlMessage)(nil),      // 5: urutau.v1.ControlMessage
-	(*Hello)(nil),               // 6: urutau.v1.Hello
-	(*ChunkIds)(nil),            // 7: urutau.v1.ChunkIds
-	(*EnrichRef)(nil),           // 8: urutau.v1.EnrichRef
-	(*TableAssignment)(nil),     // 9: urutau.v1.TableAssignment
-	(*BatchConfig)(nil),         // 10: urutau.v1.BatchConfig
-	(*Assignment)(nil),          // 11: urutau.v1.Assignment
-	(*Ack)(nil),                 // 12: urutau.v1.Ack
-	(*ChunkRequest)(nil),        // 13: urutau.v1.ChunkRequest
-	(*ChunkReady)(nil),          // 14: urutau.v1.ChunkReady
-	(*ChunkFailed)(nil),         // 15: urutau.v1.ChunkFailed
-	(*StagedBatch)(nil),         // 16: urutau.v1.StagedBatch
-	(*WorkerError)(nil),         // 17: urutau.v1.WorkerError
-	(*Pause)(nil),               // 18: urutau.v1.Pause
-	(*Shutdown)(nil),            // 19: urutau.v1.Shutdown
-	(*BatchMeta)(nil),           // 20: urutau.v1.BatchMeta
-	(*WindowTag)(nil),           // 21: urutau.v1.WindowTag
-	nil,                         // 22: urutau.v1.Hello.CommittedEntry
-	nil,                         // 23: urutau.v1.Hello.CompletedChunksEntry
-	nil,                         // 24: urutau.v1.EnrichRef.OnEntry
-	nil,                         // 25: urutau.v1.EnrichRef.AsEntry
-	(*durationpb.Duration)(nil), // 26: google.protobuf.Duration
+	(WorkerPhase)(0),              // 0: urutau.v1.WorkerPhase
+	(WriteMode)(0),                // 1: urutau.v1.WriteMode
+	(ErrorClass)(0),               // 2: urutau.v1.ErrorClass
+	(*WorkerMessage)(nil),         // 3: urutau.v1.WorkerMessage
+	(*CoordinatorMessage)(nil),    // 4: urutau.v1.CoordinatorMessage
+	(*ControlMessage)(nil),        // 5: urutau.v1.ControlMessage
+	(*Hello)(nil),                 // 6: urutau.v1.Hello
+	(*MaintenanceAssignment)(nil), // 7: urutau.v1.MaintenanceAssignment
+	(*ChunkIds)(nil),              // 8: urutau.v1.ChunkIds
+	(*EnrichRef)(nil),             // 9: urutau.v1.EnrichRef
+	(*TableAssignment)(nil),       // 10: urutau.v1.TableAssignment
+	(*BatchConfig)(nil),           // 11: urutau.v1.BatchConfig
+	(*Assignment)(nil),            // 12: urutau.v1.Assignment
+	(*Ack)(nil),                   // 13: urutau.v1.Ack
+	(*ChunkRequest)(nil),          // 14: urutau.v1.ChunkRequest
+	(*ChunkReady)(nil),            // 15: urutau.v1.ChunkReady
+	(*ChunkFailed)(nil),           // 16: urutau.v1.ChunkFailed
+	(*StagedBatch)(nil),           // 17: urutau.v1.StagedBatch
+	(*WorkerError)(nil),           // 18: urutau.v1.WorkerError
+	(*Pause)(nil),                 // 19: urutau.v1.Pause
+	(*Shutdown)(nil),              // 20: urutau.v1.Shutdown
+	(*BatchMeta)(nil),             // 21: urutau.v1.BatchMeta
+	(*WindowTag)(nil),             // 22: urutau.v1.WindowTag
+	nil,                           // 23: urutau.v1.Hello.CommittedEntry
+	nil,                           // 24: urutau.v1.Hello.CompletedChunksEntry
+	nil,                           // 25: urutau.v1.EnrichRef.OnEntry
+	nil,                           // 26: urutau.v1.EnrichRef.AsEntry
+	(*durationpb.Duration)(nil),   // 27: google.protobuf.Duration
 }
 var file_urutau_v1_control_proto_depIdxs = []int32{
 	6,  // 0: urutau.v1.WorkerMessage.hello:type_name -> urutau.v1.Hello
-	12, // 1: urutau.v1.WorkerMessage.ack:type_name -> urutau.v1.Ack
-	14, // 2: urutau.v1.WorkerMessage.chunk_ready:type_name -> urutau.v1.ChunkReady
-	15, // 3: urutau.v1.WorkerMessage.chunk_failed:type_name -> urutau.v1.ChunkFailed
-	17, // 4: urutau.v1.WorkerMessage.error:type_name -> urutau.v1.WorkerError
-	16, // 5: urutau.v1.WorkerMessage.staged:type_name -> urutau.v1.StagedBatch
-	11, // 6: urutau.v1.CoordinatorMessage.assign:type_name -> urutau.v1.Assignment
-	13, // 7: urutau.v1.CoordinatorMessage.chunk:type_name -> urutau.v1.ChunkRequest
-	18, // 8: urutau.v1.ControlMessage.pause:type_name -> urutau.v1.Pause
-	19, // 9: urutau.v1.ControlMessage.shutdown:type_name -> urutau.v1.Shutdown
-	0,  // 10: urutau.v1.Hello.phase:type_name -> urutau.v1.WorkerPhase
-	22, // 11: urutau.v1.Hello.committed:type_name -> urutau.v1.Hello.CommittedEntry
-	23, // 12: urutau.v1.Hello.completed_chunks:type_name -> urutau.v1.Hello.CompletedChunksEntry
-	24, // 13: urutau.v1.EnrichRef.on:type_name -> urutau.v1.EnrichRef.OnEntry
-	25, // 14: urutau.v1.EnrichRef.as:type_name -> urutau.v1.EnrichRef.AsEntry
-	1,  // 15: urutau.v1.TableAssignment.write_mode:type_name -> urutau.v1.WriteMode
-	8,  // 16: urutau.v1.TableAssignment.enrich:type_name -> urutau.v1.EnrichRef
-	26, // 17: urutau.v1.BatchConfig.max_interval:type_name -> google.protobuf.Duration
-	9,  // 18: urutau.v1.Assignment.tables:type_name -> urutau.v1.TableAssignment
-	10, // 19: urutau.v1.Assignment.batching:type_name -> urutau.v1.BatchConfig
-	26, // 20: urutau.v1.Ack.commit_duration:type_name -> google.protobuf.Duration
-	2,  // 21: urutau.v1.ChunkFailed.class:type_name -> urutau.v1.ErrorClass
-	2,  // 22: urutau.v1.WorkerError.class:type_name -> urutau.v1.ErrorClass
-	26, // 23: urutau.v1.Shutdown.grace:type_name -> google.protobuf.Duration
-	21, // 24: urutau.v1.BatchMeta.window:type_name -> urutau.v1.WindowTag
-	7,  // 25: urutau.v1.Hello.CompletedChunksEntry.value:type_name -> urutau.v1.ChunkIds
-	3,  // 26: urutau.v1.UrutauControl.Session:input_type -> urutau.v1.WorkerMessage
-	3,  // 27: urutau.v1.UrutauControl.Control:input_type -> urutau.v1.WorkerMessage
-	4,  // 28: urutau.v1.UrutauControl.Session:output_type -> urutau.v1.CoordinatorMessage
-	5,  // 29: urutau.v1.UrutauControl.Control:output_type -> urutau.v1.ControlMessage
-	28, // [28:30] is the sub-list for method output_type
-	26, // [26:28] is the sub-list for method input_type
-	26, // [26:26] is the sub-list for extension type_name
-	26, // [26:26] is the sub-list for extension extendee
-	0,  // [0:26] is the sub-list for field type_name
+	13, // 1: urutau.v1.WorkerMessage.ack:type_name -> urutau.v1.Ack
+	15, // 2: urutau.v1.WorkerMessage.chunk_ready:type_name -> urutau.v1.ChunkReady
+	16, // 3: urutau.v1.WorkerMessage.chunk_failed:type_name -> urutau.v1.ChunkFailed
+	18, // 4: urutau.v1.WorkerMessage.error:type_name -> urutau.v1.WorkerError
+	17, // 5: urutau.v1.WorkerMessage.staged:type_name -> urutau.v1.StagedBatch
+	12, // 6: urutau.v1.CoordinatorMessage.assign:type_name -> urutau.v1.Assignment
+	14, // 7: urutau.v1.CoordinatorMessage.chunk:type_name -> urutau.v1.ChunkRequest
+	7,  // 8: urutau.v1.CoordinatorMessage.maintenance:type_name -> urutau.v1.MaintenanceAssignment
+	19, // 9: urutau.v1.ControlMessage.pause:type_name -> urutau.v1.Pause
+	20, // 10: urutau.v1.ControlMessage.shutdown:type_name -> urutau.v1.Shutdown
+	0,  // 11: urutau.v1.Hello.phase:type_name -> urutau.v1.WorkerPhase
+	23, // 12: urutau.v1.Hello.committed:type_name -> urutau.v1.Hello.CommittedEntry
+	24, // 13: urutau.v1.Hello.completed_chunks:type_name -> urutau.v1.Hello.CompletedChunksEntry
+	25, // 14: urutau.v1.EnrichRef.on:type_name -> urutau.v1.EnrichRef.OnEntry
+	26, // 15: urutau.v1.EnrichRef.as:type_name -> urutau.v1.EnrichRef.AsEntry
+	1,  // 16: urutau.v1.TableAssignment.write_mode:type_name -> urutau.v1.WriteMode
+	9,  // 17: urutau.v1.TableAssignment.enrich:type_name -> urutau.v1.EnrichRef
+	27, // 18: urutau.v1.BatchConfig.max_interval:type_name -> google.protobuf.Duration
+	10, // 19: urutau.v1.Assignment.tables:type_name -> urutau.v1.TableAssignment
+	11, // 20: urutau.v1.Assignment.batching:type_name -> urutau.v1.BatchConfig
+	27, // 21: urutau.v1.Ack.commit_duration:type_name -> google.protobuf.Duration
+	2,  // 22: urutau.v1.ChunkFailed.class:type_name -> urutau.v1.ErrorClass
+	2,  // 23: urutau.v1.WorkerError.class:type_name -> urutau.v1.ErrorClass
+	27, // 24: urutau.v1.Shutdown.grace:type_name -> google.protobuf.Duration
+	22, // 25: urutau.v1.BatchMeta.window:type_name -> urutau.v1.WindowTag
+	8,  // 26: urutau.v1.Hello.CompletedChunksEntry.value:type_name -> urutau.v1.ChunkIds
+	3,  // 27: urutau.v1.UrutauControl.Session:input_type -> urutau.v1.WorkerMessage
+	3,  // 28: urutau.v1.UrutauControl.Control:input_type -> urutau.v1.WorkerMessage
+	4,  // 29: urutau.v1.UrutauControl.Session:output_type -> urutau.v1.CoordinatorMessage
+	5,  // 30: urutau.v1.UrutauControl.Control:output_type -> urutau.v1.ControlMessage
+	29, // [29:31] is the sub-list for method output_type
+	27, // [27:29] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_urutau_v1_control_proto_init() }
@@ -2064,6 +2164,7 @@ func file_urutau_v1_control_proto_init() {
 	file_urutau_v1_control_proto_msgTypes[1].OneofWrappers = []any{
 		(*CoordinatorMessage_Assign)(nil),
 		(*CoordinatorMessage_Chunk)(nil),
+		(*CoordinatorMessage_Maintenance)(nil),
 	}
 	file_urutau_v1_control_proto_msgTypes[2].OneofWrappers = []any{
 		(*ControlMessage_Pause)(nil),
@@ -2075,7 +2176,7 @@ func file_urutau_v1_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_urutau_v1_control_proto_rawDesc), len(file_urutau_v1_control_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   23,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

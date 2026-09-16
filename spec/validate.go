@@ -118,7 +118,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 			problems = append(problems, fmt.Sprintf("sink.defaults.targetFileSize: %v", err))
 		}
 	}
-	validateMaintenance(s.Sink.Maintenance, &problems)
+	validateMaintenance(s.Sink.Maintenance, s.Sink.Type, &problems)
 
 	if len(s.Tables) == 0 {
 		problems = append(problems, "tables: at least one required")
@@ -572,8 +572,20 @@ func validateFilter(f *Filter, path string, problems *[]string) {
 // A nil Maintenance or a nil sub-config disables that operation — nothing
 // to validate. Interval/duration/age defaults are applied at the point of
 // use (the Maintainer), not here: Validate only rejects malformed strings.
-func validateMaintenance(m *Maintenance, problems *[]string) {
+//
+// Maintenance is an Iceberg-only feature (see Maintenance's doc): a
+// maintenance block on any other sink type is rejected here, not silently
+// ignored at runtime, so an operator who configures it on a ClickHouse or
+// Couchbase sink gets a validation error instead of a feature that looks
+// configured but never runs. sinkType is the already-normalized Sink.Type
+// (Validate defaults an empty type to the Iceberg sink before this call).
+func validateMaintenance(m *Maintenance, sinkType string, problems *[]string) {
 	if m == nil {
+		return
+	}
+	if !sinkSupportsMaintenance(sinkType) {
+		*problems = append(*problems, fmt.Sprintf(
+			"sink.maintenance: only the Iceberg sink supports table maintenance, not sink.type %q", sinkType))
 		return
 	}
 	if c := m.Compaction; c != nil {
@@ -617,6 +629,20 @@ func validateMaintenance(m *Maintenance, problems *[]string) {
 	}
 }
 
+// sinkSupportsMaintenance reports whether a sink type supports background
+// table maintenance. Only the Iceberg sink does: the feature drives
+// iceberg-go's compaction/snapshot-expiry/orphan-cleanup APIs, so the
+// Iceberg family is the whole supported set. Today that is exactly
+// driver.DefaultSinkType ("iceberg+rest"); a future Iceberg catalog variant
+// ("iceberg+glue", …) keeps the "<engine>+<catalog>" naming and is covered
+// by the prefix, while a non-Iceberg sink registers under a different name
+// and is rejected. spec cannot ask the driver registry (driver imports spec,
+// not the reverse), so the sink-type name is matched here, the same way the
+// kafka-only format rules above match "kafka" literally.
+func sinkSupportsMaintenance(sinkType string) bool {
+	return sinkType == "iceberg" || strings.HasPrefix(sinkType, "iceberg+")
+}
+
 // byteUnits are the binary (Ki/Mi/Gi/Ti) suffixes ParseBytes accepts, in the
 // same style as sink.defaults.targetFileSize's existing "128Mi" spelling —
 // matching Kubernetes resource-quantity convention, which operators writing
@@ -641,6 +667,12 @@ func ParseBytes(s string) (int64, error) {
 			n, err := strconv.ParseInt(strings.TrimSuffix(s, u.suffix), 10, 64)
 			if err != nil || n < 0 {
 				return 0, fmt.Errorf("%q is not a valid byte size (e.g. 512Mi)", s)
+			}
+			// Reject the multiplication overflow before it wraps silently:
+			// "9223372036854775807Mi" must be a loud error, not a negative
+			// byte count.
+			if n > math.MaxInt64/u.mult {
+				return 0, fmt.Errorf("%q is too large (overflows int64 bytes)", s)
 			}
 			return n * u.mult, nil
 		}

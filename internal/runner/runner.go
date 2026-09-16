@@ -17,6 +17,7 @@ import (
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/maintenance"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -654,29 +655,38 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	},
 		committedPositions: make(map[string]position.Position)}
 
-	// Iceberg table maintenance (issue #96): one Maintainer goroutine per
-	// target table, for the life of the pipeline (ctx, not a narrower
-	// setup-only context). Optional capability, checked against the
-	// NEUTRAL sink.Maintainable interface — never a concrete sink package,
-	// which internal/architecture's TestOrchestrationConsumesContracts
-	// forbids the runner from importing. Every sink that does not
-	// implement it (everything but Iceberg today) silently skips this,
-	// same as requireConcurrentSink's capability-check pattern in the
-	// coordinator. Skipped entirely (no goroutine at all) when Maintenance
-	// is nil or disabled, so a pipeline that never configured it pays
-	// nothing.
-	if msnk, ok := snk.(sink.Maintainable); ok && s.Sink.MaintenanceEnabled() {
+	// Iceberg table maintenance (issue #96): the collapsed runner schedules
+	// maintenance in-process — one loop per target table, for the life of
+	// the pipeline (ctx, not a narrower setup-only context) — because there
+	// is no separate worker process to hand the pass to. The distributed
+	// coordinator instead provisions an ephemeral maintenance worker per
+	// table (see its scheduler). Checked against the NEUTRAL sink.Maintainable
+	// interface — never a concrete sink package, which
+	// internal/architecture's TestOrchestrationConsumesContracts forbids
+	// the runner from importing. Maintenance is Iceberg-only (spec.Validate
+	// rejects it on any other sink type), so a sink that does not implement
+	// the capability here is a bug, not a configuration to tolerate: fail
+	// loudly, matching requireConcurrentSink's hard capability check in the
+	// coordinator, rather than silently dropping the operator's maintenance
+	// block. Skipped entirely (no goroutine at all) when Maintenance is nil
+	// or disabled, so a pipeline that never configured it pays nothing.
+	if s.Sink.MaintenanceEnabled() {
+		msnk, ok := snk.(sink.Maintainable)
+		if !ok {
+			return nil, fmt.Errorf("runner: sink %q does not support table maintenance (sink.maintenance is Iceberg-only)", s.Sink.Type)
+		}
+		sched := maintenance.NewSchedule()
 		for _, ref := range refs {
 			ref := ref
 			// snk.Position reads the table's OWN committed cdc.position
 			// (CommittedPosition, walk-back included), rather than an
-			// in-memory approximation — compaction only ticks every few
+			// in-memory approximation — compaction only runs every few
 			// minutes at minimum, so the extra catalog round-trip is not a
 			// hot-path cost, and reading the authoritative value avoids
 			// coupling the Maintainer to the runner's/coordinator's
 			// internal bookkeeping (which differ in shape between the two).
 			// A read error just means no position is attached to this
-			// tick's compaction commit — not fatal, logged by compact
+			// pass's compaction commit — not fatal, logged by compact
 			// itself via its normal error path if it ever surfaces there.
 			currentPosition := func() string {
 				pos, err := snk.Position(ctx, ref)
@@ -686,7 +696,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 				return pos
 			}
 			m := msnk.Maintain(ref, *s.Sink.Maintenance, log, currentPosition, nil)
-			go m.Run(ctx)
+			go maintenance.RunLoop(ctx, m, ref.Target, s.Sink.Maintenance, sched, log)
 		}
 	}
 

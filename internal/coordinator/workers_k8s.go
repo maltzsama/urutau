@@ -45,23 +45,11 @@ func (c *Coordinator) provisionWorkers(ctx context.Context, workerTarget map[str
 	if len(workerTarget) == 0 {
 		return nil
 	}
-	if _, err := os.Stat(filepath.Join(workerConfigDir, workerPodTemplateFile(anyTarget(workerTarget)))); err != nil {
+	if !workerPodTemplateAvailable(workerTarget) {
 		return nil
 	}
 
-	restCfg, err := rest.InClusterConfig()
-	if err != nil {
-		return fmt.Errorf("k8s worker provisioning: worker pod template present but not running in-cluster: %w", err)
-	}
-	clientset, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return fmt.Errorf("k8s worker provisioning: build client: %w", err)
-	}
-	nsBytes, err := os.ReadFile(serviceAccountNamespaceFile)
-	if err != nil {
-		return fmt.Errorf("k8s worker provisioning: read own namespace: %w", err)
-	}
-	owner, err := coordinatorPodOwner(ctx, clientset, string(nsBytes))
+	clientset, ns, owner, err := inClusterClient(ctx)
 	if err != nil {
 		return fmt.Errorf("k8s worker provisioning: %w", err)
 	}
@@ -76,13 +64,48 @@ func (c *Coordinator) provisionWorkers(ctx context.Context, workerTarget map[str
 			}
 			templates[target] = tmpl
 		}
-		dep := workerDeployment(name, string(nsBytes), owner, tmpl)
-		if err := ensureDeployment(ctx, clientset, string(nsBytes), dep); err != nil {
+		dep := workerDeployment(name, ns, owner, tmpl)
+		if err := ensureDeployment(ctx, clientset, ns, dep); err != nil {
 			return fmt.Errorf("k8s worker provisioning: %s: %w", name, err)
 		}
 		c.log.Info("coordinator: worker deployment ensured", "worker", name, "table", target)
 	}
 	return nil
+}
+
+// workerPodTemplateAvailable reports whether the operator rendered worker pod
+// templates for this pipeline — the switch that turns Kubernetes worker
+// provisioning on: the data workers and the ephemeral maintenance workers
+// alike. When it is false the coordinator makes zero Kubernetes API calls.
+func workerPodTemplateAvailable(workerTarget map[string]string) bool {
+	if len(workerTarget) == 0 {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(workerConfigDir, workerPodTemplateFile(anyTarget(workerTarget))))
+	return err == nil
+}
+
+// inClusterClient builds the coordinator's in-cluster Kubernetes client, its
+// own namespace, and the ownerReference every workload it creates carries
+// back to its own Pod (so the Pod dying cascades to GC).
+func inClusterClient(ctx context.Context) (kubernetes.Interface, string, metav1.OwnerReference, error) {
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, "", metav1.OwnerReference{}, fmt.Errorf("worker pod template present but not running in-cluster: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return nil, "", metav1.OwnerReference{}, fmt.Errorf("build client: %w", err)
+	}
+	nsBytes, err := os.ReadFile(serviceAccountNamespaceFile)
+	if err != nil {
+		return nil, "", metav1.OwnerReference{}, fmt.Errorf("read own namespace: %w", err)
+	}
+	owner, err := coordinatorPodOwner(ctx, clientset, string(nsBytes))
+	if err != nil {
+		return nil, "", metav1.OwnerReference{}, err
+	}
+	return clientset, string(nsBytes), owner, nil
 }
 
 // anyTarget returns one value from the map — used only to probe whether

@@ -34,7 +34,12 @@ func TestParseBytes(t *testing.T) {
 // is the only spelling this parser understands, matching the existing
 // targetFileSize convention (spec/load_test.go's "128Mi" fixture).
 func TestParseBytesRejectsNonBinaryUnit(t *testing.T) {
-	for _, bad := range []string{"1K", "1M", "1G", "1.5Mi", "-1Mi", "Mi", "", "abc"} {
+	for _, bad := range []string{
+		"1K", "1M", "1G", "1.5Mi", "-1Mi", "Mi", "", "abc",
+		// Multiplication overflow must be a loud error, not a wrapped
+		// (negative) byte count.
+		"9223372036854775807Mi", "9007199254740992Gi", "9223372036854775807Ti",
+	} {
 		if _, err := ParseBytes(bad); err == nil {
 			t.Errorf("ParseBytes(%q): want error, got none", bad)
 		}
@@ -66,6 +71,36 @@ func maintSpec() *Spec {
 func TestValidateMaintenanceAccepted(t *testing.T) {
 	if err := maintSpec().Validate(); err != nil {
 		t.Fatalf("well-formed maintenance config must validate: %v", err)
+	}
+}
+
+// Maintenance is an Iceberg-only feature. Configuring it on another sink
+// type must be a validation error, not a block that validates and then
+// silently never runs — the operator wrote a feature the sink cannot honor.
+func TestValidateMaintenanceRejectsNonIcebergSink(t *testing.T) {
+	for _, typ := range []string{"clickhouse", "couchbase"} {
+		s := maintSpec()
+		s.Sink.Type = typ
+		err := s.Validate()
+		if err == nil {
+			t.Errorf("sink.type %q: maintenance must be rejected, got no error", typ)
+			continue
+		}
+		if !strings.Contains(err.Error(), "sink.maintenance") {
+			t.Errorf("sink.type %q: want a sink.maintenance problem, got %v", typ, err)
+		}
+	}
+}
+
+// The Iceberg family is the supported set: the default (empty, normalized
+// to "iceberg+rest") and any future "iceberg+<catalog>" variant.
+func TestValidateMaintenanceAcceptsIcebergSink(t *testing.T) {
+	for _, typ := range []string{"", "iceberg", "iceberg+rest", "iceberg+glue"} {
+		s := maintSpec()
+		s.Sink.Type = typ
+		if err := s.Validate(); err != nil {
+			t.Errorf("sink.type %q: maintenance must validate: %v", typ, err)
+		}
 	}
 }
 

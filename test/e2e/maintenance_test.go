@@ -11,14 +11,15 @@ import (
 	"github.com/apache/iceberg-go/table"
 
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
 
 const maintTableName = "maintenance"
 
 // TestMaintainerCompactsAndPreservesPosition proves the issue #96 finding
-// end to end: compaction started via Maintainer.Run rewrites many small
-// files into few, AND carries cdc.position forward onto the rewrite
+// end to end: a compaction pass started via Maintainer.RunOnce rewrites many
+// small files into few, AND carries cdc.position forward onto the rewrite
 // snapshot's properties — so CommittedPosition reads it from the fast path
 // (the table property) rather than falling back to walkBackPosition's
 // newest-snapshot-with-the-property scan. Run with URUTAU_E2E=1 against the
@@ -75,32 +76,20 @@ func TestMaintainerCompactsAndPreservesPosition(t *testing.T) {
 	// about tuning the bin-packing threshold.
 	m := urutauiceberg.NewMaintainer(cat, ident, spec.Maintenance{
 		Enabled:    true,
-		Compaction: &spec.CompactionConfig{Interval: "50ms", MinInputFiles: 2},
+		Compaction: &spec.CompactionConfig{MinInputFiles: 2},
 	}, nil, func() string { return lastPos }, nil)
 
-	runCtx, runCancel := context.WithTimeout(ctx, 3*time.Second)
-	defer runCancel()
-	done := make(chan struct{})
-	go func() { m.Run(runCtx); close(done) }()
-
-	// Poll for the compaction to land rather than sleep a fixed guess —
-	// the ticker fires every 50ms, so this settles quickly once it does.
-	var tasksAfter []table.FileScanTask
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) {
-		tbl = reload(t, ctx, cat, ident)
-		tasksAfter, err = tbl.Scan().PlanFiles(ctx)
-		if err != nil {
-			t.Fatalf("plan files after: %v", err)
-		}
-		if len(tasksAfter) < nFiles {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	// RunOnce is one-shot — the exact call the ephemeral maintenance worker
+	// makes — so the pass is done when it returns; no ticker to wait out.
+	if err := m.RunOnce(ctx, []sink.MaintenanceOp{sink.MaintenanceCompaction}); err != nil {
+		t.Fatalf("RunOnce compaction: %v", err)
 	}
-	runCancel()
-	<-done
 
+	tbl = reload(t, ctx, cat, ident)
+	tasksAfter, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatalf("plan files after: %v", err)
+	}
 	if len(tasksAfter) >= nFiles {
 		t.Fatalf("data files after compaction = %d, want fewer than %d — compaction did not run", len(tasksAfter), nFiles)
 	}
@@ -173,20 +162,20 @@ func TestMaintainerExpiresSnapshotsRespectingMaxAge(t *testing.T) {
 	probe := &expiryProbe{}
 	m := urutauiceberg.NewMaintainer(cat, ident, spec.Maintenance{
 		Enabled:        true,
-		SnapshotExpiry: &spec.SnapshotExpiryConfig{Interval: "50ms", RetainLast: 1, MaxAge: "1h"},
+		SnapshotExpiry: &spec.SnapshotExpiryConfig{RetainLast: 1, MaxAge: "1h"},
 	}, nil, nil, probe)
 
-	runCtx, runCancel := context.WithTimeout(ctx, 3*time.Second)
-	defer runCancel()
-	done := make(chan struct{})
-	go func() { m.Run(runCtx); close(done) }()
-	<-done
+	// RunOnce is one-shot — the exact call the ephemeral maintenance worker
+	// makes.
+	if err := m.RunOnce(ctx, []sink.MaintenanceOp{sink.MaintenanceSnapshotExpiry}); err != nil {
+		t.Fatalf("RunOnce snapshot expiry: %v", err)
+	}
 
-	// A run must have actually SUCCEEDED at least once — otherwise
-	// "snapshot count unchanged" would pass trivially because the ticker
-	// never got a working tick, not because MaxAge protected anything.
+	// The pass must have actually SUCCEEDED — otherwise "snapshot count
+	// unchanged" would pass trivially because the operation never ran, not
+	// because MaxAge protected anything.
 	if probe.successes == 0 {
-		t.Fatalf("snapshot expiry never completed a successful run in 3s (last error: %v)", probe.lastErr)
+		t.Fatalf("snapshot expiry never completed a successful run (last error: %v)", probe.lastErr)
 	}
 
 	tbl = reload(t, ctx, cat, ident)

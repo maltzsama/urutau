@@ -19,8 +19,9 @@ import (
 // owns the catalog connection and the target→identifier mapping, so the
 // orchestration never touches iceberg-go types.
 type Sink struct {
-	cat catalog.Catalog
-	ns  string
+	cat            catalog.Catalog
+	ns             string
+	targetFileSize int64
 }
 
 // Open dials the catalog and ensures the namespace, returning a Sink that
@@ -39,7 +40,24 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	if err := EnsureNamespace(ctx, cat, table.Identifier{cfg.Namespace}); err != nil {
 		return nil, err
 	}
-	return &Sink{cat: cat, ns: cfg.Namespace}, nil
+	return &Sink{cat: cat, ns: cfg.Namespace, targetFileSize: targetFileSizeFrom(cfg.Options[driver.OptTargetFileSize])}, nil
+}
+
+// targetFileSizeFrom parses the spec's byte-size string ("128Mi", "512Mi")
+// into bytes. Empty or malformed yields 0 — "no override", iceberg-go's own
+// default. spec.Validate already rejected malformed strings before a spec
+// reaches here, so the fallback is defense, not the primary path. It must go
+// through spec.ParseBytes (the "Mi"/"Gi" grammar), not strconv.ParseInt: the
+// spec stores the operator's spelling, not a plain byte count.
+func targetFileSizeFrom(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	n, err := spec.ParseBytes(s)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // ident resolves a target table name into an iceberg identifier, falling
@@ -64,7 +82,7 @@ func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.S
 
 // Writer opens the per-table committer.
 func (s *Sink) Writer(ctx context.Context, ref core.TableRef, cast core.CastPolicy, meta []core.MetadataColumn) (sink.TableWriter, error) {
-	return NewTableWriter(ctx, s.cat, s.ident(ref.Target), ref.PrimaryKey, cast, meta, ref.Source)
+	return NewTableWriter(ctx, s.cat, s.ident(ref.Target), ref.PrimaryKey, cast, meta, ref.Source, s.targetFileSize)
 }
 
 // Position reads the committed CDC position (with walk-back). An empty
@@ -98,24 +116,24 @@ func (s *Sink) Close() error { return nil }
 // no longer wins.
 func (s *Sink) SupportsConcurrentWriters() bool { return true }
 
-// Sink is the only sink that supports background table maintenance today.
+// Sink is the only sink that supports table maintenance today.
 var _ sink.Maintainable = (*Sink)(nil)
 
-// Maintainer implements sink.Maintainer (just Run) — the orchestration only
-// ever calls that one method through the interface.
+// Maintainer implements sink.Maintainer (just RunOnce) — the orchestration
+// only ever calls that one method through the interface.
 var _ sink.Maintainer = (*Maintainer)(nil)
 
 // Maintain implements sink.Maintainable: it builds a Maintainer for one
-// target table, so the runner and coordinator can launch background
+// target table, so the runner and coordinator can run
 // compaction/snapshot-expiry/orphan-cleanup through the neutral sink
 // contract, never importing this package directly (the architecture wall
 // internal/architecture enforces). cat/ident stay private, per the Sink type
 // doc. currentPosition and metrics are passed straight through to
 // NewMaintainer — see its doc for what a nil value means for each. Callers
-// are responsible for running `go m.Run(ctx)` and for only calling this when
-// Maintenance is non-nil and Enabled (Maintainer.Run itself already no-ops
-// on a disabled config, but callers should not pay for a goroutine per table
-// when maintenance is off entirely).
+// drive the pass with RunOnce, and should only build a Maintainer when
+// Maintenance is non-nil and Enabled (RunOnce itself no-ops on a disabled
+// config, but callers should not pay for a scheduler per table when
+// maintenance is off entirely).
 func (s *Sink) Maintain(ref core.TableRef, cfg spec.Maintenance, log *slog.Logger, currentPosition func() string, metrics sink.MaintainerMetrics) sink.Maintainer {
 	return NewMaintainer(s.cat, s.ident(ref.Target), cfg, log, currentPosition, metrics)
 }

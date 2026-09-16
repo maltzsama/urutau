@@ -6,6 +6,7 @@ package spec
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
@@ -100,8 +101,9 @@ type Sink struct {
 	// window at the cost of transaction overhead per batch.
 	CommitMode CommitMode `json:"commitMode,omitempty"`
 	// Maintenance configures background Iceberg table maintenance
-	// (compaction, snapshot expiry, orphan cleanup). Iceberg-only: ignored
-	// by every other sink. Nil disables it entirely.
+	// (compaction, snapshot expiry, orphan cleanup). Iceberg-only: any
+	// other sink type rejects a maintenance block in Validate rather than
+	// silently ignoring it. Nil disables it entirely.
 	Maintenance *Maintenance `json:"maintenance,omitempty"`
 }
 
@@ -151,12 +153,16 @@ type CompactionConfig struct {
 
 // SnapshotExpiryConfig tunes snapshot history pruning
 // (Transaction.ExpireSnapshots). This is the ONE operation in Maintenance
-// that needs an operator-chosen safety window: expiring the snapshot that
-// carries the only surviving cdc.position table property, before a crashed
-// pipeline has had a chance to recover, can strand position recovery or
-// resume from a point further ahead than what was actually committed. This
-// applies identically in append-only and upsert mode — the position
-// property is written the same way in both.
+// that needs an operator-chosen safety window. The committed position has
+// two homes: the cdc.position TABLE property (the fast resume path, read
+// first by CommittedPosition) and each snapshot's summary (the walk-back
+// fallback, scanned only when the property is absent). Snapshot expiry
+// cannot touch the table property — it lives in the table metadata, not in a
+// snapshot — but it does prune the snapshot summaries the fallback needs, so
+// expiring them before a crashed pipeline has recovered can strand position
+// recovery or resume from a point further ahead than what was actually
+// committed. This applies identically in append-only and upsert mode: the
+// position is written the same way in both.
 //
 // MaxAge (and RetainLast) together ARE that window: set it to cover the
 // worst-case time your pipeline could be down before you give up on
@@ -185,6 +191,21 @@ type OrphanCleanupConfig struct {
 	// duration syntax. Default "72h" (3 days) — iceberg-go's own default.
 	OlderThan string `json:"olderThan,omitempty"`
 }
+
+// Default maintenance intervals, applied when the operator leaves the
+// corresponding interval unset. These are the documented defaults for the
+// three Maintenance sub-configs above. The SCHEDULER reads them — the
+// collapsed runner, or the coordinator that provisions an ephemeral
+// maintenance worker per table — to decide when each operation is
+// due; the operation itself never sees the interval. They live here, not in
+// the Iceberg sink, because the orchestration that schedules maintenance
+// consumes only the spec/sink contracts and cannot import a concrete sink
+// package.
+const (
+	DefaultCompactionInterval     = 5 * time.Minute
+	DefaultSnapshotExpiryInterval = 10 * time.Minute
+	DefaultOrphanCleanupInterval  = time.Hour
+)
 
 // CommitMode is the data-vs-position commit sequencing selector.
 type CommitMode string

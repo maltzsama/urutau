@@ -278,11 +278,12 @@ func OpenSink(ctx context.Context, s *spec.Spec) (sink.Sink, error) {
 // sink factory. Named constants so a typo is a compile error, not a silent
 // "" read. client_secret is a credential: never log the Options map.
 const (
-	OptWarehouse    = "warehouse"
-	OptClientID     = "client_id"
-	OptClientSecret = "client_secret"
-	OptScope        = "scope"
-	OptCommitMode   = "commit_mode"
+	OptWarehouse      = "warehouse"
+	OptClientID       = "client_id"
+	OptClientSecret   = "client_secret"
+	OptScope          = "scope"
+	OptCommitMode     = "commit_mode"
+	OptTargetFileSize = "target_file_size"
 )
 
 // SinkConfig renders a spec's sink section into the neutral config.
@@ -292,11 +293,12 @@ func SinkConfig(s *spec.Spec) sink.Config {
 		URI:       s.Sink.URI,
 		Namespace: s.Sink.Namespace,
 		Options: map[string]string{
-			OptWarehouse:    s.Sink.Warehouse,
-			OptClientID:     s.Sink.ClientID,
-			OptClientSecret: s.Sink.ClientSecret,
-			OptScope:        s.Sink.Scope,
-			OptCommitMode:   string(s.Sink.CommitMode),
+			OptWarehouse:      s.Sink.Warehouse,
+			OptClientID:       s.Sink.ClientID,
+			OptClientSecret:   s.Sink.ClientSecret,
+			OptScope:          s.Sink.Scope,
+			OptCommitMode:     string(s.Sink.CommitMode),
+			OptTargetFileSize: s.Sink.Defaults.TargetFileSize,
 		},
 		// Position decoding hint for sinks that compare per-partition
 		// positions (WK-001 C7). Not a source coupling — a string hint.

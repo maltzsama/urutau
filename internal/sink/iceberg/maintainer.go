@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -22,23 +21,17 @@ import (
 // Applied here — at the point of use — rather than in spec.Validate, which
 // only rejects malformed strings and leaves zero values as "unset."
 const (
-	defaultCompactionInterval = 5 * time.Minute
 	// Compaction's own MinInputFiles/TargetFileSize defaults come straight
 	// from compaction.DefaultConfig() (compactionConfigFrom) rather than
 	// being re-declared here — one source of truth for iceberg-go's values.
-	defaultSnapshotExpiryInterval = 10 * time.Minute
+	//
+	// The per-operation INTERVAL defaults live in spec
+	// (spec.DefaultCompactionInterval and friends): the scheduler, not the
+	// Maintainer, decides when an operation is due, and the scheduler
+	// (runner/coordinator) cannot import this package.
 	defaultSnapshotExpiryMaxAge   = 168 * time.Hour // 7 days
 	defaultSnapshotExpiryRetain   = 1
-	defaultOrphanCleanupInterval  = time.Hour
 	defaultOrphanCleanupOlderThan = 72 * time.Hour // 3 days, iceberg-go's own default
-
-	// maxConsecutiveFailures: after this many consecutive failed runs of
-	// ONE operation, that operation logs and stops trying until the next
-	// process restart — a persistently broken catalog/warehouse should not
-	// spam retries forever, per the issue's "3 consecutive failures" rule.
-	// The other two operations are unaffected: each ticker fails
-	// independently.
-	maxConsecutiveFailures = 3
 
 	// maintainerMaxTries/maintainerBackoff mirror TableWriter's own retry
 	// tuning (writer.go's maxTries: 5, backoff: 200ms) — same isRetryableError
@@ -47,52 +40,41 @@ const (
 	maintainerBackoff  = 200 * time.Millisecond
 )
 
-// Maintainer runs the three Iceberg table-maintenance operations
-// (compaction, snapshot expiry, orphan cleanup) for one table on
-// independent tickers, following the checkpoint.go pattern: context-
-// cancelled, ticker-driven, non-fatal errors logged and looped.
+// Maintainer executes the three Iceberg table-maintenance operations
+// (compaction, snapshot expiry, orphan cleanup) for one table. It is
+// one-shot: RunOnce executes the requested operations, in order, and
+// returns; the caller owns scheduling (see sink.Maintainer). In the
+// distributed engine that caller is the coordinator, which provisions an
+// ephemeral maintenance worker per table and pushes the pass to it; in the
+// collapsed runner it is an in-process scheduler.
 //
-// The three operations serialize against EACH OTHER via runMu: compact and
-// expireSnapshots are both metadata commits subject to the same
-// stale-branch-pointer conflict a concurrent CDC write can trigger, and
-// unlike that CDC write (whose duration is bounded by one collapsed batch),
-// a compaction pass over many groups can run for minutes. Retrying a short
-// backoff against an operation that legitimately takes 15 minutes just
-// burns through maintainerMaxTries and then waits out the OTHER ticker's
-// full Interval before trying again — for a table with expiry every 5m and
-// a compaction run that takes 15m, that is not an isolated collision, it is
-// expiry repeatedly failing against the same in-progress compaction. runMu
-// removes that cause entirely: only one of the three ever executes at a
-// time for this table. It does not, and cannot, prevent a collision with a
-// concurrent CDC commit from the table's own TableWriter — that one is still
-// handled by the retry loop below, which relies on iceberg-go's own
-// rewriteValidator / stale-ref rejection (isRetryableError /
+// Because RunOnce runs the operations sequentially, they never race each
+// other: a compaction pass completes before snapshot expiry begins. That
+// matters — compact and expireSnapshots are both metadata commits subject
+// to the same stale-branch-pointer conflict, and a compaction pass over
+// many groups can run for minutes. What RunOnce does NOT serialize against
+// is a concurrent CDC commit from the table's own TableWriter; that is
+// handled by each operation's own retry loop, which relies on iceberg-go's
+// own rewriteValidator / stale-ref rejection (isRetryableError /
 // table.ErrCommitFailed), because urutau does not own that writer's
-// lifecycle the way it owns its own three tickers.
+// lifecycle.
 type Maintainer struct {
 	cat   catalog.Catalog
 	ident table.Identifier
 	cfg   spec.Maintenance
 	log   *slog.Logger
-	// runMu serializes compact/expireSnapshots/cleanOrphans against each
-	// other for this table. See the type doc for why.
-	runMu sync.Mutex
 	// currentPosition returns the table's most recently known committed
 	// cdc.position, so a compaction commit can carry it forward on the
 	// rewrite snapshot instead of relying on walkBackPosition's fallback
-	// (issue #96 finding). Reads a live value on every compaction tick
-	// rather than a value captured at construction, since the position
-	// advances continuously while the Maintainer runs for the life of the
-	// pipeline. May return "" (nothing committed yet, or the caller does
-	// not track it) — a compaction commit with no position property is
-	// still correct, just one that must fall back to the walk-back if this
-	// snapshot becomes the newest one lacking the property.
+	// (issue #96 finding). Reads a live value on every pass rather than a
+	// value captured at construction, since the position advances
+	// continuously while the table is being replicated. May return ""
+	// (nothing committed yet, or the caller does not track it) — a
+	// compaction commit with no position property is still correct, just
+	// one that must fall back to the walk-back if this snapshot becomes the
+	// newest one lacking the property.
 	currentPosition func() string
 	metrics         sink.MaintainerMetrics
-
-	compactFailures int
-	expireFailures  int
-	orphanFailures  int
 }
 
 // NewMaintainer builds a Maintainer for one table. currentPosition and
@@ -105,105 +87,49 @@ func NewMaintainer(cat catalog.Catalog, ident table.Identifier, cfg spec.Mainten
 	return &Maintainer{cat: cat, ident: ident, cfg: cfg, log: log, currentPosition: currentPosition, metrics: metrics}
 }
 
-// Run starts the three maintenance tickers and blocks until ctx is
-// cancelled. Each disabled or nil sub-config's ticker is simply never
-// started — a table with only SnapshotExpiry configured never touches
-// compaction or orphan cleanup.
+// RunOnce runs the requested operations once, in the given order, and
+// returns the first error. An empty ops slice is a no-op; an operation the
+// table's config does not enable is skipped. The caller owns scheduling —
+// the runner's in-process scheduler, or the coordinator, which provisions an
+// ephemeral maintenance worker per table and pushes the pass to it.
 //
-// Per-operation failures are logged and looped (never fatal to the process:
-// a maintenance failure must not take down the CDC pipeline it runs
-// alongside), except after maxConsecutiveFailures consecutive failures of
-// the SAME operation, which then stops its own ticker and logs a warning —
-// the other two operations are unaffected.
-func (m *Maintainer) Run(ctx context.Context) {
+// Operations run sequentially, so no locking is needed: compaction creates
+// new files and invalidates old ones, snapshot expiry dereferences them,
+// orphan cleanup physically removes them — the order the caller passes is
+// the order they execute in.
+func (m *Maintainer) RunOnce(ctx context.Context, ops []sink.MaintenanceOp) error {
 	if !m.cfg.Enabled {
-		return
+		return nil
 	}
-	var wg sync.WaitGroup
-	if c := m.cfg.Compaction; c != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			m.runTicker(ctx, "compaction", durationOr(c.Interval, defaultCompactionInterval), m.compact, &m.compactFailures)
-		}()
-	}
-	if e := m.cfg.SnapshotExpiry; e != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			m.runTicker(ctx, "snapshot_expiry", durationOr(e.Interval, defaultSnapshotExpiryInterval), m.expireSnapshots, &m.expireFailures)
-		}()
-	}
-	if o := m.cfg.OrphanCleanup; o != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			m.runTicker(ctx, "orphan_cleanup", durationOr(o.Interval, defaultOrphanCleanupInterval), m.cleanOrphans, &m.orphanFailures)
-		}()
-	}
-	wg.Wait()
-}
-
-// runTicker is the shared ticker loop: fire on interval, run once, track
-// consecutive failures, stop this ticker (not the others) after
-// maxConsecutiveFailures. Mirrors checkpoint.run's ctx.Done()/ticker.C
-// select and its "log and continue" error handling.
-//
-// A tick that fires while another of this Maintainer's operations holds
-// runMu WAITS for it (queued, not a failed attempt) — see the Maintainer
-// type doc. The wait itself is cancellable: lockOrDone below returns early
-// on ctx.Done() instead of blocking past shutdown, at the cost of a leaked
-// goroutine still waiting on the mutex in the background (acceptable: the
-// process is shutting down and Go reclaims it on exit).
-func (m *Maintainer) runTicker(ctx context.Context, op string, interval time.Duration, run func(context.Context) error, failures *int) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !m.lockOrDone(ctx) {
-				return // ctx cancelled while queued behind another operation
-			}
-			err := run(ctx)
-			m.runMu.Unlock()
-			if err != nil {
-				*failures++
-				m.log.Warn("iceberg maintenance: run failed", "op", op, "table", m.ident, "attempt", *failures, "err", err)
-				if *failures >= maxConsecutiveFailures {
-					m.log.Warn("iceberg maintenance: stopping after consecutive failures", "op", op, "table", m.ident, "failures", *failures)
-					return
-				}
-				continue
-			}
-			*failures = 0
+	for _, op := range ops {
+		if err := m.runOne(ctx, op); err != nil {
+			return fmt.Errorf("iceberg maintenance: %s: %w", op, err)
 		}
 	}
+	return nil
 }
 
-// lockOrDone acquires runMu, but gives up and returns false if ctx is
-// cancelled first — sync.Mutex has no context-aware Lock, so this races a
-// blocking Lock() (on a background goroutine, since it cannot be
-// interrupted once started) against ctx.Done(). On cancellation the
-// background goroutine is left to acquire the mutex whenever the operation
-// holding it finishes and then immediately unlock; harmless; by then the
-// process is shutting down.
-func (m *Maintainer) lockOrDone(ctx context.Context) bool {
-	acquired := make(chan struct{})
-	go func() {
-		m.runMu.Lock()
-		close(acquired)
-	}()
-	select {
-	case <-acquired:
-		return true
-	case <-ctx.Done():
-		go func() {
-			<-acquired
-			m.runMu.Unlock()
-		}()
-		return false
+// runOne dispatches one operation, skipping it when the table's config does
+// not enable it (a due op the operator never configured cannot run).
+func (m *Maintainer) runOne(ctx context.Context, op sink.MaintenanceOp) error {
+	switch op {
+	case sink.MaintenanceCompaction:
+		if m.cfg.Compaction == nil {
+			return nil
+		}
+		return m.compact(ctx)
+	case sink.MaintenanceSnapshotExpiry:
+		if m.cfg.SnapshotExpiry == nil {
+			return nil
+		}
+		return m.expireSnapshots(ctx)
+	case sink.MaintenanceOrphanCleanup:
+		if m.cfg.OrphanCleanup == nil {
+			return nil
+		}
+		return m.cleanOrphans(ctx)
+	default:
+		return fmt.Errorf("unknown operation %q", op)
 	}
 }
 
@@ -220,14 +146,12 @@ func (m *Maintainer) lockOrDone(ctx context.Context) bool {
 // that does not know about this property.
 //
 // Retried like TableWriter's own commits (writer.go's isRetryableError).
-// runMu already rules out a collision with this table's OWN expireSnapshots
-// or cleanOrphans (runTicker queues behind them instead), so what this
-// retry actually guards against is a concurrent CDC commit from the
-// table's TableWriter — a source urutau does not serialize against, since
-// that writer's lifecycle belongs to the worker, not the Maintainer.
-// Re-planning from scratch on every attempt (not just re-committing) is
-// deliberate: a stale plan's file paths may no longer exist after the
-// winner of the race committed.
+// RunOnce runs the operations sequentially, so this retry guards only
+// against a concurrent CDC commit from the table's own TableWriter — a
+// source urutau does not serialize against, since that writer's lifecycle
+// belongs to the worker, not the Maintainer. Re-planning from scratch on
+// every attempt (not just re-committing) is deliberate: a stale plan's file
+// paths may no longer exist after the winner of the race committed.
 func (m *Maintainer) compact(ctx context.Context) error {
 	var lastErr error
 	for attempt := 0; attempt < maintainerMaxTries; attempt++ {
@@ -244,6 +168,12 @@ func (m *Maintainer) compact(ctx context.Context) error {
 			return nil // nothing to compact — not a failure, not a metrics event
 		}
 		if !isRetryableError(err) {
+			// A terminal error still counts as a run: the "runs" counter is
+			// what makes a stalled maintainer visible, and it must not stay
+			// at zero just because every attempt failed terminally.
+			if m.metrics != nil {
+				m.metrics.CompactionRun(identString(m.ident), 0, 0, 0, 0, err)
+			}
 			return err
 		}
 		lastErr = err
@@ -313,10 +243,10 @@ func (m *Maintainer) compactOnce(ctx context.Context) (did bool, err error) {
 // history to recover cdc.position via CommittedPosition's walk-back even
 // after the fast-path table property is gone.
 //
-// Retried on the same terms as compact: runMu already rules out a race
-// against this table's own compaction, so the retry here is for a
-// concurrent CDC commit racing the branch pointer this transaction was
-// built from — see compact's doc comment.
+// Retried on the same terms as compact: RunOnce runs the operations
+// sequentially, so the retry here is for a concurrent CDC commit racing the
+// branch pointer this transaction was built from — see compact's doc
+// comment.
 func (m *Maintainer) expireSnapshots(ctx context.Context) error {
 	var lastErr error
 	for attempt := 0; attempt < maintainerMaxTries; attempt++ {
@@ -330,6 +260,9 @@ func (m *Maintainer) expireSnapshots(ctx context.Context) error {
 			return nil
 		}
 		if !isRetryableError(err) {
+			if m.metrics != nil {
+				m.metrics.SnapshotExpiryRun(identString(m.ident), 0, err)
+			}
 			return err
 		}
 		lastErr = err
@@ -380,6 +313,9 @@ func (m *Maintainer) cleanOrphans(ctx context.Context) error {
 	o := m.cfg.OrphanCleanup
 	tbl, err := m.cat.LoadTable(ctx, m.ident)
 	if err != nil {
+		if m.metrics != nil {
+			m.metrics.OrphanCleanupRun(identString(m.ident), 0, 0, err)
+		}
 		return fmt.Errorf("iceberg maintenance: orphan cleanup: load table: %w", err)
 	}
 

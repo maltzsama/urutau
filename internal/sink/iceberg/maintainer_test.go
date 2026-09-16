@@ -2,9 +2,7 @@ package iceberg
 
 import (
 	"context"
-	"errors"
 	"log/slog"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,7 +25,7 @@ func TestSinkSatisfiesMaintainableThroughTheInterface(t *testing.T) {
 }
 
 // discardLogger is a *slog.Logger that writes nowhere — the tests assert on
-// behavior (call counts, failure thresholds), not log output.
+// behavior (call counts, skipped operations), not log output.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(discardWriter{}, nil))
 }
@@ -117,225 +115,42 @@ func TestIdentString(t *testing.T) {
 	}
 }
 
-// Run must not start a ticker for a disabled/nil Maintenance, or for a
-// nil sub-config — a table with only SnapshotExpiry set must never touch
-// compaction or orphan cleanup. Proven by giving Run a run func that would
-// panic if called, and cancelling ctx immediately: Run must return promptly
-// (nothing to wait on) rather than hang on a ticker for an operation that
-// should never have started.
-func TestRunSkipsDisabledOperations(t *testing.T) {
+// RunOnce is the one-shot pass the ephemeral worker (and the collapsed
+// runner's in-process scheduler) drives. It must be a no-op when maintenance
+// is disabled or the caller passes no operations.
+func TestRunOnceDisabledIsNoop(t *testing.T) {
 	m := &Maintainer{cfg: spec.Maintenance{Enabled: false}, log: discardLogger()}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	done := make(chan struct{})
-	go func() { m.Run(ctx); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return promptly for a disabled Maintenance")
+	if err := m.RunOnce(context.Background(), []sink.MaintenanceOp{sink.MaintenanceCompaction}); err != nil {
+		t.Fatalf("disabled maintenance must be a no-op: %v", err)
 	}
 }
 
-// runTicker fires on the ticker, not before — and stops immediately when
-// ctx is cancelled, without waiting out a long interval.
-func TestRunTickerFiresAndStopsOnCancel(t *testing.T) {
-	m := &Maintainer{log: discardLogger()}
-	var calls atomic.Int32
-	ctx, cancel := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-	failures := 0
-	go func() {
-		m.runTicker(ctx, "test", 10*time.Millisecond, func(context.Context) error {
-			calls.Add(1)
-			return nil
-		}, &failures)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond) // several ticks at 10ms
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runTicker did not stop after ctx cancellation")
-	}
-	if calls.Load() < 2 {
-		t.Errorf("expected multiple ticks in 50ms at a 10ms interval, got %d", calls.Load())
+func TestRunOnceEmptyOpsIsNoop(t *testing.T) {
+	m := &Maintainer{cfg: spec.Maintenance{Enabled: true}, log: discardLogger()}
+	if err := m.RunOnce(context.Background(), nil); err != nil {
+		t.Fatalf("empty ops must be a no-op: %v", err)
 	}
 }
 
-// After maxConsecutiveFailures consecutive failures, runTicker stops on its
-// own — it must not spam a persistently broken catalog forever.
-func TestRunTickerStopsAfterConsecutiveFailures(t *testing.T) {
-	m := &Maintainer{log: discardLogger()}
-	var calls atomic.Int32
-	failures := 0
-	done := make(chan struct{})
-
-	go func() {
-		m.runTicker(context.Background(), "test", 5*time.Millisecond, func(context.Context) error {
-			calls.Add(1)
-			return errors.New("boom")
-		}, &failures)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runTicker did not stop after consecutive failures")
-	}
-	if got := calls.Load(); got != int32(maxConsecutiveFailures) {
-		t.Errorf("run() called %d times, want exactly maxConsecutiveFailures (%d)", got, maxConsecutiveFailures)
+func TestRunOnceUnknownOpErrors(t *testing.T) {
+	m := &Maintainer{cfg: spec.Maintenance{Enabled: true}, log: discardLogger()}
+	if err := m.RunOnce(context.Background(), []sink.MaintenanceOp{"nope"}); err == nil {
+		t.Fatal("an unknown operation must error")
 	}
 }
 
-// A success resets the failure counter — an intermittent failure must not
-// accumulate toward the stop threshold across unrelated successful ticks.
-func TestRunTickerResetsFailuresOnSuccess(t *testing.T) {
-	m := &Maintainer{log: discardLogger()}
-	var calls atomic.Int32
-	failures := 0
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-
-	go func() {
-		m.runTicker(ctx, "test", 5*time.Millisecond, func(context.Context) error {
-			n := calls.Add(1)
-			// Fail, succeed, fail, succeed, ... — never two failures in a
-			// row, so the threshold must never trip within this run.
-			if n%2 == 1 {
-				return errors.New("intermittent")
-			}
-			return nil
-		}, &failures)
-		close(done) // happens-before: failures is safe to read once this fires
-	}()
-
-	time.Sleep(80 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runTicker did not stop after ctx cancellation")
+// A due operation whose sub-config is nil must be skipped WITHOUT touching
+// the catalog: runOne returns before m.compact/m.expireSnapshots/
+// m.cleanOrphans, so this passes with a nil catalog. A table with only
+// SnapshotExpiry configured must never compact or clean orphans.
+func TestRunOnceSkipsDisabledSubConfigs(t *testing.T) {
+	m := &Maintainer{cfg: spec.Maintenance{Enabled: true}, log: discardLogger()}
+	ops := []sink.MaintenanceOp{
+		sink.MaintenanceCompaction,
+		sink.MaintenanceSnapshotExpiry,
+		sink.MaintenanceOrphanCleanup,
 	}
-
-	if calls.Load() < int32(maxConsecutiveFailures)+2 {
-		t.Skip("not enough ticks landed in the window to distinguish reset from no-reset; flaky under load")
-	}
-	// If failures reset on success, run() keeps being called past
-	// maxConsecutiveFailures total invocations (interleaved fail/success
-	// never accumulates two in a row). If it did NOT reset, calls would
-	// have stopped at exactly maxConsecutiveFailures failing calls.
-	if failures >= maxConsecutiveFailures {
-		t.Errorf("failures counter = %d at end, want < %d (a success must reset it)", failures, maxConsecutiveFailures)
-	}
-}
-
-// THE SCENARIO THIS FILE EXISTS TO PIN: a long-running operation (a
-// compaction pass over many groups can legitimately take minutes) must not
-// make its sibling operation fail repeatedly against it. Before runMu, two
-// operations on the same Maintainer had no coordination at all and would
-// race the catalog's branch pointer directly — this proves they now queue
-// instead: a slow op1 blocks op2's tick until op1 releases runMu, and op2
-// runs exactly once immediately after, not zero times (queued has no
-// effect) and not with a failure recorded (raced would fail then retry).
-func TestRunTickerQueuesBehindSiblingOperation(t *testing.T) {
-	m := &Maintainer{log: discardLogger()}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	op1Started := make(chan struct{})
-	op1Release := make(chan struct{})
-	var op1Calls, op2Calls atomic.Int32
-	var op1Failures, op2Failures int
-
-	done1 := make(chan struct{})
-	go func() {
-		m.runTicker(ctx, "op1", 10*time.Millisecond, func(context.Context) error {
-			if op1Calls.Add(1) == 1 {
-				close(op1Started)
-				<-op1Release // hold runMu until the test says to release
-			}
-			return nil
-		}, &op1Failures)
-		close(done1)
-	}()
-
-	<-op1Started // op1 now holds runMu and is blocked inside its run func
-
-	done2 := make(chan struct{})
-	go func() {
-		m.runTicker(ctx, "op2", 10*time.Millisecond, func(context.Context) error {
-			op2Calls.Add(1)
-			return nil
-		}, &op2Failures)
-		close(done2)
-	}()
-
-	// op2's ticker fires repeatedly while op1 holds the lock; every one of
-	// those ticks must queue on lockOrDone, not run and not fail.
-	time.Sleep(60 * time.Millisecond)
-	if got := op2Calls.Load(); got != 0 {
-		t.Fatalf("op2 ran %d times while op1 held the lock, want 0 (it must queue, not race)", got)
-	}
-	if op2Failures != 0 {
-		t.Fatalf("op2 recorded %d failures while queued, want 0 (queueing must not look like a failed attempt)", op2Failures)
-	}
-
-	close(op1Release) // let op1 finish and release runMu
-
-	// op2 must now run — poll rather than sleep-and-hope, since the exact
-	// moment op1 releases and op2's next tick lands is not deterministic.
-	deadline := time.Now().Add(2 * time.Second)
-	for op2Calls.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := op2Calls.Load(); got == 0 {
-		t.Fatal("op2 never ran after op1 released the lock")
-	}
-
-	cancel()
-	for _, d := range []chan struct{}{done1, done2} {
-		select {
-		case <-d:
-		case <-time.After(2 * time.Second):
-			t.Fatal("a runTicker goroutine did not stop after cancellation")
-		}
-	}
-}
-
-// A tick queued behind a sibling must not block shutdown: cancelling ctx
-// while lockOrDone is waiting must return promptly, not hang until the
-// sibling eventually releases the lock.
-func TestRunTickerCancelWhileQueued(t *testing.T) {
-	m := &Maintainer{log: discardLogger()}
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Hold runMu directly (not via runTicker) so nothing ever releases it
-	// during this test — the only way out for the queued ticker is ctx
-	// cancellation, which is exactly what is under test.
-	m.runMu.Lock()
-	t.Cleanup(func() { m.runMu.Unlock() })
-
-	failures := 0
-	done := make(chan struct{})
-	go func() {
-		m.runTicker(ctx, "queued", 5*time.Millisecond, func(context.Context) error {
-			t.Error("run() must not be called while queued behind a permanently-held lock")
-			return nil
-		}, &failures)
-		close(done)
-	}()
-
-	time.Sleep(30 * time.Millisecond) // let at least one tick queue on lockOrDone
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runTicker did not stop promptly when cancelled while queued behind a held lock")
+	if err := m.RunOnce(context.Background(), ops); err != nil {
+		t.Fatalf("all sub-configs nil: every operation must be skipped, got %v", err)
 	}
 }
