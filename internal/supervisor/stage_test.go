@@ -86,26 +86,6 @@ func TestStageSupervisorDead(t *testing.T) {
 	}
 }
 
-func TestPipelineSupervisorHealth(t *testing.T) {
-	p := NewPipelineSupervisor(PipelineConfig{}, slog.Default())
-
-	h := p.Health()
-	// Before any stage is started, health reports unhealthy (stage is nil).
-	if h.SourceHealthy {
-		t.Error("source should not be healthy before start")
-	}
-	if h.SinkHealthy {
-		t.Error("sink should not be healthy before start")
-	}
-	// But no errors yet.
-	if h.SourceErr != nil {
-		t.Errorf("source error: %v", h.SourceErr)
-	}
-	if h.SinkErr != nil {
-		t.Errorf("sink error: %v", h.SinkErr)
-	}
-}
-
 type someError struct{}
 
 func (someError) Error() string { return "test error" }

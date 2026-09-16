@@ -241,27 +241,3 @@ func WireMetadataFields() []arrow.Field {
 		{Name: "__phase", Type: arrow.BinaryTypes.String, Nullable: true},
 	}
 }
-
-// SchemaFromArrow reconstructs a core.Schema from a typed Arrow schema.
-// Data columns (non-metadata) appear in schema order; metadata columns
-// (__op, __pos, __commit_ts, __ingest_ts, __snapshot, __phase) are
-// excluded — they travel outside the core schema.
-func SchemaFromArrow(as *arrow.Schema) (core.Schema, error) {
-	cols := make([]core.Column, 0, as.NumFields())
-	for i := range as.NumFields() {
-		f := as.Field(i)
-		if isMetadataColumn(f.Name) {
-			continue
-		}
-		ct, err := fieldTypeToCore(f)
-		if err != nil {
-			return core.Schema{}, fmt.Errorf("transport: schema field %q: %w", f.Name, err)
-		}
-		ct.Nullable = f.Nullable
-		cols = append(cols, core.Column{
-			Name: f.Name,
-			Type: ct,
-		})
-	}
-	return core.Schema{Columns: cols}, nil
-}
