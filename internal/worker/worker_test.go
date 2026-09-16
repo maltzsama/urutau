@@ -56,7 +56,7 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 		// Record rows VERBATIM in wire order (RV-10): the W-3 contract is
 		// that the wire preserves arrival order — re-partitioning into
 		// upserts-then-deletes here would hide an ordering regression in
-		// the code under test. Assertions that need the split call ByOp.
+		// the code under test. Assertions that need the split call byOp.
 		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: rows, Position: string(b.Watermark), Mode: toRowMode(b.Mode)})
 	}
 	if f.failAt != nil && f.failAt[i] {
