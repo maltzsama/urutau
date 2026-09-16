@@ -161,8 +161,10 @@ func New(cfg Config) *Worker {
 		cfg:    cfg,
 		tables: make(map[string]*tablePipeline),
 	}
+	// The registry always exists: the coordinator records the worker's series
+	// via the metrics report, even when this worker serves no /metrics endpoint.
+	w.metrics = observability.New()
 	if cfg.MetricsAddr != "" {
-		w.metrics = observability.New()
 		go func() { _ = w.metrics.Serve(cfg.MetricsAddr, nil) }()
 	}
 	return w

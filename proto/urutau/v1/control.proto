@@ -22,6 +22,7 @@ message WorkerMessage {
     WorkerError error        = 5;
     StagedBatch staged       = 6;  // staged data files, one per delivery (WK-001 C5)
     MaintenanceResult maintenance_result = 7;  // one ephemeral maintenance pass's outcome
+    WorkerMetricsReport worker_metrics = 8;    // periodic worker-side series the coordinator cannot derive from acks
   }
 }
 
@@ -112,6 +113,30 @@ message OrphanResult {
   int64  files_deleted = 1;
   int64  bytes_freed   = 2;
   string error         = 3;  // empty on success
+}
+
+// WorkerMetricsReport is the worker's periodic report of the series the
+// coordinator cannot derive from acks: commit failures, dropped deletes,
+// snapshot progress, and enrich counters. Per-table (and per-reference for
+// enrich), so the coordinator can label its own registry. Counters are
+// cumulative totals, not deltas.
+message WorkerMetricsReport {
+  repeated TableMetrics tables = 1;
+}
+
+message TableMetrics {
+  string         table             = 1;
+  int64          commit_failures   = 2;
+  int64          deletes_dropped   = 3;
+  double         snapshot_progress = 4;
+  repeated EnrichMetrics enrich    = 5;
+}
+
+message EnrichMetrics {
+  string reference     = 1;
+  int64  misses        = 2;
+  int64  inner_dropped = 3;
+  int64  evicted       = 4;
 }
 
 message ChunkIds {
