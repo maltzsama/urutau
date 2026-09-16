@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.1](https://github.com/maltzsama/urutau/compare/v0.1.0...v0.1.1) (2026-09-16)
+
+
+### Bug Fixes
+
+* **position:** honor the partial order of Kafka offsets in Compare and MinSafe ([7f01fdf](https://github.com/maltzsama/urutau/commit/7f01fdff6d245b7293ba16dfc32ae57dde4613a4))
+* **position:** honor the partial order of Kafka offsets in Compare and MinSafe ([a43a665](https://github.com/maltzsama/urutau/commit/a43a665ca7b5665bf788006e9124ac5647d0bb4b)), closes [#90](https://github.com/maltzsama/urutau/issues/90)
+* **worker:** detect schema drift inside declared struct columns ([a9b9540](https://github.com/maltzsama/urutau/commit/a9b9540dae6abd79b2843d9d588d707b6b17c8ee))
+* **worker:** detect schema drift inside declared struct columns ([f973e82](https://github.com/maltzsama/urutau/commit/f973e828ff3f667aa77b5105bde5c5a45bedb05b)), closes [#89](https://github.com/maltzsama/urutau/issues/89)
+
 ## 0.1.0 (2026-09-15)
 
 ### Highlights
