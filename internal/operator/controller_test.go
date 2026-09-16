@@ -24,6 +24,7 @@ import (
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
 	_ "github.com/maltzsama/urutau/internal/builtin"
+	urutauspec "github.com/maltzsama/urutau/spec"
 )
 
 var (
@@ -556,4 +557,25 @@ func waitForSTS(t *testing.T, nsName, name string) *appsv1.StatefulSet {
 	}
 	t.Fatalf("statefulset %s was not created", name)
 	return nil
+}
+
+// The worker Pod template must carry --metrics-addr only when the operator
+// opts in: the endpoint is off by default, so an empty Worker.MetricsAddr
+// must not start a listener on every worker Pod. Pure unit test — the
+// template is a function of the CR, no cluster needed.
+func TestWorkerPodTemplateMetricsAddr(t *testing.T) {
+	tbl := urutauspec.Table{Target: "raw.orders"}
+
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Worker.MetricsAddr = ":9091"
+	cmd := strings.Join(workerPodTemplate(cr, "urutau:test", tbl).Spec.Containers[0].Command, " ")
+	if !strings.Contains(cmd, "--metrics-addr :9091") {
+		t.Fatalf("worker command = %q, want --metrics-addr :9091", cmd)
+	}
+
+	off := pipelineCR("orders", "ns")
+	cmd = strings.Join(workerPodTemplate(off, "urutau:test", tbl).Spec.Containers[0].Command, " ")
+	if strings.Contains(cmd, "--metrics-addr") {
+		t.Fatalf("worker command = %q, must not carry --metrics-addr when unset", cmd)
+	}
 }

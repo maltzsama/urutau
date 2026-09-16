@@ -10,7 +10,6 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
-	"github.com/maltzsama/urutau/internal/observability"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
@@ -19,10 +18,10 @@ import (
 // RunMaintenance connects to the coordinator as an ephemeral maintenance
 // worker: it sends a maintenance Hello, waits for the coordinator to push a
 // MaintenanceAssignment (one is sent when a maintenance turn is due), runs
-// the requested operations once, and returns. The process then exits, and
-// the coordinator's Deployment restarts it for the next turn — so a
-// maintenance pass never competes with the coordinator's routing/commit
-// path, and never takes the coordinator down with it.
+// the requested operations once, reports the outcome, and returns. The
+// process then exits, and the coordinator's Deployment restarts it for the
+// next turn — so a maintenance pass never competes with the coordinator's
+// routing/commit path, and never takes the coordinator down with it.
 //
 // It never opens the data plane: no Flight, no acks. The coordinator knows a
 // maintenance worker by its Hello marker, answers with the maintenance
@@ -61,22 +60,31 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 		if assign == nil {
 			continue // ignore anything but the maintenance assignment
 		}
-		if err := runMaintenancePass(ctx, cfg, assign); err != nil {
-			return err
+		results, passErr := runMaintenancePass(ctx, cfg, assign)
+		// Report the outcome before exiting: this process's own /metrics
+		// dies with it, so a result not sent now is lost to the coordinator's
+		// long-lived registry. Report even on failure — the coordinator
+		// records the failed operation too.
+		sendErr := session.Send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_MaintenanceResult{
+			MaintenanceResult: &pb.MaintenanceResult{Ops: results},
+		}})
+		if sendErr != nil && passErr == nil {
+			return fmt.Errorf("worker: maintenance: report: %w", sendErr)
 		}
-		return nil // one pass per process: exit, and the Deployment restarts us
+		return passErr // one pass per process: exit, and the Deployment restarts us
 	}
 }
 
 // runMaintenancePass opens the sink, runs the assigned operations once, and
-// returns. The assignment carries the table, the operations (in order), and
-// the operation parameters — the coordinator already decided which
-// operations are due, so the intervals in the config are ignored.
-func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.MaintenanceAssignment) error {
+// returns the per-operation results plus the first error. The assignment
+// carries the table, the operations (in order), and the operation
+// parameters — the coordinator already decided which operations are due, so
+// the intervals in the config are ignored.
+func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.MaintenanceAssignment) ([]*pb.MaintenanceOpResult, error) {
 	var maint spec.Maintenance
 	if len(assign.MaintenanceConfig) > 0 {
 		if err := json.Unmarshal(assign.MaintenanceConfig, &maint); err != nil {
-			return fmt.Errorf("worker: maintenance: config: %w", err)
+			return nil, fmt.Errorf("worker: maintenance: config: %w", err)
 		}
 	}
 	maint.Enabled = true
@@ -85,7 +93,7 @@ func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.Mainte
 		ops[i] = sink.MaintenanceOp(o)
 	}
 	if len(ops) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	snk, err := driver.OpenSinkConfig(ctx, sink.Config{
@@ -95,13 +103,13 @@ func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.Mainte
 		Options:   cfg.Sink.Options,
 	})
 	if err != nil {
-		return fmt.Errorf("worker: maintenance: open sink: %w", err)
+		return nil, fmt.Errorf("worker: maintenance: open sink: %w", err)
 	}
 	defer func() { _ = snk.Close() }()
 
 	maintainable, ok := snk.(sink.Maintainable)
 	if !ok {
-		return fmt.Errorf("worker: maintenance: sink %q does not support table maintenance", cfg.Sink.Type)
+		return nil, fmt.Errorf("worker: maintenance: sink %q does not support table maintenance", cfg.Sink.Type)
 	}
 	ref := core.TableRef{Target: assign.TargetTable}
 	currentPosition := func() string {
@@ -111,56 +119,61 @@ func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.Mainte
 		}
 		return pos
 	}
+	collector := &resultCollector{}
 	cfg.Logger.Info("worker: maintenance: start", "table", assign.TargetTable, "ops", ops)
-	m := maintainable.Maintain(ref, maint, cfg.Logger, currentPosition, maintenanceMetricsFor(cfg.MetricsAddr))
+	m := maintainable.Maintain(ref, maint, cfg.Logger, currentPosition, collector)
 	if err := m.RunOnce(ctx, ops); err != nil {
-		return fmt.Errorf("worker: maintenance %s: %w", assign.TargetTable, err)
+		cfg.Logger.Warn("worker: maintenance: failed", "table", assign.TargetTable, "ops", ops, "err", err)
+		return collector.ops, fmt.Errorf("worker: maintenance %s: %w", assign.TargetTable, err)
 	}
 	cfg.Logger.Info("worker: maintenance: done", "table", assign.TargetTable, "ops", ops)
-	return nil
+	return collector.ops, nil
 }
 
-// maintenanceMetricsFor returns the Prometheus recorder for a maintenance
-// pass, or nil when the worker serves no metrics. The pass runs in THIS
-// process, so its counters live in the worker's own registry (served on
-// MetricsAddr) — not the coordinator's, which never sees the pass.
-func maintenanceMetricsFor(metricsAddr string) sink.MaintainerMetrics {
-	if metricsAddr == "" {
-		return nil
-	}
-	m := observability.New()
-	go func() { _ = m.Serve(metricsAddr, nil) }()
-	return maintenanceMetrics{m}
+// resultCollector is a sink.MaintainerMetrics that captures each operation's
+// result instead of writing it to a Prometheus registry. The worker's own
+// registry would die with the process (the worker is ephemeral), so the
+// results are shipped to the coordinator, whose registry is long-lived and
+// scraped. RunOnce calls these synchronously and in order, so no locking.
+type resultCollector struct {
+	ops []*pb.MaintenanceOpResult
 }
 
-// maintenanceMetrics implements sink.MaintainerMetrics against the worker's
-// own Prometheus registry.
-type maintenanceMetrics struct {
-	m *observability.Metrics
+func (r *resultCollector) CompactionRun(_ string, filesRemoved, filesAdded int, bytesBefore, bytesAfter int64, err error) {
+	r.ops = append(r.ops, &pb.MaintenanceOpResult{Op: &pb.MaintenanceOpResult_Compaction{
+		Compaction: &pb.CompactionResult{
+			FilesRemoved: int64(filesRemoved),
+			FilesAdded:   int64(filesAdded),
+			BytesBefore:  bytesBefore,
+			BytesAfter:   bytesAfter,
+			Error:        errText(err),
+		},
+	}})
 }
 
-func (a maintenanceMetrics) CompactionRun(table string, filesRemoved, filesAdded int, bytesBefore, bytesAfter int64, err error) {
-	a.m.IcebergCompactionRuns.WithLabelValues(table).Inc()
-	if err != nil {
-		return
-	}
-	a.m.IcebergCompactionFilesRemoved.WithLabelValues(table).Add(float64(filesRemoved))
-	a.m.IcebergCompactionFilesAdded.WithLabelValues(table).Add(float64(filesAdded))
-	a.m.IcebergCompactionBytesBefore.WithLabelValues(table).Add(float64(bytesBefore))
-	a.m.IcebergCompactionBytesAfter.WithLabelValues(table).Add(float64(bytesAfter))
+func (r *resultCollector) SnapshotExpiryRun(_ string, snapshotsRemoved int, err error) {
+	r.ops = append(r.ops, &pb.MaintenanceOpResult{Op: &pb.MaintenanceOpResult_Expiry{
+		Expiry: &pb.ExpiryResult{
+			SnapshotsRemoved: int64(snapshotsRemoved),
+			Error:            errText(err),
+		},
+	}})
 }
 
-func (a maintenanceMetrics) SnapshotExpiryRun(table string, snapshotsRemoved int, err error) {
-	a.m.IcebergSnapshotExpiryRuns.WithLabelValues(table).Inc()
+func (r *resultCollector) OrphanCleanupRun(_ string, filesDeleted int, bytesFreed int64, err error) {
+	r.ops = append(r.ops, &pb.MaintenanceOpResult{Op: &pb.MaintenanceOpResult_Orphan{
+		Orphan: &pb.OrphanResult{
+			FilesDeleted: int64(filesDeleted),
+			BytesFreed:   bytesFreed,
+			Error:        errText(err),
+		},
+	}})
+}
+
+// errText renders an error for the wire, empty on success.
+func errText(err error) string {
 	if err == nil {
-		a.m.IcebergSnapshotExpirySnapshots.WithLabelValues(table).Add(float64(snapshotsRemoved))
+		return ""
 	}
-}
-
-func (a maintenanceMetrics) OrphanCleanupRun(table string, filesDeleted int, bytesFreed int64, err error) {
-	a.m.IcebergOrphanCleanupRuns.WithLabelValues(table).Inc()
-	if err == nil {
-		a.m.IcebergOrphanCleanupFiles.WithLabelValues(table).Add(float64(filesDeleted))
-		a.m.IcebergOrphanCleanupBytes.WithLabelValues(table).Add(float64(bytesFreed))
-	}
+	return err.Error()
 }
