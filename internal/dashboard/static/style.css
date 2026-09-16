@@ -53,12 +53,12 @@ nav a.active { color: var(--pico-color); border-color: var(--accent); font-weigh
 .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .streamgrid, .workgrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.section { margin-top: 16px; }
+.section { margin-top: 24px; }
 .sectionhead { display: flex; justify-content: space-between; align-items: center; gap: 12px;
   margin-bottom: 8px; flex-wrap: wrap; }
 .sectionhead h2 { margin: 0; }
 
-.card { margin: 0; }
+.card { margin-bottom: 0; }
 .card.clickable { cursor: pointer; }
 .kpi .label { font-size: .66rem; text-transform: uppercase; letter-spacing: .07em;
   color: var(--pico-muted-color); font-weight: 750; }
@@ -87,12 +87,14 @@ nav a.active { color: var(--pico-color); border-color: var(--accent); font-weigh
 .banner.fail { border-left-color: var(--err); }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .actions.end { justify-content: flex-end; }
-.toolbar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  margin-bottom: 10px; flex: 1 1 auto; min-width: 0; }
 .toolbar input, .toolbar select { margin: 0; font-size: .82rem; }
-.toolbar input { flex: 1; min-width: 150px; }
+.toolbar input { flex: 1 1 180px; min-width: 120px; }
+.toolbar select { flex: 0 0 auto; width: auto; }
 
 /* ── buttons: compact, and the variants Pico does not color ───────────── */
-button, .button { font-size: .82rem; padding: .38rem .7rem; }
+button, .button { font-size: .82rem; padding: .38rem .7rem; margin-bottom: 0; }
 button.danger { background: var(--err); border-color: var(--err); color: #fff; }
 button.danger:hover { filter: brightness(.92); }
 button.warning { background: var(--warn); border-color: var(--warn); color: #fff; }
@@ -107,12 +109,12 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .event .msg { margin-top: 3px; }
 
 /* ── copy button / theme toggle ───────────────────────────────────────── */
-.copy-btn { width: auto; min-width: 22px; height: 22px; padding: 0 6px;
+.copy-btn { width: auto; min-width: 22px; height: 22px; padding: 0 6px; margin: 0;
   display: inline-grid; place-items: center; border-radius: 6px; font-size: .72rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
   color: var(--pico-muted-color); cursor: pointer; line-height: 1; }
 .copy-btn:hover { color: var(--pico-color); }
-.theme-toggle { width: auto; padding: 3px 9px; border-radius: 999px; font-size: .74rem;
+.theme-toggle { width: auto; padding: 3px 9px; margin: 0; border-radius: 999px; font-size: .74rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
   color: var(--pico-color); cursor: pointer; }
 

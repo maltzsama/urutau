@@ -17,6 +17,7 @@
 </script>
 <link rel="stylesheet" href="/vendor/pico.min.css">
 <link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
 </head>
 <body x-data="app()" x-init="init()">
 
@@ -109,20 +110,27 @@
       </article>
     </div>
 
-    <div class="grid two section">
-      <article class="card">
-        <div class="sectionhead"><h2>Throughput</h2>
+    <section class="section">
+      <div class="sectionhead">
+        <h2>Throughput &amp; lag</h2>
+        <div class="topline">
+          <span class="muted small">window</span>
           <select x-model="window" @change="renderCharts()">
             <option value="5m">5m</option><option value="30m">30m</option><option value="1h">1h</option>
           </select>
         </div>
-        <div class="chart"><canvas id="chart-throughput"></canvas></div>
-      </article>
-      <article class="card">
-        <div class="sectionhead"><h2>Lag by stream</h2><span class="muted small">threshold 30s</span></div>
-        <div class="chart"><canvas id="chart-lag"></canvas></div>
-      </article>
-    </div>
+      </div>
+      <div class="grid two">
+        <article class="card">
+          <div class="sectionhead"><h2>Throughput</h2><span class="muted small">rows/s</span></div>
+          <div class="chart"><canvas id="chart-throughput"></canvas></div>
+        </article>
+        <article class="card">
+          <div class="sectionhead"><h2>Lag by stream</h2><span class="muted small">threshold 30s</span></div>
+          <div class="chart"><canvas id="chart-lag"></canvas></div>
+        </article>
+      </div>
+    </section>
 
     <section class="card section">
       <div class="sectionhead">
