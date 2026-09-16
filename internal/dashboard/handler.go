@@ -116,10 +116,45 @@ func (h *Handler) listLogs(w http.ResponseWriter, r *http.Request) {
 			TS:    rec.Time.UTC().Format(time.RFC3339Nano),
 			Level: rec.Level.String(),
 			Msg:   rec.Message,
-			Attrs: rec.Attrs,
+			Attrs: jsonSafeAttrs(rec.Attrs),
 		}
 	}
 	writeJSON(w, out)
+}
+
+// jsonSafeAttrs recursively replaces values json.Marshal cannot encode (maps
+// with non-string keys, channels, funcs, …) with their text form, so one odd
+// attr can never 500 the whole logs endpoint. The log buffer already stores
+// JSON-safe values; this is defense in depth.
+func jsonSafeAttrs(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = jsonSafeValue(v)
+	}
+	return out
+}
+
+func jsonSafeValue(v any) any {
+	switch t := v.(type) {
+	case nil, bool, string,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, json.Number:
+		return v
+	case map[string]any:
+		return jsonSafeAttrs(t)
+	case []any:
+		out := make([]any, len(t))
+		for i, vv := range t {
+			out[i] = jsonSafeValue(vv)
+		}
+		return out
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func (h *Handler) cancel(w http.ResponseWriter, _ *http.Request) {

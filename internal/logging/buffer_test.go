@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"testing"
@@ -81,5 +82,26 @@ func TestNewBufferedCaptures(t *testing.T) {
 	got := buf.Tail(slog.LevelDebug, 10)
 	if len(got) != 1 || got[0].Message != "hello" || got[0].Attrs["k"] != "v" {
 		t.Fatalf("NewBuffered did not capture: %v", got)
+	}
+}
+
+// A KindAny attr can carry a Go value json.Marshal refuses (a map with
+// non-string keys, e.g. the mysql driver's tag maps). The buffer must store a
+// JSON-safe rendering, or the dashboard's /logs endpoint 500s and the SPA
+// never finishes loading.
+func TestTeeHandlerJSONSafeAttrs(t *testing.T) {
+	buf := NewBuffer(4)
+	log := discardLogger(buf)
+	log.Info("x", "tags", map[struct{ A int }]int{{A: 1}: 2})
+
+	got := buf.Tail(slog.LevelInfo, 1)
+	if len(got) != 1 {
+		t.Fatalf("got %d records, want 1", len(got))
+	}
+	if _, ok := got[0].Attrs["tags"].(string); !ok {
+		t.Fatalf("tags attr = %#v, want a JSON-safe string", got[0].Attrs["tags"])
+	}
+	if _, err := json.Marshal(got[0].Attrs); err != nil {
+		t.Fatalf("attrs are not JSON-marshalable: %v", err)
 	}
 }

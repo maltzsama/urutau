@@ -119,7 +119,10 @@ func (h *teeHandler) WithGroup(name string) slog.Handler {
 }
 
 // addAttrs flattens attrs into m, prefixing group paths. A slog.Group attr
-// recurses (a named group extends the path, an inline one does not).
+// recurses (a named group extends the path, an inline one does not). Values
+// are stored JSON-safe: a KindAny attr can carry an arbitrary Go value (e.g. a
+// map with non-string keys) that json.Marshal refuses, and the dashboard
+// serializes these records, so those are rendered as text.
 func addAttrs(m map[string]any, groups []string, attrs []slog.Attr) {
 	for _, a := range attrs {
 		if a.Value.Kind() == slog.KindGroup {
@@ -138,6 +141,16 @@ func addAttrs(m map[string]any, groups []string, attrs []slog.Attr) {
 		if len(groups) > 0 {
 			key = strings.Join(groups, ".") + "." + key
 		}
-		m[key] = a.Value.Any()
+		m[key] = jsonSafeValue(a.Value)
 	}
+}
+
+// jsonSafeValue renders a slog value for the wire. The typed kinds (string,
+// int, bool, time, …) keep their Go value; KindAny — where an arbitrary Go
+// value lives — is rendered as text, since it may not be JSON-serializable.
+func jsonSafeValue(v slog.Value) any {
+	if v.Kind() == slog.KindAny {
+		return v.String()
+	}
+	return v.Any()
 }
