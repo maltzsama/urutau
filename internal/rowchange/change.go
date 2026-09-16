@@ -181,18 +181,6 @@ func (b Batch) ByOp() (upserts, deletes []Change) {
 	return upserts, deletes
 }
 
-// ToDataplaneMode maps a row-layer write mode to the public data-plane enum.
-// The enums have different zero values (row layer 0 = upsert, data plane 0 =
-// ModeUnset), so a raw uint8 cast would silently misread across the boundary.
-func ToDataplaneMode(m WriteMode) dataplane.WriteMode {
-	switch m {
-	case AppendMode:
-		return dataplane.AppendMode
-	default:
-		return dataplane.UpsertMode
-	}
-}
-
 // ToRowMode maps a data-plane write mode to the row-layer enum. ModeUnset is
 // mapped to upsert only because the caller validates it first; it must never
 // reach here from production code.

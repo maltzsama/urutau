@@ -65,9 +65,6 @@ func Start(dir, token string, svc flight.FlightServer) (*Server, error) {
 // Addr is the unix socket path — the address client.Connect dials.
 func (s *Server) Addr() string { return s.addr }
 
-// Token is the bearer token client.Connect authenticates with.
-func (s *Server) Token() string { return s.token }
-
 // Stop gracefully stops the server and removes the socket.
 func (s *Server) Stop() {
 	s.grpc.GracefulStop()
