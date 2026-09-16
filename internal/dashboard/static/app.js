@@ -7,6 +7,7 @@ function app() {
   const HISTORY = 720; // 1h at a 5s sample
   const HISTORY_MS = 5000;
   const COLORS = ['#2563eb', '#16a34a', '#d97706', '#c0392b', '#7c3aed'];
+  let es = null; // the EventSource, kept outside Alpine's reactive data
 
   return {
     view: 'overview',
@@ -37,7 +38,6 @@ function app() {
     series: {},        // per-stream series: target -> { lag: [], rate: [] }
     workerTimeline: {}, // worker -> [{ t, status }]
     lastHistoryAt: 0,
-    timers: [],
 
     tabs: [
       { id: 'overview', label: 'Overview' },
@@ -55,11 +55,57 @@ function app() {
       });
       const v = new URLSearchParams(location.search).get('view');
       if (v) this.view = v;
-      this.refresh();
-      this.timers.push(setInterval(() => this.refresh(), 2000));
+      this.openStream();
       window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') { this.drawer.open = false; this.modal.open = false; }
       });
+    },
+
+    // openStream subscribes to the coordinator's SSE stream: a full snapshot on
+    // connect, then live 'state', 'event' and 'log' pushes. No polling. The
+    // browser's EventSource reconnects on its own when the stream drops.
+    openStream() {
+      if (es) es.close();
+      es = new EventSource(API + '/stream');
+      es.addEventListener('snapshot', (e) => {
+        const s = JSON.parse(e.data);
+        this.applyState(s);
+        if (s.events) this.events = s.events;
+        if (s.logs) this.logs = s.logs;
+        this.loaded = true;
+        this.error = '';
+        this.failures = 0;
+        this.lastPoll = new Date().toLocaleTimeString('en-GB');
+        this.pushHistory();
+        this.$nextTick(() => this.renderCharts());
+      });
+      es.addEventListener('state', (e) => {
+        this.applyState(JSON.parse(e.data));
+        this.lastPoll = new Date().toLocaleTimeString('en-GB');
+        this.pushHistory();
+        this.$nextTick(() => this.renderCharts());
+      });
+      es.addEventListener('event', (e) => {
+        this.events.unshift(JSON.parse(e.data));
+        if (this.events.length > 1000) this.events.pop();
+      });
+      es.addEventListener('log', (e) => {
+        this.logs.unshift(JSON.parse(e.data));
+        if (this.logs.length > 1000) this.logs.pop();
+      });
+      es.onerror = () => {
+        // The stream dropped; the browser retries. Show the outage, keep the
+        // last known state.
+        this.failures++;
+        this.error = 'Coordinator unreachable';
+        this.lastPoll = 'stale';
+      };
+    },
+
+    applyState(s) {
+      if (s.pipeline) this.summary = s.pipeline;
+      if (s.tables) this.tables = s.tables;
+      if (s.workers) this.workers = s.workers;
     },
 
     // ── theme ─────────────────────────────────────────────────────────────
@@ -84,32 +130,34 @@ function app() {
       if (!r.ok) throw new Error(path + ': ' + r.status);
       return r.json();
     },
+    // refresh is a one-shot REST fetch, used by the Retry button. Live updates
+    // arrive over the SSE stream, not here; each endpoint is fetched
+    // independently so one failure cannot blank the whole dashboard.
     async refresh() {
-      try {
-        const [summary, tables, workers, events, logs] = await Promise.all([
-          this.fetchJSON(API + '/pipeline'),
-          this.fetchJSON(API + '/tables'),
-          this.fetchJSON(API + '/workers'),
-          this.fetchJSON(API + '/events?limit=' + this.eventLimit),
-          this.fetchJSON(API + '/logs?limit=500'),
-        ]);
-        this.summary = summary || {};
-        this.tables = tables || [];
-        this.workers = workers || [];
-        this.events = events || [];
-        this.logs = logs || [];
-        this.failures = 0;
+      const [summary, tables, workers, events, logs] = await Promise.allSettled([
+        this.fetchJSON(API + '/pipeline'),
+        this.fetchJSON(API + '/tables'),
+        this.fetchJSON(API + '/workers'),
+        this.fetchJSON(API + '/events?limit=' + this.eventLimit),
+        this.fetchJSON(API + '/logs?limit=500'),
+      ]);
+      if (summary.status === 'fulfilled') this.summary = summary.value || {};
+      if (tables.status === 'fulfilled') this.tables = tables.value || [];
+      if (workers.status === 'fulfilled') this.workers = workers.value || [];
+      if (events.status === 'fulfilled') this.events = events.value || [];
+      if (logs.status === 'fulfilled') this.logs = logs.value || [];
+      if ([summary, tables, workers].every((r) => r.status === 'fulfilled')) {
         this.error = '';
+        this.failures = 0;
         this.loaded = true;
         this.lastPoll = new Date().toLocaleTimeString('en-GB');
-        this.pushHistory();
-        this.$nextTick(() => this.renderCharts());
-      } catch (e) {
-        // Keep the last valid state; surface the outage.
+      } else {
         this.failures++;
         this.error = 'Coordinator unreachable';
         this.lastPoll = 'stale';
       }
+      this.pushHistory();
+      this.$nextTick(() => this.renderCharts());
     },
     pushHistory() {
       // Sample the series every 5s (not on every 2s poll), so the 720-point
