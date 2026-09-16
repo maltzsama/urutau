@@ -2,7 +2,7 @@
 
 *Tupi–Guaraní for the potoo — a nightjar that stands motionless through the night, watching. A fitting name for a process that spends its life quietly watching a binlog.*
 
-Go ≥ 1.26 · pre-0.1.0, hardening in progress · license: **Apache-2.0**
+v0.1.0 · Go ≥ 1.26 · license: **Apache-2.0** <!-- x-release-please-version -->
 
 Urutau replicates MySQL, Postgres, and Kafka into Apache Iceberg,
 ClickHouse, and Couchbase **reflecting source state** — upsert by primary
@@ -75,11 +75,12 @@ through Trino, and watch a live change replicate.
 
 ## Status
 
-**Pre-0.1.0.** The engine runs end to end — MySQL/Postgres/Kafka into
-Iceberg, ClickHouse, or Couchbase, single-process or distributed, with the
-k8s operator — and the commit path has been verified by reading back
-through Trino rather than trusting a successful write. Correctness-critical
-paths are still being actively hardened; read
+**Released.** The engine runs end to end — MySQL/Postgres/Kafka into Iceberg,
+ClickHouse, or Couchbase, single-process or distributed, with the k8s
+operator — and the commit path has been verified by reading back through
+Trino rather than trusting a successful write. It is not yet software with
+production mileage: correctness-critical paths are still being actively
+hardened, so read
 [Known limitations and roadmap](https://maltzsama.github.io/urutau/docs/reference/roadmap)
 before relying on this for anything you can't afford to lose.
 
@@ -120,9 +121,11 @@ an init container, ahead of the coordinator.
 ## Contributing
 
 Issues and PRs are welcome. All code, comments, commit messages, and
-documentation in this repository are **English**. `CONTRIBUTING.md` (DCO/
-CLA decision, code of conduct) is not written yet — treat that as an open
-item, not an oversight to work around.
+documentation in this repository are **English**. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the community expectations.
+The contributor sign-off policy (DCO vs CLA) is still open — tracked in the
+[roadmap](https://maltzsama.github.io/urutau/docs/reference/roadmap#registered-for-v2-not-v1-gaps).
 
 ## Development
 

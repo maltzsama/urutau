@@ -2,8 +2,7 @@
 
 ## 0.1.0 (2026-09-15)
 
-
-### ⚠ BREAKING CHANGES
+### Highlights
 
 * **operator:** flat cpu/memory on the CR, single image for coordinator and workers
 * **spec:** Workers becomes an object (number, cpu, memory)

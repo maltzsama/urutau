@@ -27,8 +27,9 @@ silently — they're tracked, not forgotten.
 parent-child shard lineage is a position-contract problem Kafka doesn't
 have, and it isn't modeled yet.
 
-**Post-0.1.0 sync modes** (`incremental`, `backfill-only`) — declared as a
-future part of the contract, not implemented.
+**Incremental and backfill-only sync modes** (`incremental`,
+`backfill-only`) — declared as a future part of the contract, not
+implemented.
 
 Nested canonical types (`Struct`/`List`/`Map`), `KindFixedBinary`, the
 Kafka `raw`/Confluent-Avro decoders, transport-native metadata columns,
@@ -56,4 +57,7 @@ is a correctness gap in v1.
   [Position](../architecture/state-position.md) is required for them. It is
   designed but not implemented — a first sketch (a bbolt package) was
   removed as dead code.
+- **Contributor sign-off policy (DCO vs CLA)**: not decided. A per-commit
+  DCO is simple; a one-time CLA is the rights grant a future Apache
+  Foundation donation needs. See [CONTRIBUTING.md](https://github.com/maltzsama/urutau/blob/main/CONTRIBUTING.md#sign-off-dco-vs-cla--open).
 

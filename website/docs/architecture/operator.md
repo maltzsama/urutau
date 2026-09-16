@@ -88,7 +88,7 @@ kind: CDCPipeline
 metadata:
   name: shop-mysql
 spec:
-  image: ghcr.io/example/urutau:v0.5.0
+  image: ghcr.io/you/urutau:v1.2.3
   secrets:
     source: shop-mysql-creds
     catalog: polaris-creds
