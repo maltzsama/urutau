@@ -15,6 +15,28 @@ import (
 	"github.com/maltzsama/urutau/sink"
 )
 
+// toRowMode translates the data-plane write mode to the row-layer enum the
+// recorded rowchange.Batch carries. Test-only: production never bridges the
+// two.
+func toRowMode(m dataplane.WriteMode) rowchange.WriteMode {
+	if m == dataplane.AppendMode {
+		return rowchange.AppendMode
+	}
+	return rowchange.UpsertMode
+}
+
+// byOp splits a recorded batch by operation, preserving arrival order.
+func byOp(b rowchange.Batch) (upserts, deletes []rowchange.Change) {
+	for _, c := range b.Changes {
+		if c.Op == rowchange.OpDelete {
+			deletes = append(deletes, c)
+		} else {
+			upserts = append(upserts, c)
+		}
+	}
+	return upserts, deletes
+}
+
 type fakeCommitter struct {
 	mu      sync.Mutex
 	batches []rowchange.Batch
@@ -28,14 +50,14 @@ func (f *fakeCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	defer f.mu.Unlock()
 	i := len(f.batches)
 	if b.Record == nil || b.Record.NumRows() == 0 {
-		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
+		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: toRowMode(b.Mode)})
 	} else {
 		rows, _ := transport.DecodeBatch(b.Record, b.Table, []string{"id"})
 		// Record rows VERBATIM in wire order (RV-10): the W-3 contract is
 		// that the wire preserves arrival order — re-partitioning into
 		// upserts-then-deletes here would hide an ordering regression in
 		// the code under test. Assertions that need the split call ByOp.
-		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: rows, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
+		f.batches = append(f.batches, rowchange.Batch{Table: b.Table, Changes: rows, Position: string(b.Watermark), Mode: toRowMode(b.Mode)})
 	}
 	if f.failAt != nil && f.failAt[i] {
 		return errors.New("boom")
@@ -326,13 +348,13 @@ func TestMergeBatchesPropagatesMode(t *testing.T) {
 	}
 }
 
-// batchUpserts/batchDeletes: ByOp views for assertions.
+// batchUpserts/batchDeletes: byOp views for assertions.
 func batchUpserts(b rowchange.Batch) []rowchange.Change {
-	u, _ := b.ByOp()
+	u, _ := byOp(b)
 	return u
 }
 
 func batchDeletes(b rowchange.Batch) []rowchange.Change {
-	_, d := b.ByOp()
+	_, d := byOp(b)
 	return d
 }

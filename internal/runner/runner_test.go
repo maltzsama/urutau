@@ -27,6 +27,16 @@ import (
 
 const runnerTestUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
 
+// toRowMode translates the data-plane write mode to the row-layer enum the
+// recorded rowchange.Batch carries. Test-only: production never bridges the
+// two.
+func toRowMode(m dataplane.WriteMode) rowchange.WriteMode {
+	if m == dataplane.AppendMode {
+		return rowchange.AppendMode
+	}
+	return rowchange.UpsertMode
+}
+
 // gateCommitter records committed batches.
 type gateCommitter struct {
 	mu      sync.Mutex
@@ -39,7 +49,7 @@ func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	// a production bridge.
 	if b.Record == nil || b.Record.NumRows() == 0 {
 		c.mu.Lock()
-		c.batches = append(c.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode)})
+		c.batches = append(c.batches, rowchange.Batch{Table: b.Table, Position: string(b.Watermark), Mode: toRowMode(b.Mode)})
 		c.mu.Unlock()
 		return nil
 	}
@@ -52,7 +62,7 @@ func (c *gateCommitter) Commit(_ context.Context, b *dataplane.Batch) error {
 	}
 	c.mu.Lock()
 	c.batches = append(c.batches, rowchange.Batch{
-		Table: b.Table, Changes: upserts, Position: string(b.Watermark), Mode: rowchange.ToRowMode(b.Mode),
+		Table: b.Table, Changes: upserts, Position: string(b.Watermark), Mode: toRowMode(b.Mode),
 	})
 	c.mu.Unlock()
 	return nil
