@@ -10,6 +10,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // Config is everything a sink needs, in neutral terms. Driver-specific
@@ -169,6 +170,40 @@ type PositionSeeder interface {
 	// position (a fresh table). Called by the coordinator after a table's
 	// snapshot completes, for the owners whose partition had no rows.
 	SeedPositions(ctx context.Context, ref core.TableRef, owners []string) error
+}
+
+// Maintainer runs background table maintenance for one target table until
+// ctx is cancelled. Returned by Maintainable.Maintain; the orchestration only
+// ever calls Run, so the concrete implementation (compaction, snapshot
+// expiry, whatever a future sink needs) stays entirely behind the interface.
+type Maintainer interface {
+	Run(ctx context.Context)
+}
+
+// MaintainerMetrics receives counts from each maintenance run, labeled by
+// target table. Every method is called synchronously from the Maintainer's
+// own goroutine after a run completes (success or failure): implementations
+// must not block. A nil MaintainerMetrics passed to Maintain means no
+// metrics are recorded — Maintainable implementations must treat it that
+// way, not panic.
+type MaintainerMetrics interface {
+	CompactionRun(table string, filesRemoved, filesAdded int, bytesBefore, bytesAfter int64, err error)
+	SnapshotExpiryRun(table string, snapshotsRemoved int, err error)
+	OrphanCleanupRun(table string, filesDeleted int, bytesFreed int64, err error)
+}
+
+// Maintainable is an optional capability: a sink that supports background
+// table maintenance (compaction, snapshot expiry, orphan cleanup — Iceberg
+// today) implements it so the orchestration can launch one Maintainer per
+// target table without ever importing the concrete sink package (the
+// architecture wall internal/architecture enforces: runner/coordinator
+// consume only source/sink/driver contracts). currentPosition and metrics
+// may be nil; what a nil value means is the implementation's contract to
+// document (the Iceberg Maintainer treats nil currentPosition as "never
+// attach cdc.position to a compaction commit" and nil metrics as "record
+// nothing").
+type Maintainable interface {
+	Maintain(ref core.TableRef, cfg spec.Maintenance, log *slog.Logger, currentPosition func() string, metrics MaintainerMetrics) Maintainer
 }
 
 // Sink is a destination catalog. It is the composition of the small
