@@ -1794,7 +1794,11 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	if !c.isStagedTable(ack.Table) {
 		c.recordConfirmed(worker, pos)
 	}
-	c.recordTableStats(worker, ack.Table, int64(ack.Rows), int64(ack.Deletes), time.Now())
+	var commitLatencyMs float64
+	if d := ack.GetCommitDuration(); d != nil {
+		commitLatencyMs = float64(d.AsDuration().Milliseconds())
+	}
+	c.recordTableStats(worker, ack.Table, int64(ack.Rows), int64(ack.Deletes), commitLatencyMs, time.Now())
 	if c.metrics != nil {
 		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()

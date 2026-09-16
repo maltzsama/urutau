@@ -17,8 +17,8 @@ func TestDashStateTablesAggregates(t *testing.T) {
 		}}},
 	}
 	now := time.Now()
-	c.recordTableStats("w-0", "raw.orders", 10, 2, now)
-	c.recordTableStats("w-0", "raw.orders", 5, 0, now)
+	c.recordTableStats("w-0", "raw.orders", 10, 2, 12, now)
+	c.recordTableStats("w-0", "raw.orders", 5, 0, 8, now)
 	c.recordMaintStats("raw.orders", "compaction", now, func(s *maintStats) {
 		s.filesRemoved += 3
 		s.bytesBefore += 100
@@ -37,6 +37,9 @@ func TestDashStateTablesAggregates(t *testing.T) {
 	if st.Commits != 2 || st.RowsTotal != 15 || st.EqualityDeletes != 2 {
 		t.Errorf("ack aggregate = %+v", st)
 	}
+	if st.CommitLatencyMs != 8 {
+		t.Errorf("commit latency = %v, want the last ack's (8)", st.CommitLatencyMs)
+	}
 	if st.Maintenance == nil || st.Maintenance.Compaction == nil || st.Maintenance.Compaction.FilesRemoved != 3 {
 		t.Errorf("compaction aggregate = %+v", st.Maintenance)
 	}
@@ -51,7 +54,7 @@ func TestDashStateTablesAggregates(t *testing.T) {
 // A zero Coordinator (no maps) must not panic on the recording paths.
 func TestRecordStatsLazyInit(t *testing.T) {
 	c := &Coordinator{}
-	c.recordTableStats("w", "t", 1, 0, time.Now())
+	c.recordTableStats("w", "t", 1, 0, 0, time.Now())
 	c.recordMaintStats("t", "compaction", time.Now(), func(*maintStats) {})
 	if len(dashState{c}.Tables()) != 0 {
 		t.Error("no spec tables, so no rows")

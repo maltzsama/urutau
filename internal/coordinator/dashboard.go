@@ -22,6 +22,7 @@ type tableStats struct {
 	rows             int64
 	deletes          int64
 	lastCommit       time.Time
+	commitLatencyMs  float64
 	commitFailures   int64
 	deletesDropped   int64
 	snapshotProgress float64
@@ -104,6 +105,7 @@ func (s dashState) Tables() []dashboard.TableStatus {
 			st.RowsTotal = ts.rows
 			st.EqualityDeletes = ts.deletes
 			st.CommitFailures = ts.commitFailures
+			st.CommitLatencyMs = ts.commitLatencyMs
 			st.DeletesDropped = ts.deletesDropped
 			st.SnapshotProgress = ts.snapshotProgress
 			if !ts.lastCommit.IsZero() {
@@ -204,7 +206,7 @@ func (s dashState) RestartWorker(name string) error {
 
 // recordTableStats folds one ack into the per-table aggregate. The maps are
 // lazily initialized so a zero Coordinator (tests) is safe.
-func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64, at time.Time) {
+func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64, commitLatencyMs float64, at time.Time) {
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	if c.tableStats == nil {
@@ -221,6 +223,7 @@ func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64
 	ts.commits++
 	ts.rows += rows
 	ts.deletes += deletes
+	ts.commitLatencyMs = commitLatencyMs
 	ts.lastCommit = at
 	c.lastAck[worker] = at
 }

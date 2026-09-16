@@ -33,6 +33,7 @@ type TableStatus struct {
 	RowsRate         float64      `json:"rows_rate"`
 	Commits          int64        `json:"commits"`
 	CommitFailures   int64        `json:"commit_failures"`
+	CommitLatencyMs  float64      `json:"commit_latency_ms"`
 	EqualityDeletes  int64        `json:"equality_deletes"`
 	DeletesDropped   int64        `json:"deletes_dropped"`
 	SnapshotProgress float64      `json:"snapshot_progress"`
