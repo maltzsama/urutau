@@ -55,11 +55,17 @@ func TestOffsetsCompare(t *testing.T) {
 	}
 }
 
+// Two topics have no order to compare: the old lexicographic fallback was an
+// artificial order with no semantic meaning, and a caller acting on it would
+// treat one topic's progress as covering another's.
 func TestOffsetsCompareDifferentTopic(t *testing.T) {
 	a := &Offsets{Topic: "a", Parts: map[int32]int64{0: 100}}
 	b := &Offsets{Topic: "b", Parts: map[int32]int64{0: 1}}
-	if a.Compare(b) >= 0 {
-		t.Error("topic 'a' should sort before 'b'")
+	if a.Compare(b) != Incomparable {
+		t.Errorf("different topics must be Incomparable, got %d", a.Compare(b))
+	}
+	if _, ok := a.Meet(b); ok {
+		t.Error("different topics must have no meet")
 	}
 }
 
