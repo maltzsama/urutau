@@ -51,4 +51,9 @@ is a correctness gap in v1.
   left-join miss by leaving the reference columns NULL; it does not emit a
   dedicated wire column, so the `enrich_miss` metadata key cannot be
   materialized yet.
+- **Plugin-sink position store**: external plugin sinks have no transactional
+  place to persist a position, so the out-of-sink store described in
+  [Position](../architecture/state-position.md) is required for them. It is
+  designed but not implemented — a first sketch (a bbolt package) was
+  removed as dead code.
 
