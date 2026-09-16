@@ -54,13 +54,14 @@ type TableWriter struct {
 	metaByName      map[string]core.MetadataColumn
 	sourceTable     string
 	recordBatchSize int64
+	targetFileSize  int64
 }
 
 // NewTableWriter loads the table, resolves the equality-delete key (the
 // primary key) and precomputes the arrow schemas for data and delete rows.
 // The cast policy is applied to source column values during projection; the
 // metadata columns are projected from the change header.
-func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identifier, primaryKey []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string) (*TableWriter, error) {
+func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identifier, primaryKey []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string, targetFileSize int64) (*TableWriter, error) {
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return nil, fmt.Errorf("iceberg: load %v: %w", ident, err)
@@ -107,6 +108,7 @@ func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identi
 		metaByName:      metaByName,
 		sourceTable:     sourceTable,
 		recordBatchSize: 64 * 1024, // 64k rows per Arrow record batch
+		targetFileSize:  targetFileSize,
 	}, nil
 }
 

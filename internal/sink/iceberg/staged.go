@@ -113,7 +113,11 @@ func (w *TableWriter) WriteStaged(ctx context.Context, b *dataplane.Batch) ([]by
 // returns the resulting DataFiles without committing.
 func (w *TableWriter) writeDataFiles(ctx context.Context, tbl *table.Table, rec arrow.RecordBatch) ([]iceberg.DataFile, error) {
 	var files []iceberg.DataFile
-	for df, err := range table.WriteRecords(ctx, tbl, rec.Schema(), oneBatch(rec)) {
+	opts := []table.WriteRecordOption{}
+	if w.targetFileSize > 0 {
+		opts = append(opts, table.WithTargetFileSize(w.targetFileSize))
+	}
+	for df, err := range table.WriteRecords(ctx, tbl, rec.Schema(), oneBatch(rec), opts...) {
 		if err != nil {
 			return nil, fmt.Errorf("iceberg: write records %v: %w", w.ident, err)
 		}

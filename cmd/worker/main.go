@@ -64,6 +64,9 @@ type workerFlags struct {
 	tlsCA        string
 	logLevel     string
 	logFormat    string
+	// maintenance mode (the coordinator launches the worker as an ephemeral
+	// per-table maintenance worker).
+	maintenance bool
 }
 
 func runCmd() *cobra.Command {
@@ -78,6 +81,17 @@ func runCmd() *cobra.Command {
 				if err := driver.LoadPlugin(p, flightwrap.Wrap{}); err != nil {
 					return err
 				}
+			}
+			// Maintenance mode: the coordinator launched this process as an
+			// ephemeral maintenance worker. It connects, waits for the
+			// coordinator to push a maintenance assignment, runs the pass,
+			// and exits.
+			if f.maintenance {
+				cfg, err := f.config()
+				if err != nil {
+					return err
+				}
+				return worker.RunMaintenance(cmd.Context(), cfg)
 			}
 			cfg, err := f.config()
 			if err != nil {
@@ -115,6 +129,7 @@ func runCmd() *cobra.Command {
 	fl.StringVar(&f.tlsCA, "tls-ca", "", "CA that signs the coordinator's server cert (mTLS)")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	fl.StringVar(&f.logFormat, "log-format", "text", "log format: text|json")
+	fl.BoolVar(&f.maintenance, "maintenance", false, "run as an ephemeral maintenance worker: connect, run the coordinator's maintenance assignment once, and exit")
 	return cmd
 }
 

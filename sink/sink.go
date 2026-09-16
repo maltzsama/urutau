@@ -10,6 +10,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // Config is everything a sink needs, in neutral terms. Driver-specific
@@ -169,6 +170,61 @@ type PositionSeeder interface {
 	// position (a fresh table). Called by the coordinator after a table's
 	// snapshot completes, for the owners whose partition had no rows.
 	SeedPositions(ctx context.Context, ref core.TableRef, owners []string) error
+}
+
+// MaintenanceOp names one table-maintenance operation a Maintainer can run.
+// The orchestration decides WHEN each op runs (the spec's per-op intervals)
+// and asks the Maintainer to execute just the due ones — see
+// Maintainer.RunOnce.
+type MaintenanceOp string
+
+const (
+	// MaintenanceCompaction rewrites small data files into larger ones.
+	MaintenanceCompaction MaintenanceOp = "compaction"
+	// MaintenanceSnapshotExpiry prunes old snapshot history.
+	MaintenanceSnapshotExpiry MaintenanceOp = "snapshot_expiry"
+	// MaintenanceOrphanCleanup deletes unreferenced files from the warehouse.
+	MaintenanceOrphanCleanup MaintenanceOp = "orphan_cleanup"
+)
+
+// Maintainer executes table-maintenance operations for one target table. It
+// is one-shot: the caller owns scheduling (which op, when) and calls
+// RunOnce per turn, while the Maintainer owns the operation itself. That
+// split lets the orchestration run maintenance in a separate, ephemeral
+// worker — one per table, which dies when the pass is done — instead of a
+// resident goroutine in the coordinator, without the orchestration ever
+// importing a concrete sink package.
+type Maintainer interface {
+	// RunOnce runs the requested operations once, in the given order, and
+	// returns the first error. An empty ops slice is a no-op. An op the
+	// table's config does not enable is skipped.
+	RunOnce(ctx context.Context, ops []MaintenanceOp) error
+}
+
+// MaintainerMetrics receives counts from each maintenance run, labeled by
+// target table. Every method is called synchronously from the Maintainer's
+// own goroutine after a run completes (success or failure): implementations
+// must not block. A nil MaintainerMetrics passed to Maintain means no
+// metrics are recorded — Maintainable implementations must treat it that
+// way, not panic.
+type MaintainerMetrics interface {
+	CompactionRun(table string, filesRemoved, filesAdded int, bytesBefore, bytesAfter int64, err error)
+	SnapshotExpiryRun(table string, snapshotsRemoved int, err error)
+	OrphanCleanupRun(table string, filesDeleted int, bytesFreed int64, err error)
+}
+
+// Maintainable is an optional capability: a sink that supports table
+// maintenance (compaction, snapshot expiry, orphan cleanup — Iceberg today)
+// implements it so the orchestration can build one Maintainer per target
+// table without ever importing the concrete sink package (the architecture
+// wall internal/architecture enforces: runner/coordinator consume only
+// source/sink/driver contracts). currentPosition and metrics may be nil;
+// what a nil value means is the implementation's contract to document (the
+// Iceberg Maintainer treats nil currentPosition as "never attach
+// cdc.position to a compaction commit" and nil metrics as "record
+// nothing").
+type Maintainable interface {
+	Maintain(ref core.TableRef, cfg spec.Maintenance, log *slog.Logger, currentPosition func() string, metrics MaintainerMetrics) Maintainer
 }
 
 // Sink is a destination catalog. It is the composition of the small

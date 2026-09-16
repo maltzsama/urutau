@@ -1,0 +1,49 @@
+# MySQL binlog -> Apache Iceberg, upsert, with background table maintenance.
+#
+# This is the exact spec test/e2e/maintenance_example_test.go runs
+# (extracted into this file, read from disk) — TestMaintenanceExample
+# exercises it end to end against a real MySQL + Iceberg (Polaris REST
+# catalog) stack, proving sink.maintenance.compaction actually runs and
+# collapses many small commits into fewer data files. If this file stops
+# validating or the e2e test stops passing, this example is out of date.
+#
+# sink.maintenance defaults to disabled (see pipeline-spec.md); every other
+# example in this directory omits it entirely, on purpose, to show the
+# ordinary shape of a spec. This file exists to show the maintenance block
+# on its own, with short intervals so its effect is visible inside a test
+# run — a production pipeline typically wants minutes-to-hours intervals
+# instead (see website/docs/reference/sinks.md#table-maintenance).
+#
+# Values point at the repo's e2e docker-compose stack
+# (test/e2e/docker-compose.yml); adjust uri/sink for your own MySQL and
+# Iceberg catalog.
+pipeline: e2e-mysql-maintenance
+source:
+  kind: mysql
+  uri: mysql://repl:replpass@127.0.0.1:3306/shop
+  serverId: "1102"
+sink:
+  uri: http://localhost:8181/api/catalog
+  namespace: raw
+  warehouse: quickstart_catalog
+  clientId: root
+  clientSecret: s3cr3t
+  scope: PRINCIPAL_ROLE:ALL
+  maintenance:
+    enabled: true
+    compaction:
+      interval: 5s
+      targetFileSize: 1Mi
+      minInputFiles: 2
+    snapshotExpiry:
+      interval: 30s
+      retainLast: 1
+      maxAge: 1h
+    orphanCleanup:
+      interval: 1m
+      olderThan: 1h
+tables:
+  - source: shop.orders
+    target: raw.orders_maintained
+    primaryKey: [id]
+    createIfNotExists: true

@@ -126,6 +126,10 @@ type Coordinator struct {
 	snk       sink.Sink
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
+	// maint schedules the ephemeral maintenance workers (issue #96). Nil
+	// unless maintenance is enabled in the spec.
+	maint *maintenanceScheduler
+
 	// Worker registry: groups resolved at boot from the spec, one queue
 	// and one ticket each. route maps every target table to its N
 	// partition owners, in partition order (route[target][i] owns
@@ -515,6 +519,26 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err := snk.EnsureTable(ctx, ref, resolvedSchemas[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
+	}
+
+	// Iceberg table maintenance (issue #96): the coordinator SCHEDULES
+	// maintenance but does not run it in its own process. With Kubernetes
+	// worker provisioning available it provisions an ephemeral maintenance
+	// worker per table (from the table's own worker pod template) and pushes
+	// the due operations to it over the control stream; the worker dies when
+	// the pass is done, so no maintenance work competes with the
+	// coordinator's routing/commit path. Without Kubernetes there is no
+	// worker to launch — the collapsed runner's in-process schedule is the
+	// only path there. Checked against the NEUTRAL sink.Maintainable
+	// interface — never a concrete sink package, which internal/architecture's
+	// TestOrchestrationConsumesContracts forbids the coordinator from
+	// importing. Maintenance is Iceberg-only (spec.Validate rejects it on
+	// any other sink type), so a sink that does not implement the capability
+	// here is a bug, not a configuration to tolerate: fail loudly, exactly
+	// like requireConcurrentSink above. Skipped entirely when Maintenance is
+	// nil or disabled.
+	if err := c.startMaintenance(refs, workerTarget); err != nil {
+		return err
 	}
 
 	resume, needsSnapshot, err := c.resumeFrom(ctx, refs)
@@ -1960,6 +1984,12 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	hello := msg.GetHello()
 	if hello == nil {
 		return errors.New("coordinator: first worker message must be Hello")
+	}
+	// An ephemeral maintenance worker is a worker, but has no data plane:
+	// route it to the maintenance scheduler instead of the assignment/ack
+	// path below.
+	if hello.Maintenance {
+		return c.maintenanceSession(stream, hello)
 	}
 
 	c.mu.Lock()

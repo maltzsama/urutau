@@ -100,7 +100,7 @@ func TestWorkerEndToEnd(t *testing.T) {
 		t.Fatalf("ensure table: %v", err)
 	}
 
-	wr, err := urutauiceberg.NewTableWriter(ctx, cat, ident, []string{"id"}, core.CastPolicy{}, nil, "")
+	wr, err := urutauiceberg.NewTableWriter(ctx, cat, ident, []string{"id"}, core.CastPolicy{}, nil, "", 0)
 	if err != nil {
 		t.Fatalf("writer: %v", err)
 	}

@@ -34,6 +34,22 @@ type Metrics struct {
 	EnrichMisses  *prometheus.CounterVec
 	EnrichDropped *prometheus.CounterVec
 	EnrichEvicted *prometheus.CounterVec
+
+	// Iceberg table maintenance (issue #96): compaction, snapshot expiry,
+	// orphan cleanup. All labeled by table; "runs" counters increment on
+	// every attempt (success or failure) so a stalled maintainer (0 runs
+	// while the pipeline is otherwise healthy) is visible without a
+	// separate liveness signal.
+	IcebergCompactionRuns          *prometheus.CounterVec
+	IcebergCompactionFilesRemoved  *prometheus.CounterVec
+	IcebergCompactionFilesAdded    *prometheus.CounterVec
+	IcebergCompactionBytesBefore   *prometheus.CounterVec
+	IcebergCompactionBytesAfter    *prometheus.CounterVec
+	IcebergSnapshotExpiryRuns      *prometheus.CounterVec
+	IcebergSnapshotExpirySnapshots *prometheus.CounterVec
+	IcebergOrphanCleanupRuns       *prometheus.CounterVec
+	IcebergOrphanCleanupFiles      *prometheus.CounterVec
+	IcebergOrphanCleanupBytes      *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -88,9 +104,44 @@ func New() *Metrics {
 		Name: "urutau_enrich_evicted_total", Help: "events evicted from the cold-start buffer (maxEvents or maxWait)."},
 		[]string{"table", "reference"})
 
+	m.IcebergCompactionRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_compaction_runs_total", Help: "compaction attempts per table, success or failure."},
+		[]string{"table"})
+	m.IcebergCompactionFilesRemoved = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_compaction_files_removed_total", Help: "data files removed by compaction, per table."},
+		[]string{"table"})
+	m.IcebergCompactionFilesAdded = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_compaction_files_added_total", Help: "data files added by compaction, per table."},
+		[]string{"table"})
+	m.IcebergCompactionBytesBefore = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_compaction_bytes_before", Help: "input bytes rewritten by compaction, per table."},
+		[]string{"table"})
+	m.IcebergCompactionBytesAfter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_compaction_bytes_after", Help: "output bytes written by compaction, per table."},
+		[]string{"table"})
+	m.IcebergSnapshotExpiryRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_snapshot_expiry_runs_total", Help: "snapshot expiry attempts per table, success or failure."},
+		[]string{"table"})
+	m.IcebergSnapshotExpirySnapshots = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_snapshot_expiry_snapshots_removed_total", Help: "snapshots removed by expiry, per table."},
+		[]string{"table"})
+	m.IcebergOrphanCleanupRuns = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_orphan_cleanup_runs_total", Help: "orphan cleanup attempts per table, success or failure."},
+		[]string{"table"})
+	m.IcebergOrphanCleanupFiles = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_orphan_cleanup_files_deleted_total", Help: "unreferenced files deleted by orphan cleanup, per table."},
+		[]string{"table"})
+	m.IcebergOrphanCleanupBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_orphan_cleanup_bytes_freed_total", Help: "storage bytes freed by orphan cleanup, per table."},
+		[]string{"table"})
+
 	reg.MustRegister(m.LagSeconds, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
 	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	reg.MustRegister(m.EnrichMisses, m.EnrichDropped, m.EnrichEvicted)
+	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,
+		m.IcebergCompactionBytesBefore, m.IcebergCompactionBytesAfter)
+	reg.MustRegister(m.IcebergSnapshotExpiryRuns, m.IcebergSnapshotExpirySnapshots)
+	reg.MustRegister(m.IcebergOrphanCleanupRuns, m.IcebergOrphanCleanupFiles, m.IcebergOrphanCleanupBytes)
 	return m
 }
 
