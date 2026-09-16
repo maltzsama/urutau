@@ -108,9 +108,10 @@ The committed position lives **in the destination**, written atomically with
 the data. Resume folds use the minimum safe position — an undefined order is
 an error, never an arbitrary pick.
 
-`internal/state` (bbolt) is the exception, for external plugin sinks that
-cannot persist a position themselves; when both exist, the destination wins.
-See [Position](../architecture/state-position.md).
+The one case the sink cannot cover is an external plugin sink that has no
+position capability of its own; the store for that case is designed but not
+implemented. When both a sink position and an out-of-sink store exist, the
+sink wins. See [Position](../architecture/state-position.md).
 
 ## Related
 

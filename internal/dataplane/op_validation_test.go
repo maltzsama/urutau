@@ -1,9 +1,13 @@
 package dataplane_test
 
-// T-11 (real): a batch carrying an unknown __op value (3) must be rejected
-// by every op-consuming stage — SplitByOp, Filter, Collapse and
-// TransitionMatrix. An unknown op that slipped through would vanish
+// T-11: a batch carrying an unknown __op value (3) must be rejected by the
+// op-consuming stage. An unknown op that slipped through would vanish
 // silently: no mask matches it, so the row never reaches the sink.
+//
+// Collapse is the only such stage left — the row path (SplitByOp, Filter,
+// TransitionMatrix) was removed as dead code. Validation runs against the
+// ORIGINAL batch, before Take, so a poison op is caught even when it sits in
+// a row that loses its group and would never survive the collapse.
 
 import (
 	"context"
@@ -11,14 +15,63 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
 
+func TestCollapseRejectsUnknownOp(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 2, Allocator: alloc})
+	defer b.Release()
+
+	bad := withOpValues(t, b, 0, 3)
+	defer bad.Release()
+
+	if _, _, err := dataplane.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
+		t.Error("Collapse: unknown op accepted")
+	}
+}
+
+// The poison sits in row 0, which loses to row 1 whenever the two share a key.
+// Validating after Take would drop it silently; validating before catches it
+// either way.
+func TestCollapseRejectsUnknownOpInLosingRow(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 2, Allocator: alloc})
+	defer b.Release()
+
+	bad := withOpValues(t, b, 3, 0)
+	defer bad.Release()
+
+	if _, _, err := dataplane.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
+		t.Error("Collapse: poison op in potentially-losing row accepted")
+	}
+}
+
+// Every valid op must still pass — the guard rejects the unknown, not the known.
+func TestCollapseAcceptsEveryValidOp(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 3, Allocator: alloc})
+	defer b.Release()
+
+	ok := withOpValues(t, b, 0, 1, 2) // insert, update, delete
+	defer ok.Release()
+
+	ups, dels, err := dataplane.Collapse(context.Background(), alloc, ok, []string{"id"})
+	if err != nil {
+		t.Fatalf("Collapse rejected a batch of valid ops: %v", err)
+	}
+	if ups != nil {
+		ups.Release()
+	}
+	if dels != nil {
+		dels.Release()
+	}
+}
+
 // withOpValues returns a new Batch (caller releases) with the __op column
-// replaced by the given values. Record immutability forbids mutation, so
-// the record is rebuilt with retained columns.
+// replaced by the given values. Record immutability forbids mutation, so the
+// record is rebuilt sharing every other column.
 func withOpValues(t *testing.T, b *dataplane.Batch, ops ...uint8) *dataplane.Batch {
 	t.Helper()
 	rec := b.Record
@@ -56,78 +109,4 @@ func withOpValues(t *testing.T, b *dataplane.Batch, ops ...uint8) *dataplane.Bat
 		c.Release()
 	}
 	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: b.Watermark}
-}
-
-// allTrueMask builds a boolean mask with all rows selected.
-func allTrueMask(t *testing.T, alloc memory.Allocator, n int) arrow.Array {
-	t.Helper()
-	bld := array.NewBooleanBuilder(alloc)
-	defer bld.Release()
-	for range n {
-		bld.Append(true)
-	}
-	return bld.NewBooleanArray()
-}
-
-func TestInvalidOpRejectedByEveryStage(t *testing.T) {
-	alloc := checkedAlloc(t)
-
-	// One insert + one row with op=3 (unknown).
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 2, Allocator: alloc})
-	defer b.Release()
-	bad := withOpValues(t, b, 0, 3)
-	defer bad.Release()
-
-	if _, _, _, err := dataplane.SplitByOp(context.Background(), alloc, bad); err == nil {
-		t.Error("SplitByOp: unknown op accepted")
-	}
-
-	mask := allTrueMask(t, alloc, int(bad.Record.NumRows()))
-	defer mask.Release()
-	ins, del, upd, err := dataplane.Filter(context.Background(), alloc, bad, mask)
-	if err == nil {
-		if ins != nil {
-			ins.Release()
-		}
-		if del != nil {
-			del.Release()
-		}
-		if upd != nil {
-			upd.Release()
-		}
-		t.Error("Filter: unknown op accepted")
-	}
-
-	if _, _, err := dataplane.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
-		t.Error("Collapse: unknown op accepted")
-	}
-
-	if _, _, _, err := dataplane.TransitionMatrix(context.Background(), alloc, bad, nil, nil); err == nil {
-		t.Error("TransitionMatrix: unknown op accepted")
-	}
-}
-
-// TestInvalidOpInLosingRowRejected covers the collapse nuance: the invalid
-// op sits in a row that would LOSE the collapse (a later row wins the same
-// key) — validation must run on the ORIGINAL batch, before Take, so the
-// poison row is caught even though it would be discarded.
-func TestInvalidOpInLosingRowRejected(t *testing.T) {
-	alloc := checkedAlloc(t)
-
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 2, Allocator: alloc})
-	defer b.Release()
-	// Both rows share the same PK (id=1 for seed 42's first two rows is not
-	// guaranteed) — force identical keys by using the same row twice: ops
-	// (0 valid winner, 3 poison) on rows with equal keys. GenerateBatch
-	// rows have distinct ids, so rebuild the id column instead: simpler to
-	// validate the original-batch path via Collapse ordering — row 0 wins
-	// only if it's last; here the poison op=3 is row 0, valid op row 1.
-	// If ids differ, row 1 is its own group winner and row 0 survives too —
-	// either way the poison must error before Take.
-	bad := withOpValues(t, b, 3, 0)
-	defer bad.Release()
-
-	if _, _, err := dataplane.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
-		t.Error("Collapse: poison op in potentially-losing row accepted")
-	}
 }

@@ -5,8 +5,6 @@ package rowchange
 
 import (
 	"time"
-
-	"github.com/maltzsama/urutau/dataplane"
 )
 
 type Op uint8
@@ -105,38 +103,6 @@ type Window struct {
 	Closes   bool
 }
 
-// Collapsed is the reduced state of a batch after per-key collapse: the last
-// operation for each key wins, winners keep first-appearance order (D-6).
-type Collapsed struct {
-	// Changes holds the surviving rows in first-appearance order. A key
-	// whose last operation is a delete appears here AS a delete (equality
-	// delete only — a data row must never be emitted for it, since a delete
-	// file committed together with the data it means to remove is
-	// unreliable across Iceberg implementations, see the spike finding).
-	Changes []Change
-}
-
-// Keys returns every primary key in the batch, in collapse order.
-func (c Collapsed) Keys() [][]any {
-	keys := make([][]any, 0, len(c.Changes))
-	for _, ch := range c.Changes {
-		keys = append(keys, ch.Key)
-	}
-	return keys
-}
-
-// Count returns (upserts, deletes) — winners split by final operation.
-func (c Collapsed) Count() (upserts, deletes int) {
-	for _, ch := range c.Changes {
-		if ch.Op == OpDelete {
-			deletes++
-		} else {
-			upserts++
-		}
-	}
-	return upserts, deletes
-}
-
 // WriteMode controls how the worker and writer handle a batch.
 type WriteMode uint8
 
@@ -154,7 +120,7 @@ const (
 // D-6: Changes holds ONE slice in ARRIVAL order — order is the input of
 // last-write-wins. Splitting into upsert/delete buckets before the wire
 // reorders a delete after a later insert of the same key and resurrects
-// the row (T-13). Consumers that need the split call ByOp().
+// the row (T-13).
 type Batch struct {
 	Table    string
 	Changes  []Change
@@ -165,42 +131,4 @@ type Batch struct {
 	// position.
 	SnapshotState   string
 	SnapshotPending []uint32 // chunk IDs still pending after this batch
-}
-
-// ByOp partitions the batch's changes by operation, preserving arrival
-// order within each partition. Derived view — never written back.
-func (b Batch) ByOp() (upserts, deletes []Change) {
-	for _, c := range b.Changes {
-		switch c.Op {
-		case OpDelete:
-			deletes = append(deletes, c)
-		case OpInsert, OpUpdate:
-			upserts = append(upserts, c)
-		}
-	}
-	return upserts, deletes
-}
-
-// ToDataplaneMode maps a row-layer write mode to the public data-plane enum.
-// The enums have different zero values (row layer 0 = upsert, data plane 0 =
-// ModeUnset), so a raw uint8 cast would silently misread across the boundary.
-func ToDataplaneMode(m WriteMode) dataplane.WriteMode {
-	switch m {
-	case AppendMode:
-		return dataplane.AppendMode
-	default:
-		return dataplane.UpsertMode
-	}
-}
-
-// ToRowMode maps a data-plane write mode to the row-layer enum. ModeUnset is
-// mapped to upsert only because the caller validates it first; it must never
-// reach here from production code.
-func ToRowMode(m dataplane.WriteMode) WriteMode {
-	switch m {
-	case dataplane.AppendMode:
-		return AppendMode
-	default:
-		return UpsertMode
-	}
 }

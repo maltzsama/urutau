@@ -721,9 +721,9 @@ func TestCodecDecodeRejectsColumnPastMetadataTail(t *testing.T) {
 	}
 }
 
-// T-11 (op validation) lives in dataplane: op_validation_test.go — the
-// codec round-trips the __op byte verbatim; op-semantics validation is a
-// dataplane concern (SplitByOp/Filter/Collapse/TransitionMatrix).
+// T-11 (op validation) lives in dataplane: validateOpColumn in op.go,
+// exercised through Collapse (collapse_test.go). The codec round-trips the
+// __op byte verbatim; op-semantics validation is a dataplane concern.
 
 // T-12: Nomes reservados rejeitados no schema.
 func TestCodecReservedNamesRejected(t *testing.T) {

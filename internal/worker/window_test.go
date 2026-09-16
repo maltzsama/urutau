@@ -135,7 +135,7 @@ func TestWindowNoEventsClosesEmitsAll(t *testing.T) {
 		t.Fatalf("want 1 commit, got %d", len(fc.batches))
 	}
 	b := fc.batches[0]
-	ups, _ := b.ByOp()
+	ups, _ := byOp(b)
 	if len(ups) != 2 {
 		t.Fatalf("want both snapshot rows emitted, got %+v", ups)
 	}
