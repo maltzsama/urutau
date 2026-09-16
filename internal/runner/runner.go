@@ -653,6 +653,43 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		}
 	},
 		committedPositions: make(map[string]position.Position)}
+
+	// Iceberg table maintenance (issue #96): one Maintainer goroutine per
+	// target table, for the life of the pipeline (ctx, not a narrower
+	// setup-only context). Optional capability, checked against the
+	// NEUTRAL sink.Maintainable interface — never a concrete sink package,
+	// which internal/architecture's TestOrchestrationConsumesContracts
+	// forbids the runner from importing. Every sink that does not
+	// implement it (everything but Iceberg today) silently skips this,
+	// same as requireConcurrentSink's capability-check pattern in the
+	// coordinator. Skipped entirely (no goroutine at all) when Maintenance
+	// is nil or disabled, so a pipeline that never configured it pays
+	// nothing.
+	if msnk, ok := snk.(sink.Maintainable); ok && s.Sink.MaintenanceEnabled() {
+		for _, ref := range refs {
+			ref := ref
+			// snk.Position reads the table's OWN committed cdc.position
+			// (CommittedPosition, walk-back included), rather than an
+			// in-memory approximation — compaction only ticks every few
+			// minutes at minimum, so the extra catalog round-trip is not a
+			// hot-path cost, and reading the authoritative value avoids
+			// coupling the Maintainer to the runner's/coordinator's
+			// internal bookkeeping (which differ in shape between the two).
+			// A read error just means no position is attached to this
+			// tick's compaction commit — not fatal, logged by compact
+			// itself via its normal error path if it ever surfaces there.
+			currentPosition := func() string {
+				pos, err := snk.Position(ctx, ref)
+				if err != nil {
+					return ""
+				}
+				return pos
+			}
+			m := msnk.Maintain(ref, *s.Sink.Maintenance, log, currentPosition, nil)
+			go m.Run(ctx)
+		}
+	}
+
 	w.OnSchemaDrift(func(d worker.SchemaDrift) {
 		log.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
 			"action", "declare the column in the spec and resume")

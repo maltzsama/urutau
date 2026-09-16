@@ -517,6 +517,38 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 	}
 
+	// Iceberg table maintenance (issue #96): one Maintainer goroutine per
+	// target table, on c.runCtx (the run's full lifetime, not this setup
+	// call's ctx). Optional capability, checked against the NEUTRAL
+	// sink.Maintainable interface — never a concrete sink package, which
+	// internal/architecture's TestOrchestrationConsumesContracts forbids
+	// the coordinator from importing — same capability-style check as
+	// requireConcurrentSink above; every sink that does not implement it
+	// silently skips this. Skipped entirely when Maintenance is nil or
+	// disabled.
+	//
+	// Metrics: c.metrics is nil unless cfg.MetricsAddr was set, and
+	// maintainerMetricsAdapter's methods already no-op on a nil *Metrics —
+	// so this passes a non-nil MaintainerMetrics unconditionally rather
+	// than repeating the nil check the adapter already does.
+	if msnk, ok := snk.(sink.Maintainable); ok && c.cfg.Spec.Sink.MaintenanceEnabled() {
+		for _, ref := range refs {
+			ref := ref
+			// snk.Position reads the table's own committed cdc.position
+			// authoritatively (CommittedPosition, walk-back included) —
+			// see the identical choice and its reasoning in runner.go.
+			currentPosition := func() string {
+				pos, err := snk.Position(c.runCtx, ref)
+				if err != nil {
+					return ""
+				}
+				return pos
+			}
+			m := msnk.Maintain(ref, *c.cfg.Spec.Sink.Maintenance, c.log, currentPosition, maintainerMetricsAdapter{c.metrics})
+			go m.Run(c.runCtx)
+		}
+	}
+
 	resume, needsSnapshot, err := c.resumeFrom(ctx, refs)
 	if err != nil {
 		return err
@@ -749,6 +781,51 @@ func requirePartitionKey(t spec.Table, ref core.TableRef) error {
 			"way to divide it", t.Target)
 	}
 	return nil
+}
+
+// maintainerMetricsAdapter implements sink.MaintainerMetrics against the
+// coordinator's own Prometheus registry (internal/observability), so no sink
+// package needs an observability import — the same dependency direction
+// sink packages already keep everywhere else. A nil *observability.Metrics
+// (no MetricsAddr configured) makes every method a no-op instead of
+// panicking, so the coordinator can pass this unconditionally.
+type maintainerMetricsAdapter struct {
+	m *observability.Metrics
+}
+
+func (a maintainerMetricsAdapter) CompactionRun(table string, filesRemoved, filesAdded int, bytesBefore, bytesAfter int64, err error) {
+	if a.m == nil {
+		return
+	}
+	a.m.IcebergCompactionRuns.WithLabelValues(table).Inc()
+	if err != nil {
+		return
+	}
+	a.m.IcebergCompactionFilesRemoved.WithLabelValues(table).Add(float64(filesRemoved))
+	a.m.IcebergCompactionFilesAdded.WithLabelValues(table).Add(float64(filesAdded))
+	a.m.IcebergCompactionBytesBefore.WithLabelValues(table).Add(float64(bytesBefore))
+	a.m.IcebergCompactionBytesAfter.WithLabelValues(table).Add(float64(bytesAfter))
+}
+
+func (a maintainerMetricsAdapter) SnapshotExpiryRun(table string, snapshotsRemoved int, err error) {
+	if a.m == nil {
+		return
+	}
+	a.m.IcebergSnapshotExpiryRuns.WithLabelValues(table).Inc()
+	if err == nil {
+		a.m.IcebergSnapshotExpirySnapshots.WithLabelValues(table).Add(float64(snapshotsRemoved))
+	}
+}
+
+func (a maintainerMetricsAdapter) OrphanCleanupRun(table string, filesDeleted int, bytesFreed int64, err error) {
+	if a.m == nil {
+		return
+	}
+	a.m.IcebergOrphanCleanupRuns.WithLabelValues(table).Inc()
+	if err == nil {
+		a.m.IcebergOrphanCleanupFiles.WithLabelValues(table).Add(float64(filesDeleted))
+		a.m.IcebergOrphanCleanupBytes.WithLabelValues(table).Add(float64(bytesFreed))
+	}
 }
 
 // requireConcurrentSink rejects workers>1 when the sink does not declare the
