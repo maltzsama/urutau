@@ -181,6 +181,9 @@ func logEntryOf(rec logging.Record) logEntry {
 // connect and then forwards every state/event/log change until the client
 // goes away. The browser's EventSource reconnects on its own.
 func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
+	// The metrics server (observability.ServeMux) imposes a 10s WriteTimeout;
+	// an SSE stream is long-lived, so clear that per-connection deadline.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
