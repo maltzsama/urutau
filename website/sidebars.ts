@@ -7,6 +7,7 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 const sidebars: SidebarsConfig = {
   docs: [
     'quickstart',
+    'reference/whats-new-v0.2.0',
     'concepts',
     {
       type: 'category',
@@ -15,6 +16,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'guides/cdc-upsert',
         'guides/append-only',
+        'guides/table-maintenance',
         'guides/enrich-reference-table',
         'guides/plugins',
         'guides/distributed',
@@ -39,7 +41,6 @@ const sidebars: SidebarsConfig = {
         'reference/cli',
         'reference/plugin-contract',
         'reference/roadmap',
-        'reference/whats-new-v0.2.0',
       ],
     },
     {
