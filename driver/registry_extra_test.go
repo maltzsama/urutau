@@ -13,13 +13,14 @@ func TestSinkConfigFromSpec(t *testing.T) {
 	s := &spec.Spec{
 		Source: spec.Source{Kind: "mysql"},
 		Sink: spec.Sink{
-			Type:       "iceberg+rest",
-			URI:        "http://catalog:8181",
-			Namespace:  "lakehouse",
-			Warehouse:  "wh",
-			ClientID:   "cid",
-			Scope:      "public",
-			CommitMode: "atomic",
+			Type:         "iceberg+rest",
+			URI:          "http://catalog:8181",
+			Namespace:    "lakehouse",
+			Warehouse:    "wh",
+			ClientID:     "cid",
+			Scope:        "public",
+			CommitMode:   "atomic",
+			EvolveSchema: true,
 			Defaults: spec.Defaults{
 				TargetFileSize: "256MB",
 			},
@@ -46,6 +47,9 @@ func TestSinkConfigFromSpec(t *testing.T) {
 	}
 	if got.Options[OptTargetFileSize] != "256MB" {
 		t.Errorf("target_file_size = %q", got.Options[OptTargetFileSize])
+	}
+	if got.Options[OptEvolveSchema] != "true" {
+		t.Errorf("evolve_schema = %q", got.Options[OptEvolveSchema])
 	}
 }
 
