@@ -237,3 +237,96 @@ func TestProjectErrorsOnMissingCastColumn(t *testing.T) {
 		t.Fatalf("missing cast column must error citing the column, got %v", err)
 	}
 }
+
+func TestParseTimestampText(t *testing.T) {
+	tests := []struct {
+		input string
+		err   bool
+	}{
+		{"2024-01-02 15:04:05", false},
+		{"2024-01-02 15:04:05.123456", false},
+		{"2024-01-02T15:04:05Z", false},
+		{"not-a-timestamp", true},
+	}
+	for _, tt := range tests {
+		_, err := parseTimestampText(tt.input)
+		if (err != nil) != tt.err {
+			t.Errorf("parseTimestampText(%q) error = %v, wantErr %v", tt.input, err, tt.err)
+		}
+	}
+}
+
+func TestProps(t *testing.T) {
+	got := props("")
+	if len(got) != 0 {
+		t.Errorf("props(\"\") = %v, want empty", got)
+	}
+	got = props("pos-123")
+	if got["cdc.position"] != "pos-123" {
+		t.Errorf("props(\"pos-123\") = %v, want cdc.position=pos-123", got)
+	}
+}
+
+func TestDateToDays(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int32
+		err   bool
+	}{
+		{"1970-01-01", 0, false},
+		{"2024-01-02", 19724, false},
+		{"not-a-date", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := dateToDays(tt.input)
+		if (err != nil) != tt.err {
+			t.Errorf("dateToDays(%q) error = %v, wantErr %v", tt.input, err, tt.err)
+		}
+		if !tt.err && got != tt.want {
+			t.Errorf("dateToDays(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestTimeToMicros(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int64
+		err   bool
+	}{
+		{"00:00:00", 0, false},
+		{"12:00:00", 12 * 3600_000_000, false},
+		{"15:04:05", 15*3600_000_000 + 4*60_000_000 + 5*1_000_000, false},
+		{"15:04:05.123456", 15*3600_000_000 + 4*60_000_000 + 5*1_000_000 + 123456, false},
+		{"not-a-time", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := timeToMicros(tt.input)
+		if (err != nil) != tt.err {
+			t.Errorf("timeToMicros(%q) error = %v, wantErr %v", tt.input, err, tt.err)
+		}
+		if !tt.err && got != tt.want {
+			t.Errorf("timeToMicros(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestUuidToBytes(t *testing.T) {
+	input := "550e8400-e29b-41d4-a716-446655440000"
+	got, err := uuidToBytes(input)
+	if err != nil {
+		t.Fatalf("uuidToBytes(%q): %v", input, err)
+	}
+	if len(got) != 16 {
+		t.Fatalf("uuidToBytes(%q) len = %d, want 16", input, len(got))
+	}
+	if got[0] != 0x55 {
+		t.Fatalf("uuidToBytes first byte = %x, want 55", got[0])
+	}
+	if _, err := uuidToBytes("not-a-uuid"); err == nil {
+		t.Error("uuidToBytes should error on invalid UUID")
+	}
+	if _, err := uuidToBytes("550e8400-e29b-41d4-a716"); err == nil {
+		t.Error("uuidToBytes should error on short UUID")
+	}
+}

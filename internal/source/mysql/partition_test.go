@@ -183,3 +183,48 @@ func TestCharsetBaseSanity(t *testing.T) {
 		t.Fatal("charsetBase must be > 1 for encoding to be meaningful")
 	}
 }
+
+func TestIsIntegerType(t *testing.T) {
+	integers := []string{"tinyint", "smallint", "mediumint", "int", "bigint", "TINYINT", "BIGINT"}
+	for _, dt := range integers {
+		if !isIntegerType(dt) {
+			t.Errorf("isIntegerType(%q) = false, want true", dt)
+		}
+	}
+	nonIntegers := []string{"varchar", "char", "text", "blob", "decimal", "float"}
+	for _, dt := range nonIntegers {
+		if isIntegerType(dt) {
+			t.Errorf("isIntegerType(%q) = true, want false", dt)
+		}
+	}
+}
+
+func TestIsStringType(t *testing.T) {
+	strings := []string{"char", "varchar", "CHAR", "VARCHAR"}
+	for _, dt := range strings {
+		if !isStringType(dt) {
+			t.Errorf("isStringType(%q) = false, want true", dt)
+		}
+	}
+	nonStrings := []string{"int", "bigint", "text", "blob", "decimal"}
+	for _, dt := range nonStrings {
+		if isStringType(dt) {
+			t.Errorf("isStringType(%q) = true, want false", dt)
+		}
+	}
+}
+
+func TestToString(t *testing.T) {
+	got, err := toString("hello")
+	if err != nil || got != "hello" {
+		t.Fatalf("toString(%q) = %q, %v", "hello", got, err)
+	}
+	got, err = toString([]byte("world"))
+	if err != nil || got != "world" {
+		t.Fatalf("toString(%q) = %q, %v", []byte("world"), got, err)
+	}
+	_, err = toString(42)
+	if err == nil {
+		t.Fatal("toString(42) should error")
+	}
+}

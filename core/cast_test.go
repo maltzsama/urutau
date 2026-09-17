@@ -8,6 +8,25 @@ import (
 	"time"
 )
 
+func TestCastTargetString(t *testing.T) {
+	tests := []struct {
+		target CastTarget
+		want   string
+	}{
+		{CastTarget{Type: ColumnType{Kind: KindString}}, "string"},
+		{CastTarget{Type: ColumnType{Kind: KindInt64}}, "int64"},
+		{CastTarget{Type: ColumnType{Kind: KindTimestampTZ}, AssumeUTC: true}, "timestamptz(assume_utc)"},
+		{CastTarget{Type: ColumnType{Kind: KindString}, Encoding: "hex"}, "string(hex)"},
+		{CastTarget{Type: ColumnType{Kind: KindString}, Encoding: "base64"}, "string(base64)"},
+	}
+	for _, tt := range tests {
+		got := tt.target.String()
+		if got != tt.want {
+			t.Errorf("CastTarget%+v.String() = %q, want %q", tt.target, got, tt.want)
+		}
+	}
+}
+
 func TestParseCastTarget(t *testing.T) {
 	tests := []struct {
 		input string

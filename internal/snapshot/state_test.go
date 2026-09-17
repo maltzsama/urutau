@@ -107,3 +107,72 @@ func TestBoundsRoundTripNativeTypes(t *testing.T) {
 		t.Fatalf("bounds[0][3] = %v (%T), want int64 7", row[3], row[3])
 	}
 }
+
+func TestEncodePending(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []uint32
+		want  string
+	}{
+		{"empty", nil, "[]"},
+		{"nil", []uint32{}, "[]"},
+		{"single", []uint32{1}, "[1]"},
+		{"multiple", []uint32{1, 2, 3}, "[1,2,3]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EncodePending(tt.input)
+			if got != tt.want {
+				t.Errorf("EncodePending(%v) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPendingIDs(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []uint32
+		want  string
+	}{
+		{"empty", nil, "[]"},
+		{"single", []uint32{1}, "[1]"},
+		{"multiple", []uint32{1, 2, 3}, "[1,2,3]"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PendingIDs(tt.input)
+			if got != tt.want {
+				t.Errorf("PendingIDs(%v) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRemoveFromPending(t *testing.T) {
+	tests := []struct {
+		name    string
+		pending []uint32
+		chunkID uint32
+		want    []uint32
+	}{
+		{"remove middle", []uint32{1, 2, 3}, 2, []uint32{1, 3}},
+		{"remove first", []uint32{1, 2, 3}, 1, []uint32{2, 3}},
+		{"remove last", []uint32{1, 2, 3}, 3, []uint32{1, 2}},
+		{"remove non-existent", []uint32{1, 2, 3}, 5, []uint32{1, 2, 3}},
+		{"remove from empty", nil, 1, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RemoveFromPending(tt.pending, tt.chunkID)
+			if len(got) != len(tt.want) {
+				t.Fatalf("RemoveFromPending(%v, %d) = %v, want %v", tt.pending, tt.chunkID, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("RemoveFromPending(%v, %d)[%d] = %d, want %d", tt.pending, tt.chunkID, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
