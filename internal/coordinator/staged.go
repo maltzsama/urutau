@@ -130,32 +130,6 @@ func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
 	return out
 }
 
-// discardTable drops every cycle of a table — a worker that died before
-// delivering leaves its cycles permanently incomplete. Returns the count,
-// for logging; the discarded cycles are never committed.
-func (s *stagedCycles) discardTable(table string) int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	n := 0
-	for k := range s.open {
-		if k.table == table {
-			delete(s.open, k)
-			n++
-		}
-	}
-	for k := range s.done {
-		if k.table == table {
-			delete(s.done, k)
-			n++
-		}
-	}
-	delete(s.order, table)
-	return n
-}
-
 // discardWorker drops every cycle that needed a delivery from worker — on
 // session loss those cycles can never complete, and an incomplete cycle must
 // never be committed — and then every remaining cycle of each affected table.
@@ -204,14 +178,4 @@ func (s *stagedCycles) discardWorker(worker string) int {
 		delete(s.order, table)
 	}
 	return discarded
-}
-
-// len reports the number of tracked cycles (tests).
-func (s *stagedCycles) len() int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.open) + len(s.done)
 }

@@ -31,7 +31,12 @@ func TestExternalPluginDrivesPipeline(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runner.Run(ctx, s, runner.Config{MaxRows: 10, MaxInterval: 20 * time.Millisecond})
+		r, err := runner.NewRunner(ctx, s, runner.Config{MaxRows: 10, MaxInterval: 20 * time.Millisecond})
+		if err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- r.Run(ctx)
 	}()
 
 	deadline := time.Now().Add(10 * time.Second)
@@ -113,4 +118,16 @@ func TestRunnerWithAdaptersDrivesPipeline(t *testing.T) {
 	if seen[1] != "a" || seen[2] != "b" {
 		t.Fatalf("committed values = %v, want {1:a 2:b}", seen)
 	}
+}
+
+// rows returns every row recorded for a target. Test-only: it moved here from
+// fake.go, whose production build (the plugin is loaded by fake_test) has no
+// caller for it.
+func (r *records) rows(target string) []recRow {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]recRow, 0, len(r.upserts[target])+len(r.deletes[target]))
+	out = append(out, r.upserts[target]...)
+	out = append(out, r.deletes[target]...)
+	return out
 }

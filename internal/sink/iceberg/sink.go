@@ -2,6 +2,8 @@ package iceberg
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -97,11 +99,16 @@ func (s *Sink) SetProperties(ctx context.Context, ref core.TableRef, props map[s
 }
 
 // Properties reads the target table's properties. A missing table yields an
-// empty map with no error (treated as not started).
+// empty map with no error (treated as not started); any OTHER catalog error
+// propagates — swallowing it here silently discards snapshot progress and
+// restarts the backfill from scratch, duplicating append-table rows.
 func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]string, error) {
 	tbl, err := s.cat.LoadTable(ctx, s.ident(ref.Target))
 	if err != nil {
-		return map[string]string{}, nil
+		if errors.Is(err, catalog.ErrNoSuchTable) {
+			return map[string]string{}, nil
+		}
+		return nil, fmt.Errorf("iceberg: properties %v: %w", s.ident(ref.Target), err)
 	}
 	return tbl.Properties(), nil
 }

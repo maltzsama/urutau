@@ -144,15 +144,6 @@ func arrowValue(col arrow.Array, row int) any {
 	}
 }
 
-func (r *records) rows(target string) []recRow {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]recRow, 0, len(r.upserts[target])+len(r.deletes[target]))
-	out = append(out, r.upserts[target]...)
-	out = append(out, r.deletes[target]...)
-	return out
-}
-
 // committed is the sink singleton the runner writes into and the test reads.
 var committed = newRecords()
 

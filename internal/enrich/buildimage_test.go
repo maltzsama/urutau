@@ -165,3 +165,14 @@ func TestBuildImageJoinTableShape(t *testing.T) {
 		t.Fatal("lookup(99) must miss")
 	}
 }
+
+// lookup returns the row index for a typed join value and whether it hit.
+// Test-only: it moved here from enrich.go — production joins read
+// snap.keyIndex directly (columnar.go) and have no caller for this wrapper.
+func (s *snapshot) lookup(key any) (int32, bool) {
+	if s.refTable == nil {
+		return 0, false
+	}
+	idx, ok := s.keyIndex[normalizeKey(key)]
+	return idx, ok
+}

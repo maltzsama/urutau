@@ -209,3 +209,40 @@ func TestCommitStagedCycleAdvancesConfirmedForOwners(t *testing.T) {
 		t.Fatalf("confirmed = %v, want 0/10 (the cycle MinSafe)", got)
 	}
 }
+
+// discardTable drops every cycle of a table. Test-only: it moved here from
+// staged.go, whose production path is discardWorker (per lost worker, with
+// table cascading) and has no caller for the per-table variant.
+func (s *stagedCycles) discardTable(table string) int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k := range s.open {
+		if k.table == table {
+			delete(s.open, k)
+			n++
+		}
+	}
+	for k := range s.done {
+		if k.table == table {
+			delete(s.done, k)
+			n++
+		}
+	}
+	delete(s.order, table)
+	return n
+}
+
+// len reports the number of tracked cycles. Test-only: it moved here from
+// staged.go, whose production build has no caller for it.
+func (s *stagedCycles) len() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.open) + len(s.done)
+}

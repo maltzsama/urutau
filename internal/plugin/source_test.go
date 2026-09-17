@@ -1,11 +1,15 @@
 package plugin
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -262,5 +266,32 @@ func TestCdcRecordToWire(t *testing.T) {
 	}
 	if rows[0].Key[0] != int64(7) {
 		t.Fatalf("key = %v", rows[0].Key)
+	}
+}
+
+// stubDoGet is a flight.FlightService_DoGetClient whose Recv always fails
+// with err. Embedding the interface satisfies the remaining methods.
+type stubDoGet struct {
+	flight.FlightService_DoGetClient
+	err error
+}
+
+func (s *stubDoGet) Recv() (*flight.FlightData, error) { return nil, s.err }
+
+// readBatches must distinguish end-of-stream (io.EOF → nil) from a mid-stream
+// failure (propagated) — a transport error is NOT the source being exhausted,
+// and treating it as one silently truncates the pipeline with a clean exit.
+func TestReadBatchesPropagatesStreamErrors(t *testing.T) {
+	r := &sourceReader{alloc: memory.DefaultAllocator}
+	ctx := context.Background()
+
+	if err := r.readBatches(ctx, &stubDoGet{err: io.EOF}, nil, core.TableRef{}); err != nil {
+		t.Fatalf("readBatches(io.EOF) = %v, want nil", err)
+	}
+
+	boom := errors.New("boom: transport died")
+	err := r.readBatches(ctx, &stubDoGet{err: boom}, nil, core.TableRef{})
+	if !errors.Is(err, boom) {
+		t.Fatalf("readBatches(boom) = %v, want wrapped boom", err)
 	}
 }

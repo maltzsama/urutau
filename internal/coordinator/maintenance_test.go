@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/observability"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -288,14 +290,20 @@ func TestSessionLeavesOpsDueWhenPassNeverReports(t *testing.T) {
 	}
 }
 
-// A reported pass does mark the operations as run, so the next tick does not
-// immediately provision another worker for the same turn.
+// A reported pass marks the operations the worker says it completed, so the
+// next tick does not immediately provision another worker for the same turn.
 func TestSessionMarksOpsRunOnReportedResult(t *testing.T) {
 	m, _ := testScheduler(t)
 	m.register("w", "raw.orders")
 
 	stream := &fakeSessionStream{in: []*pb.WorkerMessage{{
-		Msg: &pb.WorkerMessage_MaintenanceResult{MaintenanceResult: &pb.MaintenanceResult{}},
+		Msg: &pb.WorkerMessage_MaintenanceResult{MaintenanceResult: &pb.MaintenanceResult{
+			Ops: []*pb.MaintenanceOpResult{
+				{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{}}},
+				{Op: &pb.MaintenanceOpResult_Expiry{Expiry: &pb.ExpiryResult{}}},
+				{Op: &pb.MaintenanceOpResult_Orphan{Orphan: &pb.OrphanResult{}}},
+			},
+		}},
 	}}}
 	if err := m.session(stream, &pb.Hello{WorkerName: "w", Maintenance: true}); err != nil {
 		t.Fatalf("session: %v", err)
@@ -303,6 +311,46 @@ func TestSessionMarksOpsRunOnReportedResult(t *testing.T) {
 
 	if due := m.sched.Due("raw.orders", m.cfg, time.Now()); len(due) != 0 {
 		t.Fatalf("due = %v after a reported pass, want none until the interval elapses", due)
+	}
+}
+
+// A partial pass marks only what succeeded. The worker reports on failure
+// too, and its pass reports nothing at all for an operation it never
+// reached, so marking the whole assignment would hold operations off for a
+// full interval without them ever having run.
+func TestSessionMarksOnlySucceededOps(t *testing.T) {
+	m, _ := testScheduler(t)
+	// testScheduler enables compaction only; this case needs all three so
+	// the assignment covers an op that fails and one behind it.
+	m.cfg = &spec.Maintenance{
+		Enabled:        true,
+		Compaction:     &spec.CompactionConfig{Interval: "1h"},
+		SnapshotExpiry: &spec.SnapshotExpiryConfig{Interval: "1h"},
+		OrphanCleanup:  &spec.OrphanCleanupConfig{Interval: "1h"},
+	}
+	m.register("w", "raw.orders")
+
+	// Compaction succeeded, expiry failed, cleanup never ran.
+	stream := &fakeSessionStream{in: []*pb.WorkerMessage{{
+		Msg: &pb.WorkerMessage_MaintenanceResult{MaintenanceResult: &pb.MaintenanceResult{
+			Ops: []*pb.MaintenanceOpResult{
+				{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{}}},
+				{Op: &pb.MaintenanceOpResult_Expiry{Expiry: &pb.ExpiryResult{Error: "commit rejected"}}},
+			},
+		}},
+	}}}
+	if err := m.session(stream, &pb.Hello{WorkerName: "w", Maintenance: true}); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+
+	due := m.sched.Due("raw.orders", m.cfg, time.Now())
+	if slices.Contains(due, sink.MaintenanceCompaction) {
+		t.Error("compaction is still due though the worker reported it succeeded")
+	}
+	for _, op := range []sink.MaintenanceOp{sink.MaintenanceSnapshotExpiry, sink.MaintenanceOrphanCleanup} {
+		if !slices.Contains(due, op) {
+			t.Errorf("%s was marked run: the worker reported it as failed, or never reached it", op)
+		}
 	}
 }
 

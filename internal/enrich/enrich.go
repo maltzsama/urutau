@@ -128,15 +128,6 @@ func (s *snapshot) refType(as string) arrow.DataType {
 	return nil
 }
 
-// lookup returns the row index for a typed join value and whether it hit.
-func (s *snapshot) lookup(key any) (int32, bool) {
-	if s.refTable == nil {
-		return 0, false
-	}
-	idx, ok := s.keyIndex[normalizeKey(key)]
-	return idx, ok
-}
-
 // refJoin is one reference: its config and the hot lookup snapshot. The
 // snapshot is swapped atomically — an in-flight batch finishes against the
 // old image, never a half-built one. The mutex only protects the sticky

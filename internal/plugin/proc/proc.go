@@ -233,7 +233,6 @@ func readLine(br *bufio.Reader) (string, error) {
 }
 
 func (p *Process) Addr() string     { return p.addr }
-func (p *Process) Socket() string   { return p.socket }
 func (p *Process) ReadyInfo() Ready { return p.ready }
 
 // Exited returns a channel that is closed when the process exits.

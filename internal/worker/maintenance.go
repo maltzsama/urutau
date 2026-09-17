@@ -140,11 +140,32 @@ func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.Mainte
 	collector := &resultCollector{}
 	cfg.Logger.Info("worker: maintenance: start", "table", assign.TargetTable, "ops", ops)
 	m := maintainable.Maintain(ref, maint, cfg.Logger, currentPosition, collector)
-	if err := m.RunOnce(ctx, ops); err != nil {
-		cfg.Logger.Warn("worker: maintenance: failed", "table", assign.TargetTable, "ops", ops, "err", err)
-		return collector.ops, fmt.Errorf("worker: maintenance %s: %w", assign.TargetTable, err)
+
+	// One RunOnce per operation, continuing past a failure. A batch call
+	// stops at the first error, so a failing operation would keep every
+	// later one in the assignment from ever running — and since the
+	// coordinator only marks what this pass reports as succeeded, an
+	// operation that never runs is never marked and is simply reassigned to
+	// the next pass, where the same failure blocks it again. The operations
+	// are independent (each reloads the table and acts on what it finds), so
+	// the one that is broken should be the only one that is broken.
+	var firstErr error
+	for _, op := range ops {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		if err := m.RunOnce(ctx, []sink.MaintenanceOp{op}); err != nil {
+			cfg.Logger.Warn("worker: maintenance: failed", "table", assign.TargetTable, "op", op, "err", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("worker: maintenance %s: %s: %w", assign.TargetTable, op, err)
+			}
+		}
+	}
+	if firstErr != nil {
+		return collector.ops, firstErr
 	}
 	cfg.Logger.Info("worker: maintenance: done", "table", assign.TargetTable, "ops", ops)
+
 	return collector.ops, nil
 }
 

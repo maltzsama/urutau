@@ -344,13 +344,3 @@ func ValidateParallelism(kind string, maxParallelChunks int) error {
 	}
 	return nil
 }
-
-// resetRegistry clears the registry. TEST-ONLY: it exists so driver tests can
-// assert empty-registry diagnostics without being polluted by other tests'
-// registrations. Never call from production code.
-func resetRegistry() {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-	reg.sources = nil
-	reg.sinks = nil
-}
