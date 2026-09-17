@@ -147,8 +147,9 @@
         <div class="card" x-show="maintenance().compaction">
           <div class="row"><span class="small muted">COMPACTION</span>
             <span class="badge" x-text="maintenance().compaction?.runs + ' runs'"></span></div>
-          <div class="hero" x-text="bytes(reclaimed())"></div>
-          <div class="small muted">bytes reclaimed</div>
+          <div class="metricline"><span>Bytes before</span><strong x-text="bytes(maintenance().compaction?.bytes_before)"></strong></div>
+          <div class="metricline"><span>Bytes after</span><strong x-text="bytes(maintenance().compaction?.bytes_after)"></strong></div>
+          <div class="metricline"><span>Reclaimed</span><strong x-text="bytes(reclaimed())"></strong></div>
           <div class="metricline"><span>Files removed</span><strong x-text="maintenance().compaction?.files_removed"></strong></div>
           <div class="metricline"><span>Files added</span><strong x-text="maintenance().compaction?.files_added"></strong></div>
           <div class="metricline"><span>Last run</span><strong x-text="ago(maintenance().compaction?.last_run)"></strong></div>
@@ -352,7 +353,7 @@
           <div class="metricline"><span>Commits</span><strong x-text="fmt(drawerTable().commits)"></strong></div>
           <div class="metricline" x-show="drawerTable().commit_failures"><span>Failures</span><strong class="red" x-text="drawerTable().commit_failures"></strong></div>
         </div>
-        <div class="section"><h3>Throughput &amp; lag</h3><div class="chart"><canvas id="chart-drawer"></canvas></div></div>
+        <div class="section"><h3>Throughput</h3><div class="chart"><canvas id="chart-drawer"></canvas></div></div>
         <div class="section"><h3>Maintenance</h3>
           <div class="metricline" x-show="drawerTable().maintenance?.compaction">
             <span>Compaction</span><strong x-text="drawerTable().maintenance?.compaction?.runs + ' runs'"></strong></div>

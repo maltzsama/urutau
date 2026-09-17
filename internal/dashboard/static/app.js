@@ -474,24 +474,22 @@ function app() {
       if (!el) return;
       const s = series[this.drawer.target] || {};
       const rate = this.tail(s.rate);
-      const lag = this.tail(s.lag);
+      const axis = cssVar('--pico-muted-color', '#888');
       const data = {
         labels: rate.map((_, i) => i),
         datasets: [
-          { label: 'Rows/s', data: rate, borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
-          { label: 'Lag (s)', data: lag, borderColor: COLORS[2], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
+          { label: 'Rows/s', data: rate, borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2 },
         ],
       };
-      const axis = cssVar('--pico-muted-color', '#888');
       const opts = {
         responsive: true, maintainAspectRatio: false, animation: false,
-        plugins: { legend: { display: true, labels: { boxWidth: 10 } } },
+        plugins: { legend: { display: false } },
         scales: {
           x: { display: false },
-          y: { position: 'left', beginAtZero: true, grid: { color: cssVar('--pico-muted-border-color', '#ddd') },
+          y: { beginAtZero: true,
+               title: { display: true, text: 'rows/s', color: axis, font: { size: 10 } },
+               grid: { color: cssVar('--pico-muted-border-color', '#ddd') },
                ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
-          y1: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false },
-                ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
         },
       };
       if (charts['chart-drawer']) {
