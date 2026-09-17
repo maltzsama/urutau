@@ -1,16 +1,83 @@
 package coordinator
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/grpc/metadata"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/maltzsama/urutau/internal/observability"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/spec"
 )
+
+// fakeSessionStream is a scripted UrutauControl_SessionServer: Recv returns
+// the queued worker messages in order, and Send records what the coordinator
+// pushed.
+//
+// Once the queue is drained Recv models the real maintenance worker, which
+// blocks in Recv waiting for an assignment and only returns when the
+// coordinator ends the session. blockWhenDrained makes that explicit: with
+// it set, a coordinator that waits on Recv instead of dismissing the worker
+// deadlocks, which is the zombie-Pod bug rather than a passing test.
+type fakeSessionStream struct {
+	in               []*pb.WorkerMessage
+	sent             []*pb.CoordinatorMessage
+	ctx              context.Context
+	blockWhenDrained bool
+}
+
+func (f *fakeSessionStream) Recv() (*pb.WorkerMessage, error) {
+	if len(f.in) == 0 {
+		if f.blockWhenDrained {
+			<-make(chan struct{}) // a real worker parks here until dismissed
+		}
+		return nil, io.EOF
+	}
+	msg := f.in[0]
+	f.in = f.in[1:]
+	return msg, nil
+}
+
+func (f *fakeSessionStream) Send(m *pb.CoordinatorMessage) error {
+	f.sent = append(f.sent, m)
+	return nil
+}
+
+func (f *fakeSessionStream) Context() context.Context {
+	if f.ctx == nil {
+		return context.Background()
+	}
+	return f.ctx
+}
+
+func (f *fakeSessionStream) SetHeader(metadata.MD) error  { return nil }
+func (f *fakeSessionStream) SendHeader(metadata.MD) error { return nil }
+func (f *fakeSessionStream) SetTrailer(metadata.MD)       {}
+func (f *fakeSessionStream) SendMsg(any) error            { return nil }
+func (f *fakeSessionStream) RecvMsg(any) error            { return nil }
+
+// testScheduler builds a maintenance scheduler with compaction enabled (so
+// exactly one operation is due on the first Due call) and a fake Kubernetes
+// client, so Pod provisioning and deletion are observable.
+func testScheduler(t *testing.T) (*maintenanceScheduler, *fake.Clientset) {
+	t.Helper()
+	cs := fake.NewSimpleClientset()
+	m := newMaintenanceScheduler(
+		&Coordinator{log: slog.New(slog.DiscardHandler)},
+		&spec.Maintenance{Enabled: true, Compaction: &spec.CompactionConfig{Interval: "1h"}},
+	)
+	m.k8s, m.namespace = cs, "ns"
+	return m, cs
+}
 
 func TestMaintenanceWorkerNameSanitizes(t *testing.T) {
 	cases := []struct {
@@ -87,6 +154,168 @@ func hasArgPair(args []string, flag, value string) bool {
 		}
 	}
 	return false
+}
+
+// The whole point of issue #105: a worker serves exactly one pass and its
+// Pod is deleted, so the pod terminates instead of being restarted into a
+// crash loop.
+func TestSessionDeletesPodAfterOnePass(t *testing.T) {
+	m, cs := testScheduler(t)
+	m.register("w", "raw.orders")
+	m.active["w"] = true
+	if _, err := cs.CoreV1().Pods("ns").Create(context.Background(),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "ns"}},
+		metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed pod: %v", err)
+	}
+
+	stream := &fakeSessionStream{in: []*pb.WorkerMessage{{
+		Msg: &pb.WorkerMessage_MaintenanceResult{MaintenanceResult: &pb.MaintenanceResult{}},
+	}}}
+	if err := m.session(stream, &pb.Hello{WorkerName: "w", Maintenance: true}); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+
+	if len(stream.sent) != 1 || stream.sent[0].GetMaintenance() == nil {
+		t.Fatalf("sent = %v, want exactly one MaintenanceAssignment", stream.sent)
+	}
+	if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "w", metav1.GetOptions{}); err == nil {
+		t.Fatal("pod still exists after the pass; it must be deleted so the worker terminates")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.active["w"] || m.connected["w"] {
+		t.Fatalf("active=%v connected=%v, both must be cleared so the next turn can provision", m.active["w"], m.connected["w"])
+	}
+}
+
+// A worker that connects with nothing due must be dismissed, not left
+// blocked in Recv forever. Leaving it connected would pin active[name] and
+// silently stop every future maintenance turn for that table.
+func TestSessionDismissesWorkerWithNothingDue(t *testing.T) {
+	m, cs := testScheduler(t)
+	m.register("w", "raw.orders")
+	m.active["w"] = true
+	if _, err := cs.CoreV1().Pods("ns").Create(context.Background(),
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "ns"}},
+		metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed pod: %v", err)
+	}
+	// Everything already ran, so nothing is due for this worker.
+	m.sched.MarkRun("raw.orders", m.sched.Due("raw.orders", m.cfg, time.Now()), time.Now())
+
+	// blockWhenDrained: this worker never sends anything, exactly like a real
+	// one parked in Recv. The coordinator must dismiss it on its own.
+	stream := &fakeSessionStream{blockWhenDrained: true}
+	done := make(chan error, 1)
+	go func() { done <- m.session(stream, &pb.Hello{WorkerName: "w", Maintenance: true}) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("session: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session never returned: the worker is parked in Recv with nothing due, so its Pod would linger and pin the table forever")
+	}
+
+	if len(stream.sent) != 0 {
+		t.Fatalf("sent = %v, want no assignment when nothing is due", stream.sent)
+	}
+	if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "w", metav1.GetOptions{}); err == nil {
+		t.Fatal("dismissed worker's pod still exists; it must be deleted")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.active["w"] || m.connected["w"] {
+		t.Fatal("dismissal must free the table, otherwise maintenance stops for good")
+	}
+}
+
+// MarkRun happens on the worker's reported result, not when the assignment
+// is sent: a worker killed mid-pass (OOM, node drain) must leave its
+// operations due so the next turn retries them.
+func TestSessionLeavesOpsDueWhenPassNeverReports(t *testing.T) {
+	m, _ := testScheduler(t)
+	m.register("w", "raw.orders")
+
+	// No MaintenanceResult queued: the worker died after receiving the
+	// assignment.
+	if err := m.session(&fakeSessionStream{}, &pb.Hello{WorkerName: "w", Maintenance: true}); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+
+	if due := m.sched.Due("raw.orders", m.cfg, time.Now()); len(due) == 0 {
+		t.Fatal("operations were marked run despite the pass never reporting a result")
+	}
+}
+
+// A reported pass does mark the operations as run, so the next tick does not
+// immediately provision another worker for the same turn.
+func TestSessionMarksOpsRunOnReportedResult(t *testing.T) {
+	m, _ := testScheduler(t)
+	m.register("w", "raw.orders")
+
+	stream := &fakeSessionStream{in: []*pb.WorkerMessage{{
+		Msg: &pb.WorkerMessage_MaintenanceResult{MaintenanceResult: &pb.MaintenanceResult{}},
+	}}}
+	if err := m.session(stream, &pb.Hello{WorkerName: "w", Maintenance: true}); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+
+	if due := m.sched.Due("raw.orders", m.cfg, time.Now()); len(due) != 0 {
+		t.Fatalf("due = %v after a reported pass, want none until the interval elapses", due)
+	}
+}
+
+// tick provisions a Pod per due table, and only one: a table whose worker is
+// still in flight is skipped rather than piling up duplicate Pods.
+func TestTickProvisionsOnePodPerDueTableAndNoDuplicates(t *testing.T) {
+	m, cs := testScheduler(t)
+	m.register("w", "raw.orders")
+	// loadWorkerPodTemplate reads the operator-rendered template from disk,
+	// which is absent here, so provisioning fails and active is rolled back —
+	// that rollback is exactly what must happen on a provisioning error.
+	m.tick(time.Now())
+	m.mu.Lock()
+	stillActive := m.active["w"]
+	m.mu.Unlock()
+	if stillActive {
+		t.Fatal("a failed provision must clear active, otherwise the table is stuck forever")
+	}
+	pods, err := cs.CoreV1().Pods("ns").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("pods = %d, want 0 when the template is missing", len(pods.Items))
+	}
+
+	// With a worker already in flight, tick must not provision at all.
+	m.mu.Lock()
+	m.active["w"] = true
+	m.mu.Unlock()
+	m.tick(time.Now())
+	pods, err = cs.CoreV1().Pods("ns").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("pods = %d, want 0 while a pass is in flight", len(pods.Items))
+	}
+}
+
+// Without Kubernetes provisioning (no worker pod template, so no client)
+// tick is a no-op rather than a nil-pointer panic.
+func TestTickWithoutKubernetesIsANoop(t *testing.T) {
+	m := newMaintenanceScheduler(
+		&Coordinator{log: slog.New(slog.DiscardHandler)},
+		&spec.Maintenance{Enabled: true, Compaction: &spec.CompactionConfig{Interval: "1h"}},
+	)
+	m.register("w", "raw.orders")
+	m.tick(time.Now())
+	if due := m.sched.Due("raw.orders", m.cfg, time.Now()); len(due) == 0 {
+		t.Fatal("tick must not consume the due turn when it cannot provision")
+	}
 }
 
 // recordResult folds a maintenance worker's reported pass into the

@@ -37,20 +37,20 @@ type maintenanceScheduler struct {
 	namespace string
 	owner     metav1.OwnerReference
 
-	mu     sync.Mutex
-	tables map[string]string                      // worker name -> table
-	active map[string]bool                        // worker name -> Pod exists (provisioned, not yet cleaned up)
-	out    map[string]chan *pb.CoordinatorMessage // worker name -> assignment channel, once connected
+	mu        sync.Mutex
+	tables    map[string]string // worker name -> table
+	active    map[string]bool   // worker name -> Pod provisioned, not yet cleaned up
+	connected map[string]bool   // worker name -> session in progress
 }
 
 func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenanceScheduler {
 	return &maintenanceScheduler{
-		c:      c,
-		cfg:    cfg,
-		sched:  maintenance.NewSchedule(),
-		tables: map[string]string{},
-		active: map[string]bool{},
-		out:    map[string]chan *pb.CoordinatorMessage{},
+		c:         c,
+		cfg:       cfg,
+		sched:     maintenance.NewSchedule(),
+		tables:    map[string]string{},
+		active:    map[string]bool{},
+		connected: map[string]bool{},
 	}
 }
 
@@ -106,9 +106,19 @@ func (m *maintenanceScheduler) register(name, table string) {
 	m.mu.Unlock()
 }
 
-// session serves one connected maintenance worker: it waits for the push
-// loop to hand it a due assignment, sends it, and returns when the worker
-// closes the stream (it exits after its pass).
+// session serves one connected maintenance worker for exactly one pass: it
+// hands over the operations due for its table, records the result the worker
+// reports, and returns when the worker closes the stream (it exits after the
+// pass). The worker's Pod is deleted on the way out, so it terminates
+// instead of being restarted.
+//
+// A worker that finds nothing due is dismissed immediately rather than left
+// blocked in Recv: its Pod only exists because tick saw a turn due, so
+// nothing due here means the turn was already served (a duplicate Pod, or a
+// coordinator restart that lost the in-memory schedule). Returning ends the
+// session, the worker exits, and the deferred cleanup frees the table to be
+// provisioned again — leaving it connected would pin active[name] forever
+// and silently stop all further maintenance for that table.
 func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, hello *pb.Hello) error {
 	name := hello.WorkerName
 	m.mu.Lock()
@@ -117,32 +127,20 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 		m.mu.Unlock()
 		return fmt.Errorf("coordinator: unknown maintenance worker %q", name)
 	}
-	if _, dup := m.out[name]; dup {
+	if m.connected[name] {
 		m.mu.Unlock()
 		return fmt.Errorf("coordinator: maintenance worker %q already connected", name)
 	}
-	out := make(chan *pb.CoordinatorMessage, 1)
-	m.out[name] = out
-	// This worker's Pod exists only because a turn was due when tick
-	// provisioned it; hand over that assignment immediately rather than
-	// making the freshly-started worker idle until the next tick.
-	due := m.sched.Due(table, m.cfg, time.Now())
-	if len(due) > 0 {
-		if msg, err := m.assignment(table, due); err == nil {
-			out <- msg
-			m.sched.MarkRun(table, due, time.Now())
-		} else {
-			m.c.log.Warn("coordinator: maintenance: build assignment", "table", table, "err", err)
-		}
-	}
+	m.connected[name] = true
 	m.mu.Unlock()
+
 	defer func() {
 		m.mu.Lock()
-		delete(m.out, name)
+		delete(m.connected, name)
 		delete(m.active, name)
 		m.mu.Unlock()
-		// The worker exits right after this session ends; delete its Pod so
-		// it terminates instead of being restarted by Kubernetes.
+		// The worker exits as soon as this session ends; delete its Pod so it
+		// terminates instead of lingering.
 		if m.k8s != nil {
 			if err := deletePod(context.Background(), m.k8s, m.namespace, name); err != nil {
 				m.c.log.Warn("coordinator: maintenance: delete worker pod", "worker", name, "err", err)
@@ -151,38 +149,42 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	}()
 	m.c.log.Info("coordinator: maintenance worker connected", "worker", name, "table", table)
 
-	// The worker sends its Hello and, after the pass, a MaintenanceResult;
-	// detect it leaving (the stream closing) so the deferred deregistration
-	// runs and its restart reconnects cleanly.
-	done := make(chan error, 1)
-	go func() {
-		for {
-			msg, err := stream.Recv()
-			if err != nil {
-				done <- err
-				return
-			}
-			if res := msg.GetMaintenanceResult(); res != nil {
-				m.recordResult(table, res)
-			}
-		}
-	}()
+	// This Pod exists only because tick saw a turn due, so serve it now
+	// rather than making a freshly-started worker idle until the next tick.
+	m.mu.Lock()
+	due := m.sched.Due(table, m.cfg, time.Now())
+	m.mu.Unlock()
+	if len(due) == 0 {
+		m.c.log.Info("coordinator: maintenance: nothing due, dismissing worker", "worker", name, "table", table)
+		return nil
+	}
+	msg, err := m.assignment(table, due)
+	if err != nil {
+		return fmt.Errorf("coordinator: maintenance: build assignment for %s: %w", table, err)
+	}
+	if err := stream.Send(msg); err != nil {
+		return err
+	}
 
+	// The worker reports a MaintenanceResult when the pass ends, then closes
+	// the stream. MarkRun happens on that report, not on the send above: a
+	// worker that dies mid-pass (OOM, node drain) must leave the operations
+	// due rather than have them counted as run.
 	for {
-		select {
-		case msg := <-out:
-			if err := stream.Send(msg); err != nil {
-				return err
-			}
-		case <-done:
-			return nil // the worker finished its pass and exited
-		case <-stream.Context().Done():
-			return stream.Context().Err()
+		in, err := stream.Recv()
+		if err != nil {
+			return nil // the worker finished (or died); either way it is gone
+		}
+		if res := in.GetMaintenanceResult(); res != nil {
+			m.recordResult(table, res)
+			m.mu.Lock()
+			m.sched.MarkRun(table, due, time.Now())
+			m.mu.Unlock()
 		}
 	}
 }
 
-// run pushes due assignments to connected maintenance workers until ctx is
+// run provisions ephemeral maintenance workers for due turns until ctx is
 // done.
 func (m *maintenanceScheduler) run(ctx context.Context) {
 	ticker := time.NewTicker(maintenance.CheckInterval(m.cfg))
@@ -197,34 +199,23 @@ func (m *maintenanceScheduler) run(ctx context.Context) {
 	}
 }
 
-// tick, for every table with a turn due, either hands the assignment to a
-// connected worker or — if no worker is connected or already being
-// provisioned for it — provisions a fresh ephemeral Pod for that table. A
-// worker that already has an assignment in flight (channel full) is skipped
-// until the next tick — the operation stays due, so nothing is lost.
+// tick provisions one ephemeral Pod per table whose next turn has come due
+// and that has no worker in flight already. Handing over the assignment is
+// session's job, not tick's — the worker gets it the moment it connects.
+// A table whose previous pass is still running is skipped; its operations
+// stay due, so nothing is lost.
 func (m *maintenanceScheduler) tick(now time.Time) {
+	if m.k8s == nil {
+		return
+	}
 	m.mu.Lock()
 	type toProvision struct{ name, table string }
 	var provision []toProvision
 	for name, table := range m.tables {
-		due := m.sched.Due(table, m.cfg, now)
-		if len(due) == 0 {
+		if m.active[name] || m.connected[name] {
 			continue
 		}
-		if out, connected := m.out[name]; connected {
-			msg, err := m.assignment(table, due)
-			if err != nil {
-				m.c.log.Warn("coordinator: maintenance: build assignment", "table", table, "err", err)
-				continue
-			}
-			select {
-			case out <- msg:
-				m.sched.MarkRun(table, due, now)
-			default:
-			}
-			continue
-		}
-		if m.active[name] || m.k8s == nil {
+		if len(m.sched.Due(table, m.cfg, now)) == 0 {
 			continue
 		}
 		m.active[name] = true

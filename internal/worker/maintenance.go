@@ -3,10 +3,14 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
@@ -19,9 +23,14 @@ import (
 // worker: it sends a maintenance Hello, waits for the coordinator to push a
 // MaintenanceAssignment (one is sent when a maintenance turn is due), runs
 // the requested operations once, reports the outcome, and returns. The
-// process then exits, and the coordinator's Deployment restarts it for the
-// next turn — so a maintenance pass never competes with the coordinator's
-// routing/commit path, and never takes the coordinator down with it.
+// process then exits for good — this Pod is one pass, and the coordinator
+// provisions a fresh Pod for the next due turn. So a maintenance pass never
+// competes with the coordinator's routing/commit path, and never takes the
+// coordinator down with it.
+//
+// The coordinator may also close the stream without sending an assignment
+// (nothing due after all); that dismissal ends the pass the same way, with
+// the process exiting rather than waiting for work that will not come.
 //
 // It never opens the data plane: no Flight, no acks. The coordinator knows a
 // maintenance worker by its Hello marker, answers with the maintenance
@@ -54,6 +63,13 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 	for {
 		msg, err := session.Recv()
 		if err != nil {
+			if errors.Is(err, io.EOF) || status.Code(err) == codes.Canceled {
+				// The coordinator dismissed us without an assignment: nothing
+				// was due after all. Not a failure — exit 0 so the Pod reports
+				// Completed rather than Error.
+				cfg.Logger.Info("worker: maintenance: dismissed with no assignment", "worker", cfg.Name)
+				return nil
+			}
 			return fmt.Errorf("worker: maintenance: %w", err)
 		}
 		assign := msg.GetMaintenance()
@@ -63,15 +79,17 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 		results, passErr := runMaintenancePass(ctx, cfg, assign)
 		// Report the outcome before exiting: this process's own /metrics
 		// dies with it, so a result not sent now is lost to the coordinator's
-		// long-lived registry. Report even on failure — the coordinator
-		// records the failed operation too.
+		// long-lived registry. The coordinator also marks the operations as
+		// run only once this report lands, so a pass that dies before it
+		// stays due. Report even on failure — the coordinator records the
+		// failed operation too.
 		sendErr := session.Send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_MaintenanceResult{
 			MaintenanceResult: &pb.MaintenanceResult{Ops: results},
 		}})
 		if sendErr != nil && passErr == nil {
 			return fmt.Errorf("worker: maintenance: report: %w", sendErr)
 		}
-		return passErr // one pass per process: exit, and the Deployment restarts us
+		return passErr // one pass per process: exit for good
 	}
 }
 
