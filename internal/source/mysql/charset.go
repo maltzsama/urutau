@@ -10,6 +10,7 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/encoding/traditionalchinese"
 	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/encoding/unicode/utf32"
 )
 
 // Character-set decoding for binlog string values.
@@ -69,9 +70,21 @@ func decoderFor(collation string) (func([]byte) (string, error), bool) {
 // Only sets whose bytes are NOT already UTF-8 appear here; everything else
 // (utf8/utf8mb3/utf8mb4/ascii, and anything unlisted) passes through.
 //
-// The list covers the single-byte sets MySQL ships that have a Go decoder,
-// plus the UCS-2/UTF-16 family. binary is deliberately absent: a binary
-// column carries bytes, not text, and must not be reinterpreted.
+// The list covers every MySQL character set x/text models faithfully: the
+// single-byte sets, the Unicode family, and the multi-byte East Asian sets.
+// binary is deliberately absent — a binary column carries bytes, not text,
+// and must not be reinterpreted.
+//
+// What remains unlisted, and why each stays that way:
+//
+//	eucjpms, macce  a near-miss table exists but is NOT the same mapping
+//	                (see the notes below and macce's test), so decoding
+//	                would corrupt exactly the characters the charset is for
+//	armscii8, dec8, geostd8, hp8, keybcs2, swe7
+//	                x/text has no decoder at all
+//
+// Closing those needs MySQL's own conversion tables (share/charsets/*.xml),
+// not a lookalike from another standard.
 var charsetDecoders = map[string]func([]byte) (string, error){
 	"latin1":   decodeWith(charmap.Windows1252), // MySQL's latin1 IS cp1252, not ISO-8859-1
 	"latin2":   decodeWith(charmap.ISO8859_2),
@@ -92,6 +105,7 @@ var charsetDecoders = map[string]func([]byte) (string, error){
 	"ucs2":     decodeUTF16BE, // BMP-only subset of UTF-16, big endian
 	"utf16":    decodeUTF16BE,
 	"utf16le":  decodeUTF16LE,
+	"utf32":    decodeUTF32BE, // MySQL's utf32 is big endian, fixed 4 bytes
 
 	// Multi-byte East Asian sets. x/text's decoders are the WHATWG/Unicode
 	// mappings, which match MySQL's tables for the overwhelming majority of
@@ -118,6 +132,13 @@ var charsetDecoders = map[string]func([]byte) (string, error){
 	"gb18030": decodeWith(simplifiedchinese.GB18030),
 	"big5":    decodeWith(traditionalchinese.Big5),
 	"euckr":   decodeWith(korean.EUCKR),
+
+	// gb2312 is the subset GBK extends, so the GBK decoder covers it: every
+	// gb2312 byte sequence is a valid GBK one with the same meaning.
+	"gb2312": decodeWith(simplifiedchinese.GBK),
+	// MySQL's tis620 is the Thai set Windows-874 encodes (cp874 is the
+	// Microsoft name for the same code page).
+	"tis620": decodeWith(charmap.Windows874),
 }
 
 // decodeWith adapts an x/text encoding to the decoder signature.
@@ -137,6 +158,12 @@ func decodeUTF16BE(b []byte) (string, error) {
 
 func decodeUTF16LE(b []byte) (string, error) {
 	out, err := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder().Bytes(b)
+
+	return string(out), err
+}
+
+func decodeUTF32BE(b []byte) (string, error) {
+	out, err := utf32.UTF32(utf32.BigEndian, utf32.IgnoreBOM).NewDecoder().Bytes(b)
 
 	return string(out), err
 }

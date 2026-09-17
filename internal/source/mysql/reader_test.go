@@ -417,3 +417,50 @@ func TestRowToMapEucjpmsStillPassesThrough(t *testing.T) {
 		t.Errorf("eucjpms = %q, want the raw bytes passed through", got)
 	}
 }
+
+// gb2312 is the subset GBK extends, and MySQL's tis620 is the Thai code
+// page Windows-874 encodes; both reuse a decoder already in the table.
+func TestRowToMapDecodesSubsetCharsets(t *testing.T) {
+	for _, tc := range []struct {
+		name, collation string
+		raw             []byte
+		want            string
+	}{
+		{"gb2312", "gb2312_chinese_ci", []byte{0xd6, 0xd0, 0xb9, 0xfa}, "中国"},
+		{"tis620", "tis620_thai_ci", []byte{0xa1, 0xa2, 0xa3}, "กขฃ"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl := &schema.Table{Columns: []schema.TableColumn{
+				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
+			}}
+			if got := rowToMap(tbl, []any{tc.raw})["v"]; got != tc.want {
+				t.Errorf("v = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// macce (Mac Central Europe) must NOT be folded into charmap.Macintosh:
+// they differ. Byte 0x8e is "é" in Mac Roman and a different character in
+// Mac Central Europe, so decoding it with the wrong table would corrupt
+// exactly the accented characters the charset exists for.
+func TestRowToMapMacceStillPassesThrough(t *testing.T) {
+	raw := []byte{0x8e}
+	tbl := &schema.Table{Columns: []schema.TableColumn{
+		{Name: "v", Type: schema.TYPE_STRING, Collation: "macce_general_ci"},
+	}}
+	got, _ := rowToMap(tbl, []any{raw})["v"].(string)
+	if !bytes.Equal([]byte(got), raw) {
+		t.Errorf("macce = %q, want the raw byte passed through (Mac Roman is a different table)", got)
+	}
+}
+
+// MySQL's utf32 is fixed-width big-endian UTF-32.
+func TestRowToMapDecodesUTF32(t *testing.T) {
+	tbl := &schema.Table{Columns: []schema.TableColumn{
+		{Name: "v", Type: schema.TYPE_STRING, Collation: "utf32_general_ci"},
+	}}
+	if got := rowToMap(tbl, []any{[]byte{0x00, 0x00, 0x4e, 0x2d}})["v"]; got != "中" {
+		t.Errorf("utf32 = %q, want %q", got, "中")
+	}
+}
