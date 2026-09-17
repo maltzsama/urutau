@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.2.0](https://github.com/maltzsama/urutau/compare/v0.1.1...v0.2.0) (2026-09-17)
+
+
+### Features
+
+* **coordinator:** push dashboard updates over SSE ([7f00c26](https://github.com/maltzsama/urutau/commit/7f00c26ac7fe4aa2e2f07e78387d666af2100784))
+* **coordinator:** record the worker metrics report ([6f76408](https://github.com/maltzsama/urutau/commit/6f76408b464f6d4a09a06c0410b605598f94c2a0))
+* **coordinator:** serve the dashboard ([9842ba5](https://github.com/maltzsama/urutau/commit/9842ba524097e8477056a038cc5c93d0d4a5243c))
+* **dashboard:** 1h client-side series buffer ([7b0e65e](https://github.com/maltzsama/urutau/commit/7b0e65ebbb29f7d654eec36879496f693868440a))
+* **dashboard:** apply the UI review feedback ([57f2b0f](https://github.com/maltzsama/urutau/commit/57f2b0f7f2e1993cedbc5bbac5e0c286a7734132))
+* **dashboard:** embedded coordinator monitoring UI ([2b75194](https://github.com/maltzsama/urutau/commit/2b75194eea4613d90881a699c8ee55f1135fca68))
+* **dashboard:** embedded coordinator monitoring UI + JSON API ([91ce694](https://github.com/maltzsama/urutau/commit/91ce6947f30d0a19cec55a2c96fa615fd2f91aed))
+* **dashboard:** per-stream commit latency ([4e0b9d1](https://github.com/maltzsama/urutau/commit/4e0b9d10bd848bcea4e029829487fec7d27e126e))
+* **dashboard:** server-sent events for live state ([fecf4b3](https://github.com/maltzsama/urutau/commit/fecf4b36b4c1c17cf21e95f5df16ce686b702347))
+* **dashboard:** SPA consumes the SSE stream instead of polling ([f26833d](https://github.com/maltzsama/urutau/commit/f26833dd27024429ef5de1827793a003e4fdc4c2))
+* **dashboard:** view polish ([3e68089](https://github.com/maltzsama/urutau/commit/3e680897992313c6dcb254248bd0aca362bb8950))
+* Iceberg table maintenance (compaction, snapshot expiry, orphan cleanup) ([77e7254](https://github.com/maltzsama/urutau/commit/77e72546e88a6f383a287adb866c1880d888214b))
+* **iceberg:** implement the Maintainer (compaction, snapshot expiry, orphan cleanup) ([7da6ab9](https://github.com/maltzsama/urutau/commit/7da6ab99b680fe496682d8f2c0b81b4d8d48fa07))
+* **logging:** buffered slog handler for the dashboard log tail ([c612316](https://github.com/maltzsama/urutau/commit/c612316911b364e52f72048b9e781dfd511ed772))
+* **maintenance:** ephemeral connected worker; fix targetFileSize ([fa5a32d](https://github.com/maltzsama/urutau/commit/fa5a32d2e7a50aa080f29766cc86ac5bc3af6e86))
+* **observability:** add Iceberg maintenance metrics ([7addf0a](https://github.com/maltzsama/urutau/commit/7addf0a8024ba5100112016d59d79e0252a68d7f))
+* **observability:** expose the metrics mux for extra routes ([d216f8d](https://github.com/maltzsama/urutau/commit/d216f8d4b27807b7b3d3ed2610a8c98e9ff67478))
+* **runner,coordinator:** launch Iceberg maintenance per target table ([de33370](https://github.com/maltzsama/urutau/commit/de3337047dfe6d49741297290cdbf67e5ef8ddfb))
+* **sink:** add Maintainable capability contract ([b8fd2be](https://github.com/maltzsama/urutau/commit/b8fd2bee67fb85a553313af80be76f3b08ffbede))
+* **spec:** add Iceberg maintenance config (compaction, snapshot expiry, orphan cleanup) ([7fa7442](https://github.com/maltzsama/urutau/commit/7fa7442a49e8cd2e20c512035fda659c7bb4897c))
+* **worker:** report worker metrics to the coordinator ([8a90a2c](https://github.com/maltzsama/urutau/commit/8a90a2cb6921ec67cc74f0e9f38e6989c9732893))
+
+
+### Bug Fixes
+
+* **build:** promote prometheus/client_model to a direct dependency ([9e8320d](https://github.com/maltzsama/urutau/commit/9e8320d9611072ac91ab0d5e0e4a1ed320ab984a))
+* **coordinator:** run maintenance workers as ephemeral Pods, not Deployments ([730dffe](https://github.com/maltzsama/urutau/commit/730dffed2447cec6f91199e36e56abcf13df83f5))
+* **coordinator:** run maintenance workers as ephemeral Pods, not Deployments ([b420fea](https://github.com/maltzsama/urutau/commit/b420fea97a248fa508616789e5003ebb83c9e408))
+* **dashboard:** align the header, sections and toolbars ([23b9126](https://github.com/maltzsama/urutau/commit/23b9126ba1525e9e70cd1a7fc2efba0a39737398))
+* **dashboard:** clarify the drawer chart and compaction numbers ([a0e8d0d](https://github.com/maltzsama/urutau/commit/a0e8d0dcebdfde5f4af0ae4b583a406df8742e20))
+* **dashboard:** connect the SSE stream and keep chart state out of Alpine ([610e96a](https://github.com/maltzsama/urutau/commit/610e96aadaf05c41a89631586e8090c3403bd3a7))
+* **dashboard:** default the write mode label to upsert ([e079276](https://github.com/maltzsama/urutau/commit/e079276730f85093cd785952b3e4eb209ff05719))
+* **dashboard:** keep button labels visible in the light theme ([6880439](https://github.com/maltzsama/urutau/commit/6880439131b8f81172843c113244a3602674bc12))
+* **dashboard:** keep the SSE stream alive past the write deadline ([2ce7607](https://github.com/maltzsama/urutau/commit/2ce76074302f28305a3ac5205342ed63fba40df9))
+* **dashboard:** make per-stream throughput, rate and commit latency real ([adfadbc](https://github.com/maltzsama/urutau/commit/adfadbc8e4d19b484166cd2bba13ce41ba090917))
+* **dashboard:** make the copy buttons readable and functional ([e878bee](https://github.com/maltzsama/urutau/commit/e878beea73e4131281e2b2e92a4ec1e6470df6c2))
+* **dashboard:** make the window selector actually change the charts ([c7f78e2](https://github.com/maltzsama/urutau/commit/c7f78e2106b68f705ff3f4ae277846b11c2818f7))
+* **dashboard:** populate the stream's current position ([b2599ba](https://github.com/maltzsama/urutau/commit/b2599ba0ec8d06754ec6aa962eac660e8bd9386f))
+* **dashboard:** restore the drawer's lag line with labeled axes ([fba818a](https://github.com/maltzsama/urutau/commit/fba818a10e40b0a21267cb8cc0751735a1c518e1))
+* enable worker metrics in Kubernetes; report maintenance passes back ([e424e81](https://github.com/maltzsama/urutau/commit/e424e816dcae67e7b82cef696d523d283e6be7ed))
+* enable worker metrics in Kubernetes; report maintenance passes back ([7777750](https://github.com/maltzsama/urutau/commit/7777750fb765b0addf39fda80d6833d516419d83)), closes [#100](https://github.com/maltzsama/urutau/issues/100)
+* **logging:** keep the log buffer's attrs JSON-safe ([fb5d55c](https://github.com/maltzsama/urutau/commit/fb5d55c07dc9ec0d42be34b885e4eb07ccb969aa))
+* **maintenance:** dismiss idle workers, mark ops run only on a reported pass ([cc25691](https://github.com/maltzsama/urutau/commit/cc2569175de93044ae6262f8386d71742fd0dfef))
+* **maintenance:** reconcile worker Pods against the cluster, scope pod RBAC ([ea0ff78](https://github.com/maltzsama/urutau/commit/ea0ff78947e9ba15b442eb903b7ddcab8aeb03f2))
+* **spec:** reject sink.commitMode on non-Couchbase sinks ([d2df3be](https://github.com/maltzsama/urutau/commit/d2df3be56986df9b9f2d07ad01a8a6d242977ba2))
+* **spec:** reject sink.commitMode on non-Couchbase sinks ([591a559](https://github.com/maltzsama/urutau/commit/591a559cb11969d011c8a597593ce535ef33f1db)), closes [#99](https://github.com/maltzsama/urutau/issues/99)
+
 ## [0.1.1](https://github.com/maltzsama/urutau/compare/v0.1.0...v0.1.1) (2026-09-16)
 
 
