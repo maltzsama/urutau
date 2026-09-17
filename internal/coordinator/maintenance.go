@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/maintenance"
@@ -19,39 +17,46 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
-// maintenanceScheduler owns the ephemeral maintenance workers. It provisions
-// one worker per table — a Deployment, exactly like the data workers, from
-// the table's own pod template — and pushes a MaintenanceAssignment to a
-// connected worker when a maintenance turn is due. The worker runs the pass
-// and exits; its Deployment restarts it for the next turn. The coordinator
-// never runs maintenance in its own process, and never supervises these
-// workers for acks (they have no data plane).
+// maintenanceScheduler owns the ephemeral maintenance workers, one per
+// table. Unlike the data workers, a maintenance worker is not kept running:
+// tick provisions a bare Pod (restartPolicy: Never) for a table only when a
+// turn is due, and session deletes that Pod once the worker's pass ends —
+// so the pod that shows up in `kubectl get pods` exists only for the
+// duration of one pass, not forever. The coordinator never runs maintenance
+// in its own process, and never supervises these workers for acks (they
+// have no data plane).
 type maintenanceScheduler struct {
 	c     *Coordinator
 	cfg   *spec.Maintenance
 	sched *maintenance.Schedule
 
-	mu     sync.Mutex
-	tables map[string]string                      // worker name -> table
-	out    map[string]chan *pb.CoordinatorMessage // worker name -> assignment channel
+	// k8s is nil when Kubernetes worker provisioning is off (no worker pod
+	// template) — tick then has nothing to provision and is a no-op.
+	k8s       kubernetes.Interface
+	namespace string
+	owner     metav1.OwnerReference
+
+	mu        sync.Mutex
+	tables    map[string]string // worker name -> table
+	connected map[string]bool   // worker name -> session in progress
 }
 
 func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenanceScheduler {
 	return &maintenanceScheduler{
-		c:      c,
-		cfg:    cfg,
-		sched:  maintenance.NewSchedule(),
-		tables: map[string]string{},
-		out:    map[string]chan *pb.CoordinatorMessage{},
+		c:         c,
+		cfg:       cfg,
+		sched:     maintenance.NewSchedule(),
+		tables:    map[string]string{},
+		connected: map[string]bool{},
 	}
 }
 
 // startMaintenance wires the maintenance scheduler. It registers one
-// maintenance worker per table, provisions their Deployments when Kubernetes
-// worker provisioning is on, and starts the push loop. Without Kubernetes
-// (no worker pod template) it still registers the workers but there is
-// nothing to launch — the collapsed runner's in-process path is the only
-// option there, and it is not this code.
+// maintenance worker per table and starts the tick loop that provisions an
+// ephemeral Pod for a table whenever its next turn comes due. Without
+// Kubernetes (no worker pod template) it still registers the workers but
+// there is nothing to launch — the collapsed runner's in-process path is
+// the only option there, and it is not this code.
 //
 // Metrics: the pass runs in the worker's process, which is ephemeral, so the
 // worker reports the outcome back over the control stream and recordResult
@@ -72,9 +77,11 @@ func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[st
 		c.log.Warn("coordinator: maintenance enabled but no worker pod template — no maintenance worker will run (Kubernetes provisioning is off)")
 		return nil
 	}
-	if err := c.provisionMaintenanceWorkers(m); err != nil {
-		return err
+	clientset, ns, owner, err := inClusterClient(context.Background())
+	if err != nil {
+		return fmt.Errorf("k8s maintenance provisioning: %w", err)
 	}
+	m.k8s, m.namespace, m.owner = clientset, ns, owner
 	go m.run(c.runCtx)
 	return nil
 }
@@ -96,9 +103,19 @@ func (m *maintenanceScheduler) register(name, table string) {
 	m.mu.Unlock()
 }
 
-// session serves one connected maintenance worker: it waits for the push
-// loop to hand it a due assignment, sends it, and returns when the worker
-// closes the stream (it exits after its pass).
+// session serves one connected maintenance worker for exactly one pass: it
+// hands over the operations due for its table, records the result the worker
+// reports, and returns when the worker closes the stream (it exits after the
+// pass). The worker's Pod is deleted on the way out, so it terminates
+// instead of being restarted.
+//
+// A worker that finds nothing due is dismissed immediately rather than left
+// blocked in Recv: its Pod only exists because tick saw a turn due, so
+// nothing due here means the turn was already served (a duplicate Pod, or a
+// coordinator restart that lost the in-memory schedule). Returning ends the
+// session, the worker exits, and the deferred cleanup removes its Pod —
+// leaving it connected would park the Pod forever and silently stop all
+// further maintenance for that table.
 func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, hello *pb.Hello) error {
 	name := hello.WorkerName
 	m.mu.Lock()
@@ -107,52 +124,66 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 		m.mu.Unlock()
 		return fmt.Errorf("coordinator: unknown maintenance worker %q", name)
 	}
-	if _, dup := m.out[name]; dup {
+	if m.connected[name] {
 		m.mu.Unlock()
 		return fmt.Errorf("coordinator: maintenance worker %q already connected", name)
 	}
-	out := make(chan *pb.CoordinatorMessage, 1)
-	m.out[name] = out
+	m.connected[name] = true
 	m.mu.Unlock()
+
 	defer func() {
+		// Delete the Pod BEFORE releasing the table: while connected[name] is
+		// set, tick skips this table, so the Pod cannot be adopted as a fresh
+		// provision mid-teardown. Clearing first would let a tick in that
+		// window see the Pod, count it as its own, and then watch this delete
+		// take it away.
+		if m.k8s != nil {
+			if err := deletePod(context.Background(), m.k8s, m.namespace, name); err != nil {
+				m.c.log.Warn("coordinator: maintenance: delete worker pod", "worker", name, "err", err)
+			}
+		}
 		m.mu.Lock()
-		delete(m.out, name)
+		delete(m.connected, name)
 		m.mu.Unlock()
 	}()
 	m.c.log.Info("coordinator: maintenance worker connected", "worker", name, "table", table)
 
-	// The worker sends its Hello and, after the pass, a MaintenanceResult;
-	// detect it leaving (the stream closing) so the deferred deregistration
-	// runs and its restart reconnects cleanly.
-	done := make(chan error, 1)
-	go func() {
-		for {
-			msg, err := stream.Recv()
-			if err != nil {
-				done <- err
-				return
-			}
-			if res := msg.GetMaintenanceResult(); res != nil {
-				m.recordResult(table, res)
-			}
-		}
-	}()
+	// This Pod exists only because tick saw a turn due, so serve it now
+	// rather than making a freshly-started worker idle until the next tick.
+	m.mu.Lock()
+	due := m.sched.Due(table, m.cfg, time.Now())
+	m.mu.Unlock()
+	if len(due) == 0 {
+		m.c.log.Info("coordinator: maintenance: nothing due, dismissing worker", "worker", name, "table", table)
+		return nil
+	}
+	msg, err := m.assignment(table, due)
+	if err != nil {
+		return fmt.Errorf("coordinator: maintenance: build assignment for %s: %w", table, err)
+	}
+	if err := stream.Send(msg); err != nil {
+		return err
+	}
 
+	// The worker reports a MaintenanceResult when the pass ends, then closes
+	// the stream. MarkRun happens on that report, not on the send above: a
+	// worker that dies mid-pass (OOM, node drain) must leave the operations
+	// due rather than have them counted as run.
 	for {
-		select {
-		case msg := <-out:
-			if err := stream.Send(msg); err != nil {
-				return err
-			}
-		case <-done:
-			return nil // the worker finished its pass and exited
-		case <-stream.Context().Done():
-			return stream.Context().Err()
+		in, err := stream.Recv()
+		if err != nil {
+			return nil // the worker finished (or died); either way it is gone
+		}
+		if res := in.GetMaintenanceResult(); res != nil {
+			m.recordResult(table, res)
+			m.mu.Lock()
+			m.sched.MarkRun(table, due, time.Now())
+			m.mu.Unlock()
 		}
 	}
 }
 
-// run pushes due assignments to connected maintenance workers until ctx is
+// run provisions ephemeral maintenance workers for due turns until ctx is
 // done.
 func (m *maintenanceScheduler) run(ctx context.Context) {
 	ticker := time.NewTicker(maintenance.CheckInterval(m.cfg))
@@ -167,29 +198,73 @@ func (m *maintenanceScheduler) run(ctx context.Context) {
 	}
 }
 
-// tick sends each connected worker the operations due for its table. A
-// worker that already has an assignment in flight (channel full) is skipped
-// until the next tick — the operation stays due, so nothing is lost.
+// tick provisions one ephemeral Pod per table whose next turn has come due
+// and that has no worker in flight already. Handing over the assignment is
+// session's job, not tick's — the worker gets it the moment it connects.
+//
+// A table with a live session is skipped; its operations stay due, so
+// nothing is lost. Otherwise the live Pod, not a local flag, decides: a Pod
+// still starting is left alone, and one that will never open a session
+// (Failed, Succeeded without reporting, ImagePullBackOff, unschedulable) is
+// deleted so the next tick provisions a fresh one. A bare flag cannot do
+// this — a Pod that dies before connecting never reaches session's cleanup,
+// and the flag would pin the table until the coordinator restarted.
 func (m *maintenanceScheduler) tick(now time.Time) {
+	if m.k8s == nil {
+		return
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for name, out := range m.out {
-		table := m.tables[name]
-		due := m.sched.Due(table, m.cfg, now)
-		if len(due) == 0 {
+	candidates := make(map[string]string, len(m.tables))
+	for name, table := range m.tables {
+		if m.connected[name] {
 			continue
 		}
-		msg, err := m.assignment(table, due)
-		if err != nil {
-			m.c.log.Warn("coordinator: maintenance: build assignment", "table", table, "err", err)
+		if len(m.sched.Due(table, m.cfg, now)) == 0 {
 			continue
 		}
-		select {
-		case out <- msg:
-			m.sched.MarkRun(table, due, now)
-		default:
+		candidates[name] = table
+	}
+	m.mu.Unlock()
+
+	for name, table := range candidates {
+		if err := m.provisionWorkerPod(name, table); err != nil {
+			m.c.log.Warn("coordinator: maintenance: provision worker pod", "worker", name, "table", table, "err", err)
 		}
 	}
+}
+
+// provisionWorkerPod brings one due table's maintenance worker Pod into
+// existence, reconciling against whatever is already there rather than
+// trusting a local flag:
+//
+//   - no Pod: create it.
+//   - a Pod that has not finished starting: leave it, it may still connect.
+//   - a Pod that can no longer connect: delete it and create a replacement
+//     on the next tick, so a failed image pull or an unschedulable Pod does
+//     not stall the table forever.
+func (m *maintenanceScheduler) provisionWorkerPod(name, table string) error {
+	ctx := context.Background()
+	existing, err := getPod(ctx, m.k8s, m.namespace, name)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if podCanStillConnect(existing) {
+			return nil
+		}
+		m.c.log.Info("coordinator: maintenance: replacing worker pod that cannot connect",
+			"worker", name, "table", table, "phase", existing.Status.Phase)
+		return deletePod(ctx, m.k8s, m.namespace, name)
+	}
+	tmpl, err := loadWorkerPodTemplate(table)
+	if err != nil {
+		return err
+	}
+	if err := createPod(ctx, m.k8s, m.namespace, maintenanceWorkerPod(name, m.namespace, m.owner, tmpl)); err != nil {
+		return err
+	}
+	m.c.log.Info("coordinator: maintenance worker pod provisioned", "worker", name, "table", table)
+	return nil
 }
 
 // assignment renders one table's due operations into a wire assignment. The
@@ -266,64 +341,9 @@ func (m *maintenanceScheduler) recordResult(table string, res *pb.MaintenanceRes
 	m.c.pushDashState()
 }
 
-// provisionMaintenanceWorkers ensures one maintenance worker Deployment per
-// table, cloning that table's own worker pod template — the same template
-// the data workers use, so catalog credentials, image, ServiceAccount and
-// resources all match.
-func (c *Coordinator) provisionMaintenanceWorkers(m *maintenanceScheduler) error {
-	m.mu.Lock()
-	names := make(map[string]string, len(m.tables))
-	for name, table := range m.tables {
-		names[name] = table
-	}
-	m.mu.Unlock()
-
-	clientset, ns, owner, err := inClusterClient(context.Background())
-	if err != nil {
-		return fmt.Errorf("k8s maintenance provisioning: %w", err)
-	}
-	for name, table := range names {
-		tmpl, err := loadWorkerPodTemplate(table)
-		if err != nil {
-			return fmt.Errorf("k8s maintenance provisioning: %s: %w", table, err)
-		}
-		dep := maintenanceWorkerDeployment(name, ns, owner, tmpl)
-		if err := ensureDeployment(context.Background(), clientset, ns, dep); err != nil {
-			return fmt.Errorf("k8s maintenance provisioning: %s: %w", name, err)
-		}
-		c.log.Info("coordinator: maintenance worker deployment ensured", "worker", name, "table", table)
-	}
-	return nil
-}
-
-// maintenanceWorkerDeployment is the data worker Deployment plus the
-// --maintenance flag, so the same pod template serves both.
-func maintenanceWorkerDeployment(name, namespace string, owner metav1.OwnerReference, tmpl corev1.PodTemplateSpec) *appsv1.Deployment {
-	dep := workerDeployment(name, namespace, owner, tmpl)
-	for i := range dep.Spec.Template.Spec.Containers {
-		dep.Spec.Template.Spec.Containers[i].Args = append(dep.Spec.Template.Spec.Containers[i].Args, "--maintenance")
-	}
-	return dep
-}
-
-// maintenanceWorkerName derives a DNS-1123 worker name from the pipeline and
-// table target ("<pipeline>-<target>-maint"), sanitizing the dots a target
-// carries and truncating to Kubernetes' 63-character limit.
+// maintenanceWorkerName is maintenance.WorkerName — the operator names these
+// same Pods in this coordinator's RBAC Role, so the derivation is shared
+// rather than reimplemented here.
 func maintenanceWorkerName(pipeline, table string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(pipeline + "-" + table + "-maint") {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	s := strings.Trim(b.String(), "-")
-	if s == "" {
-		s = "urutau-maintenance"
-	}
-	if len(s) > 63 {
-		s = strings.Trim(s[:63], "-")
-	}
-	return s
+	return maintenance.WorkerName(pipeline, table)
 }

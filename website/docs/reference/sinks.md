@@ -48,14 +48,15 @@ Each sub-block is independently optional — a table declaring only
 `snapshotExpiry` never runs compaction or orphan cleanup.
 
 **Maintenance runs in its own ephemeral worker, not in the coordinator.** The
-coordinator only *schedules*: it provisions one maintenance worker per table —
-a Deployment, exactly like the data workers, cloned from that table's own
-worker pod template — and pushes the operations that are due when the worker
-connects. The worker runs the pass and exits; its Deployment restarts it for
-the next turn. So a long compaction never competes with the coordinator's
-routing and commit path, and never takes the coordinator down with it. (In
-the collapsed single-process runner there is no worker to launch, so the pass
-runs in-process on the same schedule.) Because the pass is one-shot, the
+coordinator only *schedules*: for each table, it provisions a bare Pod
+(`restartPolicy: Never`), cloned from that table's own worker pod template,
+only when a turn is due — and pushes the operations that are due once the
+worker connects. The worker runs the pass, reports the result, and exits; the
+coordinator then deletes the Pod, so it terminates rather than restarting.
+The next due turn gets a fresh Pod. So a long compaction never competes with
+the coordinator's routing and commit path, and never takes the coordinator
+down with it. (In the collapsed single-process runner there is no worker to
+launch, so the pass runs in-process on the same schedule.) Because the pass is one-shot, the
 three operations run in order — compaction, then snapshot expiry, then orphan
 cleanup — so a compaction never races the expiry that dereferences the files
 it just wrote.

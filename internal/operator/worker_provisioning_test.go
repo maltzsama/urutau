@@ -3,7 +3,10 @@ package operator
 import (
 	"testing"
 
+	rbacv1 "k8s.io/api/rbac/v1"
+
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	"github.com/maltzsama/urutau/internal/maintenance"
 	urutauspec "github.com/maltzsama/urutau/spec"
 )
 
@@ -167,5 +170,84 @@ func TestCoordinatorStatefulSetAppliesResources(t *testing.T) {
 	c := sts.Spec.Template.Spec.Containers[0]
 	if c.Resources.Requests.Cpu().String() != "1" || c.Resources.Requests.Memory().String() != "2Gi" {
 		t.Fatalf("coordinator resources = %+v, want cpu=1 memory=2Gi", c.Resources)
+	}
+}
+
+// withMaintenance turns sink.maintenance on in a CR's inline spec.
+func withMaintenance(cr *urutauv1alpha1.CDCPipeline) *urutauv1alpha1.CDCPipeline {
+	sink := cr.Spec.Definition.Inline["sink"].(map[string]any)
+	sink["maintenance"] = map[string]any{
+		"enabled":    true,
+		"compaction": map[string]any{"interval": "1h"},
+	}
+	return cr
+}
+
+// podRule returns the coordinator Role's rule carrying the given pods verb.
+func podRule(t *testing.T, cr *urutauv1alpha1.CDCPipeline, verb string) *rbacv1.PolicyRule {
+	t.Helper()
+	for _, r := range coordinatorRole(cr).Rules {
+		if len(r.Resources) != 1 || r.Resources[0] != "pods" {
+			continue
+		}
+		for _, v := range r.Verbs {
+			if v == verb {
+				rule := r
+				return &rule
+			}
+		}
+	}
+	return nil
+}
+
+// The coordinator deletes only the maintenance Pods it provisions, so the
+// Role names them explicitly rather than granting namespace-wide delete.
+func TestCoordinatorRoleScopesPodDeleteToMaintenanceWorkers(t *testing.T) {
+	cr := withMaintenance(pipelineCR("orders", "ns"))
+
+	del := podRule(t, cr, "delete")
+	if del == nil {
+		t.Fatal("no pods/delete rule; the coordinator cannot clean up its maintenance Pods")
+	}
+	want := maintenance.WorkerName("e2e", "raw.orders")
+	if len(del.ResourceNames) != 1 || del.ResourceNames[0] != want {
+		t.Fatalf("delete resourceNames = %v, want exactly [%s]", del.ResourceNames, want)
+	}
+
+	// create cannot be name-scoped (the Pod does not exist yet), but it must
+	// not be the rule that also carries delete.
+	create := podRule(t, cr, "create")
+	if create == nil {
+		t.Fatal("no pods/create rule")
+	}
+	for _, v := range create.Verbs {
+		if v == "delete" && len(create.ResourceNames) == 0 {
+			t.Fatal("create and delete share an unscoped rule, which grants namespace-wide pod deletion")
+		}
+	}
+}
+
+// A pipeline that never enables maintenance provisions no maintenance Pods,
+// so it gets no Pod write permission at all.
+func TestCoordinatorRoleWithoutMaintenanceGrantsNoPodWrites(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	for _, verb := range []string{"create", "delete"} {
+		if r := podRule(t, cr, verb); r != nil {
+			t.Errorf("pods/%s granted with maintenance off: %+v", verb, r)
+		}
+	}
+	// Reading its own Pod is still required, for the ownerReference.
+	if podRule(t, cr, "get") == nil {
+		t.Error("pods/get must remain: the coordinator reads its own Pod for the ownerReference")
+	}
+}
+
+// The Role names the Pods the coordinator actually creates. If these drift,
+// the coordinator silently loses the ability to delete its own workers.
+func TestMaintenanceWorkerNamesMatchWhatTheCoordinatorCreates(t *testing.T) {
+	names := maintenanceWorkerNames(withMaintenance(pipelineCR("orders", "ns")))
+	want := maintenance.WorkerName("e2e", "raw.orders")
+	if len(names) != 1 || names[0] != want {
+		t.Fatalf("maintenanceWorkerNames = %v, want [%s] (same derivation the coordinator uses)", names, want)
 	}
 }
