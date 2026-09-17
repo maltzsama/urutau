@@ -29,6 +29,17 @@ rules:
   # operator must hold them too — it never uses deployments/pods itself (the
   # coordinator creates the worker Deployments, and creates/deletes the
   # ephemeral maintenance worker Pods — issue #105).
+  #
+  # These are held only to be delegated, but this ClusterRole is bound
+  # cluster-wide (see the ClusterRoleBinding below), so pods/delete reaches
+  # every namespace. The coordinator's own Role scopes delete down to the
+  # maintenance Pod names it provisions (coordinatorRole in
+  # internal/operator/controller.go); the operator's copy cannot be scoped
+  # the same way, because a ClusterRole may not use resourceNames for
+  # permissions it grants across namespaces it does not know yet. Narrowing
+  # this further means binding the operator per managed namespace with a
+  # RoleBinding instead of the cluster-wide binding — a deployment-model
+  # change, tracked separately.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "create", "update"]

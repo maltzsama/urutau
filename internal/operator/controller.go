@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	"github.com/maltzsama/urutau/internal/maintenance"
 	urutauspec "github.com/maltzsama/urutau/spec"
 )
 
@@ -333,41 +335,86 @@ func coordinatorServiceAccount(cr *urutauv1alpha1.CDCPipeline) *corev1.ServiceAc
 // namespace. The contract is that the coordinator, not the operator, writes
 // its status.
 //
-// It also grants Deployment management for the long-lived data workers, and
-// Pod management for the ephemeral maintenance workers (issue #105): a
-// maintenance worker is a bare Pod (restartPolicy: Never) the coordinator
-// creates when a turn is due and deletes once the pass ends, not a
-// Deployment — a Deployment's restartPolicy is always Always, which is what
-// made those workers restart-loop forever instead of terminating. It also
-// reads its own Pod to set the ownerReference that cascades GC of
-// everything it provisions when the coordinator dies. This is
-// namespace-wide (no resourceNames) because neither a worker Deployment nor
-// a maintenance Pod exists yet when the coordinator boots and needs to
-// create it — matching the same pattern the operator's own ClusterRole
-// already uses for statefulsets/configmaps/services.
+// It also grants Deployment management for the long-lived data workers and
+// reading its own Pod, to set the ownerReference that cascades GC of
+// everything it provisions when the coordinator dies. Those are
+// namespace-wide (no resourceNames) because a worker Deployment does not
+// exist yet when the coordinator boots and needs to create it — matching
+// the pattern the operator's own ClusterRole already uses for
+// statefulsets/configmaps/services.
+//
+// Deleting Pods is granted separately and narrowly. The ephemeral
+// maintenance workers (issue #105) are bare Pods the coordinator creates
+// when a turn is due and deletes once the pass ends, so it needs delete —
+// but only ever on those names, which are derivable here. A pipeline with
+// maintenance off gets no Pod create/delete at all.
 func coordinatorRole(cr *urutauv1alpha1.CDCPipeline) *rbacv1.Role {
+	rules := []rbacv1.PolicyRule{
+		{
+			APIGroups:     []string{"urutau.io"},
+			Resources:     []string{"cdcpipelines", "cdcpipelines/status"},
+			ResourceNames: []string{cr.Name},
+			Verbs:         []string{"get", "update", "patch"},
+		},
+		{
+			APIGroups: []string{"apps"},
+			Resources: []string{"deployments"},
+			Verbs:     []string{"get", "create", "update"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get"},
+		},
+	}
+	if names := maintenanceWorkerNames(cr); len(names) > 0 {
+		rules = append(rules,
+			// create cannot be scoped by name: RBAC matches resourceNames
+			// against an existing object, and the Pod does not exist yet.
+			rbacv1.PolicyRule{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"create"},
+			},
+			rbacv1.PolicyRule{
+				APIGroups:     []string{""},
+				Resources:     []string{"pods"},
+				ResourceNames: names,
+				Verbs:         []string{"delete"},
+			},
+		)
+	}
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: coordinatorName(cr), Namespace: cr.Namespace,
 			Labels: selectorLabels(cr)},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups:     []string{"urutau.io"},
-				Resources:     []string{"cdcpipelines", "cdcpipelines/status"},
-				ResourceNames: []string{cr.Name},
-				Verbs:         []string{"get", "update", "patch"},
-			},
-			{
-				APIGroups: []string{"apps"},
-				Resources: []string{"deployments"},
-				Verbs:     []string{"get", "create", "update"},
-			},
-			{
-				APIGroups: []string{""},
-				Resources: []string{"pods"},
-				Verbs:     []string{"get", "create", "delete"},
-			},
-		},
+		Rules: rules,
 	}
+}
+
+// maintenanceWorkerNames returns the Pod names this pipeline's coordinator
+// may delete — one ephemeral maintenance worker per table — or nil when
+// maintenance is off, so no Pod write permission is granted at all. The
+// names must match coordinator.maintenanceWorkerName exactly; a spec that
+// does not parse yields nil, and the coordinator fails on the same spec
+// before it could provision anything.
+func maintenanceWorkerNames(cr *urutauv1alpha1.CDCPipeline) []string {
+	if len(cr.Spec.Definition.Inline) == 0 {
+		return nil
+	}
+	payload, err := yaml.Marshal(cr.Spec.Definition.Inline)
+	if err != nil {
+		return nil
+	}
+	s, err := urutauspec.LoadYAML(strings.NewReader(string(payload)))
+	if err != nil || !s.Sink.MaintenanceEnabled() {
+		return nil
+	}
+	names := make([]string, 0, len(s.Tables))
+	for _, t := range s.Tables {
+		names = append(names, maintenance.WorkerName(s.Pipeline, t.Target))
+	}
+	sort.Strings(names) // stable Role content, so ensure() sees no spurious drift
+	return names
 }
 
 func coordinatorRoleBinding(cr *urutauv1alpha1.CDCPipeline) *rbacv1.RoleBinding {

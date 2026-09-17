@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -39,7 +38,6 @@ type maintenanceScheduler struct {
 
 	mu        sync.Mutex
 	tables    map[string]string // worker name -> table
-	active    map[string]bool   // worker name -> Pod provisioned, not yet cleaned up
 	connected map[string]bool   // worker name -> session in progress
 }
 
@@ -49,7 +47,6 @@ func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenance
 		cfg:       cfg,
 		sched:     maintenance.NewSchedule(),
 		tables:    map[string]string{},
-		active:    map[string]bool{},
 		connected: map[string]bool{},
 	}
 }
@@ -116,9 +113,9 @@ func (m *maintenanceScheduler) register(name, table string) {
 // blocked in Recv: its Pod only exists because tick saw a turn due, so
 // nothing due here means the turn was already served (a duplicate Pod, or a
 // coordinator restart that lost the in-memory schedule). Returning ends the
-// session, the worker exits, and the deferred cleanup frees the table to be
-// provisioned again — leaving it connected would pin active[name] forever
-// and silently stop all further maintenance for that table.
+// session, the worker exits, and the deferred cleanup removes its Pod —
+// leaving it connected would park the Pod forever and silently stop all
+// further maintenance for that table.
 func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, hello *pb.Hello) error {
 	name := hello.WorkerName
 	m.mu.Lock()
@@ -135,17 +132,19 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	m.mu.Unlock()
 
 	defer func() {
-		m.mu.Lock()
-		delete(m.connected, name)
-		delete(m.active, name)
-		m.mu.Unlock()
-		// The worker exits as soon as this session ends; delete its Pod so it
-		// terminates instead of lingering.
+		// Delete the Pod BEFORE releasing the table: while connected[name] is
+		// set, tick skips this table, so the Pod cannot be adopted as a fresh
+		// provision mid-teardown. Clearing first would let a tick in that
+		// window see the Pod, count it as its own, and then watch this delete
+		// take it away.
 		if m.k8s != nil {
 			if err := deletePod(context.Background(), m.k8s, m.namespace, name); err != nil {
 				m.c.log.Warn("coordinator: maintenance: delete worker pod", "worker", name, "err", err)
 			}
 		}
+		m.mu.Lock()
+		delete(m.connected, name)
+		m.mu.Unlock()
 	}()
 	m.c.log.Info("coordinator: maintenance worker connected", "worker", name, "table", table)
 
@@ -202,48 +201,66 @@ func (m *maintenanceScheduler) run(ctx context.Context) {
 // tick provisions one ephemeral Pod per table whose next turn has come due
 // and that has no worker in flight already. Handing over the assignment is
 // session's job, not tick's — the worker gets it the moment it connects.
-// A table whose previous pass is still running is skipped; its operations
-// stay due, so nothing is lost.
+//
+// A table with a live session is skipped; its operations stay due, so
+// nothing is lost. Otherwise the live Pod, not a local flag, decides: a Pod
+// still starting is left alone, and one that will never open a session
+// (Failed, Succeeded without reporting, ImagePullBackOff, unschedulable) is
+// deleted so the next tick provisions a fresh one. A bare flag cannot do
+// this — a Pod that dies before connecting never reaches session's cleanup,
+// and the flag would pin the table until the coordinator restarted.
 func (m *maintenanceScheduler) tick(now time.Time) {
 	if m.k8s == nil {
 		return
 	}
 	m.mu.Lock()
-	type toProvision struct{ name, table string }
-	var provision []toProvision
+	candidates := make(map[string]string, len(m.tables))
 	for name, table := range m.tables {
-		if m.active[name] || m.connected[name] {
+		if m.connected[name] {
 			continue
 		}
 		if len(m.sched.Due(table, m.cfg, now)) == 0 {
 			continue
 		}
-		m.active[name] = true
-		provision = append(provision, toProvision{name, table})
+		candidates[name] = table
 	}
 	m.mu.Unlock()
 
-	for _, p := range provision {
-		if err := m.provisionWorkerPod(p.name, p.table); err != nil {
-			m.c.log.Warn("coordinator: maintenance: provision worker pod", "worker", p.name, "table", p.table, "err", err)
-			m.mu.Lock()
-			delete(m.active, p.name)
-			m.mu.Unlock()
+	for name, table := range candidates {
+		if err := m.provisionWorkerPod(name, table); err != nil {
+			m.c.log.Warn("coordinator: maintenance: provision worker pod", "worker", name, "table", table, "err", err)
 		}
 	}
 }
 
-// provisionWorkerPod creates the ephemeral Pod for one due table's
-// maintenance worker. The Pod connects to the coordinator on its own, is
-// served its assignment by tick (or session, if it races the next tick),
-// and is deleted by session once its pass ends.
+// provisionWorkerPod brings one due table's maintenance worker Pod into
+// existence, reconciling against whatever is already there rather than
+// trusting a local flag:
+//
+//   - no Pod: create it.
+//   - a Pod that has not finished starting: leave it, it may still connect.
+//   - a Pod that can no longer connect: delete it and create a replacement
+//     on the next tick, so a failed image pull or an unschedulable Pod does
+//     not stall the table forever.
 func (m *maintenanceScheduler) provisionWorkerPod(name, table string) error {
+	ctx := context.Background()
+	existing, err := getPod(ctx, m.k8s, m.namespace, name)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if podCanStillConnect(existing) {
+			return nil
+		}
+		m.c.log.Info("coordinator: maintenance: replacing worker pod that cannot connect",
+			"worker", name, "table", table, "phase", existing.Status.Phase)
+		return deletePod(ctx, m.k8s, m.namespace, name)
+	}
 	tmpl, err := loadWorkerPodTemplate(table)
 	if err != nil {
 		return err
 	}
-	pod := maintenanceWorkerPod(name, m.namespace, m.owner, tmpl)
-	if err := createPod(context.Background(), m.k8s, m.namespace, pod); err != nil {
+	if err := createPod(ctx, m.k8s, m.namespace, maintenanceWorkerPod(name, m.namespace, m.owner, tmpl)); err != nil {
 		return err
 	}
 	m.c.log.Info("coordinator: maintenance worker pod provisioned", "worker", name, "table", table)
@@ -305,24 +322,9 @@ func (m *maintenanceScheduler) recordResult(table string, res *pb.MaintenanceRes
 	}
 }
 
-// maintenanceWorkerName derives a DNS-1123 worker name from the pipeline and
-// table target ("<pipeline>-<target>-maint"), sanitizing the dots a target
-// carries and truncating to Kubernetes' 63-character limit.
+// maintenanceWorkerName is maintenance.WorkerName — the operator names these
+// same Pods in this coordinator's RBAC Role, so the derivation is shared
+// rather than reimplemented here.
 func maintenanceWorkerName(pipeline, table string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(pipeline + "-" + table + "-maint") {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	s := strings.Trim(b.String(), "-")
-	if s == "" {
-		s = "urutau-maintenance"
-	}
-	if len(s) > 63 {
-		s = strings.Trim(s[:63], "-")
-	}
-	return s
+	return maintenance.WorkerName(pipeline, table)
 }

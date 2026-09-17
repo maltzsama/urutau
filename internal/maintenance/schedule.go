@@ -9,6 +9,7 @@ package maintenance
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -177,4 +178,34 @@ func durationOrDefault(s string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// WorkerName derives the DNS-1123 name of a table's ephemeral maintenance
+// worker from the pipeline and table target ("<pipeline>-<target>-maint"),
+// sanitizing the dots a target carries and truncating to Kubernetes'
+// 63-character limit.
+//
+// It lives here, in the seam both sides already import, because two
+// packages must agree on it exactly: the coordinator creates and deletes
+// Pods under this name, and the operator names the same Pods in the
+// coordinator's RBAC Role. A private copy in either package would let the
+// Role and the Pods drift apart, and the failure mode is a coordinator that
+// cannot clean up after itself.
+func WorkerName(pipeline, table string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(pipeline + "-" + table + "-maint") {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if s == "" {
+		s = "urutau-maintenance"
+	}
+	if len(s) > 63 {
+		s = strings.Trim(s[:63], "-")
+	}
+	return s
 }

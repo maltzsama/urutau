@@ -235,15 +235,67 @@ func maintenanceWorkerPod(name, namespace string, owner metav1.OwnerReference, t
 	}
 }
 
-// createPod creates the Pod, tolerating AlreadyExists — the coordinator may
-// retry a tick before the previous create's result is known, or a stale Pod
-// from a prior coordinator generation may still be terminating.
+// createPod creates the Pod, tolerating AlreadyExists — a Pod from a
+// previous coordinator generation may still be terminating under the same
+// name, and the caller reconciles against the live Pod on its next pass
+// rather than assuming this create is the one that took effect.
 func createPod(ctx context.Context, cs kubernetes.Interface, namespace string, pod *corev1.Pod) error {
 	_, err := cs.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
 		return nil
 	}
 	return err
+}
+
+// getPod returns the named Pod, or nil when it does not exist.
+func getPod(ctx context.Context, cs kubernetes.Interface, namespace, name string) (*corev1.Pod, error) {
+	pod, err := cs.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return pod, nil
+}
+
+// podCanStillConnect reports whether an existing maintenance worker Pod may
+// yet open its control session. A Pod that cannot is replaced rather than
+// waited on, so a table is never stalled by one that will never connect.
+//
+// Pending covers both a Pod that is simply still being scheduled and one
+// wedged on ImagePullBackOff or CrashLoopBackOff; the waiting reason tells
+// them apart. Running is kept regardless of session state: the worker may be
+// mid-dial, and a Running Pod that has genuinely hung is the one case left
+// to the coordinator's own restart rather than guessed at with a timeout.
+func podCanStillConnect(pod *corev1.Pod) bool {
+	if pod.DeletionTimestamp != nil {
+		return false
+	}
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded, corev1.PodFailed:
+		return false
+	case corev1.PodPending:
+		for _, cs := range pod.Status.ContainerStatuses {
+			if w := cs.State.Waiting; w != nil && terminalWaitingReasons[w.Reason] {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+// terminalWaitingReasons are the container waiting reasons a maintenance Pod
+// never recovers from on its own — it is replaced instead of waited on.
+var terminalWaitingReasons = map[string]bool{
+	"ImagePullBackOff":           true,
+	"ErrImagePull":               true,
+	"InvalidImageName":           true,
+	"CreateContainerConfigError": true,
+	"CreateContainerError":       true,
+	"CrashLoopBackOff":           true,
 }
 
 // deletePod removes the ephemeral maintenance worker's Pod once its pass

@@ -12,7 +12,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/maltzsama/urutau/internal/observability"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -64,6 +66,23 @@ func (f *fakeSessionStream) SendHeader(metadata.MD) error { return nil }
 func (f *fakeSessionStream) SetTrailer(metadata.MD)       {}
 func (f *fakeSessionStream) SendMsg(any) error            { return nil }
 func (f *fakeSessionStream) RecvMsg(any) error            { return nil }
+
+func seedPod(t *testing.T, cs *fake.Clientset, name string) {
+	t.Helper()
+	seedPodWithStatus(t, cs, name, corev1.PodStatus{Phase: corev1.PodRunning})
+}
+
+func seedPodWithStatus(t *testing.T, cs *fake.Clientset, name string, status corev1.PodStatus) {
+	t.Helper()
+	if _, err := cs.CoreV1().Pods("ns").Create(context.Background(),
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"},
+			Status:     status,
+		},
+		metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed pod %s: %v", name, err)
+	}
+}
 
 // testScheduler builds a maintenance scheduler with compaction enabled (so
 // exactly one operation is due on the first Due call) and a fake Kubernetes
@@ -162,12 +181,7 @@ func hasArgPair(args []string, flag, value string) bool {
 func TestSessionDeletesPodAfterOnePass(t *testing.T) {
 	m, cs := testScheduler(t)
 	m.register("w", "raw.orders")
-	m.active["w"] = true
-	if _, err := cs.CoreV1().Pods("ns").Create(context.Background(),
-		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "ns"}},
-		metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed pod: %v", err)
-	}
+	seedPod(t, cs, "w")
 
 	stream := &fakeSessionStream{in: []*pb.WorkerMessage{{
 		Msg: &pb.WorkerMessage_MaintenanceResult{MaintenanceResult: &pb.MaintenanceResult{}},
@@ -184,23 +198,48 @@ func TestSessionDeletesPodAfterOnePass(t *testing.T) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.active["w"] || m.connected["w"] {
-		t.Fatalf("active=%v connected=%v, both must be cleared so the next turn can provision", m.active["w"], m.connected["w"])
+	if m.connected["w"] {
+		t.Fatal("connected must be cleared so the next turn can provision")
+	}
+}
+
+// The Pod must be gone before the table is released. Clearing connected
+// first would let a concurrent tick see the still-live Pod, adopt it as its
+// own provision, and then have this cleanup delete it — leaving the table
+// with no worker and no pending turn.
+func TestSessionDeletesPodBeforeReleasingTable(t *testing.T) {
+	m, cs := testScheduler(t)
+	m.register("w", "raw.orders")
+	seedPod(t, cs, "w")
+
+	var podGoneWhenReleased bool
+	cs.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		// Runs inside deletePod: whether the table is still claimed here is
+		// exactly the ordering under test.
+		m.mu.Lock()
+		podGoneWhenReleased = m.connected["w"]
+		m.mu.Unlock()
+		return false, nil, nil
+	})
+
+	stream := &fakeSessionStream{in: []*pb.WorkerMessage{{
+		Msg: &pb.WorkerMessage_MaintenanceResult{MaintenanceResult: &pb.MaintenanceResult{}},
+	}}}
+	if err := m.session(stream, &pb.Hello{WorkerName: "w", Maintenance: true}); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if !podGoneWhenReleased {
+		t.Fatal("table was released before the Pod was deleted: a tick in that window would adopt the doomed Pod")
 	}
 }
 
 // A worker that connects with nothing due must be dismissed, not left
-// blocked in Recv forever. Leaving it connected would pin active[name] and
+// blocked in Recv forever. Leaving it parked would keep its Pod alive and
 // silently stop every future maintenance turn for that table.
 func TestSessionDismissesWorkerWithNothingDue(t *testing.T) {
 	m, cs := testScheduler(t)
 	m.register("w", "raw.orders")
-	m.active["w"] = true
-	if _, err := cs.CoreV1().Pods("ns").Create(context.Background(),
-		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "ns"}},
-		metav1.CreateOptions{}); err != nil {
-		t.Fatalf("seed pod: %v", err)
-	}
+	seedPod(t, cs, "w")
 	// Everything already ran, so nothing is due for this worker.
 	m.sched.MarkRun("raw.orders", m.sched.Due("raw.orders", m.cfg, time.Now()), time.Now())
 
@@ -226,7 +265,7 @@ func TestSessionDismissesWorkerWithNothingDue(t *testing.T) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.active["w"] || m.connected["w"] {
+	if m.connected["w"] {
 		t.Fatal("dismissal must free the table, otherwise maintenance stops for good")
 	}
 }
@@ -273,15 +312,9 @@ func TestTickProvisionsOnePodPerDueTableAndNoDuplicates(t *testing.T) {
 	m, cs := testScheduler(t)
 	m.register("w", "raw.orders")
 	// loadWorkerPodTemplate reads the operator-rendered template from disk,
-	// which is absent here, so provisioning fails and active is rolled back —
-	// that rollback is exactly what must happen on a provisioning error.
+	// which is absent here, so provisioning fails. The failure must not be
+	// recorded as state: nothing is left claiming the table.
 	m.tick(time.Now())
-	m.mu.Lock()
-	stillActive := m.active["w"]
-	m.mu.Unlock()
-	if stillActive {
-		t.Fatal("a failed provision must clear active, otherwise the table is stuck forever")
-	}
 	pods, err := cs.CoreV1().Pods("ns").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
@@ -290,9 +323,9 @@ func TestTickProvisionsOnePodPerDueTableAndNoDuplicates(t *testing.T) {
 		t.Fatalf("pods = %d, want 0 when the template is missing", len(pods.Items))
 	}
 
-	// With a worker already in flight, tick must not provision at all.
+	// A live session owns the table: tick must not provision a second Pod.
 	m.mu.Lock()
-	m.active["w"] = true
+	m.connected["w"] = true
 	m.mu.Unlock()
 	m.tick(time.Now())
 	pods, err = cs.CoreV1().Pods("ns").List(context.Background(), metav1.ListOptions{})
@@ -301,6 +334,51 @@ func TestTickProvisionsOnePodPerDueTableAndNoDuplicates(t *testing.T) {
 	}
 	if len(pods.Items) != 0 {
 		t.Fatalf("pods = %d, want 0 while a pass is in flight", len(pods.Items))
+	}
+}
+
+// An existing Pod that is still starting is left alone — tick must not
+// churn it while it is on its way to connecting.
+func TestTickLeavesStartingPodAlone(t *testing.T) {
+	m, cs := testScheduler(t)
+	m.register("w", "raw.orders")
+	seedPodWithStatus(t, cs, "w", corev1.PodStatus{Phase: corev1.PodPending})
+
+	m.tick(time.Now())
+
+	if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "w", metav1.GetOptions{}); err != nil {
+		t.Fatalf("starting pod was removed: %v", err)
+	}
+}
+
+// The failure the flag-based version could not recover from: a Pod that will
+// never open a session (Failed, or wedged on ImagePullBackOff) must be
+// deleted so a later tick provisions a replacement. Otherwise maintenance
+// for that table stalls until the coordinator restarts.
+func TestTickReplacesPodThatCanNeverConnect(t *testing.T) {
+	stuck := map[string]corev1.PodStatus{
+		"failed": {Phase: corev1.PodFailed},
+		"image-pull": {Phase: corev1.PodPending, ContainerStatuses: []corev1.ContainerStatus{{
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}},
+		}}},
+		"succeeded-without-reporting": {Phase: corev1.PodSucceeded},
+	}
+	for name, status := range stuck {
+		t.Run(name, func(t *testing.T) {
+			m, cs := testScheduler(t)
+			m.register("w", "raw.orders")
+			seedPodWithStatus(t, cs, "w", status)
+
+			m.tick(time.Now())
+
+			if _, err := cs.CoreV1().Pods("ns").Get(context.Background(), "w", metav1.GetOptions{}); err == nil {
+				t.Fatal("pod that can never connect was kept; the table would stall until the coordinator restarts")
+			}
+			// The turn is still due, so the next tick provisions a fresh Pod.
+			if due := m.sched.Due("raw.orders", m.cfg, time.Now()); len(due) == 0 {
+				t.Fatal("the due turn was consumed by a pod that never ran it")
+			}
+		})
 	}
 }
 
