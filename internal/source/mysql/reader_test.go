@@ -360,7 +360,9 @@ func TestRowToMapLeavesBinaryBytesAlone(t *testing.T) {
 // guess: the raw form is still recoverable, a bad guess is not.
 func TestRowToMapUnknownCollationPassesThrough(t *testing.T) {
 	raw := []byte{0xe9, 0x41}
-	for _, collation := range []string{"", "sjis_japanese_ci", "gbk_chinese_ci"} {
+	// Character sets MySQL ships that x/text does not model: they must keep
+	// their bytes rather than be decoded by a near-miss table.
+	for _, collation := range []string{"", "hp8_english_ci", "keybcs2_general_ci", "dec8_swedish_ci"} {
 		tbl := &schema.Table{Columns: []schema.TableColumn{
 			{Name: "v", Type: schema.TYPE_STRING, Collation: collation},
 		}}
@@ -368,5 +370,50 @@ func TestRowToMapUnknownCollationPassesThrough(t *testing.T) {
 		if !bytes.Equal([]byte(got), raw) {
 			t.Errorf("collation %q: got %q, want the raw bytes untouched", collation, got)
 		}
+	}
+}
+
+// Multi-byte East Asian character sets. x/text's decoders follow the
+// WHATWG/Unicode indexes; MySQL maintains its own tables, which agree for
+// the overwhelming majority of code points. These pin the common cases.
+func TestRowToMapDecodesMultibyteCharsets(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		collation string
+		raw       []byte
+		want      string
+	}{
+		{"sjis", "sjis_japanese_ci", []byte{0x93, 0xfa, 0x96, 0x7b}, "日本"},
+		// cp932 is Microsoft's Shift-JIS superset; katakana encodes identically.
+		{"cp932", "cp932_japanese_ci", []byte{0x83, 0x65, 0x83, 0x58, 0x83, 0x67}, "テスト"},
+		// ujis is MySQL's name for EUC-JP.
+		{"ujis", "ujis_japanese_ci", []byte{0xc6, 0xfc, 0xcb, 0xdc}, "日本"},
+		{"gbk", "gbk_chinese_ci", []byte{0xd6, 0xd0, 0xb9, 0xfa}, "中国"},
+		{"gb18030", "gb18030_chinese_ci", []byte{0xd6, 0xd0, 0xb9, 0xfa}, "中国"},
+		{"big5", "big5_chinese_ci", []byte{0xa4, 0xa4, 0xa4, 0xe5}, "中文"},
+		{"euckr", "euckr_korean_ci", []byte{0xc7, 0xd1, 0xb1, 0xb9}, "한국"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl := &schema.Table{Columns: []schema.TableColumn{
+				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
+			}}
+			if got := rowToMap(tbl, []any{tc.raw})["v"]; got != tc.want {
+				t.Errorf("v = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// eucjpms is MySQL's Microsoft-flavored EUC-JP: it differs from plain EUC-JP
+// in exactly the vendor rows x/text does not model, so it must pass through
+// rather than decode a handful of characters wrongly.
+func TestRowToMapEucjpmsStillPassesThrough(t *testing.T) {
+	raw := []byte{0xc6, 0xfc, 0xcb, 0xdc}
+	tbl := &schema.Table{Columns: []schema.TableColumn{
+		{Name: "v", Type: schema.TYPE_STRING, Collation: "eucjpms_japanese_ci"},
+	}}
+	got, _ := rowToMap(tbl, []any{raw})["v"].(string)
+	if !bytes.Equal([]byte(got), raw) {
+		t.Errorf("eucjpms = %q, want the raw bytes passed through", got)
 	}
 }

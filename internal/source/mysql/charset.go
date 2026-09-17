@@ -3,7 +3,12 @@ package mysql
 import (
 	"strings"
 
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
 	"golang.org/x/text/encoding/unicode"
 )
 
@@ -87,11 +92,38 @@ var charsetDecoders = map[string]func([]byte) (string, error){
 	"ucs2":     decodeUTF16BE, // BMP-only subset of UTF-16, big endian
 	"utf16":    decodeUTF16BE,
 	"utf16le":  decodeUTF16LE,
+
+	// Multi-byte East Asian sets. x/text's decoders are the WHATWG/Unicode
+	// mappings, which match MySQL's tables for the overwhelming majority of
+	// code points but are not guaranteed identical in every corner — MySQL
+	// maintains its own tables. Two known shapes are handled explicitly:
+	//
+	//   - sjis vs cp932: MySQL ships both. cp932 is Microsoft's superset of
+	//     Shift-JIS (extra NEC/IBM vendor rows), and x/text's ShiftJIS
+	//     decoder follows the WHATWG index, which already includes those
+	//     rows — so it serves both, and plain sjis input is unaffected by
+	//     the extra mappings.
+	//   - gbk vs gb18030: gb18030 is a strict superset of gbk, but decoding
+	//     gbk bytes WITH the gb18030 decoder is not safe in general (the
+	//     4-byte forms differ), so each maps to its own decoder.
+	//
+	// ujis is MySQL's name for EUC-JP. eucjpms is MySQL's Microsoft-flavored
+	// EUC-JP variant, deliberately absent: it differs from plain EUC-JP in
+	// exactly the vendor rows x/text does not model, so it passes through
+	// rather than decoding a handful of characters wrongly.
+	"sjis":    decodeWith(japanese.ShiftJIS),
+	"cp932":   decodeWith(japanese.ShiftJIS),
+	"ujis":    decodeWith(japanese.EUCJP),
+	"gbk":     decodeWith(simplifiedchinese.GBK),
+	"gb18030": decodeWith(simplifiedchinese.GB18030),
+	"big5":    decodeWith(traditionalchinese.Big5),
+	"euckr":   decodeWith(korean.EUCKR),
 }
 
-func decodeWith(cm *charmap.Charmap) func([]byte) (string, error) {
+// decodeWith adapts an x/text encoding to the decoder signature.
+func decodeWith(enc encoding.Encoding) func([]byte) (string, error) {
 	return func(b []byte) (string, error) {
-		out, err := cm.NewDecoder().Bytes(b)
+		out, err := enc.NewDecoder().Bytes(b)
 
 		return string(out), err
 	}
