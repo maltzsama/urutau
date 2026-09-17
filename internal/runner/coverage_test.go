@@ -32,7 +32,6 @@ type resumeSink struct {
 	sink.Sink
 	positions map[string]string
 	posErr    error
-	props     map[string]map[string]string
 	propsErr  error
 }
 

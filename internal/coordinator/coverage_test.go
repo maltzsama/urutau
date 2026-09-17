@@ -302,7 +302,7 @@ func TestOnAckTruncatesAndRecords(t *testing.T) {
 	c.tableStats = map[string]*tableStats{}
 	c.maintStats = map[string]map[string]*maintStats{}
 	c.index["w0"].add(inflightBatch{id: 1, table: "raw.orders", high: position.MustLSN("0/10"), bytes: 64})
-	c.budget.acquire(context.Background(), "w0", 64)
+	_ = c.budget.acquire(context.Background(), "w0", 64)
 
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Position: "0/10", Rows: 5, Deletes: 1})
 	if got := c.index["w0"].InFlight(); got != 0 {
@@ -356,10 +356,12 @@ func TestMinSafePositions(t *testing.T) {
 
 func TestStagedLockSerializesPerTable(t *testing.T) {
 	c, _ := coordHarness()
-	if c.stagedLock("a") != c.stagedLock("a") {
+	a1 := c.stagedLock("a")
+	a2 := c.stagedLock("a")
+	if a1 != a2 {
 		t.Fatal("same table must share one mutex")
 	}
-	if c.stagedLock("a") == c.stagedLock("b") {
+	if a1 == c.stagedLock("b") {
 		t.Fatal("different tables must not share a mutex")
 	}
 }

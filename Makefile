@@ -59,9 +59,9 @@ test:
 # test` until the heavy catalog/session fixtures that close it land.
 cover:
 	$(GO) test -cover -count=1 ./internal/sink/iceberg/ ./internal/coordinator/ | tee /tmp/urutau-cover.txt
-	@grep -qE 'sink/iceberg .*coverage: ([5-9][0-9]|100)%' /tmp/urutau-cover.txt \
+	@grep -qE 'sink/iceberg[[:space:]].*coverage: ([5-9][0-9](\.[0-9]+)?|100(\.0+)?)%' /tmp/urutau-cover.txt \
 		|| { echo "FLOOR: sink/iceberg below 50% (minimum, not proof)"; exit 1; }
-	@grep -qE 'coordinator .*coverage: ([6-9][0-9]|100)%' /tmp/urutau-cover.txt \
+	@grep -qE 'coordinator[[:space:]].*coverage: ([6-9][0-9](\.[0-9]+)?|100(\.0+)?)%' /tmp/urutau-cover.txt \
 		|| { echo "FLOOR: coordinator below 65% (minimum, not proof)"; exit 1; }
 	@echo "coverage floors met"
 
