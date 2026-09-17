@@ -2,8 +2,10 @@ package mysql
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/canal"
 	"github.com/go-mysql-org/go-mysql/schema"
@@ -29,7 +31,7 @@ func ordersTable() *schema.Table {
 var ordersRef = TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}
 
 func newTestReader(out chan<- rowchange.Change) *Reader {
-	return &Reader{out: out, bySrc: map[string]TableRef{"shop.orders": ordersRef}}
+	return &Reader{out: out, bySrc: map[string]TableRef{"shop.orders": ordersRef}, done: make(chan struct{})}
 }
 
 func TestDecodeInsert(t *testing.T) {
@@ -463,4 +465,65 @@ func TestRowToMapDecodesUTF32(t *testing.T) {
 	if got := rowToMap(tbl, []any{[]byte{0x00, 0x00, 0x4e, 0x2d}})["v"]; got != "中" {
 		t.Errorf("utf32 = %q, want %q", got, "中")
 	}
+}
+
+// A stalled consumer (channel full, nobody reading) must not prevent the
+// reader from shutting down. emit is OnRow's send path, and OnRow runs on
+// canal's own event-loop goroutine — a bare channel send there would block
+// that goroutine indefinitely, which stops canal reading further binlog
+// events and makes Close()/context cancellation unable to break out (see
+// issue #114). This test itself hangs against the old bare `r.out <- c`,
+// so its own timeout guard is what turns that into a reported failure
+// instead of a wedged test run.
+func TestEmitUnblocksOnStop(t *testing.T) {
+	out := make(chan rowchange.Change) // unbuffered: any send blocks until read
+	r := newTestReader(out)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.emit(rowchange.Change{}) }()
+
+	// Give emit a moment to actually reach the select and park on the send;
+	// this is a best-effort scheduling nudge, not a correctness dependency
+	// (stop() below is safe to call regardless of whether emit reached its
+	// select yet, since done is closed once for the whole reader).
+	r.stop()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errReaderStopped) {
+			t.Fatalf("emit() = %v, want errReaderStopped", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("emit() did not return after stop() — a stalled consumer would hang OnRow, " +
+			"and with it canal's event loop, forever")
+	}
+}
+
+// A send that can complete must still complete normally — stop() being
+// available must not turn every emit into a stop, and calling stop() must
+// not race a concurrent successful send.
+func TestEmitSucceedsWithoutStop(t *testing.T) {
+	out := make(chan rowchange.Change, 1)
+	r := newTestReader(out)
+
+	if err := r.emit(rowchange.Change{Op: rowchange.OpInsert}); err != nil {
+		t.Fatalf("emit() = %v, want nil", err)
+	}
+	select {
+	case c := <-out:
+		if c.Op != rowchange.OpInsert {
+			t.Fatalf("got %+v", c)
+		}
+	default:
+		t.Fatal("emit() returned nil but nothing was sent")
+	}
+}
+
+// stop must be safe to call more than once — Close() and StartFromGTID's
+// ctx.Done()/done-channel paths can both reach it during an ordinary
+// shutdown race.
+func TestStopIsIdempotent(t *testing.T) {
+	r := newTestReader(nil)
+	r.stop()
+	r.stop() // must not panic (close of closed channel)
 }

@@ -6,6 +6,7 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -55,6 +56,17 @@ type Reader struct {
 	winChunk uint32 // chunkID of the open DBLog window, when winOpen
 	winOpen  bool
 	winLow   *position.GTID // source watermark captured at OpenWindow
+
+	// done is closed once, by StartFromGTID on the way out (whether it
+	// exits via ctx.Done() or the stream ending on its own). OnRow selects
+	// on it alongside every send to r.out: without this, a stalled
+	// consumer blocks OnRow forever on canal's own event-loop goroutine,
+	// which stops canal from reading further binlog events (no GTIDs, no
+	// heartbeats, no rotates) and makes Close()/ctx cancellation hang,
+	// because neither can unblock a goroutine parked on a channel send —
+	// only a reader on the other end can. See issue #114.
+	done     chan struct{}
+	doneOnce sync.Once
 
 	canal.DummyEventHandler // unimplemented hooks are no-ops
 }
@@ -119,9 +131,14 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		return nil, fmt.Errorf("mysql: new canal: %w", err)
 	}
 
-	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc}
+	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc, done: make(chan struct{})}
 	c.SetEventHandler(r)
 	return r, nil
+}
+
+// stop closes done exactly once, unblocking any OnRow send in progress.
+func (r *Reader) stop() {
+	r.doneOnce.Do(func() { close(r.done) })
 }
 
 // StartFromGTID begins streaming from the given GTID set, blocking until
@@ -152,10 +169,17 @@ func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error 
 
 	select {
 	case <-ctx.Done():
+		r.stop() // unblock any OnRow send parked on r.out before Close
 		r.canal.Close()
 		return ctx.Err()
 	case err := <-done:
-		if err != nil {
+		r.stop()
+		// errReaderStopped surfaces here when Close() (not ctx.Done, this
+		// case) triggered the shutdown while OnRow was mid-send: canal
+		// propagates OnRow's error out of its own sync loop, so it arrives
+		// as this call's own error rather than through ctx.Done(). It is
+		// an orderly stop, not a stream failure.
+		if err != nil && !errors.Is(err, errReaderStopped) {
 			return fmt.Errorf("mysql: stream ended: %w", err)
 		}
 		return nil
@@ -197,8 +221,12 @@ func (r *Reader) Master(ctx context.Context) (position.Position, error) {
 	}
 }
 
-// Close stops the reader and its replication connection.
-func (r *Reader) Close() { r.canal.Close() }
+// Close stops the reader and its replication connection. Safe to call
+// before StartFromGTID unblocks the same shutdown path it uses.
+func (r *Reader) Close() {
+	r.stop()
+	r.canal.Close()
+}
 
 // SetConfirmed is a no-op for MySQL: binlog retention is time/size-based,
 // not consumer-confirmed, so there is no slot to hold back.
@@ -267,24 +295,50 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 		for _, row := range e.Rows {
 			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos)
 			c.Window = win
-			r.out <- c
+			if err := r.emit(c); err != nil {
+				return err
+			}
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
 			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos)
 			c.Window = win
-			r.out <- c
+			if err := r.emit(c); err != nil {
+				return err
+			}
 		}
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
 			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
 			c.Window = win
-			r.out <- c
+			if err := r.emit(c); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
+
+// emit sends c to the reader's output, or returns an error if the reader is
+// shutting down first. A bare `r.out <- c` would block OnRow — and with it
+// canal's whole event loop — for as long as a stalled consumer takes to
+// drain the channel, with Close()/context cancellation unable to break it
+// out (see the done field's doc comment, issue #114). Returning the error
+// makes canal tear the stream down instead of continuing to feed a reader
+// that is on its way out.
+func (r *Reader) emit(c rowchange.Change) error {
+	select {
+	case r.out <- c:
+		return nil
+	case <-r.done:
+		return errReaderStopped
+	}
+}
+
+// errReaderStopped is emit's sentinel for "the reader is shutting down" —
+// not a stream failure, so callers must not treat it as one.
+var errReaderStopped = fmt.Errorf("mysql: reader stopped")
 
 // OnDDL surfaces DDL statements seen on the stream. The query is the
 // authoritative statement. Row data is not produced here — schema drift on
