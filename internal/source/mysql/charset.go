@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"fmt"
 	"strings"
 
 	"golang.org/x/text/encoding"
@@ -70,21 +71,28 @@ func decoderFor(collation string) (func([]byte) (string, error), bool) {
 // Only sets whose bytes are NOT already UTF-8 appear here; everything else
 // (utf8/utf8mb3/utf8mb4/ascii, and anything unlisted) passes through.
 //
-// The list covers every MySQL character set x/text models faithfully: the
-// single-byte sets, the Unicode family, and the multi-byte East Asian sets.
-// binary is deliberately absent — a binary column carries bytes, not text,
-// and must not be reinterpreted.
+// The list covers every MySQL character set x/text models faithfully (the
+// single-byte sets, the Unicode family, the multi-byte East Asian sets), plus
+// 7 single-byte sets x/text has no decoder for at all — armscii8, dec8,
+// geostd8, hp8, keybcs2, swe7, macce — decoded via generatedCharsetTables
+// (charset_tables.go), extracted directly from a real MySQL 8.4 server
+// rather than borrowed from a lookalike standard. See
+// internal/source/mysql/charsetgen's doc comment for the extraction method.
 //
-// What remains unlisted, and why each stays that way:
+// macce deserves a specific note: it is NOT charmap.Macintosh (Mac Roman).
+// Byte 0x8E decodes to "é" under Mac Roman and to a different character
+// under Mac Central Europe — confirmed against the real server — so folding
+// it into the x/text charmap would have silently corrupted exactly the
+// accented characters the charset exists to carry. The generated table
+// avoids that by construction.
 //
-//	eucjpms, macce  a near-miss table exists but is NOT the same mapping
-//	                (see the notes below and macce's test), so decoding
-//	                would corrupt exactly the characters the charset is for
-//	armscii8, dec8, geostd8, hp8, keybcs2, swe7
-//	                x/text has no decoder at all
-//
-// Closing those needs MySQL's own conversion tables (share/charsets/*.xml),
-// not a lookalike from another standard.
+// What remains unlisted, and why: eucjpms is MySQL's Microsoft-flavored
+// EUC-JP. It is multi-byte, so the same-server extraction this package uses
+// for the 7 single-byte sets does not directly apply (enumerating byte pairs
+// found real vendor-row divergences from plain EUC-JP, but also inconsistent
+// error-vs-"?" behavior from MySQL's CONVERT() that was not fully resolved).
+// Tracked separately rather than shipped uncertain — see issue referenced in
+// eucjpms's passthrough test.
 var charsetDecoders = map[string]func([]byte) (string, error){
 	"latin1":   decodeWith(charmap.Windows1252), // MySQL's latin1 IS cp1252, not ISO-8859-1
 	"latin2":   decodeWith(charmap.ISO8859_2),
@@ -139,6 +147,36 @@ var charsetDecoders = map[string]func([]byte) (string, error){
 	// MySQL's tis620 is the Thai set Windows-874 encodes (cp874 is the
 	// Microsoft name for the same code page).
 	"tis620": decodeWith(charmap.Windows874),
+
+	// Generated from a real MySQL server — see this map's doc comment.
+	"armscii8": decodeGenerated("armscii8"),
+	"dec8":     decodeGenerated("dec8"),
+	"geostd8":  decodeGenerated("geostd8"),
+	"hp8":      decodeGenerated("hp8"),
+	"keybcs2":  decodeGenerated("keybcs2"),
+	"swe7":     decodeGenerated("swe7"),
+	"macce":    decodeGenerated("macce"),
+}
+
+// decodeGenerated returns a decoder backed by one of generatedCharsetTables'
+// per-byte maps (charset_tables.go). A byte absent from the table is
+// unassigned in the source charset — MySQL itself would convert it to "?",
+// but this package's policy (see decodeString) is that a byte the decoder
+// cannot place is kept raw rather than replaced, so it is reported as a
+// decode error and the caller falls back to the original bytes.
+func decodeGenerated(charset string) func([]byte) (string, error) {
+	table := generatedCharsetTables[charset] // panics at init if charsetgen and this map drift — caught by TestGeneratedCharsetsRegistered
+	return func(b []byte) (string, error) {
+		out := make([]rune, len(b))
+		for i, bb := range b {
+			r, ok := table[bb]
+			if !ok {
+				return "", fmt.Errorf("mysql: byte 0x%02X is unassigned in charset %q", bb, charset)
+			}
+			out[i] = r
+		}
+		return string(out), nil
+	}
 }
 
 // decodeWith adapts an x/text encoding to the decoder signature.

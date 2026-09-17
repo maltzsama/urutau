@@ -362,9 +362,9 @@ func TestRowToMapLeavesBinaryBytesAlone(t *testing.T) {
 // guess: the raw form is still recoverable, a bad guess is not.
 func TestRowToMapUnknownCollationPassesThrough(t *testing.T) {
 	raw := []byte{0xe9, 0x41}
-	// Character sets MySQL ships that x/text does not model: they must keep
-	// their bytes rather than be decoded by a near-miss table.
-	for _, collation := range []string{"", "hp8_english_ci", "keybcs2_general_ci", "dec8_swedish_ci"} {
+	// eucjpms is multi-byte and tracked separately (see charset.go's doc
+	// comment); "notacharset" stands in for anything genuinely unmodeled.
+	for _, collation := range []string{"", "eucjpms_japanese_ci", "notacharset_general_ci"} {
 		tbl := &schema.Table{Columns: []schema.TableColumn{
 			{Name: "v", Type: schema.TYPE_STRING, Collation: collation},
 		}}
@@ -442,18 +442,65 @@ func TestRowToMapDecodesSubsetCharsets(t *testing.T) {
 	}
 }
 
-// macce (Mac Central Europe) must NOT be folded into charmap.Macintosh:
-// they differ. Byte 0x8e is "é" in Mac Roman and a different character in
-// Mac Central Europe, so decoding it with the wrong table would corrupt
-// exactly the accented characters the charset exists for.
-func TestRowToMapMacceStillPassesThrough(t *testing.T) {
-	raw := []byte{0x8e}
+// macce (Mac Central Europe) decodes through its own generated table
+// rather than charmap.Macintosh (Mac Roman): they differ. Byte 0x80 is "Ä"
+// in Mac Central Europe and a different character in Mac Roman — decoding
+// through the wrong table would have corrupted exactly the accented
+// characters the charset exists for. Value verified against a real MySQL
+// 8.4 server (see internal/source/mysql/charsetgen).
+func TestRowToMapDecodesMacce(t *testing.T) {
 	tbl := &schema.Table{Columns: []schema.TableColumn{
 		{Name: "v", Type: schema.TYPE_STRING, Collation: "macce_general_ci"},
 	}}
+	if got := rowToMap(tbl, []any{[]byte{0x80}})["v"]; got != "Ä" {
+		t.Errorf("macce 0x80 = %q, want %q", got, "Ä")
+	}
+}
+
+// TestRowToMapDecodesGeneratedCharsets covers the 7 single-byte character
+// sets with no golang.org/x/text decoder (armscii8, dec8, geostd8, hp8,
+// keybcs2, swe7, macce). Each is generated from a real MySQL 8.4 server
+// (internal/source/mysql/charsetgen), not hand-transcribed or borrowed from
+// a lookalike standard — the risk that made macce and eucjpms unsafe to
+// treat casually. Values below were independently verified against the
+// server, not just copied from the generated file.
+func TestRowToMapDecodesGeneratedCharsets(t *testing.T) {
+	for _, tc := range []struct {
+		name, collation string
+		raw             byte
+		want            string
+	}{
+		{"armscii8 Armenian", "armscii8_general_ci", 0xC0, "Ը"},
+		{"dec8 accented", "dec8_swedish_ci", 0xC0, "À"},
+		{"geostd8 euro", "geostd8_general_ci", 0x80, "€"},
+		{"hp8 accented", "hp8_english_ci", 0xC0, "â"},
+		{"keybcs2 Czech", "keybcs2_general_ci", 0x80, "Č"},
+		{"swe7 accented", "swe7_swedish_ci", 0x40, "É"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl := &schema.Table{Columns: []schema.TableColumn{
+				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
+			}}
+			if got := rowToMap(tbl, []any{[]byte{tc.raw}})["v"]; got != tc.want {
+				t.Errorf("%s byte 0x%02X = %q, want %q", tc.name, tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// swe7 is a strict 7-bit set: every byte 0x80-0xFF has no assignment.
+// MySQL itself converts such a byte to "?" without error, but this
+// package's decodeString policy is to keep unmappable bytes raw (more
+// recoverable than a lossy substitute), so it must fall through untouched
+// rather than becoming "?".
+func TestRowToMapGeneratedCharsetUnassignedByteFallsThrough(t *testing.T) {
+	tbl := &schema.Table{Columns: []schema.TableColumn{
+		{Name: "v", Type: schema.TYPE_STRING, Collation: "swe7_swedish_ci"},
+	}}
+	raw := []byte{0x80}
 	got, _ := rowToMap(tbl, []any{raw})["v"].(string)
 	if !bytes.Equal([]byte(got), raw) {
-		t.Errorf("macce = %q, want the raw byte passed through (Mac Roman is a different table)", got)
+		t.Errorf("swe7 unassigned byte = %q, want the raw byte kept (not \"?\")", got)
 	}
 }
 
