@@ -21,7 +21,6 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // ErrCommitExhausted marks a terminal commit failure: retries against the
@@ -197,14 +196,22 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	}
 	defer rec.Release()
 
-	// Build properties with snapshot state when present.
+	// Write the delete files ONCE; only the catalog commit is retried below.
+	tbl, err := w.cat.LoadTable(ctx, w.ident)
+	if err != nil {
+		return fmt.Errorf("iceberg: load %v: %w", w.ident, err)
+	}
+	files, err := tbl.NewTransaction().WriteEqualityDeletes(ctx, w.eqIDs, oneBatch(rec))
+	if err != nil {
+		return fmt.Errorf("iceberg: write equality deletes %v: %w", w.ident, err)
+	}
+	if len(files) == 0 && pos == "" {
+		// No delete files and no position to advance — nothing pending.
+		return nil
+	}
+
 	p := props(pos)
-	if snapshotState != "" {
-		p["cdc.snapshot.state"] = snapshotState
-	}
-	if snapshotPending != nil {
-		p["cdc.snapshot.pending"] = snapshot.EncodePending(snapshotPending)
-	}
+	addSnapshotProps(p, snapshotState, snapshotPending)
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -222,43 +229,18 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			continue
 		}
 		txn := tbl.NewTransaction()
-		files, err := txn.WriteEqualityDeletes(ctx, w.eqIDs, oneBatch(rec))
-		if err != nil {
-			if !isRetryableError(err) {
-				return err
-			}
-			lastErr = err
-			continue
-		}
-		if len(files) == 0 {
-			// No delete files produced. If this is a delete-only batch
-			// (pos != "" means this is the last commit), still advance
-			// the position — there is nothing pending.
-			if pos != "" {
-				if err := txn.SetProperties(p); err != nil {
+		if len(files) > 0 {
+			// The RowDelta builder's Commit stages the row-level update onto
+			// the transaction (txn.apply); it does NOT commit to the catalog.
+			// The single catalog commit is below, after properties are staged,
+			// so the deletes and the position land in one atomic snapshot.
+			if err := txn.NewRowDelta(p).AddDeletes(files...).Commit(ctx); err != nil {
+				if !isRetryableError(err) {
 					return err
 				}
-				if _, err := txn.Commit(ctx); err != nil {
-					if !isRetryableError(err) {
-						return err
-					}
-					lastErr = err
-					continue
-				}
+				lastErr = err
+				continue
 			}
-			return nil
-		}
-		// The RowDelta builder's Commit stages the row-level update onto
-		// the transaction (txn.apply); it does NOT commit to the catalog.
-		// The single catalog commit happens below, after properties are
-		// staged, so the deletes and the position land in one atomic
-		// snapshot.
-		if err := txn.NewRowDelta(p).AddDeletes(files...).Commit(ctx); err != nil {
-			if !isRetryableError(err) {
-				return err
-			}
-			lastErr = err
-			continue
 		}
 		if pos != "" {
 			if err := txn.SetProperties(p); err != nil {
@@ -284,17 +266,25 @@ func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos 
 		return err
 	}
 	defer rec.Release()
-	at := array.NewTableFromRecords(rec.Schema(), []arrow.RecordBatch{rec})
-	defer at.Release()
 
-	// Build properties with snapshot state when present.
+	// Write the data files ONCE: this is the object-store work, and
+	// WriteRecords honours the configured target file size (AppendTable, which
+	// the retry loop used to call, has no size knob). Only the catalog commit
+	// below is retried, so a retryable failure costs a commit, not a re-upload.
+	tbl, err := w.cat.LoadTable(ctx, w.ident)
+	if err != nil {
+		return fmt.Errorf("iceberg: load %v: %w", w.ident, err)
+	}
+	files, err := w.writeDataFiles(ctx, tbl, rec)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
 	p := props(pos)
-	if snapshotState != "" {
-		p["cdc.snapshot.state"] = snapshotState
-	}
-	if snapshotPending != nil {
-		p["cdc.snapshot.pending"] = snapshot.EncodePending(snapshotPending)
-	}
+	addSnapshotProps(p, snapshotState, snapshotPending)
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -312,7 +302,10 @@ func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos 
 			continue
 		}
 		txn := tbl.NewTransaction()
-		if err := txn.AppendTable(ctx, at, w.recordBatchSize, p); err != nil {
+		// One RowDelta carries the appended files; its Commit stages the
+		// update on the transaction and the catalog commit is below — the same
+		// shape the staged path uses.
+		if err := txn.NewRowDelta(p).AddRows(files...).Commit(ctx); err != nil {
 			if !isRetryableError(err) {
 				return err
 			}
