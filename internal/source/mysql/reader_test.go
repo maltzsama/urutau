@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/schema"
 
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -15,6 +16,8 @@ import (
 )
 
 const readerTestUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+
+var testCommitTS = time.Unix(1700000000, 0).UTC()
 
 func ordersTable() *schema.Table {
 	return &schema.Table{
@@ -39,10 +42,13 @@ func TestDecodeInsert(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3")
+	c := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3", testCommitTS)
 
 	if c.Op != rowchange.OpInsert || c.Table != "raw.orders" || c.Position != "u:1-3" {
 		t.Fatalf("change = %+v", c)
+	}
+	if !c.CommitTS.Equal(testCommitTS) {
+		t.Fatalf("commit ts = %v, want %v", c.CommitTS, testCommitTS)
 	}
 	if len(c.Key) != 1 || c.Key[0] != int64(7) {
 		t.Fatalf("key = %v, want [7]", c.Key)
@@ -63,7 +69,7 @@ func TestDecodeDeleteKeepsBeforeOnly(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4")
+	c := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4", testCommitTS)
 
 	if c.Op != rowchange.OpDelete {
 		t.Fatalf("op = %v", c.Op)
@@ -82,7 +88,7 @@ func TestDecodeUpdateCarriesBeforeAndAfter(t *testing.T) {
 	before := []any{int64(7), []byte("old"), 1.0}
 	after := []any{int64(7), []byte("new"), 2.0}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5")
+	c := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
 
 	if c.After["v"] != "new" || c.Before["v"] != "old" {
 		t.Fatalf("update before/after = %v / %v", c.Before, c.After)
@@ -573,4 +579,31 @@ func TestStopIsIdempotent(t *testing.T) {
 	r := newTestReader(nil)
 	r.stop()
 	r.stop() // must not panic (close of closed channel)
+}
+
+// OnGTID stamps the transaction's commit time from the GTID event (microsecond
+// precision, MySQL 8.0.1+) with a fallback to the header's second-precision
+// timestamp. Issue #137.
+func TestOnGTIDCapturesCommitTime(t *testing.T) {
+	sid := []byte{0x3e, 0x11, 0xfa, 0x47, 0x71, 0xca, 0x11, 0xe1, 0x9e, 0x33, 0xc8, 0x0a, 0xa9, 0x42, 0x95, 0x62}
+	r := newTestReader(nil)
+
+	micros := uint64(1700000000)*1_000_000 + 123456
+	e := &replication.GTIDEvent{SID: sid, GNO: 3, OriginalCommitTimestamp: micros}
+	if err := r.OnGTID(&replication.EventHeader{Timestamp: 1699999999}, e); err != nil {
+		t.Fatalf("OnGTID: %v", err)
+	}
+	want := time.Unix(int64(micros/1_000_000), int64(micros%1_000_000)*1000).UTC()
+	if !r.curCommitTS.Equal(want) {
+		t.Fatalf("commit ts = %v, want %v", r.curCommitTS, want)
+	}
+
+	// No original commit timestamp (pre-8.0.1): fall back to the header.
+	e2 := &replication.GTIDEvent{SID: sid, GNO: 4}
+	if err := r.OnGTID(&replication.EventHeader{Timestamp: 1699999999}, e2); err != nil {
+		t.Fatalf("OnGTID: %v", err)
+	}
+	if want := time.Unix(1699999999, 0).UTC(); !r.curCommitTS.Equal(want) {
+		t.Fatalf("fallback commit ts = %v, want %v", r.curCommitTS, want)
+	}
 }

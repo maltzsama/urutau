@@ -51,6 +51,9 @@ type Reader struct {
 	curSet  *position.GTID // accumulated GTID set through the current transaction
 	curGTID string         // curSet.String() — the position rows of this txn carry
 	curTxn  *position.GTID // single GTID of the transaction being decoded (window check)
+	// curCommitTS is the transaction's commit time, captured on the GTID
+	// event and stamped onto every row of the transaction (issue #137).
+	curCommitTS time.Time
 
 	winMu    sync.Mutex
 	winChunk uint32 // chunkID of the open DBLog window, when winOpen
@@ -234,7 +237,7 @@ func (r *Reader) SetConfirmed(_ func() position.Position) {}
 
 // ── canal.EventHandler ──────────────────────────────────────────────
 
-func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {
+func (r *Reader) OnGTID(header *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {
 	next, err := e.GTIDNext()
 	if err != nil {
 		return fmt.Errorf("mysql: gtid next: %w", err)
@@ -243,8 +246,20 @@ func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) e
 	if err != nil {
 		return fmt.Errorf("mysql: gtid next parse: %w", err)
 	}
+	// The transaction commit time: microsecond precision from the GTID event
+	// on MySQL 8.0.1+, else the event header's second-precision timestamp.
+	// MySQL 8.0.1+ always carries OriginalCommitTimestamp, so the header is a
+	// fallback for older servers (and MariaDB, whose GTID event is a different
+	// concrete type). See issue #137.
+	commitTS := time.Unix(int64(header.Timestamp), 0).UTC()
+	if ge, ok := e.(*replication.GTIDEvent); ok {
+		if t := ge.OriginalCommitTime(); !t.IsZero() {
+			commitTS = t.UTC()
+		}
+	}
 	r.mu.Lock()
 	r.curTxn = g
+	r.curCommitTS = commitTS
 	r.mu.Unlock()
 	r.mergeGTID(g)
 	return nil
@@ -273,6 +288,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	r.mu.Lock()
 	pos := r.curGTID
 	txn := r.curTxn
+	commitTS := r.curCommitTS
 	r.winMu.Lock()
 	var win *rowchange.Window
 	// Only events strictly past the low watermark are InWindow: an event at
@@ -293,7 +309,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	switch e.Action {
 	case canal.InsertAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos)
+			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos, commitTS)
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -301,7 +317,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos)
+			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos, commitTS)
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -310,7 +326,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
-			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
+			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos, commitTS)
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -351,12 +367,14 @@ func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replic
 }
 
 // decode maps one row (in table column order) to a rowchange. key is built from
-// the spec primary key columns, in spec order.
-func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string) rowchange.Change {
+// the spec primary key columns, in spec order. commitTS is the transaction's
+// commit time, carried onto every row of the transaction.
+func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) rowchange.Change {
 	c := rowchange.Change{
 		Op:       op,
 		Table:    ref.Target,
 		Position: pos,
+		CommitTS: commitTS,
 		IngestTS: time.Now(),
 	}
 
