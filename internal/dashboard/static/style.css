@@ -41,7 +41,8 @@ nav a.active { color: var(--pico-color); border-color: var(--accent); font-weigh
 /* ── pills / badges ───────────────────────────────────────────────────── */
 .pill, .badge { display: inline-flex; align-items: center; gap: 5px;
   border: 1px solid var(--pico-muted-border-color); border-radius: 999px;
-  padding: 2px 8px; font-size: .72rem; font-weight: 650; white-space: nowrap; }
+  padding: 2px 8px; font-size: .72rem; font-weight: 650; white-space: nowrap;
+  color: var(--pico-form-element-color); }
 .pill:before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .badge { background: var(--pico-card-background-color); }
 .green { color: var(--ok); } .amber { color: var(--warn); }
@@ -112,11 +113,11 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .copy-btn { width: auto; min-width: 28px; height: 28px; padding: 0 8px; margin: 0;
   display: inline-grid; place-items: center; border-radius: 6px; font-size: .9rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
-  color: var(--pico-color); cursor: pointer; line-height: 1; }
+  color: var(--pico-form-element-color); cursor: pointer; line-height: 1; }
 .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
 .theme-toggle { width: auto; padding: 3px 9px; margin: 0; border-radius: 999px; font-size: .74rem;
   border: 1px solid var(--pico-muted-border-color); background: var(--pico-card-background-color);
-  color: var(--pico-color); cursor: pointer; }
+  color: var(--pico-form-element-color); cursor: pointer; }
 
 /* ── drawer / modal / toast ───────────────────────────────────────────── */
 .overlay { position: fixed; inset: 0; background: #0008; display: flex; align-items: stretch;
