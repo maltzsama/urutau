@@ -356,6 +356,15 @@ func normalizeCol(col schema.TableColumn, v any) any {
 		return decodeEnum(col, v)
 	case schema.TYPE_SET:
 		return decodeSet(col, v)
+	case schema.TYPE_STRING:
+		// Text columns carry their bytes in the column's own character set,
+		// unconverted (see charset.go). TYPE_BINARY is deliberately not here:
+		// its bytes are not text and reinterpreting them would corrupt them.
+		if b, ok := v.([]byte); ok {
+			return decodeString(b, col.Collation)
+		}
+
+		return normalize(v)
 	default:
 		return normalize(v)
 	}

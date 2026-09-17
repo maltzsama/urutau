@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -306,5 +307,66 @@ func TestRowToMapEnumWithoutMembersFallsThrough(t *testing.T) {
 	}
 	if got := rowToMap(tbl, []any{int64(2)}); got["status"] != int64(2) {
 		t.Errorf("ENUM without members = %#v, want the raw value", got["status"])
+	}
+}
+
+// A text column's bytes arrive in the column's own character set, with no
+// conversion — the binlog does not transcode. The backfill's SELECT does get
+// transcoded (its connection is utf8mb4, so the server converts), so a
+// non-UTF-8 column landed as mojibake from CDC and as correct text from the
+// snapshot: the same split ENUM and SET had.
+func TestRowToMapDecodesNonUTF8Charsets(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		collation string
+		raw       []byte
+		want      string
+	}{
+		// MySQL's "latin1" is cp1252, not ISO-8859-1: byte 0x80 is the euro
+		// sign, which ISO-8859-1 would decode as a control character.
+		{"latin1 accents", "latin1_swedish_ci", []byte{0x4a, 0xe9, 0x72, 0xf4, 0x6d, 0x65}, "Jérôme"},
+		{"latin1 euro", "latin1_swedish_ci", []byte{0x80}, "€"},
+		{"cp1251 cyrillic", "cp1251_general_ci", []byte{0xcc, 0xee, 0xf1, 0xea, 0xe2, 0xe0}, "Москва"},
+		{"utf8mb4 passthrough", "utf8mb4_general_ci", []byte("José"), "José"},
+		{"ascii passthrough", "ascii_general_ci", []byte("plain"), "plain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl := &schema.Table{Columns: []schema.TableColumn{
+				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
+			}}
+			got := rowToMap(tbl, []any{tc.raw})["v"]
+			if got != tc.want {
+				t.Errorf("v = %q, want %q — a %s column must decode to UTF-8, or CDC writes "+
+					"mojibake where the backfill writes correct text", got, tc.want, tc.collation)
+			}
+		})
+	}
+}
+
+// Binary columns are bytes, not text: reinterpreting them through a charset
+// decoder would corrupt them. They must survive byte for byte.
+func TestRowToMapLeavesBinaryBytesAlone(t *testing.T) {
+	raw := []byte{0xff, 0xfe, 0x00, 0x80, 0x41}
+	tbl := &schema.Table{Columns: []schema.TableColumn{
+		{Name: "b", Type: schema.TYPE_BINARY, Collation: "binary"},
+	}}
+	got, ok := rowToMap(tbl, []any{raw})["b"].(string)
+	if !ok || !bytes.Equal([]byte(got), raw) {
+		t.Errorf("binary column = %#v, want the original bytes %v preserved", got, raw)
+	}
+}
+
+// An unknown or absent collation must pass the bytes through rather than
+// guess: the raw form is still recoverable, a bad guess is not.
+func TestRowToMapUnknownCollationPassesThrough(t *testing.T) {
+	raw := []byte{0xe9, 0x41}
+	for _, collation := range []string{"", "sjis_japanese_ci", "gbk_chinese_ci"} {
+		tbl := &schema.Table{Columns: []schema.TableColumn{
+			{Name: "v", Type: schema.TYPE_STRING, Collation: collation},
+		}}
+		got, _ := rowToMap(tbl, []any{raw})["v"].(string)
+		if !bytes.Equal([]byte(got), raw) {
+			t.Errorf("collation %q: got %q, want the raw bytes untouched", collation, got)
+		}
 	}
 }
