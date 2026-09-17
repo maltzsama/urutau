@@ -97,7 +97,23 @@ process, one binary, no Kubernetes. It:
 
 Leave it running — it's a long-lived process, like any replicator.
 
-## 6. Prove it worked — read it back
+## 6. Watch it on the dashboard
+
+Add `--metrics-addr :9090` to enable the embedded monitoring dashboard:
+
+```sh
+./bin/urutau run -f pipeline.yaml --metrics-addr :9090
+```
+
+Open **http://localhost:9090** in your browser. You'll see the pipeline
+status, the table stream with live throughput charts, and the connected
+worker — all updated in real time via Server-Sent Events.
+
+The dashboard also has a JSON API at `/api/v1/*`. See
+[Dashboard](guides/dashboard.md) and
+[Dashboard API](reference/dashboard-api.md) for details.
+
+## 7. Prove it worked — read it back
 
 Don't trust the write; read it back through a real SQL engine:
 
@@ -111,7 +127,7 @@ comes back empty, which is correct. What matters is that the table exists
 in Iceberg with the right columns (`DESCRIBE iceberg.bronze.orders` if you
 want to check).
 
-## 7. Change some data, watch it replicate
+## 8. Change some data, watch it replicate
 
 In another terminal, connect to MySQL and mutate `shop.orders`:
 
@@ -133,7 +149,7 @@ docker exec -it $(docker compose -f test/e2e/docker-compose.yml ps -q mysql) \
   -e "UPDATE orders SET v='updated' WHERE id=101;"
 ```
 
-## 8. Stop and clean up
+## 9. Stop and clean up
 
 ```sh
 # Ctrl-C the running `urutau run` process, then:

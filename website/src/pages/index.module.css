@@ -10,6 +10,10 @@
   overflow: hidden;
 }
 
+.heroLogo {
+  margin-bottom: 1rem;
+}
+
 @media screen and (max-width: 996px) {
   .heroBanner {
     padding: 2rem;
@@ -20,6 +24,17 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 1rem;
+}
+
+.githubButton {
+  border: none;
+}
+
+.outlineButton {
+  border: 2px solid currentColor;
+  background: transparent;
+  color: inherit;
 }
 
 .features {
@@ -27,4 +42,10 @@
   align-items: center;
   padding: 2rem 0;
   width: 100%;
+}
+
+.etymology {
+  font-size: 0.85rem;
+  opacity: 0.7;
+  margin-top: 0.5rem;
 }

@@ -12,16 +12,35 @@ function HomepageHeader() {
   return (
     <header className={clsx('hero hero--primary', styles.heroBanner)}>
       <div className="container">
+        <img
+          src="/urutau/img/icon.svg"
+          alt="Urutau"
+          className={styles.heroLogo}
+          width={120}
+          height={120}
+        />
         <Heading as="h1" className="hero__title">
           {siteConfig.title}
         </Heading>
+        <p className={styles.etymology}>
+          Tupi–Guaraní for the potoo — a nightjar that stands motionless through
+          the night, watching. A fitting name for a process that spends its life
+          quietly watching a binlog.
+        </p>
         <p className="hero__subtitle">{siteConfig.tagline}</p>
         <div className={styles.buttons}>
           <Link
-            className="button button--secondary button--lg"
+            className={clsx('button button--lg', styles.outlineButton)}
             to="/docs/quickstart">
             Get Started
           </Link>
+          <iframe
+            src="https://ghbtns.com/github-btn.html?user=maltzsama&repo=urutau&type=star&count=true&size=large"
+            width="160"
+            height="30"
+            title="GitHub Stars"
+            className={styles.githubButton}
+          />
         </div>
       </div>
     </header>
