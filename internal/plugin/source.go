@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -259,7 +261,10 @@ func (r *sourceReader) readBatches(ctx context.Context, stream flight.FlightServ
 	for {
 		fd, err := stream.Recv()
 		if err != nil {
-			return nil // stream ended
+			if errors.Is(err, io.EOF) {
+				return nil // stream ended
+			}
+			return fmt.Errorf("plugin source: recv: %w", err)
 		}
 		if len(fd.DataBody) == 0 {
 			continue // empty batch (liveness signal, CONTRACT §8.3)
