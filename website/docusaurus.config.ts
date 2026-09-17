@@ -53,8 +53,10 @@ const config: Config = {
     },
     navbar: {
       title: 'Urutau',
+      style: 'dark',
       logo: {
         src: 'img/icon.svg',
+        srcDark: 'img/icon-dark.svg',
         alt: 'Urutau',
       },
       items: [
@@ -73,6 +75,7 @@ const config: Config = {
           href: 'https://github.com/maltzsama/urutau',
           label: 'GitHub',
           position: 'right',
+          className: 'header-github-link',
         },
       ],
     },

@@ -12,6 +12,13 @@ function HomepageHeader() {
   return (
     <header className={clsx('hero hero--primary', styles.heroBanner)}>
       <div className="container">
+        <img
+          src="/urutau/img/icon.svg"
+          alt="Urutau"
+          className={styles.heroLogo}
+          width={120}
+          height={120}
+        />
         <Heading as="h1" className="hero__title">
           {siteConfig.title}
         </Heading>
