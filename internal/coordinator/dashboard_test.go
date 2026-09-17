@@ -5,6 +5,8 @@ import (
 	"time"
 
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -107,5 +109,32 @@ func TestDashStateTablesRowsRate(t *testing.T) {
 	}
 	if rate := got[0].RowsRate; rate < 3.5 || rate > 4.5 {
 		t.Errorf("RowsRate = %v, want ~4 rows/s (40 rows over 10s)", rate)
+	}
+}
+
+// The drawer's "current position" comes from the serving worker's last
+// durably-committed position (c.confirmed), keyed by worker and mapped to its
+// table.
+func TestDashStateTablesPosition(t *testing.T) {
+	pos, err := position.ParseGTID("00000000-0000-0000-0000-000000000001:1-42")
+	if err != nil {
+		t.Fatalf("ParseGTID: %v", err)
+	}
+	c := &Coordinator{
+		cfg: Config{Spec: &spec.Spec{Tables: []spec.Table{
+			{Source: "shop.orders", Target: "raw.orders"},
+		}}},
+		workers: map[string]*workerState{
+			"w-0": {refs: []source.TableRef{{Source: "shop.orders", Target: "raw.orders"}}},
+		},
+		confirmed: map[string]position.Position{"w-0": pos},
+	}
+
+	got := dashState{c}.Tables()
+	if len(got) != 1 {
+		t.Fatalf("Tables = %d, want 1", len(got))
+	}
+	if got[0].Position != pos.String() {
+		t.Errorf("Position = %q, want %q", got[0].Position, pos.String())
 	}
 }

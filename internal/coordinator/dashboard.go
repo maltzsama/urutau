@@ -101,6 +101,7 @@ func (s dashState) Tables() []dashboard.TableStatus {
 	if c.cfg.Spec == nil {
 		return nil
 	}
+	positions := c.tablePositions()
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	out := make([]dashboard.TableStatus, 0, len(c.cfg.Spec.Tables))
@@ -109,6 +110,7 @@ func (s dashState) Tables() []dashboard.TableStatus {
 			Source:    t.Source,
 			Target:    t.Target,
 			WriteMode: writeModeLabel(t.WriteMode),
+			Position:  positions[t.Target],
 		}
 		if ts := c.tableStats[t.Target]; ts != nil {
 			st.Commits = ts.commits
@@ -342,6 +344,30 @@ func maintenanceView(m map[string]*maintStats) *dashboard.Maintenance {
 	}
 	if out.Compaction == nil && out.Expiry == nil && out.Orphan == nil {
 		return nil
+	}
+	return out
+}
+
+// tablePositions returns the latest durably-committed position per table, by
+// looking up the worker that serves it (one worker serves exactly one table).
+// Empty where nothing is committed yet. Never holds two locks at once.
+func (c *Coordinator) tablePositions() map[string]string {
+	workerTables := make(map[string]string)
+	c.mu.Lock()
+	for name, w := range c.workers {
+		for _, ref := range w.refs {
+			workerTables[name] = ref.Target
+		}
+	}
+	c.mu.Unlock()
+
+	c.confirmedMu.Lock()
+	defer c.confirmedMu.Unlock()
+	out := make(map[string]string, len(workerTables))
+	for worker, table := range workerTables {
+		if pos := c.confirmed[worker]; pos != nil {
+			out[table] = pos.String()
+		}
 	}
 	return out
 }
