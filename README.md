@@ -103,6 +103,7 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | [Distributed mode](https://maltzsama.github.io/urutau/docs/guides/distributed) | Coordinator + worker without Kubernetes — the same engine, by hand |
 | [Monitoring](https://maltzsama.github.io/urutau/docs/guides/monitoring) | Metrics, `/statusz`, logs, what to alert on |
 | [Dashboard](https://maltzsama.github.io/urutau/docs/guides/dashboard) | Embedded monitoring UI with real-time updates |
+| [Table maintenance](https://maltzsama.github.io/urutau/docs/guides/table-maintenance) | Background compaction, snapshot expiry, orphan cleanup |
 | [Reliability](https://maltzsama.github.io/urutau/docs/guides/reliability) | Audit trail, checkpoints, supervision, resume |
 | [Troubleshooting](https://maltzsama.github.io/urutau/docs/guides/troubleshooting) | Symptom → cause → fix, grouped by area |
 | [CLI reference](https://maltzsama.github.io/urutau/docs/reference/cli) | All four binaries and every flag |
