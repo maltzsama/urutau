@@ -400,12 +400,22 @@ function app() {
     ms(n) { return n ? n.toFixed(0) + ' ms' : '—'; },
 
     // ── charts (Chart.js) ─────────────────────────────────────────────────
-    windowPoints() {
-      return this.window === '5m' ? 60 : this.window === '1h' ? 720 : 360;
+    windowSeconds() {
+      return this.window === '5m' ? 300 : this.window === '1h' ? 3600 : 1800;
     },
+    // tail caps a series to the client-side ring size. The visible window is
+    // set by the x-axis domain (see line/drawerChart), not by slicing here, so
+    // changing the window zooms the chart even before a full window of data
+    // has accumulated.
     tail(arr) {
-      const n = this.windowPoints();
-      return arr && arr.length > n ? arr.slice(arr.length - n) : (arr || []);
+      return arr && arr.length > HISTORY ? arr.slice(arr.length - HISTORY) : (arr || []);
+    },
+    // points maps a value series to {x,y} points on a time axis anchored at
+    // "now" (x=0), stepping back one sample interval per point.
+    points(arr) {
+      const a = arr || [];
+      const stepS = HISTORY_MS / 1000;
+      return a.map((v, i) => ({ x: -(a.length - 1 - i) * stepS, y: v }));
     },
     renderCharts() {
       if (typeof Chart === 'undefined') return;
@@ -427,9 +437,8 @@ function app() {
       const el = document.getElementById(id);
       if (!el) return;
       const data = {
-        labels: datasets[0] ? datasets[0].map((_, i) => i) : [],
         datasets: datasets.map((d, i) => ({
-          label: labels[i], data: d || [], borderColor: COLORS[i % COLORS.length],
+          label: labels[i], data: this.points(d), borderColor: COLORS[i % COLORS.length],
           backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2,
         })),
       };
@@ -437,13 +446,14 @@ function app() {
         responsive: true, maintainAspectRatio: false, animation: false,
         plugins: { legend: { display: datasets.length > 1, labels: { boxWidth: 10 } } },
         scales: {
-          x: { display: false },
+          x: { type: 'linear', min: -this.windowSeconds(), max: 0, display: false },
           y: { beginAtZero: true, grid: { color: grid },
                ticks: { color: cssVar('--pico-muted-color', '#888'), maxTicksLimit: 5, font: { size: 10 } } },
         },
       };
       if (charts[id]) {
         charts[id].data = data;
+        charts[id].options = opts;
         charts[id].update('none');
       } else {
         charts[id] = new Chart(el, { type: 'line', data, options: opts });
@@ -476,17 +486,16 @@ function app() {
       const rate = this.tail(s.rate);
       const lag = this.tail(s.lag);
       const data = {
-        labels: rate.map((_, i) => i),
         datasets: [
-          { label: 'rows/s', data: rate, borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
-          { label: 'lag (s)', data: lag, borderColor: COLORS[2], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
+          { label: 'rows/s', data: this.points(rate), borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
+          { label: 'lag (s)', data: this.points(lag), borderColor: COLORS[2], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
         ],
       };
       const opts = {
         responsive: true, maintainAspectRatio: false, animation: false,
         plugins: { legend: { display: true, labels: { boxWidth: 10 } } },
         scales: {
-          x: { display: false },
+          x: { type: 'linear', min: -this.windowSeconds(), max: 0, display: false },
           // Two series, two units: label each axis and color it to match its
           // line so the two number scales are never ambiguous.
           y: { position: 'left', beginAtZero: true,
