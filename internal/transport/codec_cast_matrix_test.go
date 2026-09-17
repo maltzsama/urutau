@@ -117,3 +117,88 @@ func TestSourceSchemaCastHandoff(t *testing.T) {
 		t.Fatalf("date -> string = %v, %v; want 2024-01-01", got, err)
 	}
 }
+
+// TestMySQLCDCAndBackfillAgreeOnTimestampInstant pins issue #115: the MySQL
+// binlog reader (canal.Config.ParseTime: false) hands the sink a string for
+// DATETIME/TIMESTAMP columns, while the backfill's connection (parseTime=true
+// in the DSN) hands over an already-parsed time.Time. Both feed the same
+// target column through this same appendTypedValue path.
+//
+// The two representations currently agree because both default to UTC — the
+// go-sql-driver's loc defaults to time.UTC when unset, and canal's
+// TimestampStringLocation is unset too — but neither default is asserted
+// anywhere. This test is the assertion: if either side's default (or an
+// explicit configuration) ever drifts, the same source row would encode to
+// two different instants depending on which path produced it, silently,
+// exactly like the ENUM/SET and charset bugs #111 fixed.
+func TestMySQLCDCAndBackfillAgreeOnTimestampInstant(t *testing.T) {
+	cases := []struct {
+		name       string
+		cdcString  string    // what canal.Config.ParseTime:false delivers
+		backfillTS time.Time // what the parseTime=true DSN delivers
+	}{
+		{
+			name:       "whole seconds",
+			cdcString:  "2026-09-17 12:00:00",
+			backfillTS: time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			// DATETIME(6): binlog carries the fraction in the string;
+			// go-sql-driver decodes it into time.Time's nanosecond field.
+			name:       "fractional seconds (DATETIME(6))",
+			cdcString:  "2026-09-17 12:00:00.123456",
+			backfillTS: time.Date(2026, 9, 17, 12, 0, 0, 123456000, time.UTC),
+		},
+		{
+			name:       "midnight epoch-adjacent",
+			cdcString:  "1970-01-01 00:00:01",
+			backfillTS: time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ct := core.ColumnType{Kind: core.KindTimestamp}
+
+			viaCDC := encodeOne(t, ct, tc.cdcString)
+			gotCDC, ok := viaCDC.Value("c", 0)
+			if !ok {
+				t.Fatal("CDC path: no value at row 0")
+			}
+
+			viaBackfill := encodeOne(t, ct, tc.backfillTS)
+			gotBackfill, ok := viaBackfill.Value("c", 0)
+			if !ok {
+				t.Fatal("backfill path: no value at row 0")
+			}
+
+			cdcTime, ok := gotCDC.(time.Time)
+			if !ok {
+				t.Fatalf("CDC path produced %T, want time.Time", gotCDC)
+			}
+			backfillTime, ok := gotBackfill.(time.Time)
+			if !ok {
+				t.Fatalf("backfill path produced %T, want time.Time", gotBackfill)
+			}
+
+			if !cdcTime.Equal(backfillTime) {
+				t.Errorf("CDC (string %q) = %v, backfill (time.Time %v) = %v — "+
+					"the same source row must land on the same instant regardless of "+
+					"which path replicated it",
+					tc.cdcString, cdcTime, tc.backfillTS, backfillTime)
+			}
+		})
+	}
+}
+
+// A NULL timestamp must stay NULL through both representations — nil from
+// the backfill's driver, and (by convention, since canal.ParseTime:false
+// still yields nil for a NULL column rather than an empty string) nil from
+// CDC too.
+func TestMySQLCDCAndBackfillAgreeOnNullTimestamp(t *testing.T) {
+	ct := core.ColumnType{Kind: core.KindTimestamp}
+	rd := encodeOne(t, ct, nil)
+	got, ok := rd.Value("c", 0)
+	if ok && got != nil {
+		t.Errorf("NULL timestamp round-tripped as %#v, want NULL", got)
+	}
+}
