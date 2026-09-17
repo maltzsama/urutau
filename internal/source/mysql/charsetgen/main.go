@@ -91,7 +91,7 @@ func readTSV(path string) ([]entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var out []entry
 	sc := bufio.NewScanner(f)
@@ -175,7 +175,7 @@ func generate(names []string, tables map[string]map[int]rune) string {
 	b.WriteString("// preferring recoverable raw bytes over a lossy substitute).\n")
 	b.WriteString("var generatedCharsetTables = map[string]map[byte]rune{\n")
 	for _, name := range names {
-		b.WriteString(fmt.Sprintf("\t%q: %sTable,\n", name, name))
+		fmt.Fprintf(&b, "\t%q: %sTable,\n", name, name)
 	}
 	b.WriteString("}\n\n")
 
@@ -187,12 +187,12 @@ func generate(names []string, tables map[string]map[int]rune) string {
 		}
 		sort.Ints(keys)
 
-		b.WriteString(fmt.Sprintf("// %sTable is the byte -> rune mapping for MySQL's %q charset,\n", name, name))
-		b.WriteString(fmt.Sprintf("// %d of 256 byte values assigned; the rest are unassigned in the\n", len(tbl)))
+		fmt.Fprintf(&b, "// %sTable is the byte -> rune mapping for MySQL's %q charset,\n", name, name)
+		fmt.Fprintf(&b, "// %d of 256 byte values assigned; the rest are unassigned in the\n", len(tbl))
 		b.WriteString("// source charset.\n")
-		b.WriteString(fmt.Sprintf("var %sTable = map[byte]rune{\n", name))
+		fmt.Fprintf(&b, "var %sTable = map[byte]rune{\n", name)
 		for _, k := range keys {
-			b.WriteString(fmt.Sprintf("\t0x%02X: %d, // %s\n", k, tbl[k], quoteRune(tbl[k])))
+			fmt.Fprintf(&b, "\t0x%02X: %d, // %s\n", k, tbl[k], quoteRune(tbl[k]))
 		}
 		b.WriteString("}\n\n")
 	}
