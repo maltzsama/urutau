@@ -210,8 +210,12 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 		return nil
 	}
 
+	// A retry after a lost catalog response must not re-add the same files
+	// (issue #123, same guard the staged path uses).
+	key := cycleKey(files, nil, pos)
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
+	p["cdc.cycle"] = key
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -227,6 +231,9 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			}
 			lastErr = err
 			continue
+		}
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
 		if len(files) > 0 {
@@ -283,8 +290,12 @@ func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos 
 		return nil
 	}
 
+	// A retry after a lost catalog response must not re-add the same files —
+	// appends are not idempotent (issue #123, same guard the staged path uses).
+	key := cycleKey(nil, files, pos)
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
+	p["cdc.cycle"] = key
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -300,6 +311,9 @@ func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos 
 			}
 			lastErr = err
 			continue
+		}
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
 		// One RowDelta carries the appended files; its Commit stages the
@@ -391,6 +405,29 @@ func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Id
 	return err
 }
 
+// createTable creates the target table, reporting whether it was created.
+// A false return with a nil error means a concurrent creator won the race
+// (ErrTableAlreadyExists) — the caller must reload and validate that table.
+func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string) (bool, error) {
+	opts := []catalog.CreateTableOpt{
+		catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
+	}
+	if len(partitionBy) > 0 {
+		spec, err := buildPartitionSpec(schema, partitionBy)
+		if err != nil {
+			return false, fmt.Errorf("iceberg: %v: partition spec: %w", ident, err)
+		}
+		opts = append(opts, catalog.WithPartitionSpec(&spec))
+	}
+	if _, err := cat.CreateTable(ctx, ident, schema, opts...); err != nil {
+		if errors.Is(err, catalog.ErrTableAlreadyExists) {
+			return false, nil
+		}
+		return false, fmt.Errorf("iceberg: create %v: %w", ident, err)
+	}
+	return true, nil
+}
+
 // EnsureTable creates the target table if absent. When the table already
 // exists, every column touched by a cast rule must match the resolved type:
 // if the existing column's Iceberg type disagrees, a hard error prevents
@@ -398,32 +435,26 @@ func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Id
 // verified for divergence on existing tables.
 func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
 	existing, err := cat.LoadTable(ctx, ident)
-	if err != nil {
-		// Only a genuinely missing table means "create". Any other catalog
-		// error (auth, network) must propagate: treating it as absent would
-		// attempt a create against a table that may already exist.
-		if !errors.Is(err, catalog.ErrNoSuchTable) {
-			return fmt.Errorf("iceberg: load %v: %w", ident, err)
+	switch {
+	case errors.Is(err, catalog.ErrNoSuchTable):
+		created, cerr := createTable(ctx, cat, ident, schema, partitionBy)
+		if cerr != nil {
+			return cerr
 		}
-		opts := []catalog.CreateTableOpt{
-			catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
+		if created {
+			return nil
 		}
-		if len(partitionBy) > 0 {
-			spec, err := buildPartitionSpec(schema, partitionBy)
-			if err != nil {
-				return fmt.Errorf("iceberg: %v: partition spec: %w", ident, err)
-			}
-			opts = append(opts, catalog.WithPartitionSpec(&spec))
+		// A concurrent creator won the race. Reload the winning table and
+		// validate it exactly as if it had existed all along — returning here
+		// would skip the cast and partition-spec divergence checks below.
+		existing, err = cat.LoadTable(ctx, ident)
+		if err != nil {
+			return fmt.Errorf("iceberg: load %v after a create race: %w", ident, err)
 		}
-		if _, err := cat.CreateTable(ctx, ident, schema, opts...); err != nil {
-			// A concurrent creator won the race — the table exists, which is
-			// all EnsureTable promises.
-			if errors.Is(err, catalog.ErrTableAlreadyExists) {
-				return nil
-			}
-			return fmt.Errorf("iceberg: create %v: %w", ident, err)
-		}
-		return nil
+	case err != nil:
+		// Any other catalog error (auth, network) must propagate: treating it
+		// as absent would attempt a create against a table that may exist.
+		return fmt.Errorf("iceberg: load %v: %w", ident, err)
 	}
 	// Table exists — verify cast divergence and partition spec divergence.
 	existSchema := existing.Schema()

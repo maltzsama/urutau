@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/table"
 
@@ -74,5 +75,34 @@ func TestAppendColumnRejectsInt32Overflow(t *testing.T) {
 	defer arr.Release()
 	if arr.Value(0) != 42 || arr.Value(1) != 7 {
 		t.Fatalf("values = %d, %d; want 42, 7", arr.Value(0), arr.Value(1))
+	}
+}
+
+// createErrCatalog is a catalog.Catalog whose CreateTable always fails with
+// err, so createTable's already-exists tolerance is testable in isolation.
+type createErrCatalog struct {
+	catalog.Catalog
+	err error
+}
+
+func (c createErrCatalog) CreateTable(context.Context, table.Identifier, *iceberg.Schema, ...catalog.CreateTableOpt) (*table.Table, error) {
+	return nil, c.err
+}
+
+// createTable must report a lost create race (ErrTableAlreadyExists) as
+// "not created, no error" so EnsureTable reloads and validates the winner,
+// and must propagate any other error.
+func TestCreateTableToleratesAlreadyExists(t *testing.T) {
+	ident := table.Identifier{"raw", "t"}
+	schema := testSchema(t)
+
+	created, err := createTable(context.Background(), createErrCatalog{err: catalog.ErrTableAlreadyExists}, ident, schema, nil)
+	if created || err != nil {
+		t.Fatalf("createTable(already exists) = %v, %v; want false, nil", created, err)
+	}
+
+	boom := errors.New("boom")
+	if _, err := createTable(context.Background(), createErrCatalog{err: boom}, ident, schema, nil); !errors.Is(err, boom) {
+		t.Fatalf("createTable(boom) = %v, want boom", err)
 	}
 }
