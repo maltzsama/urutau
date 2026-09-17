@@ -3,7 +3,9 @@ package iceberg
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"time"
@@ -222,8 +224,13 @@ func (s *Sink) commitStagedProps(ctx context.Context, ident table.Identifier, po
 // sequence, so the equality delete (sequence S) applies only to rows written
 // before it (sequence < S) and never erases the rows committed with it.
 func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes, appends []iceberg.DataFile, pos, snapshotState string, snapshotPending []uint32) error {
+	// The cycle's identity rides the snapshot properties so a retry after a
+	// lost catalog response can tell the commit already landed instead of
+	// re-adding the same files — appends are not idempotent (issue #123).
+	key := cycleKey(deletes, appends, pos)
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
+	p["cdc.cycle"] = key
 
 	var lastErr error
 	for attempt := 0; attempt < maxCommitTries; attempt++ {
@@ -239,6 +246,9 @@ func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes
 			}
 			lastErr = err
 			continue
+		}
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
 		rd := txn.NewRowDelta(p)
@@ -289,6 +299,34 @@ func addSnapshotProps(p iceberg.Properties, state string, pending []uint32) {
 	if pending != nil {
 		p["cdc.snapshot.pending"] = snapshot.EncodePending(pending)
 	}
+}
+
+// cycleKey is a stable identity for one staged cycle: its file paths plus the
+// position. It is written to the commit's snapshot properties so a retry can
+// detect that a previous attempt already committed (issue #123).
+func cycleKey(deletes, appends []iceberg.DataFile, pos string) string {
+	h := sha256.New()
+	for _, df := range deletes {
+		_, _ = h.Write([]byte(df.FilePath()))
+		_, _ = h.Write([]byte{0})
+	}
+	for _, df := range appends {
+		_, _ = h.Write([]byte(df.FilePath()))
+		_, _ = h.Write([]byte{0})
+	}
+	_, _ = h.Write([]byte(pos))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// cycleCommitted reports whether the cycle is already durable: the table
+// already holds its position (the fast path, written atomically with the
+// files) or its head snapshot carries the cycle key. A retry that sees either
+// must not re-add the files — appends are not idempotent. Pure, for tests.
+func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key, pos string) bool {
+	if pos != "" && props["cdc.position"] == pos {
+		return true
+	}
+	return head != nil && head.Summary != nil && head.Summary.Properties["cdc.cycle"] == key
 }
 
 // encodeStaged frames a payload as its opaque descriptor: a magic byte, a

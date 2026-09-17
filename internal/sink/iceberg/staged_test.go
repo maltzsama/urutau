@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
 )
 
 // C5.1/C5.2: the descriptor framing is a magic byte, the spec/schema
@@ -114,4 +115,43 @@ func testSchema(t *testing.T) *iceberg.Schema {
 	return iceberg.NewSchema(0, iceberg.NestedField{
 		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true,
 	})
+}
+
+// TestCycleCommittedDetectsALandedCommit pins issue #123: a retry after a lost
+// catalog response must not re-add the cycle's files (appends are not
+// idempotent).
+func TestCycleCommittedDetectsALandedCommit(t *testing.T) {
+	key := cycleKey(nil, nil, "gtid:1-9")
+	if key == "" {
+		t.Fatal("cycleKey must be non-empty")
+	}
+	if cycleKey(nil, nil, "gtid:1-9") != key {
+		t.Fatal("cycleKey must be stable")
+	}
+	if cycleKey(nil, nil, "gtid:1-10") == key {
+		t.Fatal("different positions must yield different cycle keys")
+	}
+
+	// Fast path: the table already holds the cycle's position.
+	if !cycleCommitted(iceberg.Properties{"cdc.position": "gtid:1-9"}, nil, key, "gtid:1-9") {
+		t.Fatal("a table already holding the cycle's position must be detected")
+	}
+	// The head snapshot carries the cycle key.
+	head := &table.Snapshot{SnapshotID: 7, Summary: &table.Summary{
+		Operation:  table.OpAppend,
+		Properties: iceberg.Properties{"cdc.cycle": key},
+	}}
+	if !cycleCommitted(nil, head, key, "") {
+		t.Fatal("a head snapshot carrying the cycle key must be detected")
+	}
+	// Nothing committed yet, or a different cycle.
+	if cycleCommitted(nil, nil, key, "gtid:1-9") {
+		t.Fatal("an uncommitted cycle must not be reported as committed")
+	}
+	other := &table.Snapshot{SnapshotID: 8, Summary: &table.Summary{
+		Properties: iceberg.Properties{"cdc.cycle": "other"},
+	}}
+	if cycleCommitted(nil, other, key, "") {
+		t.Fatal("a different cycle key must not match")
+	}
 }
