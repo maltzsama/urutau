@@ -452,3 +452,66 @@ func (r *relay) gatedCount() int {
 	defer r.gateMu.Unlock()
 	return len(r.gateBuf)
 }
+
+// failingReader yields nBatches nil-free batches and then fails, modelling a
+// source that breaks mid-stream (a dropped plugin connection, a replication
+// slot error) rather than reaching a clean end of stream.
+type failingReader struct {
+	remaining int
+	err       error
+}
+
+func (f *failingReader) Next(context.Context) (*dataplane.Batch, error) {
+	if f.remaining > 0 {
+		f.remaining--
+
+		return nil, nil // no batch, no error: relay treats nil as end-of-stream
+	}
+
+	return nil, f.err
+}
+
+func (f *failingReader) Start(context.Context, position.Position) error    { return nil }
+func (f *failingReader) Synced() position.Position                         { return nil }
+func (f *failingReader) Master(context.Context) (position.Position, error) { return nil, nil }
+func (f *failingReader) OpenWindow(context.Context, uint32)                {}
+func (f *failingReader) ClearWindow()                                      {}
+func (f *failingReader) Close()                                            {}
+func (f *failingReader) SetConfirmed(func() position.Position)             {}
+
+// A source failure must reach the Runner, not be swallowed as a clean end of
+// stream. relay.run pulls batches in a goroutine and signals completion by
+// closing the channel, which cannot by itself distinguish "the source ended"
+// from "the source broke" — so a discarded Next error would end the pipeline
+// as a successful run with silently truncated data.
+//
+// This is the same failure class as the plugin reader's io.EOF fix one layer
+// up: propagating the error there accomplishes nothing if the relay drops it
+// here.
+func TestRelayPropagatesSourceError(t *testing.T) {
+	ingest := make(chan worker.Ingest, 8)
+	w := worker.New(worker.Config{MaxRows: 100, MaxInterval: time.Hour})
+	r := newRelay(ingest, w)
+
+	wantErr := errors.New("source connection lost mid-stream")
+	err := r.run(context.Background(), &failingReader{err: wantErr})
+
+	if err == nil {
+		t.Fatal("relay.run = nil on a source failure — a broken stream must not look like a clean end of stream")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("relay.run = %v, want it to wrap %v", err, wantErr)
+	}
+}
+
+// The clean case must stay clean: a reader that ends by returning a nil
+// batch (no error) is a successful end of stream, not a failure.
+func TestRelayCleanEndOfStreamIsNotAnError(t *testing.T) {
+	ingest := make(chan worker.Ingest, 8)
+	w := worker.New(worker.Config{MaxRows: 100, MaxInterval: time.Hour})
+	r := newRelay(ingest, w)
+
+	if err := r.run(context.Background(), &failingReader{err: nil}); err != nil {
+		t.Fatalf("relay.run = %v on a clean end of stream, want nil", err)
+	}
+}

@@ -194,10 +194,25 @@ func pluginRecordToWire(rec arrow.RecordBatch, alloc memory.Allocator) (arrow.Re
 	if err := wantColumn(schema, offsetIdx, "offset", "binary"); err != nil {
 		return nil, err
 	}
+	// ts_source's unit is read from the schema rather than assumed:
+	// Type.Name() is "timestamp" for every unit, so a record declaring
+	// milliseconds or nanoseconds passes a name-only check and then gets
+	// decoded with the wrong tick size. That is silent corruption, not a
+	// failure — a millisecond record decoded as microseconds lands in 1970,
+	// a nanosecond one in the year 58681. internal/plugin/sink.go writes
+	// microseconds, but this is the public plugin contract: a third-party
+	// client may legitimately send another unit, and decoding it by its own
+	// declaration is both safer and more permissive than rejecting it.
+	tsUnit := arrow.Microsecond
 	if tsIdx >= 0 {
 		if err := wantColumn(schema, tsIdx, "ts_source", "timestamp"); err != nil {
 			return nil, err
 		}
+		tsType, ok := schema.Field(tsIdx).Type.(*arrow.TimestampType)
+		if !ok {
+			return nil, fmt.Errorf("plugin sink record column %q: not an Arrow timestamp type", "ts_source")
+		}
+		tsUnit = tsType.Unit
 	}
 	for _, name := range dataCols {
 		if err := wantColumn(schema, fieldIndex(schema, name), name, "utf8"); err != nil {
@@ -222,7 +237,7 @@ func pluginRecordToWire(rec arrow.RecordBatch, alloc memory.Allocator) (arrow.Re
 		if tsIdx >= 0 {
 			tsCol := rec.Column(tsIdx).(*array.Timestamp)
 			if !tsCol.IsNull(i) {
-				ts = tsCol.Value(i).ToTime(arrow.Microsecond).UTC()
+				ts = tsCol.Value(i).ToTime(tsUnit).UTC()
 			}
 		}
 

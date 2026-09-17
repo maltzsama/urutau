@@ -187,11 +187,21 @@ func (r *relay) drainGate(ctx context.Context) (bool, error) {
 // window). Release drains decoded events ahead of the Closes marker.
 func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 	batchCh := make(chan *dataplane.Batch, 16)
+	// readErr carries the puller's failure to the consumer below. A closed
+	// batchCh alone cannot distinguish "the source ended" from "the source
+	// broke": discarding the error here would let a mid-stream failure end
+	// the pipeline as a clean, successful run with silently truncated data —
+	// the same class of bug fixed in the plugin reader, one layer up. Written
+	// once before close(batchCh), read only after the channel is drained, so
+	// the close/read pair carries the happens-before edge.
+	var readErr error
 	go func() {
 		defer close(batchCh)
 		for {
 			b, err := rdr.Next(ctx)
 			if err != nil {
+				readErr = err
+
 				return
 			}
 			if b == nil {
@@ -217,7 +227,8 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 				if _, err := r.drainGate(ctx); err != nil {
 					return err
 				}
-				return nil
+
+				return readErr // nil on a clean end of stream
 			}
 			if r.gate(b) {
 				continue
