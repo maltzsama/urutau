@@ -8,9 +8,8 @@ import (
 	"sync"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/maintenance"
@@ -19,21 +18,29 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
-// maintenanceScheduler owns the ephemeral maintenance workers. It provisions
-// one worker per table — a Deployment, exactly like the data workers, from
-// the table's own pod template — and pushes a MaintenanceAssignment to a
-// connected worker when a maintenance turn is due. The worker runs the pass
-// and exits; its Deployment restarts it for the next turn. The coordinator
-// never runs maintenance in its own process, and never supervises these
-// workers for acks (they have no data plane).
+// maintenanceScheduler owns the ephemeral maintenance workers, one per
+// table. Unlike the data workers, a maintenance worker is not kept running:
+// tick provisions a bare Pod (restartPolicy: Never) for a table only when a
+// turn is due, and session deletes that Pod once the worker's pass ends —
+// so the pod that shows up in `kubectl get pods` exists only for the
+// duration of one pass, not forever. The coordinator never runs maintenance
+// in its own process, and never supervises these workers for acks (they
+// have no data plane).
 type maintenanceScheduler struct {
 	c     *Coordinator
 	cfg   *spec.Maintenance
 	sched *maintenance.Schedule
 
+	// k8s is nil when Kubernetes worker provisioning is off (no worker pod
+	// template) — tick then has nothing to provision and is a no-op.
+	k8s       kubernetes.Interface
+	namespace string
+	owner     metav1.OwnerReference
+
 	mu     sync.Mutex
 	tables map[string]string                      // worker name -> table
-	out    map[string]chan *pb.CoordinatorMessage // worker name -> assignment channel
+	active map[string]bool                        // worker name -> Pod exists (provisioned, not yet cleaned up)
+	out    map[string]chan *pb.CoordinatorMessage // worker name -> assignment channel, once connected
 }
 
 func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenanceScheduler {
@@ -42,16 +49,17 @@ func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenance
 		cfg:    cfg,
 		sched:  maintenance.NewSchedule(),
 		tables: map[string]string{},
+		active: map[string]bool{},
 		out:    map[string]chan *pb.CoordinatorMessage{},
 	}
 }
 
 // startMaintenance wires the maintenance scheduler. It registers one
-// maintenance worker per table, provisions their Deployments when Kubernetes
-// worker provisioning is on, and starts the push loop. Without Kubernetes
-// (no worker pod template) it still registers the workers but there is
-// nothing to launch — the collapsed runner's in-process path is the only
-// option there, and it is not this code.
+// maintenance worker per table and starts the tick loop that provisions an
+// ephemeral Pod for a table whenever its next turn comes due. Without
+// Kubernetes (no worker pod template) it still registers the workers but
+// there is nothing to launch — the collapsed runner's in-process path is
+// the only option there, and it is not this code.
 //
 // Metrics: the pass runs in the worker's process, which is ephemeral, so the
 // worker reports the outcome back over the control stream and recordResult
@@ -72,9 +80,11 @@ func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[st
 		c.log.Warn("coordinator: maintenance enabled but no worker pod template — no maintenance worker will run (Kubernetes provisioning is off)")
 		return nil
 	}
-	if err := c.provisionMaintenanceWorkers(m); err != nil {
-		return err
+	clientset, ns, owner, err := inClusterClient(context.Background())
+	if err != nil {
+		return fmt.Errorf("k8s maintenance provisioning: %w", err)
 	}
+	m.k8s, m.namespace, m.owner = clientset, ns, owner
 	go m.run(c.runCtx)
 	return nil
 }
@@ -113,11 +123,31 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	}
 	out := make(chan *pb.CoordinatorMessage, 1)
 	m.out[name] = out
+	// This worker's Pod exists only because a turn was due when tick
+	// provisioned it; hand over that assignment immediately rather than
+	// making the freshly-started worker idle until the next tick.
+	due := m.sched.Due(table, m.cfg, time.Now())
+	if len(due) > 0 {
+		if msg, err := m.assignment(table, due); err == nil {
+			out <- msg
+			m.sched.MarkRun(table, due, time.Now())
+		} else {
+			m.c.log.Warn("coordinator: maintenance: build assignment", "table", table, "err", err)
+		}
+	}
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
 		delete(m.out, name)
+		delete(m.active, name)
 		m.mu.Unlock()
+		// The worker exits right after this session ends; delete its Pod so
+		// it terminates instead of being restarted by Kubernetes.
+		if m.k8s != nil {
+			if err := deletePod(context.Background(), m.k8s, m.namespace, name); err != nil {
+				m.c.log.Warn("coordinator: maintenance: delete worker pod", "worker", name, "err", err)
+			}
+		}
 	}()
 	m.c.log.Info("coordinator: maintenance worker connected", "worker", name, "table", table)
 
@@ -167,29 +197,66 @@ func (m *maintenanceScheduler) run(ctx context.Context) {
 	}
 }
 
-// tick sends each connected worker the operations due for its table. A
+// tick, for every table with a turn due, either hands the assignment to a
+// connected worker or — if no worker is connected or already being
+// provisioned for it — provisions a fresh ephemeral Pod for that table. A
 // worker that already has an assignment in flight (channel full) is skipped
 // until the next tick — the operation stays due, so nothing is lost.
 func (m *maintenanceScheduler) tick(now time.Time) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for name, out := range m.out {
-		table := m.tables[name]
+	type toProvision struct{ name, table string }
+	var provision []toProvision
+	for name, table := range m.tables {
 		due := m.sched.Due(table, m.cfg, now)
 		if len(due) == 0 {
 			continue
 		}
-		msg, err := m.assignment(table, due)
-		if err != nil {
-			m.c.log.Warn("coordinator: maintenance: build assignment", "table", table, "err", err)
+		if out, connected := m.out[name]; connected {
+			msg, err := m.assignment(table, due)
+			if err != nil {
+				m.c.log.Warn("coordinator: maintenance: build assignment", "table", table, "err", err)
+				continue
+			}
+			select {
+			case out <- msg:
+				m.sched.MarkRun(table, due, now)
+			default:
+			}
 			continue
 		}
-		select {
-		case out <- msg:
-			m.sched.MarkRun(table, due, now)
-		default:
+		if m.active[name] || m.k8s == nil {
+			continue
+		}
+		m.active[name] = true
+		provision = append(provision, toProvision{name, table})
+	}
+	m.mu.Unlock()
+
+	for _, p := range provision {
+		if err := m.provisionWorkerPod(p.name, p.table); err != nil {
+			m.c.log.Warn("coordinator: maintenance: provision worker pod", "worker", p.name, "table", p.table, "err", err)
+			m.mu.Lock()
+			delete(m.active, p.name)
+			m.mu.Unlock()
 		}
 	}
+}
+
+// provisionWorkerPod creates the ephemeral Pod for one due table's
+// maintenance worker. The Pod connects to the coordinator on its own, is
+// served its assignment by tick (or session, if it races the next tick),
+// and is deleted by session once its pass ends.
+func (m *maintenanceScheduler) provisionWorkerPod(name, table string) error {
+	tmpl, err := loadWorkerPodTemplate(table)
+	if err != nil {
+		return err
+	}
+	pod := maintenanceWorkerPod(name, m.namespace, m.owner, tmpl)
+	if err := createPod(context.Background(), m.k8s, m.namespace, pod); err != nil {
+		return err
+	}
+	m.c.log.Info("coordinator: maintenance worker pod provisioned", "worker", name, "table", table)
+	return nil
 }
 
 // assignment renders one table's due operations into a wire assignment. The
@@ -245,46 +312,6 @@ func (m *maintenanceScheduler) recordResult(table string, res *pb.MaintenanceRes
 			}
 		}
 	}
-}
-
-// provisionMaintenanceWorkers ensures one maintenance worker Deployment per
-// table, cloning that table's own worker pod template — the same template
-// the data workers use, so catalog credentials, image, ServiceAccount and
-// resources all match.
-func (c *Coordinator) provisionMaintenanceWorkers(m *maintenanceScheduler) error {
-	m.mu.Lock()
-	names := make(map[string]string, len(m.tables))
-	for name, table := range m.tables {
-		names[name] = table
-	}
-	m.mu.Unlock()
-
-	clientset, ns, owner, err := inClusterClient(context.Background())
-	if err != nil {
-		return fmt.Errorf("k8s maintenance provisioning: %w", err)
-	}
-	for name, table := range names {
-		tmpl, err := loadWorkerPodTemplate(table)
-		if err != nil {
-			return fmt.Errorf("k8s maintenance provisioning: %s: %w", table, err)
-		}
-		dep := maintenanceWorkerDeployment(name, ns, owner, tmpl)
-		if err := ensureDeployment(context.Background(), clientset, ns, dep); err != nil {
-			return fmt.Errorf("k8s maintenance provisioning: %s: %w", name, err)
-		}
-		c.log.Info("coordinator: maintenance worker deployment ensured", "worker", name, "table", table)
-	}
-	return nil
-}
-
-// maintenanceWorkerDeployment is the data worker Deployment plus the
-// --maintenance flag, so the same pod template serves both.
-func maintenanceWorkerDeployment(name, namespace string, owner metav1.OwnerReference, tmpl corev1.PodTemplateSpec) *appsv1.Deployment {
-	dep := workerDeployment(name, namespace, owner, tmpl)
-	for i := range dep.Spec.Template.Spec.Containers {
-		dep.Spec.Template.Spec.Containers[i].Args = append(dep.Spec.Template.Spec.Containers[i].Args, "--maintenance")
-	}
-	return dep
 }
 
 // maintenanceWorkerName derives a DNS-1123 worker name from the pipeline and

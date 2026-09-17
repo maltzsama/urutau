@@ -27,13 +27,14 @@ rules:
   # The per-pipeline coordinator Role grants these to the coordinator's own
   # ServiceAccount. RBAC forbids granting what you do not hold, so the
   # operator must hold them too — it never uses deployments/pods itself (the
-  # coordinator creates the worker Deployments and reads worker Pods).
+  # coordinator creates the worker Deployments, and creates/deletes the
+  # ephemeral maintenance worker Pods — issue #105).
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "create", "update"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get"]
+    verbs: ["get", "create", "delete"]
   # ConfigMap carries the resolved spec; the Service is the coordinator's
   # headless stable identity. Delete flows through owner-reference GC.
   - apiGroups: [""]

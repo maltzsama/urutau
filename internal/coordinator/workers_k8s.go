@@ -208,4 +208,53 @@ func ensureDeployment(ctx context.Context, cs kubernetes.Interface, namespace st
 	return err
 }
 
+// maintenanceWorkerPod is the data worker's own Pod template plus the
+// --maintenance flag, run as a bare Pod with restartPolicy: Never instead of
+// a Deployment: the maintenance worker connects, runs its assigned pass
+// once, and exits — it must terminate, not restart. The coordinator creates
+// one of these per due turn and deletes it once the worker's session ends.
+func maintenanceWorkerPod(name, namespace string, owner metav1.OwnerReference, tmpl corev1.PodTemplateSpec) *corev1.Pod {
+	tmpl = *tmpl.DeepCopy()
+	if tmpl.Labels == nil {
+		tmpl.Labels = map[string]string{}
+	}
+	tmpl.Labels["urutau.io/worker"] = name
+	tmpl.Spec.RestartPolicy = corev1.RestartPolicyNever
+	for i := range tmpl.Spec.Containers {
+		tmpl.Spec.Containers[i].Args = append(tmpl.Spec.Containers[i].Args, "--maintenance", "--name", name)
+	}
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			Labels:          tmpl.Labels,
+			OwnerReferences: []metav1.OwnerReference{owner},
+		},
+		Spec: tmpl.Spec,
+	}
+}
+
+// createPod creates the Pod, tolerating AlreadyExists — the coordinator may
+// retry a tick before the previous create's result is known, or a stale Pod
+// from a prior coordinator generation may still be terminating.
+func createPod(ctx context.Context, cs kubernetes.Interface, namespace string, pod *corev1.Pod) error {
+	_, err := cs.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+// deletePod removes the ephemeral maintenance worker's Pod once its pass
+// ends (the session it held closes). A Pod that is already gone is not an
+// error — nothing left to clean up.
+func deletePod(ctx context.Context, cs kubernetes.Interface, namespace, name string) error {
+	err := cs.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
 func int32Ptr(v int32) *int32 { return &v }

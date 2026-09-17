@@ -33,12 +33,14 @@ func TestMaintenanceWorkerNameSanitizes(t *testing.T) {
 	}
 }
 
-// The maintenance Deployment clones the table's worker pod template and adds
-// only the --maintenance flag: the worker connects to the coordinator for its
-// assignment, so it needs no table/ops/config on the command line. The
-// caller's template must not be mutated — it is reused for the table's data
-// worker Deployments.
-func TestMaintenanceWorkerDeploymentAddsFlag(t *testing.T) {
+// The maintenance Pod clones the table's worker pod template, sets
+// restartPolicy: Never (issue #105 — a Deployment's pod always restarts,
+// which made a one-shot maintenance worker restart-loop forever instead of
+// terminating), and adds the --maintenance flag: the worker connects to the
+// coordinator for its assignment, so it needs no table/ops/config on the
+// command line. The caller's template must not be mutated — it is reused
+// for the table's data worker Deployments.
+func TestMaintenanceWorkerPodIsEphemeral(t *testing.T) {
 	tmpl := corev1.PodTemplateSpec{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
@@ -49,15 +51,15 @@ func TestMaintenanceWorkerDeploymentAddsFlag(t *testing.T) {
 		},
 	}
 	owner := metav1.OwnerReference{Name: "coord-pod", Kind: "Pod"}
-	dep := maintenanceWorkerDeployment("shop-raw-orders-maint", "raw", owner, tmpl)
+	pod := maintenanceWorkerPod("shop-raw-orders-maint", "raw", owner, tmpl)
 
-	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != 1 {
-		t.Errorf("Replicas = %v, want 1", dep.Spec.Replicas)
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("RestartPolicy = %v, want Never — a one-shot worker must not be restarted", pod.Spec.RestartPolicy)
 	}
-	if len(dep.OwnerReferences) != 1 || dep.OwnerReferences[0].Name != "coord-pod" {
-		t.Errorf("OwnerReferences = %v, want the coordinator pod (GC on pod death)", dep.OwnerReferences)
+	if len(pod.OwnerReferences) != 1 || pod.OwnerReferences[0].Name != "coord-pod" {
+		t.Errorf("OwnerReferences = %v, want the coordinator pod (GC on pod death)", pod.OwnerReferences)
 	}
-	ctr := dep.Spec.Template.Spec.Containers[0]
+	ctr := pod.Spec.Containers[0]
 	if !hasArg(ctr.Args, "--maintenance") {
 		t.Errorf("args = %v, want --maintenance", ctr.Args)
 	}

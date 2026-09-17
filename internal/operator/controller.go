@@ -333,14 +333,18 @@ func coordinatorServiceAccount(cr *urutauv1alpha1.CDCPipeline) *corev1.ServiceAc
 // namespace. The contract is that the coordinator, not the operator, writes
 // its status.
 //
-// It also grants Deployment management and reading its own Pod: the
-// coordinator, not the operator, provisions the worker Deployments it
-// needs (spec.Table.WorkerGroupNames), and reads its own Pod to set the
-// ownerReference that cascades their GC when the coordinator dies. This
-// is namespace-wide on deployments (no resourceNames) because a
-// Deployment doesn't exist yet when the coordinator boots and needs to
-// create it — an accepted scope matching the same pattern the operator's
-// own ClusterRole already uses for statefulsets/configmaps/services.
+// It also grants Deployment management for the long-lived data workers, and
+// Pod management for the ephemeral maintenance workers (issue #105): a
+// maintenance worker is a bare Pod (restartPolicy: Never) the coordinator
+// creates when a turn is due and deletes once the pass ends, not a
+// Deployment — a Deployment's restartPolicy is always Always, which is what
+// made those workers restart-loop forever instead of terminating. It also
+// reads its own Pod to set the ownerReference that cascades GC of
+// everything it provisions when the coordinator dies. This is
+// namespace-wide (no resourceNames) because neither a worker Deployment nor
+// a maintenance Pod exists yet when the coordinator boots and needs to
+// create it — matching the same pattern the operator's own ClusterRole
+// already uses for statefulsets/configmaps/services.
 func coordinatorRole(cr *urutauv1alpha1.CDCPipeline) *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: coordinatorName(cr), Namespace: cr.Namespace,
@@ -360,7 +364,7 @@ func coordinatorRole(cr *urutauv1alpha1.CDCPipeline) *rbacv1.Role {
 			{
 				APIGroups: []string{""},
 				Resources: []string{"pods"},
-				Verbs:     []string{"get"},
+				Verbs:     []string{"get", "create", "delete"},
 			},
 		},
 	}
