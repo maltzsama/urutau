@@ -8,12 +8,12 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -41,7 +41,7 @@ func (w *TableWriter) projectRecord(ctx context.Context, b *dataplane.Batch) (ar
 
 	for i, f := range fields {
 		if m, ok := w.metaByName[f.Name]; ok {
-			col, err := w.buildMetaColumn(src, m.From, nrows)
+			col, err := w.buildMetaColumn(src, m.From, f, nrows)
 			if err != nil {
 				releaseCols(cols, i)
 				return nil, fmt.Errorf("iceberg: metadata %q: %w", f.Name, err)
@@ -128,8 +128,11 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.B
 
 // buildMetaColumn builds one metadata column from the wire columns or a
 // constant. Value mapping mirrors the row-based metaValue (CR-069 §3.6:
-// project, don't compute, what already exists).
-func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKey, nrows int64) (arrow.Array, error) {
+// project, don't compute, what already exists). The target field carries the
+// Arrow type the column MUST have: array.NewRecordBatch panics on any
+// column/field type mismatch, so every branch — including the nulls — is
+// typed from field, never from a fixed guess.
+func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKey, field arrow.Field, nrows int64) (arrow.Array, error) {
 	switch key {
 	case core.MetaOp:
 		opCol, err := uint8Column(src, "__op")
@@ -152,10 +155,10 @@ func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKe
 		return posCol, nil
 
 	case core.MetaCommitTS:
-		return timestampColumn(src, "__commit_ts")
+		return timestampColumn(src, "__commit_ts", field.Type)
 
 	case core.MetaIngestTS:
-		return timestampColumn(src, "__ingest_ts")
+		return timestampColumn(src, "__ingest_ts", field.Type)
 
 	case core.MetaPhase:
 		// __phase rides the wire (born at the source); project it straight.
@@ -170,12 +173,16 @@ func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKe
 		return constString(src.NumRows(), w.sourceTable), nil
 
 	default:
-		// shard, msg_ts, msg_key, headers, enrich_miss: null (CDC sources
-		// carry none of these).
-		return nullString(src.NumRows()), nil
+		// shard, msg_ts, msg_key, headers, enrich_miss: null. msg_ts is a
+		// timestamp and enrich_miss a bool, so the null must be built in the
+		// FIELD's type — a utf8 null would panic NewRecordBatch. (msg_ts is
+		// NULL for CDC by design; enrich_miss's value is not on the wire yet,
+		// so this is a typed NULL rather than the change's flag.)
+		return nullColumn(field.Type, src.NumRows()), nil
 	}
 }
 
+// releaseCols releases the columns built so far (the first upTo entries).
 func releaseCols(cols []arrow.Array, upTo int) {
 	for i := range upTo {
 		if cols[i] != nil {
@@ -184,6 +191,7 @@ func releaseCols(cols []arrow.Array, upTo int) {
 	}
 }
 
+// colIndexByName returns the index of the field named name, or -1.
 func colIndexByName(s *arrow.Schema, name string) int {
 	for i := range s.NumFields() {
 		if s.Field(i).Name == name {
@@ -193,6 +201,8 @@ func colIndexByName(s *arrow.Schema, name string) int {
 	return -1
 }
 
+// uint8Column returns the named column as a Uint8 array, or an error when it
+// is missing or the wrong type.
 func uint8Column(src arrow.RecordBatch, name string) (*array.Uint8, error) {
 	idx := colIndexByName(src.Schema(), name)
 	if idx < 0 {
@@ -205,6 +215,8 @@ func uint8Column(src arrow.RecordBatch, name string) (*array.Uint8, error) {
 	return col, nil
 }
 
+// stringColumn returns the named column as a String array, or an error when it
+// is missing or the wrong type.
 func stringColumn(src arrow.RecordBatch, name string) (*array.String, error) {
 	idx := colIndexByName(src.Schema(), name)
 	if idx < 0 {
@@ -217,29 +229,43 @@ func stringColumn(src arrow.RecordBatch, name string) (*array.String, error) {
 	return col, nil
 }
 
-func timestampColumn(src arrow.RecordBatch, name string) (arrow.Array, error) {
+// timestampColumn builds the named wire timestamp column in the target field's
+// unit and zone (dt), preserving the instant; a missing or non-timestamp
+// column becomes a typed null.
+func timestampColumn(src arrow.RecordBatch, name string, dt arrow.DataType) (arrow.Array, error) {
+	target, ok := dt.(*arrow.TimestampType)
+	if !ok {
+		return nil, fmt.Errorf("iceberg: metadata %q: target field is %s, not a timestamp", name, dt)
+	}
 	idx := colIndexByName(src.Schema(), name)
 	if idx < 0 {
-		return nullString(src.NumRows()), nil
+		return nullColumn(target, src.NumRows()), nil
 	}
 	col := src.Column(idx)
 	if col.DataType().ID() != arrow.TIMESTAMP {
-		return nullString(src.NumRows()), nil
+		return nullColumn(target, src.NumRows()), nil
 	}
 	tsCol := col.(*array.Timestamp)
 	unit := tsCol.DataType().(*arrow.TimestampType).Unit
-	bb := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"})
+	// Build in the TARGET field's unit and zone: the wire carries __commit_ts
+	// as ns and __ingest_ts as us, while an Iceberg Timestamptz field is
+	// timestamp[us, UTC]. A hardcoded unit mismatches the schema, which makes
+	// array.NewRecordBatch panic.
+	bb := array.NewTimestampBuilder(memory.DefaultAllocator, target)
 	defer bb.Release()
 	for i := range tsCol.Len() {
 		if tsCol.IsNull(i) {
 			bb.AppendNull()
 			continue
 		}
-		bb.Append(arrow.Timestamp(tsCol.Value(i).ToTime(unit).UnixNano()))
+		// ToTime interprets the raw value with the SOURCE unit; AppendTime
+		// stores it in the target's — the absolute instant is preserved.
+		bb.AppendTime(tsCol.Value(i).ToTime(unit))
 	}
 	return bb.NewTimestampArray(), nil
 }
 
+// changeOpString renders a rowchange op as its wire string.
 func changeOpString(op uint8) string {
 	switch op {
 	case 0:
@@ -251,6 +277,7 @@ func changeOpString(op uint8) string {
 	}
 }
 
+// nullColumn builds an n-row null array of type dt.
 func nullColumn(dt arrow.DataType, n int64) arrow.Array {
 	bb := array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{{Name: "x", Type: dt, Nullable: true}}, nil))
 	defer bb.Release()
@@ -260,20 +287,12 @@ func nullColumn(dt arrow.DataType, n int64) arrow.Array {
 	return bb.Field(0).NewArray()
 }
 
+// constString builds an n-row string array holding v.
 func constString(n int64, v string) arrow.Array {
 	bb := array.NewStringBuilder(memory.DefaultAllocator)
 	defer bb.Release()
 	for range n {
 		bb.Append(v)
-	}
-	return bb.NewStringArray()
-}
-
-func nullString(n int64) arrow.Array {
-	bb := array.NewStringBuilder(memory.DefaultAllocator)
-	defer bb.Release()
-	for range n {
-		bb.AppendNull()
 	}
 	return bb.NewStringArray()
 }
@@ -347,7 +366,11 @@ func extractKeys(batches []*dataplane.Batch, pkCols []string) ([][]any, error) {
 		for r := 0; r < int(b.Record.NumRows()); r++ {
 			key := make([]any, len(pkCols))
 			for i, idx := range idxs {
-				key[i] = scalarValue(b.Record.Column(idx), r)
+				v, err := scalarValue(b.Record.Column(idx), r)
+				if err != nil {
+					return nil, fmt.Errorf("iceberg: PK column %q: %w", pkCols[i], err)
+				}
+				key[i] = v
 			}
 			keys = append(keys, key)
 		}
@@ -359,34 +382,69 @@ func extractKeys(batches []*dataplane.Batch, pkCols []string) ([][]any, error) {
 // the equality-delete key boundary (§4.1) — never on the data path.
 //
 // The value it returns must be one that appendColumn accepts for the PK
-// column's Iceberg type. Iceberg has no unsigned integer, so a KindUInt64
-// column is Decimal(20,0) in the schema (typemap) and on the data path; the
-// delete key must carry the SAME canonical decimal form, not the raw uint64,
-// or the delete path diverges from the data path (one value, one wire
-// representation — the RV-11 family).
-func scalarValue(col arrow.Array, row int) any {
+// column's Iceberg type — deleteRecord feeds it straight back through
+// appendColumn. Iceberg has no unsigned integer, so a KindUInt64 column is
+// Decimal(20,0) in the schema (typemap) and on the data path; the delete key
+// must carry the SAME canonical decimal form, not the raw uint64, or the
+// delete path diverges from the data path (one value, one wire
+// representation — the RV-11 family). Decimal, date and time keys travel as
+// their canonical text, which is what appendColumn's decimal/date/time
+// builders parse. An unhandled array type is an ERROR: returning nil here
+// would write a NULL key that matches no row, so the delete would silently
+// never apply.
+func scalarValue(col arrow.Array, row int) (any, error) {
 	switch c := col.(type) {
 	case *array.Int64:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Int32:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Uint8:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Uint64:
-		return strconv.FormatUint(c.Value(row), 10) // canonical decimal(20,0) text
+		return strconv.FormatUint(c.Value(row), 10), nil // canonical decimal(20,0) text
 	case *array.Float64:
-		return c.Value(row)
+		return c.Value(row), nil
+	case *array.Float32:
+		return c.Value(row), nil
 	case *array.String:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Binary:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.FixedSizeBinary:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Boolean:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Timestamp:
-		return c.Value(row).ToTime(c.DataType().(*arrow.TimestampType).Unit)
+		return c.Value(row).ToTime(c.DataType().(*arrow.TimestampType).Unit), nil
+	case *array.Decimal128:
+		return c.Value(row).ToString(c.DataType().(*arrow.Decimal128Type).Scale), nil
+	case *array.Date32:
+		return time.Unix(int64(c.Value(row))*86400, 0).UTC().Format("2006-01-02"), nil
+	case *array.Time64:
+		// formatTimeOfDay is microsecond-based; the wire carries Time64us, but
+		// normalize defensively so a different unit cannot shift the key.
+		v := int64(c.Value(row))
+		switch c.DataType().(*arrow.Time64Type).Unit {
+		case arrow.Microsecond:
+		case arrow.Nanosecond:
+			v /= 1_000
+		default:
+			return nil, fmt.Errorf("unsupported Time64 unit %s", c.DataType())
+		}
+		return formatTimeOfDay(v), nil
 	default:
-		return nil
+		return nil, fmt.Errorf("unsupported primary-key column type %s", col.DataType())
 	}
+}
+
+// formatTimeOfDay renders microseconds since midnight as the
+// "15:04:05.ffffff" text timeToMicros parses back.
+func formatTimeOfDay(micros int64) string {
+	h := micros / 3_600_000_000
+	micros %= 3_600_000_000
+	m := micros / 60_000_000
+	micros %= 60_000_000
+	s := micros / 1_000_000
+	micros %= 1_000_000
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, micros)
 }

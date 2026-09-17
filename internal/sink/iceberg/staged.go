@@ -3,7 +3,9 @@ package iceberg
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"time"
@@ -28,9 +30,15 @@ var _ sink.StagingWriter = (*TableWriter)(nil)
 // descriptors and it commits them as one unit (WK-001 C5).
 var _ sink.StagedCommitter = (*Sink)(nil)
 
-// stagedMagic frames a WriteStaged descriptor (WK-001 C5). A leading byte so
-// a malformed or foreign payload is rejected before decoding.
-const stagedMagic = 0x57 // 'W'
+// The descriptor is framed by a leading magic byte so a malformed or foreign
+// payload is rejected before decoding. stagedMagicV2 is the current,
+// fingerprinted format; stagedMagic is the pre-fingerprint format released in
+// 0.2.0, still accepted on decode so a rolling upgrade (an old worker's
+// descriptor reaching a new coordinator) does not stall a staged cycle.
+const (
+	stagedMagic   = 0x57 // 'W' — legacy (no spec/schema fingerprint)
+	stagedMagicV2 = 0x58 // 'X' — fingerprinted
+)
 
 // stagedPayload is the decoded form of a WriteStaged descriptor: the delete
 // files and the data files one delivery produced, plus the snapshot state
@@ -127,10 +135,13 @@ func (w *TableWriter) writeDataFiles(ctx context.Context, tbl *table.Table, rec 
 }
 
 // CommitStaged commits one cycle's descriptors as a single unit: every delete
-// file of the cycle in one commit, then every data file in the next, with the
-// cycle's position on the LAST commit (WK-001 §4.2 invariants 3 and 4). The
-// delete-before-append order is mandatory: staged together, iceberg-go gives
-// the delete the higher sequence and it would erase the fresh rows.
+// file and every data file of the cycle land in ONE RowDelta, with the cycle's
+// position on that same commit (WK-001 §4.2 invariants 3 and 4). One RowDelta
+// is the atomic unit — a crash between a separate delete commit and append
+// commit would leave the deletes visible without their fresh rows. Within the
+// snapshot every file shares the snapshot's sequence, so the equality delete
+// (sequence S) applies only to rows written before it (sequence < S) and never
+// erases the rows committed with it.
 //
 // The snapshot state travels in the descriptors; the last non-empty one wins
 // (all deliveries of a binlog batch share it).
@@ -208,7 +219,7 @@ func (s *Sink) commitStagedProps(ctx context.Context, ident table.Identifier, po
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: staged property commit on %v: %v", ErrCommitExhausted, ident, lastErr)
+	return fmt.Errorf("%w: staged property commit on %v: %w", ErrCommitExhausted, ident, lastErr)
 }
 
 // commitStaged commits a cycle's delete AND data files as ONE atomic snapshot
@@ -219,8 +230,13 @@ func (s *Sink) commitStagedProps(ctx context.Context, ident table.Identifier, po
 // sequence, so the equality delete (sequence S) applies only to rows written
 // before it (sequence < S) and never erases the rows committed with it.
 func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes, appends []iceberg.DataFile, pos, snapshotState string, snapshotPending []uint32) error {
+	// The cycle's identity rides the snapshot properties so a retry after a
+	// lost catalog response can tell the commit already landed instead of
+	// re-adding the same files — appends are not idempotent (issue #123).
+	key := cycleKey(deletes, appends, pos)
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
+	p["cdc.cycle"] = key
 
 	var lastErr error
 	for attempt := 0; attempt < maxCommitTries; attempt++ {
@@ -236,6 +252,9 @@ func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes
 			}
 			lastErr = err
 			continue
+		}
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
 		rd := txn.NewRowDelta(p)
@@ -267,7 +286,7 @@ func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: staged commit on %v: %v", ErrCommitExhausted, ident, lastErr)
+	return fmt.Errorf("%w: staged commit on %v: %w", ErrCommitExhausted, ident, lastErr)
 }
 
 // maxCommitTries and stagedBackoff mirror the TableWriter's retry policy for
@@ -288,12 +307,47 @@ func addSnapshotProps(p iceberg.Properties, state string, pending []uint32) {
 	}
 }
 
-// encodeStaged frames a payload as its opaque descriptor. The partition
-// spec, schema and format version are re-supplied by the decoder from the
-// table (they belong to the table, not the descriptor).
+// cycleKey is a stable identity for one staged cycle: its file paths plus the
+// position. It is written to the commit's snapshot properties so a retry can
+// detect that a previous attempt already committed (issue #123).
+func cycleKey(deletes, appends []iceberg.DataFile, pos string) string {
+	h := sha256.New()
+	for _, df := range deletes {
+		_, _ = h.Write([]byte(df.FilePath()))
+		_, _ = h.Write([]byte{0})
+	}
+	for _, df := range appends {
+		_, _ = h.Write([]byte(df.FilePath()))
+		_, _ = h.Write([]byte{0})
+	}
+	_, _ = h.Write([]byte(pos))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// cycleCommitted reports whether the cycle is already durable: the table
+// already holds its position (the fast path, written atomically with the
+// files) or its head snapshot carries the cycle key. A retry that sees either
+// must not re-add the files — appends are not idempotent. Pure, for tests.
+func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key, pos string) bool {
+	if pos != "" && props["cdc.position"] == pos {
+		return true
+	}
+	return head != nil && head.Summary != nil && head.Summary.Properties["cdc.cycle"] == key
+}
+
+// encodeStaged frames a payload as its opaque descriptor: a magic byte, a
+// fingerprint of the partition spec and schema the files were encoded against,
+// the snapshot state (string + pending list) and two length-prefixed file
+// lists (deletes, appends).
 func encodeStaged(p stagedPayload, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteByte(stagedMagic)
+	buf.WriteByte(stagedMagicV2)
+	// The decoder re-supplies the table's CURRENT spec and schema; a change
+	// between staging and commit makes iceberg-go's codec silently mis-type
+	// partition values, so fingerprint both and reject a mismatch loudly
+	// (issue #124).
+	writeUint32(&buf, uint32(spec.ID()))
+	writeString(&buf, schemaString(schema))
 	writeString(&buf, p.snapshotState)
 	writeUint32List(&buf, p.snapshotPending)
 	if err := writeFileList(&buf, p.deletes, spec, schema, version); err != nil {
@@ -305,13 +359,63 @@ func encodeStaged(p stagedPayload, spec iceberg.PartitionSpec, schema *iceberg.S
 	return buf.Bytes(), nil
 }
 
-// decodeStaged is the inverse of encodeStaged; spec, schema and version must
-// be the table's, matching the encoder.
+// schemaString renders a schema for the descriptor fingerprint. A nil schema
+// (tests, or an unpartitioned edge) is the empty string.
+func schemaString(schema *iceberg.Schema) string {
+	if schema == nil {
+		return ""
+	}
+	return schema.String()
+}
+
+// decodeStaged decodes a descriptor, dispatching on the leading magic: the
+// fingerprinted v2 format or the pre-fingerprint legacy one (accepted so a
+// mixed-version rolling upgrade keeps committing). spec, schema and version
+// are the table's current ones; v2 checks them against the fingerprint.
 func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
-	if len(data) < 1 || data[0] != stagedMagic {
+	if len(data) < 1 {
+		return stagedPayload{}, fmt.Errorf("staged descriptor: empty")
+	}
+	switch data[0] {
+	case stagedMagicV2:
+		return decodeStagedV2(data[1:], spec, schema, version)
+	case stagedMagic:
+		return decodeStagedLegacy(data[1:], spec, schema, version)
+	default:
 		return stagedPayload{}, fmt.Errorf("staged descriptor: bad magic")
 	}
-	r := bytes.NewReader(data[1:])
+}
+
+// decodeStagedV2 decodes the fingerprinted format, rejecting a spec or schema
+// drift since staging.
+func decodeStagedV2(body []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
+	r := bytes.NewReader(body)
+	specID, err := readUint32(r)
+	if err != nil {
+		return stagedPayload{}, err
+	}
+	if int(specID) != spec.ID() {
+		return stagedPayload{}, fmt.Errorf("staged descriptor: partition spec changed since staging (staged %d, table %d)", specID, spec.ID())
+	}
+	encSchema, err := readString(r)
+	if err != nil {
+		return stagedPayload{}, err
+	}
+	if encSchema != schemaString(schema) {
+		return stagedPayload{}, fmt.Errorf("staged descriptor: table schema changed since staging")
+	}
+	return decodeStagedBody(r, spec, schema, version)
+}
+
+// decodeStagedLegacy decodes the pre-fingerprint format (0.2.0): state,
+// pending, deletes, appends — with no fingerprint to check.
+func decodeStagedLegacy(body []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
+	return decodeStagedBody(bytes.NewReader(body), spec, schema, version)
+}
+
+// decodeStagedBody reads the fields common to both formats from r, positioned
+// at the snapshot state.
+func decodeStagedBody(r *bytes.Reader, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
 	state, err := readString(r)
 	if err != nil {
 		return stagedPayload{}, err
@@ -331,6 +435,23 @@ func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schem
 	return stagedPayload{deletes: deletes, appends: appends, snapshotState: state, snapshotPending: pending}, nil
 }
 
+// writeUint32 writes x big-endian into the descriptor buffer.
+func writeUint32(buf *bytes.Buffer, x uint32) {
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], x)
+	buf.Write(n[:])
+}
+
+// readUint32 reads a big-endian uint32 from the descriptor reader.
+func readUint32(r *bytes.Reader) (uint32, error) {
+	var n [4]byte
+	if _, err := io.ReadFull(r, n[:]); err != nil {
+		return 0, fmt.Errorf("staged descriptor: %w", err)
+	}
+	return binary.BigEndian.Uint32(n[:]), nil
+}
+
+// writeString writes a length-prefixed string into the descriptor buffer.
 func writeString(buf *bytes.Buffer, s string) {
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(s)))
@@ -338,6 +459,8 @@ func writeString(buf *bytes.Buffer, s string) {
 	buf.WriteString(s)
 }
 
+// readString reads a length-prefixed string, rejecting a length that exceeds
+// the remaining bytes before it drives an allocation.
 func readString(r *bytes.Reader) (string, error) {
 	var n [4]byte
 	if _, err := io.ReadFull(r, n[:]); err != nil {
@@ -354,6 +477,8 @@ func readString(r *bytes.Reader) (string, error) {
 	return string(b), nil
 }
 
+// writeUint32List writes a length-prefixed uint32 list into the descriptor
+// buffer.
 func writeUint32List(buf *bytes.Buffer, xs []uint32) {
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(xs)))
@@ -364,6 +489,8 @@ func writeUint32List(buf *bytes.Buffer, xs []uint32) {
 	}
 }
 
+// readUint32List reads a length-prefixed uint32 list, rejecting a count that
+// cannot fit in the remaining bytes.
 func readUint32List(r *bytes.Reader) ([]uint32, error) {
 	var n [4]byte
 	if _, err := io.ReadFull(r, n[:]); err != nil {

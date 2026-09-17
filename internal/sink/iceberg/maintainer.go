@@ -33,11 +33,17 @@ const (
 	defaultSnapshotExpiryRetain   = 1
 	defaultOrphanCleanupOlderThan = 72 * time.Hour // 3 days, iceberg-go's own default
 
-	// maintainerMaxTries/maintainerBackoff mirror TableWriter's own retry
-	// tuning (writer.go's maxTries: 5, backoff: 200ms) — same isRetryableError
-	// classification, same backoffDuration jitter.
-	maintainerMaxTries = 5
-	maintainerBackoff  = 200 * time.Millisecond
+	// maintainerMaxTries/maintainerBackoff deliberately exceed TableWriter's
+	// own tuning (maxTries: 5, backoff: 200ms). A maintenance commit races the
+	// table's live CDC writer, and a compaction pass over many files runs for
+	// minutes — so a conflict is the expected outcome, not an exception, and
+	// the budget must span the writer's commit cadence instead of giving up
+	// after ~6s. With 8 tries and a 1s base the jittered exponential backoff
+	// (capped at 30s) retries for roughly two minutes before giving up. Same
+	// isRetryableError classification and backoffDuration jitter as the
+	// writer.
+	maintainerMaxTries = 8
+	maintainerBackoff  = time.Second
 )
 
 // Maintainer executes the three Iceberg table-maintenance operations
@@ -181,7 +187,7 @@ func (m *Maintainer) compact(ctx context.Context) error {
 	if m.metrics != nil {
 		m.metrics.CompactionRun(identString(m.ident), 0, 0, 0, 0, lastErr)
 	}
-	return fmt.Errorf("%w: compaction on %v: %v", ErrCommitExhausted, m.ident, lastErr)
+	return fmt.Errorf("%w: compaction on %v: %w", ErrCommitExhausted, m.ident, lastErr)
 }
 
 // errNothingToCompact signals compactOnce found no candidate groups — a
@@ -270,9 +276,10 @@ func (m *Maintainer) expireSnapshots(ctx context.Context) error {
 	if m.metrics != nil {
 		m.metrics.SnapshotExpiryRun(identString(m.ident), 0, lastErr)
 	}
-	return fmt.Errorf("%w: snapshot expiry on %v: %v", ErrCommitExhausted, m.ident, lastErr)
+	return fmt.Errorf("%w: snapshot expiry on %v: %w", ErrCommitExhausted, m.ident, lastErr)
 }
 
+// expireSnapshotsOnce runs one snapshot-expiry attempt against the table.
 func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {
 	e := m.cfg.SnapshotExpiry
 	tbl, err := m.cat.LoadTable(ctx, m.ident)
@@ -374,6 +381,7 @@ func durationOr(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// intOr returns n, or def when n is zero (an unset config value).
 func intOr(n int, def int) int {
 	if n <= 0 {
 		return def
