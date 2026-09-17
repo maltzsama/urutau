@@ -138,6 +138,25 @@ func TestScalarValueSupportsUnhandledPKTypes(t *testing.T) {
 	}
 }
 
+// A Time64 key must be normalized to microseconds regardless of the array's
+// unit: formatTimeOfDay is microsecond-based, so a nanosecond value (not on
+// today's wire, which is Time64us) would otherwise shift the key.
+func TestScalarValueNormalizesTime64Unit(t *testing.T) {
+	nsB := array.NewTime64Builder(memory.DefaultAllocator, &arrow.Time64Type{Unit: arrow.Nanosecond})
+	nsB.Append(arrow.Time64(3_661_500_000_000)) // 3661.5 s expressed in ns
+	ns := nsB.NewTime64Array()
+	nsB.Release()
+	defer ns.Release()
+
+	v, err := scalarValue(ns, 0)
+	if err != nil {
+		t.Fatalf("scalarValue(ns Time64): %v", err)
+	}
+	if micros, terr := timeToMicros(v.(string)); terr != nil || micros != 3_661_500_000 {
+		t.Fatalf("ns Time64 key %q: micros=%d err=%v, want 3661500000", v, micros, terr)
+	}
+}
+
 // extractKeys for a decimal PK must yield the canonical decimal text, not nil.
 func TestExtractKeysDecimalPKIsNotNull(t *testing.T) {
 	decB := array.NewDecimal128Builder(memory.DefaultAllocator, &arrow.Decimal128Type{Precision: 20, Scale: 0})

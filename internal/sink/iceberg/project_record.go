@@ -409,7 +409,17 @@ func scalarValue(col arrow.Array, row int) (any, error) {
 	case *array.Date32:
 		return time.Unix(int64(c.Value(row))*86400, 0).UTC().Format("2006-01-02"), nil
 	case *array.Time64:
-		return formatTimeOfDay(int64(c.Value(row))), nil
+		// formatTimeOfDay is microsecond-based; the wire carries Time64us, but
+		// normalize defensively so a different unit cannot shift the key.
+		v := int64(c.Value(row))
+		switch c.DataType().(*arrow.Time64Type).Unit {
+		case arrow.Microsecond:
+		case arrow.Nanosecond:
+			v /= 1_000
+		default:
+			return nil, fmt.Errorf("unsupported Time64 unit %s", c.DataType())
+		}
+		return formatTimeOfDay(v), nil
 	default:
 		return nil, fmt.Errorf("unsupported primary-key column type %s", col.DataType())
 	}
