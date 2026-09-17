@@ -474,22 +474,29 @@ function app() {
       if (!el) return;
       const s = series[this.drawer.target] || {};
       const rate = this.tail(s.rate);
-      const axis = cssVar('--pico-muted-color', '#888');
+      const lag = this.tail(s.lag);
       const data = {
         labels: rate.map((_, i) => i),
         datasets: [
-          { label: 'Rows/s', data: rate, borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2 },
+          { label: 'rows/s', data: rate, borderColor: COLORS[0], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' },
+          { label: 'lag (s)', data: lag, borderColor: COLORS[2], backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y1' },
         ],
       };
       const opts = {
         responsive: true, maintainAspectRatio: false, animation: false,
-        plugins: { legend: { display: false } },
+        plugins: { legend: { display: true, labels: { boxWidth: 10 } } },
         scales: {
           x: { display: false },
-          y: { beginAtZero: true,
-               title: { display: true, text: 'rows/s', color: axis, font: { size: 10 } },
+          // Two series, two units: label each axis and color it to match its
+          // line so the two number scales are never ambiguous.
+          y: { position: 'left', beginAtZero: true,
+               title: { display: true, text: 'rows/s', color: COLORS[0], font: { size: 10 } },
                grid: { color: cssVar('--pico-muted-border-color', '#ddd') },
-               ticks: { color: axis, maxTicksLimit: 5, font: { size: 10 } } },
+               ticks: { color: COLORS[0], maxTicksLimit: 5, font: { size: 10 } } },
+          y1: { position: 'right', beginAtZero: true,
+                title: { display: true, text: 'lag (s)', color: COLORS[2], font: { size: 10 } },
+                grid: { drawOnChartArea: false },
+                ticks: { color: COLORS[2], maxTicksLimit: 5, font: { size: 10 } } },
         },
       };
       if (charts['chart-drawer']) {
