@@ -62,11 +62,13 @@ tables:
 ```
 
 ```sh
-urutau run -f pipeline.yaml
+urutau run -f pipeline.yaml --metrics-addr :9090
 ```
 
 `run` is the collapsed mode: coordinator and worker in one process against
-the sink — no Kubernetes required to try it.
+the sink — no Kubernetes required to try it. The `--metrics-addr` flag
+enables the **embedded monitoring dashboard** at `http://localhost:9090`
+alongside the Prometheus `/metrics` endpoint.
 
 **→ [Quickstart](https://maltzsama.github.io/urutau/docs/quickstart)** walks through this end to
 end on your machine — build the binary, stand up a real MySQL + Iceberg
@@ -78,9 +80,14 @@ through Trino, and watch a live change replicate.
 **Released.** The engine runs end to end — MySQL/Postgres/Kafka into Iceberg,
 ClickHouse, or Couchbase, single-process or distributed, with the k8s
 operator — and the commit path has been verified by reading back through
-Trino rather than trusting a successful write. It is not yet software with
-production mileage: correctness-critical paths are still being actively
-hardened, so read
+Trino rather than trusting a successful write.
+
+v0.2.0 adds **background Iceberg table maintenance** (compaction, snapshot
+expiry, orphan cleanup) and an **embedded monitoring dashboard** with
+real-time SSE updates.
+
+It is not yet software with production mileage: correctness-critical paths
+are still being actively hardened, so read
 [Known limitations and roadmap](https://maltzsama.github.io/urutau/docs/reference/roadmap)
 before relying on this for anything you can't afford to lose.
 
@@ -95,6 +102,7 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | [Deploy on Kubernetes](https://maltzsama.github.io/urutau/docs/guides/deploy-kubernetes) | Submit one `CDCPipeline`; the operator runs the coordinator and its workers |
 | [Distributed mode](https://maltzsama.github.io/urutau/docs/guides/distributed) | Coordinator + worker without Kubernetes — the same engine, by hand |
 | [Monitoring](https://maltzsama.github.io/urutau/docs/guides/monitoring) | Metrics, `/statusz`, logs, what to alert on |
+| [Dashboard](https://maltzsama.github.io/urutau/docs/guides/dashboard) | Embedded monitoring UI with real-time updates |
 | [Reliability](https://maltzsama.github.io/urutau/docs/guides/reliability) | Audit trail, checkpoints, supervision, resume |
 | [Troubleshooting](https://maltzsama.github.io/urutau/docs/guides/troubleshooting) | Symptom → cause → fix, grouped by area |
 | [CLI reference](https://maltzsama.github.io/urutau/docs/reference/cli) | All four binaries and every flag |
@@ -102,8 +110,10 @@ Documentation is hosted at **[maltzsama.github.io/urutau](https://maltzsama.gith
 | [Delivery guarantees](https://maltzsama.github.io/urutau/docs/reference/guarantees) | **The behavior contract** — at-least-once, per-table atomicity, ordering, deletes, poison-batch policy. Read this before depending on any behavior not shown in an example. |
 | [Sources](https://maltzsama.github.io/urutau/docs/reference/sources) | MySQL, Postgres, Kafka — what each needs, Kafka's decoder formats |
 | [Sinks](https://maltzsama.github.io/urutau/docs/reference/sinks) | Iceberg, ClickHouse, Couchbase — commit mechanics, nested-column support, atomicity trade-offs |
+| [Dashboard API](https://maltzsama.github.io/urutau/docs/reference/dashboard-api) | REST and SSE reference for the embedded dashboard |
 | [Enrichment](https://maltzsama.github.io/urutau/docs/reference/enrichment) | Broadcast reference join — grammar, cold start, examples |
 | [Known limitations and roadmap](https://maltzsama.github.io/urutau/docs/reference/roadmap) | What's genuinely missing today, kept current |
+| [What's new in v0.2.0](https://maltzsama.github.io/urutau/docs/reference/whats-new-v0.2.0) | Release highlights — maintenance, dashboard, metrics |
 | [Plugin contract](https://maltzsama.github.io/urutau/docs/reference/plugin-contract) | The normative Arrow Flight subprocess plugin contract |
 | [Writing a plugin](https://maltzsama.github.io/urutau/docs/guides/plugins) | The Arrow Flight subprocess contract (normative), plus the narrower in-process Go `.so` alternative |
 | [Architecture](https://maltzsama.github.io/urutau/docs/architecture/overview) | Package boundaries, the dependency diagram, repository map, E2E spike findings |

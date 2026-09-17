@@ -65,6 +65,29 @@ maintenance worker is ephemeral and reports its pass back before exiting)
 | `urutau_enrich_inner_dropped_total` | counter | Events dropped by an inner-join miss |
 | `urutau_enrich_evicted_total` | counter | Events evicted from the cold-start buffer |
 
+## Dashboard
+
+v0.2.0 adds an **embedded monitoring dashboard** — a web UI served from
+the coordinator's HTTP server. It shows pipeline status, per-table
+throughput and lag charts, worker health, operational events, and
+coordinator logs, all updated in real time via Server-Sent Events.
+
+Enable it with `--metrics-addr`:
+
+```sh
+urutau run -f pipeline.yaml --metrics-addr :9090
+# Open http://localhost:9090
+```
+
+The dashboard also exposes a JSON API for programmatic access. See
+[Dashboard](dashboard.md) for the full guide and
+[Dashboard API](../reference/dashboard-api.md) for the REST/SSE
+reference.
+
+The dashboard and Prometheus metrics share the same HTTP address. Both
+are available simultaneously — `/metrics` for Prometheus scraping, `/`
+for the web UI.
+
 ## Live state: `/statusz`
 
 The coordinator serves `/statusz` on the same address as `/metrics` when
