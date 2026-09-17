@@ -291,12 +291,19 @@ func addSnapshotProps(p iceberg.Properties, state string, pending []uint32) {
 	}
 }
 
-// encodeStaged frames a payload as its opaque descriptor. The partition
-// spec, schema and format version are re-supplied by the decoder from the
-// table (they belong to the table, not the descriptor).
+// encodeStaged frames a payload as its opaque descriptor: a magic byte, a
+// fingerprint of the partition spec and schema the files were encoded against,
+// the snapshot state (string + pending list) and two length-prefixed file
+// lists (deletes, appends).
 func encodeStaged(p stagedPayload, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteByte(stagedMagic)
+	// The decoder re-supplies the table's CURRENT spec and schema; a change
+	// between staging and commit makes iceberg-go's codec silently mis-type
+	// partition values, so fingerprint both and reject a mismatch loudly
+	// (issue #124).
+	writeUint32(&buf, uint32(spec.ID()))
+	writeString(&buf, schemaString(schema))
 	writeString(&buf, p.snapshotState)
 	writeUint32List(&buf, p.snapshotPending)
 	if err := writeFileList(&buf, p.deletes, spec, schema, version); err != nil {
@@ -308,6 +315,15 @@ func encodeStaged(p stagedPayload, spec iceberg.PartitionSpec, schema *iceberg.S
 	return buf.Bytes(), nil
 }
 
+// schemaString renders a schema for the descriptor fingerprint. A nil schema
+// (tests, or an unpartitioned edge) is the empty string.
+func schemaString(schema *iceberg.Schema) string {
+	if schema == nil {
+		return ""
+	}
+	return schema.String()
+}
+
 // decodeStaged is the inverse of encodeStaged; spec, schema and version must
 // be the table's, matching the encoder.
 func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
@@ -315,6 +331,20 @@ func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schem
 		return stagedPayload{}, fmt.Errorf("staged descriptor: bad magic")
 	}
 	r := bytes.NewReader(data[1:])
+	specID, err := readUint32(r)
+	if err != nil {
+		return stagedPayload{}, err
+	}
+	if int(specID) != spec.ID() {
+		return stagedPayload{}, fmt.Errorf("staged descriptor: partition spec changed since staging (staged %d, table %d)", specID, spec.ID())
+	}
+	encSchema, err := readString(r)
+	if err != nil {
+		return stagedPayload{}, err
+	}
+	if encSchema != schemaString(schema) {
+		return stagedPayload{}, fmt.Errorf("staged descriptor: table schema changed since staging")
+	}
 	state, err := readString(r)
 	if err != nil {
 		return stagedPayload{}, err
@@ -332,6 +362,20 @@ func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schem
 		return stagedPayload{}, err
 	}
 	return stagedPayload{deletes: deletes, appends: appends, snapshotState: state, snapshotPending: pending}, nil
+}
+
+func writeUint32(buf *bytes.Buffer, x uint32) {
+	var n [4]byte
+	binary.BigEndian.PutUint32(n[:], x)
+	buf.Write(n[:])
+}
+
+func readUint32(r *bytes.Reader) (uint32, error) {
+	var n [4]byte
+	if _, err := io.ReadFull(r, n[:]); err != nil {
+		return 0, fmt.Errorf("staged descriptor: %w", err)
+	}
+	return binary.BigEndian.Uint32(n[:]), nil
 }
 
 func writeString(buf *bytes.Buffer, s string) {

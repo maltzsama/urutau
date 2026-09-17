@@ -8,15 +8,25 @@ import (
 	"github.com/apache/iceberg-go"
 )
 
-// C5.1/C5.2: the descriptor framing is a magic byte, the snapshot state
-// (string + pending list) and two length-prefixed file lists (deletes,
-// appends). Empty payloads are the deterministic case — no DataFile encoding.
+// C5.1/C5.2: the descriptor framing is a magic byte, the spec/schema
+// fingerprint, the snapshot state (string + pending list) and two
+// length-prefixed file lists (deletes, appends). Empty payloads are the
+// deterministic case — no DataFile encoding.
 func TestEncodeStagedEmptyFraming(t *testing.T) {
 	b, err := encodeStaged(stagedPayload{}, iceberg.PartitionSpec{}, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []byte{stagedMagic, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	// magic + specID + schema len + state len + pending count + deletes count + appends count
+	want := []byte{
+		stagedMagic,
+		0, 0, 0, 0, // spec ID
+		0, 0, 0, 0, // schema string length
+		0, 0, 0, 0, // snapshot state length
+		0, 0, 0, 0, // pending list count
+		0, 0, 0, 0, // delete file count
+		0, 0, 0, 0, // append file count
+	}
 	if !bytes.Equal(b, want) {
 		t.Fatalf("encodeStaged = %v, want %v", b, want)
 	}
@@ -51,25 +61,57 @@ func TestDecodeStagedRejectsBadMagic(t *testing.T) {
 }
 
 func TestDecodeStagedRejectsOversizedLengths(t *testing.T) {
-	// A length field that claims far more bytes than the payload holds must
-	// be rejected before it drives an allocation.
-	buf := []byte{stagedMagic}
 	var n [4]byte
-	binary.BigEndian.PutUint32(n[:], 1<<30) // 1 GiB claimed, nothing follows
-	buf = append(buf, n[:]...)
+	put := func(buf []byte, v uint32) []byte {
+		binary.BigEndian.PutUint32(n[:], v)
+		return append(buf, n[:]...)
+	}
+
+	// A string length that claims far more bytes than the payload holds must
+	// be rejected before it drives an allocation. Layout: magic, spec ID,
+	// then the oversized schema-string length.
+	buf := []byte{stagedMagic}
+	buf = put(buf, 0)     // spec ID matches
+	buf = put(buf, 1<<30) // schema string length: 1 GiB claimed, nothing follows
 	if _, err := decodeStaged(buf, iceberg.PartitionSpec{}, nil, 2); err == nil {
 		t.Fatal("an oversized string length must be rejected")
 	}
 
 	// Same for a file-list count: it cannot exceed the remaining bytes / 4.
 	buf = []byte{stagedMagic}
-	binary.BigEndian.PutUint32(n[:], 0) // empty snapshot state
-	buf = append(buf, n[:]...)
-	binary.BigEndian.PutUint32(n[:], 0) // empty pending list
-	buf = append(buf, n[:]...)
-	binary.BigEndian.PutUint32(n[:], 1<<30) // delete-file count
-	buf = append(buf, n[:]...)
+	buf = put(buf, 0)     // spec ID
+	buf = put(buf, 0)     // empty schema string
+	buf = put(buf, 0)     // empty snapshot state
+	buf = put(buf, 0)     // empty pending list
+	buf = put(buf, 1<<30) // delete-file count
 	if _, err := decodeStaged(buf, iceberg.PartitionSpec{}, nil, 2); err == nil {
 		t.Fatal("an oversized file count must be rejected")
 	}
+}
+
+// TestDecodeStagedRejectsSpecOrSchemaDrift pins issue #124: the descriptor
+// fingerprints the spec and schema the files were encoded against, so a table
+// that evolved between staging and committing is rejected instead of silently
+// committing mis-typed partition values.
+func TestDecodeStagedRejectsSpecOrSchemaDrift(t *testing.T) {
+	b, err := encodeStaged(stagedPayload{}, iceberg.PartitionSpec{}, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same spec (ID 0) and schema (empty): decodes.
+	if _, err := decodeStaged(b, iceberg.PartitionSpec{}, nil, 2); err != nil {
+		t.Fatalf("matching fingerprint must decode: %v", err)
+	}
+	// The table gained a schema: the fingerprint no longer matches.
+	if _, err := decodeStaged(b, iceberg.PartitionSpec{}, testSchema(t), 2); err == nil {
+		t.Fatal("a schema change since staging must be rejected")
+	}
+}
+
+// testSchema builds a minimal non-empty schema for the fingerprint test.
+func testSchema(t *testing.T) *iceberg.Schema {
+	t.Helper()
+	return iceberg.NewSchema(0, iceberg.NestedField{
+		ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true,
+	})
 }
