@@ -5,7 +5,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 const config: Config = {
   title: 'Urutau',
   tagline: 'CDC engine — replicate MySQL, Postgres, and Kafka into Iceberg, ClickHouse, and Couchbase',
-  favicon: 'img/favicon.ico',
+  favicon: 'img/icon.svg',
 
   future: {
     v4: true,
@@ -53,6 +53,10 @@ const config: Config = {
     },
     navbar: {
       title: 'Urutau',
+      logo: {
+        src: 'img/icon.svg',
+        alt: 'Urutau',
+      },
       items: [
         {
           type: 'docSidebar',
