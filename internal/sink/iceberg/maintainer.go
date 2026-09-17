@@ -279,6 +279,7 @@ func (m *Maintainer) expireSnapshots(ctx context.Context) error {
 	return fmt.Errorf("%w: snapshot expiry on %v: %w", ErrCommitExhausted, m.ident, lastErr)
 }
 
+// expireSnapshotsOnce runs one snapshot-expiry attempt against the table.
 func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {
 	e := m.cfg.SnapshotExpiry
 	tbl, err := m.cat.LoadTable(ctx, m.ident)
@@ -380,6 +381,7 @@ func durationOr(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// intOr returns n, or def when n is zero (an unset config value).
 func intOr(n int, def int) int {
 	if n <= 0 {
 		return def

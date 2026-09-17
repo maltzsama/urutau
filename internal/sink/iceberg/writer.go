@@ -189,6 +189,9 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	return nil
 }
 
+// commitDeletes writes the equality-delete files once, then commits them
+// together with the position (and snapshot state), retrying only the catalog
+// commit. The write-once shape keeps a retry from re-uploading the batch.
 func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos string, snapshotState string, snapshotPending []uint32) error {
 	rec, err := w.deleteRecord(keys)
 	if err != nil {
@@ -266,6 +269,9 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	return fmt.Errorf("%w: delete commit on %v: %w", ErrCommitExhausted, w.ident, lastErr)
 }
 
+// commitAppend projects the batch, writes its data files once (honouring the
+// configured target file size) and commits them with the position, retrying
+// only the catalog commit.
 func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos string, snapshotState string, snapshotPending []uint32) error {
 	// Columnar projection: data columns retained/cast, metadata built.
 	rec, err := w.projectRecord(ctx, b)
@@ -489,6 +495,8 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 	return nil
 }
 
+// props builds the commit properties carrying cdc.position (empty when there
+// is no position to advance).
 func props(pos string) iceberg.Properties {
 	if pos == "" {
 		return iceberg.Properties{}
@@ -496,6 +504,7 @@ func props(pos string) iceberg.Properties {
 	return iceberg.Properties{"cdc.position": pos}
 }
 
+// sleepCtx waits d or returns early with the context error.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -572,6 +581,8 @@ func (w *TableWriter) deleteRecord(keys [][]any) (arrow.RecordBatch, error) {
 	return b.NewRecordBatch(), nil
 }
 
+// appendColumn appends values to an Arrow builder, converting each to the
+// field's target type and rejecting a value that does not fit.
 func appendColumn(builder array.Builder, field arrow.Field, values []any) error {
 	switch builder.(type) {
 	case *array.StructBuilder, *array.ListBuilder, *array.MapBuilder:

@@ -435,12 +435,14 @@ func decodeStagedBody(r *bytes.Reader, spec iceberg.PartitionSpec, schema *icebe
 	return stagedPayload{deletes: deletes, appends: appends, snapshotState: state, snapshotPending: pending}, nil
 }
 
+// writeUint32 writes x big-endian into the descriptor buffer.
 func writeUint32(buf *bytes.Buffer, x uint32) {
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], x)
 	buf.Write(n[:])
 }
 
+// readUint32 reads a big-endian uint32 from the descriptor reader.
 func readUint32(r *bytes.Reader) (uint32, error) {
 	var n [4]byte
 	if _, err := io.ReadFull(r, n[:]); err != nil {
@@ -449,6 +451,7 @@ func readUint32(r *bytes.Reader) (uint32, error) {
 	return binary.BigEndian.Uint32(n[:]), nil
 }
 
+// writeString writes a length-prefixed string into the descriptor buffer.
 func writeString(buf *bytes.Buffer, s string) {
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(s)))
@@ -456,6 +459,8 @@ func writeString(buf *bytes.Buffer, s string) {
 	buf.WriteString(s)
 }
 
+// readString reads a length-prefixed string, rejecting a length that exceeds
+// the remaining bytes before it drives an allocation.
 func readString(r *bytes.Reader) (string, error) {
 	var n [4]byte
 	if _, err := io.ReadFull(r, n[:]); err != nil {
@@ -472,6 +477,8 @@ func readString(r *bytes.Reader) (string, error) {
 	return string(b), nil
 }
 
+// writeUint32List writes a length-prefixed uint32 list into the descriptor
+// buffer.
 func writeUint32List(buf *bytes.Buffer, xs []uint32) {
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(xs)))
@@ -482,6 +489,8 @@ func writeUint32List(buf *bytes.Buffer, xs []uint32) {
 	}
 }
 
+// readUint32List reads a length-prefixed uint32 list, rejecting a count that
+// cannot fit in the remaining bytes.
 func readUint32List(r *bytes.Reader) ([]uint32, error) {
 	var n [4]byte
 	if _, err := io.ReadFull(r, n[:]); err != nil {

@@ -182,6 +182,7 @@ func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKe
 	}
 }
 
+// releaseCols releases the columns built so far (the first upTo entries).
 func releaseCols(cols []arrow.Array, upTo int) {
 	for i := range upTo {
 		if cols[i] != nil {
@@ -190,6 +191,7 @@ func releaseCols(cols []arrow.Array, upTo int) {
 	}
 }
 
+// colIndexByName returns the index of the field named name, or -1.
 func colIndexByName(s *arrow.Schema, name string) int {
 	for i := range s.NumFields() {
 		if s.Field(i).Name == name {
@@ -199,6 +201,8 @@ func colIndexByName(s *arrow.Schema, name string) int {
 	return -1
 }
 
+// uint8Column returns the named column as a Uint8 array, or an error when it
+// is missing or the wrong type.
 func uint8Column(src arrow.RecordBatch, name string) (*array.Uint8, error) {
 	idx := colIndexByName(src.Schema(), name)
 	if idx < 0 {
@@ -211,6 +215,8 @@ func uint8Column(src arrow.RecordBatch, name string) (*array.Uint8, error) {
 	return col, nil
 }
 
+// stringColumn returns the named column as a String array, or an error when it
+// is missing or the wrong type.
 func stringColumn(src arrow.RecordBatch, name string) (*array.String, error) {
 	idx := colIndexByName(src.Schema(), name)
 	if idx < 0 {
@@ -223,6 +229,9 @@ func stringColumn(src arrow.RecordBatch, name string) (*array.String, error) {
 	return col, nil
 }
 
+// timestampColumn builds the named wire timestamp column in the target field's
+// unit and zone (dt), preserving the instant; a missing or non-timestamp
+// column becomes a typed null.
 func timestampColumn(src arrow.RecordBatch, name string, dt arrow.DataType) (arrow.Array, error) {
 	target, ok := dt.(*arrow.TimestampType)
 	if !ok {
@@ -256,6 +265,7 @@ func timestampColumn(src arrow.RecordBatch, name string, dt arrow.DataType) (arr
 	return bb.NewTimestampArray(), nil
 }
 
+// changeOpString renders a rowchange op as its wire string.
 func changeOpString(op uint8) string {
 	switch op {
 	case 0:
@@ -267,6 +277,7 @@ func changeOpString(op uint8) string {
 	}
 }
 
+// nullColumn builds an n-row null array of type dt.
 func nullColumn(dt arrow.DataType, n int64) arrow.Array {
 	bb := array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{{Name: "x", Type: dt, Nullable: true}}, nil))
 	defer bb.Release()
@@ -276,6 +287,7 @@ func nullColumn(dt arrow.DataType, n int64) arrow.Array {
 	return bb.Field(0).NewArray()
 }
 
+// constString builds an n-row string array holding v.
 func constString(n int64, v string) arrow.Array {
 	bb := array.NewStringBuilder(memory.DefaultAllocator)
 	defer bb.Release()

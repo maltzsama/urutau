@@ -7,6 +7,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 )
 
+// parentPtr returns a pointer to id (Snapshot.ParentSnapshotID is *int64).
 func parentPtr(id int64) *int64 { return &id }
 
 // lookupFrom builds a SnapshotLookup over a snapshot set.

@@ -29,6 +29,8 @@ type loadErrCatalog struct {
 	err error
 }
 
+// LoadTable always fails with the stub's error, proving a commit path was
+// entered without needing a live catalog.
 func (c loadErrCatalog) LoadTable(context.Context, table.Identifier) (*table.Table, error) {
 	return nil, c.err
 }
@@ -85,6 +87,8 @@ type createErrCatalog struct {
 	err error
 }
 
+// CreateTable always fails with the stub's error, so createTable's
+// already-exists tolerance is testable in isolation.
 func (c createErrCatalog) CreateTable(context.Context, table.Identifier, *iceberg.Schema, ...catalog.CreateTableOpt) (*table.Table, error) {
 	return nil, c.err
 }

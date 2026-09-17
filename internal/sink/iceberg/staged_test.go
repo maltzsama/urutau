@@ -55,12 +55,16 @@ func TestEncodeDecodeStagedState(t *testing.T) {
 	}
 }
 
+// TestDecodeStagedRejectsBadMagic pins that a descriptor without the magic byte
+// is rejected.
 func TestDecodeStagedRejectsBadMagic(t *testing.T) {
 	if _, err := decodeStaged([]byte{0x00, 0, 0, 0, 0}, iceberg.PartitionSpec{}, nil, 2); err == nil {
 		t.Fatal("a descriptor without the magic must be rejected")
 	}
 }
 
+// TestDecodeStagedRejectsOversizedLengths pins that a length field claiming
+// more bytes than the payload holds is rejected before it drives an allocation.
 func TestDecodeStagedRejectsOversizedLengths(t *testing.T) {
 	var n [4]byte
 	put := func(buf []byte, v uint32) []byte {
