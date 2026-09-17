@@ -22,6 +22,11 @@ function HomepageHeader() {
         <Heading as="h1" className="hero__title">
           {siteConfig.title}
         </Heading>
+        <p className={styles.etymology}>
+          Tupi–Guaraní for the potoo — a nightjar that stands motionless through
+          the night, watching. A fitting name for a process that spends its life
+          quietly watching a binlog.
+        </p>
         <p className="hero__subtitle">{siteConfig.tagline}</p>
         <div className={styles.buttons}>
           <Link
