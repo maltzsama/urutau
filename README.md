@@ -2,7 +2,7 @@
 
 *Tupi–Guaraní for the potoo — a nightjar that stands motionless through the night, watching. A fitting name for a process that spends its life quietly watching a binlog.*
 
-v0.1.1 · Go ≥ 1.26 · license: **Apache-2.0** <!-- x-release-please-version -->
+v0.2.0 · Go ≥ 1.26 · license: **Apache-2.0** <!-- x-release-please-version -->
 
 Urutau replicates MySQL, Postgres, and Kafka into Apache Iceberg,
 ClickHouse, and Couchbase **reflecting source state** — upsert by primary
