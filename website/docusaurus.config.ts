@@ -53,7 +53,6 @@ const config: Config = {
     },
     navbar: {
       title: 'Urutau',
-      style: 'dark',
       logo: {
         src: 'img/icon.svg',
         srcDark: 'img/icon-dark.svg',

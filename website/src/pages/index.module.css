@@ -27,6 +27,16 @@
   gap: 1rem;
 }
 
+.githubButton {
+  border: none;
+}
+
+.outlineButton {
+  border: 2px solid currentColor;
+  background: transparent;
+  color: inherit;
+}
+
 .features {
   display: flex;
   align-items: center;

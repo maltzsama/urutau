@@ -25,10 +25,17 @@ function HomepageHeader() {
         <p className="hero__subtitle">{siteConfig.tagline}</p>
         <div className={styles.buttons}>
           <Link
-            className="button button--secondary button--lg"
+            className={clsx('button button--lg', styles.outlineButton)}
             to="/docs/quickstart">
             Get Started
           </Link>
+          <iframe
+            src="https://ghbtns.com/github-btn.html?user=maltzsama&repo=urutau&type=star&count=true&size=large"
+            width="160"
+            height="30"
+            title="GitHub Stars"
+            className={styles.githubButton}
+          />
         </div>
       </div>
     </header>
