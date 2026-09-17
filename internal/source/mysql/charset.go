@@ -179,29 +179,45 @@ func decodeGenerated(charset string) func([]byte) (string, error) {
 	}
 }
 
-// decodeWith adapts an x/text encoding to the decoder signature.
+// decodeWith adapts an x/text encoding to the decoder signature. The decoder
+// is built ONCE (at map-init time) and reused for every value: x/text's
+// Decoder.Bytes calls transform.Bytes, which resets the transformer and runs
+// it to EOF on each call, so a full-buffer decode carries no state across
+// calls. The decode path is single-goroutine — canal invokes OnRow from its
+// own event loop — so the shared decoder is never used concurrently. This
+// removes one decoder allocation per decoded non-UTF-8 string value (issue
+// #117).
 func decodeWith(enc encoding.Encoding) func([]byte) (string, error) {
+	dec := enc.NewDecoder()
 	return func(b []byte) (string, error) {
-		out, err := enc.NewDecoder().Bytes(b)
+		out, err := dec.Bytes(b)
 
 		return string(out), err
 	}
 }
 
+// Cached decoders for the fixed-endian Unicode sets, same reuse rationale as
+// decodeWith.
+var (
+	utf16BEDecoder = unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewDecoder()
+	utf16LEDecoder = unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder()
+	utf32BEDecoder = utf32.UTF32(utf32.BigEndian, utf32.IgnoreBOM).NewDecoder()
+)
+
 func decodeUTF16BE(b []byte) (string, error) {
-	out, err := unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewDecoder().Bytes(b)
+	out, err := utf16BEDecoder.Bytes(b)
 
 	return string(out), err
 }
 
 func decodeUTF16LE(b []byte) (string, error) {
-	out, err := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder().Bytes(b)
+	out, err := utf16LEDecoder.Bytes(b)
 
 	return string(out), err
 }
 
 func decodeUTF32BE(b []byte) (string, error) {
-	out, err := utf32.UTF32(utf32.BigEndian, utf32.IgnoreBOM).NewDecoder().Bytes(b)
+	out, err := utf32BEDecoder.Bytes(b)
 
 	return string(out), err
 }
