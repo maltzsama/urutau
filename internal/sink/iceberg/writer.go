@@ -345,25 +345,28 @@ func CommittedPosition(ctx context.Context, cat catalog.Catalog, ident table.Ide
 // a loaded table's metadata. Split out for unit testing without a live
 // catalog.
 func committedPosition(tbl *table.Table) string {
-	return walkBackPosition(tbl.Properties(), tbl.Metadata().Snapshots())
+	return walkBackPosition(tbl.Properties(), tbl.CurrentSnapshot(), tbl.Metadata().SnapshotByID)
 }
 
-// walkBackPosition finds cdc.position in the table properties, else walks
-// the snapshot summaries newest-first. iceberg-go keeps snapshots in
-// chronological order (oldest first), so the walk starts at the last
-// element and scans backwards — a forward walk would return the OLDEST
-// position after a compaction drops the table property and rewind the
-// pipeline across a large amount of already-applied history. Pure, for
-// tests.
-func walkBackPosition(props iceberg.Properties, snaps []table.Snapshot) string {
+// walkBackPosition finds cdc.position in the table properties, else walks the
+// BRANCH ancestry from the current head, newest-first, returning the first
+// summary that carries it. Walking the ancestry rather than the flat snapshot
+// list matters after a third-party rollback-to-snapshot: the newer snapshots
+// stay in the metadata list while the branch head has moved back, so a flat
+// newest-first scan could return a position AHEAD of the table's visible
+// state and a resume from it would silently skip data. Pure, for tests.
+func walkBackPosition(props iceberg.Properties, head *table.Snapshot, lookup table.SnapshotLookup) string {
 	if pos := props["cdc.position"]; pos != "" {
 		return pos
 	}
-	for i := len(snaps) - 1; i >= 0; i-- {
-		if snaps[i].Summary == nil {
+	if head == nil {
+		return ""
+	}
+	for _, snap := range table.AncestorsOf(head.SnapshotID, lookup) {
+		if snap.Summary == nil {
 			continue
 		}
-		if pos := snaps[i].Summary.Properties["cdc.position"]; pos != "" {
+		if pos := snap.Summary.Properties["cdc.position"]; pos != "" {
 			return pos
 		}
 	}
