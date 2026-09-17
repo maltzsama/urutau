@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -331,15 +332,78 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 // rowToMap maps a row (in table column order) to column-name → value.
 // The binlog yields []byte for string columns; normalize them to string so
 // the writer's scalar type switch accepts them.
+//
+// ENUM and SET need the column definition, not just the value: the binlog
+// encodes them numerically (see decodeEnum/decodeSet), while the backfill's
+// SELECT returns them as text. Both paths feed the same target column, so
+// decoding here is what keeps a CDC row and a snapshot row of the same
+// source row identical.
 func rowToMap(tbl *schema.Table, row []any) map[string]any {
 	out := make(map[string]any, len(tbl.Columns))
 	for i, col := range tbl.Columns {
 		if i >= len(row) {
 			continue
 		}
-		out[col.Name] = normalize(row[i])
+		out[col.Name] = normalizeCol(col, row[i])
 	}
 	return out
+}
+
+// normalizeCol converts one binlog value using its column definition.
+func normalizeCol(col schema.TableColumn, v any) any {
+	switch col.Type {
+	case schema.TYPE_ENUM:
+		return decodeEnum(col, v)
+	case schema.TYPE_SET:
+		return decodeSet(col, v)
+	default:
+		return normalize(v)
+	}
+}
+
+// decodeEnum turns the binlog's 1-based member index into the member string.
+// MySQL stores an ENUM as its ordinal, so the raw event carries int64(2) for
+// the second member — which the target column (mapped to KindString by
+// mapColumnType) would otherwise stringify to "2" instead of "b". No error is
+// raised anywhere on that path, so the wrong value lands silently.
+//
+// Index 0 is MySQL's marker for a value rejected on insert (non-strict mode
+// stores the empty string), and an index past the member list means the
+// column was altered between the TableMapEvent and this decode: both fall
+// back to the raw value rather than inventing a member.
+func decodeEnum(col schema.TableColumn, v any) any {
+	idx, ok := v.(int64)
+	if !ok || len(col.EnumValues) == 0 {
+		return normalize(v)
+	}
+	if idx == 0 {
+		return ""
+	}
+	if idx < 0 || int(idx) > len(col.EnumValues) {
+		return normalize(v)
+	}
+	return col.EnumValues[idx-1]
+}
+
+// decodeSet turns the binlog's bitmask into the comma-joined member list, in
+// declaration order — the same text the backfill's SELECT returns. Bit 0 is
+// the first member: SET('x','y','z') holding 'x,z' arrives as 0b101.
+//
+// Bits past the member list mean the column was altered between the
+// TableMapEvent and this decode; they are ignored rather than dropping the
+// members that did resolve.
+func decodeSet(col schema.TableColumn, v any) any {
+	mask, ok := v.(int64)
+	if !ok || len(col.SetValues) == 0 {
+		return normalize(v)
+	}
+	members := make([]string, 0, len(col.SetValues))
+	for bit := 0; bit < len(col.SetValues) && bit < 64; bit++ {
+		if mask&(1<<uint(bit)) != 0 {
+			members = append(members, col.SetValues[bit])
+		}
+	}
+	return strings.Join(members, ",")
 }
 
 func normalize(v any) any {

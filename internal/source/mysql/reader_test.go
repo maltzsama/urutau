@@ -237,3 +237,74 @@ func TestOnRowWindowTagsOnlyPastLowWatermark(t *testing.T) {
 		t.Fatalf("closed window must not tag: %+v", c.Window)
 	}
 }
+
+// enumSetTable mirrors a table with one ENUM and one SET column, as canal
+// populates them from the table definition.
+func enumSetTable() *schema.Table {
+	return &schema.Table{
+		Schema: "shop",
+		Name:   "orders",
+		Columns: []schema.TableColumn{
+			{Name: "id", Type: schema.TYPE_NUMBER},
+			{Name: "status", Type: schema.TYPE_ENUM, EnumValues: []string{"new", "paid", "shipped"}},
+			{Name: "tags", Type: schema.TYPE_SET, SetValues: []string{"gift", "fragile", "express"}},
+		},
+	}
+}
+
+// The binlog encodes ENUM as a 1-based ordinal and SET as a bitmask, while
+// the backfill's SELECT returns both as text. Both feed the same target
+// column, which mapColumnType maps to KindString — and the sink's
+// StringifyScalar converts an int64 to its decimal digits without error. So
+// an undecoded ordinal does not fail anywhere: it silently writes "2" where
+// the snapshot of the same row wrote "paid".
+func TestRowToMapDecodesEnumAndSet(t *testing.T) {
+	tbl := enumSetTable()
+
+	// status = 'paid' (2nd member), tags = 'gift,express' (bits 0 and 2).
+	got := rowToMap(tbl, []any{int64(7), int64(2), int64(0b101)})
+
+	if got["status"] != "paid" {
+		t.Errorf("status = %#v, want \"paid\" — an ENUM ordinal must decode to its member, "+
+			"or CDC writes the ordinal where the backfill writes the text", got["status"])
+	}
+	if got["tags"] != "gift,express" {
+		t.Errorf("tags = %#v, want \"gift,express\" — a SET bitmask must decode to its "+
+			"comma-joined members in declaration order", got["tags"])
+	}
+}
+
+// Edge cases that must not invent a value: MySQL stores 0 for an ENUM value
+// rejected on insert, and an ordinal or bit past the member list means the
+// column was altered between the TableMapEvent and this decode.
+func TestRowToMapEnumSetEdgeCases(t *testing.T) {
+	tbl := enumSetTable()
+
+	if got := rowToMap(tbl, []any{int64(1), int64(0), int64(0)}); got["status"] != "" {
+		t.Errorf("ENUM index 0 = %#v, want \"\" (MySQL's marker for a rejected value)", got["status"])
+	}
+	if got := rowToMap(tbl, []any{int64(1), int64(99), int64(0)}); got["status"] != int64(99) {
+		t.Errorf("out-of-range ENUM index = %#v, want the raw value kept rather than a "+
+			"fabricated member", got["status"])
+	}
+	// Bit 3 has no member (only 3 declared); the members that do resolve stay.
+	if got := rowToMap(tbl, []any{int64(1), int64(1), int64(0b1001)}); got["tags"] != "gift" {
+		t.Errorf("SET with an unknown bit = %#v, want \"gift\"", got["tags"])
+	}
+	// An empty SET is the empty string, matching what SELECT returns.
+	if got := rowToMap(tbl, []any{int64(1), int64(1), int64(0)}); got["tags"] != "" {
+		t.Errorf("empty SET = %#v, want \"\"", got["tags"])
+	}
+}
+
+// A column whose definition carries no members (canal could not introspect
+// it) must fall through to the plain normalizer rather than dropping data.
+func TestRowToMapEnumWithoutMembersFallsThrough(t *testing.T) {
+	tbl := &schema.Table{
+		Schema: "shop", Name: "orders",
+		Columns: []schema.TableColumn{{Name: "status", Type: schema.TYPE_ENUM}},
+	}
+	if got := rowToMap(tbl, []any{int64(2)}); got["status"] != int64(2) {
+		t.Errorf("ENUM without members = %#v, want the raw value", got["status"])
+	}
+}
