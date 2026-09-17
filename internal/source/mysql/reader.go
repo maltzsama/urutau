@@ -6,6 +6,7 @@ package mysql
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,6 +40,9 @@ type Config struct {
 	Heartbeat time.Duration
 	Tables    []TableRef
 	Logger    *slog.Logger
+	// TLSConfig, when non-nil, secures the replication connection (issue
+	// #138). Nil means plaintext.
+	TLSConfig *tls.Config
 }
 
 // Reader wraps a canal instance and decodes its row events.
@@ -118,18 +122,7 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		bySrc[t.Source] = t
 	}
 
-	c, err := canal.NewCanal(&canal.Config{
-		Addr:              cfg.Addr,
-		User:              cfg.User,
-		Password:          cfg.Password,
-		ServerID:          cfg.ServerID,
-		Flavor:            "mysql",
-		HeartbeatPeriod:   cfg.Heartbeat,
-		ReadTimeout:       60 * time.Second,
-		IncludeTableRegex: incl,
-		ParseTime:         false,
-		Logger:            cfg.Logger,
-	})
+	c, err := canal.NewCanal(canalConfig(cfg, incl))
 	if err != nil {
 		return nil, fmt.Errorf("mysql: new canal: %w", err)
 	}
@@ -137,6 +130,24 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc, done: make(chan struct{})}
 	c.SetEventHandler(r)
 	return r, nil
+}
+
+// canalConfig renders the neutral Config into go-mysql's canal.Config — split
+// out so the replication wiring (including TLS) is testable without dialing.
+func canalConfig(cfg Config, includeRegex []string) *canal.Config {
+	return &canal.Config{
+		Addr:              cfg.Addr,
+		User:              cfg.User,
+		Password:          cfg.Password,
+		ServerID:          cfg.ServerID,
+		Flavor:            "mysql",
+		HeartbeatPeriod:   cfg.Heartbeat,
+		ReadTimeout:       60 * time.Second,
+		IncludeTableRegex: includeRegex,
+		ParseTime:         false,
+		Logger:            cfg.Logger,
+		TLSConfig:         cfg.TLSConfig,
+	}
 }
 
 // stop closes done exactly once, unblocking any OnRow send in progress.

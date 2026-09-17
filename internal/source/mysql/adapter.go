@@ -45,7 +45,11 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
-		db, err := sql.Open("mysql", conn.QueryDSN())
+		dsn, err := conn.QueryDSN()
+		if err != nil {
+			return nil, err
+		}
+		db, err := sql.Open("mysql", dsn)
 		if err != nil {
 			return nil, err
 		}
@@ -110,6 +114,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		Heartbeat: a.rt.Heartbeat,
 		Tables:    refs,
 		Logger:    a.rt.Logger,
+		TLSConfig: conn.TLSConfig(),
 	}, out)
 	if err != nil {
 		return nil, err

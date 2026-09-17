@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"testing"
@@ -605,5 +606,18 @@ func TestOnGTIDCapturesCommitTime(t *testing.T) {
 	}
 	if want := time.Unix(1699999999, 0).UTC(); !r.curCommitTS.Equal(want) {
 		t.Fatalf("fallback commit ts = %v, want %v", r.curCommitTS, want)
+	}
+}
+
+// canalConfig threads the TLS config into the replication connection. Issue
+// #138.
+func TestCanalConfigCarriesTLS(t *testing.T) {
+	tc := &tls.Config{ServerName: "db.example.com"}
+	cc := canalConfig(Config{Addr: "h:3306", TLSConfig: tc}, []string{`^db\.t$`})
+	if cc.TLSConfig != tc {
+		t.Fatal("canal config did not carry the TLS config")
+	}
+	if cc.Flavor != "mysql" || cc.ParseTime {
+		t.Fatalf("canal config = %+v", cc)
 	}
 }
