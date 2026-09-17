@@ -102,6 +102,15 @@ type Sink struct {
 	// closing the recovery window at the cost of transaction overhead per
 	// batch.
 	CommitMode CommitMode `json:"commitMode,omitempty"`
+	// EvolveSchema opts into additive schema evolution on the target table.
+	// Off by default: the sink is fail-closed on schema divergence and
+	// hard-errors until an operator intervenes. When on, EnsureTable evolves
+	// an existing table to the resolved schema by adding missing columns
+	// (nullable) and applying only Iceberg's allowed type promotions
+	// (int→long, float→double, decimal widening, timestamp precision
+	// widening) — never a narrowing, rename, or drop. Iceberg-only: other
+	// sinks ignore it.
+	EvolveSchema bool `json:"evolveSchema,omitempty"`
 	// Maintenance configures background Iceberg table maintenance
 	// (compaction, snapshot expiry, orphan cleanup). Iceberg-only: any
 	// other sink type rejects a maintenance block in Validate rather than

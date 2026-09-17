@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"plugin"
 	"slices"
+	"strconv"
 	"sync"
 
 	"github.com/maltzsama/urutau/sink"
@@ -284,6 +285,7 @@ const (
 	OptScope          = "scope"
 	OptCommitMode     = "commit_mode"
 	OptTargetFileSize = "target_file_size"
+	OptEvolveSchema   = "evolve_schema"
 )
 
 // SinkConfig renders a spec's sink section into the neutral config.
@@ -299,6 +301,7 @@ func SinkConfig(s *spec.Spec) sink.Config {
 			OptScope:          s.Sink.Scope,
 			OptCommitMode:     string(s.Sink.CommitMode),
 			OptTargetFileSize: s.Sink.Defaults.TargetFileSize,
+			OptEvolveSchema:   strconv.FormatBool(s.Sink.EvolveSchema),
 		},
 		// Position decoding hint for sinks that compare per-partition
 		// positions (WK-001 C7). Not a source coupling — a string hint.

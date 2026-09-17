@@ -414,7 +414,31 @@ func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Id
 // createTable creates the target table, reporting whether it was created.
 // A false return with a nil error means a concurrent creator won the race
 // (ErrTableAlreadyExists) — the caller must reload and validate that table.
-func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string) (bool, error) {
+// sortOrderFor builds the table's default sort order over its identifier
+// (primary-key) columns, ascending with nulls first. A sort order clusters
+// equal-key rows together within data files, so equality-delete pruning and
+// key-range scans stay local. It is a create-time property: existing tables
+// are untouched (issue #131). A primary-key column absent from the schema is
+// a hard error — the same condition NewTableWriter rejects later, surfaced
+// here before the table is created.
+func sortOrderFor(schema *iceberg.Schema, primaryKey []string) (table.SortOrder, error) {
+	fields := make([]table.SortField, 0, len(primaryKey))
+	for _, name := range primaryKey {
+		f, ok := schema.FindFieldByName(name)
+		if !ok {
+			return table.SortOrder{}, fmt.Errorf("primary key column %q not found", name)
+		}
+		fields = append(fields, table.SortField{
+			SourceIDs: []int{f.ID},
+			Transform: iceberg.IdentityTransform{},
+			Direction: table.SortASC,
+			NullOrder: table.NullsFirst,
+		})
+	}
+	return table.NewSortOrder(1, fields)
+}
+
+func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy, primaryKey []string) (bool, error) {
 	opts := []catalog.CreateTableOpt{
 		catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
 	}
@@ -425,6 +449,13 @@ func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 		}
 		opts = append(opts, catalog.WithPartitionSpec(&spec))
 	}
+	if len(primaryKey) > 0 {
+		order, err := sortOrderFor(schema, primaryKey)
+		if err != nil {
+			return false, fmt.Errorf("iceberg: %v: sort order: %w", ident, err)
+		}
+		opts = append(opts, catalog.WithSortOrder(order))
+	}
 	if _, err := cat.CreateTable(ctx, ident, schema, opts...); err != nil {
 		if errors.Is(err, catalog.ErrTableAlreadyExists) {
 			return false, nil
@@ -434,16 +465,86 @@ func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 	return true, nil
 }
 
+// evolveTable brings an existing table's schema to want by adding missing
+// columns and applying only Iceberg's allowed primitive promotions
+// (int→long, float→double, decimal widening, timestamp precision widening).
+// iceberg-go's UpdateColumn runs the promotion through iceberg.PromoteType
+// and rejects anything else — a narrowing, a cross-kind change, or a
+// non-primitive type change — so the fail-closed contract holds even with
+// evolution on. Adding a required column with no default is likewise
+// rejected. The transaction no-ops when the schema already matches, so a
+// steady-state boot writes no metadata (issue #132).
+func evolveTable(ctx context.Context, tbl *table.Table, want *iceberg.Schema) error {
+	txn := tbl.NewTransaction()
+	us := txn.UpdateSchema(true, false)
+	evolveFields(us, nil, tbl.Schema().Fields(), want.Fields())
+	if err := us.Commit(); err != nil {
+		return fmt.Errorf("schema evolution: %w", err)
+	}
+	if _, err := txn.Commit(ctx); err != nil {
+		return fmt.Errorf("schema evolution commit: %w", err)
+	}
+	return nil
+}
+
+// evolveFields reconciles one level of fields, descending into structs so a
+// field added inside a nested column is caught too. Add/update calls stage
+// onto the UpdateSchema; iceberg-go validates them at Commit.
+func evolveFields(us *table.UpdateSchema, path []string, existing, want []iceberg.NestedField) {
+	for _, wf := range want {
+		ef, ok := findNestedField(existing, wf.Name)
+		if !ok {
+			// New column: add it whole (a struct arrives with its fields).
+			us.AddColumn(append(path, wf.Name), wf.Type, wf.Doc, wf.Required, nil)
+			continue
+		}
+		ws, wIsStruct := wf.Type.(*iceberg.StructType)
+		es, eIsStruct := ef.Type.(*iceberg.StructType)
+		if wIsStruct && eIsStruct {
+			evolveFields(us, append(path, wf.Name), es.FieldList, ws.FieldList)
+			continue
+		}
+		update := table.ColumnUpdate{}
+		if !wf.Type.Equals(ef.Type) {
+			update.FieldType = iceberg.Optional[iceberg.Type]{Valid: true, Val: wf.Type}
+		}
+		if !wf.Required && ef.Required {
+			// required→optional only; optional→required is rejected by iceberg.
+			update.Required = iceberg.Optional[bool]{Valid: true, Val: false}
+		}
+		if update.FieldType.Valid || update.Required.Valid {
+			us.UpdateColumn(append(path, wf.Name), update)
+		}
+	}
+}
+
+// findNestedField finds a field by name in one schema level.
+func findNestedField(fields []iceberg.NestedField, name string) (iceberg.NestedField, bool) {
+	for _, f := range fields {
+		if f.Name == name {
+			return f, true
+		}
+	}
+	return iceberg.NestedField{}, false
+}
+
 // EnsureTable creates the target table if absent. When the table already
 // exists, every column touched by a cast rule must match the resolved type:
 // if the existing column's Iceberg type disagrees, a hard error prevents
 // silent data corruption. The partition spec is applied on create and
-// verified for divergence on existing tables.
-func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
+// verified for divergence on existing tables. The primary key, when known,
+// becomes the table's default sort order on create (issue #131).
+//
+// When evolveSchema is true the fail-closed schema check is replaced by an
+// additive evolution: missing columns are added and Iceberg's allowed type
+// promotions applied (issue #132). Partition-spec divergence stays a hard
+// error — partition evolution is a deliberate maintenance operation, not
+// something a boot should do implicitly.
+func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy, primaryKey []string, cast core.CastPolicy, evolveSchema bool) error {
 	existing, err := cat.LoadTable(ctx, ident)
 	switch {
 	case errors.Is(err, catalog.ErrNoSuchTable):
-		created, cerr := createTable(ctx, cat, ident, schema, partitionBy)
+		created, cerr := createTable(ctx, cat, ident, schema, partitionBy, primaryKey)
 		if cerr != nil {
 			return cerr
 		}
@@ -462,20 +563,26 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 		// as absent would attempt a create against a table that may exist.
 		return fmt.Errorf("iceberg: load %v: %w", ident, err)
 	}
-	// Table exists — verify cast divergence and partition spec divergence.
-	existSchema := existing.Schema()
-	for colName := range cast.Columns {
-		newField, ok := schema.FindFieldByName(colName)
-		if !ok {
-			continue // column not in resolved schema — introspection will catch
+	// Table exists — verify (or evolve) the schema, then the partition spec.
+	if evolveSchema {
+		if err := evolveTable(ctx, existing, schema); err != nil {
+			return fmt.Errorf("iceberg: %v: %w", ident, err)
 		}
-		existField, ok := existSchema.FindFieldByName(colName)
-		if !ok {
-			return fmt.Errorf("iceberg: %v: cast column %q not in existing table", ident, colName)
-		}
-		if !newField.Type.Equals(existField.Type) {
-			return fmt.Errorf("iceberg: %v: cast column %q type divergence: spec wants %s, table has %s",
-				ident, colName, newField.Type, existField.Type)
+	} else {
+		existSchema := existing.Schema()
+		for colName := range cast.Columns {
+			newField, ok := schema.FindFieldByName(colName)
+			if !ok {
+				continue // column not in resolved schema — introspection will catch
+			}
+			existField, ok := existSchema.FindFieldByName(colName)
+			if !ok {
+				return fmt.Errorf("iceberg: %v: cast column %q not in existing table", ident, colName)
+			}
+			if !newField.Type.Equals(existField.Type) {
+				return fmt.Errorf("iceberg: %v: cast column %q type divergence: spec wants %s, table has %s",
+					ident, colName, newField.Type, existField.Type)
+			}
 		}
 	}
 	// Partition spec divergence: if partitionBy is specified, it must

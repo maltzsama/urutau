@@ -192,7 +192,7 @@ func TestEnsureTablePartitionSpecDivergence(t *testing.T) {
 func TestEnsureTablePropagatesCatalogError(t *testing.T) {
 	boom := errors.New("auth failure")
 	err := EnsureTable(context.Background(), &loadErrCatalog{err: boom},
-		table.Identifier{"raw", "orders"}, iceberg.NewSchema(0), nil, core.CastPolicy{})
+		table.Identifier{"raw", "orders"}, iceberg.NewSchema(0), nil, nil, core.CastPolicy{}, false)
 	if !errors.Is(err, boom) {
 		t.Fatalf("EnsureTable = %v, want boom", err)
 	}
@@ -212,7 +212,7 @@ func TestEnsureTableCreateRaceReloadsWinner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FromCanonical: %v", err)
 	}
-	if err := EnsureTable(ctx, cat, s.ident("orders"), ischema, nil, core.CastPolicy{}); err != nil {
+	if err := EnsureTable(ctx, cat, s.ident("orders"), ischema, nil, nil, core.CastPolicy{}, false); err != nil {
 		t.Fatalf("EnsureTable(create race) must validate the winner: %v", err)
 	}
 	if cat.loads != 2 {

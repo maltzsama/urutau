@@ -24,6 +24,9 @@ type Sink struct {
 	cat            catalog.Catalog
 	ns             string
 	targetFileSize int64
+	// evolveSchema opts into additive schema evolution in EnsureTable
+	// (sink.evolveSchema). Off means the historical fail-closed behavior.
+	evolveSchema bool
 }
 
 // Open dials the catalog and ensures the namespace, returning a Sink that
@@ -42,8 +45,18 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	if err := EnsureNamespace(ctx, cat, table.Identifier{cfg.Namespace}); err != nil {
 		return nil, err
 	}
-	return &Sink{cat: cat, ns: cfg.Namespace, targetFileSize: targetFileSizeFrom(cfg.Options[driver.OptTargetFileSize])}, nil
+	return &Sink{
+		cat:            cat,
+		ns:             cfg.Namespace,
+		targetFileSize: targetFileSizeFrom(cfg.Options[driver.OptTargetFileSize]),
+		evolveSchema:   evolveSchemaFrom(cfg.Options[driver.OptEvolveSchema]),
+	}, nil
 }
+
+// evolveSchemaFrom reports whether the sink.evolveSchema option is on. Only
+// the exact "true" enables it; an absent or malformed value keeps the
+// fail-closed default.
+func evolveSchemaFrom(s string) bool { return s == "true" }
 
 // targetFileSizeFrom parses the spec's byte-size string ("128Mi", "512Mi")
 // into bytes. Empty or malformed yields 0 — "no override", iceberg-go's own
@@ -79,7 +92,7 @@ func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.S
 	if err != nil {
 		return err
 	}
-	return EnsureTable(ctx, s.cat, s.ident(ref.Target), is, partitionBy, cast)
+	return EnsureTable(ctx, s.cat, s.ident(ref.Target), is, partitionBy, ref.PrimaryKey, cast, s.evolveSchema)
 }
 
 // Writer opens the per-table committer.
