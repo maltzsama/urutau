@@ -444,3 +444,11 @@ func TestCollapsedRejectsPartitionedTable(t *testing.T) {
 		t.Fatalf("collapsed run with workers>1 must fail citing distributed mode, got: %v", err)
 	}
 }
+
+// gatedCount reports how many batches the gate currently buffers. Test-only:
+// it moved here from runner.go, whose production build has no caller for it.
+func (r *relay) gatedCount() int {
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	return len(r.gateBuf)
+}

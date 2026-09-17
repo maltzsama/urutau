@@ -48,9 +48,9 @@ type Config struct {
 }
 
 // Run executes the collapsed pipeline for a validated spec until ctx is
-// cancelled or a terminal error occurs.
-// Run builds the collapsed pipeline, runs the snapshot phase, and blocks
-// until ctx is cancelled or a terminal error occurs.
+// cancelled or a terminal error occurs. Convenience entry point for callers
+// that don't need the *Runner handle — the e2e suite drives every scenario
+// through it; the binary path (cmd/urutau) uses NewRunner directly.
 func Run(ctx context.Context, s *spec.Spec, cfg Config) error {
 	r, err := NewRunner(ctx, s, cfg)
 	if err != nil {
@@ -143,13 +143,6 @@ func (r *relay) GateFlush() {
 }
 
 // gate buffers an event when the gate is on for its table.
-// gatedCount returns how many batches are buffered by the gate.
-func (r *relay) gatedCount() int {
-	r.gateMu.Lock()
-	defer r.gateMu.Unlock()
-	return len(r.gateBuf)
-}
-
 func (r *relay) gate(b *dataplane.Batch) bool {
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()

@@ -151,11 +151,6 @@ func (s *StageSupervisor) stopStage(ctx context.Context) error {
 	return stg.Stop(ctx)
 }
 
-// Shutdown gracefully stops the plugin.
-func (s *StageSupervisor) Shutdown(ctx context.Context) error {
-	return s.stopStage(ctx)
-}
-
 // ── backoff ────────────────────────────────────────────────────────────
 
 func (s *StageSupervisor) currentBackoff() time.Duration {

@@ -117,3 +117,14 @@ func TestOpenSourceNilSpec(t *testing.T) {
 		t.Error("OpenSource(nil) must error, not panic")
 	}
 }
+
+// resetRegistry clears the registry. TEST-ONLY: it lets driver tests assert
+// empty-registry diagnostics without being polluted by other tests'
+// registrations. Moved here from registry.go, whose production build has no
+// caller for it.
+func resetRegistry() {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	reg.sources = nil
+	reg.sinks = nil
+}
