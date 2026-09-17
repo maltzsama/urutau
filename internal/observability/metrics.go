@@ -24,6 +24,7 @@ type Metrics struct {
 	// Worker.
 	RowsWritten      *prometheus.CounterVec
 	CommitDuration   *prometheus.HistogramVec
+	CommitLatencyMs  *prometheus.GaugeVec
 	CommitFailures   *prometheus.CounterVec
 	EqualityDeletes  *prometheus.CounterVec
 	SnapshotProgress *prometheus.GaugeVec
@@ -77,6 +78,9 @@ func New() *Metrics {
 		Name:    "urutau_worker_commit_duration_seconds",
 		Help:    "Iceberg commit latency per table.",
 		Buckets: prometheus.DefBuckets},
+		[]string{"table"})
+	m.CommitLatencyMs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "urutau_worker_commit_latency_ms", Help: "last Iceberg commit latency per table."},
 		[]string{"table"})
 	m.CommitFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_worker_commit_failures_total", Help: "failed commits per table."},
@@ -136,7 +140,7 @@ func New() *Metrics {
 		[]string{"table"})
 
 	reg.MustRegister(m.LagSeconds, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
-	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
+	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitLatencyMs, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	reg.MustRegister(m.EnrichMisses, m.EnrichDropped, m.EnrichEvicted)
 	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,
 		m.IcebergCompactionBytesBefore, m.IcebergCompactionBytesAfter)
@@ -145,17 +149,28 @@ func New() *Metrics {
 	return m
 }
 
-// Serve exposes /metrics (Prometheus) and, when encoder is non-nil,
-// /statusz (live JSON state) on addr. Blocks until the server stops.
-func (m *Metrics) Serve(addr string, encoder func(w http.ResponseWriter, r *http.Request)) error {
+// Handler builds the /metrics (+ optional /statusz) mux, so a caller can add
+// its own routes (the dashboard) before serving.
+func (m *Metrics) Handler(encoder func(w http.ResponseWriter, r *http.Request)) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{}))
 	if encoder != nil {
 		mux.HandleFunc("/statusz", encoder)
 	}
+	return mux
+}
+
+// Serve exposes /metrics (and /statusz) on addr, blocking until the server
+// stops. A caller with extra routes builds a mux via Handler and calls ServeMux.
+func (m *Metrics) Serve(addr string, encoder func(w http.ResponseWriter, r *http.Request)) error {
+	return ServeMux(addr, m.Handler(encoder))
+}
+
+// ServeMux runs an http.Server with the given handler on addr until it stops.
+func ServeMux(addr string, handler http.Handler) error {
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,

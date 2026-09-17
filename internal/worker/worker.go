@@ -161,8 +161,10 @@ func New(cfg Config) *Worker {
 		cfg:    cfg,
 		tables: make(map[string]*tablePipeline),
 	}
+	// The registry always exists: the coordinator records the worker's series
+	// via the metrics report, even when this worker serves no /metrics endpoint.
+	w.metrics = observability.New()
 	if cfg.MetricsAddr != "" {
-		w.metrics = observability.New()
 		go func() { _ = w.metrics.Serve(cfg.MetricsAddr, nil) }()
 	}
 	return w
@@ -495,6 +497,7 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 		rb.batch.Release()
 		if w.metrics != nil {
 			w.metrics.CommitDuration.WithLabelValues(p.target).Observe(time.Since(start).Seconds())
+			w.metrics.CommitLatencyMs.WithLabelValues(p.target).Set(float64(time.Since(start).Milliseconds()))
 			w.metrics.RowsWritten.WithLabelValues(p.target, "upsert").Add(float64(rb.upserts))
 			w.metrics.EqualityDeletes.WithLabelValues(p.target).Add(float64(rb.deletes))
 		}

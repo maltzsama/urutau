@@ -16,17 +16,39 @@ func New(level, format string) (*slog.Logger, error) {
 	if err != nil {
 		return nil, err
 	}
+	h, err := baseHandler(format, lvl)
+	if err != nil {
+		return nil, err
+	}
+	return slog.New(h), nil
+}
+
+// NewBuffered is New plus a Buffer mirroring the last capacity records, for the
+// dashboard's log tail. The logger's stderr output is unchanged.
+func NewBuffered(level, format string, capacity int) (*slog.Logger, *Buffer, error) {
+	lvl, err := parseLevel(level)
+	if err != nil {
+		return nil, nil, err
+	}
+	h, err := baseHandler(format, lvl)
+	if err != nil {
+		return nil, nil, err
+	}
+	buf := NewBuffer(capacity)
+	return slog.New(&teeHandler{base: h, buf: buf}), buf, nil
+}
+
+// baseHandler builds the stderr handler for a format and level.
+func baseHandler(format string, lvl slog.Level) (slog.Handler, error) {
 	opts := &slog.HandlerOptions{Level: lvl}
-	var h slog.Handler
 	switch strings.ToLower(format) {
 	case "", "text":
-		h = slog.NewTextHandler(os.Stderr, opts)
+		return slog.NewTextHandler(os.Stderr, opts), nil
 	case "json":
-		h = slog.NewJSONHandler(os.Stderr, opts)
+		return slog.NewJSONHandler(os.Stderr, opts), nil
 	default:
 		return nil, fmt.Errorf("logging: unknown format %q (want text|json)", format)
 	}
-	return slog.New(h), nil
 }
 
 func parseLevel(level string) (slog.Level, error) {

@@ -38,9 +38,11 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/grpctls"
+	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -98,9 +100,13 @@ type Config struct {
 	MaxResets   int
 	ResetWindow time.Duration
 
-	// MetricsAddr serves /metrics (Prometheus) and /statusz (live state).
-	// Empty disables the endpoint.
+	// MetricsAddr serves /metrics (Prometheus), /statusz (live state), and the
+	// dashboard (issue #97). Empty disables the endpoint.
 	MetricsAddr string
+
+	// LogBuffer is the coordinator logger's in-memory tail, served by the
+	// dashboard's Logs view. Nil disables that view.
+	LogBuffer *logging.Buffer
 
 	Logger *slog.Logger
 }
@@ -218,6 +224,17 @@ type Coordinator struct {
 	supervisor *supervisor
 	terminate  chan error
 	metrics    *observability.Metrics
+
+	// Dashboard (issue #97): the recent-events ring, the read-only API handler,
+	// the run's start time, and the per-table/worker aggregates the API serves.
+	dashEvents *dashboard.Events
+	dash       *dashboard.Handler
+	startedAt  time.Time
+
+	statsMu    sync.Mutex
+	tableStats map[string]*tableStats
+	maintStats map[string]map[string]*maintStats
+	lastAck    map[string]time.Time
 }
 
 // workerState is one worker group's slice of the pipeline: its tables, its
@@ -300,11 +317,29 @@ func Run(ctx context.Context, cfg Config) error {
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
 	c.supervisor = newSupervisor(c)
 	c.terminate = make(chan error, 1)
+	c.startedAt = time.Now()
+	c.dashEvents = dashboard.NewEvents(1000)
+	c.tableStats = map[string]*tableStats{}
+	c.maintStats = map[string]map[string]*maintStats{}
+	c.lastAck = map[string]time.Time{}
 	if cfg.MetricsAddr != "" {
 		c.metrics = observability.New()
+		mux := c.metrics.Handler(c.statusz)
+		// A nil *logging.Buffer must stay a nil interface, or the dashboard
+		// would call Tail on a nil pointer.
+		var logSrc dashboard.LogSource
+		if cfg.LogBuffer != nil {
+			logSrc = cfg.LogBuffer
+		}
+		c.dash = dashboard.New(dashState{c}, c.dashEvents, logSrc, c.log)
+		c.dash.Register(mux)
+		// Every new log line is pushed to the SSE subscribers.
+		if cfg.LogBuffer != nil {
+			cfg.LogBuffer.SetOnAppend(c.dash.PublishLog)
+		}
 		go func() {
 			// A busy port silently disables observability otherwise — say so.
-			if err := c.metrics.Serve(cfg.MetricsAddr, c.statusz); err != nil {
+			if err := observability.ServeMux(cfg.MetricsAddr, mux); err != nil {
 				c.log.Warn("coordinator: metrics server stopped", "addr", cfg.MetricsAddr, "err", err)
 			}
 		}()
@@ -712,7 +747,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return fmt.Errorf("coordinator: stream: %w", err)
 	case err := <-c.terminate:
 		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": "crashloop"})
+		c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": terminateReason(err)})
 		return err
 	}
 
@@ -733,7 +768,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return ctx.Err()
 		case err := <-c.terminate:
 			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": "crashloop"})
+			c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": terminateReason(err)})
 			return err
 		case err := <-streamErr:
 			if ctx.Err() != nil {
@@ -879,8 +914,16 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 }
 
 // emit writes one event to the audit trail when configured; best-effort by
-// contract (a lost trail must never fail the pipeline).
+// contract (a lost trail must never fail the pipeline). The dashboard's
+// recent-events ring is fed here too, unconditionally, so the UI shows events
+// even when no audit trail is configured.
 func (c *Coordinator) emit(kind string, fields map[string]any) error {
+	if c.dashEvents != nil {
+		ev := c.dashEvents.Record(kind, fields)
+		if c.dash != nil {
+			c.dash.PublishEvent(ev)
+		}
+	}
 	if c.ev == nil {
 		return nil
 	}
@@ -1758,6 +1801,11 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	if !c.isStagedTable(ack.Table) {
 		c.recordConfirmed(worker, pos)
 	}
+	var commitLatencyMs float64
+	if d := ack.GetCommitDuration(); d != nil {
+		commitLatencyMs = float64(d.AsDuration().Milliseconds())
+	}
+	c.recordTableStats(worker, ack.Table, int64(ack.Rows), int64(ack.Deletes), commitLatencyMs, time.Now())
 	if c.metrics != nil {
 		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()
@@ -2018,6 +2066,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		// invert the order supervisor.tick uses (supervisor.mu → c.mu) and
 		// deadlock the two (audit #3).
 		c.supervisor.noteAttach(hello.WorkerName)
+		c.pushDashState() // the worker attached
 	}
 	if !known {
 		sessCancel()
@@ -2067,6 +2116,8 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 				c.onStagedBatch(hello.WorkerName, m.Staged)
 			case *pb.WorkerMessage_Hello:
 				c.onHello(hello.WorkerName, m.Hello)
+			case *pb.WorkerMessage_WorkerMetrics:
+				c.onWorkerMetrics(m.WorkerMetrics)
 			case *pb.WorkerMessage_ChunkReady:
 				// A full chunkReady buffer with no draining snapshot loop
 				// (stale replies after a reset) must not wedge this recv
@@ -2123,6 +2174,7 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	if n := c.staged.discardWorker(worker); n > 0 {
 		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
 	}
+	c.pushDashState() // the worker is no longer attached
 	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {

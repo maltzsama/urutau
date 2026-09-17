@@ -334,6 +334,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	runErr := make(chan error, 1)
 	ingest := make(chan Ingest, 1024)
 	go func() { runErr <- w.Run(pipeCtx, ingest) }()
+	go reportWorkerMetrics(pipeCtx, w, sender, cfg.Logger)
 
 	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
 	defer chunks.Close()

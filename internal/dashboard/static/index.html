@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coordinator Dashboard</title>
+<script>
+  // Apply the stored theme before first paint, so there is no flash of the
+  // wrong theme. "auto" resolves against the OS preference.
+  (function () {
+    var t = localStorage.getItem('urutau-theme') || 'auto';
+    var resolved = t === 'auto'
+      ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+      : t;
+    document.documentElement.setAttribute('data-theme', resolved);
+  })();
+</script>
+<link rel="stylesheet" href="/vendor/pico.min.css">
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body x-data="app()" x-init="init()">
+
+<main class="container">
+  <header class="topbar">
+    <div>
+      <h1><span x-text="summary.pipeline || 'pipeline'"></span> <small class="muted">/ Coordinator</small></h1>
+      <div class="small muted inline-copy">
+        Run <span class="mono" x-text="summary.run_id || '—'"></span>
+        <button class="copy-btn" type="button" aria-label="Copy run ID"
+                @click="copy(summary.run_id)">⧉</button>
+      </div>
+    </div>
+    <div class="topline">
+      <span class="pill" :class="statusClass(summary.status)" x-text="summary.status || 'unknown'"></span>
+      <span class="small">Uptime <b x-text="uptime()"></b></span>
+      <span class="small">Last poll <b x-text="lastPoll || '—'"></b></span>
+      <span class="pill" :class="failures > 3 ? 'red' : 'amber'" x-show="failures > 0"
+            x-text="'poll failures: ' + failures"></span>
+      <button class="theme-toggle" type="button" @click="cycleTheme()"
+              :aria-label="'Theme: ' + theme" x-text="themeLabel()"></button>
+    </div>
+  </header>
+
+  <nav>
+    <template x-for="tab in tabs" :key="tab.id">
+      <a href="#" :class="{ active: view === tab.id }"
+         @click.prevent="setView(tab.id)" x-text="tab.label"></a>
+    </template>
+  </nav>
+
+  <div class="card" x-show="!loaded" aria-busy="true">
+    <span class="muted">Loading coordinator state…</span>
+  </div>
+
+  <div class="banner fail" x-show="loaded && error" x-cloak>
+    <div><b x-text="error"></b> <span class="muted">— showing the last known state</span></div>
+    <div class="actions"><button @click="refresh()">Retry</button></div>
+  </div>
+
+  <!-- ── Overview ─────────────────────────────────────────────────────── -->
+  <section x-show="view === 'overview'">
+    <div class="banner" :class="bannerClass()">
+      <div>
+        <span class="pill" :class="statusClass(summary.status)" x-text="summary.status || 'unknown'"></span>
+        <span x-text="bannerReason()"></span>
+      </div>
+      <div class="actions">
+        <button @click="setView('events')">View events</button>
+        <button class="danger" @click="confirmCancel()" x-show="summary.status !== 'failed'">Cancel pipeline</button>
+      </div>
+    </div>
+
+    <div class="grid kpis">
+      <article class="card kpi" @click="setView('workers')">
+        <div class="label">Workers online</div>
+        <div class="hero" x-text="workersOnline()"></div>
+        <div class="delta muted">attached / total</div>
+        <div class="spark"><canvas id="spark-workers"></canvas></div>
+      </article>
+      <article class="card kpi" @click="setView('streams')">
+        <div class="label">Total lag</div>
+        <div class="hero" x-text="totalLag().toFixed(1) + 's'"></div>
+        <div class="delta muted">sum across streams</div>
+        <div class="spark"><canvas id="spark-lag"></canvas></div>
+      </article>
+      <article class="card kpi" @click="setView('streams')">
+        <div class="label">Throughput</div>
+        <div class="hero" x-text="totalRate().toFixed(1) + '/s'"></div>
+        <div class="delta muted">rows/s</div>
+        <div class="spark"><canvas id="spark-throughput"></canvas></div>
+      </article>
+      <article class="card kpi" @click="setView('streams')">
+        <div class="label">Commits</div>
+        <div class="hero" x-text="fmt(totalCommits())"></div>
+        <div class="delta muted">total</div>
+        <div class="spark"><canvas id="spark-commits"></canvas></div>
+      </article>
+      <article class="card kpi" @click="setView('events')">
+        <div class="label">Errors · last hour</div>
+        <div class="hero" x-text="errorCount()"></div>
+        <div class="delta muted">from the event ring</div>
+        <div class="spark"><canvas id="spark-errors"></canvas></div>
+      </article>
+      <article class="card kpi" @click="setView('streams')">
+        <div class="label">Snapshot progress</div>
+        <div class="hero" x-text="snapshotDone() + '/' + tables.length"></div>
+        <div class="delta muted">streams done</div>
+        <div class="spark"><canvas id="spark-snapshot"></canvas></div>
+      </article>
+    </div>
+
+    <section class="section">
+      <div class="sectionhead">
+        <h2>Throughput &amp; lag</h2>
+        <div class="topline">
+          <span class="muted small">window</span>
+          <select x-model="window" @change="renderCharts()">
+            <option value="5m">5m</option><option value="30m">30m</option><option value="1h">1h</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid two">
+        <article class="card">
+          <div class="sectionhead"><h2>Throughput</h2><span class="muted small">rows/s</span></div>
+          <div class="chart"><canvas id="chart-throughput"></canvas></div>
+        </article>
+        <article class="card">
+          <div class="sectionhead"><h2>Lag by stream</h2><span class="muted small">threshold 30s</span></div>
+          <div class="chart"><canvas id="chart-lag"></canvas></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="card section">
+      <div class="sectionhead">
+        <div><h2>Maintenance</h2><div class="small muted">Iceberg housekeeping · coordinator-reported totals</div></div>
+        <div class="topline">
+          <span class="badge" x-text="summary.maintenance_enabled ? 'enabled' : 'disabled'"></span>
+          <button @click="setView('streams')">View streams →</button>
+        </div>
+      </div>
+      <div class="muted small" x-show="!summary.maintenance_enabled">
+        Maintenance is off for this pipeline. Enable <code>sink.maintenance</code> to run compaction, snapshot expiry and orphan cleanup.
+      </div>
+      <div class="grid three" x-show="summary.maintenance_enabled && maintenance()">
+        <div class="card" x-show="maintenance().compaction">
+          <div class="row"><span class="small muted">COMPACTION</span>
+            <span class="badge" x-text="maintenance().compaction?.runs + ' runs'"></span></div>
+          <div class="metricline"><span>Bytes before</span><strong x-text="bytes(maintenance().compaction?.bytes_before)"></strong></div>
+          <div class="metricline"><span>Bytes after</span><strong x-text="bytes(maintenance().compaction?.bytes_after)"></strong></div>
+          <div class="metricline"><span>Reclaimed</span><strong x-text="bytes(reclaimed())"></strong></div>
+          <div class="metricline"><span>Files removed</span><strong x-text="maintenance().compaction?.files_removed"></strong></div>
+          <div class="metricline"><span>Files added</span><strong x-text="maintenance().compaction?.files_added"></strong></div>
+          <div class="metricline"><span>Last run</span><strong x-text="ago(maintenance().compaction?.last_run)"></strong></div>
+        </div>
+        <div class="card" x-show="maintenance().expiry">
+          <div class="row"><span class="small muted">SNAPSHOT EXPIRY</span>
+            <span class="badge" x-text="maintenance().expiry?.runs + ' runs'"></span></div>
+          <div class="hero" x-text="maintenance().expiry?.snapshots_removed"></div>
+          <div class="small muted">snapshots removed</div>
+          <div class="metricline"><span>Last run</span><strong x-text="ago(maintenance().expiry?.last_run)"></strong></div>
+        </div>
+        <div class="card" x-show="maintenance().orphan">
+          <div class="row"><span class="small muted">ORPHAN CLEANUP</span>
+            <span class="badge" x-text="maintenance().orphan?.runs + ' runs'"></span></div>
+          <div class="hero" x-text="bytes(maintenance().orphan?.bytes_freed)"></div>
+          <div class="small muted">bytes freed</div>
+          <div class="metricline"><span>Files deleted</span><strong x-text="maintenance().orphan?.files_deleted"></strong></div>
+          <div class="metricline"><span>Last run</span><strong x-text="ago(maintenance().orphan?.last_run)"></strong></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card section">
+      <div class="sectionhead"><h2>Recent activity</h2><button @click="setView('events')">View all →</button></div>
+      <template x-for="e in recentEvents()" :key="e.ts + e.type">
+        <article class="event" :class="eventClass(e)">
+          <div class="row"><span class="small muted"><span x-text="ts(e.ts)"></span> · <b x-text="e.type"></b></span></div>
+          <div class="small"><span x-text="e.worker"></span> <span x-text="e.table ? '· ' + e.table : ''"></span></div>
+          <div class="msg" x-text="e.message"></div>
+        </article>
+      </template>
+      <div x-show="recentEvents().length === 0" class="muted small">No recent events.</div>
+    </section>
+  </section>
+
+  <!-- ── Streams ──────────────────────────────────────────────────────── -->
+  <section x-show="view === 'streams'">
+    <div class="sectionhead">
+      <h2>Streams <span class="muted small" x-text="'(' + filteredStreams().length + ')'"></span></h2>
+      <div class="toolbar">
+        <input placeholder="Filter streams…" x-model="streamFilter">
+        <select x-model="sort">
+          <option value="lag">Lag desc</option>
+          <option value="source">Source</option>
+        </select>
+      </div>
+    </div>
+    <div class="grid streamgrid">
+      <template x-for="t in filteredStreams()" :key="t.target">
+        <article class="card clickable" @click="openStream(t)">
+          <div class="row">
+            <div><h3 x-text="t.source"></h3><div class="small muted" x-text="'→ ' + t.target"></div></div>
+            <span class="pill" :class="streamStatusClass(t)" x-text="streamStatus(t)"></span>
+          </div>
+          <div class="row"><span class="badge" x-text="t.write_mode"></span><span class="small muted">Lag</span></div>
+          <div class="hero" x-text="t.lag_s.toFixed(1) + 's'"></div>
+          <div class="metricline"><span>Rows total</span><strong x-text="fmt(t.rows_total)"></strong></div>
+          <div class="metricline"><span>Rate</span><strong x-text="t.rows_rate.toFixed(1) + '/s'"></strong></div>
+          <div class="metricline"><span>Commits</span><strong><span x-text="fmt(t.commits)"></span>
+            <span class="red" x-show="t.commit_failures" x-text="' · ' + t.commit_failures + ' failures'"></span></strong></div>
+          <div class="metricline" x-show="t.equality_deletes"><span>Equality deletes</span><strong x-text="fmt(t.equality_deletes)"></strong></div>
+          <div class="metricline" x-show="t.deletes_dropped"><span>Deletes dropped</span><strong x-text="fmt(t.deletes_dropped)"></strong></div>
+          <div class="metricline"><span>Commit latency</span><strong x-text="ms(t.commit_latency_ms)"></strong></div>
+          <div x-show="t.snapshot_progress > 0 && t.snapshot_progress < 1">
+            <div class="bar"><i :style="'width:' + (t.snapshot_progress * 100) + '%'"></i></div>
+            <div class="small muted" x-text="Math.round(t.snapshot_progress * 100) + '% snapshot'"></div>
+          </div>
+        </article>
+      </template>
+    </div>
+    <div x-show="filteredStreams().length === 0" class="card muted">No streams match.</div>
+  </section>
+
+  <!-- ── Workers ──────────────────────────────────────────────────────── -->
+  <section x-show="view === 'workers'">
+    <div class="sectionhead">
+      <h2>Workers <span class="muted small" x-text="'(' + filteredWorkers().length + ')'"></span></h2>
+      <input placeholder="Filter workers…" x-model="workerFilter">
+    </div>
+    <div class="grid workgrid">
+      <template x-for="w in filteredWorkers()" :key="w.name">
+        <article class="card">
+          <div class="row"><h3 x-text="w.name"></h3>
+            <span class="pill" :class="workerClass(w)" x-text="w.status"></span></div>
+          <div class="small muted">epoch <span x-text="w.epoch"></span></div>
+          <div>
+            <template x-for="t in w.tables" :key="t">
+              <button class="badge" @click="openStreamByName(t)" x-text="t"></button>
+            </template>
+          </div>
+          <div class="metricline"><span>Last ack</span><strong x-text="w.last_ack_s ? w.last_ack_s.toFixed(1) + 's ago' : '—'"></strong></div>
+          <div class="metricline"><span>Inflight</span><strong x-text="bytes(w.inflight_bytes)"></strong></div>
+          <details><summary>Committed positions</summary>
+            <template x-for="(v, k) in (w.committed || {})" :key="k">
+              <div class="mono small" x-text="k + ': ' + v"></div>
+            </template>
+            <div class="muted small" x-show="!w.committed || Object.keys(w.committed).length === 0">None</div>
+          </details>
+          <div class="small muted" x-show="workerTransitions(w.name).length > 1">
+            <template x-for="(tr, i) in workerTransitions(w.name)" :key="i">
+              <span><span x-text="tr.status"></span><span x-show="i < workerTransitions(w.name).length - 1" x-text="' → '"></span></span>
+            </template>
+          </div>
+          <div class="actions">
+            <button :disabled="w.status === 'pending'" @click="confirmRestart(w.name)">Restart</button>
+            <button class="copy-btn" type="button" aria-label="Copy kubectl logs command"
+                    @click="copy('kubectl logs -l worker=' + w.name)">⧉ logs</button>
+          </div>
+        </article>
+      </template>
+    </div>
+  </section>
+
+  <!-- ── Events ───────────────────────────────────────────────────────── -->
+  <section x-show="view === 'events'">
+    <div class="sectionhead">
+      <h2>Events <span class="muted small">newest first</span></h2>
+      <button @click="paused = !paused" x-text="paused ? 'Resume auto-scroll' : 'Pause auto-scroll'"></button>
+    </div>
+    <div class="toolbar">
+      <select x-model="eventFilter">
+        <option value="all">All types</option>
+        <option value="error">Errors</option>
+        <option value="warning">Warnings</option>
+        <option value="info">Info</option>
+      </select>
+      <input placeholder="Search message, worker, table…" x-model="query">
+      <select x-model.number="eventLimit">
+        <option :value="100">100</option><option :value="200">200</option>
+        <option :value="500">500</option><option :value="1000">1000</option>
+      </select>
+    </div>
+    <div class="banner warn" x-show="paused">Auto-scroll paused.</div>
+    <template x-for="e in filteredEvents()" :key="e.ts + e.type + e.worker">
+      <article class="event" :class="eventClass(e)">
+        <div class="row">
+          <span class="small muted"><span x-text="ts(e.ts)"></span> · <b x-text="e.type"></b></span>
+          <button class="copy-btn" type="button" aria-label="Copy event JSON" @click="copy(JSON.stringify(e))">⧉</button>
+        </div>
+        <div class="small"><span x-text="e.worker"></span> <span x-text="e.table ? '· ' + e.table : ''"></span></div>
+        <div class="msg" x-text="e.message"></div>
+      </article>
+    </template>
+    <div x-show="filteredEvents().length === 0" class="card muted">No events match the filter.</div>
+  </section>
+
+  <!-- ── Logs ─────────────────────────────────────────────────────────── -->
+  <section x-show="view === 'logs'">
+    <div class="sectionhead"><h2>Logs <span class="muted small">coordinator</span></h2></div>
+    <div class="toolbar">
+      <select x-model="logFilter">
+        <option value="all">All</option>
+        <option value="warnings">Warnings+</option>
+        <option value="errors">Errors</option>
+      </select>
+      <input placeholder="Search…" x-model="query">
+    </div>
+    <template x-for="l in filteredLogs()" :key="l.ts + l.msg">
+      <article class="event" :class="logClass(l)">
+        <div class="row">
+          <span class="small muted"><span x-text="ts(l.ts)"></span> · <b x-text="l.level"></b></span>
+          <button class="copy-btn" type="button" aria-label="Copy log JSON" @click="copy(JSON.stringify(l))">⧉</button>
+        </div>
+        <div x-text="l.msg"></div>
+        <div class="small muted">
+          <template x-for="(v, k) in (l.attrs || {})" :key="k">
+            <span class="badge" x-text="k + ': ' + v"></span>
+          </template>
+        </div>
+      </article>
+    </template>
+    <div x-show="filteredLogs().length === 0" class="card muted">No log lines.</div>
+  </section>
+
+  <footer>
+    <span>urutau coordinator ·
+      <a href="https://github.com/maltzsama/urutau" target="_blank" rel="noopener">GitHub</a></span>
+    <span><a href="/metrics">/metrics</a> · <a href="/statusz">/statusz</a></span>
+  </footer>
+</main>
+
+<!-- Stream detail drawer -->
+<div class="overlay" x-show="drawer.open" x-cloak @click.self="drawer.open = false">
+  <aside class="drawer">
+    <div class="row">
+      <h2 x-text="drawerTable() ? drawerTable().source + ' → ' + drawerTable().target : 'Details'"></h2>
+      <button class="copy-btn" type="button" aria-label="Close" @click="drawer.open = false">✕</button>
+    </div>
+    <template x-if="drawerTable()">
+      <div>
+        <div class="topline">
+          <span class="badge" x-text="drawerTable().write_mode"></span>
+          <span class="pill" :class="streamStatusClass(drawerTable())" x-text="streamStatus(drawerTable())"></span>
+        </div>
+        <p class="muted small section">Current position</p>
+        <p class="mono inline-copy"><span x-text="drawerTable().position || '—'"></span>
+          <button class="copy-btn" type="button" aria-label="Copy position" @click="copy(drawerTable().position)">⧉</button></p>
+        <div class="grid two section">
+          <div class="metricline"><span>Lag</span><strong x-text="drawerTable().lag_s.toFixed(1) + 's'"></strong></div>
+          <div class="metricline"><span>Commit latency</span><strong x-text="ms(drawerTable().commit_latency_ms)"></strong></div>
+          <div class="metricline"><span>Commits</span><strong x-text="fmt(drawerTable().commits)"></strong></div>
+          <div class="metricline" x-show="drawerTable().commit_failures"><span>Failures</span><strong class="red" x-text="drawerTable().commit_failures"></strong></div>
+        </div>
+        <div class="section"><h3>Throughput &amp; lag</h3><div class="chart"><canvas id="chart-drawer"></canvas></div></div>
+        <div class="section"><h3>Maintenance</h3>
+          <div class="metricline" x-show="drawerTable().maintenance?.compaction">
+            <span>Compaction</span><strong x-text="drawerTable().maintenance?.compaction?.runs + ' runs'"></strong></div>
+          <div class="metricline" x-show="drawerTable().maintenance?.expiry">
+            <span>Snapshot expiry</span><strong x-text="drawerTable().maintenance?.expiry?.snapshots_removed + ' removed'"></strong></div>
+          <div class="metricline" x-show="drawerTable().maintenance?.orphan">
+            <span>Orphan cleanup</span><strong x-text="bytes(drawerTable().maintenance?.orphan?.bytes_freed)"></strong></div>
+          <div class="muted small" x-show="!drawerTable().maintenance">Maintenance is off or has not run yet.</div>
+        </div>
+      </div>
+    </template>
+  </aside>
+</div>
+
+<!-- Confirmation modal -->
+<div class="modal" x-show="modal.open" x-cloak @click.self="modal.open = false">
+  <div class="modalbox">
+    <h2 x-text="modal.title"></h2>
+    <p class="muted" x-text="modal.text"></p>
+    <p class="red" x-show="modal.error" x-text="modal.error"></p>
+    <div class="actions end">
+      <button @click="modal.open = false">Cancel</button>
+      <button class="danger" @click="runModalAction()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" x-show="toastMsg" x-cloak x-text="toastMsg" role="status"></div>
+
+<script defer src="/vendor/chart.umd.min.js"></script>
+<script defer src="/app.js"></script>
+<script defer src="/vendor/alpine.min.js"></script>
+</body>
+</html>
