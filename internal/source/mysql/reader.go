@@ -6,10 +6,12 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +56,17 @@ type Reader struct {
 	winChunk uint32 // chunkID of the open DBLog window, when winOpen
 	winOpen  bool
 	winLow   *position.GTID // source watermark captured at OpenWindow
+
+	// done is closed once, by StartFromGTID on the way out (whether it
+	// exits via ctx.Done() or the stream ending on its own). OnRow selects
+	// on it alongside every send to r.out: without this, a stalled
+	// consumer blocks OnRow forever on canal's own event-loop goroutine,
+	// which stops canal from reading further binlog events (no GTIDs, no
+	// heartbeats, no rotates) and makes Close()/ctx cancellation hang,
+	// because neither can unblock a goroutine parked on a channel send —
+	// only a reader on the other end can. See issue #114.
+	done     chan struct{}
+	doneOnce sync.Once
 
 	canal.DummyEventHandler // unimplemented hooks are no-ops
 }
@@ -118,9 +131,14 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		return nil, fmt.Errorf("mysql: new canal: %w", err)
 	}
 
-	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc}
+	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc, done: make(chan struct{})}
 	c.SetEventHandler(r)
 	return r, nil
+}
+
+// stop closes done exactly once, unblocking any OnRow send in progress.
+func (r *Reader) stop() {
+	r.doneOnce.Do(func() { close(r.done) })
 }
 
 // StartFromGTID begins streaming from the given GTID set, blocking until
@@ -151,10 +169,17 @@ func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error 
 
 	select {
 	case <-ctx.Done():
+		r.stop() // unblock any OnRow send parked on r.out before Close
 		r.canal.Close()
 		return ctx.Err()
 	case err := <-done:
-		if err != nil {
+		r.stop()
+		// errReaderStopped surfaces here when Close() (not ctx.Done, this
+		// case) triggered the shutdown while OnRow was mid-send: canal
+		// propagates OnRow's error out of its own sync loop, so it arrives
+		// as this call's own error rather than through ctx.Done(). It is
+		// an orderly stop, not a stream failure.
+		if err != nil && !errors.Is(err, errReaderStopped) {
 			return fmt.Errorf("mysql: stream ended: %w", err)
 		}
 		return nil
@@ -196,8 +221,12 @@ func (r *Reader) Master(ctx context.Context) (position.Position, error) {
 	}
 }
 
-// Close stops the reader and its replication connection.
-func (r *Reader) Close() { r.canal.Close() }
+// Close stops the reader and its replication connection. Safe to call
+// before StartFromGTID unblocks the same shutdown path it uses.
+func (r *Reader) Close() {
+	r.stop()
+	r.canal.Close()
+}
 
 // SetConfirmed is a no-op for MySQL: binlog retention is time/size-based,
 // not consumer-confirmed, so there is no slot to hold back.
@@ -266,24 +295,50 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 		for _, row := range e.Rows {
 			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos)
 			c.Window = win
-			r.out <- c
+			if err := r.emit(c); err != nil {
+				return err
+			}
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
 			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos)
 			c.Window = win
-			r.out <- c
+			if err := r.emit(c); err != nil {
+				return err
+			}
 		}
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
 			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
 			c.Window = win
-			r.out <- c
+			if err := r.emit(c); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
+
+// emit sends c to the reader's output, or returns an error if the reader is
+// shutting down first. A bare `r.out <- c` would block OnRow — and with it
+// canal's whole event loop — for as long as a stalled consumer takes to
+// drain the channel, with Close()/context cancellation unable to break it
+// out (see the done field's doc comment, issue #114). Returning the error
+// makes canal tear the stream down instead of continuing to feed a reader
+// that is on its way out.
+func (r *Reader) emit(c rowchange.Change) error {
+	select {
+	case r.out <- c:
+		return nil
+	case <-r.done:
+		return errReaderStopped
+	}
+}
+
+// errReaderStopped is emit's sentinel for "the reader is shutting down" —
+// not a stream failure, so callers must not treat it as one.
+var errReaderStopped = fmt.Errorf("mysql: reader stopped")
 
 // OnDDL surfaces DDL statements seen on the stream. The query is the
 // authoritative statement. Row data is not produced here — schema drift on
@@ -331,15 +386,87 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 // rowToMap maps a row (in table column order) to column-name → value.
 // The binlog yields []byte for string columns; normalize them to string so
 // the writer's scalar type switch accepts them.
+//
+// ENUM and SET need the column definition, not just the value: the binlog
+// encodes them numerically (see decodeEnum/decodeSet), while the backfill's
+// SELECT returns them as text. Both paths feed the same target column, so
+// decoding here is what keeps a CDC row and a snapshot row of the same
+// source row identical.
 func rowToMap(tbl *schema.Table, row []any) map[string]any {
 	out := make(map[string]any, len(tbl.Columns))
 	for i, col := range tbl.Columns {
 		if i >= len(row) {
 			continue
 		}
-		out[col.Name] = normalize(row[i])
+		out[col.Name] = normalizeCol(col, row[i])
 	}
 	return out
+}
+
+// normalizeCol converts one binlog value using its column definition.
+func normalizeCol(col schema.TableColumn, v any) any {
+	switch col.Type {
+	case schema.TYPE_ENUM:
+		return decodeEnum(col, v)
+	case schema.TYPE_SET:
+		return decodeSet(col, v)
+	case schema.TYPE_STRING:
+		// Text columns carry their bytes in the column's own character set,
+		// unconverted (see charset.go). TYPE_BINARY is deliberately not here:
+		// its bytes are not text and reinterpreting them would corrupt them.
+		if b, ok := v.([]byte); ok {
+			return decodeString(b, col.Collation)
+		}
+
+		return normalize(v)
+	default:
+		return normalize(v)
+	}
+}
+
+// decodeEnum turns the binlog's 1-based member index into the member string.
+// MySQL stores an ENUM as its ordinal, so the raw event carries int64(2) for
+// the second member — which the target column (mapped to KindString by
+// mapColumnType) would otherwise stringify to "2" instead of "b". No error is
+// raised anywhere on that path, so the wrong value lands silently.
+//
+// Index 0 is MySQL's marker for a value rejected on insert (non-strict mode
+// stores the empty string), and an index past the member list means the
+// column was altered between the TableMapEvent and this decode: both fall
+// back to the raw value rather than inventing a member.
+func decodeEnum(col schema.TableColumn, v any) any {
+	idx, ok := v.(int64)
+	if !ok || len(col.EnumValues) == 0 {
+		return normalize(v)
+	}
+	if idx == 0 {
+		return ""
+	}
+	if idx < 0 || int(idx) > len(col.EnumValues) {
+		return normalize(v)
+	}
+	return col.EnumValues[idx-1]
+}
+
+// decodeSet turns the binlog's bitmask into the comma-joined member list, in
+// declaration order — the same text the backfill's SELECT returns. Bit 0 is
+// the first member: SET('x','y','z') holding 'x,z' arrives as 0b101.
+//
+// Bits past the member list mean the column was altered between the
+// TableMapEvent and this decode; they are ignored rather than dropping the
+// members that did resolve.
+func decodeSet(col schema.TableColumn, v any) any {
+	mask, ok := v.(int64)
+	if !ok || len(col.SetValues) == 0 {
+		return normalize(v)
+	}
+	members := make([]string, 0, len(col.SetValues))
+	for bit := 0; bit < len(col.SetValues) && bit < 64; bit++ {
+		if mask&(1<<uint(bit)) != 0 {
+			members = append(members, col.SetValues[bit])
+		}
+	}
+	return strings.Join(members, ",")
 }
 
 func normalize(v any) any {
