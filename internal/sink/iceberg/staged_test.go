@@ -20,7 +20,7 @@ func TestEncodeStagedEmptyFraming(t *testing.T) {
 	}
 	// magic + specID + schema len + state len + pending count + deletes count + appends count
 	want := []byte{
-		stagedMagic,
+		stagedMagicV2,
 		0, 0, 0, 0, // spec ID
 		0, 0, 0, 0, // schema string length
 		0, 0, 0, 0, // snapshot state length
@@ -71,7 +71,7 @@ func TestDecodeStagedRejectsOversizedLengths(t *testing.T) {
 	// A string length that claims far more bytes than the payload holds must
 	// be rejected before it drives an allocation. Layout: magic, spec ID,
 	// then the oversized schema-string length.
-	buf := []byte{stagedMagic}
+	buf := []byte{stagedMagicV2}
 	buf = put(buf, 0)     // spec ID matches
 	buf = put(buf, 1<<30) // schema string length: 1 GiB claimed, nothing follows
 	if _, err := decodeStaged(buf, iceberg.PartitionSpec{}, nil, 2); err == nil {
@@ -79,7 +79,7 @@ func TestDecodeStagedRejectsOversizedLengths(t *testing.T) {
 	}
 
 	// Same for a file-list count: it cannot exceed the remaining bytes / 4.
-	buf = []byte{stagedMagic}
+	buf = []byte{stagedMagicV2}
 	buf = put(buf, 0)     // spec ID
 	buf = put(buf, 0)     // empty schema string
 	buf = put(buf, 0)     // empty snapshot state
@@ -87,6 +87,27 @@ func TestDecodeStagedRejectsOversizedLengths(t *testing.T) {
 	buf = put(buf, 1<<30) // delete-file count
 	if _, err := decodeStaged(buf, iceberg.PartitionSpec{}, nil, 2); err == nil {
 		t.Fatal("an oversized file count must be rejected")
+	}
+}
+
+// TestDecodeStagedLegacyFormat pins the rolling-upgrade compatibility (issue
+// #124 review): a pre-fingerprint 0.2.0 descriptor (magic 0x57, no spec/schema
+// fingerprint) must still decode, so an old worker's descriptor reaching a new
+// coordinator does not stall a staged cycle.
+func TestDecodeStagedLegacyFormat(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte(stagedMagic)
+	writeString(&buf, "in_progress")
+	writeUint32List(&buf, []uint32{5})
+	writeUint32(&buf, 0) // no delete files
+	writeUint32(&buf, 0) // no append files
+
+	p, err := decodeStaged(buf.Bytes(), iceberg.PartitionSpec{}, nil, 2)
+	if err != nil {
+		t.Fatalf("a legacy descriptor must decode: %v", err)
+	}
+	if p.snapshotState != "in_progress" || len(p.snapshotPending) != 1 || p.snapshotPending[0] != 5 {
+		t.Fatalf("legacy payload = %+v", p)
 	}
 }
 

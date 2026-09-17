@@ -30,9 +30,15 @@ var _ sink.StagingWriter = (*TableWriter)(nil)
 // descriptors and it commits them as one unit (WK-001 C5).
 var _ sink.StagedCommitter = (*Sink)(nil)
 
-// stagedMagic frames a WriteStaged descriptor (WK-001 C5). A leading byte so
-// a malformed or foreign payload is rejected before decoding.
-const stagedMagic = 0x57 // 'W'
+// The descriptor is framed by a leading magic byte so a malformed or foreign
+// payload is rejected before decoding. stagedMagicV2 is the current,
+// fingerprinted format; stagedMagic is the pre-fingerprint format released in
+// 0.2.0, still accepted on decode so a rolling upgrade (an old worker's
+// descriptor reaching a new coordinator) does not stall a staged cycle.
+const (
+	stagedMagic   = 0x57 // 'W' — legacy (no spec/schema fingerprint)
+	stagedMagicV2 = 0x58 // 'X' — fingerprinted
+)
 
 // stagedPayload is the decoded form of a WriteStaged descriptor: the delete
 // files and the data files one delivery produced, plus the snapshot state
@@ -335,7 +341,7 @@ func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key, pos str
 // lists (deletes, appends).
 func encodeStaged(p stagedPayload, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteByte(stagedMagic)
+	buf.WriteByte(stagedMagicV2)
 	// The decoder re-supplies the table's CURRENT spec and schema; a change
 	// between staging and commit makes iceberg-go's codec silently mis-type
 	// partition values, so fingerprint both and reject a mismatch loudly
@@ -362,13 +368,28 @@ func schemaString(schema *iceberg.Schema) string {
 	return schema.String()
 }
 
-// decodeStaged is the inverse of encodeStaged; spec, schema and version must
-// be the table's, matching the encoder.
+// decodeStaged decodes a descriptor, dispatching on the leading magic: the
+// fingerprinted v2 format or the pre-fingerprint legacy one (accepted so a
+// mixed-version rolling upgrade keeps committing). spec, schema and version
+// are the table's current ones; v2 checks them against the fingerprint.
 func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
-	if len(data) < 1 || data[0] != stagedMagic {
+	if len(data) < 1 {
+		return stagedPayload{}, fmt.Errorf("staged descriptor: empty")
+	}
+	switch data[0] {
+	case stagedMagicV2:
+		return decodeStagedV2(data[1:], spec, schema, version)
+	case stagedMagic:
+		return decodeStagedLegacy(data[1:], spec, schema, version)
+	default:
 		return stagedPayload{}, fmt.Errorf("staged descriptor: bad magic")
 	}
-	r := bytes.NewReader(data[1:])
+}
+
+// decodeStagedV2 decodes the fingerprinted format, rejecting a spec or schema
+// drift since staging.
+func decodeStagedV2(body []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
+	r := bytes.NewReader(body)
 	specID, err := readUint32(r)
 	if err != nil {
 		return stagedPayload{}, err
@@ -383,6 +404,18 @@ func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schem
 	if encSchema != schemaString(schema) {
 		return stagedPayload{}, fmt.Errorf("staged descriptor: table schema changed since staging")
 	}
+	return decodeStagedBody(r, spec, schema, version)
+}
+
+// decodeStagedLegacy decodes the pre-fingerprint format (0.2.0): state,
+// pending, deletes, appends — with no fingerprint to check.
+func decodeStagedLegacy(body []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
+	return decodeStagedBody(bytes.NewReader(body), spec, schema, version)
+}
+
+// decodeStagedBody reads the fields common to both formats from r, positioned
+// at the snapshot state.
+func decodeStagedBody(r *bytes.Reader, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
 	state, err := readString(r)
 	if err != nil {
 		return stagedPayload{}, err
