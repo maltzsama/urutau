@@ -181,7 +181,7 @@ func (m *Maintainer) compact(ctx context.Context) error {
 	if m.metrics != nil {
 		m.metrics.CompactionRun(identString(m.ident), 0, 0, 0, 0, lastErr)
 	}
-	return fmt.Errorf("%w: compaction on %v: %v", ErrCommitExhausted, m.ident, lastErr)
+	return fmt.Errorf("%w: compaction on %v: %w", ErrCommitExhausted, m.ident, lastErr)
 }
 
 // errNothingToCompact signals compactOnce found no candidate groups — a
@@ -270,7 +270,7 @@ func (m *Maintainer) expireSnapshots(ctx context.Context) error {
 	if m.metrics != nil {
 		m.metrics.SnapshotExpiryRun(identString(m.ident), 0, lastErr)
 	}
-	return fmt.Errorf("%w: snapshot expiry on %v: %v", ErrCommitExhausted, m.ident, lastErr)
+	return fmt.Errorf("%w: snapshot expiry on %v: %w", ErrCommitExhausted, m.ident, lastErr)
 }
 
 func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {

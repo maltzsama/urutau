@@ -274,7 +274,7 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: delete commit on %v: %v", ErrCommitExhausted, w.ident, lastErr)
+	return fmt.Errorf("%w: delete commit on %v: %w", ErrCommitExhausted, w.ident, lastErr)
 }
 
 func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos string, snapshotState string, snapshotPending []uint32) error {
@@ -331,7 +331,7 @@ func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos 
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: append commit on %v: %v", ErrCommitExhausted, w.ident, lastErr)
+	return fmt.Errorf("%w: append commit on %v: %w", ErrCommitExhausted, w.ident, lastErr)
 }
 
 // CommittedPosition reads the committed cdc.position of a table. The fast
@@ -403,7 +403,12 @@ func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Id
 func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
 	existing, err := cat.LoadTable(ctx, ident)
 	if err != nil {
-		// Table does not exist — create.
+		// Only a genuinely missing table means "create". Any other catalog
+		// error (auth, network) must propagate: treating it as absent would
+		// attempt a create against a table that may already exist.
+		if !errors.Is(err, catalog.ErrNoSuchTable) {
+			return fmt.Errorf("iceberg: load %v: %w", ident, err)
+		}
 		opts := []catalog.CreateTableOpt{
 			catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
 		}
@@ -414,8 +419,12 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 			}
 			opts = append(opts, catalog.WithPartitionSpec(&spec))
 		}
-		_, err = cat.CreateTable(ctx, ident, schema, opts...)
-		if err != nil {
+		if _, err := cat.CreateTable(ctx, ident, schema, opts...); err != nil {
+			// A concurrent creator won the race — the table exists, which is
+			// all EnsureTable promises.
+			if errors.Is(err, catalog.ErrTableAlreadyExists) {
+				return nil
+			}
 			return fmt.Errorf("iceberg: create %v: %w", ident, err)
 		}
 		return nil
@@ -487,6 +496,11 @@ func backoffDuration(base time.Duration, attempt int) time.Duration {
 	return d + jitter
 }
 
+// retryableHTTPStatus matches an HTTP status as a WHOLE token. A bare
+// substring match would treat a longer number (an offset like "15008") as a
+// status code and retry a terminal error.
+var retryableHTTPStatus = regexp.MustCompile(`\b(408|429|500|502|503|504)\b`)
+
 // isRetryableError classifies an error as transient (retryable) or
 // terminal. I/O and HTTP 5xx errors from the object store or catalog
 // are transient; schema, type, and 4xx errors are terminal.
@@ -495,19 +509,19 @@ func isRetryableError(err error) bool {
 		return true
 	}
 	s := err.Error()
-	// HTTP 5xx or throttling, or network errors from REST catalog or S3.
-	// The status-code tokens also cover the REST/S3 client messages that
-	// embed them; 429 and S3's SlowDown/RequestTimeout are the throttling
-	// signals a server overloaded enough to shed retries sends.
-	if strings.Contains(s, "500") || strings.Contains(s, "502") ||
-		strings.Contains(s, "503") || strings.Contains(s, "504") ||
-		strings.Contains(s, "429") || strings.Contains(s, "408") ||
-		strings.Contains(s, "SlowDown") || strings.Contains(s, "RequestTimeout") ||
-		strings.Contains(s, "throttl") || strings.Contains(s, "Too Many Requests") ||
-		strings.Contains(s, "connection refused") || strings.Contains(s, "EOF") ||
-		strings.Contains(s, "i/o timeout") || strings.Contains(s, "broken pipe") ||
-		strings.Contains(s, "reset by peer") {
+	// HTTP 5xx / 408 / 429 (whole tokens) or throttling/network errors from
+	// the REST catalog or S3. 429 and S3's SlowDown/RequestTimeout are the
+	// throttling signals a server overloaded enough to shed retries sends.
+	if retryableHTTPStatus.MatchString(s) {
 		return true
+	}
+	for _, tok := range []string{
+		"SlowDown", "RequestTimeout", "throttl", "Too Many Requests",
+		"connection refused", "EOF", "i/o timeout", "broken pipe", "reset by peer",
+	} {
+		if strings.Contains(s, tok) {
+			return true
+		}
 	}
 	return false
 }

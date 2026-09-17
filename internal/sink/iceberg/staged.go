@@ -127,10 +127,13 @@ func (w *TableWriter) writeDataFiles(ctx context.Context, tbl *table.Table, rec 
 }
 
 // CommitStaged commits one cycle's descriptors as a single unit: every delete
-// file of the cycle in one commit, then every data file in the next, with the
-// cycle's position on the LAST commit (WK-001 §4.2 invariants 3 and 4). The
-// delete-before-append order is mandatory: staged together, iceberg-go gives
-// the delete the higher sequence and it would erase the fresh rows.
+// file and every data file of the cycle land in ONE RowDelta, with the cycle's
+// position on that same commit (WK-001 §4.2 invariants 3 and 4). One RowDelta
+// is the atomic unit — a crash between a separate delete commit and append
+// commit would leave the deletes visible without their fresh rows. Within the
+// snapshot every file shares the snapshot's sequence, so the equality delete
+// (sequence S) applies only to rows written before it (sequence < S) and never
+// erases the rows committed with it.
 //
 // The snapshot state travels in the descriptors; the last non-empty one wins
 // (all deliveries of a binlog batch share it).
@@ -208,7 +211,7 @@ func (s *Sink) commitStagedProps(ctx context.Context, ident table.Identifier, po
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: staged property commit on %v: %v", ErrCommitExhausted, ident, lastErr)
+	return fmt.Errorf("%w: staged property commit on %v: %w", ErrCommitExhausted, ident, lastErr)
 }
 
 // commitStaged commits a cycle's delete AND data files as ONE atomic snapshot
@@ -267,7 +270,7 @@ func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes
 		}
 		return nil
 	}
-	return fmt.Errorf("%w: staged commit on %v: %v", ErrCommitExhausted, ident, lastErr)
+	return fmt.Errorf("%w: staged commit on %v: %w", ErrCommitExhausted, ident, lastErr)
 }
 
 // maxCommitTries and stagedBackoff mirror the TableWriter's retry policy for
