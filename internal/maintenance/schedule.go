@@ -142,6 +142,38 @@ func CheckInterval(cfg *spec.Maintenance) time.Duration {
 // coordinator instead provisions an ephemeral maintenance worker per table
 // and pushes the pass to it, so no long-lived maintenance goroutine lives in
 // the coordinator.
+//
+// Operations are dispatched one per RunOnce call rather than as one batch,
+// and a failure in one does not abandon the rest of the turn. Both halves
+// matter, because RunOnce runs a batch in order and returns the first
+// error, which says that something failed but not how much of the batch
+// committed first:
+//
+//   - Marking per operation. The operations before a failure really did
+//     commit — a compaction rewrite snapshot is on the table whether or not
+//     the expiry that followed it succeeded. A batch call can only mark all
+//     or none, and marking none leaves them due on the next tick, so with a
+//     persistently failing operation the earlier ones re-run every tick
+//     instead of once per interval. Dispatching singly costs nothing
+//     (RunOnce is sequential either way) and lets each success be recorded
+//     before the next operation is attempted.
+//
+//   - Continuing past a failure. Abandoning the turn starves every
+//     operation ordered after the failing one: an operation that never
+//     completes is never marked, so it is due on every subsequent tick and
+//     blocked on every subsequent tick. A snapshot expiry that keeps
+//     failing would stop orphan cleanup from ever running again, which is
+//     worse than the redundant work it was meant to avoid.
+//
+// Continuing is safe because the operations are independent, not a
+// pipeline: each reloads the table from the catalog and acts on whatever
+// state it finds (see iceberg.Maintainer's compactOnce, expireSnapshotsOnce
+// and cleanOrphans). opsInOrder is a preference — do the cheap
+// metadata-level work before the expensive physical sweep — not a
+// dependency. Orphan cleanup in particular removes only files unreferenced
+// by the state it loads, behind its own OlderThan safety window, so a
+// skipped expiry means it finds fewer files to delete, never that it
+// deletes something it should not have.
 func RunLoop(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Maintenance, sched *Schedule, log *slog.Logger) {
 	if log == nil {
 		log = slog.Default()
@@ -153,16 +185,33 @@ func RunLoop(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Mai
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			due := sched.Due(table, cfg, now)
-			if len(due) == 0 {
-				continue
-			}
-			if err := m.RunOnce(ctx, due); err != nil {
-				log.Warn("maintenance: run failed", "table", table, "ops", due, "err", err)
-				continue
-			}
-			sched.MarkRun(table, due, time.Now())
+			RunTurn(ctx, m, table, cfg, sched, log, now)
 		}
+	}
+}
+
+// RunTurn runs one maintenance turn: the operations due at now, each
+// dispatched on its own, with successes recorded as they happen. RunLoop
+// calls it on every tick; it is exported so a scheduler driving a virtual
+// clock (tests, and any future non-ticker driver) exercises the same
+// bookkeeping rather than a copy of it.
+//
+// See RunLoop's doc comment for why operations are dispatched singly and
+// why a failure does not abandon the rest of the turn.
+func RunTurn(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Maintenance, sched *Schedule, log *slog.Logger, now time.Time) {
+	if log == nil {
+		log = slog.Default()
+	}
+	for _, op := range sched.Due(table, cfg, now) {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := m.RunOnce(ctx, []sink.MaintenanceOp{op}); err != nil {
+			log.Warn("maintenance: run failed", "table", table, "op", op, "err", err)
+
+			continue
+		}
+		sched.MarkRun(table, []sink.MaintenanceOp{op}, now)
 	}
 }
 

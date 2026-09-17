@@ -169,6 +169,15 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	// the stream. MarkRun happens on that report, not on the send above: a
 	// worker that dies mid-pass (OOM, node drain) must leave the operations
 	// due rather than have them counted as run.
+	//
+	// Only the operations the worker reported as succeeded are marked, not
+	// the whole assignment. The worker reports on failure too (it has to —
+	// its own registry dies with the process), and its pass stops at the
+	// first error, so an assignment of [compaction, expiry, cleanup] that
+	// failed at expiry reports a successful compaction, a failed expiry, and
+	// nothing at all for the cleanup that never ran. Marking all three would
+	// record two operations as done that were not, holding the cleanup off
+	// for a full interval each time the expiry breaks.
 	for {
 		in, err := stream.Recv()
 		if err != nil {
@@ -176,11 +185,39 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 		}
 		if res := in.GetMaintenanceResult(); res != nil {
 			m.recordResult(table, res)
-			m.mu.Lock()
-			m.sched.MarkRun(table, due, time.Now())
-			m.mu.Unlock()
+			if ran := succeededOps(res); len(ran) > 0 {
+				m.mu.Lock()
+				m.sched.MarkRun(table, ran, time.Now())
+				m.mu.Unlock()
+			}
 		}
 	}
+}
+
+// succeededOps returns the operations a worker's report says completed
+// without error — the ones that may be marked as run. An operation the
+// worker never reached contributes no result at all, and one that failed
+// carries an Error, so neither is returned.
+func succeededOps(res *pb.MaintenanceResult) []sink.MaintenanceOp {
+	var ops []sink.MaintenanceOp
+	for _, op := range res.Ops {
+		switch r := op.Op.(type) {
+		case *pb.MaintenanceOpResult_Compaction:
+			if r.Compaction.Error == "" {
+				ops = append(ops, sink.MaintenanceCompaction)
+			}
+		case *pb.MaintenanceOpResult_Expiry:
+			if r.Expiry.Error == "" {
+				ops = append(ops, sink.MaintenanceSnapshotExpiry)
+			}
+		case *pb.MaintenanceOpResult_Orphan:
+			if r.Orphan.Error == "" {
+				ops = append(ops, sink.MaintenanceOrphanCleanup)
+			}
+		}
+	}
+
+	return ops
 }
 
 // run provisions ephemeral maintenance workers for due turns until ctx is
