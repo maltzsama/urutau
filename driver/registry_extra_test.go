@@ -13,12 +13,12 @@ func TestSinkConfigFromSpec(t *testing.T) {
 	s := &spec.Spec{
 		Source: spec.Source{Kind: "mysql"},
 		Sink: spec.Sink{
-			Type:      "iceberg+rest",
-			URI:       "http://catalog:8181",
-			Namespace: "lakehouse",
-			Warehouse: "wh",
-			ClientID:  "cid",
-			Scope:     "public",
+			Type:       "iceberg+rest",
+			URI:        "http://catalog:8181",
+			Namespace:  "lakehouse",
+			Warehouse:  "wh",
+			ClientID:   "cid",
+			Scope:      "public",
 			CommitMode: "atomic",
 			Defaults: spec.Defaults{
 				TargetFileSize: "256MB",

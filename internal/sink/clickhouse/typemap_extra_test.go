@@ -95,7 +95,7 @@ func TestCoerceEdgeCases(t *testing.T) {
 
 	// Decimal from decimal.Decimal directly.
 	d := decimal.RequireFromString("99.99")
-	got, err = coerce("Decimal(10,2)", d)
+	_, err = coerce("Decimal(10,2)", d)
 	if err != nil {
 		t.Errorf("coerce(Decimal, decimal) = %v", err)
 	}
