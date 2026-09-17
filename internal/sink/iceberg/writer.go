@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"regexp"
 	"strconv"
@@ -132,10 +133,28 @@ func (w *TableWriter) Close() error { return nil }
 // the position has not advanced. Resume reprocesses the batch: deletes are
 // idempotent, appends rewrite. Converges without loss.
 func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
-	// Split the batch into upsert rows and delete rows by __op (columnar).
-	// The append path is fully columnar (projectRecord); the equality-delete
-	// keys are extracted for iceberg-go, whose API takes keys — the §4.1
-	// library boundary, not a data-path materialization.
+	pos := string(b.Watermark)
+
+	if b.Mode != dataplane.UpsertMode {
+		// Append mode: the worker has already decided which rows an
+		// append-only table carries — appendRowsToKeep drops deletes with no
+		// image and every delete under onDelete: skip, and a delete that DOES
+		// carry an image is written as its before-image row (DELETE IMAGE
+		// CONTRACT). So the whole batch is appended as-is. Splitting it here
+		// would route those deliberately kept delete rows into the delete
+		// bucket append mode never reads (they would be dropped), and a batch
+		// of only such rows would commit nothing at all — leaving cdc.position
+		// unadvanced, so a restart replays the batch forever.
+		if b.Record == nil || b.Record.NumRows() == 0 {
+			return nil
+		}
+		return w.commitAppend(ctx, b, pos, b.SnapshotState, b.SnapshotPending)
+	}
+
+	// Upsert mode: split the batch into upsert rows and delete rows by __op
+	// (columnar). The append path is fully columnar (projectRecord); the
+	// equality-delete keys are extracted for iceberg-go, whose API takes keys
+	// — the §4.1 library boundary, not a data-path materialization.
 	upsertBatch, deleteBatch, err := splitByOp(ctx, b)
 	if err != nil {
 		return err
@@ -147,23 +166,20 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		defer deleteBatch.Release()
 	}
 
-	pos := string(b.Watermark)
-	if b.Mode == dataplane.UpsertMode {
-		// Equality-delete the PKs of ALL rows (upserts delete their older
-		// versions, deletes are the last word).
-		keys, err := extractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
-		if err != nil {
-			return err
+	// Equality-delete the PKs of ALL rows (upserts delete their older
+	// versions, deletes are the last word).
+	keys, err := extractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
+	if err != nil {
+		return err
+	}
+	if len(keys) > 0 {
+		// Position goes on the delete only when it IS the last commit.
+		delPos := ""
+		if upsertBatch == nil || upsertBatch.Record.NumRows() == 0 {
+			delPos = pos
 		}
-		if len(keys) > 0 {
-			// Position goes on the delete only when it IS the last commit.
-			delPos := ""
-			if upsertBatch == nil || upsertBatch.Record.NumRows() == 0 {
-				delPos = pos
-			}
-			if err := w.commitDeletes(ctx, keys, delPos, b.SnapshotState, b.SnapshotPending); err != nil {
-				return err
-			}
+		if err := w.commitDeletes(ctx, keys, delPos, b.SnapshotState, b.SnapshotPending); err != nil {
+			return err
 		}
 	}
 	if upsertBatch != nil && upsertBatch.Record.NumRows() > 0 {
@@ -555,11 +571,17 @@ func appendColumn(builder array.Builder, field arrow.Field, values []any) error 
 			case int32:
 				b.Append(t)
 			case int:
+				if t < math.MinInt32 || t > math.MaxInt32 {
+					return fmt.Errorf("iceberg: column %q: %v overflows int32", name, t)
+				}
 				b.Append(int32(t))
 			case int64:
+				if t < math.MinInt32 || t > math.MaxInt32 {
+					return fmt.Errorf("iceberg: column %q: %v overflows int32", name, t)
+				}
 				b.Append(int32(t))
 			case float64:
-				if t != float64(int64(t)) {
+				if t != float64(int64(t)) || t < math.MinInt32 || t > math.MaxInt32 {
 					return fmt.Errorf("iceberg: column %q: cannot append %v as int32", name, v)
 				}
 				b.Append(int32(t))
