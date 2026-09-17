@@ -79,7 +79,7 @@ func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.S
 	if err != nil {
 		return err
 	}
-	return EnsureTable(ctx, s.cat, s.ident(ref.Target), is, partitionBy, cast)
+	return EnsureTable(ctx, s.cat, s.ident(ref.Target), is, partitionBy, ref.PrimaryKey, cast)
 }
 
 // Writer opens the per-table committer.

@@ -100,13 +100,13 @@ func TestCreateTableToleratesAlreadyExists(t *testing.T) {
 	ident := table.Identifier{"raw", "t"}
 	schema := testSchema(t)
 
-	created, err := createTable(context.Background(), createErrCatalog{err: catalog.ErrTableAlreadyExists}, ident, schema, nil)
+	created, err := createTable(context.Background(), createErrCatalog{err: catalog.ErrTableAlreadyExists}, ident, schema, nil, nil)
 	if created || err != nil {
 		t.Fatalf("createTable(already exists) = %v, %v; want false, nil", created, err)
 	}
 
 	boom := errors.New("boom")
-	if _, err := createTable(context.Background(), createErrCatalog{err: boom}, ident, schema, nil); !errors.Is(err, boom) {
+	if _, err := createTable(context.Background(), createErrCatalog{err: boom}, ident, schema, nil, nil); !errors.Is(err, boom) {
 		t.Fatalf("createTable(boom) = %v, want boom", err)
 	}
 }

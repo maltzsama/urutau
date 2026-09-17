@@ -414,7 +414,31 @@ func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Id
 // createTable creates the target table, reporting whether it was created.
 // A false return with a nil error means a concurrent creator won the race
 // (ErrTableAlreadyExists) — the caller must reload and validate that table.
-func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string) (bool, error) {
+// sortOrderFor builds the table's default sort order over its identifier
+// (primary-key) columns, ascending with nulls first. A sort order clusters
+// equal-key rows together within data files, so equality-delete pruning and
+// key-range scans stay local. It is a create-time property: existing tables
+// are untouched (issue #131). A primary-key column absent from the schema is
+// a hard error — the same condition NewTableWriter rejects later, surfaced
+// here before the table is created.
+func sortOrderFor(schema *iceberg.Schema, primaryKey []string) (table.SortOrder, error) {
+	fields := make([]table.SortField, 0, len(primaryKey))
+	for _, name := range primaryKey {
+		f, ok := schema.FindFieldByName(name)
+		if !ok {
+			return table.SortOrder{}, fmt.Errorf("primary key column %q not found", name)
+		}
+		fields = append(fields, table.SortField{
+			SourceIDs: []int{f.ID},
+			Transform: iceberg.IdentityTransform{},
+			Direction: table.SortASC,
+			NullOrder: table.NullsFirst,
+		})
+	}
+	return table.NewSortOrder(1, fields)
+}
+
+func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy, primaryKey []string) (bool, error) {
 	opts := []catalog.CreateTableOpt{
 		catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
 	}
@@ -424,6 +448,13 @@ func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 			return false, fmt.Errorf("iceberg: %v: partition spec: %w", ident, err)
 		}
 		opts = append(opts, catalog.WithPartitionSpec(&spec))
+	}
+	if len(primaryKey) > 0 {
+		order, err := sortOrderFor(schema, primaryKey)
+		if err != nil {
+			return false, fmt.Errorf("iceberg: %v: sort order: %w", ident, err)
+		}
+		opts = append(opts, catalog.WithSortOrder(order))
 	}
 	if _, err := cat.CreateTable(ctx, ident, schema, opts...); err != nil {
 		if errors.Is(err, catalog.ErrTableAlreadyExists) {
@@ -438,12 +469,13 @@ func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 // exists, every column touched by a cast rule must match the resolved type:
 // if the existing column's Iceberg type disagrees, a hard error prevents
 // silent data corruption. The partition spec is applied on create and
-// verified for divergence on existing tables.
-func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy []string, cast core.CastPolicy) error {
+// verified for divergence on existing tables. The primary key, when known,
+// becomes the table's default sort order on create (issue #131).
+func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy, primaryKey []string, cast core.CastPolicy) error {
 	existing, err := cat.LoadTable(ctx, ident)
 	switch {
 	case errors.Is(err, catalog.ErrNoSuchTable):
-		created, cerr := createTable(ctx, cat, ident, schema, partitionBy)
+		created, cerr := createTable(ctx, cat, ident, schema, partitionBy, primaryKey)
 		if cerr != nil {
 			return cerr
 		}

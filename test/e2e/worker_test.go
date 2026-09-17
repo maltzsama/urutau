@@ -96,7 +96,7 @@ func TestWorkerEndToEnd(t *testing.T) {
 	if err := urutauiceberg.EnsureNamespace(ctx, cat, table.Identifier{"raw"}); err != nil {
 		t.Fatalf("namespace: %v", err)
 	}
-	if err := urutauiceberg.EnsureTable(ctx, cat, ident, schema, nil, core.CastPolicy{}); err != nil {
+	if err := urutauiceberg.EnsureTable(ctx, cat, ident, schema, nil, []string{"id"}, core.CastPolicy{}); err != nil {
 		t.Fatalf("ensure table: %v", err)
 	}
 
