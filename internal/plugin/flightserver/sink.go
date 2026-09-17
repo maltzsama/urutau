@@ -185,6 +185,26 @@ func pluginRecordToWire(rec arrow.RecordBatch, alloc memory.Allocator) (arrow.Re
 		dataCols = append(dataCols, name)
 	}
 
+	// The record arrives over the public plugin contract; a skewed client
+	// must fail with a typed error, not panic this Flight server goroutine
+	// (unchecked assertions here would take the whole subprocess down).
+	if err := wantColumn(schema, opIdx, "op", "utf8"); err != nil {
+		return nil, err
+	}
+	if err := wantColumn(schema, offsetIdx, "offset", "binary"); err != nil {
+		return nil, err
+	}
+	if tsIdx >= 0 {
+		if err := wantColumn(schema, tsIdx, "ts_source", "timestamp"); err != nil {
+			return nil, err
+		}
+	}
+	for _, name := range dataCols {
+		if err := wantColumn(schema, fieldIndex(schema, name), name, "utf8"); err != nil {
+			return nil, err
+		}
+	}
+
 	changes := make([]rowchange.Change, 0, n)
 	for i := range n {
 		op := rec.Column(opIdx).(*array.String).Value(i)
@@ -244,4 +264,17 @@ func fieldIndex(s *arrow.Schema, name string) int {
 		}
 	}
 	return -1
+}
+
+// wantColumn verifies the field at idx exists and has the expected Arrow
+// type. The record arrives over the public plugin contract — a skewed client
+// must fail with a typed error instead of panicking the Flight server.
+func wantColumn(schema *arrow.Schema, idx int, name, want string) error {
+	if idx < 0 {
+		return fmt.Errorf("plugin sink record missing %q column", name)
+	}
+	if got := schema.Field(idx).Type.Name(); got != want {
+		return fmt.Errorf("plugin sink record column %q: got %s, want %s", name, got, want)
+	}
+	return nil
 }
