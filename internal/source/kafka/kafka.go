@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -25,6 +26,13 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+)
+
+// Backoff bounds for transient fetch failures. A permanent error returns
+// instead of retrying, so these only pace a broker that is coming back.
+const (
+	minFetchBackoff = 100 * time.Millisecond
+	maxFetchBackoff = 30 * time.Second
 )
 
 // Source implements source.Source for Kafka.
@@ -249,7 +257,13 @@ func (r *Reader) Next(ctx context.Context) (*dataplane.Batch, error) {
 
 // consume is the blocking consume loop: it polls fetches and feeds decoded
 // changes to r.out, returning the terminal error.
+//
+// Errors are classified rather than uniformly retried. A permanent condition
+// (unknown topic, denied authorization, bad credentials) returns and fails
+// the pipeline: retrying it spins at full speed forever while making no
+// progress and reporting nothing upstream. A transient one backs off.
 func (r *Reader) consume(ctx context.Context) error {
+	backoff := minFetchBackoff
 	for {
 		select {
 		case <-ctx.Done():
@@ -262,11 +276,28 @@ func (r *Reader) consume(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			r.logger.Error("kafka: fetch", "err", err)
+			switch classifyFetch(err) {
+			case fetchPermanent:
+				return fmt.Errorf("kafka: fetch failed permanently: %w", err)
+			case fetchPositionLost:
+				return &ErrPositionLost{Topic: firstFetchTopic(fetches), Err: err}
+			}
+			r.logger.Error("kafka: fetch, retrying", "err", err, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, maxFetchBackoff)
 			continue
 		}
+		backoff = minFetchBackoff
 
+		var fatal error
 		fetches.EachRecord(func(rec *kgo.Record) {
+			if fatal != nil {
+				return
+			}
 			// franz-go leaves Record.Context nil on the consume side (it is
 			// only populated by an explicit hook, or on the produce side) —
 			// a decoder that needs one (Avro's schema registry HTTP fetch)
@@ -275,6 +306,11 @@ func (r *Reader) consume(ctx context.Context) error {
 			rec.Context = ctx
 			changes, err := r.dec.Decode(rec)
 			if err != nil {
+				if decodeIsFatal(err) {
+					fatal = fmt.Errorf("kafka: decode topic %s partition %d offset %d: %w",
+						rec.Topic, rec.Partition, rec.Offset, err)
+					return
+				}
 				r.logger.Error("kafka: decode", "topic", rec.Topic, "err", err)
 				return
 			}
@@ -311,7 +347,20 @@ func (r *Reader) consume(ctx context.Context) error {
 			r.synced.Set(rec.Topic, rec.Partition, rec.Offset+1)
 			r.mu.Unlock()
 		})
+		if fatal != nil {
+			return fatal
+		}
 	}
+}
+
+// firstFetchTopic names a topic carried by the fetch, for the error message.
+func firstFetchTopic(fetches kgo.Fetches) string {
+	for _, e := range fetches.Errors() {
+		if e.Topic != "" {
+			return e.Topic
+		}
+	}
+	return ""
 }
 
 // transportOf captures the message-queue envelope of a record for the
