@@ -110,13 +110,20 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 			if err != nil {
 				return fmt.Errorf("postgres: chunker bounds: %w", err)
 			}
-			key, err := scanRow(rows)
-			_ = rows.Close()
-			if err == sql.ErrNoRows {
+			key, scanErr := scanRow(rows)
+			closeErr := rows.Close()
+			switch {
+			case scanErr == sql.ErrNoRows:
+				// Clean end of the key sequence: only here is an empty
+				// result the terminator, and only if the close was clean.
+				if closeErr != nil {
+					return fmt.Errorf("postgres: chunker bounds close: %w", closeErr)
+				}
 				return nil
-			}
-			if err != nil {
-				return err
+			case scanErr != nil:
+				return scanErr
+			case closeErr != nil:
+				return fmt.Errorf("postgres: chunker bounds close: %w", closeErr)
 			}
 			bounds = append(bounds, key)
 		}
@@ -193,7 +200,17 @@ func (c *Chunker) scanOnce(ctx context.Context, ch source.Chunk, fn func(row map
 	if err != nil {
 		return fmt.Errorf("postgres: chunk scan: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	// Close is captured, not merely deferred: a close error is a real
+	// transient failure and must be retried like any other read error.
+	closed := false
+	closeRows := func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		return rows.Close()
+	}
+	defer func() { _ = closeRows() }()
 
 	colsMeta, err := rows.Columns()
 	if err != nil {
@@ -214,7 +231,11 @@ func (c *Chunker) scanOnce(ctx context.Context, ch source.Chunk, fn func(row map
 		}
 		return vals, true, nil
 	}
-	return scanPipeline(ctx, colsMeta, c.workers, produce, fn)
+	err = scanPipeline(ctx, colsMeta, c.workers, produce, fn)
+	if cerr := closeRows(); err == nil && cerr != nil {
+		return fmt.Errorf("postgres: chunk scan close: %w", cerr)
+	}
+	return err
 }
 
 // scanBatchSize is how many raw rows a producer hands to a worker at once.
@@ -359,6 +380,12 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 		return nil, err
 	}
 	if !rows.Next() {
+		// A false Next is a clean end only if the iteration itself did not
+		// fail; otherwise the transient error must surface (and be retried)
+		// instead of being reported as an empty result.
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 		return nil, sql.ErrNoRows
 	}
 	vals := make([]any, len(cols))

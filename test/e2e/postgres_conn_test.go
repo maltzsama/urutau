@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,19 +41,44 @@ func pgConnTo(t *testing.T, uri string) *sql.DB {
 	return db
 }
 
-// runPostgresPipeline starts the runner and returns a stop func plus a
-// check that fails the test if the runner exits early.
-func runPostgresPipeline(t *testing.T, ctx context.Context, s *spec.Spec) (func(), func()) {
+// runPostgresPipeline starts the runner and returns a stop func that cancels
+// AND waits for runner.Run to return, plus a check that fails the test if the
+// runner exited early. Waiting matters: these tests share the raw.orders
+// table, so the next test must not truncate it while the previous runner is
+// still cleaning up. The completion signal is a channel separate from the
+// error, so check does not consume what stop waits on.
+func runPostgresPipeline(t *testing.T, ctx context.Context, s *spec.Spec) (stop func(), check func()) {
 	t.Helper()
-	runCtx, stop := context.WithCancel(ctx)
-	runErr := make(chan error, 1)
-	go func() { runErr <- runner.Run(runCtx, s, testConfig()) }()
-	check := func() {
+	runCtx, cancel := context.WithCancel(ctx)
+	var (
+		mu   sync.Mutex
+		err  error
+		done = make(chan struct{})
+	)
+	go func() {
+		e := runner.Run(runCtx, s, testConfig())
+		mu.Lock()
+		err = e
+		mu.Unlock()
+		close(done)
+	}()
+	check = func() {
 		t.Helper()
 		select {
-		case err := <-runErr:
-			t.Fatalf("runner exited early: %v", err)
+		case <-done:
+			mu.Lock()
+			e := err
+			mu.Unlock()
+			t.Fatalf("runner exited early: %v", e)
 		default:
+		}
+	}
+	stop = func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Errorf("runner did not stop within 30s")
 		}
 	}
 	return stop, check
