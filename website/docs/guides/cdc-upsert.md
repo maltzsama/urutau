@@ -148,6 +148,6 @@ Avro landing, no stable key to upsert on) — see
 [append-only](append-only.md#ondelete-what-happens-to-a-delete) for why
 `onDelete: skip` is required there.
 
-See [Sources](../reference/sources.md) and [Sinks](../reference/sinks.md)
+See [Sources](../sources/index.md) and [Sinks](../reference/sinks.md)
 for what each driver actually supports (capabilities, nested-type
 mapping, resume semantics).

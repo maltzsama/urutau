@@ -34,7 +34,7 @@ implemented.
 Nested canonical types (`Struct`/`List`/`Map`), `KindFixedBinary`, the
 Kafka `raw`/Confluent-Avro decoders, transport-native metadata columns,
 and `append-idempotent` write mode were all on this list at one point —
-they've since shipped and moved into [Sources](sources),
+they've since shipped and moved into [Sources](../sources/index.md),
 [Sinks](sinks), and [Enrichment](enrichment).
 
 ### Registered for v2 (not v1 gaps)
