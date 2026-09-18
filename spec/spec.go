@@ -79,6 +79,56 @@ type Source struct {
 	// SchemaRegistry is the Confluent-compatible schema registry base URL
 	// (e.g. http://registry:8081), required when format is avro.
 	SchemaRegistry string `json:"schemaRegistry,omitempty"`
+	// Postgres configures a PostgreSQL source via structured fields instead
+	// of a URI. When present, uri is ignored for connection building (but
+	// slotName and snapshotUri remain flat). Nil means the source uses uri.
+	Postgres *PostgresSource `json:"postgres,omitempty"`
+}
+
+// PostgresSource holds structured PostgreSQL connection fields. When present
+// in source.postgres, these fields build the connection instead of source.uri.
+type PostgresSource struct {
+	Host     string            `json:"host,omitempty"`
+	Port     int               `json:"port,omitempty"`
+	Database string            `json:"database,omitempty"`
+	Username string            `json:"username,omitempty"`
+	Password string            `json:"password,omitempty"`
+	Params   map[string]string `json:"params,omitempty"`
+	SSL      *SSLConfig        `json:"ssl,omitempty"`
+	SSH      *SSHConfig        `json:"ssh,omitempty"`
+	// MaxThreads limits the number of concurrent connections for snapshot
+	// chunk SELECTs. 1..32, default 10 (the existing capability).
+	MaxThreads int `json:"maxThreads,omitempty"`
+	// RetryCount is the number of transient-connection retries with
+	// exponential backoff before failing. 0 means no retry (fail
+	// immediately).
+	RetryCount int `json:"retryCount,omitempty"`
+}
+
+// SSLConfig configures TLS for the PostgreSQL connection.
+type SSLConfig struct {
+	// Mode selects the TLS behavior: "disable" (default), "require",
+	// "verify-ca", "verify-full".
+	Mode string `json:"mode,omitempty"`
+	// CA is the path to the server CA certificate PEM file (used by
+	// verify-ca and verify-full).
+	CA string `json:"ca,omitempty"`
+	// Cert is the path to the client certificate PEM file (mutual TLS).
+	Cert string `json:"cert,omitempty"`
+	// Key is the path to the client private key PEM file (mutual TLS).
+	Key string `json:"key,omitempty"`
+}
+
+// SSHConfig configures an SSH tunnel for the PostgreSQL connection.
+type SSHConfig struct {
+	Host       string `json:"host,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Username   string `json:"username,omitempty"`
+	Password   string `json:"password,omitempty"`
+	PrivateKey string `json:"privateKey,omitempty"`
+	// Passphrase decrypts the private key when encrypted. Empty means
+	// unencrypted.
+	Passphrase string `json:"passphrase,omitempty"`
 }
 
 type Sink struct {

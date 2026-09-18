@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -20,9 +21,10 @@ import (
 // Source adapts the Postgres pgoutput reader to the source contract. It is
 // the self-contained driver entry point; init() registers the kind.
 type Source struct {
-	spec *spec.Spec
-	rt   source.Runtime
-	db   *sql.DB // the source's query connection (chunk SELECTs, introspection)
+	spec    *spec.Spec
+	rt      source.Runtime
+	db      *sql.DB     // the source's query connection (chunk SELECTs, introspection)
+	connCfg *ConnConfig // resolved connection config (nil when using URI)
 }
 
 func capabilities() source.Capabilities {
@@ -40,11 +42,27 @@ func capabilities() source.Capabilities {
 
 func init() {
 	factory := func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
-		db, err := sql.Open("pgx", s.Source.URI)
+		var cc *ConnConfig
+		var err error
+		if s.Source.Postgres != nil {
+			cc, err = BuildConnConfigFromPostgres(s.Source.Postgres)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			cc, err = BuildConnConfig(s.Source.URI)
+			if err != nil {
+				return nil, err
+			}
+		}
+		db, err := sql.Open("pgx", cc.QueryURI)
 		if err != nil {
 			return nil, err
 		}
-		return Source{spec: s, rt: rt, db: db}, nil
+		if cc.MaxOpenConns > 0 {
+			db.SetMaxOpenConns(cc.MaxOpenConns)
+		}
+		return Source{spec: s, rt: rt, db: db, connCfg: cc}, nil
 	}
 	if err := driver.RegisterSource("postgres", capabilities(), factory); err != nil {
 		panic(err)
@@ -96,17 +114,50 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if slot == "" {
 		return nil, fmt.Errorf("postgres: source requires slotName")
 	}
-	out := make(chan rowchange.Change, 1024)
-	rdr, err := New(ctx, Config{
-		URI:      a.spec.Source.URI,
-		DB:       a.db,
-		SlotName: slot,
-		Tables:   refs,
-		Logger:   a.rt.Logger,
-	}, out)
-	if err != nil {
-		return nil, err
+
+	// Determine the replication URI: use ConnConfig if available, else URI.
+	uri := a.spec.Source.URI
+	if a.connCfg != nil {
+		uri = a.connCfg.QueryURI
 	}
+
+	var rdr *Reader
+	var err error
+	retries := 0
+	maxRetries := 0
+	if a.connCfg != nil {
+		maxRetries = a.connCfg.RetryCount
+	}
+	for {
+		out := make(chan rowchange.Change, 1024)
+		rdr, err = New(ctx, Config{
+			URI:      uri,
+			ConnCfg:  a.connCfg,
+			DB:       a.db,
+			SlotName: slot,
+			Tables:   refs,
+			Logger:   a.rt.Logger,
+		}, out)
+		if err == nil {
+			break
+		}
+		retries++
+		if retries > maxRetries {
+			return nil, fmt.Errorf("postgres: open (after %d retries): %w", retries-1, err)
+		}
+		backoff := time.Duration(1<<uint(retries-1)) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		a.rt.Logger.Warn("postgres: connection failed, retrying", "attempt", retries, "backoff", backoff, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
+	out := make(chan rowchange.Change, 1024)
 	puller := sourcepull.New(out)
 	// Introspect each table so live batches encode against the canonical
 	// schema — a stable shape per table, never a per-drain inference.
