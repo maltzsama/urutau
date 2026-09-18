@@ -221,7 +221,7 @@ func (m *Maintainer) compactOnce(ctx context.Context) (did bool, err error) {
 	props := iceberg.Properties{}
 	if m.currentPosition != nil {
 		if pos := m.currentPosition(); pos != "" {
-			props["cdc.position"] = pos
+			props[propPosition] = pos
 		}
 	}
 

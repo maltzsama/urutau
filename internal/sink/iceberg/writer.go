@@ -28,6 +28,13 @@ import (
 // the batch — skipping would advance the position past uncommitted data.
 var ErrCommitExhausted = errors.New("iceberg: commit retries exhausted")
 
+// Iceberg table-property keys owned by the commit cycle. The snapshot-state
+// keys live in internal/snapshot (PropSnapshotState, PropSnapshotPending).
+const (
+	propPosition = "cdc.position"
+	propCycle    = "cdc.cycle"
+)
+
 // TableWriter owns the write path of a single target table.
 //
 // Commit applies a collapsed batch as delete-then-append — two snapshots —
@@ -218,7 +225,7 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	key := cycleKey(files, nil, pos)
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
-	p["cdc.cycle"] = key
+	p[propCycle] = key
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -301,7 +308,7 @@ func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos 
 	key := cycleKey(nil, files, pos)
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
-	p["cdc.cycle"] = key
+	p[propCycle] = key
 
 	var lastErr error
 	for attempt := 0; attempt < w.maxTries; attempt++ {
@@ -376,7 +383,7 @@ func committedPosition(tbl *table.Table) string {
 // newest-first scan could return a position AHEAD of the table's visible
 // state and a resume from it would silently skip data. Pure, for tests.
 func walkBackPosition(props iceberg.Properties, head *table.Snapshot, lookup table.SnapshotLookup) string {
-	if pos := props["cdc.position"]; pos != "" {
+	if pos := props[propPosition]; pos != "" {
 		return pos
 	}
 	if head == nil {
@@ -386,7 +393,7 @@ func walkBackPosition(props iceberg.Properties, head *table.Snapshot, lookup tab
 		if snap.Summary == nil {
 			continue
 		}
-		if pos := snap.Summary.Properties["cdc.position"]; pos != "" {
+		if pos := snap.Summary.Properties[propPosition]; pos != "" {
 			return pos
 		}
 	}
@@ -608,7 +615,7 @@ func props(pos string) iceberg.Properties {
 	if pos == "" {
 		return iceberg.Properties{}
 	}
-	return iceberg.Properties{"cdc.position": pos}
+	return iceberg.Properties{propPosition: pos}
 }
 
 // sleepCtx waits d or returns early with the context error.

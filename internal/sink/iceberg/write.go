@@ -65,8 +65,8 @@ func addEqualityDeletes(ctx context.Context, txn *table.Transaction, eqFieldIDs 
 // setPositionProperty keeps the table property cdc.position in lockstep with
 // the data committed by this transaction.
 func setPositionProperty(txn *table.Transaction, props iceberg.Properties) {
-	if pos, ok := props["cdc.position"]; ok {
-		_ = txn.SetProperties(iceberg.Properties{"cdc.position": pos})
+	if pos, ok := props[propPosition]; ok {
+		_ = txn.SetProperties(iceberg.Properties{propPosition: pos})
 	}
 }
 
