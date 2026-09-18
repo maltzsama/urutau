@@ -62,6 +62,12 @@ When present, `uri` is ignored for connection building.
 | `maxThreads` | no | Max concurrent snapshot connections (1..32, default `runtime.NumCPU()`) |
 | `retryCount` | no | Transient-connection retries with backoff (default 3; 0 means "use the default") |
 
+In distributed mode the worker opens the snapshot `SELECT` from a DSN rendered
+from this block. `ssl.ca`/`ssl.cert`/`ssl.key` travel as **paths**, so every
+worker must mount those files at the same paths as the coordinator; `ssh` is
+not supported in distributed mode — set `snapshotUri` to a directly reachable
+read-only URI. See [Distributed mode](../guides/distributed.md#source-credentials-and-files-on-workers).
+
 See [Sources](../sources/index.md) for driver-specific behavior — e.g. the MySQL `uri`
 accepts `timezone` and TLS (`tls`, `ssl-ca`, `ssl-cert`, `ssl-key`,
 `ssl-server-name`) query parameters.

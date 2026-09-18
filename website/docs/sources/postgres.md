@@ -78,6 +78,14 @@ and reused.
 | `maxThreads` | `runtime.NumCPU()` | Max concurrent connections for snapshot chunk SELECTs (1..32) |
 | `retryCount` | 3 | Transient-connection retries with exponential backoff. 0 means "use the default" |
 
+### Distributed mode
+
+In [distributed mode](../guides/distributed.md) the worker opens the snapshot
+chunk `SELECT` from a DSN rendered from this block. `ssl.ca`, `ssl.cert` and
+`ssl.key` are sent as **paths**, so every worker must mount those files at the
+same paths as the coordinator. `ssh` is not supported in distributed mode —
+set `snapshotUri` to a directly reachable read-only URI instead.
+
 ## Requirements
 
 - `wal_level=logical`.
