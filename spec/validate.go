@@ -213,7 +213,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 		validateFilter(tbl.Filter, p+".filter", &problems)
 		validateMetadata(tbl, p, &problems)
 		validateCast(tbl, p, &problems)
-		validateColumns(tbl, p, &problems)
+		validateColumns(tbl, s.Source, p, &problems)
 		validatePartitionBy(tbl, p, &problems)
 		validateBootstrap(tbl, p, &problems)
 		validateEnrich(tbl, p, &problems)
@@ -225,30 +225,14 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	return nil
 }
 
-// validMetadataKeys is the closed metadata catalog.
-var validMetadataKeys = map[core.MetadataKey]bool{
-	core.MetaOp:          true,
-	core.MetaCommitTS:    true,
-	core.MetaIngestTS:    true,
-	core.MetaPosition:    true,
-	core.MetaSourceTable: true,
-	core.MetaPhase:       true,
-	core.MetaStream:      true,
-	core.MetaShard:       true,
-	core.MetaSeq:         true,
-	core.MetaMsgTS:       true,
-	core.MetaMsgKey:      true,
-	core.MetaHeaders:     true,
-}
-
 // validateMetadata checks the closed metadata rules: catalog membership,
 // explicit valid destination name, no repeats, never part of the primary
 // key.
 func validateMetadata(tbl Table, path string, problems *[]string) {
 	seen := map[string]bool{}
 	for _, m := range tbl.Metadata {
-		if !validMetadataKeys[m.From] {
-			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: op, commit_ts, ingest_ts, position, source_table, phase, stream, shard, sequence, msg_ts, msg_key, headers)", path, m.From))
+		if !core.ValidMetadataKey(m.From) {
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: %s)", path, m.From, core.MetadataCatalogNames()))
 		}
 		if m.As == "" {
 			*problems = append(*problems, fmt.Sprintf("%s.metadata.as: required", path))
@@ -290,7 +274,7 @@ func validateCast(tbl Table, path string, problems *[]string) {
 // a malformed composite shape — fails loudly here instead of surfacing at
 // first use inside a source's Introspect (audit #10: every other textual
 // grammar in this package is validated at boot, not at runtime).
-func validateColumns(tbl Table, path string, problems *[]string) {
+func validateColumns(tbl Table, src Source, path string, problems *[]string) {
 	for name, decl := range tbl.Columns {
 		if name == "" {
 			*problems = append(*problems, fmt.Sprintf("%s.columns: empty column name", path))
@@ -298,6 +282,17 @@ func validateColumns(tbl Table, path string, problems *[]string) {
 		}
 		if _, err := decl.Resolve(); err != nil {
 			*problems = append(*problems, fmt.Sprintf("%s.columns.%s: %v", path, name, err))
+		}
+		if decl.From != "" || decl.Required {
+			if src.Kind != "kafka" || (src.Format != "raw" && src.Format != "avro") {
+				*problems = append(*problems, fmt.Sprintf("%s.columns.%s: from/required are only valid for kafka raw/avro sources", path, name))
+			}
+		}
+		// The pre-decode bytes are Confluent wire format, unreadable without
+		// the registry: there is no raw blob to land, unlike raw's opt-in
+		// payload column.
+		if src.Format == "avro" && name == "payload" {
+			*problems = append(*problems, fmt.Sprintf("%s.columns.%s: \"payload\" is not valid for format avro — the pre-decode bytes are Confluent wire format, not an independently readable value", path, name))
 		}
 	}
 }

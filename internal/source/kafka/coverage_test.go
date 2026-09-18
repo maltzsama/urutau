@@ -17,6 +17,7 @@ import (
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 func TestCapabilities(t *testing.T) {
@@ -46,7 +47,7 @@ func TestParsePosition(t *testing.T) {
 		t.Fatalf("ParsePosition: %v", err)
 	}
 	off, ok := pos.(*position.Offsets)
-	if !ok || off.Topic != "t" || off.Parts[0] != 5 || off.Parts[1] != 9 {
+	if !ok || off.Topics["t"][0] != 5 || off.Topics["t"][1] != 9 {
 		t.Fatalf("ParsePosition = %#v", pos)
 	}
 	if _, err := s.ParsePosition("not-an-offset"); err == nil {
@@ -66,12 +67,14 @@ func TestInitialPositionIsEmptyOffsets(t *testing.T) {
 }
 
 func TestReaderPositionAndNoops(t *testing.T) {
-	off := &position.Offsets{Topic: "t", Parts: map[int32]int64{0: 3}}
+	off := position.NewOffsets("t", map[int32]int64{0: 3})
 	r := &Reader{synced: off}
-	if r.Synced() != off {
-		t.Fatal("Synced must return the tracked offsets")
+	// Synced/Master return a copy, not the live maps — the consume loop keeps
+	// mutating r.synced — so compare by value.
+	if got := r.Synced(); got.String() != off.String() {
+		t.Fatalf("Synced = %s, want %s", got, off)
 	}
-	if got, err := r.Master(context.Background()); err != nil || got != off {
+	if got, err := r.Master(context.Background()); err != nil || got.String() != off.String() {
 		t.Fatalf("Master = %v, %v", got, err)
 	}
 	// No-op lifecycle methods must not panic.
@@ -122,4 +125,67 @@ func TestKgoLogger(t *testing.T) {
 		t.Fatalf("Level = %v", l.Level())
 	}
 	l.Log(kgo.LogLevelInfo, "hello", "k", "v") // must not panic
+}
+
+// extractionByTopic builds one entry per table that declares columns, and
+// separates the payload-column flag from the extracted fields.
+func TestExtractionByTopic(t *testing.T) {
+	sp := &spec.Spec{Tables: []spec.Table{
+		{
+			Source: "orders",
+			Columns: map[string]spec.ColumnDecl{
+				"payload":     {Scalar: "string"},
+				"id":          {Scalar: "int64"},
+				"customer_id": {Scalar: "int64", Required: true},
+				"order_total": {Scalar: "decimal(20,4)", From: "totals.grand_total"},
+			},
+		},
+		{Source: "clicks"}, // no Columns: stays opaque
+	}}
+
+	byTopic := extractionByTopic(sp, "payload")
+	orders, ok := byTopic["orders"]
+	if !ok {
+		t.Fatal("orders must have an extraction entry")
+	}
+	if !orders.KeepPayload {
+		t.Error("the payload column must set KeepPayload rather than becoming an extracted field")
+	}
+	if len(orders.Fields) != 3 {
+		t.Fatalf("orders.Fields = %v, want 3 (id, customer_id, order_total)", orders.Fields)
+	}
+	var gotRequired, gotPath bool
+	for _, f := range orders.Fields {
+		if f.Name == "customer_id" && f.Required {
+			gotRequired = true
+		}
+		if f.Name == "order_total" && f.Path == "totals.grand_total" {
+			gotPath = true
+		}
+		if f.Name == "payload" {
+			t.Error("the payload column must not also appear as an extracted field")
+		}
+	}
+	if !gotRequired {
+		t.Error("customer_id must carry Required")
+	}
+	if !gotPath {
+		t.Error("order_total must carry its declared From path")
+	}
+
+	if _, ok := byTopic["clicks"]; ok {
+		t.Error("a table with no declared columns must not get an extraction entry (stays opaque)")
+	}
+}
+
+// avro has no payload column, so passing "" never treats any declared
+// column as the raw-blob flag.
+func TestExtractionByTopicNoPayloadColumnForAvro(t *testing.T) {
+	sp := &spec.Spec{Tables: []spec.Table{
+		{Source: "orders", Columns: map[string]spec.ColumnDecl{"id": {Scalar: "int64"}}},
+	}}
+	byTopic := extractionByTopic(sp, "")
+	if byTopic["orders"].KeepPayload {
+		t.Error("KeepPayload must never be set when there is no payload column name")
+	}
 }

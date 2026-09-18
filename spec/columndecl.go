@@ -28,6 +28,18 @@ type ColumnDecl struct {
 	// Map holds the key/value declarations when this entry is
 	// {"map": {"key": decl, "value": decl}}. Nil otherwise.
 	Map *MapDecl
+
+	// From is the payload path this column is extracted from, for message
+	// sources whose payload is a document rather than a row: "totals.grand"
+	// reads a nested field. Empty means the column name is the path, which
+	// is the common case. Only meaningful for Kafka raw/avro.
+	From string
+	// Required fails the record when the declared field is absent from the
+	// payload, instead of landing NULL. A field can be missing because the
+	// contract says it is optional or because the producer broke, and only
+	// the operator knows which — so it is declared per column rather than
+	// being one global policy.
+	Required bool
 }
 
 // MapDecl is the {"key": decl, "value": decl} body of a map declaration.
@@ -36,12 +48,17 @@ type MapDecl struct {
 	Value ColumnDecl `json:"value"`
 }
 
-// compositeBody is the wire shape of a composite ColumnDecl: exactly one
-// of the three keys is present.
+// compositeBody is the wire shape of a non-scalar ColumnDecl. Exactly one
+// of struct/list/map names the shape, or "type" gives a scalar that needs
+// the extraction attributes an inline string cannot carry. From and Required
+// may accompany any of them.
 type compositeBody struct {
-	Struct map[string]ColumnDecl `json:"struct,omitempty"`
-	List   *ColumnDecl           `json:"list,omitempty"`
-	Map    *MapDecl              `json:"map,omitempty"`
+	Struct   map[string]ColumnDecl `json:"struct,omitempty"`
+	List     *ColumnDecl           `json:"list,omitempty"`
+	Map      *MapDecl              `json:"map,omitempty"`
+	Type     string                `json:"type,omitempty"`
+	From     string                `json:"from,omitempty"`
+	Required bool                  `json:"required,omitempty"`
 }
 
 // UnmarshalJSON accepts a plain string (scalar) or an object with exactly
@@ -73,23 +90,41 @@ func (d *ColumnDecl) UnmarshalJSON(b []byte) error {
 	if body.Map != nil {
 		set++
 	}
-	if set != 1 {
-		return fmt.Errorf("spec: column: exactly one of struct, list, map is required, got %d", set)
+	if body.Type != "" {
+		set++
 	}
-	*d = ColumnDecl{Struct: body.Struct, List: body.List, Map: body.Map}
+	if set != 1 {
+		return fmt.Errorf("spec: column: exactly one of type, struct, list, map is required, got %d", set)
+	}
+	*d = ColumnDecl{
+		Scalar:   body.Type,
+		Struct:   body.Struct,
+		List:     body.List,
+		Map:      body.Map,
+		From:     body.From,
+		Required: body.Required,
+	}
 	return nil
 }
 
-// MarshalJSON renders a scalar back to its bare string, and a composite
-// back to its single-key object — the inverse of UnmarshalJSON.
+// MarshalJSON renders a plain scalar back to its bare string, and anything
+// else back to its object form — the inverse of UnmarshalJSON. A scalar that
+// carries extraction attributes cannot be a bare string, so it renders as
+// {"type": ..., "from": ...}.
 func (d ColumnDecl) MarshalJSON() ([]byte, error) {
+	body := compositeBody{
+		Struct:   d.Struct,
+		List:     d.List,
+		Map:      d.Map,
+		From:     d.From,
+		Required: d.Required,
+	}
 	switch {
-	case d.Struct != nil:
-		return json.Marshal(compositeBody{Struct: d.Struct})
-	case d.List != nil:
-		return json.Marshal(compositeBody{List: d.List})
-	case d.Map != nil:
-		return json.Marshal(compositeBody{Map: d.Map})
+	case d.Struct != nil || d.List != nil || d.Map != nil:
+		return json.Marshal(body)
+	case d.From != "" || d.Required:
+		body.Type = d.Scalar
+		return json.Marshal(body)
 	default:
 		return json.Marshal(d.Scalar)
 	}

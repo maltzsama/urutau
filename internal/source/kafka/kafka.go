@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -25,6 +26,13 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+)
+
+// Backoff bounds for transient fetch failures. A permanent error returns
+// instead of retrying, so these only pace a broker that is coming back.
+const (
+	minFetchBackoff = 100 * time.Millisecond
+	maxFetchBackoff = 30 * time.Second
 )
 
 // Source implements source.Source for Kafka.
@@ -137,13 +145,19 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	})
 	switch s.Spec.Source.Format {
 	case "raw":
-		dec = &decoder.Raw{}
+		dec = &decoder.Raw{
+			ByTopic: extractionByTopic(s.Spec, "payload"),
+			Miss:    s.missLogger(),
+		}
 	case "avro":
 		if s.Spec.Source.SchemaRegistry == "" {
 			client.Close()
 			return nil, fmt.Errorf("kafka: source.schemaRegistry required when format is avro")
 		}
-		dec = decoder.NewAvroDecoder(decoder.NewHTTPRegistry(s.Spec.Source.SchemaRegistry))
+		avroDec := decoder.NewAvroDecoder(decoder.NewHTTPRegistry(s.Spec.Source.SchemaRegistry))
+		avroDec.ByTopic = extractionByTopic(s.Spec, "")
+		avroDec.Miss = s.missLogger()
+		dec = avroDec
 	}
 
 	r := &Reader{
@@ -172,6 +186,50 @@ func (r *Reader) SetSourceSchemas(schemas map[string]core.Schema) {
 // the committed position or the beginning.
 func (s Source) InitialPosition(_ context.Context) (position.Position, error) {
 	return &position.Offsets{}, nil
+}
+
+// extractionByTopic builds the per-topic field-extraction declarations from
+// the spec's tables, for the raw and avro decoders. payloadColumnName is the
+// column that means "also keep the raw payload" (raw's "payload"; empty for
+// avro, which has none — see spec.validateColumns).
+//
+// Introspect requires every Kafka table to declare Columns regardless of
+// format (Columns is also how debezium tables assert their shape, since
+// Kafka has no SQL introspection), so len(t.Columns) == 0 cannot happen for
+// a resolved spec. It is still checked here defensively: this function reads
+// the spec directly rather than through Introspect's validated path, and an
+// empty Columns must mean "no extraction entry" (opaque), never a
+// zero-field TopicExtraction that would extract nothing while still
+// switching the topic out of passthrough mode.
+func extractionByTopic(sp *spec.Spec, payloadColumnName string) map[string]decoder.TopicExtraction {
+	byTopic := make(map[string]decoder.TopicExtraction, len(sp.Tables))
+	for _, t := range sp.Tables {
+		if len(t.Columns) == 0 {
+			continue
+		}
+		te := decoder.TopicExtraction{Fields: make([]decoder.Field, 0, len(t.Columns))}
+		for name, col := range t.Columns {
+			if payloadColumnName != "" && name == payloadColumnName {
+				te.KeepPayload = true
+				continue
+			}
+			te.Fields = append(te.Fields, decoder.Field{Name: name, Path: col.From, Required: col.Required})
+		}
+		sort.Slice(te.Fields, func(i, j int) bool { return te.Fields[i].Name < te.Fields[j].Name })
+		byTopic[t.Source] = te
+	}
+	return byTopic
+}
+
+// missLogger returns a decoder.MissFn that logs an extraction miss. Bronze
+// should not go down over one malformed message, but a silent NULL hides a
+// producer schema change — this is the visible middle ground until a metric
+// is wired up (see issue #143's open question on making this an observable
+// counter).
+func (s Source) missLogger() decoder.MissFn {
+	return func(column string) {
+		s.Rt.Logger.Warn("kafka: declared field absent from payload", "column", column)
+	}
 }
 
 // topicToTarget builds a topic → target table map from the table refs.
@@ -207,11 +265,13 @@ type Reader struct {
 	synced *position.Offsets
 }
 
-// Synced returns the current consumer position.
+// Synced returns the current consumer position. The copy is deliberate: the
+// consume loop keeps mutating r.synced, so handing out the live maps would
+// race with whoever holds the returned position.
 func (r *Reader) Synced() position.Position {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.synced
+	return r.synced.Clone()
 }
 
 // Master returns the high-watermark position (the latest offset across
@@ -220,7 +280,7 @@ func (r *Reader) Synced() position.Position {
 func (r *Reader) Master(_ context.Context) (position.Position, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.synced, nil
+	return r.synced.Clone(), nil
 }
 
 // OpenWindow is a no-op for Kafka: there is no DBLog snapshot window.
@@ -247,7 +307,13 @@ func (r *Reader) Next(ctx context.Context) (*dataplane.Batch, error) {
 
 // consume is the blocking consume loop: it polls fetches and feeds decoded
 // changes to r.out, returning the terminal error.
+//
+// Errors are classified rather than uniformly retried. A permanent condition
+// (unknown topic, denied authorization, bad credentials) returns and fails
+// the pipeline: retrying it spins at full speed forever while making no
+// progress and reporting nothing upstream. A transient one backs off.
 func (r *Reader) consume(ctx context.Context) error {
+	backoff := minFetchBackoff
 	for {
 		select {
 		case <-ctx.Done():
@@ -260,11 +326,28 @@ func (r *Reader) consume(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			r.logger.Error("kafka: fetch", "err", err)
+			switch classifyFetch(err) {
+			case fetchPermanent:
+				return fmt.Errorf("kafka: fetch failed permanently: %w", err)
+			case fetchPositionLost:
+				return &ErrPositionLost{Topic: firstFetchTopic(fetches), Err: err}
+			}
+			r.logger.Error("kafka: fetch, retrying", "err", err, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, maxFetchBackoff)
 			continue
 		}
+		backoff = minFetchBackoff
 
+		var fatal error
 		fetches.EachRecord(func(rec *kgo.Record) {
+			if fatal != nil {
+				return
+			}
 			// franz-go leaves Record.Context nil on the consume side (it is
 			// only populated by an explicit hook, or on the produce side) —
 			// a decoder that needs one (Avro's schema registry HTTP fetch)
@@ -273,6 +356,11 @@ func (r *Reader) consume(ctx context.Context) error {
 			rec.Context = ctx
 			changes, err := r.dec.Decode(rec)
 			if err != nil {
+				if decodeIsFatal(err) {
+					fatal = fmt.Errorf("kafka: decode topic %s partition %d offset %d: %w",
+						rec.Topic, rec.Partition, rec.Offset, err)
+					return
+				}
 				r.logger.Error("kafka: decode", "topic", rec.Topic, "err", err)
 				return
 			}
@@ -290,10 +378,8 @@ func (r *Reader) consume(ctx context.Context) error {
 					return
 				}
 				c.Table = ref.Target
-				c.Position = (&position.Offsets{
-					Topic: rec.Topic,
-					Parts: map[int32]int64{rec.Partition: rec.Offset},
-				}).String()
+				c.Position = position.NewOffsets(rec.Topic,
+					map[int32]int64{rec.Partition: rec.Offset}).String()
 				c.Transport = transportOf(rec)
 				// The raw key tuple inherits JSON object disorder; rebuild
 				// it in the declared primary-key order so every downstream
@@ -308,14 +394,23 @@ func (r *Reader) consume(ctx context.Context) error {
 			}
 
 			r.mu.Lock()
-			if r.synced.Parts == nil {
-				r.synced.Parts = make(map[int32]int64)
-			}
-			r.synced.Topic = rec.Topic
-			r.synced.Parts[rec.Partition] = rec.Offset + 1
+			r.synced.Set(rec.Topic, rec.Partition, rec.Offset+1)
 			r.mu.Unlock()
 		})
+		if fatal != nil {
+			return fatal
+		}
 	}
+}
+
+// firstFetchTopic names a topic carried by the fetch, for the error message.
+func firstFetchTopic(fetches kgo.Fetches) string {
+	for _, e := range fetches.Errors() {
+		if e.Topic != "" {
+			return e.Topic
+		}
+	}
+	return ""
 }
 
 // transportOf captures the message-queue envelope of a record for the

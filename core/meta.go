@@ -9,6 +9,8 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 )
 
 // MetadataKey identifies one pipeline-provided value that can be landed as a
@@ -105,7 +107,7 @@ func (k *MetadataKey) UnmarshalText(b []byte) error {
 
 func (k *MetadataKey) set(s string) error {
 	key := MetadataKey(s)
-	if !validMetadataKey(key) {
+	if !ValidMetadataKey(key) {
 		return fmt.Errorf("core: unknown metadata key %q (the catalog is closed)", s)
 	}
 	*k = key
@@ -120,15 +122,29 @@ type MetadataColumn struct {
 	As   string      `json:"as"`
 }
 
-// validMetadataKey reports whether k is a member of the closed catalog.
+// MetadataCatalog is the closed catalog, in the order the keys are declared
+// above. It is the single source of truth: membership checks and the
+// catalog list in error messages both derive from it, so a key added here
+// cannot be missed by a validator (spec/validate.go once kept a hand-copied
+// map that silently omitted enrich_miss).
+var MetadataCatalog = []MetadataKey{
+	MetaOp, MetaCommitTS, MetaIngestTS, MetaPosition, MetaSourceTable,
+	MetaPhase, MetaEnrichMiss, MetaStream, MetaShard, MetaSeq, MetaMsgTS,
+	MetaMsgKey, MetaHeaders,
+}
+
+// ValidMetadataKey reports whether k is a member of the closed catalog.
 // The catalog is closed by design (package doc); an unknown key is a spec
 // typo and must fail loudly, never become a silent string column.
-func validMetadataKey(k MetadataKey) bool {
-	switch k {
-	case MetaOp, MetaCommitTS, MetaIngestTS, MetaPosition, MetaSourceTable,
-		MetaPhase, MetaEnrichMiss, MetaStream, MetaShard, MetaSeq, MetaMsgTS,
-		MetaMsgKey, MetaHeaders:
-		return true
+func ValidMetadataKey(k MetadataKey) bool {
+	return slices.Contains(MetadataCatalog, k)
+}
+
+// MetadataCatalogNames renders the catalog for an error message.
+func MetadataCatalogNames() string {
+	names := make([]string, len(MetadataCatalog))
+	for i, k := range MetadataCatalog {
+		names[i] = string(k)
 	}
-	return false
+	return strings.Join(names, ", ")
 }
