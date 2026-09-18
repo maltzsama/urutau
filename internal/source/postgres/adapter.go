@@ -160,16 +160,12 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		if !isTransient(err) || attempt >= maxRetries {
 			return nil, fmt.Errorf("postgres: open (after %d retries): %w", attempt, err)
 		}
-		backoff := time.Duration(1<<uint(attempt)) * time.Second
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
 		a.rt.Logger.Warn("postgres: connection failed, retrying",
-			"attempt", attempt+1, "backoff", backoff, "err", err)
+			"attempt", attempt+1, "backoff", retryBackoff(attempt), "err", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(retryBackoff(attempt)):
 		}
 	}
 

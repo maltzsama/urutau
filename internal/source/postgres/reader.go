@@ -244,10 +244,32 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 	}
 	r.cfg.Logger.Info("reader start", "from", start.String())
 
+	// New already opened a live connection, so the first pass streams
+	// directly. needConnect is set after a stream loss: the next pass
+	// redials first. A failed redial consumes an attempt and is retried
+	// with backoff, so a sustained outage is tolerated within the budget
+	// instead of ending the stream on the first failed redial.
+	needConnect := false
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if needConnect {
+			if derr := r.dialReplication(ctx); derr != nil {
+				if !isTransient(derr) || attempt >= r.retries {
+					return derr
+				}
+				r.cfg.Logger.Warn("postgres: replication reconnect failed",
+					"attempt", attempt+1, "err", derr)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(retryBackoff(attempt)):
+				}
+				continue
+			}
+		}
+
 		err := r.runReplication(ctx, start)
 		if err == nil {
 			return nil
@@ -260,9 +282,6 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 		}
 		r.cfg.Logger.Warn("postgres: replication stream lost, reconnecting",
 			"attempt", attempt+1, "from", r.Synced().String(), "err", err)
-		if rerr := r.reconnect(ctx); rerr != nil {
-			return rerr
-		}
 		// Resume from the last position committed to the sink. At worst
 		// this replays a transaction, which the idempotent commit absorbs;
 		// it never skips data. With no commit yet, 0/0 lets the slot pick
@@ -272,6 +291,7 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 		} else {
 			start = position.MustLSN("0/0")
 		}
+		needConnect = true
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -363,11 +383,11 @@ func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error 
 	}
 }
 
-// reconnect closes the dead replication connection and dials a fresh one.
-// The in-flight transaction buffer is dropped: the connection died before
-// its commit, so those rows were never committed and must not be flushed.
-// Runs only in the StartFromLSN goroutine.
-func (r *Reader) reconnect(ctx context.Context) error {
+// dialReplication closes the (dead) replication connection and dials a fresh
+// one. The in-flight transaction buffer is dropped: the connection died
+// before its commit, so those rows were never committed and must not be
+// flushed. Runs only in the StartFromLSN goroutine.
+func (r *Reader) dialReplication(ctx context.Context) error {
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = r.conn.Close(closeCtx)
 	cancel()

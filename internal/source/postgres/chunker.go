@@ -92,7 +92,9 @@ func (c *Chunker) PK() []string { return c.pk }
 
 // Bounds returns the ordered list of chunk boundary keys: key[0] is the
 // lowest PK, followed by every chunkSize-th key, then nil (the open high
-// bound of the last chunk).
+// bound of the last chunk). The whole computation is retried on a transient
+// error, so a failure while fetching a boundary row is covered, not just the
+// initial QueryContext.
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	cols := quotedList(c.pk)
 	query := fmt.Sprintf(
@@ -101,22 +103,26 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	)
 
 	var bounds [][]any
-	for offset := 0; ; offset += c.chunkSize {
-		rows, err := retryTransient(ctx, c.retries, func() (*sql.Rows, error) {
-			return c.db.QueryContext(ctx, query, offset)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("postgres: chunker bounds: %w", err)
+	err := retryTransientErr(ctx, c.retries, func() error {
+		bounds = bounds[:0]
+		for offset := 0; ; offset += c.chunkSize {
+			rows, err := c.db.QueryContext(ctx, query, offset)
+			if err != nil {
+				return fmt.Errorf("postgres: chunker bounds: %w", err)
+			}
+			key, err := scanRow(rows)
+			_ = rows.Close()
+			if err == sql.ErrNoRows {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			bounds = append(bounds, key)
 		}
-		key, err := scanRow(rows)
-		_ = rows.Close()
-		if err == sql.ErrNoRows {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		bounds = append(bounds, key)
+	})
+	if err != nil {
+		return nil, err
 	}
 	return bounds, nil
 }
@@ -125,11 +131,38 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 // column name. Values decode through the same scalar mapping the pgoutput
 // reader uses, so snapshot rows and stream rows land in Iceberg identically.
 //
-// Rows are normalized by a bounded pool of `workers` goroutines, but fn is
-// always invoked from a single goroutine, so it need not be thread-safe and
-// snapshot rows stay keyed inserts (order-independent). The chunk SELECT is
-// retried on transient errors before any row is emitted (#166).
+// The whole scan is retried on a transient error, covering a failure during
+// rows.Next/Scan and not just the initial QueryContext. Rows are buffered
+// until the scan completes, so a retry never re-delivers rows to fn — the
+// DBLog snapshot collects a chunk before relaying it, so a full re-scan is
+// safe and cannot duplicate.
+//
+// Within one scan, rows are normalized by a bounded pool of `workers`
+// goroutines, but fn is always invoked from a single goroutine, so it need
+// not be thread-safe. Row order is not preserved (snapshot rows are keyed
+// inserts, order-independent).
 func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
+	var buffered []map[string]any
+	err := retryTransientErr(ctx, c.retries, func() error {
+		buffered = buffered[:0]
+		return c.scanOnce(ctx, ch, func(m map[string]any) error {
+			buffered = append(buffered, m)
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+	for _, m := range buffered {
+		if err := fn(m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanOnce runs one chunk SELECT, streaming normalized rows to fn.
+func (c *Chunker) scanOnce(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
 	// Row-constructor comparison keeps composite PKs lexicographic; the
 	// placeholder index runs across clauses ($1..$k, then $k+1..).
 	cond := make([]string, 0, 2)
@@ -156,9 +189,7 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	query := fmt.Sprintf("SELECT * FROM %s.%s%s ORDER BY %s",
 		quoteIdent(c.schema), quoteIdent(c.table), where, cols)
 
-	rows, err := retryTransient(ctx, c.retries, func() (*sql.Rows, error) {
-		return c.db.QueryContext(ctx, query, args...)
-	})
+	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("postgres: chunk scan: %w", err)
 	}

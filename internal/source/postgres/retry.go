@@ -10,13 +10,15 @@ import (
 )
 
 // retryBackoff returns the exponential backoff for attempt n (0-based):
-// 1s, 2s, 4s, … capped at 30s.
+// 1s, 2s, 4s, 8s, 16s, then 30s. The exponent is capped BEFORE the shift:
+// 2^n seconds overflows time.Duration (int64 nanoseconds) around n=34,
+// yielding a negative delay that would fire immediately. 30s needs at most
+// 2^5, so anything beyond is the cap.
 func retryBackoff(attempt int) time.Duration {
-	d := time.Duration(1<<uint(attempt)) * time.Second
-	if d > 30*time.Second {
-		d = 30 * time.Second
+	if attempt >= 5 {
+		return 30 * time.Second
 	}
-	return d
+	return time.Duration(1<<uint(attempt)) * time.Second
 }
 
 // retryTransient runs op up to retries+1 times, retrying only transient
@@ -41,6 +43,14 @@ func retryTransient[T any](ctx context.Context, retries int, op func() (T, error
 		case <-time.After(retryBackoff(attempt)):
 		}
 	}
+}
+
+// retryTransientErr is retryTransient for operations with no result value.
+func retryTransientErr(ctx context.Context, retries int, op func() error) error {
+	_, err := retryTransient(ctx, retries, func() (struct{}, error) {
+		return struct{}{}, op()
+	})
+	return err
 }
 
 // isTransient reports whether a connection/query error is worth retrying.

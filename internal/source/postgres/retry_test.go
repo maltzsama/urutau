@@ -6,9 +6,48 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestRetryBackoffCapped(t *testing.T) {
+	// Never negative, never above the 30s cap, even for a huge retryCount
+	// where 2^attempt * time.Second would overflow time.Duration.
+	for _, attempt := range []int{0, 1, 4, 5, 6, 34, 35, 100} {
+		d := retryBackoff(attempt)
+		if d <= 0 {
+			t.Fatalf("retryBackoff(%d) = %v, want > 0", attempt, d)
+		}
+		if d > 30*time.Second {
+			t.Fatalf("retryBackoff(%d) = %v, want <= 30s", attempt, d)
+		}
+	}
+	if got := retryBackoff(0); got != time.Second {
+		t.Fatalf("retryBackoff(0) = %v, want 1s", got)
+	}
+	if got := retryBackoff(5); got != 30*time.Second {
+		t.Fatalf("retryBackoff(5) = %v, want 30s", got)
+	}
+}
+
+func TestRetryTransientErr(t *testing.T) {
+	attempts := 0
+	transient := &pgconn.PgError{Code: "08006"}
+	err := retryTransientErr(context.Background(), 3, func() error {
+		attempts++
+		if attempts == 1 {
+			return transient
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
 
 func TestIsTransientSQLState(t *testing.T) {
 	cases := []struct {
