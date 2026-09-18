@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -183,37 +184,105 @@ func columnIsDecimal(st *TableState, name string) bool {
 	return i >= 0 && strings.EqualFold(st.Columns[i].DataType, "numeric")
 }
 
-// numericCompare compares two numeric scalars exactly (int64, float64, or a
-// decimal string) and returns -1, 0, or 1.
+// numericCompare compares two numeric scalars with PostgreSQL `numeric`
+// semantics and returns -1, 0, or 1. Unlike big.Rat alone, it accepts the
+// special values a `numeric` column can hold — NaN and ±Infinity — ordering
+// them as Postgres does: -Infinity < finite < Infinity < NaN, and NaN equal
+// to itself.
 func numericCompare(a, b any) (int, error) {
-	ar, err := toRat(a)
+	av, err := parsePgNumeric(a)
 	if err != nil {
 		return 0, err
 	}
-	br, err := toRat(b)
+	bv, err := parsePgNumeric(b)
 	if err != nil {
 		return 0, err
 	}
-	return ar.Cmp(br), nil
+	return cmpPgNumeric(av, bv), nil
 }
 
-func toRat(v any) (*big.Rat, error) {
+const (
+	pgNumFinite = iota
+	pgNumNegInf
+	pgNumPosInf
+	pgNumNaN
+)
+
+type pgNumeric struct {
+	kind int
+	rat  *big.Rat // set only when kind == pgNumFinite
+}
+
+func parsePgNumeric(v any) (pgNumeric, error) {
 	switch t := v.(type) {
 	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "nan":
+			return pgNumeric{kind: pgNumNaN}, nil
+		case "infinity", "+infinity", "inf", "+inf":
+			return pgNumeric{kind: pgNumPosInf}, nil
+		case "-infinity", "-inf":
+			return pgNumeric{kind: pgNumNegInf}, nil
+		}
 		r, ok := new(big.Rat).SetString(t)
 		if !ok {
-			return nil, fmt.Errorf("pg_numeric_cmp: %q is not a number", t)
+			return pgNumeric{}, fmt.Errorf("pg_numeric_cmp: %q is not a number", t)
 		}
-		return r, nil
+		return pgNumeric{kind: pgNumFinite, rat: r}, nil
 	case int64:
-		return new(big.Rat).SetInt64(t), nil
+		return pgNumeric{kind: pgNumFinite, rat: new(big.Rat).SetInt64(t)}, nil
 	case int:
-		return new(big.Rat).SetInt64(int64(t)), nil
+		return pgNumeric{kind: pgNumFinite, rat: new(big.Rat).SetInt64(int64(t))}, nil
 	case float64:
-		return new(big.Rat).SetFloat64(t), nil
+		switch {
+		case math.IsNaN(t):
+			return pgNumeric{kind: pgNumNaN}, nil
+		case math.IsInf(t, 1):
+			return pgNumeric{kind: pgNumPosInf}, nil
+		case math.IsInf(t, -1):
+			return pgNumeric{kind: pgNumNegInf}, nil
+		}
+		return pgNumeric{kind: pgNumFinite, rat: new(big.Rat).SetFloat64(t)}, nil
 	default:
-		return nil, fmt.Errorf("pg_numeric_cmp: unsupported type %T", v)
+		return pgNumeric{}, fmt.Errorf("pg_numeric_cmp: unsupported type %T", v)
 	}
+}
+
+func cmpPgNumeric(a, b pgNumeric) int {
+	// NaN is the largest value and equal to itself (Postgres numeric).
+	if a.kind == pgNumNaN || b.kind == pgNumNaN {
+		switch {
+		case a.kind == pgNumNaN && b.kind == pgNumNaN:
+			return 0
+		case a.kind == pgNumNaN:
+			return 1
+		default:
+			return -1
+		}
+	}
+	// -Infinity < finite < +Infinity.
+	if a.kind != b.kind {
+		switch {
+		case a.kind == pgNumFinite:
+			if b.kind == pgNumPosInf {
+				return -1
+			}
+			return 1
+		case b.kind == pgNumFinite:
+			if a.kind == pgNumPosInf {
+				return 1
+			}
+			return -1
+		case a.kind == pgNumPosInf:
+			return 1
+		default:
+			return -1
+		}
+	}
+	if a.kind == pgNumFinite {
+		return a.rat.Cmp(b.rat)
+	}
+	return 0
 }
 
 // columnIsNumeric reports whether the column maps to a numeric Postgres type

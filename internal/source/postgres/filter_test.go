@@ -190,3 +190,43 @@ func TestFilterExprNumericExactPrecision(t *testing.T) {
 		t.Fatal("2^53+1 must not equal 2^53: numeric comparison lost precision")
 	}
 }
+
+// A `numeric` column can hold NaN and ±Infinity; the exact comparison must
+// accept them and order them as Postgres does, instead of erroring and
+// stopping CDC.
+func TestFilterExprNumericSpecialValues(t *testing.T) {
+	st := testFilterState()
+	cases := []struct {
+		name string
+		val  string
+		op   spec.Operator
+		lit  any
+		want bool
+	}{
+		{"nan_eq_nan", "NaN", spec.OpEq, "NaN", true},
+		{"nan_neq_nan", "NaN", spec.OpNeq, "NaN", false},
+		{"nan_gt_num", "NaN", spec.OpGt, float64(100), true},
+		{"nan_gt_inf", "NaN", spec.OpGt, "Infinity", true},
+		{"inf_gt_num", "Infinity", spec.OpGt, float64(100), true},
+		{"inf_gt_nan", "Infinity", spec.OpGt, "NaN", false},
+		{"neginf_lt_num", "-Infinity", spec.OpLt, float64(100), true},
+		{"neginf_eq_neginf", "-Infinity", spec.OpEq, "-Infinity", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p, err := newProjection(nil, &spec.Filter{
+				Predicate: &spec.Predicate{Column: "amount", Op: c.op, Value: c.lit},
+			}, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := p.keep(map[string]any{"amount": c.val})
+			if err != nil {
+				t.Fatalf("keep: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("amount=%s op=%s lit=%v: keep=%v, want %v", c.val, c.op, c.lit, got, c.want)
+			}
+		})
+	}
+}
