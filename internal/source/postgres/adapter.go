@@ -96,9 +96,15 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
-// NewChunker builds the chunk SELECT source for one table.
+// NewChunker builds the chunk SELECT source for one table. The concurrent
+// normalization pool (#161) and the snapshot-query retry budget (#166) come
+// from the resolved connection config (maxThreads / retryCount).
 func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
-	return NewChunker(a.db, source, pk, chunkSize)
+	opts := []ChunkerOption{}
+	if a.connCfg != nil {
+		opts = append(opts, WithWorkers(a.connCfg.MaxOpenConns), WithRetries(a.connCfg.RetryCount))
+	}
+	return NewChunker(a.db, source, pk, chunkSize, opts...)
 }
 
 // CloseQuery releases the query connection and tears down the SSH tunnel.
@@ -138,12 +144,13 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	var err error
 	for attempt := 0; ; attempt++ {
 		rdr, err = New(ctx, Config{
-			URI:      uri,
-			ConnCfg:  a.connCfg,
-			DB:       a.db,
-			SlotName: slot,
-			Tables:   refs,
-			Logger:   a.rt.Logger,
+			URI:        uri,
+			ConnCfg:    a.connCfg,
+			DB:         a.db,
+			SlotName:   slot,
+			Tables:     refs,
+			Logger:     a.rt.Logger,
+			RetryCount: maxRetries,
 		}, out)
 		if err == nil {
 			break
@@ -153,16 +160,12 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		if !isTransient(err) || attempt >= maxRetries {
 			return nil, fmt.Errorf("postgres: open (after %d retries): %w", attempt, err)
 		}
-		backoff := time.Duration(1<<uint(attempt)) * time.Second
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
 		a.rt.Logger.Warn("postgres: connection failed, retrying",
-			"attempt", attempt+1, "backoff", backoff, "err", err)
+			"attempt", attempt+1, "backoff", retryBackoff(attempt), "err", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(retryBackoff(attempt)):
 		}
 	}
 

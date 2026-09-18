@@ -110,6 +110,14 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 		}
 		cc.tunnel = tunnel
 		cfg.DialFunc = tunnel.Dial
+		// pgx resolves the host to IPs BEFORE calling DialFunc, which would
+		// require the database hostname to resolve locally — defeating the
+		// tunnel for a host only reachable through the bastion. Return the
+		// host unchanged so DialFunc receives it verbatim and the bastion
+		// does the resolution.
+		cfg.LookupFunc = func(_ context.Context, host string) ([]string, error) {
+			return []string{host}, nil
+		}
 	}
 
 	return cc, nil

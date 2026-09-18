@@ -75,8 +75,8 @@ and reused.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `maxThreads` | `runtime.NumCPU()` | Max concurrent connections for snapshot chunk SELECTs (1..32) |
-| `retryCount` | 3 | Transient-connection retries with exponential backoff. 0 means "use the default" |
+| `maxThreads` | `runtime.NumCPU()` | Max concurrent connections for snapshot chunk SELECTs (1..32), and the size of the concurrent row-normalization pool |
+| `retryCount` | 3 | Transient-error retries with exponential backoff: snapshot queries are retried, and a lost replication stream reconnects and resumes from the committed position. 0 means "use the default" |
 
 ### Distributed mode
 
