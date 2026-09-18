@@ -155,6 +155,13 @@ func TestToFloatAndCompareScalar(t *testing.T) {
 	if compareScalar("a", "b") >= 0 {
 		t.Fatal("string compareScalar must order a < b")
 	}
+	// Adjacent int64 values above 2^53 must not collapse: a float64 round
+	// trip would call them equal and route a key to the wrong worker.
+	const a = int64(9007199254740992) // 2^53
+	const b = int64(9007199254740993) // 2^53+1
+	if compareScalar(b, a) <= 0 {
+		t.Fatal("int64 compareScalar lost precision above 2^53")
+	}
 }
 
 func TestTerminateReason(t *testing.T) {

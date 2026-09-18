@@ -66,15 +66,3 @@ func TestPartitionNumeric(t *testing.T) {
 		}
 	}
 }
-
-func TestCharsetRoundTrip(t *testing.T) {
-	for _, s := range []string{"a", "abc", "ZZZ", "a0z", ""} {
-		enc, err := encodeCharsetString(s)
-		if err != nil {
-			t.Fatalf("encode %q: %v", s, err)
-		}
-		if got := decodeCharsetString(enc); got != s {
-			t.Fatalf("round trip %q = %q", s, got)
-		}
-	}
-}

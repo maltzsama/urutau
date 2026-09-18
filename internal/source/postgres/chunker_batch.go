@@ -8,6 +8,11 @@ import (
 	sq "github.com/Masterminds/squirrel"
 )
 
+// maxChunkBounds caps the chunk count a value-range split may produce. A
+// sparse wide domain (a bigint PK with a huge span and a small step) would
+// otherwise allocate millions of empty chunks; the cap fails loud instead.
+const maxChunkBounds = 1 << 20
+
 // batchBounds splits an integer/float chunk column by value range: MIN..MAX
 // stepped by chunkSize. A dense key yields ~chunkSize rows per chunk.
 func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
@@ -39,8 +44,16 @@ func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
 			step = 1
 		}
 		var bounds [][]any
-		for v := min; v <= max; v += step {
+		for v := min; v <= max; {
 			bounds = append(bounds, []any{v})
+			if len(bounds) >= maxChunkBounds {
+				return nil, fmt.Errorf("postgres: chunker: %s: value-range split exceeds %d chunks (widen the key or set chunkColumn)", c.qualifiedTable(), maxChunkBounds)
+			}
+			// Stop before the next add would exceed max or overflow int64.
+			if step > max-v {
+				break
+			}
+			v += step
 		}
 		if len(bounds) == 0 {
 			bounds = append(bounds, []any{min})
@@ -55,8 +68,16 @@ func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
 	}
 	step := c.numericStep()
 	var bounds [][]any
-	for v := min; v <= max; v += step {
+	for v := min; v <= max; {
 		bounds = append(bounds, []any{v})
+		if len(bounds) >= maxChunkBounds {
+			return nil, fmt.Errorf("postgres: chunker: %s: value-range split exceeds %d chunks (widen the key or set chunkColumn)", c.qualifiedTable(), maxChunkBounds)
+		}
+		next := v + step
+		if next == v {
+			break // step too small to advance a large float
+		}
+		v = next
 	}
 	if len(bounds) == 0 {
 		bounds = append(bounds, []any{min})

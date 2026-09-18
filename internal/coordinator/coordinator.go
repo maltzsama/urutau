@@ -1698,6 +1698,21 @@ func comparePK(a, b []any) int {
 }
 
 func compareScalar(a, b any) int {
+	// Exact integer comparison first: float64 cannot represent adjacent
+	// int64 values above 2^53, so a float round-trip would collapse distinct
+	// keys and boundaries and route a key to the wrong worker.
+	if ai, aok := toInt64(a); aok {
+		if bi, bok := toInt64(b); bok {
+			switch {
+			case ai < bi:
+				return -1
+			case ai > bi:
+				return 1
+			default:
+				return 0
+			}
+		}
+	}
 	af, aok := toFloat(a)
 	bf, bok := toFloat(b)
 	if aok && bok {
@@ -1712,6 +1727,22 @@ func compareScalar(a, b any) int {
 	}
 	as, bs := fmt.Sprint(a), fmt.Sprint(b)
 	return strings.Compare(as, bs)
+}
+
+// toInt64 extracts an exact integer when v is an integer type. A float is not
+// coerced here: a float64 that is integral may still be an approximation of a
+// larger int64.
+func toInt64(v any) (int64, bool) {
+	switch t := v.(type) {
+	case int64:
+		return t, true
+	case int32:
+		return int64(t), true
+	case int:
+		return int64(t), true
+	default:
+		return 0, false
+	}
 }
 
 func toFloat(v any) (float64, bool) {
