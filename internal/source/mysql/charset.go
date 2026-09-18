@@ -3,6 +3,7 @@ package mysql
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
@@ -180,44 +181,35 @@ func decodeGenerated(charset string) func([]byte) (string, error) {
 }
 
 // decodeWith adapts an x/text encoding to the decoder signature. The decoder
-// is built ONCE (at map-init time) and reused for every value: x/text's
-// Decoder.Bytes calls transform.Bytes, which resets the transformer and runs
-// it to EOF on each call, so a full-buffer decode carries no state across
-// calls. The decode path is single-goroutine — canal invokes OnRow from its
-// own event loop — so the shared decoder is never used concurrently. This
-// removes one decoder allocation per decoded non-UTF-8 string value (issue
-// #117).
+// is pooled: x/text's Decoder.Bytes resets the transformer and runs it to EOF
+// on each call, so a decoder is safe to reuse, and a pool keeps two concurrent
+// readers (the package-level decoder set is shared) off the same instance.
+// This removes the per-value decoder allocation (issue #117).
 func decodeWith(enc encoding.Encoding) func([]byte) (string, error) {
-	dec := enc.NewDecoder()
+	return pooledDecoder(enc.NewDecoder)
+}
+
+// pooledDecoder wraps a decoder constructor in a sync.Pool.
+func pooledDecoder(newDec func() *encoding.Decoder) func([]byte) (string, error) {
+	pool := &sync.Pool{New: func() any { return newDec() }}
 	return func(b []byte) (string, error) {
+		dec := pool.Get().(*encoding.Decoder)
 		out, err := dec.Bytes(b)
+		pool.Put(dec)
 
 		return string(out), err
 	}
 }
 
-// Cached decoders for the fixed-endian Unicode sets, same reuse rationale as
-// decodeWith.
+// Decoders for the fixed-endian Unicode sets, same pooling rationale.
 var (
-	utf16BEDecoder = unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewDecoder()
-	utf16LEDecoder = unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder()
-	utf32BEDecoder = utf32.UTF32(utf32.BigEndian, utf32.IgnoreBOM).NewDecoder()
+	decodeUTF16BE = pooledDecoder(func() *encoding.Decoder {
+		return unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewDecoder()
+	})
+	decodeUTF16LE = pooledDecoder(func() *encoding.Decoder {
+		return unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder()
+	})
+	decodeUTF32BE = pooledDecoder(func() *encoding.Decoder {
+		return utf32.UTF32(utf32.BigEndian, utf32.IgnoreBOM).NewDecoder()
+	})
 )
-
-func decodeUTF16BE(b []byte) (string, error) {
-	out, err := utf16BEDecoder.Bytes(b)
-
-	return string(out), err
-}
-
-func decodeUTF16LE(b []byte) (string, error) {
-	out, err := utf16LEDecoder.Bytes(b)
-
-	return string(out), err
-}
-
-func decodeUTF32BE(b []byte) (string, error) {
-	out, err := utf32BEDecoder.Bytes(b)
-
-	return string(out), err
-}
