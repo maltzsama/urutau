@@ -38,6 +38,9 @@ func compileFilterExpr(f *spec.Filter, st *TableState) (*vm.Program, error) {
 	if f == nil {
 		return nil, nil
 	}
+	if err := checkFilterColumns(st, f); err != nil {
+		return nil, err
+	}
 	src, err := filterExprSource(f, st)
 	if err != nil {
 		return nil, err
@@ -97,11 +100,11 @@ func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
 	case spec.OpIsNotNull:
 		return raw + " != nil", nil
 	}
-	if columnIsDecimal(st, p.Column) {
-		return filterExprDecimal(p, raw)
+	if columnIsPgNumeric(st, p.Column) {
+		return filterExprPgNumeric(p, raw)
 	}
 	lhs := raw
-	if columnIsNumeric(st, p.Column) {
+	if columnIsInteger(st, p.Column) {
 		lhs = "float(" + raw + ")"
 	}
 	switch p.Op {
@@ -136,10 +139,12 @@ func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
 	}
 }
 
-// filterExprDecimal renders a predicate on a `numeric` column through the
-// exact pg_numeric_cmp helper, since the value is decoded as a decimal string
-// and Postgres compares `numeric` at native precision.
-func filterExprDecimal(p *spec.Predicate, raw string) (string, error) {
+// filterExprPgNumeric renders a predicate on a column that is compared
+// through the exact pg_numeric_cmp helper: `numeric` (decoded as a decimal
+// string) and `real`/`double precision`/`money` (decoded as float64). This
+// keeps native precision and accepts the special values those columns can
+// hold — NaN and ±Infinity — which a plain expr comparison cannot.
+func filterExprPgNumeric(p *spec.Predicate, raw string) (string, error) {
 	guard := "(" + raw + " != nil)"
 	switch p.Op {
 	case spec.OpEq, spec.OpNeq, spec.OpLt, spec.OpLte, spec.OpGt, spec.OpGte:
@@ -174,14 +179,53 @@ func filterExprDecimal(p *spec.Predicate, raw string) (string, error) {
 	}
 }
 
-// columnIsDecimal reports whether the column is Postgres `numeric`, decoded
-// as a decimal string.
-func columnIsDecimal(st *TableState, name string) bool {
+// checkFilterColumns reports an error when a filter references a column that
+// is not in the introspected table. A typo would otherwise emit an unknown
+// identifier into the snapshot SQL, and in CDC evaluate a missing map key as
+// nil (so is_null matches every row and other predicates reject every row).
+func checkFilterColumns(st *TableState, f *spec.Filter) error {
+	if f == nil || st == nil {
+		return nil
+	}
+	switch {
+	case len(f.All) > 0:
+		for i := range f.All {
+			if err := checkFilterColumns(st, &f.All[i]); err != nil {
+				return err
+			}
+		}
+	case len(f.Any) > 0:
+		for i := range f.Any {
+			if err := checkFilterColumns(st, &f.Any[i]); err != nil {
+				return err
+			}
+		}
+	case f.Not != nil:
+		return checkFilterColumns(st, f.Not)
+	case f.Predicate != nil:
+		if st.FindColumn(f.Predicate.Column) < 0 {
+			return fmt.Errorf("filter column %q not found in the source table", f.Predicate.Column)
+		}
+	}
+	return nil
+}
+
+// columnIsPgNumeric reports whether the column is compared through the exact
+// pg_numeric_cmp helper: `numeric` and the floating types, which can hold
+// NaN/Infinity.
+func columnIsPgNumeric(st *TableState, name string) bool {
 	if st == nil {
 		return false
 	}
 	i := st.FindColumn(name)
-	return i >= 0 && strings.EqualFold(st.Columns[i].DataType, "numeric")
+	if i < 0 {
+		return false
+	}
+	switch strings.ToLower(st.Columns[i].DataType) {
+	case "numeric", "real", "double precision", "money":
+		return true
+	}
+	return false
 }
 
 // numericCompare compares two numeric scalars with PostgreSQL `numeric`
@@ -285,10 +329,10 @@ func cmpPgNumeric(a, b pgNumeric) int {
 	return 0
 }
 
-// columnIsNumeric reports whether the column maps to a numeric Postgres type
-// decoded as int64/float64 (so float() comparison is exact enough and matches
-// the snapshot's float8 literal). `numeric` is handled by columnIsDecimal.
-func columnIsNumeric(st *TableState, name string) bool {
+// columnIsInteger reports whether the column is an integer type. Those are
+// compared through float() to match the snapshot, where Postgres casts the
+// integer column to float8 against the float8 literal parameter.
+func columnIsInteger(st *TableState, name string) bool {
 	if st == nil {
 		return false
 	}
@@ -297,7 +341,7 @@ func columnIsNumeric(st *TableState, name string) bool {
 		return false
 	}
 	switch strings.ToLower(st.Columns[i].DataType) {
-	case "smallint", "integer", "bigint", "real", "double precision", "money":
+	case "smallint", "integer", "bigint":
 		return true
 	}
 	return false

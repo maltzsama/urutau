@@ -114,7 +114,7 @@ transaction between slot creation and the stream start is lost.
 - **Snapshot consistency** — each chunk runs in a `REPEATABLE READ READ ONLY`
   transaction, so the chunk sees one consistent snapshot even under
   concurrent writes.
-- **Column projection** — [`columnFilter`](../reference/pipeline-spec.md#tables)
+- **Column projection** — [`columnFilter`](../reference/pipeline-spec.md#columnfilter)
   narrows the snapshot `SELECT` list and the CDC projection; the excluded
   columns are absent from the target. It must include the primary key.
 - **Row filter** — [`filter`](../reference/pipeline-spec.md#filter) is pushed

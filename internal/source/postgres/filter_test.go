@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -226,6 +227,59 @@ func TestFilterExprNumericSpecialValues(t *testing.T) {
 			}
 			if got != c.want {
 				t.Fatalf("amount=%s op=%s lit=%v: keep=%v, want %v", c.val, c.op, c.lit, got, c.want)
+			}
+		})
+	}
+}
+
+func TestCheckFilterColumns(t *testing.T) {
+	st := testFilterState()
+	ok := &spec.Filter{Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "x"}}
+	if err := checkFilterColumns(st, ok); err != nil {
+		t.Fatalf("known column: %v", err)
+	}
+	bad := &spec.Filter{Predicate: &spec.Predicate{Column: "nope", Op: spec.OpEq, Value: "x"}}
+	if err := checkFilterColumns(st, bad); err == nil {
+		t.Fatal("want an error for an unknown filter column")
+	}
+	nested := &spec.Filter{All: []spec.Filter{
+		{Not: &spec.Filter{Predicate: &spec.Predicate{Column: "nope", Op: spec.OpIsNull}}},
+	}}
+	if err := checkFilterColumns(st, nested); err == nil {
+		t.Fatal("want an error for an unknown column inside all/not")
+	}
+}
+
+// A float column can hold NaN/Infinity; the filter must accept the special
+// literal instead of failing to compile a float-vs-string comparison.
+func TestFilterExprFloatSpecialValues(t *testing.T) {
+	st := &TableState{Columns: []Column{{Name: "amount", DataType: "double precision"}}}
+	cases := []struct {
+		name string
+		val  any
+		op   spec.Operator
+		lit  any
+		want bool
+	}{
+		{"nan_eq_nan", math.NaN(), spec.OpEq, "NaN", true},
+		{"nan_gt_num", math.NaN(), spec.OpGt, float64(1), true},
+		{"inf_gt_num", math.Inf(1), spec.OpGt, float64(1), true},
+		{"neginf_lt_num", math.Inf(-1), spec.OpLt, float64(1), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p, err := newProjection(nil, &spec.Filter{
+				Predicate: &spec.Predicate{Column: "amount", Op: c.op, Value: c.lit},
+			}, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := p.keep(map[string]any{"amount": c.val})
+			if err != nil {
+				t.Fatalf("keep: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("val=%v op=%s: keep=%v, want %v", c.val, c.op, got, c.want)
 			}
 		})
 	}

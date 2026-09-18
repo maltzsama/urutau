@@ -749,8 +749,14 @@ func validatePredicate(p *Predicate, path string, problems *[]string) {
 			*problems = append(*problems, fmt.Sprintf("%s: op %q requires a value", path, p.Op))
 		}
 	case OpIn, OpNotIn:
-		if _, ok := p.Value.([]any); !ok {
+		vals, ok := p.Value.([]any)
+		if !ok {
 			*problems = append(*problems, fmt.Sprintf("%s: op %q requires a list value", path, p.Op))
+		} else if len(vals) == 0 {
+			// An empty list is meaningless, and squirrel renders an empty
+			// NOT IN as (1=1), which would keep NULL rows the CDC guard
+			// drops — reject it before either compiler sees it.
+			*problems = append(*problems, fmt.Sprintf("%s: op %q requires at least one value", path, p.Op))
 		}
 	case OpIsNull, OpIsNotNull:
 		if p.Value != nil {

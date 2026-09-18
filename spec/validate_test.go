@@ -865,3 +865,13 @@ func TestValidateColumnFilterRejectsDuplicatesAndEmpty(t *testing.T) {
 		t.Fatalf("want duplicate+empty problems, got %v", err)
 	}
 }
+
+func TestValidateFilterRejectsEmptyList(t *testing.T) {
+	for _, op := range []Operator{OpIn, OpNotIn} {
+		s := validSpec()
+		s.Tables[0].Filter = &Filter{Predicate: &Predicate{Column: "v", Op: op, Value: []any{}}}
+		if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "at least one value") {
+			t.Fatalf("op %q: want empty-list rejection, got %v", op, err)
+		}
+	}
+}

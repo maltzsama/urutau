@@ -98,6 +98,9 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	if err := checkColumnFilterExists(st, t.ColumnFilter); err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
 	}
+	if err := checkFilterColumns(st, t.Filter); err != nil {
+		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
+	}
 	if err := checkColumnFilterCoversPK(t.ColumnFilter, pk); err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
 	}
@@ -275,6 +278,16 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		}
 	}
 
+	// The reader holds an open replication connection. If the schema
+	// introspection below fails, close it before returning — otherwise the
+	// connection leaks on every failed open.
+	keepReader := false
+	defer func() {
+		if !keepReader {
+			rdr.Close()
+		}
+	}()
+
 	puller := sourcepull.New(out)
 	// Introspect each table so live batches encode against the canonical
 	// schema — a stable shape per table, never a per-drain inference. The
@@ -299,12 +312,16 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 				if cerr := checkColumnFilterExists(st, t.ColumnFilter); cerr != nil {
 					return nil, fmt.Errorf("postgres: %s: %w", ref.Source, cerr)
 				}
+				if cerr := checkFilterColumns(st, t.Filter); cerr != nil {
+					return nil, fmt.Errorf("postgres: %s: %w", ref.Source, cerr)
+				}
 				cs = filterSchemaColumns(cs, t.ColumnFilter)
 			}
 			schemas[ref.Target] = cs
 		}
 		puller.SetSchemas(schemas)
 	}
+	keepReader = true
 	return stream{Reader: rdr, out: out, Puller: puller}, nil
 }
 
