@@ -100,7 +100,7 @@ See [Sinks](sinks.md) for each sink's semantics and limits.
 | `primaryKey` | upsert | Required for `writeMode: upsert` |
 | `writeMode` | no | `upsert` (default), `append`, `append-idempotent` |
 | `onDelete` | append | `record` (default) or `skip`; a `DELETE` on append needs `filterImmutable` |
-| `filter` | no | Row filter expression |
+| `filter` | no | Structured row filter, applied at the source (snapshot WHERE + CDC). See [`filter`](#filter) |
 | `filterImmutable` | no | Required for `append` + `filter` |
 | `partitionBy` | no | Iceberg partition transform |
 | `createIfNotExists` | no | Create the target table |
@@ -109,9 +109,39 @@ See [Sinks](sinks.md) for each sink's semantics and limits.
 | `identity` | append-idempotent | Transport-metadata columns making the table idempotent |
 | `metadata` | no | Pipeline metadata columns (`op`, `commit_ts`, …) |
 | `cast` | no | Override a source column's canonical type |
+| `columnFilter` | no | Source column subset to read and emit. Must include every primary-key column |
 | `columns` | kafka | Explicit schema (no introspection) |
 | `bootstrap` | no | `snapshot` (default), `adopt`, `adopt-verify` |
 | `enrich` | no | Broadcast reference joins |
+
+### `filter`
+
+A structured predicate tree, not a raw SQL string. Each node is exactly one of
+`all`, `any`, `not`, or `where`:
+
+```yaml
+filter:
+  all:
+    - where: { col: status, op: eq, value: active }
+    - where: { col: amount, op: gt, value: 100 }
+```
+
+Operators: `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `in`, `not_in`, `is_null`,
+`is_not_null`. It is applied at the source boundary, before the Arrow
+hot-path: the snapshot composes it into the chunk `WHERE`, and CDC evaluates it
+on each decoded row. On a row that leaves the filter, an update emits a delete
+so an upsert target drops the stale row. A NULL column never satisfies a
+comparison (SQL three-valued logic). Literal types must match the column type —
+a JSON number for a numeric column, a string for a text column (no implicit
+coercion).
+
+### `columnFilter`
+
+A subset of source columns to read and emit; the excluded columns are absent
+from the target schema. It applies to the snapshot `SELECT` list and to the
+CDC projection. Every primary-key column (declared, or introspected when not
+declared) must be included — the sink resolves the key and sort order by
+column name.
 
 ### `writeMode`
 

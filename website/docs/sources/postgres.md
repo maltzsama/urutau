@@ -111,6 +111,16 @@ transaction between slot creation and the stream start is lost.
   use a SELECT-only user (the replication credential stays coordinator-side).
 - **Before image** — deletes and updates carry the old row (PK-only unless
   `REPLICA IDENTITY FULL`, which the runner sets).
+- **Snapshot consistency** — each chunk runs in a `REPEATABLE READ READ ONLY`
+  transaction, so the chunk sees one consistent snapshot even under
+  concurrent writes.
+- **Column projection** — [`columnFilter`](../reference/pipeline-spec.md#tables)
+  narrows the snapshot `SELECT` list and the CDC projection; the excluded
+  columns are absent from the target. It must include the primary key.
+- **Row filter** — [`filter`](../reference/pipeline-spec.md#filter) is pushed
+  into the snapshot `WHERE` and evaluated on each CDC row before the Arrow
+  hot-path. A row that leaves the filter produces a delete, so an upsert
+  target drops the stale row.
 
 ## Example
 
