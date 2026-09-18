@@ -7,10 +7,14 @@ import (
 	"runtime"
 	"strings"
 
+	sq "github.com/Masterminds/squirrel"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/maltzsama/urutau/source"
 )
+
+// psql builds queries with Postgres $N placeholders.
+var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
 // Chunker splits a table by its primary key, using the chunk-skipping
 // bounds trick shared with the MySQL source: pick every chunkSize-th key
@@ -30,6 +34,14 @@ type Chunker struct {
 	// retries is the transient-error retry budget for the chunk SELECT and
 	// bounds queries (#166). 0 disables retry.
 	retries int
+	// columns is the projection (#162): the source columns to read. Empty
+	// means all. The chunk SELECT lists exactly these columns; ORDER BY and
+	// the chunk bounds still use the primary key, which may be outside the
+	// projection in append-only mode.
+	columns []string
+	// filter is the compiled structured filter (#163), composed with the
+	// chunk bounds. Nil means no filter.
+	filter sq.Sqlizer
 }
 
 // ChunkerOption tunes a Chunker.
@@ -54,6 +66,16 @@ func WithRetries(n int) ChunkerOption {
 		}
 		c.retries = n
 	}
+}
+
+// WithColumns sets the column projection (#162). Empty means all columns.
+func WithColumns(cols []string) ChunkerOption {
+	return func(c *Chunker) { c.columns = cols }
+}
+
+// WithFilter sets the compiled structured filter (#163). Nil means none.
+func WithFilter(f sq.Sqlizer) ChunkerOption {
+	return func(c *Chunker) { c.filter = f }
 }
 
 // NewChunker builds a chunker for one source table.
@@ -96,17 +118,15 @@ func (c *Chunker) PK() []string { return c.pk }
 // error, so a failure while fetching a boundary row is covered, not just the
 // initial QueryContext.
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
-	cols := quotedList(c.pk)
-	query := fmt.Sprintf(
-		"SELECT %s FROM %s.%s ORDER BY %s LIMIT 1 OFFSET $1",
-		cols, quoteIdent(c.schema), quoteIdent(c.table), cols,
-	)
-
 	var bounds [][]any
 	err := retryTransientErr(ctx, c.retries, func() error {
 		bounds = bounds[:0]
 		for offset := 0; ; offset += c.chunkSize {
-			rows, err := c.db.QueryContext(ctx, query, offset)
+			query, args, err := c.boundsQuery(offset).ToSql()
+			if err != nil {
+				return fmt.Errorf("postgres: chunker bounds sql: %w", err)
+			}
+			rows, err := c.db.QueryContext(ctx, query, args...)
 			if err != nil {
 				return fmt.Errorf("postgres: chunker bounds: %w", err)
 			}
@@ -132,6 +152,28 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 		return nil, err
 	}
 	return bounds, nil
+}
+
+// boundsQuery selects the chunkSize-th key at the given offset.
+func (c *Chunker) boundsQuery(offset int) sq.SelectBuilder {
+	return psql.Select(quotedIdents(c.pk)...).
+		From(c.qualifiedTable()).
+		OrderBy(quotedIdents(c.pk)...).
+		Limit(1).
+		Offset(uint64(offset))
+}
+
+// qualifiedTable is the quoted "schema"."table".
+func (c *Chunker) qualifiedTable() string {
+	return quoteIdent(c.schema) + "." + quoteIdent(c.table)
+}
+
+// selectList is the SELECT column list: the projection, or * for all.
+func (c *Chunker) selectList() []string {
+	if len(c.columns) == 0 {
+		return []string{"*"}
+	}
+	return quotedIdents(c.columns)
 }
 
 // Scan executes the chunk SELECT and calls fn for every row, keyed by
@@ -170,33 +212,43 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 
 // scanOnce runs one chunk SELECT, streaming normalized rows to fn.
 func (c *Chunker) scanOnce(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
-	// Row-constructor comparison keeps composite PKs lexicographic; the
-	// placeholder index runs across clauses ($1..$k, then $k+1..).
-	cond := make([]string, 0, 2)
-	args := make([]any, 0, 2*len(c.pk))
-	cols := quotedList(c.pk)
-	argIdx := 1
-
+	// The query is composed with squirrel — no hand-built SQL. The chunk
+	// bounds narrow the PK range, the structured filter (#163) drops rows
+	// the operator does not want; both are ANDed, so neither widens the
+	// other. ORDER BY and the bounds reference the primary key, which the
+	// engine allows even when the key is not in the projection (#162).
+	q := psql.Select(c.selectList()...).From(c.qualifiedTable())
 	if ch.Low != nil {
-		cond = append(cond, fmt.Sprintf("(%s) >= (%s)", cols, placeholders(argIdx, len(c.pk))))
-		args = append(args, ch.Low...)
-		argIdx += len(c.pk)
+		q = q.Where(tupleCompare(">=", c.pk, ch.Low))
 	}
 	if ch.High != nil {
-		cond = append(cond, fmt.Sprintf("(%s) < (%s)", cols, placeholders(argIdx, len(c.pk))))
-		args = append(args, ch.High...)
+		q = q.Where(tupleCompare("<", c.pk, ch.High))
 	}
-	where := ""
-	if len(cond) > 0 {
-		where = " WHERE " + strings.Join(cond, " AND ")
+	if c.filter != nil {
+		q = q.Where(c.filter)
+	}
+	q = q.OrderBy(quotedIdents(c.pk)...)
+
+	query, args, err := q.ToSql()
+	if err != nil {
+		return fmt.Errorf("postgres: chunk scan sql: %w", err)
 	}
 
-	// Without a row filter the SELECT reads the whole row; select * keeps
-	// it simple and correct.
-	query := fmt.Sprintf("SELECT * FROM %s.%s%s ORDER BY %s",
-		quoteIdent(c.schema), quoteIdent(c.table), where, cols)
+	// One REPEATABLE READ, READ ONLY transaction per chunk: the chunk sees a
+	// single consistent snapshot even under concurrent writes, and the
+	// read-only marker forbids any accidental write. The transaction is
+	// rolled back on every error path and committed only after the rows are
+	// fully read, so a retry re-runs the whole chunk on a fresh snapshot.
+	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return fmt.Errorf("postgres: chunk scan tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 
-	rows, err := c.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("postgres: chunk scan: %w", err)
 	}
@@ -235,7 +287,13 @@ func (c *Chunker) scanOnce(ctx context.Context, ch source.Chunk, fn func(row map
 	if cerr := closeRows(); err == nil && cerr != nil {
 		return fmt.Errorf("postgres: chunk scan close: %w", cerr)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if cerr := tx.Commit(); cerr != nil {
+		return fmt.Errorf("postgres: chunk scan commit: %w", cerr)
+	}
+	return nil
 }
 
 // scanBatchSize is how many raw rows a producer hands to a worker at once.
@@ -405,26 +463,36 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	return vals, nil
 }
 
-// placeholders renders $from..$from+n-1.
-func placeholders(from, n int) string {
-	out := make([]string, n)
-	for i := range out {
-		out[i] = fmt.Sprintf("$%d", from+i)
-	}
-	return strings.Join(out, ", ")
-}
-
 // quoteIdent quotes one identifier, doubling embedded quotes.
 func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-func quotedList(cols []string) string {
+// quotedIdents quotes each identifier.
+func quotedIdents(cols []string) []string {
 	out := make([]string, len(cols))
 	for i, c := range cols {
 		out[i] = quoteIdent(strings.TrimSpace(c))
 	}
-	return strings.Join(out, ", ")
+	return out
+}
+
+// quotedList joins the quoted identifiers with ", ".
+func quotedList(cols []string) string {
+	return strings.Join(quotedIdents(cols), ", ")
+}
+
+// tupleCompare builds a row-constructor range comparison, e.g.
+// ("a", "b") >= (?, ?), which keeps composite primary keys lexicographic.
+// Squirrel has no tuple helper, so this uses its Expr escape hatch — the one
+// construct squirrel cannot express natively.
+func tupleCompare(op string, cols []string, vals []any) sq.Sqlizer {
+	holders := make([]string, len(vals))
+	for i := range holders {
+		holders[i] = "?"
+	}
+	expression := "(" + quotedList(cols) + ") " + op + " (" + strings.Join(holders, ", ") + ")"
+	return sq.Expr(expression, vals...)
 }
 
 // normalize maps driver values into the scalar subset shared with the

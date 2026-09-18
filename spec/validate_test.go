@@ -822,3 +822,46 @@ func TestValidatePostgresBlockRejectedForOtherKinds(t *testing.T) {
 		t.Fatalf("want kind rejection, got %v", err)
 	}
 }
+
+func TestValidateColumnFilterUpsertRequiresPK(t *testing.T) {
+	s := validSpec() // upsert by default, pk id
+	s.Tables[0].ColumnFilter = []string{"name"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "must include primary key column") {
+		t.Fatalf("want pk-in-filter problem, got %v", err)
+	}
+	// Including the PK is accepted.
+	s.Tables[0].ColumnFilter = []string{"id", "name"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("pk included must validate: %v", err)
+	}
+}
+
+func TestValidateColumnFilterAppendAllowsAnySubset(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].WriteMode = WriteModeAppend
+	s.Tables[0].PrimaryKey = nil // no declared key: any subset is fine
+	s.Tables[0].ColumnFilter = []string{"name"}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("append-only column filter without a key must validate: %v", err)
+	}
+}
+
+func TestValidateColumnFilterAppendWithDeclaredKeyRequiresIt(t *testing.T) {
+	// Even in append mode the sink builds a sort order over a declared key,
+	// so the key column cannot be filtered out.
+	s := validSpec()
+	s.Tables[0].WriteMode = WriteModeAppend
+	s.Tables[0].ColumnFilter = []string{"name"} // excludes declared pk id
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "must include primary key column") {
+		t.Fatalf("want pk-in-filter problem, got %v", err)
+	}
+}
+
+func TestValidateColumnFilterRejectsDuplicatesAndEmpty(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].ColumnFilter = []string{"id", "id", ""}
+	err := s.Validate()
+	if err == nil || !strings.Contains(err.Error(), "duplicated") || !strings.Contains(err.Error(), "empty column name") {
+		t.Fatalf("want duplicate+empty problems, got %v", err)
+	}
+}

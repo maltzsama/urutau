@@ -1427,11 +1427,13 @@ type TableAssignment struct {
 	PartitionBy       []string               `protobuf:"bytes,5,rep,name=partition_by,json=partitionBy,proto3" json:"partition_by,omitempty"`        // native Iceberg transforms
 	IncludeBefore     bool                   `protobuf:"varint,6,opt,name=include_before,json=includeBefore,proto3" json:"include_before,omitempty"` // derived: true only with a mutable-column filter
 	CreateIfNotExists bool                   `protobuf:"varint,7,opt,name=create_if_not_exists,json=createIfNotExists,proto3" json:"create_if_not_exists,omitempty"`
-	SchemaArrow       []byte                 `protobuf:"bytes,8,opt,name=schema_arrow,json=schemaArrow,proto3" json:"schema_arrow,omitempty"` // table schema as Arrow IPC (data columns); the coordinator owns introspection
-	Enrich            []*EnrichRef           `protobuf:"bytes,9,rep,name=enrich,proto3" json:"enrich,omitempty"`                              // broadcast reference joins, applied in order
-	CastPolicy        []byte                 `protobuf:"bytes,10,opt,name=cast_policy,json=castPolicy,proto3" json:"cast_policy,omitempty"`   // JSON core.CastPolicy — writes must apply the same overrides as the coordinator's DDL
-	Metadata          []byte                 `protobuf:"bytes,11,opt,name=metadata,proto3" json:"metadata,omitempty"`                         // JSON []core.MetadataColumn — pipeline metadata columns land in the target
-	Staged            bool                   `protobuf:"varint,12,opt,name=staged,proto3" json:"staged,omitempty"`                            // workers>1 on a staging sink: stage data files, let the coordinator commit the cycle (WK-001 C5.5)
+	SchemaArrow       []byte                 `protobuf:"bytes,8,opt,name=schema_arrow,json=schemaArrow,proto3" json:"schema_arrow,omitempty"`     // table schema as Arrow IPC (data columns); the coordinator owns introspection
+	Enrich            []*EnrichRef           `protobuf:"bytes,9,rep,name=enrich,proto3" json:"enrich,omitempty"`                                  // broadcast reference joins, applied in order
+	CastPolicy        []byte                 `protobuf:"bytes,10,opt,name=cast_policy,json=castPolicy,proto3" json:"cast_policy,omitempty"`       // JSON core.CastPolicy — writes must apply the same overrides as the coordinator's DDL
+	Metadata          []byte                 `protobuf:"bytes,11,opt,name=metadata,proto3" json:"metadata,omitempty"`                             // JSON []core.MetadataColumn — pipeline metadata columns land in the target
+	Staged            bool                   `protobuf:"varint,12,opt,name=staged,proto3" json:"staged,omitempty"`                                // workers>1 on a staging sink: stage data files, let the coordinator commit the cycle (WK-001 C5.5)
+	ColumnFilter      []string               `protobuf:"bytes,13,rep,name=column_filter,json=columnFilter,proto3" json:"column_filter,omitempty"` // source column projection (#162): the snapshot SELECT list
+	Filter            []byte                 `protobuf:"bytes,14,opt,name=filter,proto3" json:"filter,omitempty"`                                 // JSON spec.Filter (#163): the source WHERE predicate, composed with the chunk bounds
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1548,6 +1550,20 @@ func (x *TableAssignment) GetStaged() bool {
 		return x.Staged
 	}
 	return false
+}
+
+func (x *TableAssignment) GetColumnFilter() []string {
+	if x != nil {
+		return x.ColumnFilter
+	}
+	return nil
+}
+
+func (x *TableAssignment) GetFilter() []byte {
+	if x != nil {
+		return x.Filter
+	}
+	return nil
 }
 
 type BatchConfig struct {
@@ -2557,7 +2573,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a5\n" +
 	"\aAsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xce\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8b\x04\n" +
 	"\x0fTableAssignment\x12!\n" +
 	"\fsource_table\x18\x01 \x01(\tR\vsourceTable\x12!\n" +
 	"\ftarget_table\x18\x02 \x01(\tR\vtargetTable\x123\n" +
@@ -2574,7 +2590,9 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	" \x01(\fR\n" +
 	"castPolicy\x12\x1a\n" +
 	"\bmetadata\x18\v \x01(\fR\bmetadata\x12\x16\n" +
-	"\x06staged\x18\f \x01(\bR\x06staged\"h\n" +
+	"\x06staged\x18\f \x01(\bR\x06staged\x12#\n" +
+	"\rcolumn_filter\x18\r \x03(\tR\fcolumnFilter\x12\x16\n" +
+	"\x06filter\x18\x0e \x01(\fR\x06filter\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
 	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xda\x02\n" +

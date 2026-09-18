@@ -1895,6 +1895,19 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			} else {
 				ta.Metadata = metaB
 			}
+			// The source read projection travels too: the worker builds the
+			// snapshot chunk SELECT, so it needs the column list (#162) and
+			// the compiled predicate (#163). The predicate is shipped as the
+			// structured filter and compiled by the worker's source, so the
+			// same code path resolves it in both modes.
+			ta.ColumnFilter = tbl.ColumnFilter
+			if tbl.Filter != nil {
+				filterB, ferr := json.Marshal(tbl.Filter)
+				if ferr != nil {
+					return nil, fmt.Errorf("coordinator: filter %s: %w", ref.Source, ferr)
+				}
+				ta.Filter = filterB
+			}
 		}
 		// Broadcast reference joins travel with the assignment: the worker
 		// owns the join, the coordinator only forwards the declaration.

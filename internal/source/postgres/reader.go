@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/vm"
 	pglogrepl "github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,6 +20,7 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // statusInterval is how often the reader reports its applied LSN back to
@@ -48,6 +51,66 @@ type Config struct {
 	// RetryCount is the transient-error reconnect budget for the
 	// replication stream (#166). 0 disables reconnect.
 	RetryCount int
+	// Projections is the per-source read projection (#162/#163), keyed by
+	// "schema.table". Applied to decoded rows before they enter the Arrow
+	// hot-path.
+	Projections map[string]Projection
+}
+
+// Projection is a table's source-side read projection: the columns to emit
+// and the compiled filter a row must satisfy. Both are applied on the
+// decoded map, before the Arrow hot-path.
+type Projection struct {
+	Columns []string
+	program *vm.Program
+}
+
+// newProjection builds a projection, compiling the structured filter (#163)
+// to an expr program once per table.
+func newProjection(columns []string, f *spec.Filter) (Projection, error) {
+	p := Projection{Columns: columns}
+	if f != nil {
+		prog, err := compileFilterExpr(f)
+		if err != nil {
+			return Projection{}, err
+		}
+		p.program = prog
+	}
+	return p, nil
+}
+
+// hasFilter reports whether a filter is configured.
+func (p Projection) hasFilter() bool { return p.program != nil }
+
+// keep reports whether a full decoded row satisfies the filter. The filter is
+// evaluated on the FULL row (its columns may be excluded from the
+// projection).
+func (p Projection) keep(full map[string]any) (bool, error) {
+	if p.program == nil {
+		return true, nil
+	}
+	out, err := expr.Run(p.program, map[string]any{"row": full})
+	if err != nil {
+		return false, fmt.Errorf("postgres: filter: %w", err)
+	}
+	ok, isBool := out.(bool)
+	if !isBool {
+		return false, fmt.Errorf("postgres: filter: non-bool result %T", out)
+	}
+	return ok, nil
+}
+
+// project narrows a full decoded row to the selected columns. An empty
+// projection returns the row unchanged.
+func (p Projection) project(full map[string]any) map[string]any {
+	if len(p.Columns) == 0 {
+		return full
+	}
+	out := make(map[string]any, len(p.Columns))
+	for _, c := range p.Columns {
+		out[c] = full[c]
+	}
+	return out
 }
 
 // relEntry binds a pgoutput relation id to its introspected state and the
@@ -55,6 +118,7 @@ type Config struct {
 type relEntry struct {
 	state *TableState
 	ref   source.TableRef
+	proj  Projection
 }
 
 // Reader wraps one logical-decoding connection and decodes pgoutput row
@@ -69,6 +133,8 @@ type Reader struct {
 	bySrc   map[string]source.TableRef // "schema.table" → ref (PK + target)
 	states  map[string]*TableState     // "schema.table" → introspected state
 	relByID map[uint32]relEntry        // relation id → state, from Relation messages
+	// projections is the per-source read projection (#162/#163).
+	projections map[string]Projection
 
 	// Transaction buffer: rows stream inside a transaction before its
 	// commit LSN is known, so they accumulate and flush at Commit.
@@ -151,16 +217,17 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 	}
 
 	return &Reader{
-		cfg:     cfg,
-		db:      cfg.DB,
-		conn:    conn,
-		connCfg: connCfg,
-		retries: cfg.RetryCount,
-		out:     out,
-		bySrc:   bySrc,
-		states:  states,
-		relByID: map[uint32]relEntry{},
-		synced:  position.MustLSN("0/0"),
+		cfg:         cfg,
+		db:          cfg.DB,
+		conn:        conn,
+		connCfg:     connCfg,
+		retries:     cfg.RetryCount,
+		out:         out,
+		bySrc:       bySrc,
+		states:      states,
+		relByID:     map[uint32]relEntry{},
+		projections: cfg.Projections,
+		synced:      position.MustLSN("0/0"),
 	}, nil
 }
 
@@ -493,7 +560,7 @@ func (r *Reader) bindRelation(relID uint32, src string, ref source.TableRef) err
 	if !ok {
 		return fmt.Errorf("postgres: relation %s: no introspected state", src)
 	}
-	r.relByID[relID] = relEntry{state: st, ref: ref}
+	r.relByID[relID] = relEntry{state: st, ref: ref, proj: r.projections[src]}
 	return nil
 }
 
@@ -510,7 +577,14 @@ func (r *Reader) handleInsert(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	r.enqueue(entry, rowchange.OpInsert, row, nil)
+	keep, err := entry.proj.keep(row)
+	if err != nil {
+		return err
+	}
+	if !keep {
+		return nil
+	}
+	r.enqueue(entry, rowchange.OpInsert, entry.proj.project(row), nil)
 	return nil
 }
 
@@ -534,7 +608,31 @@ func (r *Reader) handleUpdate(payload []byte) error {
 			return err
 		}
 	}
-	r.enqueue(entry, rowchange.OpUpdate, row, before)
+
+	if entry.proj.hasFilter() {
+		afterMatch, err := entry.proj.keep(row)
+		if err != nil {
+			return err
+		}
+		beforeMatch := false
+		if before != nil {
+			beforeMatch, err = entry.proj.keep(before)
+			if err != nil {
+				return err
+			}
+		}
+		switch {
+		case !beforeMatch && !afterMatch:
+			// The row is outside the filter before and after: nothing to do.
+			return nil
+		case beforeMatch && !afterMatch:
+			// The row left the filter: emit a delete so an upsert target
+			// removes the now-excluded row instead of keeping a stale copy.
+			r.enqueue(entry, rowchange.OpDelete, nil, entry.proj.project(before))
+			return nil
+		}
+	}
+	r.enqueue(entry, rowchange.OpUpdate, entry.proj.project(row), entry.proj.project(before))
 	return nil
 }
 
@@ -556,7 +654,14 @@ func (r *Reader) handleDelete(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	r.enqueue(entry, rowchange.OpDelete, nil, before)
+	keep, err := entry.proj.keep(before)
+	if err != nil {
+		return err
+	}
+	if !keep {
+		return nil
+	}
+	r.enqueue(entry, rowchange.OpDelete, nil, entry.proj.project(before))
 	return nil
 }
 
