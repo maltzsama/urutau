@@ -255,6 +255,8 @@ func (r *Reader) SetConfirmed(_ func() position.Position) {}
 
 // ── canal.EventHandler ──────────────────────────────────────────────
 
+// OnGTID records the transaction's GTID and commit time, carried by every
+// row of the transaction.
 func (r *Reader) OnGTID(header *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {
 	next, err := e.GTIDNext()
 	if err != nil {
@@ -297,6 +299,7 @@ func (r *Reader) mergeGTID(g *position.GTID) {
 	r.curGTID = r.curSet.String()
 }
 
+// OnRow decodes one row event into rowchange.Change values and emits them.
 func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	ref, ok := r.bySrc[e.Table.Schema+"."+e.Table.Name]
 	if !ok {
@@ -561,6 +564,8 @@ func decodeSet(col schema.TableColumn, v any) any {
 // column has a different Go type by path.
 func isZeroTemporal(s string) bool { return strings.HasPrefix(s, "0000-00-00") }
 
+// normalize converts driver-native []byte cells to strings so the canonical
+// value space sees text, not raw bytes.
 func normalize(v any) any {
 	if b, ok := v.([]byte); ok {
 		return string(b)

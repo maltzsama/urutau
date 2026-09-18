@@ -28,6 +28,7 @@ type Source struct {
 	loc  *time.Location
 }
 
+// capabilities declares what the MySQL source supports.
 func capabilities() source.Capabilities {
 	return source.Capabilities{
 		Snapshot:            true,

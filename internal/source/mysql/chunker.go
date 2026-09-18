@@ -178,6 +178,7 @@ func normalizeSnapshot(v any, dbType string, loc *time.Location) any {
 	}
 }
 
+// scanRow scans one row into a normalized []any (used for chunk bounds).
 func scanRow(rows *sql.Rows) ([]any, error) {
 	cols, err := rows.Columns()
 	if err != nil {
@@ -203,6 +204,7 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	return vals, nil
 }
 
+// placeholders renders n comma-separated "?" placeholders.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }
