@@ -279,10 +279,10 @@ func TestDeleteKeyBackfilledFromKeyTuple(t *testing.T) {
 	}
 }
 
-// TestEnrichMissNullsAndHitValues — PK 4 (user_ref 99) misses: the reference
+// TestLeftJoinMissNullsAndHitValues — PK 4 (user_ref 99) misses: the reference
 // columns land NULL (absent from the decoded After). PK 5 (user_ref 1) hits:
 // ana/gold.
-func TestEnrichMissNullsAndHitValues(t *testing.T) {
+func TestLeftJoinMissNullsAndHitValues(t *testing.T) {
 	rows := harnessRows(t)
 	by := rowsByKey(rows)
 

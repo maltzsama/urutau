@@ -32,7 +32,6 @@ type Metrics struct {
 	DeletesDropped   *prometheus.CounterVec
 
 	// Enrich.
-	EnrichMisses  *prometheus.CounterVec
 	EnrichDropped *prometheus.CounterVec
 	EnrichEvicted *prometheus.CounterVec
 
@@ -98,9 +97,6 @@ func New() *Metrics {
 		Name: "urutau_worker_deletes_dropped_total", Help: "append-only deletes dropped (skip or no before image), per table."},
 		[]string{"table"})
 
-	m.EnrichMisses = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "urutau_enrich_misses_total", Help: "enrichment left-join misses (events passed with NULL reference columns)."},
-		[]string{"table", "reference"})
 	m.EnrichDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_enrich_inner_dropped_total", Help: "events dropped by inner-join miss."},
 		[]string{"table", "reference"})
@@ -141,7 +137,7 @@ func New() *Metrics {
 
 	reg.MustRegister(m.LagSeconds, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
 	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitLatencyMs, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
-	reg.MustRegister(m.EnrichMisses, m.EnrichDropped, m.EnrichEvicted)
+	reg.MustRegister(m.EnrichDropped, m.EnrichEvicted)
 	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,
 		m.IcebergCompactionBytesBefore, m.IcebergCompactionBytesAfter)
 	reg.MustRegister(m.IcebergSnapshotExpiryRuns, m.IcebergSnapshotExpirySnapshots)

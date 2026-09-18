@@ -53,14 +53,12 @@ func (m *Metrics) WorkerSnapshot() WorkerSnapshot {
 			for _, mt := range f.GetMetric() {
 				snap.CommitLatencyMs[labelValue(mt, "table")] = mt.GetGauge().GetValue()
 			}
-		case "urutau_enrich_misses_total", "urutau_enrich_inner_dropped_total", "urutau_enrich_evicted_total":
+		case "urutau_enrich_inner_dropped_total", "urutau_enrich_evicted_total":
 			for _, mt := range f.GetMetric() {
 				key := labelValue(mt, "table") + "\x00" + labelValue(mt, "reference")
 				ec := snap.Enrich[key]
 				v := int64(mt.GetCounter().GetValue())
 				switch f.GetName() {
-				case "urutau_enrich_misses_total":
-					ec.Misses = v
 				case "urutau_enrich_inner_dropped_total":
 					ec.InnerDropped = v
 				case "urutau_enrich_evicted_total":
