@@ -253,7 +253,7 @@ func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes
 			lastErr = err
 			continue
 		}
-		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos, len(deletes)+len(appends) > 0) {
 			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
@@ -324,12 +324,15 @@ func cycleKey(deletes, appends []iceberg.DataFile, pos string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// cycleCommitted reports whether the cycle is already durable: the table
-// already holds its position (the fast path, written atomically with the
-// files) or its head snapshot carries the cycle key. A retry that sees either
-// must not re-add the files — appends are not idempotent. Pure, for tests.
-func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key, pos string) bool {
-	if pos != "" && props[propPosition] == pos {
+// cycleCommitted reports whether the cycle is already durable. A cycle WITH
+// files is identified by its cycle key alone (the head snapshot carries it):
+// several distinct data cycles can share one position — every snapshot chunk
+// carries the snapshot's low watermark — so a position match must NOT be read
+// as "already committed", or the later cycles' rows are silently dropped. A
+// cycle with NO files is a bare position advance that lands no snapshot
+// summary, so it falls back to the position fast path. Pure, for tests.
+func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key, pos string, hasFiles bool) bool {
+	if !hasFiles && pos != "" && props[propPosition] == pos {
 		return true
 	}
 	return head != nil && head.Summary != nil && head.Summary.Properties[propCycle] == key
