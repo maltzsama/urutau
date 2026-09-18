@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -172,7 +174,7 @@ func newSSHTunnel(cfg *spec.SSHConfig) (*sshTunnel, error) {
 		port = 22
 	}
 	return &sshTunnel{
-		addr: fmt.Sprintf("%s:%d", cfg.Host, port),
+		addr: net.JoinHostPort(cfg.Host, strconv.Itoa(port)),
 		clientCfg: &ssh.ClientConfig{
 			User:            cfg.Username,
 			Auth:            authMethods,
@@ -246,11 +248,27 @@ func (t *sshTunnel) Dial(ctx context.Context, network, addr string) (net.Conn, e
 	}
 	conn, err := client.DialContext(ctx, network, addr)
 	if err != nil {
-		// The cached client may be dead; drop it so the next dial reconnects.
-		t.drop(client)
+		// A channel-open rejection (the target refused the TCP dial) means
+		// the SSH transport is still healthy: do NOT touch the shared
+		// client, or one refused forward would kill the query pool and the
+		// replication connection with it. Only a transport-level failure
+		// marks the client dead — safe to drop, since its other channels
+		// are dead too.
+		if transportDead(err) {
+			t.drop(client)
+		}
 		return nil, fmt.Errorf("ssh forward to %s: %w", addr, err)
 	}
 	return conn, nil
+}
+
+// transportDead reports whether a failed forward means the SSH client's
+// transport is dead, as opposed to the remote target refusing the dial
+// (an *ssh.OpenChannelError, which leaves the client usable for other
+// channels).
+func transportDead(err error) bool {
+	var openErr *ssh.OpenChannelError
+	return !errors.As(err, &openErr)
 }
 
 func (t *sshTunnel) getClient(ctx context.Context) (*ssh.Client, error) {

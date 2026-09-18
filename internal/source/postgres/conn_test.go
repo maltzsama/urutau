@@ -3,6 +3,8 @@ package postgres
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,7 +16,10 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
-func TestHostKeyCallback(t *testing.T) {
+// writeKnownHosts writes a syntactically valid known_hosts file and returns
+// its path.
+func writeKnownHosts(t *testing.T) string {
+	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -23,18 +28,49 @@ func TestHostKeyCallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	dir := t.TempDir()
-	kh := filepath.Join(dir, "known_hosts")
+	kh := filepath.Join(t.TempDir(), "known_hosts")
 	line := knownhosts.Line([]string{"bastion.example.com"}, pub)
 	if err := os.WriteFile(kh, []byte(line+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	return kh
+}
+
+func TestHostKeyCallback(t *testing.T) {
+	kh := writeKnownHosts(t)
 	if _, err := hostKeyCallback(&spec.SSHConfig{KnownHosts: kh}); err != nil {
 		t.Fatalf("hostKeyCallback: %v", err)
 	}
-	if _, err := hostKeyCallback(&spec.SSHConfig{KnownHosts: filepath.Join(dir, "missing")}); err == nil {
+	missing := filepath.Join(filepath.Dir(kh), "missing")
+	if _, err := hostKeyCallback(&spec.SSHConfig{KnownHosts: missing}); err == nil {
 		t.Fatal("want error for a missing known_hosts file")
+	}
+}
+
+func TestNewSSHTunnelAddr(t *testing.T) {
+	kh := writeKnownHosts(t)
+	tr, err := newSSHTunnel(&spec.SSHConfig{
+		Host: "2001:db8::1", Username: "u", Password: "p", KnownHosts: kh,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.addr != "[2001:db8::1]:22" {
+		t.Fatalf("addr = %q, want [2001:db8::1]:22", tr.addr)
+	}
+}
+
+func TestTransportDead(t *testing.T) {
+	// A refused target dial leaves the SSH transport usable.
+	if transportDead(&ssh.OpenChannelError{Reason: 1, Message: "connect failed"}) {
+		t.Fatal("an OpenChannelError must not mark the transport dead")
+	}
+	// A transport-level failure does.
+	if !transportDead(io.EOF) {
+		t.Fatal("io.EOF must mark the transport dead")
+	}
+	if !transportDead(errors.New("ssh: disconnect")) {
+		t.Fatal("a plain transport error must mark the transport dead")
 	}
 }
 

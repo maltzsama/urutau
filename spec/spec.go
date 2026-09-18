@@ -98,11 +98,12 @@ type PostgresSource struct {
 	SSL      *SSLConfig        `json:"ssl,omitempty"`
 	SSH      *SSHConfig        `json:"ssh,omitempty"`
 	// MaxThreads limits the number of concurrent connections for snapshot
-	// chunk SELECTs. 1..32, default 10 (the existing capability).
+	// chunk SELECTs. 1..32, default runtime.NumCPU() (clamped to 32).
 	MaxThreads int `json:"maxThreads,omitempty"`
 	// RetryCount is the number of transient-connection retries with
-	// exponential backoff before failing. 0 means no retry (fail
-	// immediately).
+	// exponential backoff before failing. Default 3. The field is
+	// omitempty, so an explicit 0 is indistinguishable from omission and
+	// resolves to the default rather than disabling retries.
 	RetryCount int `json:"retryCount,omitempty"`
 }
 
