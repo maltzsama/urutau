@@ -733,6 +733,8 @@ func validatePredicate(p *Predicate, path string, problems *[]string) {
 func validatePostgresSource(pg *PostgresSource, problems *[]string) {
 	if pg.Host == "" {
 		*problems = append(*problems, "source.postgres.host: required")
+	} else if strings.Contains(pg.Host, "://") || strings.ContainsAny(pg.Host, "/ \t") {
+		*problems = append(*problems, "source.postgres.host: must be a bare hostname or IP (no scheme, path, or whitespace)")
 	}
 	if pg.Database == "" {
 		*problems = append(*problems, "source.postgres.database: required")
@@ -760,6 +762,12 @@ func validateSSLConfig(ssl *SSLConfig, problems *[]string) {
 	default:
 		*problems = append(*problems, fmt.Sprintf(
 			"source.postgres.ssl.mode: unsupported %q (want disable | require | verify-ca | verify-full)", ssl.Mode))
+	}
+	// verify-ca/verify-full cannot verify the server without a CA to verify
+	// against. (require skips verification, so it needs none.)
+	if (ssl.Mode == "verify-ca" || ssl.Mode == "verify-full") && ssl.CA == "" {
+		*problems = append(*problems, fmt.Sprintf(
+			"source.postgres.ssl.ca: required when mode is %q", ssl.Mode))
 	}
 	if (ssl.Cert != "" || ssl.Key != "") && (ssl.Cert == "" || ssl.Key == "") {
 		*problems = append(*problems, "source.postgres.ssl.cert and ssl.key must be set together")

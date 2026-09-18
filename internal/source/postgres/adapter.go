@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
@@ -55,10 +55,11 @@ func init() {
 				return nil, err
 			}
 		}
-		db, err := sql.Open("pgx", cc.QueryURI)
-		if err != nil {
-			return nil, err
-		}
+		// Open the query connection through the SAME ConnConfig as the
+		// replication reader, so TLS and the SSH tunnel apply to both.
+		// sql.Open("pgx", dsn) would drop the DialFunc (no SSH) and rebuild
+		// TLS from the DSN alone; stdlib.GetConnector keeps the native config.
+		db := sql.OpenDB(stdlib.GetConnector(*cc.ConnConfig))
 		if cc.MaxOpenConns > 0 {
 			db.SetMaxOpenConns(cc.MaxOpenConns)
 		}
@@ -100,12 +101,18 @@ func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource
 	return NewChunker(a.db, source, pk, chunkSize)
 }
 
-// CloseQuery releases the query connection.
+// CloseQuery releases the query connection and tears down the SSH tunnel.
 func (a Source) CloseQuery() error {
+	var err error
 	if a.db != nil {
-		return a.db.Close()
+		err = a.db.Close()
 	}
-	return nil
+	if a.connCfg != nil {
+		if cerr := a.connCfg.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 // Open builds the replication reader over the pipeline's tables.
@@ -115,21 +122,21 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		return nil, fmt.Errorf("postgres: source requires slotName")
 	}
 
-	// Determine the replication URI: use ConnConfig if available, else URI.
+	// Determine the replication URI and retry budget.
 	uri := a.spec.Source.URI
-	if a.connCfg != nil {
-		uri = a.connCfg.QueryURI
-	}
-
-	var rdr *Reader
-	var err error
-	retries := 0
 	maxRetries := 0
 	if a.connCfg != nil {
+		uri = a.connCfg.QueryURI
 		maxRetries = a.connCfg.RetryCount
 	}
-	for {
-		out := make(chan rowchange.Change, 1024)
+
+	// One channel for the whole reader life: New writes into it and the
+	// returned stream pulls from it. Creating it per attempt would orphan
+	// the reader's output on the attempt that succeeds.
+	out := make(chan rowchange.Change, 1024)
+	var rdr *Reader
+	var err error
+	for attempt := 0; ; attempt++ {
 		rdr, err = New(ctx, Config{
 			URI:      uri,
 			ConnCfg:  a.connCfg,
@@ -141,15 +148,17 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		if err == nil {
 			break
 		}
-		retries++
-		if retries > maxRetries {
-			return nil, fmt.Errorf("postgres: open (after %d retries): %w", retries-1, err)
+		// Retry only transient failures: a permanent error (bad password,
+		// missing database) is not going to heal with backoff.
+		if !isTransient(err) || attempt >= maxRetries {
+			return nil, fmt.Errorf("postgres: open (after %d retries): %w", attempt, err)
 		}
-		backoff := time.Duration(1<<uint(retries-1)) * time.Second
+		backoff := time.Duration(1<<uint(attempt)) * time.Second
 		if backoff > 30*time.Second {
 			backoff = 30 * time.Second
 		}
-		a.rt.Logger.Warn("postgres: connection failed, retrying", "attempt", retries, "backoff", backoff, "err", err)
+		a.rt.Logger.Warn("postgres: connection failed, retrying",
+			"attempt", attempt+1, "backoff", backoff, "err", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -157,7 +166,6 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		}
 	}
 
-	out := make(chan rowchange.Change, 1024)
 	puller := sourcepull.New(out)
 	// Introspect each table so live batches encode against the canonical
 	// schema — a stable shape per table, never a per-drain inference.

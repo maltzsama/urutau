@@ -1944,14 +1944,23 @@ func writeModeToPB(m dataplane.WriteMode) pb.WriteMode {
 // the write path); the coordinator must not diverge from the runner.
 // snapshotDSN returns the connection string the WORKER uses for the snapshot
 // chunk SELECT: the scoped read-only SnapshotURI when set, else the full
-// source URI (pre-scoping behavior). The worker never opens a replication
+// source URI (pre-scoping behavior). When the source is configured with the
+// structured source.postgres block instead of a URI, the block is rendered to
+// its libpq DSN here so the worker — which only receives kind + dsn — can
+// still open the query connection. The worker never opens a replication
 // connection, so a deployment can grant it a SELECT-only user and keep the
 // replication credential coordinator-side (D-CD1).
 func (c *Coordinator) snapshotDSN() string {
 	if u := c.cfg.Spec.Source.SnapshotURI; u != "" {
 		return u
 	}
-	return c.cfg.Spec.Source.URI
+	if u := c.cfg.Spec.Source.URI; u != "" {
+		return u
+	}
+	if pg := c.cfg.Spec.Source.Postgres; pg != nil {
+		return pg.DSN()
+	}
+	return ""
 }
 
 // surfaceWarnings logs the advisory warnings from source introspection and

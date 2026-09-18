@@ -3,6 +3,8 @@ package postgres
 import (
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -115,7 +117,7 @@ func TestBuildDSN(t *testing.T) {
 		Username: "admin",
 		Password: "s3cret",
 	}
-	dsn := buildDSN(pg)
+	dsn := pg.DSN()
 	// Check essential parts are present.
 	for _, want := range []string{"host=db.local", "port=5433", "dbname=mydb", "user=admin", "password=s3cret", "sslmode=disable"} {
 		if !contains(dsn, want) {
@@ -126,7 +128,7 @@ func TestBuildDSN(t *testing.T) {
 
 func TestBuildDSNDefaultPort(t *testing.T) {
 	pg := &spec.PostgresSource{Host: "localhost", Database: "db"}
-	dsn := buildDSN(pg)
+	dsn := pg.DSN()
 	if !contains(dsn, "port=5432") {
 		t.Errorf("DSN %q missing default port 5432", dsn)
 	}
@@ -138,7 +140,7 @@ func TestBuildDSNWithSSL(t *testing.T) {
 		Database: "db",
 		SSL:      &spec.SSLConfig{Mode: "verify-full", CA: "/ca.pem", Cert: "/cert.pem", Key: "/key.pem"},
 	}
-	dsn := buildDSN(pg)
+	dsn := pg.DSN()
 	for _, want := range []string{"sslmode=verify-full", "sslrootcert=/ca.pem", "sslcert=/cert.pem", "sslkey=/key.pem"} {
 		if !contains(dsn, want) {
 			t.Errorf("DSN %q missing %q", dsn, want)
@@ -152,9 +154,35 @@ func TestBuildDSNWithParams(t *testing.T) {
 		Database: "db",
 		Params:   map[string]string{"application_name": "urutau"},
 	}
-	dsn := buildDSN(pg)
+	dsn := pg.DSN()
 	if !contains(dsn, "application_name=urutau") {
 		t.Errorf("DSN %q missing param", dsn)
+	}
+}
+
+func TestDSNQuotesValues(t *testing.T) {
+	pg := &spec.PostgresSource{Host: "localhost", Database: "db", Password: "p a'ss"}
+	dsn := pg.DSN()
+	if !contains(dsn, `password='p a\'ss'`) {
+		t.Errorf("DSN %q did not quote the password", dsn)
+	}
+	// The rendered DSN must round-trip through pgx's parser.
+	if _, err := pgx.ParseConfig(dsn); err != nil {
+		t.Fatalf("rendered DSN does not parse: %v", err)
+	}
+}
+
+func TestBuildConnConfigDefaults(t *testing.T) {
+	pg := &spec.PostgresSource{Host: "localhost", Database: "mydb"}
+	cc, err := BuildConnConfigFromPostgres(pg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.MaxOpenConns < 1 || cc.MaxOpenConns > 32 {
+		t.Fatalf("default MaxOpenConns = %d, want 1..32", cc.MaxOpenConns)
+	}
+	if cc.RetryCount != 3 {
+		t.Fatalf("default RetryCount = %d, want 3", cc.RetryCount)
 	}
 }
 

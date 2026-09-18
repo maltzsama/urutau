@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
+	"runtime"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/ssh"
@@ -15,17 +16,39 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
+// Defaults applied when the operator leaves a tuning field unset on the
+// nested postgres block. Both mirror the OLake reference behavior.
+const (
+	defaultMaxThreads = 0 // resolved to runtime.NumCPU() at build time
+	defaultRetryCount = 3
+	maxMaxThreads     = 32
+)
+
 // ConnConfig holds the resolved connection parameters, built from either a
 // URI or the nested PostgresSource config.
 type ConnConfig struct {
-	// QueryURI is the DSN for sql.Open("pgx", ...).
+	// QueryURI is the libpq DSN rendered from the config. It is what travels
+	// to a distributed worker (the worker only receives kind + dsn).
 	QueryURI string
-	// ConnConfig is the native pgx config for replication connections.
+	// ConnConfig is the native pgx config for replication and query
+	// connections. It carries TLSConfig and DialFunc (SSH) so both
+	// connection paths share one transport.
 	ConnConfig *pgx.ConnConfig
-	// MaxOpenConns is the maxThreads value (0 means leave default).
+	// MaxOpenConns is the resolved maxThreads value.
 	MaxOpenConns int
-	// RetryCount is the number of transient-connection retries.
+	// RetryCount is the resolved number of transient-connection retries.
 	RetryCount int
+
+	tunnel *sshTunnel
+}
+
+// Close tears down the SSH tunnel, if one was established. Safe to call
+// multiple times.
+func (c *ConnConfig) Close() error {
+	if c == nil || c.tunnel == nil {
+		return nil
+	}
+	return c.tunnel.Close()
 }
 
 // BuildConnConfig constructs a ConnConfig from a URI string.
@@ -35,8 +58,10 @@ func BuildConnConfig(uri string) (*ConnConfig, error) {
 		return nil, fmt.Errorf("postgres: parse uri: %w", err)
 	}
 	return &ConnConfig{
-		QueryURI:   uri,
-		ConnConfig: cfg,
+		QueryURI:     uri,
+		ConnConfig:   cfg,
+		MaxOpenConns: resolveMaxThreads(0),
+		RetryCount:   defaultRetryCount,
 	}, nil
 }
 
@@ -55,19 +80,13 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 		port = 5432
 	}
 
-	// Build native pgx ConnConfig.
 	cfg := &pgx.ConnConfig{}
 	cfg.Host = pg.Host
 	cfg.Port = uint16(port)
 	cfg.Database = pg.Database
-	if pg.Username != "" {
-		cfg.User = pg.Username
-	}
-	if pg.Password != "" {
-		cfg.Password = pg.Password
-	}
+	cfg.User = pg.Username
+	cfg.Password = pg.Password
 
-	// Pass through any extra params.
 	if len(pg.Params) > 0 {
 		cfg.RuntimeParams = make(map[string]string, len(pg.Params))
 		for k, v := range pg.Params {
@@ -75,7 +94,8 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 		}
 	}
 
-	// Apply TLS.
+	// TLS: a nil TLSConfig means no TLS. pgx defaults to TLS-require, so an
+	// absent/disable ssl block must clear it explicitly.
 	if pg.SSL != nil && pg.SSL.Mode != "" && pg.SSL.Mode != "disable" {
 		tlsCfg, err := buildTLSConfig(pg.SSL)
 		if err != nil {
@@ -83,70 +103,56 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 		}
 		cfg.TLSConfig = tlsCfg
 	} else {
-		// pgx defaults to TLS require; disable when no SSL block.
 		cfg.TLSConfig = nil
 	}
 
-	// Apply SSH tunnel.
+	cc := &ConnConfig{
+		QueryURI:     pg.DSN(),
+		ConnConfig:   cfg,
+		MaxOpenConns: resolveMaxThreads(pg.MaxThreads),
+		RetryCount:   resolveRetryCount(pg.RetryCount),
+	}
+
+	// SSH: one tunnel per ConnConfig, shared by the query and replication
+	// connections and torn down by Close.
 	if pg.SSH != nil {
-		dialer, err := sshDialer(pg.SSH)
+		tunnel, err := newSSHTunnel(pg.SSH)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: ssh: %w", err)
 		}
-		cfg.DialFunc = dialer
+		cc.tunnel = tunnel
+		cfg.DialFunc = tunnel.Dial
 	}
 
-	// Build query DSN for sql.Open.
-	queryURI := buildDSN(pg)
-
-	cc := &ConnConfig{
-		QueryURI:   queryURI,
-		ConnConfig: cfg,
-	}
-	if pg.MaxThreads > 0 {
-		cc.MaxOpenConns = pg.MaxThreads
-	}
-	if pg.RetryCount > 0 {
-		cc.RetryCount = pg.RetryCount
-	}
 	return cc, nil
 }
 
-// buildDSN constructs a pgx connection string (DSN) from the nested config.
-func buildDSN(pg *spec.PostgresSource) string {
-	port := pg.Port
-	if port == 0 {
-		port = 5432
+// resolveMaxThreads applies the maxThreads default (runtime.NumCPU()) and the
+// 1..32 bound. The spec validator already rejects an out-of-range explicit
+// value; this clamps the derived default.
+func resolveMaxThreads(n int) int {
+	if n == 0 {
+		n = runtime.NumCPU()
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "host=%s port=%d dbname=%s", pg.Host, port, pg.Database)
-	if pg.Username != "" {
-		fmt.Fprintf(&b, " user=%s", pg.Username)
+	if n < 1 {
+		n = 1
 	}
-	if pg.Password != "" {
-		fmt.Fprintf(&b, " password=%s", pg.Password)
+	if n > maxMaxThreads {
+		n = maxMaxThreads
 	}
-	// SSL mode
-	sslMode := "disable"
-	if pg.SSL != nil && pg.SSL.Mode != "" {
-		sslMode = pg.SSL.Mode
+	return n
+}
+
+// resolveRetryCount applies the retryCount default (3). A negative value is
+// clamped to 0 (the spec validator rejects it, this is defense in depth).
+func resolveRetryCount(n int) int {
+	if n == 0 {
+		return defaultRetryCount
 	}
-	fmt.Fprintf(&b, " sslmode=%s", sslMode)
-	if pg.SSL != nil {
-		if pg.SSL.CA != "" {
-			fmt.Fprintf(&b, " sslrootcert=%s", pg.SSL.CA)
-		}
-		if pg.SSL.Cert != "" {
-			fmt.Fprintf(&b, " sslcert=%s", pg.SSL.Cert)
-		}
-		if pg.SSL.Key != "" {
-			fmt.Fprintf(&b, " sslkey=%s", pg.SSL.Key)
-		}
+	if n < 0 {
+		return 0
 	}
-	for k, v := range pg.Params {
-		fmt.Fprintf(&b, " %s=%s", k, v)
-	}
-	return b.String()
+	return n
 }
 
 // buildTLSConfig builds a *tls.Config from the SSL config. Returns nil for
@@ -163,26 +169,21 @@ func buildTLSConfig(ssl *spec.SSLConfig) (*tls.Config, error) {
 		// TLS but don't verify the server certificate.
 		cfg.InsecureSkipVerify = true
 	case "verify-ca":
-		// TLS, verify the chain against roots but not hostname.
-		if ssl.CA != "" {
-			pool, err := loadCA(ssl.CA)
-			if err != nil {
-				return nil, err
-			}
-			cfg.RootCAs = pool
+		pool, err := loadCA(ssl.CA)
+		if err != nil {
+			return nil, err
 		}
-		// InsecureSkipVerify + VerifyConnection for chain-only check.
+		cfg.RootCAs = pool
+		// Go's default verification always checks the hostname; disable it
+		// and re-verify the chain by hand (DNSName left empty).
 		cfg.InsecureSkipVerify = true
 		cfg.VerifyConnection = verifyChainOnlyPostgres(cfg.RootCAs)
 	case "verify-full":
-		// TLS, verify chain and hostname.
-		if ssl.CA != "" {
-			pool, err := loadCA(ssl.CA)
-			if err != nil {
-				return nil, err
-			}
-			cfg.RootCAs = pool
+		pool, err := loadCA(ssl.CA)
+		if err != nil {
+			return nil, err
 		}
+		cfg.RootCAs = pool
 	}
 
 	// Client certificate (mutual TLS).
@@ -201,6 +202,9 @@ func buildTLSConfig(ssl *spec.SSLConfig) (*tls.Config, error) {
 }
 
 func loadCA(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, fmt.Errorf("ssl.ca is required for this mode")
+	}
 	pem, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read ssl.ca %q: %w", path, err)
@@ -232,8 +236,22 @@ func verifyChainOnlyPostgres(roots *x509.CertPool) func(tls.ConnectionState) err
 	}
 }
 
-// sshDialer creates a DialFunc that tunnels through an SSH server.
-func sshDialer(cfg *spec.SSHConfig) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
+// sshTunnel owns one SSH client shared by every connection the source opens
+// through it. A fresh client is dialed on first use and reused; if a forward
+// fails the dead client is dropped so the next dial reconnects. Close tears
+// it down at shutdown.
+type sshTunnel struct {
+	addr   string
+	client *ssh.ClientConfig
+
+	mu     sync.Mutex
+	conn   *ssh.Client
+	closed bool
+}
+
+// newSSHTunnel validates the SSH config and prepares (but does not dial) the
+// tunnel. No network I/O happens until the first connection.
+func newSSHTunnel(cfg *spec.SSHConfig) (*sshTunnel, error) {
 	var authMethods []ssh.AuthMethod
 	if cfg.Password != "" {
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
@@ -258,27 +276,71 @@ func sshDialer(cfg *spec.SSHConfig) (func(ctx context.Context, network, addr str
 		return nil, fmt.Errorf("no authentication method configured")
 	}
 
-	sshPort := cfg.Port
-	if sshPort == 0 {
-		sshPort = 22
+	port := cfg.Port
+	if port == 0 {
+		port = 22
 	}
-	sshAddr := fmt.Sprintf("%s:%d", cfg.Host, sshPort)
-
-	sshCfg := &ssh.ClientConfig{
-		User:            cfg.Username,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // operator-managed tunnel
-	}
-
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		client, err := ssh.Dial("tcp", sshAddr, sshCfg)
-		if err != nil {
-			return nil, fmt.Errorf("ssh dial %s: %w", sshAddr, err)
-		}
-		conn, err := client.Dial(network, addr)
-		if err != nil {
-			return nil, fmt.Errorf("ssh forward to %s: %w", addr, err)
-		}
-		return conn, nil
+	return &sshTunnel{
+		addr: fmt.Sprintf("%s:%d", cfg.Host, port),
+		client: &ssh.ClientConfig{
+			User:            cfg.Username,
+			Auth:            authMethods,
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // operator-managed tunnel
+		},
 	}, nil
+}
+
+// Dial returns a connection forwarded through the tunnel. It matches
+// pgx.ConnConfig.DialFunc.
+func (t *sshTunnel) Dial(_ context.Context, network, addr string) (net.Conn, error) {
+	client, err := t.getClient()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := client.Dial(network, addr)
+	if err != nil {
+		// The cached client may be dead; drop it so the next dial reconnects.
+		t.drop(client)
+		return nil, fmt.Errorf("ssh forward to %s: %w", addr, err)
+	}
+	return conn, nil
+}
+
+func (t *sshTunnel) getClient() (*ssh.Client, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, fmt.Errorf("ssh tunnel closed")
+	}
+	if t.conn != nil {
+		return t.conn, nil
+	}
+	client, err := ssh.Dial("tcp", t.addr, t.client)
+	if err != nil {
+		return nil, fmt.Errorf("ssh dial %s: %w", t.addr, err)
+	}
+	t.conn = client
+	return client, nil
+}
+
+func (t *sshTunnel) drop(client *ssh.Client) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.conn == client {
+		_ = t.conn.Close()
+		t.conn = nil
+	}
+}
+
+// Close tears down the SSH client. Safe to call multiple times.
+func (t *sshTunnel) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	if t.conn == nil {
+		return nil
+	}
+	err := t.conn.Close()
+	t.conn = nil
+	return err
 }

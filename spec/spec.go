@@ -6,6 +6,7 @@ package spec
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/maltzsama/urutau/core"
@@ -129,6 +130,60 @@ type SSHConfig struct {
 	// Passphrase decrypts the private key when encrypted. Empty means
 	// unencrypted.
 	Passphrase string `json:"passphrase,omitempty"`
+}
+
+// DSN renders the libpq keyword connection string for this structured config.
+// It lives here, on the Postgres-specific struct, so a caller that only holds
+// the spec (the coordinator, handing a snapshot DSN to a distributed worker)
+// can render the same string the source builds — without importing a concrete
+// source package past the architecture wall.
+func (p *PostgresSource) DSN() string {
+	port := p.Port
+	if port == 0 {
+		port = 5432
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "host=%s port=%d dbname=%s", quoteDSNValue(p.Host), port, quoteDSNValue(p.Database))
+	if p.Username != "" {
+		fmt.Fprintf(&b, " user=%s", quoteDSNValue(p.Username))
+	}
+	if p.Password != "" {
+		fmt.Fprintf(&b, " password=%s", quoteDSNValue(p.Password))
+	}
+	sslMode := "disable"
+	if p.SSL != nil && p.SSL.Mode != "" {
+		sslMode = p.SSL.Mode
+	}
+	fmt.Fprintf(&b, " sslmode=%s", sslMode)
+	if p.SSL != nil {
+		if p.SSL.CA != "" {
+			fmt.Fprintf(&b, " sslrootcert=%s", quoteDSNValue(p.SSL.CA))
+		}
+		if p.SSL.Cert != "" {
+			fmt.Fprintf(&b, " sslcert=%s", quoteDSNValue(p.SSL.Cert))
+		}
+		if p.SSL.Key != "" {
+			fmt.Fprintf(&b, " sslkey=%s", quoteDSNValue(p.SSL.Key))
+		}
+	}
+	for k, v := range p.Params {
+		fmt.Fprintf(&b, " %s=%s", k, quoteDSNValue(v))
+	}
+	return b.String()
+}
+
+// quoteDSNValue quotes a libpq keyword value when it contains whitespace or
+// a quote, so a password or path with spaces round-trips through a parser.
+func quoteDSNValue(v string) string {
+	if v == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(v, " '\\") {
+		return v
+	}
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `'`, `\'`)
+	return "'" + v + "'"
 }
 
 type Sink struct {

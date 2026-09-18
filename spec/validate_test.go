@@ -763,3 +763,53 @@ func TestValidatePostgresRequiresEitherURIOrPostgres(t *testing.T) {
 		t.Fatalf("want uri-or-postgres problem, got %v", err)
 	}
 }
+
+func TestValidatePostgresVerifyCARequiresCA(t *testing.T) {
+	for _, mode := range []string{"verify-ca", "verify-full"} {
+		s := &Spec{
+			Pipeline: "pg",
+			Source: Source{
+				Kind:     "postgres",
+				SlotName: "test_slot",
+				Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSL: &SSLConfig{Mode: mode}},
+			},
+			Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+			Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+		}
+		if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "ssl.ca") {
+			t.Fatalf("mode %q: want ssl.ca required problem, got %v", mode, err)
+		}
+	}
+}
+
+func TestValidatePostgresRequireDoesNotNeedCA(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSL: &SSLConfig{Mode: "require"}},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("require mode must not need a CA: %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsSchemeInHost(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "postgres://localhost", Database: "mydb"},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "bare hostname") {
+		t.Fatalf("want bare-hostname problem, got %v", err)
+	}
+}
