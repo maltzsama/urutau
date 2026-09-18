@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -24,8 +25,10 @@ type Source struct {
 	spec *spec.Spec
 	rt   source.Runtime
 	db   *sql.DB // the source's query connection (chunk SELECTs, introspection)
+	loc  *time.Location
 }
 
+// capabilities declares what the MySQL source supports.
 func capabilities() source.Capabilities {
 	return source.Capabilities{
 		Snapshot:            true,
@@ -45,11 +48,15 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
-		db, err := sql.Open("mysql", conn.QueryDSN())
+		dsn, err := conn.QueryDSN()
 		if err != nil {
 			return nil, err
 		}
-		return Source{spec: s, rt: rt, db: db}, nil
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			return nil, err
+		}
+		return Source{spec: s, rt: rt, db: db, loc: conn.TimeLocation()}, nil
 	}
 	if err := driver.RegisterSource("mysql", capabilities(), factory); err != nil {
 		panic(err)
@@ -84,7 +91,7 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 
 // NewChunker builds the chunk SELECT source for one table.
 func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
-	return NewChunker(a.db, source, pk, chunkSize)
+	return NewChunker(a.db, source, pk, chunkSize, a.loc)
 }
 
 // CloseQuery releases the query connection.
@@ -103,13 +110,15 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	}
 	out := make(chan rowchange.Change, 1024)
 	rdr, err := New(ctx, Config{
-		Addr:      conn.Addr(),
-		User:      conn.User,
-		Password:  conn.Password,
-		ServerID:  a.rt.ServerID,
-		Heartbeat: a.rt.Heartbeat,
-		Tables:    refs,
-		Logger:    a.rt.Logger,
+		Addr:         conn.Addr(),
+		User:         conn.User,
+		Password:     conn.Password,
+		ServerID:     a.rt.ServerID,
+		Heartbeat:    a.rt.Heartbeat,
+		Tables:       refs,
+		Logger:       a.rt.Logger,
+		TLSConfig:    conn.TLSConfig(),
+		TimeLocation: conn.TimeLocation(),
 	}, out)
 	if err != nil {
 		return nil, err

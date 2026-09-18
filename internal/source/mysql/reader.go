@@ -6,6 +6,7 @@ package mysql
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,6 +40,13 @@ type Config struct {
 	Heartbeat time.Duration
 	Tables    []TableRef
 	Logger    *slog.Logger
+	// TLSConfig, when non-nil, secures the replication connection (issue
+	// #138). Nil means plaintext.
+	TLSConfig *tls.Config
+	// TimeLocation is the operator's temporal location, applied to decoded
+	// DATETIME/TIMESTAMP/DATE values so they match the snapshot query (issue
+	// #139). Nil means UTC.
+	TimeLocation *time.Location
 }
 
 // Reader wraps a canal instance and decodes its row events.
@@ -51,6 +59,9 @@ type Reader struct {
 	curSet  *position.GTID // accumulated GTID set through the current transaction
 	curGTID string         // curSet.String() — the position rows of this txn carry
 	curTxn  *position.GTID // single GTID of the transaction being decoded (window check)
+	// curCommitTS is the transaction's commit time, captured on the GTID
+	// event and stamped onto every row of the transaction (issue #137).
+	curCommitTS time.Time
 
 	winMu    sync.Mutex
 	winChunk uint32 // chunkID of the open DBLog window, when winOpen
@@ -115,18 +126,7 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		bySrc[t.Source] = t
 	}
 
-	c, err := canal.NewCanal(&canal.Config{
-		Addr:              cfg.Addr,
-		User:              cfg.User,
-		Password:          cfg.Password,
-		ServerID:          cfg.ServerID,
-		Flavor:            "mysql",
-		HeartbeatPeriod:   cfg.Heartbeat,
-		ReadTimeout:       60 * time.Second,
-		IncludeTableRegex: incl,
-		ParseTime:         false,
-		Logger:            cfg.Logger,
-	})
+	c, err := canal.NewCanal(canalConfig(cfg, incl))
 	if err != nil {
 		return nil, fmt.Errorf("mysql: new canal: %w", err)
 	}
@@ -134,6 +134,27 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc, done: make(chan struct{})}
 	c.SetEventHandler(r)
 	return r, nil
+}
+
+// canalConfig renders the neutral Config into go-mysql's canal.Config — split
+// out so the replication wiring (including TLS) is testable without dialing.
+func canalConfig(cfg Config, includeRegex []string) *canal.Config {
+	return &canal.Config{
+		Addr:              cfg.Addr,
+		User:              cfg.User,
+		Password:          cfg.Password,
+		ServerID:          cfg.ServerID,
+		Flavor:            "mysql",
+		HeartbeatPeriod:   cfg.Heartbeat,
+		ReadTimeout:       60 * time.Second,
+		IncludeTableRegex: includeRegex,
+		// ParseTime makes go-mysql return time.Time for DATETIME/TIMESTAMP,
+		// matching the snapshot query (parseTime=true); normalizeCol then puts
+		// them in the operator's location (issue #139).
+		ParseTime: true,
+		Logger:    cfg.Logger,
+		TLSConfig: cfg.TLSConfig,
+	}
 }
 
 // stop closes done exactly once, unblocking any OnRow send in progress.
@@ -234,7 +255,9 @@ func (r *Reader) SetConfirmed(_ func() position.Position) {}
 
 // ── canal.EventHandler ──────────────────────────────────────────────
 
-func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {
+// OnGTID records the transaction's GTID and commit time, carried by every
+// row of the transaction.
+func (r *Reader) OnGTID(header *replication.EventHeader, e gomysql.BinlogGTIDEvent) error {
 	next, err := e.GTIDNext()
 	if err != nil {
 		return fmt.Errorf("mysql: gtid next: %w", err)
@@ -243,8 +266,20 @@ func (r *Reader) OnGTID(_ *replication.EventHeader, e gomysql.BinlogGTIDEvent) e
 	if err != nil {
 		return fmt.Errorf("mysql: gtid next parse: %w", err)
 	}
+	// The transaction commit time: microsecond precision from the GTID event
+	// on MySQL 8.0.1+, else the event header's second-precision timestamp.
+	// MySQL 8.0.1+ always carries OriginalCommitTimestamp, so the header is a
+	// fallback for older servers (and MariaDB, whose GTID event is a different
+	// concrete type). See issue #137.
+	commitTS := time.Unix(int64(header.Timestamp), 0).UTC()
+	if ge, ok := e.(*replication.GTIDEvent); ok {
+		if t := ge.OriginalCommitTime(); !t.IsZero() {
+			commitTS = t.UTC()
+		}
+	}
 	r.mu.Lock()
 	r.curTxn = g
+	r.curCommitTS = commitTS
 	r.mu.Unlock()
 	r.mergeGTID(g)
 	return nil
@@ -264,6 +299,7 @@ func (r *Reader) mergeGTID(g *position.GTID) {
 	r.curGTID = r.curSet.String()
 }
 
+// OnRow decodes one row event into rowchange.Change values and emits them.
 func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	ref, ok := r.bySrc[e.Table.Schema+"."+e.Table.Name]
 	if !ok {
@@ -273,6 +309,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	r.mu.Lock()
 	pos := r.curGTID
 	txn := r.curTxn
+	commitTS := r.curCommitTS
 	r.winMu.Lock()
 	var win *rowchange.Window
 	// Only events strictly past the low watermark are InWindow: an event at
@@ -293,7 +330,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	switch e.Action {
 	case canal.InsertAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos)
+			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos, commitTS)
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -301,7 +338,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos)
+			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos, commitTS)
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -310,7 +347,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
-			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos)
+			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos, commitTS)
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -351,12 +388,14 @@ func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replic
 }
 
 // decode maps one row (in table column order) to a rowchange. key is built from
-// the spec primary key columns, in spec order.
-func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string) rowchange.Change {
+// the spec primary key columns, in spec order. commitTS is the transaction's
+// commit time, carried onto every row of the transaction.
+func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) rowchange.Change {
 	c := rowchange.Change{
 		Op:       op,
 		Table:    ref.Target,
 		Position: pos,
+		CommitTS: commitTS,
 		IngestTS: time.Now(),
 	}
 
@@ -370,17 +409,26 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 	}
 	c.Key = key
 
+	loc := r.loc()
 	if op == rowchange.OpDelete {
 		if before != nil {
-			c.Before = rowToMap(tbl, before)
+			c.Before = rowToMap(tbl, before, loc)
 		}
 		return c
 	}
-	c.After = rowToMap(tbl, after)
+	c.After = rowToMap(tbl, after, loc)
 	if before != nil {
-		c.Before = rowToMap(tbl, before)
+		c.Before = rowToMap(tbl, before, loc)
 	}
 	return c
+}
+
+// loc returns the operator's temporal location, defaulting to UTC.
+func (r *Reader) loc() *time.Location {
+	if r.cfg.TimeLocation == nil {
+		return time.UTC
+	}
+	return r.cfg.TimeLocation
 }
 
 // rowToMap maps a row (in table column order) to column-name → value.
@@ -392,19 +440,22 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 // SELECT returns them as text. Both paths feed the same target column, so
 // decoding here is what keeps a CDC row and a snapshot row of the same
 // source row identical.
-func rowToMap(tbl *schema.Table, row []any) map[string]any {
+func rowToMap(tbl *schema.Table, row []any, loc *time.Location) map[string]any {
 	out := make(map[string]any, len(tbl.Columns))
 	for i, col := range tbl.Columns {
 		if i >= len(row) {
 			continue
 		}
-		out[col.Name] = normalizeCol(col, row[i])
+		out[col.Name] = normalizeCol(col, row[i], loc)
 	}
 	return out
 }
 
 // normalizeCol converts one binlog value using its column definition.
-func normalizeCol(col schema.TableColumn, v any) any {
+func normalizeCol(col schema.TableColumn, v any, loc *time.Location) any {
+	if loc == nil {
+		loc = time.UTC
+	}
 	switch col.Type {
 	case schema.TYPE_ENUM:
 		return decodeEnum(col, v)
@@ -416,6 +467,44 @@ func normalizeCol(col schema.TableColumn, v any) any {
 		// its bytes are not text and reinterpreting them would corrupt them.
 		if b, ok := v.([]byte); ok {
 			return decodeString(b, col.Collation)
+		}
+
+		return normalize(v)
+	case schema.TYPE_TIMESTAMP:
+		// An instant: go-mysql returns it in the process's Local zone. Express
+		// it in the operator's location so it matches the snapshot query
+		// (issue #139).
+		if t, ok := v.(time.Time); ok {
+			return t.In(loc)
+		}
+		if s, ok := v.(string); ok && isZeroTemporal(s) {
+			return time.Time{} // match the snapshot's zero value
+		}
+
+		return normalize(v)
+	case schema.TYPE_DATETIME:
+		// No zone: go-mysql tags the wall clock UTC. Re-tag the SAME wall clock
+		// to the operator's location — do NOT convert the instant — so it
+		// matches the snapshot's parseTime interpretation of a naive DATETIME.
+		if t, ok := v.(time.Time); ok {
+			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+		}
+		if s, ok := v.(string); ok && isZeroTemporal(s) {
+			return time.Time{}
+		}
+
+		return normalize(v)
+	case schema.TYPE_DATE:
+		// go-mysql returns DATE as a "2006-01-02" string regardless of
+		// ParseTime; the snapshot returns a time.Time at midnight. Normalize to
+		// a time.Time in the operator's location.
+		if s, ok := v.(string); ok {
+			if isZeroTemporal(s) {
+				return time.Time{}
+			}
+			if t, err := time.ParseInLocation("2006-01-02", s, loc); err == nil {
+				return t
+			}
 		}
 
 		return normalize(v)
@@ -469,6 +558,14 @@ func decodeSet(col schema.TableColumn, v any) any {
 	return strings.Join(members, ",")
 }
 
+// isZeroTemporal reports whether a go-mysql temporal string is MySQL's zero
+// value ("0000-00-00" or "0000-00-00 00:00:00[.frac]"). The snapshot driver
+// (parseTime) returns these as time.Time{}, so the CDC must too, or the same
+// column has a different Go type by path.
+func isZeroTemporal(s string) bool { return strings.HasPrefix(s, "0000-00-00") }
+
+// normalize converts driver-native []byte cells to strings so the canonical
+// value space sees text, not raw bytes.
 func normalize(v any) any {
 	if b, ok := v.([]byte); ok {
 		return string(b)

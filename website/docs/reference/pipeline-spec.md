@@ -25,18 +25,19 @@ tables: [ … ]               # required; at least one
 | Field | Required | Notes |
 | --- | --- | --- |
 | `kind` | yes | Registered driver: `mysql`, `postgres`, `kafka` |
-| `uri` | yes | Connection string; on Kubernetes, filled from `URUTAU_SOURCE_URI` |
+| `uri` | yes | Connection string: a MySQL/Postgres DSN, or the Kafka broker list. On Kubernetes, filled from `URUTAU_SOURCE_URI` |
 | `snapshotUri` | no | Read-only URI for the snapshot `SELECT`; lets a worker run as a SELECT-only user. Falls back to `uri` |
 | `serverId` | mysql | Replication server id (string holding a `uint32`). Must be unique per MySQL instance |
 | `slotName` | postgres | Logical replication slot; required for Postgres |
 | `snapshotMode` | no | `none` disables the snapshot. Must be `none` for Kafka |
-| `bootstrapServers` | kafka | Broker list |
 | `groupId` | kafka | Consumer group |
 | `partitionedByPrimaryKey` | kafka | Assert the topics are key-partitioned; required for `upsert` |
 | `format` | kafka | `debezium` (default), `raw`, `avro` |
 | `schemaRegistry` | avro | Confluent-compatible registry base URL |
 
-See [Sources](sources.md) for driver-specific behavior.
+See [Sources](../sources/index.md) for driver-specific behavior — e.g. the MySQL `uri`
+accepts `timezone` and TLS (`tls`, `ssl-ca`, `ssl-cert`, `ssl-key`,
+`ssl-server-name`) query parameters.
 
 ## `sink`
 
@@ -140,6 +141,6 @@ An inline value always wins; the environment only fills what is empty.
 
 ## Related
 
-- [Sources](sources.md) · [Sinks](sinks.md) · [Enrichment](enrichment.md) ·
+- [Sources](../sources/index.md) · [Sinks](sinks.md) · [Enrichment](enrichment.md) ·
   [Delivery guarantees](guarantees.md)
 - [CLI reference](cli.md) — the flags each binary adds.

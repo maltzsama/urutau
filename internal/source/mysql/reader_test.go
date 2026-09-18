@@ -2,12 +2,14 @@ package mysql
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/schema"
 
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -15,6 +17,8 @@ import (
 )
 
 const readerTestUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
+
+var testCommitTS = time.Unix(1700000000, 0).UTC()
 
 func ordersTable() *schema.Table {
 	return &schema.Table{
@@ -39,10 +43,13 @@ func TestDecodeInsert(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3")
+	c := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3", testCommitTS)
 
 	if c.Op != rowchange.OpInsert || c.Table != "raw.orders" || c.Position != "u:1-3" {
 		t.Fatalf("change = %+v", c)
+	}
+	if !c.CommitTS.Equal(testCommitTS) {
+		t.Fatalf("commit ts = %v, want %v", c.CommitTS, testCommitTS)
 	}
 	if len(c.Key) != 1 || c.Key[0] != int64(7) {
 		t.Fatalf("key = %v, want [7]", c.Key)
@@ -63,7 +70,7 @@ func TestDecodeDeleteKeepsBeforeOnly(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4")
+	c := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4", testCommitTS)
 
 	if c.Op != rowchange.OpDelete {
 		t.Fatalf("op = %v", c.Op)
@@ -82,7 +89,7 @@ func TestDecodeUpdateCarriesBeforeAndAfter(t *testing.T) {
 	before := []any{int64(7), []byte("old"), 1.0}
 	after := []any{int64(7), []byte("new"), 2.0}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5")
+	c := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
 
 	if c.After["v"] != "new" || c.Before["v"] != "old" {
 		t.Fatalf("update before/after = %v / %v", c.Before, c.After)
@@ -265,7 +272,7 @@ func TestRowToMapDecodesEnumAndSet(t *testing.T) {
 	tbl := enumSetTable()
 
 	// status = 'paid' (2nd member), tags = 'gift,express' (bits 0 and 2).
-	got := rowToMap(tbl, []any{int64(7), int64(2), int64(0b101)})
+	got := rowToMap(tbl, []any{int64(7), int64(2), int64(0b101)}, time.UTC)
 
 	if got["status"] != "paid" {
 		t.Errorf("status = %#v, want \"paid\" — an ENUM ordinal must decode to its member, "+
@@ -283,19 +290,19 @@ func TestRowToMapDecodesEnumAndSet(t *testing.T) {
 func TestRowToMapEnumSetEdgeCases(t *testing.T) {
 	tbl := enumSetTable()
 
-	if got := rowToMap(tbl, []any{int64(1), int64(0), int64(0)}); got["status"] != "" {
+	if got := rowToMap(tbl, []any{int64(1), int64(0), int64(0)}, time.UTC); got["status"] != "" {
 		t.Errorf("ENUM index 0 = %#v, want \"\" (MySQL's marker for a rejected value)", got["status"])
 	}
-	if got := rowToMap(tbl, []any{int64(1), int64(99), int64(0)}); got["status"] != int64(99) {
+	if got := rowToMap(tbl, []any{int64(1), int64(99), int64(0)}, time.UTC); got["status"] != int64(99) {
 		t.Errorf("out-of-range ENUM index = %#v, want the raw value kept rather than a "+
 			"fabricated member", got["status"])
 	}
 	// Bit 3 has no member (only 3 declared); the members that do resolve stay.
-	if got := rowToMap(tbl, []any{int64(1), int64(1), int64(0b1001)}); got["tags"] != "gift" {
+	if got := rowToMap(tbl, []any{int64(1), int64(1), int64(0b1001)}, time.UTC); got["tags"] != "gift" {
 		t.Errorf("SET with an unknown bit = %#v, want \"gift\"", got["tags"])
 	}
 	// An empty SET is the empty string, matching what SELECT returns.
-	if got := rowToMap(tbl, []any{int64(1), int64(1), int64(0)}); got["tags"] != "" {
+	if got := rowToMap(tbl, []any{int64(1), int64(1), int64(0)}, time.UTC); got["tags"] != "" {
 		t.Errorf("empty SET = %#v, want \"\"", got["tags"])
 	}
 }
@@ -307,7 +314,7 @@ func TestRowToMapEnumWithoutMembersFallsThrough(t *testing.T) {
 		Schema: "shop", Name: "orders",
 		Columns: []schema.TableColumn{{Name: "status", Type: schema.TYPE_ENUM}},
 	}
-	if got := rowToMap(tbl, []any{int64(2)}); got["status"] != int64(2) {
+	if got := rowToMap(tbl, []any{int64(2)}, time.UTC); got["status"] != int64(2) {
 		t.Errorf("ENUM without members = %#v, want the raw value", got["status"])
 	}
 }
@@ -336,7 +343,7 @@ func TestRowToMapDecodesNonUTF8Charsets(t *testing.T) {
 			tbl := &schema.Table{Columns: []schema.TableColumn{
 				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
 			}}
-			got := rowToMap(tbl, []any{tc.raw})["v"]
+			got := rowToMap(tbl, []any{tc.raw}, time.UTC)["v"]
 			if got != tc.want {
 				t.Errorf("v = %q, want %q — a %s column must decode to UTF-8, or CDC writes "+
 					"mojibake where the backfill writes correct text", got, tc.want, tc.collation)
@@ -352,7 +359,7 @@ func TestRowToMapLeavesBinaryBytesAlone(t *testing.T) {
 	tbl := &schema.Table{Columns: []schema.TableColumn{
 		{Name: "b", Type: schema.TYPE_BINARY, Collation: "binary"},
 	}}
-	got, ok := rowToMap(tbl, []any{raw})["b"].(string)
+	got, ok := rowToMap(tbl, []any{raw}, time.UTC)["b"].(string)
 	if !ok || !bytes.Equal([]byte(got), raw) {
 		t.Errorf("binary column = %#v, want the original bytes %v preserved", got, raw)
 	}
@@ -368,7 +375,7 @@ func TestRowToMapUnknownCollationPassesThrough(t *testing.T) {
 		tbl := &schema.Table{Columns: []schema.TableColumn{
 			{Name: "v", Type: schema.TYPE_STRING, Collation: collation},
 		}}
-		got, _ := rowToMap(tbl, []any{raw})["v"].(string)
+		got, _ := rowToMap(tbl, []any{raw}, time.UTC)["v"].(string)
 		if !bytes.Equal([]byte(got), raw) {
 			t.Errorf("collation %q: got %q, want the raw bytes untouched", collation, got)
 		}
@@ -399,7 +406,7 @@ func TestRowToMapDecodesMultibyteCharsets(t *testing.T) {
 			tbl := &schema.Table{Columns: []schema.TableColumn{
 				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
 			}}
-			if got := rowToMap(tbl, []any{tc.raw})["v"]; got != tc.want {
+			if got := rowToMap(tbl, []any{tc.raw}, time.UTC)["v"]; got != tc.want {
 				t.Errorf("v = %q, want %q", got, tc.want)
 			}
 		})
@@ -414,7 +421,7 @@ func TestRowToMapEucjpmsStillPassesThrough(t *testing.T) {
 	tbl := &schema.Table{Columns: []schema.TableColumn{
 		{Name: "v", Type: schema.TYPE_STRING, Collation: "eucjpms_japanese_ci"},
 	}}
-	got, _ := rowToMap(tbl, []any{raw})["v"].(string)
+	got, _ := rowToMap(tbl, []any{raw}, time.UTC)["v"].(string)
 	if !bytes.Equal([]byte(got), raw) {
 		t.Errorf("eucjpms = %q, want the raw bytes passed through", got)
 	}
@@ -435,7 +442,7 @@ func TestRowToMapDecodesSubsetCharsets(t *testing.T) {
 			tbl := &schema.Table{Columns: []schema.TableColumn{
 				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
 			}}
-			if got := rowToMap(tbl, []any{tc.raw})["v"]; got != tc.want {
+			if got := rowToMap(tbl, []any{tc.raw}, time.UTC)["v"]; got != tc.want {
 				t.Errorf("v = %q, want %q", got, tc.want)
 			}
 		})
@@ -452,7 +459,7 @@ func TestRowToMapDecodesMacce(t *testing.T) {
 	tbl := &schema.Table{Columns: []schema.TableColumn{
 		{Name: "v", Type: schema.TYPE_STRING, Collation: "macce_general_ci"},
 	}}
-	if got := rowToMap(tbl, []any{[]byte{0x80}})["v"]; got != "Ä" {
+	if got := rowToMap(tbl, []any{[]byte{0x80}}, time.UTC)["v"]; got != "Ä" {
 		t.Errorf("macce 0x80 = %q, want %q", got, "Ä")
 	}
 }
@@ -481,7 +488,7 @@ func TestRowToMapDecodesGeneratedCharsets(t *testing.T) {
 			tbl := &schema.Table{Columns: []schema.TableColumn{
 				{Name: "v", Type: schema.TYPE_STRING, Collation: tc.collation},
 			}}
-			if got := rowToMap(tbl, []any{[]byte{tc.raw}})["v"]; got != tc.want {
+			if got := rowToMap(tbl, []any{[]byte{tc.raw}}, time.UTC)["v"]; got != tc.want {
 				t.Errorf("%s byte 0x%02X = %q, want %q", tc.name, tc.raw, got, tc.want)
 			}
 		})
@@ -498,7 +505,7 @@ func TestRowToMapGeneratedCharsetUnassignedByteFallsThrough(t *testing.T) {
 		{Name: "v", Type: schema.TYPE_STRING, Collation: "swe7_swedish_ci"},
 	}}
 	raw := []byte{0x80}
-	got, _ := rowToMap(tbl, []any{raw})["v"].(string)
+	got, _ := rowToMap(tbl, []any{raw}, time.UTC)["v"].(string)
 	if !bytes.Equal([]byte(got), raw) {
 		t.Errorf("swe7 unassigned byte = %q, want the raw byte kept (not \"?\")", got)
 	}
@@ -509,7 +516,7 @@ func TestRowToMapDecodesUTF32(t *testing.T) {
 	tbl := &schema.Table{Columns: []schema.TableColumn{
 		{Name: "v", Type: schema.TYPE_STRING, Collation: "utf32_general_ci"},
 	}}
-	if got := rowToMap(tbl, []any{[]byte{0x00, 0x00, 0x4e, 0x2d}})["v"]; got != "中" {
+	if got := rowToMap(tbl, []any{[]byte{0x00, 0x00, 0x4e, 0x2d}}, time.UTC)["v"]; got != "中" {
 		t.Errorf("utf32 = %q, want %q", got, "中")
 	}
 }
@@ -573,4 +580,121 @@ func TestStopIsIdempotent(t *testing.T) {
 	r := newTestReader(nil)
 	r.stop()
 	r.stop() // must not panic (close of closed channel)
+}
+
+// OnGTID stamps the transaction's commit time from the GTID event (microsecond
+// precision, MySQL 8.0.1+) with a fallback to the header's second-precision
+// timestamp. Issue #137.
+func TestOnGTIDCapturesCommitTime(t *testing.T) {
+	sid := []byte{0x3e, 0x11, 0xfa, 0x47, 0x71, 0xca, 0x11, 0xe1, 0x9e, 0x33, 0xc8, 0x0a, 0xa9, 0x42, 0x95, 0x62}
+	r := newTestReader(nil)
+
+	micros := uint64(1700000000)*1_000_000 + 123456
+	e := &replication.GTIDEvent{SID: sid, GNO: 3, OriginalCommitTimestamp: micros}
+	if err := r.OnGTID(&replication.EventHeader{Timestamp: 1699999999}, e); err != nil {
+		t.Fatalf("OnGTID: %v", err)
+	}
+	want := time.Unix(int64(micros/1_000_000), int64(micros%1_000_000)*1000).UTC()
+	if !r.curCommitTS.Equal(want) {
+		t.Fatalf("commit ts = %v, want %v", r.curCommitTS, want)
+	}
+
+	// No original commit timestamp (pre-8.0.1): fall back to the header.
+	e2 := &replication.GTIDEvent{SID: sid, GNO: 4}
+	if err := r.OnGTID(&replication.EventHeader{Timestamp: 1699999999}, e2); err != nil {
+		t.Fatalf("OnGTID: %v", err)
+	}
+	if want := time.Unix(1699999999, 0).UTC(); !r.curCommitTS.Equal(want) {
+		t.Fatalf("fallback commit ts = %v, want %v", r.curCommitTS, want)
+	}
+}
+
+// canalConfig threads the TLS config into the replication connection. Issue
+// #138.
+func TestCanalConfigCarriesTLS(t *testing.T) {
+	tc := &tls.Config{ServerName: "db.example.com"}
+	cc := canalConfig(Config{Addr: "h:3306", TLSConfig: tc}, []string{`^db\.t$`})
+	if cc.TLSConfig != tc {
+		t.Fatal("canal config did not carry the TLS config")
+	}
+	if cc.Flavor != "mysql" || !cc.ParseTime {
+		t.Fatalf("canal config = %+v", cc)
+	}
+}
+
+// A CDC temporal value and the snapshot value for the same cell must normalize
+// to the same time.Time in the operator's location (issue #139).
+func TestNormalizeColTemporalParity(t *testing.T) {
+	loc, err := time.LoadLocation("America/Sao_Paulo")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+
+	// DATETIME: same naive wall clock. Snapshot (go-sql-driver, loc=loc) is
+	// time.Date(..., loc); CDC (go-mysql, ParseTime) tags the wall clock UTC.
+	snapDT := time.Date(2023, 1, 8, 12, 30, 45, 0, loc)
+	cdcDT := time.Date(2023, 1, 8, 12, 30, 45, 0, time.UTC)
+	if got := normalizeCol(schema.TableColumn{Name: "d", Type: schema.TYPE_DATETIME}, cdcDT, loc).(time.Time); !got.Equal(snapDT) {
+		t.Fatalf("datetime parity: got %v, want %v", got, snapDT)
+	}
+
+	// TIMESTAMP: same instant. go-mysql returns the instant (Local); the
+	// snapshot returns it in loc.
+	instant := time.Date(2023, 1, 8, 12, 30, 45, 0, time.UTC)
+	snapTS := instant.In(loc)
+	if got := normalizeCol(schema.TableColumn{Name: "t", Type: schema.TYPE_TIMESTAMP}, instant, loc).(time.Time); !got.Equal(snapTS) {
+		t.Fatalf("timestamp parity: got %v, want %v", got, snapTS)
+	}
+
+	// DATE: go-mysql returns a string; the snapshot a midnight time.Time.
+	wantDate := time.Date(2023, 1, 8, 0, 0, 0, 0, loc)
+	if got := normalizeCol(schema.TableColumn{Name: "dt", Type: schema.TYPE_DATE}, "2023-01-08", loc).(time.Time); !got.Equal(wantDate) {
+		t.Fatalf("date parity: got %v, want %v", got, wantDate)
+	}
+}
+
+// go-mysql returns MySQL's zero temporal as a string while the snapshot driver
+// (parseTime) returns time.Time{}; normalizeCol must make them agree, or the
+// same column has a different Go type by path.
+func TestNormalizeColZeroTemporal(t *testing.T) {
+	cols := []schema.TableColumn{
+		{Name: "d", Type: schema.TYPE_DATETIME},
+		{Name: "t", Type: schema.TYPE_TIMESTAMP},
+		{Name: "dt", Type: schema.TYPE_DATE},
+	}
+	for _, col := range cols {
+		for _, zero := range []string{"0000-00-00", "0000-00-00 00:00:00", "0000-00-00 00:00:00.000000"} {
+			got := normalizeCol(col, zero, time.UTC)
+			ts, ok := got.(time.Time)
+			if !ok || !ts.IsZero() {
+				t.Fatalf("%s zero %q = %v (%T), want time.Time{}", col.Name, zero, got, got)
+			}
+		}
+	}
+}
+
+// Snapshot and CDC must agree even for a TIMESTAMP whose instant falls in a
+// different DST period than "now": the snapshot does not freeze an offset (it
+// re-tags/keeps the instant in the IANA location), so both paths preserve the
+// instant. A fixed session offset (time.Now()) would shift it by the DST delta.
+func TestTemporalParityAcrossDST(t *testing.T) {
+	loc, err := time.LoadLocation("America/Sao_Paulo")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	// 2018-12-15: São Paulo observed DST (-02:00).
+	instant := time.Date(2018, 12, 15, 15, 0, 0, 0, time.UTC)
+
+	snapTS := normalizeSnapshot(instant, "TIMESTAMP", loc).(time.Time)
+	cdcTS := normalizeCol(schema.TableColumn{Name: "t", Type: schema.TYPE_TIMESTAMP}, instant, loc).(time.Time)
+	if !snapTS.Equal(instant) || !cdcTS.Equal(instant) || !snapTS.Equal(cdcTS) {
+		t.Fatalf("DST timestamp parity: snap=%v cdc=%v instant=%v", snapTS, cdcTS, instant)
+	}
+
+	wall := time.Date(2018, 12, 15, 12, 0, 0, 0, time.UTC) // naive DATETIME, parsed in UTC
+	snapDT := normalizeSnapshot(wall, "DATETIME", loc).(time.Time)
+	cdcDT := normalizeCol(schema.TableColumn{Name: "d", Type: schema.TYPE_DATETIME}, wall, loc).(time.Time)
+	if !snapDT.Equal(cdcDT) {
+		t.Fatalf("DST datetime parity: snap=%v cdc=%v", snapDT, cdcDT)
+	}
 }

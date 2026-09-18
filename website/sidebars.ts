@@ -29,12 +29,22 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
+      label: 'Sources',
+      collapsed: false,
+      items: [
+        'sources/index',
+        'sources/mysql',
+        'sources/postgres',
+        'sources/kafka',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Reference',
       collapsed: false,
       items: [
         'reference/guarantees',
         'reference/pipeline-spec',
-        'reference/sources',
         'reference/sinks',
         'reference/dashboard-api',
         'reference/enrichment',

@@ -46,6 +46,17 @@ const config: Config = {
 
   themes: ['@docusaurus/theme-mermaid'],
 
+  // The source docs moved from a single reference page to a Sources section;
+  // keep the old URL working.
+  plugins: [
+    [
+      '@docusaurus/plugin-client-redirects',
+      {
+        redirects: [{ from: '/docs/reference/sources', to: '/docs/sources/' }],
+      },
+    ],
+  ],
+
   themeConfig: {
     image: 'img/docusaurus-social-card.jpg',
     colorMode: {

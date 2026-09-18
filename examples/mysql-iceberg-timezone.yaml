@@ -1,0 +1,27 @@
+# MySQL binlog -> Apache Iceberg, upsert, with an explicit temporal timezone.
+#
+# This is the spec test/e2e/mysql_timezone_test.go runs (read from disk). It
+# exercises issue #139: with `timezone=America/Sao_Paulo` on the source URI, a
+# DATETIME (naive) and a TIMESTAMP (instant) must read back identically
+# whether the row came from the DBLog snapshot or the live binlog stream.
+#
+# Values point at the repo's e2e docker-compose stack
+# (test/e2e/docker-compose.yml); adjust uri/sink for your own MySQL and
+# Iceberg catalog.
+pipeline: e2e-mysql-timezone
+source:
+  kind: mysql
+  uri: mysql://repl:replpass@127.0.0.1:3306/shop?timezone=America/Sao_Paulo
+  serverId: "1102"
+sink:
+  uri: http://localhost:8181/api/catalog
+  namespace: raw
+  warehouse: quickstart_catalog
+  clientId: root
+  clientSecret: s3cr3t
+  scope: PRINCIPAL_ROLE:ALL
+tables:
+  - source: shop.events
+    target: raw.events
+    primaryKey: [id]
+    createIfNotExists: true

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/maltzsama/urutau/source"
 )
@@ -20,10 +21,14 @@ type Chunker struct {
 	table     string
 	pk        []string
 	chunkSize int
+	// loc is the operator's temporal location. The query connection parses in
+	// UTC; Scan re-tags naive temporals into loc so a snapshot row matches the
+	// CDC decode of the same row (issue #139).
+	loc *time.Location
 }
 
-// NewChunker builds a chunker for one source table.
-func NewChunker(db *sql.DB, source, pk string, chunkSize int) (*Chunker, error) {
+// NewChunker builds a chunker for one source table. loc may be nil (UTC).
+func NewChunker(db *sql.DB, source, pk string, chunkSize int, loc *time.Location) (*Chunker, error) {
 	schema, table, ok := strings.Cut(source, ".")
 	if !ok {
 		return nil, fmt.Errorf("mysql: chunker: source %q must be db.table", source)
@@ -39,12 +44,16 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int) (*Chunker, error) 
 			pks = append(pks, c)
 		}
 	}
+	if loc == nil {
+		loc = time.UTC
+	}
 	return &Chunker{
 		db:        db,
 		schema:    schema,
 		table:     table,
 		pk:        pks,
 		chunkSize: chunkSize,
+		loc:       loc,
 	}, nil
 }
 
@@ -116,6 +125,10 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	if err != nil {
 		return err
 	}
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		vals := make([]any, len(colsMeta))
 		ptrs := make([]any, len(colsMeta))
@@ -127,7 +140,7 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 		}
 		m := make(map[string]any, len(colsMeta))
 		for i, name := range colsMeta {
-			m[name] = normalize(vals[i])
+			m[name] = normalizeSnapshot(vals[i], dbTypeName(colTypes, i), c.loc)
 		}
 		if err := fn(m); err != nil {
 			return err
@@ -136,6 +149,36 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	return rows.Err()
 }
 
+// dbTypeName returns column i's database type name (e.g. "DATETIME"), or "".
+func dbTypeName(cols []*sql.ColumnType, i int) string {
+	if i < len(cols) {
+		return cols[i].DatabaseTypeName()
+	}
+	return ""
+}
+
+// normalizeSnapshot puts a snapshot cell's temporal value in the operator's
+// location, matching the CDC decode: DATETIME (naive) is re-tagged, DATE is
+// midnight, TIMESTAMP keeps its instant. The query connection parses in UTC,
+// so these arrive UTC-tagged. Non-temporal values fall back to normalize.
+func normalizeSnapshot(v any, dbType string, loc *time.Location) any {
+	t, ok := v.(time.Time)
+	if !ok {
+		return normalize(v)
+	}
+	switch dbType {
+	case "DATETIME":
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+	case "DATE":
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+	case "TIMESTAMP":
+		return t.In(loc)
+	default:
+		return t
+	}
+}
+
+// scanRow scans one row into a normalized []any (used for chunk bounds).
 func scanRow(rows *sql.Rows) ([]any, error) {
 	cols, err := rows.Columns()
 	if err != nil {
@@ -161,6 +204,7 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	return vals, nil
 }
 
+// placeholders renders n comma-separated "?" placeholders.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }

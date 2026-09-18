@@ -169,7 +169,7 @@ docker compose -f test/e2e/docker-compose.yml down
 ## Next steps
 
 - **Postgres or Kafka as the source** instead of MySQL: see
-  [Sources](reference/sources.md) for what each source needs (Postgres
+  [Sources](sources/index.md) for what each source needs (Postgres
   needs `slotName`; Kafka reads its brokers from `uri`, same as every
   other source, and needs an explicit `columns:` block since it has
   nothing to introspect).
