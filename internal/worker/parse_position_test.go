@@ -26,7 +26,7 @@ func TestParsePositionPerKind(t *testing.T) {
 		t.Fatalf("mysql parsed %T, want *position.GTID", my)
 	}
 
-	off := &position.Offsets{Topic: "shop.orders", Parts: map[int32]int64{0: 42}}
+	off := position.NewOffsets("shop.orders", map[int32]int64{0: 42})
 	kf, err := parsePosition("kafka")(off.String())
 	if err != nil {
 		t.Fatalf("kafka: %v", err)
@@ -35,7 +35,7 @@ func TestParsePositionPerKind(t *testing.T) {
 	if !ok {
 		t.Fatalf("kafka parsed %T, want *position.Offsets", kf)
 	}
-	if got.Topic != "shop.orders" || got.Parts[0] != 42 {
+	if got.Topics["shop.orders"][0] != 42 {
 		t.Fatalf("kafka parsed %+v, want topic shop.orders partition 0 @42", got)
 	}
 }

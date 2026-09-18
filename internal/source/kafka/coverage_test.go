@@ -46,7 +46,7 @@ func TestParsePosition(t *testing.T) {
 		t.Fatalf("ParsePosition: %v", err)
 	}
 	off, ok := pos.(*position.Offsets)
-	if !ok || off.Topic != "t" || off.Parts[0] != 5 || off.Parts[1] != 9 {
+	if !ok || off.Topics["t"][0] != 5 || off.Topics["t"][1] != 9 {
 		t.Fatalf("ParsePosition = %#v", pos)
 	}
 	if _, err := s.ParsePosition("not-an-offset"); err == nil {
@@ -66,12 +66,14 @@ func TestInitialPositionIsEmptyOffsets(t *testing.T) {
 }
 
 func TestReaderPositionAndNoops(t *testing.T) {
-	off := &position.Offsets{Topic: "t", Parts: map[int32]int64{0: 3}}
+	off := position.NewOffsets("t", map[int32]int64{0: 3})
 	r := &Reader{synced: off}
-	if r.Synced() != off {
-		t.Fatal("Synced must return the tracked offsets")
+	// Synced/Master return a copy, not the live maps — the consume loop keeps
+	// mutating r.synced — so compare by value.
+	if got := r.Synced(); got.String() != off.String() {
+		t.Fatalf("Synced = %s, want %s", got, off)
 	}
-	if got, err := r.Master(context.Background()); err != nil || got != off {
+	if got, err := r.Master(context.Background()); err != nil || got.String() != off.String() {
 		t.Fatalf("Master = %v, %v", got, err)
 	}
 	// No-op lifecycle methods must not panic.

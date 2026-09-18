@@ -207,11 +207,13 @@ type Reader struct {
 	synced *position.Offsets
 }
 
-// Synced returns the current consumer position.
+// Synced returns the current consumer position. The copy is deliberate: the
+// consume loop keeps mutating r.synced, so handing out the live maps would
+// race with whoever holds the returned position.
 func (r *Reader) Synced() position.Position {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.synced
+	return r.synced.Clone()
 }
 
 // Master returns the high-watermark position (the latest offset across
@@ -220,7 +222,7 @@ func (r *Reader) Synced() position.Position {
 func (r *Reader) Master(_ context.Context) (position.Position, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.synced, nil
+	return r.synced.Clone(), nil
 }
 
 // OpenWindow is a no-op for Kafka: there is no DBLog snapshot window.
@@ -290,10 +292,8 @@ func (r *Reader) consume(ctx context.Context) error {
 					return
 				}
 				c.Table = ref.Target
-				c.Position = (&position.Offsets{
-					Topic: rec.Topic,
-					Parts: map[int32]int64{rec.Partition: rec.Offset},
-				}).String()
+				c.Position = position.NewOffsets(rec.Topic,
+					map[int32]int64{rec.Partition: rec.Offset}).String()
 				c.Transport = transportOf(rec)
 				// The raw key tuple inherits JSON object disorder; rebuild
 				// it in the declared primary-key order so every downstream
@@ -308,11 +308,7 @@ func (r *Reader) consume(ctx context.Context) error {
 			}
 
 			r.mu.Lock()
-			if r.synced.Parts == nil {
-				r.synced.Parts = make(map[int32]int64)
-			}
-			r.synced.Topic = rec.Topic
-			r.synced.Parts[rec.Partition] = rec.Offset + 1
+			r.synced.Set(rec.Topic, rec.Partition, rec.Offset+1)
 			r.mu.Unlock()
 		})
 	}

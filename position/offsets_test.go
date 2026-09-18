@@ -9,11 +9,12 @@ func TestParseOffsets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.Topic != "orders" {
-		t.Errorf("topic = %q, want orders", o.Topic)
+	parts, ok := o.Topics["orders"]
+	if !ok {
+		t.Fatalf("topics = %v, want an orders entry", o.Topics)
 	}
-	if o.Parts[0] != 10 || o.Parts[1] != 20 {
-		t.Errorf("parts = %v, want {0:10, 1:20}", o.Parts)
+	if parts[0] != 10 || parts[1] != 20 {
+		t.Errorf("parts = %v, want {0:10, 1:20}", parts)
 	}
 }
 
@@ -22,8 +23,8 @@ func TestParseOffsetsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(o.Parts) != 0 {
-		t.Errorf("parts = %v, want empty", o.Parts)
+	if len(o.Topics["orders"]) != 0 {
+		t.Errorf("parts = %v, want empty", o.Topics["orders"])
 	}
 }
 
@@ -37,7 +38,7 @@ func TestParseOffsetsBadFormat(t *testing.T) {
 }
 
 func TestOffsetsString(t *testing.T) {
-	o := &Offsets{Topic: "orders", Parts: map[int32]int64{1: 20, 0: 10}}
+	o := NewOffsets("orders", map[int32]int64{1: 20, 0: 10})
 	s := o.String()
 	if s != "orders:p0=10,p1=20" {
 		t.Errorf("String() = %q, want orders:p0=10,p1=20", s)
@@ -45,8 +46,8 @@ func TestOffsetsString(t *testing.T) {
 }
 
 func TestOffsetsCompare(t *testing.T) {
-	a := &Offsets{Topic: "t", Parts: map[int32]int64{0: 10}}
-	b := &Offsets{Topic: "t", Parts: map[int32]int64{0: 20}}
+	a := NewOffsets("t", map[int32]int64{0: 10})
+	b := NewOffsets("t", map[int32]int64{0: 20})
 	if a.Compare(b) >= 0 {
 		t.Error("a should be less than b")
 	}
@@ -55,23 +56,28 @@ func TestOffsetsCompare(t *testing.T) {
 	}
 }
 
-// Two topics have no order to compare: the old lexicographic fallback was an
-// artificial order with no semantic meaning, and a caller acting on it would
-// treat one topic's progress as covering another's.
+// Disjoint topics carry no information about each other: neither covers the
+// other's progress, so neither contains it and the pair is Incomparable.
+// They do have a meet — the empty position — because claiming no progress on
+// either topic is always a safe lower bound.
 func TestOffsetsCompareDifferentTopic(t *testing.T) {
-	a := &Offsets{Topic: "a", Parts: map[int32]int64{0: 100}}
-	b := &Offsets{Topic: "b", Parts: map[int32]int64{0: 1}}
+	a := NewOffsets("a", map[int32]int64{0: 100})
+	b := NewOffsets("b", map[int32]int64{0: 1})
 	if a.Compare(b) != Incomparable {
-		t.Errorf("different topics must be Incomparable, got %d", a.Compare(b))
+		t.Errorf("disjoint topics must be Incomparable, got %d", a.Compare(b))
 	}
-	if _, ok := a.Meet(b); ok {
-		t.Error("different topics must have no meet")
+	m, ok := a.Meet(b)
+	if !ok {
+		t.Fatal("disjoint topics still have a meet (the empty position)")
+	}
+	if m.String() != "" {
+		t.Errorf("meet = %q, want the empty position", m.String())
 	}
 }
 
 func TestOffsetsContains(t *testing.T) {
-	a := &Offsets{Topic: "t", Parts: map[int32]int64{0: 10, 1: 20}}
-	b := &Offsets{Topic: "t", Parts: map[int32]int64{0: 5, 1: 15}}
+	a := NewOffsets("t", map[int32]int64{0: 10, 1: 20})
+	b := NewOffsets("t", map[int32]int64{0: 5, 1: 15})
 	if !a.Contains(b) {
 		t.Error("a should contain b")
 	}
@@ -81,23 +87,36 @@ func TestOffsetsContains(t *testing.T) {
 }
 
 func TestOffsetsContainsExtraPartition(t *testing.T) {
-	a := &Offsets{Topic: "t", Parts: map[int32]int64{0: 10, 1: 20, 2: 30}}
-	b := &Offsets{Topic: "t", Parts: map[int32]int64{0: 5, 1: 15}}
+	a := NewOffsets("t", map[int32]int64{0: 10, 1: 20, 2: 30})
+	b := NewOffsets("t", map[int32]int64{0: 5, 1: 15})
 	if !a.Contains(b) {
 		t.Error("a with extra partition should contain b")
 	}
 }
 
+// A topic the other side has made progress on, and this side knows nothing
+// about, is not covered — that progress has not been matched.
 func TestOffsetsContainsDifferentTopic(t *testing.T) {
-	a := &Offsets{Topic: "a", Parts: map[int32]int64{0: 10}}
-	b := &Offsets{Topic: "b", Parts: map[int32]int64{0: 5}}
+	a := NewOffsets("a", map[int32]int64{0: 10})
+	b := NewOffsets("b", map[int32]int64{0: 5})
 	if a.Contains(b) {
-		t.Error("different topics should not contain")
+		t.Error("a knows nothing of topic b, so it cannot contain b's progress")
+	}
+}
+
+// A topic present in o but absent from other is future work, not a gap.
+func TestOffsetsContainsExtraTopic(t *testing.T) {
+	a := &Offsets{}
+	a.Set("orders", 0, 10)
+	a.Set("payments", 0, 10)
+	b := NewOffsets("orders", map[int32]int64{0: 5})
+	if !a.Contains(b) {
+		t.Error("a covers every topic b knows about, so it contains b")
 	}
 }
 
 func TestOffsetsJSONRoundTrip(t *testing.T) {
-	original := &Offsets{Topic: "orders", Parts: map[int32]int64{0: 10, 2: 30}}
+	original := NewOffsets("orders", map[int32]int64{0: 10, 2: 30})
 	data, err := original.MarshalJSON()
 	if err != nil {
 		t.Fatal(err)
@@ -106,15 +125,7 @@ func TestOffsetsJSONRoundTrip(t *testing.T) {
 	if err := decoded.UnmarshalJSON(data); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Topic != original.Topic {
-		t.Errorf("topic = %q, want %q", decoded.Topic, original.Topic)
-	}
-	if len(decoded.Parts) != len(original.Parts) {
-		t.Errorf("parts len = %d, want %d", len(decoded.Parts), len(original.Parts))
-	}
-	for p, off := range original.Parts {
-		if decoded.Parts[p] != off {
-			t.Errorf("part %d offset = %d, want %d", p, decoded.Parts[p], off)
-		}
+	if got, want := decoded.String(), original.String(); got != want {
+		t.Errorf("round trip = %q, want %q", got, want)
 	}
 }
