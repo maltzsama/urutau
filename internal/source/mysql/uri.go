@@ -9,6 +9,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
+
+	// Embed the IANA timezone database so `timezone=<IANA>` resolves even in a
+	// scratch container without OS tzdata.
+	_ "time/tzdata"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -46,6 +51,13 @@ type URI struct {
 	SSLServerName string
 	tlsConfig     *tls.Config
 	tlsName       string // registered name for the DSN `tls=` parameter
+
+	// Timezone is the operator-chosen IANA location for temporal columns,
+	// applied to both the snapshot query and the CDC decode so a row's
+	// DATETIME/TIMESTAMP value is identical whichever path reads it. Defaults
+	// to UTC.
+	Timezone string
+	loc      *time.Location
 }
 
 // ParseURI parses a "mysql://user:pass@host:port/db" source URI, plus the
@@ -83,6 +95,16 @@ func ParseURI(uri string) (*URI, error) {
 	c.SSLCert = q.Get("ssl-cert")
 	c.SSLKey = q.Get("ssl-key")
 	c.SSLServerName = q.Get("ssl-server-name")
+
+	c.Timezone = q.Get("timezone")
+	if c.Timezone == "" {
+		c.Timezone = "UTC"
+	}
+	loc, err := time.LoadLocation(c.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: timezone %q: %w", c.Timezone, err)
+	}
+	c.loc = loc
 
 	if c.tlsConfig, err = c.buildTLSConfig(); err != nil {
 		return nil, err
@@ -188,6 +210,15 @@ func tlsConfigName(c *URI) string {
 // nil when TLS is off.
 func (c *URI) TLSConfig() *tls.Config { return c.tlsConfig }
 
+// TimeLocation returns the resolved temporal location (never nil; defaults to
+// UTC).
+func (c *URI) TimeLocation() *time.Location {
+	if c.loc == nil {
+		return time.UTC
+	}
+	return c.loc
+}
+
 // Addr returns host:port.
 func (c *URI) Addr() string { return c.Host + ":" + c.Port }
 
@@ -195,7 +226,8 @@ func (c *URI) Addr() string { return c.Host + ":" + c.Port }
 // is configured it registers the *tls.Config with the driver and references
 // it by name.
 func (c *URI) QueryDSN() (string, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true", c.User, c.Password, c.Addr(), c.DB)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=%s",
+		c.User, c.Password, c.Addr(), c.DB, url.QueryEscape(c.TimeLocation().String()))
 	if c.tlsConfig != nil {
 		if err := mysql.RegisterTLSConfig(c.tlsName, c.tlsConfig); err != nil {
 			return "", fmt.Errorf("mysql: register tls config: %w", err)

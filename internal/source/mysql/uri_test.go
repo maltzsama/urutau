@@ -83,7 +83,7 @@ func TestURIAddr(t *testing.T) {
 
 func TestURIQueryDSN(t *testing.T) {
 	u := &URI{User: "root", Password: "secret", Host: "localhost", Port: "3306", DB: "mydb"}
-	want := "root:secret@tcp(localhost:3306)/mydb?parseTime=true"
+	want := "root:secret@tcp(localhost:3306)/mydb?parseTime=true&loc=UTC"
 	got, err := u.QueryDSN()
 	if err != nil {
 		t.Fatalf("QueryDSN: %v", err)
@@ -212,4 +212,34 @@ func writeTestCert(t *testing.T) (certPath, keyPath string) {
 		t.Fatalf("write key: %v", err)
 	}
 	return certPath, keyPath
+}
+
+func TestParseURITimezone(t *testing.T) {
+	// Defaults to UTC.
+	u, err := ParseURI("mysql://root@localhost/mydb")
+	if err != nil {
+		t.Fatalf("ParseURI: %v", err)
+	}
+	if u.TimeLocation() != time.UTC {
+		t.Fatalf("default loc = %v, want UTC", u.TimeLocation())
+	}
+
+	u, err = ParseURI("mysql://root@localhost/mydb?timezone=America/Sao_Paulo")
+	if err != nil {
+		t.Fatalf("ParseURI(timezone): %v", err)
+	}
+	if got := u.TimeLocation().String(); got != "America/Sao_Paulo" {
+		t.Fatalf("loc = %q", got)
+	}
+	dsn, err := u.QueryDSN()
+	if err != nil {
+		t.Fatalf("QueryDSN: %v", err)
+	}
+	if !strings.Contains(dsn, "loc=America%2FSao_Paulo") {
+		t.Fatalf("QueryDSN = %q, want the loc parameter", dsn)
+	}
+
+	if _, err := ParseURI("mysql://root@localhost/mydb?timezone=Not/AZone"); err == nil {
+		t.Fatal("an unknown timezone must be rejected")
+	}
 }

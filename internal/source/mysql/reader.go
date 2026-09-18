@@ -43,6 +43,10 @@ type Config struct {
 	// TLSConfig, when non-nil, secures the replication connection (issue
 	// #138). Nil means plaintext.
 	TLSConfig *tls.Config
+	// TimeLocation is the operator's temporal location, applied to decoded
+	// DATETIME/TIMESTAMP/DATE values so they match the snapshot query (issue
+	// #139). Nil means UTC.
+	TimeLocation *time.Location
 }
 
 // Reader wraps a canal instance and decodes its row events.
@@ -144,9 +148,12 @@ func canalConfig(cfg Config, includeRegex []string) *canal.Config {
 		HeartbeatPeriod:   cfg.Heartbeat,
 		ReadTimeout:       60 * time.Second,
 		IncludeTableRegex: includeRegex,
-		ParseTime:         false,
-		Logger:            cfg.Logger,
-		TLSConfig:         cfg.TLSConfig,
+		// ParseTime makes go-mysql return time.Time for DATETIME/TIMESTAMP,
+		// matching the snapshot query (parseTime=true); normalizeCol then puts
+		// them in the operator's location (issue #139).
+		ParseTime: true,
+		Logger:    cfg.Logger,
+		TLSConfig: cfg.TLSConfig,
 	}
 }
 
@@ -399,17 +406,26 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 	}
 	c.Key = key
 
+	loc := r.loc()
 	if op == rowchange.OpDelete {
 		if before != nil {
-			c.Before = rowToMap(tbl, before)
+			c.Before = rowToMap(tbl, before, loc)
 		}
 		return c
 	}
-	c.After = rowToMap(tbl, after)
+	c.After = rowToMap(tbl, after, loc)
 	if before != nil {
-		c.Before = rowToMap(tbl, before)
+		c.Before = rowToMap(tbl, before, loc)
 	}
 	return c
+}
+
+// loc returns the operator's temporal location, defaulting to UTC.
+func (r *Reader) loc() *time.Location {
+	if r.cfg.TimeLocation == nil {
+		return time.UTC
+	}
+	return r.cfg.TimeLocation
 }
 
 // rowToMap maps a row (in table column order) to column-name → value.
@@ -421,19 +437,22 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 // SELECT returns them as text. Both paths feed the same target column, so
 // decoding here is what keeps a CDC row and a snapshot row of the same
 // source row identical.
-func rowToMap(tbl *schema.Table, row []any) map[string]any {
+func rowToMap(tbl *schema.Table, row []any, loc *time.Location) map[string]any {
 	out := make(map[string]any, len(tbl.Columns))
 	for i, col := range tbl.Columns {
 		if i >= len(row) {
 			continue
 		}
-		out[col.Name] = normalizeCol(col, row[i])
+		out[col.Name] = normalizeCol(col, row[i], loc)
 	}
 	return out
 }
 
 // normalizeCol converts one binlog value using its column definition.
-func normalizeCol(col schema.TableColumn, v any) any {
+func normalizeCol(col schema.TableColumn, v any, loc *time.Location) any {
+	if loc == nil {
+		loc = time.UTC
+	}
 	switch col.Type {
 	case schema.TYPE_ENUM:
 		return decodeEnum(col, v)
@@ -445,6 +464,35 @@ func normalizeCol(col schema.TableColumn, v any) any {
 		// its bytes are not text and reinterpreting them would corrupt them.
 		if b, ok := v.([]byte); ok {
 			return decodeString(b, col.Collation)
+		}
+
+		return normalize(v)
+	case schema.TYPE_TIMESTAMP:
+		// An instant: go-mysql returns it in the process's Local zone. Express
+		// it in the operator's location so it matches the snapshot query
+		// (issue #139).
+		if t, ok := v.(time.Time); ok {
+			return t.In(loc)
+		}
+
+		return normalize(v)
+	case schema.TYPE_DATETIME:
+		// No zone: go-mysql tags the wall clock UTC. Re-tag the SAME wall clock
+		// to the operator's location — do NOT convert the instant — so it
+		// matches the snapshot's parseTime interpretation of a naive DATETIME.
+		if t, ok := v.(time.Time); ok {
+			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+		}
+
+		return normalize(v)
+	case schema.TYPE_DATE:
+		// go-mysql returns DATE as a "2006-01-02" string regardless of
+		// ParseTime; the snapshot returns a time.Time at midnight. Normalize to
+		// a time.Time in the operator's location.
+		if s, ok := v.(string); ok {
+			if t, err := time.ParseInLocation("2006-01-02", s, loc); err == nil {
+				return t
+			}
 		}
 
 		return normalize(v)

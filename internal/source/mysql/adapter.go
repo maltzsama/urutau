@@ -107,14 +107,15 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	}
 	out := make(chan rowchange.Change, 1024)
 	rdr, err := New(ctx, Config{
-		Addr:      conn.Addr(),
-		User:      conn.User,
-		Password:  conn.Password,
-		ServerID:  a.rt.ServerID,
-		Heartbeat: a.rt.Heartbeat,
-		Tables:    refs,
-		Logger:    a.rt.Logger,
-		TLSConfig: conn.TLSConfig(),
+		Addr:         conn.Addr(),
+		User:         conn.User,
+		Password:     conn.Password,
+		ServerID:     a.rt.ServerID,
+		Heartbeat:    a.rt.Heartbeat,
+		Tables:       refs,
+		Logger:       a.rt.Logger,
+		TLSConfig:    conn.TLSConfig(),
+		TimeLocation: conn.TimeLocation(),
 	}, out)
 	if err != nil {
 		return nil, err
