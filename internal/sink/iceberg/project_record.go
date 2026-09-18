@@ -173,11 +173,9 @@ func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKe
 		return constString(src.NumRows(), w.sourceTable), nil
 
 	default:
-		// shard, msg_ts, msg_key, headers, enrich_miss: null. msg_ts is a
-		// timestamp and enrich_miss a bool, so the null must be built in the
-		// FIELD's type — a utf8 null would panic NewRecordBatch. (msg_ts is
-		// NULL for CDC by design; enrich_miss's value is not on the wire yet,
-		// so this is a typed NULL rather than the change's flag.)
+		// shard, msg_ts, msg_key, headers: null. msg_ts is a timestamp, so
+		// the null must be built in the FIELD's type — a utf8 null would
+		// panic NewRecordBatch. (msg_ts is NULL for CDC by design.)
 		return nullColumn(field.Type, src.NumRows()), nil
 	}
 }

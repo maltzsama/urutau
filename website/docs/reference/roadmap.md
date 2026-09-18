@@ -48,10 +48,6 @@ is a correctness gap in v1.
   live propagation is not automatic.
 - **Dead-letter queue** (and multi-destination DLQ): a poison batch is
   terminal in v1 — see [Delivery guarantees](guarantees.md#poison-batch-terminal-no-dead-letter-queue).
-- **`enrich_miss` as a materializable column**: the columnar join marks a
-  left-join miss by leaving the reference columns NULL; it does not emit a
-  dedicated wire column, so the `enrich_miss` metadata key cannot be
-  materialized yet.
 - **Plugin-sink position store**: external plugin sinks have no transactional
   place to persist a position, so the out-of-sink store described in
   [Position](../architecture/state-position.md) is required for them. It is

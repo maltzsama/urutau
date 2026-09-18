@@ -282,13 +282,6 @@ func TestDeleteKeyBackfilledFromKeyTuple(t *testing.T) {
 // TestEnrichMissNullsAndHitValues — PK 4 (user_ref 99) misses: the reference
 // columns land NULL (absent from the decoded After). PK 5 (user_ref 1) hits:
 // ana/gold.
-//
-// EnrichMiss is deliberately NOT asserted here: it is an in-memory flag on
-// rowchange.Change that the wire does not carry — it reaches a sink only
-// through the enrich_miss metadata column, which the harness schema does not
-// declare. The observable miss signal on the wire is "reference columns are
-// NULL", and that is what the seam must guarantee. S6's ColumnarJoin adds a
-// real miss column; when that lands, extend this test.
 func TestEnrichMissNullsAndHitValues(t *testing.T) {
 	rows := harnessRows(t)
 	by := rowsByKey(rows)

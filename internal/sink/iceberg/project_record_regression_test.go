@@ -18,20 +18,18 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
-// msg_ts (timestamp) and enrich_miss (bool) used to fall through buildMetaColumn
-// to a utf8 null, which panics array.NewRecordBatch. They must now project a
-// column whose type equals the field's.
+// msg_ts (timestamp) used to fall through buildMetaColumn to a utf8 null,
+// which panics array.NewRecordBatch. It must now project a column whose type
+// equals the field's.
 func TestMetadataColumnsMatchDeclaredFieldType(t *testing.T) {
 	fields := []arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "msg_ts", Type: &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
-		{Name: "enrich_miss", Type: arrow.FixedWidthTypes.Boolean},
 	}
 	w := &TableWriter{
 		dataSchema: arrow.NewSchema(fields, nil),
 		metaByName: map[string]core.MetadataColumn{
-			"msg_ts":      {From: core.MetaMsgTS, As: "msg_ts"},
-			"enrich_miss": {From: core.MetaEnrichMiss, As: "enrich_miss"},
+			"msg_ts": {From: core.MetaMsgTS, As: "msg_ts"},
 		},
 		cast: core.CastPolicy{},
 	}

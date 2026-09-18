@@ -35,7 +35,7 @@ func TestMetadataKeyUnmarshalJSON(t *testing.T) {
 
 // Every metadata column is nullable; the type is the shape only.
 func TestMetadataKeyColumnTypeNullable(t *testing.T) {
-	for _, k := range []MetadataKey{MetaOp, MetaCommitTS, MetaEnrichMiss, MetaStream} {
+	for _, k := range []MetadataKey{MetaOp, MetaCommitTS, MetaStream} {
 		if ct := k.ColumnType(); !ct.Nullable {
 			t.Errorf("%s.ColumnType() must be nullable, got %+v", k, ct)
 		}

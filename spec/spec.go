@@ -340,8 +340,7 @@ type Enrich struct {
 	// → destination name). Keys must appear in Select when Select is set.
 	As map[string]string `json:"as,omitempty"`
 	// JoinType is required — there is no universal miss policy: left
-	// passes the event with NULL reference columns (and enrich_miss when
-	// declared), inner drops the event.
+	// passes the event with NULL reference columns, inner drops the event.
 	JoinType string `json:"joinType"`
 	// Refresh is the full re-read interval (e.g. 5m). Empty means the
 	// default (5m). A refresh swaps the map atomically: in-flight events

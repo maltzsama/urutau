@@ -200,8 +200,7 @@ func TestBroadcastJoinLoaderCalledOnce(t *testing.T) {
 	}
 }
 
-// 2 — Left miss: the event passes, reference columns are NULL, enrich_miss
-// is set.
+// 2 — Left miss: the event passes, reference columns are NULL.
 func TestLeftMissPassesWithNullsAndFlag(t *testing.T) {
 	s, _ := newTestStage(t, refCfg(nil), usersRows())
 	out, err := s.applyOne(t, searchEvent(9, int64(42)))
