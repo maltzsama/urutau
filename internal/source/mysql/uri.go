@@ -226,16 +226,15 @@ func (c *URI) Addr() string { return c.Host + ":" + c.Port }
 // is configured it registers the *tls.Config with the driver and references
 // it by name.
 //
-// The connection also sets `time_zone` to the operator's current UTC offset
-// so the server sends TIMESTAMP in that zone; together with `loc=` the driver
-// then parses both TIMESTAMP (an instant) and DATETIME (naive) back to the
-// operator's location — matching the CDC decode (issue #139).
+// The session is pinned to UTC and the driver parses in UTC; the operator's
+// timezone is applied in Go, per column type (see normalizeSnapshot and
+// normalizeCol). That keeps TIMESTAMP's instant exact and interprets DATETIME
+// in the operator's zone without depending on the server's timezone tables or
+// freezing a DST offset (issue #139).
 func (c *URI) QueryDSN() (string, error) {
-	loc := c.TimeLocation()
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=%s&time_zone=%s",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&time_zone=%s",
 		c.User, c.Password, c.Addr(), c.DB,
-		url.QueryEscape(loc.String()),
-		url.QueryEscape("'"+mysqlTZOffset(loc)+"'"))
+		url.QueryEscape("'+00:00'"))
 	if c.tlsConfig != nil {
 		if err := mysql.RegisterTLSConfig(c.tlsName, c.tlsConfig); err != nil {
 			return "", fmt.Errorf("mysql: register tls config: %w", err)
@@ -243,17 +242,4 @@ func (c *URI) QueryDSN() (string, error) {
 		dsn += "&tls=" + url.QueryEscape(c.tlsName)
 	}
 	return dsn, nil
-}
-
-// mysqlTZOffset renders loc's current UTC offset as MySQL's time_zone offset
-// form ("+HH:MM" / "-HH:MM"). The offset form is used (rather than the IANA
-// name) because it needs no timezone tables on the server.
-func mysqlTZOffset(loc *time.Location) string {
-	_, off := time.Now().In(loc).Zone()
-	sign := "+"
-	if off < 0 {
-		sign = "-"
-		off = -off
-	}
-	return fmt.Sprintf("%s%02d:%02d", sign, off/3600, (off%3600)/60)
 }

@@ -474,6 +474,9 @@ func normalizeCol(col schema.TableColumn, v any, loc *time.Location) any {
 		if t, ok := v.(time.Time); ok {
 			return t.In(loc)
 		}
+		if s, ok := v.(string); ok && isZeroTemporal(s) {
+			return time.Time{} // match the snapshot's zero value
+		}
 
 		return normalize(v)
 	case schema.TYPE_DATETIME:
@@ -483,6 +486,9 @@ func normalizeCol(col schema.TableColumn, v any, loc *time.Location) any {
 		if t, ok := v.(time.Time); ok {
 			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
 		}
+		if s, ok := v.(string); ok && isZeroTemporal(s) {
+			return time.Time{}
+		}
 
 		return normalize(v)
 	case schema.TYPE_DATE:
@@ -490,6 +496,9 @@ func normalizeCol(col schema.TableColumn, v any, loc *time.Location) any {
 		// ParseTime; the snapshot returns a time.Time at midnight. Normalize to
 		// a time.Time in the operator's location.
 		if s, ok := v.(string); ok {
+			if isZeroTemporal(s) {
+				return time.Time{}
+			}
 			if t, err := time.ParseInLocation("2006-01-02", s, loc); err == nil {
 				return t
 			}
@@ -545,6 +554,12 @@ func decodeSet(col schema.TableColumn, v any) any {
 	}
 	return strings.Join(members, ",")
 }
+
+// isZeroTemporal reports whether a go-mysql temporal string is MySQL's zero
+// value ("0000-00-00" or "0000-00-00 00:00:00[.frac]"). The snapshot driver
+// (parseTime) returns these as time.Time{}, so the CDC must too, or the same
+// column has a different Go type by path.
+func isZeroTemporal(s string) bool { return strings.HasPrefix(s, "0000-00-00") }
 
 func normalize(v any) any {
 	if b, ok := v.([]byte); ok {

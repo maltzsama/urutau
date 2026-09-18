@@ -652,3 +652,49 @@ func TestNormalizeColTemporalParity(t *testing.T) {
 		t.Fatalf("date parity: got %v, want %v", got, wantDate)
 	}
 }
+
+// go-mysql returns MySQL's zero temporal as a string while the snapshot driver
+// (parseTime) returns time.Time{}; normalizeCol must make them agree, or the
+// same column has a different Go type by path.
+func TestNormalizeColZeroTemporal(t *testing.T) {
+	cols := []schema.TableColumn{
+		{Name: "d", Type: schema.TYPE_DATETIME},
+		{Name: "t", Type: schema.TYPE_TIMESTAMP},
+		{Name: "dt", Type: schema.TYPE_DATE},
+	}
+	for _, col := range cols {
+		for _, zero := range []string{"0000-00-00", "0000-00-00 00:00:00", "0000-00-00 00:00:00.000000"} {
+			got := normalizeCol(col, zero, time.UTC)
+			ts, ok := got.(time.Time)
+			if !ok || !ts.IsZero() {
+				t.Fatalf("%s zero %q = %v (%T), want time.Time{}", col.Name, zero, got, got)
+			}
+		}
+	}
+}
+
+// Snapshot and CDC must agree even for a TIMESTAMP whose instant falls in a
+// different DST period than "now": the snapshot does not freeze an offset (it
+// re-tags/keeps the instant in the IANA location), so both paths preserve the
+// instant. A fixed session offset (time.Now()) would shift it by the DST delta.
+func TestTemporalParityAcrossDST(t *testing.T) {
+	loc, err := time.LoadLocation("America/Sao_Paulo")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	// 2018-12-15: São Paulo observed DST (-02:00).
+	instant := time.Date(2018, 12, 15, 15, 0, 0, 0, time.UTC)
+
+	snapTS := normalizeSnapshot(instant, "TIMESTAMP", loc).(time.Time)
+	cdcTS := normalizeCol(schema.TableColumn{Name: "t", Type: schema.TYPE_TIMESTAMP}, instant, loc).(time.Time)
+	if !snapTS.Equal(instant) || !cdcTS.Equal(instant) || !snapTS.Equal(cdcTS) {
+		t.Fatalf("DST timestamp parity: snap=%v cdc=%v instant=%v", snapTS, cdcTS, instant)
+	}
+
+	wall := time.Date(2018, 12, 15, 12, 0, 0, 0, time.UTC) // naive DATETIME, parsed in UTC
+	snapDT := normalizeSnapshot(wall, "DATETIME", loc).(time.Time)
+	cdcDT := normalizeCol(schema.TableColumn{Name: "d", Type: schema.TYPE_DATETIME}, wall, loc).(time.Time)
+	if !snapDT.Equal(cdcDT) {
+		t.Fatalf("DST datetime parity: snap=%v cdc=%v", snapDT, cdcDT)
+	}
+}

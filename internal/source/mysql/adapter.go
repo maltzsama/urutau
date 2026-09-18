@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -24,6 +25,7 @@ type Source struct {
 	spec *spec.Spec
 	rt   source.Runtime
 	db   *sql.DB // the source's query connection (chunk SELECTs, introspection)
+	loc  *time.Location
 }
 
 func capabilities() source.Capabilities {
@@ -53,7 +55,7 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
-		return Source{spec: s, rt: rt, db: db}, nil
+		return Source{spec: s, rt: rt, db: db, loc: conn.TimeLocation()}, nil
 	}
 	if err := driver.RegisterSource("mysql", capabilities(), factory); err != nil {
 		panic(err)
@@ -88,7 +90,7 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 
 // NewChunker builds the chunk SELECT source for one table.
 func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
-	return NewChunker(a.db, source, pk, chunkSize)
+	return NewChunker(a.db, source, pk, chunkSize, a.loc)
 }
 
 // CloseQuery releases the query connection.

@@ -85,7 +85,7 @@ func TestURIAddr(t *testing.T) {
 func TestURIQueryDSN(t *testing.T) {
 	u := &URI{User: "root", Password: "secret", Host: "localhost", Port: "3306", DB: "mydb"}
 	want := "root:secret@tcp(localhost:3306)/mydb?parseTime=true&loc=UTC&time_zone=" +
-		url.QueryEscape("'"+mysqlTZOffset(time.UTC)+"'")
+		url.QueryEscape("'+00:00'")
 	got, err := u.QueryDSN()
 	if err != nil {
 		t.Fatalf("QueryDSN: %v", err)
@@ -237,8 +237,13 @@ func TestParseURITimezone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryDSN: %v", err)
 	}
-	if !strings.Contains(dsn, "loc=America%2FSao_Paulo") {
-		t.Fatalf("QueryDSN = %q, want the loc parameter", dsn)
+	// The session is pinned to UTC; the operator's zone is applied in Go, so
+	// it must NOT leak into the DSN.
+	if !strings.Contains(dsn, "loc=UTC") || !strings.Contains(dsn, "time_zone=") {
+		t.Fatalf("QueryDSN = %q, want a UTC-pinned session", dsn)
+	}
+	if strings.Contains(dsn, "Sao_Paulo") {
+		t.Fatalf("QueryDSN = %q, must not carry the operator zone", dsn)
 	}
 
 	if _, err := ParseURI("mysql://root@localhost/mydb?timezone=Not/AZone"); err == nil {
