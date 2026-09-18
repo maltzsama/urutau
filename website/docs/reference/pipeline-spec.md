@@ -36,7 +36,9 @@ tables: [ … ]               # required; at least one
 | `format` | kafka | `debezium` (default), `raw`, `avro` |
 | `schemaRegistry` | avro | Confluent-compatible registry base URL |
 
-See [Sources](sources.md) for driver-specific behavior.
+See [Sources](sources.md) for driver-specific behavior — e.g. the MySQL `uri`
+accepts `timezone` and TLS (`tls`, `ssl-ca`, `ssl-cert`, `ssl-key`,
+`ssl-server-name`) query parameters.
 
 ## `sink`
 
