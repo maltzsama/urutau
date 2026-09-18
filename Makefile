@@ -22,7 +22,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-deploy k8s-undeploy k8s-status
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-fixtures e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-deploy k8s-undeploy k8s-status
 
 all: lint test build
 
@@ -105,7 +105,11 @@ k8s-status:
 
 E2E_COMPOSE := test/e2e/docker-compose.yml
 
-e2e-up:
+# Throwaway TLS cert + SSH keys the e2e stack mounts. Git-ignored; idempotent.
+e2e-fixtures:
+	./test/e2e/postgres/gen-fixtures.sh
+
+e2e-up: e2e-fixtures
 	docker compose -f $(E2E_COMPOSE) up -d --wait
 
 e2e-down:
@@ -121,7 +125,7 @@ e2e-test-mysql: e2e-up
 	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestMySQLPipeline$$' ./test/e2e
 
 e2e-test-postgres: e2e-up
-	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestPostgresPipeline$$' ./test/e2e
+	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestPostgres' ./test/e2e
 
 e2e-test-clickhouse: e2e-up
 	URUTAU_E2E=1 $(GO) test $(E2E_FILTER) -run 'TestClickHouse' ./test/e2e

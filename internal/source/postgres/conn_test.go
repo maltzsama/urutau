@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -57,6 +58,31 @@ func TestNewSSHTunnelAddr(t *testing.T) {
 	}
 	if tr.addr != "[2001:db8::1]:22" {
 		t.Fatalf("addr = %q, want [2001:db8::1]:22", tr.addr)
+	}
+}
+
+func TestBuildConnConfigFromPostgresSSHBypassesLocalDNS(t *testing.T) {
+	kh := writeKnownHosts(t)
+	cc, err := BuildConnConfigFromPostgres(&spec.PostgresSource{
+		Host:     "db.internal",
+		Database: "db",
+		SSH:      &spec.SSHConfig{Host: "bastion", Username: "u", Password: "p", KnownHosts: kh},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.ConnConfig.DialFunc == nil {
+		t.Fatal("DialFunc must be set for an SSH source")
+	}
+	if cc.ConnConfig.LookupFunc == nil {
+		t.Fatal("LookupFunc must be set for an SSH source (pgx resolves before DialFunc)")
+	}
+	addrs, err := cc.ConnConfig.LookupFunc(context.Background(), "db.internal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addrs) != 1 || addrs[0] != "db.internal" {
+		t.Fatalf("LookupFunc = %v, want [db.internal] (no local resolution)", addrs)
 	}
 }
 

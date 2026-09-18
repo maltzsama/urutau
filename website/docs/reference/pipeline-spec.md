@@ -59,8 +59,8 @@ When present, `uri` is ignored for connection building.
 | `ssh.password` | no | SSH password |
 | `ssh.privateKey` | no | SSH private key path |
 | `ssh.passphrase` | no | Private key passphrase |
-| `maxThreads` | no | Max concurrent snapshot connections (1..32, default `runtime.NumCPU()`) |
-| `retryCount` | no | Transient-connection retries with backoff (default 3; 0 means "use the default") |
+| `maxThreads` | no | Max concurrent snapshot connections and row-normalization workers (1..32, default `runtime.NumCPU()`) |
+| `retryCount` | no | Transient-error retries with backoff for snapshot queries and replication reconnect (default 3; 0 means "use the default") |
 
 In distributed mode the worker opens the snapshot `SELECT` from a DSN rendered
 from this block. `ssl.ca`/`ssl.cert`/`ssl.key` travel as **paths**, so every
