@@ -6,6 +6,7 @@ package spec
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/maltzsama/urutau/core"
@@ -79,6 +80,116 @@ type Source struct {
 	// SchemaRegistry is the Confluent-compatible schema registry base URL
 	// (e.g. http://registry:8081), required when format is avro.
 	SchemaRegistry string `json:"schemaRegistry,omitempty"`
+	// Postgres configures a PostgreSQL source via structured fields instead
+	// of a URI. When present, uri is ignored for connection building (but
+	// slotName and snapshotUri remain flat). Nil means the source uses uri.
+	Postgres *PostgresSource `json:"postgres,omitempty"`
+}
+
+// PostgresSource holds structured PostgreSQL connection fields. When present
+// in source.postgres, these fields build the connection instead of source.uri.
+type PostgresSource struct {
+	Host     string            `json:"host,omitempty"`
+	Port     int               `json:"port,omitempty"`
+	Database string            `json:"database,omitempty"`
+	Username string            `json:"username,omitempty"`
+	Password string            `json:"password,omitempty"`
+	Params   map[string]string `json:"params,omitempty"`
+	SSL      *SSLConfig        `json:"ssl,omitempty"`
+	SSH      *SSHConfig        `json:"ssh,omitempty"`
+	// MaxThreads limits the number of concurrent connections for snapshot
+	// chunk SELECTs. 1..32, default runtime.NumCPU() (clamped to 32).
+	MaxThreads int `json:"maxThreads,omitempty"`
+	// RetryCount is the number of transient-connection retries with
+	// exponential backoff before failing. Default 3. The field is
+	// omitempty, so an explicit 0 is indistinguishable from omission and
+	// resolves to the default rather than disabling retries.
+	RetryCount int `json:"retryCount,omitempty"`
+}
+
+// SSLConfig configures TLS for the PostgreSQL connection.
+type SSLConfig struct {
+	// Mode selects the TLS behavior: "disable" (default), "require",
+	// "verify-ca", "verify-full".
+	Mode string `json:"mode,omitempty"`
+	// CA is the path to the server CA certificate PEM file (used by
+	// verify-ca and verify-full).
+	CA string `json:"ca,omitempty"`
+	// Cert is the path to the client certificate PEM file (mutual TLS).
+	Cert string `json:"cert,omitempty"`
+	// Key is the path to the client private key PEM file (mutual TLS).
+	Key string `json:"key,omitempty"`
+}
+
+// SSHConfig configures an SSH tunnel for the PostgreSQL connection.
+type SSHConfig struct {
+	Host       string `json:"host,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Username   string `json:"username,omitempty"`
+	Password   string `json:"password,omitempty"`
+	PrivateKey string `json:"privateKey,omitempty"`
+	// Passphrase decrypts the private key when encrypted. Empty means
+	// unencrypted.
+	Passphrase string `json:"passphrase,omitempty"`
+	// KnownHosts is the OpenSSH known_hosts file the bastion's host key is
+	// verified against. Empty falls back to ~/.ssh/known_hosts. Host key
+	// verification is never disabled: a missing file is an error, not a
+	// silent trust-everything.
+	KnownHosts string `json:"knownHosts,omitempty"`
+}
+
+// DSN renders the libpq keyword connection string for this structured config.
+// It lives here, on the Postgres-specific struct, so a caller that only holds
+// the spec (the coordinator, handing a snapshot DSN to a distributed worker)
+// can render the same string the source builds — without importing a concrete
+// source package past the architecture wall.
+func (p *PostgresSource) DSN() string {
+	port := p.Port
+	if port == 0 {
+		port = 5432
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "host=%s port=%d dbname=%s", quoteDSNValue(p.Host), port, quoteDSNValue(p.Database))
+	if p.Username != "" {
+		fmt.Fprintf(&b, " user=%s", quoteDSNValue(p.Username))
+	}
+	if p.Password != "" {
+		fmt.Fprintf(&b, " password=%s", quoteDSNValue(p.Password))
+	}
+	sslMode := "disable"
+	if p.SSL != nil && p.SSL.Mode != "" {
+		sslMode = p.SSL.Mode
+	}
+	fmt.Fprintf(&b, " sslmode=%s", sslMode)
+	if p.SSL != nil {
+		if p.SSL.CA != "" {
+			fmt.Fprintf(&b, " sslrootcert=%s", quoteDSNValue(p.SSL.CA))
+		}
+		if p.SSL.Cert != "" {
+			fmt.Fprintf(&b, " sslcert=%s", quoteDSNValue(p.SSL.Cert))
+		}
+		if p.SSL.Key != "" {
+			fmt.Fprintf(&b, " sslkey=%s", quoteDSNValue(p.SSL.Key))
+		}
+	}
+	for k, v := range p.Params {
+		fmt.Fprintf(&b, " %s=%s", k, quoteDSNValue(v))
+	}
+	return b.String()
+}
+
+// quoteDSNValue quotes a libpq keyword value when it contains whitespace or
+// a quote, so a password or path with spaces round-trips through a parser.
+func quoteDSNValue(v string) string {
+	if v == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(v, " '\\") {
+		return v
+	}
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `'`, `\'`)
+	return "'" + v + "'"
 }
 
 type Sink struct {

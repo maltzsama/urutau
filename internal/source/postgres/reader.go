@@ -40,6 +40,7 @@ const (
 // connection used for introspection and position reads.
 type Config struct {
 	URI      string
+	ConnCfg  *ConnConfig // resolved from nested config (nil when using URI)
 	DB       *sql.DB
 	SlotName string
 	Tables   []source.TableRef
@@ -121,9 +122,20 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		states[ref.Source] = st
 	}
 
-	connCfg, err := pgx.ParseConfig(cfg.URI)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: parse uri: %w", err)
+	var connCfg *pgx.ConnConfig
+	if cfg.ConnCfg != nil && cfg.ConnCfg.ConnConfig != nil {
+		// Deep-copy before mutating: the source's ConnConfig is shared with
+		// the query connector (stdlib.GetConnector keeps a shallow copy), so
+		// writing "replication" into the shared RuntimeParams map would leak
+		// the replication mode into every query connection — and pgx rejects
+		// the extended protocol on a replication connection.
+		connCfg = cfg.ConnCfg.ConnConfig.Copy()
+	} else {
+		var err error
+		connCfg, err = pgx.ParseConfig(cfg.URI)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: parse uri: %w", err)
+		}
 	}
 	// Logical replication speaks a variant protocol; the server must know
 	// this connection is a replication one.

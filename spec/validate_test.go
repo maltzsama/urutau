@@ -569,3 +569,256 @@ func TestValidateNestedPrimaryKeyRejected(t *testing.T) {
 		t.Fatalf("top-level pk must validate: %v", err)
 	}
 }
+
+func TestValidatePostgresSourceAccepted(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb"},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("postgres nested config must validate: %v", err)
+	}
+}
+
+func TestValidatePostgresRequiresHost(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Database: "mydb"},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "host") {
+		t.Fatalf("want host-required problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRequiresDatabase(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost"},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "database") {
+		t.Fatalf("want database-required problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsURIAndPostgres(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			URI:      "postgres://localhost/db",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb"},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("want mutually-exclusive problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsBadPort(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", Port: 99999},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "port") {
+		t.Fatalf("want port problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsBadMaxThreads(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", MaxThreads: 50},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "maxThreads") {
+		t.Fatalf("want maxThreads problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsBadSSLMode(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSL: &SSLConfig{Mode: "bogus"}},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "ssl.mode") {
+		t.Fatalf("want ssl.mode problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsSSLCertWithoutKey(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSL: &SSLConfig{Mode: "require", Cert: "/cert.pem"}},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "cert and ssl.key") {
+		t.Fatalf("want cert+key problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsSSHMissingHost(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSH: &SSHConfig{Username: "ubuntu"}},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "ssh.host") {
+		t.Fatalf("want ssh.host problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsSSHMissingAuth(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSH: &SSHConfig{Host: "bastion", Username: "ubuntu"}},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "password or privateKey") {
+		t.Fatalf("want ssh auth problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresAcceptsWithSSLAndSSH(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{
+				Host:     "localhost",
+				Database: "mydb",
+				SSL:      &SSLConfig{Mode: "verify-full", CA: "/ca.pem"},
+				SSH:      &SSHConfig{Host: "bastion", Username: "ubuntu", Password: "secret"},
+			},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("postgres with ssl+ssh must validate: %v", err)
+	}
+}
+
+func TestValidatePostgresRequiresEitherURIOrPostgres(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source:   Source{Kind: "postgres", SlotName: "test_slot"},
+		Sink:     Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables:   []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "source.uri or source.postgres") {
+		t.Fatalf("want uri-or-postgres problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresVerifyCARequiresCA(t *testing.T) {
+	for _, mode := range []string{"verify-ca", "verify-full"} {
+		s := &Spec{
+			Pipeline: "pg",
+			Source: Source{
+				Kind:     "postgres",
+				SlotName: "test_slot",
+				Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSL: &SSLConfig{Mode: mode}},
+			},
+			Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+			Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+		}
+		if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "ssl.ca") {
+			t.Fatalf("mode %q: want ssl.ca required problem, got %v", mode, err)
+		}
+	}
+}
+
+func TestValidatePostgresRequireDoesNotNeedCA(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", SSL: &SSLConfig{Mode: "require"}},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("require mode must not need a CA: %v", err)
+	}
+}
+
+func TestValidatePostgresRejectsSchemeInHost(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "postgres://localhost", Database: "mydb"},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "bare hostname") {
+		t.Fatalf("want bare-hostname problem, got %v", err)
+	}
+}
+
+func TestValidatePostgresBlockRejectedForOtherKinds(t *testing.T) {
+	s := validSpec() // mysql source
+	s.Source.URI = ""
+	s.Source.Postgres = &PostgresSource{Host: "localhost", Database: "mydb"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "only valid for kind postgres") {
+		t.Fatalf("want kind rejection, got %v", err)
+	}
+}

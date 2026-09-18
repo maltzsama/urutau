@@ -101,6 +101,22 @@ urutau-worker run --coordinator urutau-coordinator:50051 \
   --tls-cert client.crt --tls-key client.key --tls-ca ca.crt
 ```
 
+## Source credentials and files on workers
+
+The worker owns the snapshot chunk `SELECT`, so the coordinator sends it a
+**source DSN** — credentials included. Two consequences for a structured
+`source.postgres` block:
+
+- **TLS material is sent as paths, not contents.** The DSN carries
+  `sslrootcert`/`sslcert`/`sslkey` (from `ssl.ca`/`ssl.cert`/`ssl.key`), so
+  every worker must mount those files at the **same paths** as the
+  coordinator. Otherwise the assignment validates but the snapshot
+  connection fails. Mount them from the same Secret/volume on both.
+- **SSH tunnels are not supported in distributed mode.** A DSN cannot carry
+  the tunnel, and the worker would connect directly to the database. Set
+  `source.snapshotUri` to a directly reachable read-only URI (or use the
+  collapsed runner). The coordinator rejects the combination otherwise.
+
 ## Supervision and resets
 
 A worker that stops acking is not silently dropped. If a worker goes

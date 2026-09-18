@@ -5,8 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/driver"
@@ -20,9 +21,10 @@ import (
 // Source adapts the Postgres pgoutput reader to the source contract. It is
 // the self-contained driver entry point; init() registers the kind.
 type Source struct {
-	spec *spec.Spec
-	rt   source.Runtime
-	db   *sql.DB // the source's query connection (chunk SELECTs, introspection)
+	spec    *spec.Spec
+	rt      source.Runtime
+	db      *sql.DB     // the source's query connection (chunk SELECTs, introspection)
+	connCfg *ConnConfig // resolved connection config (nil when using URI)
 }
 
 func capabilities() source.Capabilities {
@@ -40,11 +42,28 @@ func capabilities() source.Capabilities {
 
 func init() {
 	factory := func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
-		db, err := sql.Open("pgx", s.Source.URI)
-		if err != nil {
-			return nil, err
+		var cc *ConnConfig
+		var err error
+		if s.Source.Postgres != nil {
+			cc, err = BuildConnConfigFromPostgres(s.Source.Postgres)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			cc, err = BuildConnConfig(s.Source.URI)
+			if err != nil {
+				return nil, err
+			}
 		}
-		return Source{spec: s, rt: rt, db: db}, nil
+		// Open the query connection through the SAME ConnConfig as the
+		// replication reader, so TLS and the SSH tunnel apply to both.
+		// sql.Open("pgx", dsn) would drop the DialFunc (no SSH) and rebuild
+		// TLS from the DSN alone; stdlib.GetConnector keeps the native config.
+		db := sql.OpenDB(stdlib.GetConnector(*cc.ConnConfig))
+		if cc.MaxOpenConns > 0 {
+			db.SetMaxOpenConns(cc.MaxOpenConns)
+		}
+		return Source{spec: s, rt: rt, db: db, connCfg: cc}, nil
 	}
 	if err := driver.RegisterSource("postgres", capabilities(), factory); err != nil {
 		panic(err)
@@ -82,12 +101,18 @@ func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource
 	return NewChunker(a.db, source, pk, chunkSize)
 }
 
-// CloseQuery releases the query connection.
+// CloseQuery releases the query connection and tears down the SSH tunnel.
 func (a Source) CloseQuery() error {
+	var err error
 	if a.db != nil {
-		return a.db.Close()
+		err = a.db.Close()
 	}
-	return nil
+	if a.connCfg != nil {
+		if cerr := a.connCfg.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 // Open builds the replication reader over the pipeline's tables.
@@ -96,17 +121,51 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if slot == "" {
 		return nil, fmt.Errorf("postgres: source requires slotName")
 	}
-	out := make(chan rowchange.Change, 1024)
-	rdr, err := New(ctx, Config{
-		URI:      a.spec.Source.URI,
-		DB:       a.db,
-		SlotName: slot,
-		Tables:   refs,
-		Logger:   a.rt.Logger,
-	}, out)
-	if err != nil {
-		return nil, err
+
+	// Determine the replication URI and retry budget.
+	uri := a.spec.Source.URI
+	maxRetries := 0
+	if a.connCfg != nil {
+		uri = a.connCfg.QueryURI
+		maxRetries = a.connCfg.RetryCount
 	}
+
+	// One channel for the whole reader life: New writes into it and the
+	// returned stream pulls from it. Creating it per attempt would orphan
+	// the reader's output on the attempt that succeeds.
+	out := make(chan rowchange.Change, 1024)
+	var rdr *Reader
+	var err error
+	for attempt := 0; ; attempt++ {
+		rdr, err = New(ctx, Config{
+			URI:      uri,
+			ConnCfg:  a.connCfg,
+			DB:       a.db,
+			SlotName: slot,
+			Tables:   refs,
+			Logger:   a.rt.Logger,
+		}, out)
+		if err == nil {
+			break
+		}
+		// Retry only transient failures: a permanent error (bad password,
+		// missing database) is not going to heal with backoff.
+		if !isTransient(err) || attempt >= maxRetries {
+			return nil, fmt.Errorf("postgres: open (after %d retries): %w", attempt, err)
+		}
+		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		a.rt.Logger.Warn("postgres: connection failed, retrying",
+			"attempt", attempt+1, "backoff", backoff, "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+
 	puller := sourcepull.New(out)
 	// Introspect each table so live batches encode against the canonical
 	// schema — a stable shape per table, never a per-drain inference.

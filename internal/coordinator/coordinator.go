@@ -1840,13 +1840,17 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 	c.mu.Lock()
 	epoch := w.epoch
 	c.mu.Unlock()
+	dsn, err := c.snapshotDSN()
+	if err != nil {
+		return nil, err
+	}
 	assign := &pb.Assignment{
 		WorkerName: w.name,
 		Epoch:      epoch,
 		RunId:      c.runID,
 		Ticket:     w.ticket,
 		SourceKind: c.cfg.Spec.Source.Kind,
-		SourceDsn:  c.snapshotDSN(),
+		SourceDsn:  dsn,
 		ChunkSize:  uint32(c.cfg.ChunkSize),
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
@@ -1944,14 +1948,31 @@ func writeModeToPB(m dataplane.WriteMode) pb.WriteMode {
 // the write path); the coordinator must not diverge from the runner.
 // snapshotDSN returns the connection string the WORKER uses for the snapshot
 // chunk SELECT: the scoped read-only SnapshotURI when set, else the full
-// source URI (pre-scoping behavior). The worker never opens a replication
-// connection, so a deployment can grant it a SELECT-only user and keep the
-// replication credential coordinator-side (D-CD1).
-func (c *Coordinator) snapshotDSN() string {
+// source URI (pre-scoping behavior). When the source is configured with the
+// structured source.postgres block instead of a URI, the block is rendered to
+// its libpq DSN here so the worker — which only receives kind + dsn — can
+// still open the query connection.
+//
+// An SSH-tunneled structured source is rejected: a DSN cannot carry the SSH
+// DialFunc, so the worker would connect directly to the database and fail.
+// The operator must set a directly reachable snapshotUri for that case (or
+// wait for the worker-side tunnel, issue #170). The worker never opens a
+// replication connection, so a deployment can grant it a SELECT-only user and
+// keep the replication credential coordinator-side (D-CD1).
+func (c *Coordinator) snapshotDSN() (string, error) {
 	if u := c.cfg.Spec.Source.SnapshotURI; u != "" {
-		return u
+		return u, nil
 	}
-	return c.cfg.Spec.Source.URI
+	if u := c.cfg.Spec.Source.URI; u != "" {
+		return u, nil
+	}
+	if pg := c.cfg.Spec.Source.Postgres; pg != nil {
+		if pg.SSH != nil {
+			return "", fmt.Errorf("coordinator: source.postgres.ssh is not supported in distributed mode — the worker cannot establish the tunnel from a DSN; set source.snapshotUri to a directly reachable read-only URI (see issue #170)")
+		}
+		return pg.DSN(), nil
+	}
+	return "", nil
 }
 
 // surfaceWarnings logs the advisory warnings from source introspection and

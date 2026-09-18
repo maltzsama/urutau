@@ -93,8 +93,18 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 			problems = append(problems, "source.schemaRegistry: required when format is avro (Confluent-compatible registry base URL)")
 		}
 	}
-	if !o.credentialsFromEnv && s.Source.URI == "" {
-		problems = append(problems, "source.uri: required")
+	if s.Source.Postgres != nil && s.Source.Kind != "postgres" {
+		problems = append(problems, "source.postgres: only valid for kind postgres")
+	}
+	if !o.credentialsFromEnv && s.Source.URI == "" &&
+		(s.Source.Kind != "postgres" || s.Source.Postgres == nil) {
+		problems = append(problems, "source.uri or source.postgres: required")
+	}
+	if s.Source.URI != "" && s.Source.Postgres != nil {
+		problems = append(problems, "source.uri and source.postgres: mutually exclusive — use one or the other")
+	}
+	if s.Source.Postgres != nil {
+		validatePostgresSource(s.Source.Postgres, &problems)
 	}
 
 	if !o.credentialsFromEnv && s.Sink.URI == "" {
@@ -720,5 +730,65 @@ func validatePredicate(p *Predicate, path string, problems *[]string) {
 		*problems = append(*problems, path+".op: required")
 	default:
 		*problems = append(*problems, fmt.Sprintf("%s.op: unknown %q", path, p.Op))
+	}
+}
+
+// validatePostgresSource checks the structured PostgreSQL source config.
+func validatePostgresSource(pg *PostgresSource, problems *[]string) {
+	if pg.Host == "" {
+		*problems = append(*problems, "source.postgres.host: required")
+	} else if strings.Contains(pg.Host, "://") || strings.ContainsAny(pg.Host, "/ \t") {
+		*problems = append(*problems, "source.postgres.host: must be a bare hostname or IP (no scheme, path, or whitespace)")
+	}
+	if pg.Database == "" {
+		*problems = append(*problems, "source.postgres.database: required")
+	}
+	if pg.Port != 0 && (pg.Port < 1 || pg.Port > 65535) {
+		*problems = append(*problems, "source.postgres.port: must be 1..65535")
+	}
+	if pg.MaxThreads != 0 && (pg.MaxThreads < 1 || pg.MaxThreads > 32) {
+		*problems = append(*problems, "source.postgres.maxThreads: must be 1..32")
+	}
+	if pg.RetryCount < 0 {
+		*problems = append(*problems, "source.postgres.retryCount: must be non-negative")
+	}
+	if pg.SSL != nil {
+		validateSSLConfig(pg.SSL, problems)
+	}
+	if pg.SSH != nil {
+		validateSSHConfig(pg.SSH, problems)
+	}
+}
+
+func validateSSLConfig(ssl *SSLConfig, problems *[]string) {
+	switch ssl.Mode {
+	case "", "disable", "require", "verify-ca", "verify-full":
+	default:
+		*problems = append(*problems, fmt.Sprintf(
+			"source.postgres.ssl.mode: unsupported %q (want disable | require | verify-ca | verify-full)", ssl.Mode))
+	}
+	// verify-ca/verify-full cannot verify the server without a CA to verify
+	// against. (require skips verification, so it needs none.)
+	if (ssl.Mode == "verify-ca" || ssl.Mode == "verify-full") && ssl.CA == "" {
+		*problems = append(*problems, fmt.Sprintf(
+			"source.postgres.ssl.ca: required when mode is %q", ssl.Mode))
+	}
+	if (ssl.Cert != "" || ssl.Key != "") && (ssl.Cert == "" || ssl.Key == "") {
+		*problems = append(*problems, "source.postgres.ssl.cert and ssl.key must be set together")
+	}
+}
+
+func validateSSHConfig(ssh *SSHConfig, problems *[]string) {
+	if ssh.Host == "" {
+		*problems = append(*problems, "source.postgres.ssh.host: required")
+	}
+	if ssh.Port != 0 && (ssh.Port < 1 || ssh.Port > 65535) {
+		*problems = append(*problems, "source.postgres.ssh.port: must be 1..65535")
+	}
+	if ssh.Username == "" {
+		*problems = append(*problems, "source.postgres.ssh.username: required")
+	}
+	if ssh.Password == "" && ssh.PrivateKey == "" {
+		*problems = append(*problems, "source.postgres.ssh: password or privateKey required")
 	}
 }

@@ -25,7 +25,7 @@ tables: [ … ]               # required; at least one
 | Field | Required | Notes |
 | --- | --- | --- |
 | `kind` | yes | Registered driver: `mysql`, `postgres`, `kafka` |
-| `uri` | yes | Connection string: a MySQL/Postgres DSN, or the Kafka broker list. On Kubernetes, filled from `URUTAU_SOURCE_URI` |
+| `uri` | yes* | Connection string: a MySQL/Postgres DSN, or the Kafka broker list. On Kubernetes, filled from `URUTAU_SOURCE_URI`. *Mutually exclusive with `postgres` |
 | `snapshotUri` | no | Read-only URI for the snapshot `SELECT`; lets a worker run as a SELECT-only user. Falls back to `uri` |
 | `serverId` | mysql | Replication server id (string holding a `uint32`). Must be unique per MySQL instance |
 | `slotName` | postgres | Logical replication slot; required for Postgres |
@@ -34,6 +34,39 @@ tables: [ … ]               # required; at least one
 | `partitionedByPrimaryKey` | kafka | Assert the topics are key-partitioned; required for `upsert` |
 | `format` | kafka | `debezium` (default), `raw`, `avro` |
 | `schemaRegistry` | avro | Confluent-compatible registry base URL |
+| `postgres` | postgres | Structured connection fields (alternative to `uri`). See below |
+
+### `source.postgres`
+
+Structured PostgreSQL connection config. Mutually exclusive with `source.uri`.
+When present, `uri` is ignored for connection building.
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `host` | yes | Database hostname |
+| `port` | no | Port (default 5432) |
+| `database` | yes | Database name |
+| `username` | no | Connection user |
+| `password` | no | Connection password |
+| `params` | no | Extra DSN key-value pairs (e.g. `application_name`) |
+| `ssl.mode` | no | `disable` (default), `require`, `verify-ca`, `verify-full` |
+| `ssl.ca` | no | Server CA certificate PEM path |
+| `ssl.cert` | no | Client certificate PEM path (mutual TLS) |
+| `ssl.key` | no | Client private key PEM path (mutual TLS) |
+| `ssh.host` | no | SSH bastion hostname |
+| `ssh.port` | no | SSH port (default 22) |
+| `ssh.username` | no | SSH user |
+| `ssh.password` | no | SSH password |
+| `ssh.privateKey` | no | SSH private key path |
+| `ssh.passphrase` | no | Private key passphrase |
+| `maxThreads` | no | Max concurrent snapshot connections (1..32, default `runtime.NumCPU()`) |
+| `retryCount` | no | Transient-connection retries with backoff (default 3; 0 means "use the default") |
+
+In distributed mode the worker opens the snapshot `SELECT` from a DSN rendered
+from this block. `ssl.ca`/`ssl.cert`/`ssl.key` travel as **paths**, so every
+worker must mount those files at the same paths as the coordinator; `ssh` is
+not supported in distributed mode — set `snapshotUri` to a directly reachable
+read-only URI. See [Distributed mode](../guides/distributed.md#source-credentials-and-files-on-workers).
 
 See [Sources](../sources/index.md) for driver-specific behavior — e.g. the MySQL `uri`
 accepts `timezone` and TLS (`tls`, `ssl-ca`, `ssl-cert`, `ssl-key`,

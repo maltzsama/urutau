@@ -193,13 +193,46 @@ func TestSnapshotDSNPrefersScopedURI(t *testing.T) {
 		URI:         "mysql://repl:secret@db/repl",
 		SnapshotURI: "mysql://readonly@db/ro",
 	}}}}
-	if got := c.snapshotDSN(); got != "mysql://readonly@db/ro" {
+	got, err := c.snapshotDSN()
+	if err != nil {
+		t.Fatalf("snapshotDSN: %v", err)
+	}
+	if got != "mysql://readonly@db/ro" {
 		t.Fatalf("snapshotDSN = %q, want the scoped read-only URI", got)
 	}
 	// Fallback when unset: the pre-scoping behavior.
 	c2 := &Coordinator{cfg: Config{Spec: &spec.Spec{Source: spec.Source{URI: "mysql://repl@db/repl"}}}}
-	if got := c2.snapshotDSN(); got != "mysql://repl@db/repl" {
+	got, err = c2.snapshotDSN()
+	if err != nil {
+		t.Fatalf("snapshotDSN: %v", err)
+	}
+	if got != "mysql://repl@db/repl" {
 		t.Fatalf("snapshotDSN fallback = %q, want the source URI", got)
+	}
+}
+
+// A structured postgres source renders its block to a DSN for the worker, but
+// an SSH-tunneled one is rejected: the worker cannot build the tunnel from a
+// DSN.
+func TestSnapshotDSNPostgres(t *testing.T) {
+	c := &Coordinator{cfg: Config{Spec: &spec.Spec{Source: spec.Source{
+		Kind:     "postgres",
+		Postgres: &spec.PostgresSource{Host: "db.internal", Database: "shop"},
+	}}}}
+	got, err := c.snapshotDSN()
+	if err != nil {
+		t.Fatalf("snapshotDSN: %v", err)
+	}
+	if !strings.Contains(got, "host=db.internal") || !strings.Contains(got, "dbname=shop") {
+		t.Fatalf("snapshotDSN = %q, want the rendered postgres DSN", got)
+	}
+
+	c2 := &Coordinator{cfg: Config{Spec: &spec.Spec{Source: spec.Source{
+		Kind:     "postgres",
+		Postgres: &spec.PostgresSource{Host: "db.internal", Database: "shop", SSH: &spec.SSHConfig{Host: "bastion", Username: "u", Password: "p"}},
+	}}}}
+	if _, err := c2.snapshotDSN(); err == nil || !strings.Contains(err.Error(), "ssh") {
+		t.Fatalf("want ssh rejection, got %v", err)
 	}
 }
 
