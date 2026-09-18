@@ -51,10 +51,11 @@ type Config struct {
 	// RetryCount is the transient-error reconnect budget for the
 	// replication stream (#166). 0 disables reconnect.
 	RetryCount int
-	// Projections is the per-source read projection (#162/#163), keyed by
-	// "schema.table". Applied to decoded rows before they enter the Arrow
-	// hot-path.
-	Projections map[string]Projection
+	// Filters and Columns are the per-source read projection (#162/#163),
+	// keyed by "schema.table". The reader compiles the filter with the
+	// introspected column types, so numeric columns compare numerically.
+	Filters map[string]*spec.Filter
+	Columns map[string][]string
 }
 
 // Projection is a table's source-side read projection: the columns to emit
@@ -66,16 +67,14 @@ type Projection struct {
 }
 
 // newProjection builds a projection, compiling the structured filter (#163)
-// to an expr program once per table.
-func newProjection(columns []string, f *spec.Filter) (Projection, error) {
+// to an expr program once per table, using the introspected column types.
+func newProjection(columns []string, f *spec.Filter, st *TableState) (Projection, error) {
 	p := Projection{Columns: columns}
-	if f != nil {
-		prog, err := compileFilterExpr(f)
-		if err != nil {
-			return Projection{}, err
-		}
-		p.program = prog
+	prog, err := compileFilterExpr(f, st)
+	if err != nil {
+		return Projection{}, err
 	}
+	p.program = prog
 	return p, nil
 }
 
@@ -193,6 +192,22 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		states[ref.Source] = st
 	}
 
+	// Compile the per-table read projection with the introspected column
+	// types, so a numeric column compares numerically.
+	projections := make(map[string]Projection, len(cfg.Tables))
+	for _, ref := range cfg.Tables {
+		cols := cfg.Columns[ref.Source]
+		f := cfg.Filters[ref.Source]
+		if len(cols) == 0 && f == nil {
+			continue
+		}
+		p, perr := newProjection(cols, f, states[ref.Source])
+		if perr != nil {
+			return nil, fmt.Errorf("postgres: reader: projection %s: %w", ref.Source, perr)
+		}
+		projections[ref.Source] = p
+	}
+
 	var connCfg *pgx.ConnConfig
 	if cfg.ConnCfg != nil && cfg.ConnCfg.ConnConfig != nil {
 		// Deep-copy before mutating: the source's ConnConfig is shared with
@@ -226,7 +241,7 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		bySrc:       bySrc,
 		states:      states,
 		relByID:     map[uint32]relEntry{},
-		projections: cfg.Projections,
+		projections: projections,
 		synced:      position.MustLSN("0/0"),
 	}, nil
 }

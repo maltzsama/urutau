@@ -90,9 +90,14 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 			pk = append(pk, st.Columns[idx].Name)
 		}
 	}
-	// A column projection must keep every key column: the sink resolves the
-	// key and sort order by column name. Declared keys are checked at spec
-	// validation; this catches a key the source introspects.
+	// A column projection must name real columns and keep every key column:
+	// the sink resolves the key and sort order by column name, and the
+	// snapshot SELECT uses the projection verbatim. Declared keys are checked
+	// at spec validation; this catches a typo and a key the source
+	// introspects.
+	if err := checkColumnFilterExists(st, t.ColumnFilter); err != nil {
+		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
+	}
 	if err := checkColumnFilterCoversPK(t.ColumnFilter, pk); err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
 	}
@@ -102,6 +107,20 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	}
 	cs = filterSchemaColumns(cs, t.ColumnFilter)
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
+}
+
+// checkColumnFilterExists reports an error when a projected column is not in
+// the source table. A typo would otherwise silently narrow the target schema
+// (filterSchemaColumns drops unknown names) and then fail the snapshot with an
+// unknown-column SQL error — or, with a snapshot-skipping bootstrap, leave the
+// requested column silently absent.
+func checkColumnFilterExists(st *TableState, columnFilter []string) error {
+	for _, c := range columnFilter {
+		if st.FindColumn(c) < 0 {
+			return fmt.Errorf("columnFilter %q not found in the source table", c)
+		}
+	}
+	return nil
 }
 
 // checkColumnFilterCoversPK reports an error when a primary-key column is not
@@ -223,23 +242,21 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	// One channel for the whole reader life: New writes into it and the
 	// returned stream pulls from it. Creating it per attempt would orphan
 	// the reader's output on the attempt that succeeds.
-	projections, perr := a.projectionsFor(refs)
-	if perr != nil {
-		return nil, perr
-	}
+	filters, columns := a.filtersColumnsFor(refs)
 	out := make(chan rowchange.Change, 1024)
 	var rdr *Reader
 	var err error
 	for attempt := 0; ; attempt++ {
 		rdr, err = New(ctx, Config{
-			URI:         uri,
-			ConnCfg:     a.connCfg,
-			DB:          a.db,
-			SlotName:    slot,
-			Tables:      refs,
-			Logger:      a.rt.Logger,
-			RetryCount:  maxRetries,
-			Projections: projections,
+			URI:        uri,
+			ConnCfg:    a.connCfg,
+			DB:         a.db,
+			SlotName:   slot,
+			Tables:     refs,
+			Logger:     a.rt.Logger,
+			RetryCount: maxRetries,
+			Filters:    filters,
+			Columns:    columns,
 		}, out)
 		if err == nil {
 			break
@@ -279,6 +296,9 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 				return nil, fmt.Errorf("postgres: schema %s: %w", ref.Source, serr)
 			}
 			if t, ok := a.tableFor(ref.Source); ok {
+				if cerr := checkColumnFilterExists(st, t.ColumnFilter); cerr != nil {
+					return nil, fmt.Errorf("postgres: %s: %w", ref.Source, cerr)
+				}
 				cs = filterSchemaColumns(cs, t.ColumnFilter)
 			}
 			schemas[ref.Target] = cs
@@ -288,25 +308,31 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	return stream{Reader: rdr, out: out, Puller: puller}, nil
 }
 
-// projectionsFor builds the per-source read projection map (#162/#163) for
-// the tables the reader streams.
-func (a Source) projectionsFor(refs []source.TableRef) (map[string]Projection, error) {
-	var out map[string]Projection
+// filtersColumnsFor builds the per-source filter and column projection maps
+// (#162/#163) for the tables the reader streams. The reader compiles the
+// filter with the introspected column types.
+func (a Source) filtersColumnsFor(refs []source.TableRef) (map[string]*spec.Filter, map[string][]string) {
+	var filters map[string]*spec.Filter
+	var columns map[string][]string
 	for _, ref := range refs {
 		t, ok := a.tableFor(ref.Source)
-		if !ok || (len(t.ColumnFilter) == 0 && t.Filter == nil) {
+		if !ok {
 			continue
 		}
-		if out == nil {
-			out = make(map[string]Projection, len(refs))
+		if len(t.ColumnFilter) > 0 {
+			if columns == nil {
+				columns = make(map[string][]string, len(refs))
+			}
+			columns[ref.Source] = t.ColumnFilter
 		}
-		p, err := newProjection(t.ColumnFilter, t.Filter)
-		if err != nil {
-			return nil, fmt.Errorf("postgres: projection %s: %w", ref.Source, err)
+		if t.Filter != nil {
+			if filters == nil {
+				filters = make(map[string]*spec.Filter, len(refs))
+			}
+			filters[ref.Source] = t.Filter
 		}
-		out[ref.Source] = p
 	}
-	return out, nil
+	return filters, columns
 }
 
 // InitialPosition returns the slot's confirmed LSN: a first boot starts

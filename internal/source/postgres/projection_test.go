@@ -10,7 +10,7 @@ import (
 func TestProjectionKeepAndProject(t *testing.T) {
 	p, err := newProjection([]string{"id", "name"}, &spec.Filter{
 		Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "active"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,5 +82,18 @@ func TestCheckColumnFilterCoversPK(t *testing.T) {
 	}
 	if err := checkColumnFilterCoversPK([]string{"name"}, []string{"id"}); err == nil {
 		t.Fatal("want an error when the key column is excluded")
+	}
+}
+
+func TestCheckColumnFilterExists(t *testing.T) {
+	st := &TableState{Columns: []Column{{Name: "id"}, {Name: "name"}}}
+	if err := checkColumnFilterExists(st, []string{"id", "name"}); err != nil {
+		t.Fatalf("known columns: %v", err)
+	}
+	if err := checkColumnFilterExists(st, nil); err != nil {
+		t.Fatalf("no filter: %v", err)
+	}
+	if err := checkColumnFilterExists(st, []string{"id", "nope"}); err == nil {
+		t.Fatal("want an error for an unknown projected column")
 	}
 }

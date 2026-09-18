@@ -50,7 +50,21 @@ func TestFilterToSquirrel(t *testing.T) {
 	}
 }
 
+func testFilterState() *TableState {
+	return &TableState{
+		Schema: "public",
+		Name:   "orders",
+		Columns: []Column{
+			{Name: "status", DataType: "text"},
+			{Name: "amount", DataType: "numeric"},
+			{Name: "active", DataType: "boolean"},
+			{Name: "note", DataType: "text"},
+		},
+	}
+}
+
 func TestProjectionFilterExpr(t *testing.T) {
+	st := testFilterState()
 	row := map[string]any{
 		"status": "active",
 		"amount": int64(150),
@@ -85,7 +99,7 @@ func TestProjectionFilterExpr(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			p, err := newProjection(nil, c.f)
+			p, err := newProjection(nil, c.f, st)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -97,5 +111,61 @@ func TestProjectionFilterExpr(t *testing.T) {
 				t.Fatalf("keep = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// A NULL column must never satisfy neq / not_in / not(...), matching SQL's
+// three-valued logic (the snapshot WHERE excludes it, so CDC must too).
+func TestFilterExprNullSemantics(t *testing.T) {
+	st := testFilterState()
+	row := map[string]any{"status": nil}
+	cases := []*spec.Filter{
+		{Predicate: &spec.Predicate{Column: "status", Op: spec.OpNeq, Value: "x"}},
+		{Predicate: &spec.Predicate{Column: "status", Op: spec.OpNotIn, Value: []any{"x"}}},
+		{Not: &spec.Filter{Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "x"}}},
+		{Not: &spec.Filter{All: []spec.Filter{
+			{Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "x"}},
+		}}},
+	}
+	for i, f := range cases {
+		p, err := newProjection(nil, f, st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := p.keep(row)
+		if err != nil {
+			t.Fatalf("case %d: %v", i, err)
+		}
+		if got {
+			t.Fatalf("case %d: NULL column must not satisfy the predicate", i)
+		}
+	}
+}
+
+// A numeric column is decoded as a decimal string; a numeric filter must
+// still compare numerically, not lexically or with a type error.
+func TestFilterExprNumericColumn(t *testing.T) {
+	st := testFilterState()
+	p, err := newProjection(nil, &spec.Filter{
+		Predicate: &spec.Predicate{Column: "amount", Op: spec.OpGt, Value: float64(100)},
+	}, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		val  string
+		want bool
+	}{
+		{"150.00", true},  // 150 > 100
+		{"9.00", false},   // lexical "9" > "100" would be true; numeric is false
+		{"100.00", false}, // not strictly greater
+	} {
+		got, err := p.keep(map[string]any{"amount": tc.val})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.val, err)
+		}
+		if got != tc.want {
+			t.Fatalf("amount=%s: keep=%v, want %v", tc.val, got, tc.want)
+		}
 	}
 }
