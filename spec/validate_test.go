@@ -505,7 +505,7 @@ func TestValidateAvroFormat(t *testing.T) {
 	s.Source.Kind = "kafka"
 	s.Tables[0].WriteMode = WriteModeAppend
 	s.Tables[0].OnDelete = OnDeleteSkip
-	s.Tables[0].Columns = map[string]ColumnDecl{"payload": {Scalar: "string"}}
+	s.Tables[0].Columns = map[string]ColumnDecl{"id": {Scalar: "string"}}
 	s.Source.Format = "avro"
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "schemaRegistry") {
 		t.Fatalf("want schemaRegistry problem, got %v", err)
@@ -518,6 +518,43 @@ func TestValidateAvroFormat(t *testing.T) {
 	s.Source.Kind = "mysql"
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "avro") {
 		t.Fatalf("want avro-kind problem, got %v", err)
+	}
+}
+
+// The pre-decode Avro bytes are Confluent wire format, not an independently
+// readable value — unlike raw's opt-in payload column, there is nothing to
+// land under that name.
+func TestValidateAvroRejectsPayloadColumn(t *testing.T) {
+	s := validSpec()
+	s.Source.Kind = "kafka"
+	s.Source.Format = "avro"
+	s.Source.SchemaRegistry = "http://registry:8081"
+	s.Tables[0].WriteMode = WriteModeAppend
+	s.Tables[0].OnDelete = OnDeleteSkip
+	s.Tables[0].Columns = map[string]ColumnDecl{"payload": {Scalar: "string"}}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "payload") {
+		t.Fatalf("want a payload-column problem, got %v", err)
+	}
+}
+
+// from/required extraction attributes are meaningless outside kafka
+// raw/avro: a SQL source introspects its own columns, and debezium already
+// interprets the whole envelope.
+func TestValidateExtractionAttributesRequireKafkaRawOrAvro(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].Columns = map[string]ColumnDecl{
+		"id": {Scalar: "int64", Required: true},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "from/required") {
+		t.Fatalf("want a from/required problem for a non-kafka source, got %v", err)
+	}
+
+	s.Source.Kind = "kafka"
+	s.Source.Format = "raw"
+	s.Tables[0].WriteMode = WriteModeAppend
+	s.Tables[0].OnDelete = OnDeleteSkip
+	if err := s.Validate(); err != nil {
+		t.Fatalf("required must validate for kafka raw: %v", err)
 	}
 }
 

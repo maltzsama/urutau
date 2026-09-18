@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"sync"
 	"testing"
 
@@ -145,6 +146,92 @@ func TestAvroDecodeBadWireFormat(t *testing.T) {
 	_, err := d.Decode(&kgo.Record{Value: []byte("no header here")})
 	if _, ok := err.(*ErrBadWireFormat); !ok {
 		t.Fatalf("err = %v, want ErrBadWireFormat", err)
+	}
+}
+
+// Declaring ByTopic[topic] selects a subset of the record for that topic —
+// the registry schema says what exists, the spec says what to keep.
+func TestAvroDecoderProjectsDeclaredFields(t *testing.T) {
+	reg := newFakeRegistry()
+	reg.add(1, orderAvroSchema)
+	d := NewAvroDecoder(reg)
+	d.ByTopic = map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "id"}, {Name: "order_total", Path: "cust.age"}}},
+	}
+
+	payload := encode(t, orderAvroSchema, map[string]any{
+		"id":   int64(1),
+		"cust": map[string]any{"name": "ana", "age": int64(30)},
+		"tags": []any{"a"},
+		"note": nil,
+	})
+	changes, err := d.Decode(&kgo.Record{Topic: "orders", Value: confluentValue(1, payload)})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	after := changes[0].After
+	if len(after) != 2 {
+		t.Fatalf("after = %v, want exactly the 2 declared columns", after)
+	}
+	if after["id"] != int64(1) {
+		t.Errorf("id = %v, want 1", after["id"])
+	}
+	if after["order_total"] != int64(30) {
+		t.Errorf("order_total = %v, want 30 (from cust.age)", after["order_total"])
+	}
+	if _, ok := after["cust"]; ok {
+		t.Error("cust must be dropped: it was not declared")
+	}
+	if _, ok := after["tags"]; ok {
+		t.Error("tags must be dropped: it was not declared")
+	}
+}
+
+// A topic absent from ByTopic keeps every decoded field, even when other
+// topics on the same decoder project a subset.
+func TestAvroDecoderUndeclaredTopicKeepsEveryField(t *testing.T) {
+	reg := newFakeRegistry()
+	reg.add(1, orderAvroSchema)
+	d := NewAvroDecoder(reg)
+	d.ByTopic = map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "id"}}},
+	}
+
+	payload := encode(t, orderAvroSchema, map[string]any{
+		"id":   int64(1),
+		"cust": map[string]any{"name": "ana", "age": int64(1)},
+		"tags": []any{"a"},
+		"note": nil,
+	})
+	changes, err := d.Decode(&kgo.Record{Topic: "clicks", Value: confluentValue(1, payload)})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := changes[0].After["cust"]; !ok {
+		t.Error("clicks is not declared, so every field must be kept")
+	}
+}
+
+// A required field the registry schema does not have fails the record — the
+// same failure Raw gets, reached through the schema instead of the payload.
+func TestAvroDecoderProjectionRequiredFieldMissingFails(t *testing.T) {
+	reg := newFakeRegistry()
+	reg.add(1, orderAvroSchema)
+	d := NewAvroDecoder(reg)
+	d.ByTopic = map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "does_not_exist", Required: true}}},
+	}
+
+	payload := encode(t, orderAvroSchema, map[string]any{
+		"id":   int64(1),
+		"cust": map[string]any{"name": "ana", "age": int64(1)},
+		"tags": []any{},
+		"note": nil,
+	})
+	_, err := d.Decode(&kgo.Record{Topic: "orders", Value: confluentValue(1, payload)})
+	var missing *ErrFieldMissing
+	if !errors.As(err, &missing) {
+		t.Fatalf("err = %v, want *ErrFieldMissing", err)
 	}
 }
 

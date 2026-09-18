@@ -145,13 +145,19 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	})
 	switch s.Spec.Source.Format {
 	case "raw":
-		dec = &decoder.Raw{}
+		dec = &decoder.Raw{
+			ByTopic: extractionByTopic(s.Spec, "payload"),
+			Miss:    s.missLogger(),
+		}
 	case "avro":
 		if s.Spec.Source.SchemaRegistry == "" {
 			client.Close()
 			return nil, fmt.Errorf("kafka: source.schemaRegistry required when format is avro")
 		}
-		dec = decoder.NewAvroDecoder(decoder.NewHTTPRegistry(s.Spec.Source.SchemaRegistry))
+		avroDec := decoder.NewAvroDecoder(decoder.NewHTTPRegistry(s.Spec.Source.SchemaRegistry))
+		avroDec.ByTopic = extractionByTopic(s.Spec, "")
+		avroDec.Miss = s.missLogger()
+		dec = avroDec
 	}
 
 	r := &Reader{
@@ -180,6 +186,50 @@ func (r *Reader) SetSourceSchemas(schemas map[string]core.Schema) {
 // the committed position or the beginning.
 func (s Source) InitialPosition(_ context.Context) (position.Position, error) {
 	return &position.Offsets{}, nil
+}
+
+// extractionByTopic builds the per-topic field-extraction declarations from
+// the spec's tables, for the raw and avro decoders. payloadColumnName is the
+// column that means "also keep the raw payload" (raw's "payload"; empty for
+// avro, which has none — see spec.validateColumns).
+//
+// Introspect requires every Kafka table to declare Columns regardless of
+// format (Columns is also how debezium tables assert their shape, since
+// Kafka has no SQL introspection), so len(t.Columns) == 0 cannot happen for
+// a resolved spec. It is still checked here defensively: this function reads
+// the spec directly rather than through Introspect's validated path, and an
+// empty Columns must mean "no extraction entry" (opaque), never a
+// zero-field TopicExtraction that would extract nothing while still
+// switching the topic out of passthrough mode.
+func extractionByTopic(sp *spec.Spec, payloadColumnName string) map[string]decoder.TopicExtraction {
+	byTopic := make(map[string]decoder.TopicExtraction, len(sp.Tables))
+	for _, t := range sp.Tables {
+		if len(t.Columns) == 0 {
+			continue
+		}
+		te := decoder.TopicExtraction{Fields: make([]decoder.Field, 0, len(t.Columns))}
+		for name, col := range t.Columns {
+			if payloadColumnName != "" && name == payloadColumnName {
+				te.KeepPayload = true
+				continue
+			}
+			te.Fields = append(te.Fields, decoder.Field{Name: name, Path: col.From, Required: col.Required})
+		}
+		sort.Slice(te.Fields, func(i, j int) bool { return te.Fields[i].Name < te.Fields[j].Name })
+		byTopic[t.Source] = te
+	}
+	return byTopic
+}
+
+// missLogger returns a decoder.MissFn that logs an extraction miss. Bronze
+// should not go down over one malformed message, but a silent NULL hides a
+// producer schema change — this is the visible middle ground until a metric
+// is wired up (see issue #143's open question on making this an observable
+// counter).
+func (s Source) missLogger() decoder.MissFn {
+	return func(column string) {
+		s.Rt.Logger.Warn("kafka: declared field absent from payload", "column", column)
+	}
 }
 
 // topicToTarget builds a topic → target table map from the table refs.

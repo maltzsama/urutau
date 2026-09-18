@@ -68,14 +68,25 @@ func classifyFetch(err error) fetchClass {
 
 // decodeIsFatal reports whether a decoder error must fail the reader rather
 // than drop the record. The decoders already mark the conditions no retry
-// resolves — a topic that is not Confluent-Avro, or a schema id the registry
-// does not know — and both mean every record decodes the same way. Dropping
-// them would decode nothing while reporting success, and would stall the
-// position at the last decodable record.
+// resolves:
+//   - ErrBadWireFormat: the topic is not Confluent-Avro.
+//   - ErrUnknownSchema: the registry does not know the schema id.
+//   - ErrNotJSON: field extraction is declared on a topic whose payload is
+//     not JSON — the spec's assertion about the topic's shape is wrong.
+//   - ErrFieldMissing: a column declared Required is absent from the
+//     payload (raw) or the registry schema (avro projection) — a contract
+//     violation, not an occasional gap.
+//
+// Every one of these means every record on the topic fails the same way.
+// Dropping them would decode nothing while reporting success, and would
+// stall the position at the last decodable record.
 func decodeIsFatal(err error) bool {
 	var badWire *decoder.ErrBadWireFormat
 	var unknownSchema *decoder.ErrUnknownSchema
-	return errors.As(err, &badWire) || errors.As(err, &unknownSchema)
+	var notJSON *decoder.ErrNotJSON
+	var fieldMissing *decoder.ErrFieldMissing
+	return errors.As(err, &badWire) || errors.As(err, &unknownSchema) ||
+		errors.As(err, &notJSON) || errors.As(err, &fieldMissing)
 }
 
 // ErrPositionLost marks retention having passed the consumer's offset. The
