@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -26,10 +27,12 @@ import (
 //     never satisfies it — matching SQL, where `col <> x` with a NULL col is
 //     UNKNOWN and excludes the row.
 //
-// The table's introspected state tells which columns are numeric, so a
-// numeric column (decoded as int64, float64, or a decimal string) is
-// compared through expr's float() — otherwise a `numeric` column, decoded as
-// a string, would fail a numeric comparison at runtime.
+// The table's introspected state tells which columns are numeric. A numeric
+// column is decoded as int64, float64, or (for `numeric`) a decimal string,
+// so it is compared through expr's float(). A `numeric` column is compared
+// exactly through pg_numeric_cmp (math/big), because Postgres evaluates
+// `numeric > float8` at the column's native precision, which float64 cannot
+// represent.
 func compileFilterExpr(f *spec.Filter, st *TableState) (*vm.Program, error) {
 	if f == nil {
 		return nil, nil
@@ -40,6 +43,12 @@ func compileFilterExpr(f *spec.Filter, st *TableState) (*vm.Program, error) {
 	}
 	prog, err := expr.Compile(src,
 		expr.Env(map[string]any{"row": map[string]any{}}),
+		expr.Function("pg_numeric_cmp", func(params ...any) (any, error) {
+			if len(params) != 2 {
+				return nil, fmt.Errorf("pg_numeric_cmp wants 2 args, got %d", len(params))
+			}
+			return numericCompare(params[0], params[1])
+		}),
 		expr.AsBool(),
 	)
 	if err != nil {
@@ -81,15 +90,20 @@ func filterExprGroup(nodes []spec.Filter, st *TableState, op string) (string, er
 
 func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
 	raw := "row[" + strconv.Quote(p.Column) + "]"
-	lhs := raw
-	if columnIsNumeric(st, p.Column) {
-		lhs = "float(" + raw + ")"
-	}
 	switch p.Op {
 	case spec.OpIsNull:
 		return raw + " == nil", nil
 	case spec.OpIsNotNull:
 		return raw + " != nil", nil
+	}
+	if columnIsDecimal(st, p.Column) {
+		return filterExprDecimal(p, raw)
+	}
+	lhs := raw
+	if columnIsNumeric(st, p.Column) {
+		lhs = "float(" + raw + ")"
+	}
+	switch p.Op {
 	case spec.OpEq, spec.OpNeq, spec.OpLt, spec.OpLte, spec.OpGt, spec.OpGte:
 		lit, err := exprLiteral(p.Value)
 		if err != nil {
@@ -121,8 +135,90 @@ func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
 	}
 }
 
+// filterExprDecimal renders a predicate on a `numeric` column through the
+// exact pg_numeric_cmp helper, since the value is decoded as a decimal string
+// and Postgres compares `numeric` at native precision.
+func filterExprDecimal(p *spec.Predicate, raw string) (string, error) {
+	guard := "(" + raw + " != nil)"
+	switch p.Op {
+	case spec.OpEq, spec.OpNeq, spec.OpLt, spec.OpLte, spec.OpGt, spec.OpGte:
+		lit, err := exprLiteral(p.Value)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s && (pg_numeric_cmp(%s, %s) %s 0)", guard, raw, lit, exprOperator(p.Op)), nil
+	case spec.OpIn, spec.OpNotIn:
+		vals, ok := p.Value.([]any)
+		if !ok {
+			return "", fmt.Errorf("postgres: filter: op %q requires a list value", p.Op)
+		}
+		parts := make([]string, 0, len(vals))
+		for _, v := range vals {
+			lit, err := exprLiteral(v)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, fmt.Sprintf("(pg_numeric_cmp(%s, %s) == 0)", raw, lit))
+		}
+		inner := "false"
+		if len(parts) > 0 {
+			inner = strings.Join(parts, " || ")
+		}
+		if p.Op == spec.OpNotIn {
+			inner = "!(" + inner + ")"
+		}
+		return fmt.Sprintf("%s && (%s)", guard, inner), nil
+	default:
+		return "", fmt.Errorf("postgres: filter: unsupported operator %q", p.Op)
+	}
+}
+
+// columnIsDecimal reports whether the column is Postgres `numeric`, decoded
+// as a decimal string.
+func columnIsDecimal(st *TableState, name string) bool {
+	if st == nil {
+		return false
+	}
+	i := st.FindColumn(name)
+	return i >= 0 && strings.EqualFold(st.Columns[i].DataType, "numeric")
+}
+
+// numericCompare compares two numeric scalars exactly (int64, float64, or a
+// decimal string) and returns -1, 0, or 1.
+func numericCompare(a, b any) (int, error) {
+	ar, err := toRat(a)
+	if err != nil {
+		return 0, err
+	}
+	br, err := toRat(b)
+	if err != nil {
+		return 0, err
+	}
+	return ar.Cmp(br), nil
+}
+
+func toRat(v any) (*big.Rat, error) {
+	switch t := v.(type) {
+	case string:
+		r, ok := new(big.Rat).SetString(t)
+		if !ok {
+			return nil, fmt.Errorf("pg_numeric_cmp: %q is not a number", t)
+		}
+		return r, nil
+	case int64:
+		return new(big.Rat).SetInt64(t), nil
+	case int:
+		return new(big.Rat).SetInt64(int64(t)), nil
+	case float64:
+		return new(big.Rat).SetFloat64(t), nil
+	default:
+		return nil, fmt.Errorf("pg_numeric_cmp: unsupported type %T", v)
+	}
+}
+
 // columnIsNumeric reports whether the column maps to a numeric Postgres type
-// in the introspected schema.
+// decoded as int64/float64 (so float() comparison is exact enough and matches
+// the snapshot's float8 literal). `numeric` is handled by columnIsDecimal.
 func columnIsNumeric(st *TableState, name string) bool {
 	if st == nil {
 		return false
@@ -132,7 +228,7 @@ func columnIsNumeric(st *TableState, name string) bool {
 		return false
 	}
 	switch strings.ToLower(st.Columns[i].DataType) {
-	case "smallint", "integer", "bigint", "real", "double precision", "numeric", "money":
+	case "smallint", "integer", "bigint", "real", "double precision", "money":
 		return true
 	}
 	return false

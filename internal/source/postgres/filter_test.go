@@ -169,3 +169,24 @@ func TestFilterExprNumericColumn(t *testing.T) {
 		}
 	}
 }
+
+// A `numeric` column is compared exactly: a value beyond float64's 53-bit
+// integer precision must not collapse onto a neighbouring literal.
+func TestFilterExprNumericExactPrecision(t *testing.T) {
+	st := testFilterState()
+	// 9007199254740993 = 2^53+1 is not representable as float64 (it rounds to
+	// 2^53), so a float comparison would call it equal to 9007199254740992.
+	p, err := newProjection(nil, &spec.Filter{
+		Predicate: &spec.Predicate{Column: "amount", Op: spec.OpEq, Value: float64(9007199254740992)},
+	}, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.keep(map[string]any{"amount": "9007199254740993"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got {
+		t.Fatal("2^53+1 must not equal 2^53: numeric comparison lost precision")
+	}
+}
