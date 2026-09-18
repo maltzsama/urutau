@@ -208,6 +208,48 @@ func TestAssignmentCarriesCastAndMode(t *testing.T) {
 // importing the pb package in this test file.
 const pbWriteModeAppend = 2
 
+// TestAssignmentCarriesSourceProjection covers #162/#163: the source column
+// projection and the structured filter must travel with the assignment so the
+// worker's snapshot chunk SELECT matches the coordinator's.
+func TestAssignmentCarriesSourceProjection(t *testing.T) {
+	c := &Coordinator{
+		cfg: Config{Spec: &spec.Spec{
+			Source: spec.Source{Kind: "postgres"},
+			Tables: []spec.Table{{
+				Source:       "public.orders",
+				Target:       "lake.orders",
+				PrimaryKey:   []string{"id"},
+				ColumnFilter: []string{"id", "v"},
+				Filter:       &spec.Filter{Predicate: &spec.Predicate{Column: "active", Op: spec.OpEq, Value: true}},
+			}},
+		}},
+		canonical: map[string]core.Schema{
+			"public.orders": {
+				Columns: []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}},
+			},
+		},
+	}
+	w := &workerState{
+		name: "w",
+		refs: []source.TableRef{{Source: "public.orders", Target: "lake.orders", PrimaryKey: []string{"id"}}},
+	}
+	msg, err := c.assignmentFor(w)
+	if err != nil {
+		t.Fatalf("assignmentFor: %v", err)
+	}
+	ta := msg.GetAssign().Tables[0]
+	if len(ta.ColumnFilter) != 2 || ta.ColumnFilter[0] != "id" {
+		t.Fatalf("column filter = %v, want [id v]", ta.ColumnFilter)
+	}
+	var f spec.Filter
+	if err := json.Unmarshal(ta.Filter, &f); err != nil {
+		t.Fatalf("unmarshal filter: %v", err)
+	}
+	if f.Predicate == nil || f.Predicate.Column != "active" {
+		t.Fatalf("filter = %+v, want a predicate on active", f)
+	}
+}
+
 // TestAssignmentTickLockOrderNoDeadlock is a smoke test that the supervisor
 // tick and a concurrent Session attach do not deadlock (audit #3): attach
 // takes c.mu then supervisor.mu; tick takes c.mu, releases, then takes

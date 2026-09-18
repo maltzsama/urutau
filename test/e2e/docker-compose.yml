@@ -32,7 +32,7 @@ services:
       - "5433:5432"
     # wal_sender_timeout=5s tightens the keepalive cadence (default 60s
     # sends one every ~30s) so the idle-source caught-up proof closes fast.
-    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=5", "-c", "max_wal_senders=5", "-c", "wal_sender_timeout=5s"]
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20", "-c", "max_wal_senders=5", "-c", "wal_sender_timeout=5s"]
     environment:
       POSTGRES_USER: repl
       POSTGRES_PASSWORD: replpass
@@ -67,7 +67,7 @@ services:
         chmod 600 /tmp/server.key
         exec docker-entrypoint.sh postgres \
           -c wal_level=logical \
-          -c max_replication_slots=5 \
+          -c max_replication_slots=20 \
           -c max_wal_senders=5 \
           -c wal_sender_timeout=5s \
           -c ssl=on \

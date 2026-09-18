@@ -8,6 +8,7 @@ import (
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // fakeChunkSource returns a fixed set of rows for any chunk.
@@ -99,5 +100,48 @@ func TestChunkExecutorEmitsWireBatch(t *testing.T) {
 	}
 	if v, _ := br.Value("v", 0); v != "a" {
 		t.Fatalf("row 0 v = %v, want a", v)
+	}
+}
+
+func TestSpecTablesFromAssignment(t *testing.T) {
+	filterJSON := []byte(`{"where":{"col":"active","op":"eq","value":true}}`)
+	bySource := map[string]*pb.TableAssignment{
+		"public.orders": {
+			SourceTable:  "public.orders",
+			ColumnFilter: []string{"id", "v"},
+			Filter:       filterJSON,
+		},
+		"public.plain": {SourceTable: "public.plain"},
+	}
+	tables, err := specTablesFromAssignment(bySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 2 {
+		t.Fatalf("got %d tables, want 2", len(tables))
+	}
+	var orders *spec.Table
+	for i := range tables {
+		if tables[i].Source == "public.orders" {
+			orders = &tables[i]
+		}
+	}
+	if orders == nil {
+		t.Fatal("public.orders not reconstructed")
+	}
+	if len(orders.ColumnFilter) != 2 || orders.ColumnFilter[0] != "id" {
+		t.Fatalf("ColumnFilter = %v", orders.ColumnFilter)
+	}
+	if orders.Filter == nil || orders.Filter.Predicate == nil || orders.Filter.Predicate.Column != "active" {
+		t.Fatalf("Filter = %+v", orders.Filter)
+	}
+}
+
+func TestSpecTablesFromAssignmentBadFilter(t *testing.T) {
+	_, err := specTablesFromAssignment(map[string]*pb.TableAssignment{
+		"public.orders": {SourceTable: "public.orders", Filter: []byte("not json")},
+	})
+	if err == nil {
+		t.Fatal("want an error for malformed filter JSON")
 	}
 }

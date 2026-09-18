@@ -5,7 +5,12 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
+	"strings"
 	"testing"
+
+	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // errRowsDriver is a minimal database/sql driver whose query yields a Rows
@@ -29,7 +34,50 @@ func (errRows) Columns() []string         { return []string{"id"} }
 func (errRows) Close() error              { return nil }
 func (errRows) Next([]driver.Value) error { return errors.New("transient boom") }
 
-func init() { sql.Register("urutau_err_rows", errRowsDriver{}) }
+// captureTxDriver records the sql.TxOptions passed to BeginTx, so the
+// isolation/read-only guarantee of the chunk scan can be asserted without a
+// real database.
+var (
+	capturedTxOptions  sql.TxOptions
+	capturedChunkQuery string
+)
+
+type captureTxDriver struct{}
+
+func (captureTxDriver) Open(string) (driver.Conn, error) { return captureTxConn{}, nil }
+
+type captureTxConn struct{}
+
+func (captureTxConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unsupported") }
+func (captureTxConn) Close() error                        { return nil }
+func (captureTxConn) Begin() (driver.Tx, error)           { return nil, errors.New("unsupported") }
+func (captureTxConn) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	capturedTxOptions = sql.TxOptions{
+		Isolation: sql.IsolationLevel(opts.Isolation),
+		ReadOnly:  opts.ReadOnly,
+	}
+	return captureTx{}, nil
+}
+func (captureTxConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	capturedChunkQuery = query
+	return emptyRows{}, nil
+}
+
+type captureTx struct{}
+
+func (captureTx) Commit() error   { return nil }
+func (captureTx) Rollback() error { return nil }
+
+type emptyRows struct{}
+
+func (emptyRows) Columns() []string         { return []string{"id"} }
+func (emptyRows) Close() error              { return nil }
+func (emptyRows) Next([]driver.Value) error { return io.EOF }
+
+func init() {
+	sql.Register("urutau_err_rows", errRowsDriver{})
+	sql.Register("urutau_capture_tx", captureTxDriver{})
+}
 
 // A failed iteration must surface the real error, not be mistaken for an
 // empty result (which would truncate Bounds).
@@ -47,6 +95,74 @@ func TestScanRowPropagatesIterationError(t *testing.T) {
 	_, err = scanRow(rows)
 	if err == nil || errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("scanRow = %v, want the iteration error, not sql.ErrNoRows", err)
+	}
+}
+
+// The chunk scan must run inside a REPEATABLE READ, READ ONLY transaction
+// (#164).
+func TestChunkScanUsesRepeatableReadReadOnly(t *testing.T) {
+	db, err := sql.Open("urutau_capture_tx", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	c, err := NewChunker(db, "public.orders", "id", 100, WithWorkers(1), WithRetries(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedTxOptions = sql.TxOptions{}
+	if err := c.Scan(context.Background(), source.Chunk{}, func(map[string]any) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if capturedTxOptions.Isolation != sql.LevelRepeatableRead {
+		t.Fatalf("isolation = %v, want RepeatableRead", capturedTxOptions.Isolation)
+	}
+	if !capturedTxOptions.ReadOnly {
+		t.Fatal("transaction must be READ ONLY")
+	}
+}
+
+// The chunk SELECT must list the projected columns and compose the filter
+// with the chunk bounds (#162/#163).
+func TestChunkScanProjectionAndFilterSQL(t *testing.T) {
+	db, err := sql.Open("urutau_capture_tx", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	filter, err := filterToSquirrel(&spec.Filter{
+		Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "active"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewChunker(db, "public.orders", "id", 100,
+		WithWorkers(1), WithRetries(0),
+		WithColumns([]string{"id", "name"}),
+		WithFilter(filter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedChunkQuery = ""
+	err = c.Scan(context.Background(),
+		source.Chunk{Low: []any{int64(1)}, High: []any{int64(10)}},
+		func(map[string]any) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := capturedChunkQuery
+	for _, want := range []string{
+		`SELECT "id", "name" FROM "public"."orders"`,
+		`("id") >= ($1)`,
+		`("id") < ($2)`,
+		`"status" = $3`,
+		`ORDER BY "id"`,
+	} {
+		if !strings.Contains(q, want) {
+			t.Fatalf("chunk query %q missing %q", q, want)
+		}
 	}
 }
 
@@ -77,14 +193,5 @@ func TestQuotedList(t *testing.T) {
 func TestQuoteIdent(t *testing.T) {
 	if quoteIdent("orders") != `"orders"` {
 		t.Fatalf("quoteIdent = %q", quoteIdent("orders"))
-	}
-}
-
-func TestPlaceholders(t *testing.T) {
-	if got := placeholders(1, 2); got != "$1, $2" {
-		t.Fatalf("placeholders(1,2) = %q", got)
-	}
-	if got := placeholders(3, 1); got != "$3" {
-		t.Fatalf("placeholders(3,1) = %q", got)
 	}
 }

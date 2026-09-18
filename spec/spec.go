@@ -385,6 +385,13 @@ type Table struct {
 	// (struct/list/map, nested to any depth) — see ColumnDecl. Ignored for
 	// SQL sources which introspect automatically.
 	Columns map[string]ColumnDecl `json:"columns,omitempty"`
+	// ColumnFilter limits the source columns read and emitted (snapshot
+	// SELECT list, CDC projection, and the resolved schema) to this subset.
+	// Empty means all columns. The filter is applied at the source boundary,
+	// before the Arrow hot-path. In upsert mode every primary-key column
+	// must be listed — the sink resolves the equality key by column name,
+	// so an excluded key column would break the target table.
+	ColumnFilter []string `json:"columnFilter,omitempty"`
 	// Bootstrap configures how the initial snapshot is handled.
 	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
 	// Enrich joins each event against reference tables loaded in memory

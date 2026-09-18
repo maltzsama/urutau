@@ -221,6 +221,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 		}
 
 		validateFilter(tbl.Filter, p+".filter", &problems)
+		validateColumnFilter(tbl, p, &problems)
 		validateMetadata(tbl, p, &problems)
 		validateCast(tbl, p, &problems)
 		validateColumns(tbl, s.Source, p, &problems)
@@ -303,6 +304,35 @@ func validateColumns(tbl Table, src Source, path string, problems *[]string) {
 		// payload column.
 		if src.Format == "avro" && name == "payload" {
 			*problems = append(*problems, fmt.Sprintf("%s.columns.%s: \"payload\" is not valid for format avro — the pre-decode bytes are Confluent wire format, not an independently readable value", path, name))
+		}
+	}
+}
+
+// validateColumnFilter checks the column projection. It must be a set of
+// distinct, non-empty names, and it must include every declared primary-key
+// column: the sink builds the target table's sort order (and, for upsert, the
+// equality key) by column name, so an excluded key column makes the table
+// unbuildable — in any write mode. A primary key the source introspects but
+// the spec does not declare is enforced at Introspect time instead.
+func validateColumnFilter(tbl Table, path string, problems *[]string) {
+	if len(tbl.ColumnFilter) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(tbl.ColumnFilter))
+	for _, c := range tbl.ColumnFilter {
+		if c == "" {
+			*problems = append(*problems, path+".columnFilter: empty column name")
+			continue
+		}
+		if seen[c] {
+			*problems = append(*problems, fmt.Sprintf("%s.columnFilter: duplicated %q", path, c))
+		}
+		seen[c] = true
+	}
+	for _, pk := range tbl.PrimaryKey {
+		if !seen[pk] {
+			*problems = append(*problems, fmt.Sprintf(
+				"%s.columnFilter: must include primary key column %q (the sink resolves the key and sort order by column name)", path, pk))
 		}
 	}
 }
@@ -719,8 +749,14 @@ func validatePredicate(p *Predicate, path string, problems *[]string) {
 			*problems = append(*problems, fmt.Sprintf("%s: op %q requires a value", path, p.Op))
 		}
 	case OpIn, OpNotIn:
-		if _, ok := p.Value.([]any); !ok {
+		vals, ok := p.Value.([]any)
+		if !ok {
 			*problems = append(*problems, fmt.Sprintf("%s: op %q requires a list value", path, p.Op))
+		} else if len(vals) == 0 {
+			// An empty list is meaningless, and squirrel renders an empty
+			// NOT IN as (1=1), which would keep NULL rows the CDC guard
+			// drops — reject it before either compiler sees it.
+			*problems = append(*problems, fmt.Sprintf("%s: op %q requires at least one value", path, p.Op))
 		}
 	case OpIsNull, OpIsNotNull:
 		if p.Value != nil {

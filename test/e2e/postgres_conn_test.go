@@ -95,7 +95,7 @@ func TestPostgresTLS(t *testing.T) {
 	const slot = "urutau_e2e_tls"
 	db := pgConnTo(t, "postgres://repl:replpass@127.0.0.1:5434/shop?sslmode=require")
 	pgExec(t, db, `TRUNCATE orders`)
-	dropSlot(t, db, slot)
+	dropE2ESlots(t, db)
 	dropIcebergTable(t, ctx)
 	seedPostgresOrders(t, db, 0, 50)
 
@@ -134,7 +134,7 @@ func TestPostgresSSH(t *testing.T) {
 	const slot = "urutau_e2e_ssh"
 	db := pgConn(t) // the plain postgres, reached directly for seeding
 	pgExec(t, db, `TRUNCATE orders`)
-	dropSlot(t, db, slot)
+	dropE2ESlots(t, db)
 	dropIcebergTable(t, ctx)
 	seedPostgresOrders(t, db, 0, 50)
 
@@ -185,7 +185,7 @@ func TestPostgresReconnect(t *testing.T) {
 
 	db := pgConn(t)
 	pgExec(t, db, `TRUNCATE orders`)
-	dropSlot(t, db, slot)
+	dropE2ESlots(t, db)
 	dropIcebergTable(t, ctx)
 	seedPostgresOrders(t, db, 0, 50)
 

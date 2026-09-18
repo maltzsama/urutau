@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	sq "github.com/Masterminds/squirrel"
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/maltzsama/urutau/core"
@@ -89,20 +90,125 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 			pk = append(pk, st.Columns[idx].Name)
 		}
 	}
+	// A column projection must name real columns and keep every key column:
+	// the sink resolves the key and sort order by column name, and the
+	// snapshot SELECT uses the projection verbatim. Declared keys are checked
+	// at spec validation; this catches a typo and a key the source
+	// introspects.
+	if err := checkColumnFilterExists(st, t.ColumnFilter); err != nil {
+		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
+	}
+	if err := checkFilterColumns(st, t.Filter); err != nil {
+		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
+	}
+	if err := checkColumnFilterCoversPK(t.ColumnFilter, pk); err != nil {
+		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
+	}
 	cs, err := CanonicalSchema(st)
 	if err != nil {
-		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: schema %s: %w", t.Source, err)
+		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: schema %s: %w", t.Source, err)
 	}
+	cs = filterSchemaColumns(cs, t.ColumnFilter)
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
+}
+
+// checkColumnFilterExists reports an error when a projected column is not in
+// the source table. A typo would otherwise silently narrow the target schema
+// (filterSchemaColumns drops unknown names) and then fail the snapshot with an
+// unknown-column SQL error — or, with a snapshot-skipping bootstrap, leave the
+// requested column silently absent.
+func checkColumnFilterExists(st *TableState, columnFilter []string) error {
+	for _, c := range columnFilter {
+		if st.FindColumn(c) < 0 {
+			return fmt.Errorf("columnFilter %q not found in the source table", c)
+		}
+	}
+	return nil
+}
+
+// checkColumnFilterCoversPK reports an error when a primary-key column is not
+// in the projection.
+func checkColumnFilterCoversPK(columnFilter, pk []string) error {
+	if len(columnFilter) == 0 || len(pk) == 0 {
+		return nil
+	}
+	keep := make(map[string]bool, len(columnFilter))
+	for _, c := range columnFilter {
+		keep[c] = true
+	}
+	for _, k := range pk {
+		if !keep[k] {
+			return fmt.Errorf("columnFilter must include primary key column %q", k)
+		}
+	}
+	return nil
+}
+
+// filterSchemaColumns keeps only the named columns, preserving the source
+// order. An empty filter keeps every column.
+func filterSchemaColumns(cs core.Schema, columns []string) core.Schema {
+	if len(columns) == 0 {
+		return cs
+	}
+	keep := make(map[string]bool, len(columns))
+	for _, c := range columns {
+		keep[c] = true
+	}
+	out := core.Schema{PrimaryKey: cs.PrimaryKey}
+	for _, c := range cs.Columns {
+		if keep[c.Name] {
+			out.Columns = append(out.Columns, c)
+		}
+	}
+	return out
+}
+
+// tableFor returns the spec table matching a source identifier.
+func (a Source) tableFor(source string) (spec.Table, bool) {
+	for _, t := range a.spec.Tables {
+		if t.Source == source {
+			return t, true
+		}
+	}
+	return spec.Table{}, false
+}
+
+// projectionFor resolves a table's read projection (#162/#163): the selected
+// columns and the compiled filter. Both are applied at the source boundary,
+// before the Arrow hot-path.
+func (a Source) projectionFor(source string) (columns []string, filter sq.Sqlizer, err error) {
+	t, ok := a.tableFor(source)
+	if !ok {
+		return nil, nil, nil
+	}
+	if len(t.ColumnFilter) > 0 {
+		columns = t.ColumnFilter
+	}
+	filter, err = filterToSquirrel(t.Filter)
+	if err != nil {
+		return nil, nil, err
+	}
+	return columns, filter, nil
 }
 
 // NewChunker builds the chunk SELECT source for one table. The concurrent
 // normalization pool (#161) and the snapshot-query retry budget (#166) come
-// from the resolved connection config (maxThreads / retryCount).
+// from the resolved connection config (maxThreads / retryCount); the column
+// projection (#162) and the filter (#163) come from the spec table.
 func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
 	opts := []ChunkerOption{}
 	if a.connCfg != nil {
 		opts = append(opts, WithWorkers(a.connCfg.MaxOpenConns), WithRetries(a.connCfg.RetryCount))
+	}
+	cols, filter, err := a.projectionFor(source)
+	if err != nil {
+		return nil, err
+	}
+	if len(cols) > 0 {
+		opts = append(opts, WithColumns(cols))
+	}
+	if filter != nil {
+		opts = append(opts, WithFilter(filter))
 	}
 	return NewChunker(a.db, source, pk, chunkSize, opts...)
 }
@@ -139,6 +245,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	// One channel for the whole reader life: New writes into it and the
 	// returned stream pulls from it. Creating it per attempt would orphan
 	// the reader's output on the attempt that succeeds.
+	filters, columns := a.filtersColumnsFor(refs)
 	out := make(chan rowchange.Change, 1024)
 	var rdr *Reader
 	var err error
@@ -151,6 +258,8 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 			Tables:     refs,
 			Logger:     a.rt.Logger,
 			RetryCount: maxRetries,
+			Filters:    filters,
+			Columns:    columns,
 		}, out)
 		if err == nil {
 			break
@@ -169,9 +278,21 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		}
 	}
 
+	// The reader holds an open replication connection. If the schema
+	// introspection below fails, close it before returning — otherwise the
+	// connection leaks on every failed open.
+	keepReader := false
+	defer func() {
+		if !keepReader {
+			rdr.Close()
+		}
+	}()
+
 	puller := sourcepull.New(out)
 	// Introspect each table so live batches encode against the canonical
-	// schema — a stable shape per table, never a per-drain inference.
+	// schema — a stable shape per table, never a per-drain inference. The
+	// schema is narrowed to the column projection so the live Arrow batches
+	// match the target table.
 	if a.db != nil {
 		schemas := make(map[string]core.Schema, len(refs))
 		for _, ref := range refs {
@@ -187,11 +308,48 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 			if serr != nil {
 				return nil, fmt.Errorf("postgres: schema %s: %w", ref.Source, serr)
 			}
+			if t, ok := a.tableFor(ref.Source); ok {
+				if cerr := checkColumnFilterExists(st, t.ColumnFilter); cerr != nil {
+					return nil, fmt.Errorf("postgres: %s: %w", ref.Source, cerr)
+				}
+				if cerr := checkFilterColumns(st, t.Filter); cerr != nil {
+					return nil, fmt.Errorf("postgres: %s: %w", ref.Source, cerr)
+				}
+				cs = filterSchemaColumns(cs, t.ColumnFilter)
+			}
 			schemas[ref.Target] = cs
 		}
 		puller.SetSchemas(schemas)
 	}
+	keepReader = true
 	return stream{Reader: rdr, out: out, Puller: puller}, nil
+}
+
+// filtersColumnsFor builds the per-source filter and column projection maps
+// (#162/#163) for the tables the reader streams. The reader compiles the
+// filter with the introspected column types.
+func (a Source) filtersColumnsFor(refs []source.TableRef) (map[string]*spec.Filter, map[string][]string) {
+	var filters map[string]*spec.Filter
+	var columns map[string][]string
+	for _, ref := range refs {
+		t, ok := a.tableFor(ref.Source)
+		if !ok {
+			continue
+		}
+		if len(t.ColumnFilter) > 0 {
+			if columns == nil {
+				columns = make(map[string][]string, len(refs))
+			}
+			columns[ref.Source] = t.ColumnFilter
+		}
+		if t.Filter != nil {
+			if filters == nil {
+				filters = make(map[string]*spec.Filter, len(refs))
+			}
+			filters[ref.Source] = t.Filter
+		}
+	}
+	return filters, columns
 }
 
 // InitialPosition returns the slot's confirmed LSN: a first boot starts

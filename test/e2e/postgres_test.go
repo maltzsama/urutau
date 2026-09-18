@@ -30,7 +30,7 @@ func TestPostgresPipeline(t *testing.T) {
 	// starts from a clean consistency point with no stale WAL replay.
 	pgExec(t, db, `TRUNCATE orders`)
 	dropIcebergTable(t, ctx)
-	dropSlot(t, db, "urutau_e2e")
+	dropE2ESlots(t, db)
 	seedPostgresOrders(t, db, 0, 50)
 
 	runCtx, stop := context.WithCancel(ctx)
@@ -133,6 +133,33 @@ func dropSlot(t *testing.T, db *sql.DB, slot string) {
 		`SELECT pg_catalog.pg_drop_replication_slot(%[1]s) WHERE EXISTS
 		 (SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = %[1]s)`,
 		"'"+slot+"'"))
+}
+
+// dropE2ESlots drops every replication slot this suite creates, so slots do
+// not accumulate across tests and exhaust the server's max_replication_slots.
+func dropE2ESlots(t *testing.T, db *sql.DB) {
+	t.Helper()
+	rows, err := db.Query(`SELECT slot_name FROM pg_catalog.pg_replication_slots WHERE slot_name LIKE 'urutau_e2e%'`)
+	if err != nil {
+		t.Fatalf("list e2e slots: %v", err)
+	}
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			t.Fatalf("scan slot name: %v", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		t.Fatalf("list e2e slots: %v", err)
+	}
+	_ = rows.Close()
+	for _, name := range names {
+		dropSlot(t, db, name)
+	}
 }
 
 func seedPostgresOrders(t *testing.T, db *sql.DB, from, count int) {

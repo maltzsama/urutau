@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -51,14 +52,22 @@ func newChunkExecutor(assign *pb.Assignment, w *Worker, log *slog.Logger, send f
 }
 
 // querySource opens the source's SQL surface on first use. The worker holds
-// only kind + dsn from the assignment, so it builds a minimal spec and
-// resolves the driver through the registry. Tests preset x.qsrc to bypass
-// the driver registry.
+// kind + dsn from the assignment, plus each table's source read projection
+// (#162 column list, #163 filter) — reconstructed into a spec so the source
+// resolves the chunk SELECT the same way the coordinator's does. Tests preset
+// x.qsrc to bypass the driver registry.
 func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, error) {
 	if x.qsrc != nil {
 		return x.qsrc, nil
 	}
-	src, err := driver.OpenSource(&spec.Spec{Source: spec.Source{Kind: x.kind, URI: x.dsn}}, source.Runtime{Logger: x.log})
+	tables, err := specTablesFromAssignment(x.bySource)
+	if err != nil {
+		return nil, err
+	}
+	src, err := driver.OpenSource(&spec.Spec{
+		Source: spec.Source{Kind: x.kind, URI: x.dsn},
+		Tables: tables,
+	}, source.Runtime{Logger: x.log})
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +77,25 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 	}
 	x.qsrc = q
 	return q, nil
+}
+
+// specTablesFromAssignment reconstructs the per-table spec the source needs
+// to resolve the snapshot projection (#162 column list, #163 filter), which
+// the coordinator shipped in the assignment.
+func specTablesFromAssignment(bySource map[string]*pb.TableAssignment) ([]spec.Table, error) {
+	tables := make([]spec.Table, 0, len(bySource))
+	for _, ta := range bySource {
+		t := spec.Table{Source: ta.SourceTable, ColumnFilter: ta.ColumnFilter}
+		if len(ta.Filter) > 0 {
+			var f spec.Filter
+			if err := json.Unmarshal(ta.Filter, &f); err != nil {
+				return nil, fmt.Errorf("worker: filter %s: %w", ta.SourceTable, err)
+			}
+			t.Filter = &f
+		}
+		tables = append(tables, t)
+	}
+	return tables, nil
 }
 
 // Close releases the source's query connection. The worker owns the executor
