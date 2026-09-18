@@ -242,7 +242,7 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			lastErr = err
 			continue
 		}
-		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key) {
 			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
@@ -325,7 +325,7 @@ func (w *TableWriter) commitAppend(ctx context.Context, b *dataplane.Batch, pos 
 			lastErr = err
 			continue
 		}
-		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key) {
 			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
