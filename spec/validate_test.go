@@ -291,6 +291,19 @@ func TestValidateMetadataClosedCatalog(t *testing.T) {
 	}
 }
 
+// Every catalog member must survive spec validation. A hand-copied second
+// catalog here once omitted enrich_miss, making it unreachable from a spec
+// though core accepted it and the sinks materialized it.
+func TestValidateMetadataAcceptsEveryCatalogKey(t *testing.T) {
+	for _, key := range core.MetadataCatalog {
+		s := validSpec()
+		s.Tables[0].Metadata = []core.MetadataColumn{{From: key, As: "meta_col"}}
+		if err := s.Validate(); err != nil {
+			t.Errorf("catalog key %q rejected by spec validation: %v", key, err)
+		}
+	}
+}
+
 func TestValidateMetadataUnknownKey(t *testing.T) {
 	s := validSpec()
 	s.Tables[0].Metadata = []core.MetadataColumn{

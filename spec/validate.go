@@ -225,30 +225,14 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	return nil
 }
 
-// validMetadataKeys is the closed metadata catalog.
-var validMetadataKeys = map[core.MetadataKey]bool{
-	core.MetaOp:          true,
-	core.MetaCommitTS:    true,
-	core.MetaIngestTS:    true,
-	core.MetaPosition:    true,
-	core.MetaSourceTable: true,
-	core.MetaPhase:       true,
-	core.MetaStream:      true,
-	core.MetaShard:       true,
-	core.MetaSeq:         true,
-	core.MetaMsgTS:       true,
-	core.MetaMsgKey:      true,
-	core.MetaHeaders:     true,
-}
-
 // validateMetadata checks the closed metadata rules: catalog membership,
 // explicit valid destination name, no repeats, never part of the primary
 // key.
 func validateMetadata(tbl Table, path string, problems *[]string) {
 	seen := map[string]bool{}
 	for _, m := range tbl.Metadata {
-		if !validMetadataKeys[m.From] {
-			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: op, commit_ts, ingest_ts, position, source_table, phase, stream, shard, sequence, msg_ts, msg_key, headers)", path, m.From))
+		if !core.ValidMetadataKey(m.From) {
+			*problems = append(*problems, fmt.Sprintf("%s.metadata.from: unknown key %q (catalog: %s)", path, m.From, core.MetadataCatalogNames()))
 		}
 		if m.As == "" {
 			*problems = append(*problems, fmt.Sprintf("%s.metadata.as: required", path))

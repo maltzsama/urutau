@@ -937,7 +937,7 @@ func ResolveSchema(src Schema, cast CastPolicy, meta []MetadataColumn) (Schema, 
 		if m.As == "" {
 			return Schema{}, nil, fmt.Errorf("core: metadata column: destination name is empty")
 		}
-		if !validMetadataKey(m.From) {
+		if !ValidMetadataKey(m.From) {
 			return Schema{}, nil, fmt.Errorf("core: metadata column %q: unknown metadata key %q (the catalog is closed)", m.As, m.From)
 		}
 		if srcNames[m.As] {
