@@ -147,6 +147,65 @@ func TestRawDecoderExtractionTombstoneAllNull(t *testing.T) {
 	}
 }
 
+// A tombstone with required fields still lands every column NULL — tombstones
+// are "no payload, no fields" and must never fail on Required.
+func TestRawDecoderExtractionTombstoneRequiredFieldAllNull(t *testing.T) {
+	d := &Raw{ByTopic: map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "id", Required: true}, {Name: "customer_id"}}},
+	}}
+	changes, err := d.Decode(&kgo.Record{Topic: "orders"})
+	if err != nil {
+		t.Fatalf("decode tombstone: %v", err)
+	}
+	after := changes[0].After
+	if after["id"] != nil || after["customer_id"] != nil {
+		t.Errorf("after = %v, want every field NULL", after)
+	}
+}
+
+// A tombstone with KeepPayload adds "payload": nil alongside the field NULLs.
+func TestRawDecoderExtractionTombstoneKeepPayloadNil(t *testing.T) {
+	d := &Raw{ByTopic: map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "id"}}, KeepPayload: true},
+	}}
+	changes, err := d.Decode(&kgo.Record{Topic: "orders"})
+	if err != nil {
+		t.Fatalf("decode tombstone: %v", err)
+	}
+	after := changes[0].After
+	if _, ok := after["payload"]; !ok || after["payload"] != nil {
+		t.Errorf("payload = %v (present %v), want NULL payload key", after["payload"], ok)
+	}
+}
+
+// A payload with trailing data after the first JSON document is rejected.
+func TestRawDecoderTrailingDataRejected(t *testing.T) {
+	d := &Raw{ByTopic: map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "id"}}},
+	}}
+	rec := &kgo.Record{Topic: "orders", Value: []byte(`{"id":1}{"id":2}`)}
+	_, err := d.Decode(rec)
+	var notJSON *ErrNotJSON
+	if !errors.As(err, &notJSON) {
+		t.Fatalf("err = %v, want *ErrNotJSON for trailing data", err)
+	}
+}
+
+// A single valid JSON document with no trailing data is accepted.
+func TestRawDecoderSingleDocumentAccepted(t *testing.T) {
+	d := &Raw{ByTopic: map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "id"}}},
+	}}
+	rec := &kgo.Record{Topic: "orders", Value: []byte(`{"id":1}`)}
+	changes, err := d.Decode(rec)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if changes[0].After["id"] == nil {
+		t.Error("id must be extracted")
+	}
+}
+
 // A required field absent from the payload fails the record.
 func TestRawDecoderRequiredFieldMissingFails(t *testing.T) {
 	d := &Raw{ByTopic: map[string]TopicExtraction{

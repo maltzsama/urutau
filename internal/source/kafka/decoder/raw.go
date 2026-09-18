@@ -17,6 +17,8 @@ package decoder
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -58,7 +60,14 @@ func (d *Raw) Decode(r *kgo.Record) ([]rowchange.Change, error) {
 // same "no payload, no fields" — rather than failing.
 func (d *Raw) extract(value []byte, spec TopicExtraction) (map[string]any, error) {
 	if value == nil {
-		return Extract(map[string]any{}, spec.Fields, d.Miss)
+		out := make(map[string]any, len(spec.Fields)+1)
+		for _, field := range spec.Fields {
+			out[field.Name] = nil
+		}
+		if spec.KeepPayload {
+			out["payload"] = nil
+		}
+		return out, nil
 	}
 
 	var doc map[string]any
@@ -66,6 +75,10 @@ func (d *Raw) extract(value []byte, spec TopicExtraction) (map[string]any, error
 	dec.UseNumber()
 	if err := dec.Decode(&doc); err != nil {
 		return nil, &ErrNotJSON{Err: err}
+	}
+	remaining, _ := io.ReadAll(dec.Buffered())
+	if len(bytes.TrimLeft(remaining, " \t\n\r")) > 0 {
+		return nil, &ErrNotJSON{Err: fmt.Errorf("raw: trailing data after JSON document")}
 	}
 
 	out, err := Extract(doc, spec.Fields, d.Miss)
