@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"runtime"
 	"strings"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/maltzsama/urutau/source"
 )
@@ -20,10 +23,41 @@ type Chunker struct {
 	table     string
 	pk        []string
 	chunkSize int
+
+	// workers bounds the concurrent row-normalization pool (issue #161).
+	// 1 means sequential. The adapter sets it from maxThreads (#165).
+	workers int
+	// retries is the transient-error retry budget for the chunk SELECT and
+	// bounds queries (#166). 0 disables retry.
+	retries int
+}
+
+// ChunkerOption tunes a Chunker.
+type ChunkerOption func(*Chunker)
+
+// WithWorkers sets the concurrent normalization pool size. n < 1 is clamped
+// to 1 (sequential).
+func WithWorkers(n int) ChunkerOption {
+	return func(c *Chunker) {
+		if n < 1 {
+			n = 1
+		}
+		c.workers = n
+	}
+}
+
+// WithRetries sets the transient-error retry budget for snapshot queries.
+func WithRetries(n int) ChunkerOption {
+	return func(c *Chunker) {
+		if n < 0 {
+			n = 0
+		}
+		c.retries = n
+	}
 }
 
 // NewChunker builds a chunker for one source table.
-func NewChunker(db *sql.DB, source, pk string, chunkSize int) (*Chunker, error) {
+func NewChunker(db *sql.DB, source, pk string, chunkSize int, opts ...ChunkerOption) (*Chunker, error) {
 	schema, table, ok := strings.Cut(source, ".")
 	if !ok {
 		return nil, fmt.Errorf("postgres: chunker: source %q must be schema.table", source)
@@ -39,13 +73,18 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int) (*Chunker, error) 
 			pks = append(pks, c)
 		}
 	}
-	return &Chunker{
+	c := &Chunker{
 		db:        db,
 		schema:    schema,
 		table:     table,
 		pk:        pks,
 		chunkSize: chunkSize,
-	}, nil
+		workers:   runtime.NumCPU(),
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c, nil
 }
 
 // PK returns the primary key columns the chunker splits by.
@@ -63,7 +102,9 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 
 	var bounds [][]any
 	for offset := 0; ; offset += c.chunkSize {
-		rows, err := c.db.QueryContext(ctx, query, offset)
+		rows, err := retryTransient(ctx, c.retries, func() (*sql.Rows, error) {
+			return c.db.QueryContext(ctx, query, offset)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("postgres: chunker bounds: %w", err)
 		}
@@ -83,6 +124,11 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 // Scan executes the chunk SELECT and calls fn for every row, keyed by
 // column name. Values decode through the same scalar mapping the pgoutput
 // reader uses, so snapshot rows and stream rows land in Iceberg identically.
+//
+// Rows are normalized by a bounded pool of `workers` goroutines, but fn is
+// always invoked from a single goroutine, so it need not be thread-safe and
+// snapshot rows stay keyed inserts (order-independent). The chunk SELECT is
+// retried on transient errors before any row is emitted (#166).
 func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
 	// Row-constructor comparison keeps composite PKs lexicographic; the
 	// placeholder index runs across clauses ($1..$k, then $k+1..).
@@ -110,7 +156,9 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	query := fmt.Sprintf("SELECT * FROM %s.%s%s ORDER BY %s",
 		quoteIdent(c.schema), quoteIdent(c.table), where, cols)
 
-	rows, err := c.db.QueryContext(ctx, query, args...)
+	rows, err := retryTransient(ctx, c.retries, func() (*sql.Rows, error) {
+		return c.db.QueryContext(ctx, query, args...)
+	})
 	if err != nil {
 		return fmt.Errorf("postgres: chunk scan: %w", err)
 	}
@@ -120,24 +168,158 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
+
+	produce := func() ([]any, bool, error) {
+		if !rows.Next() {
+			return nil, false, rows.Err()
+		}
 		vals := make([]any, len(colsMeta))
 		ptrs := make([]any, len(colsMeta))
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return fmt.Errorf("postgres: chunk scan row: %w", err)
+			return nil, false, fmt.Errorf("postgres: chunk scan row: %w", err)
 		}
-		m := make(map[string]any, len(colsMeta))
-		for i, name := range colsMeta {
-			m[name] = normalize(vals[i])
-		}
-		if err := fn(m); err != nil {
-			return err
+		return vals, true, nil
+	}
+	return scanPipeline(ctx, colsMeta, c.workers, produce, fn)
+}
+
+// scanBatchSize is how many raw rows a producer hands to a worker at once.
+// Batching amortizes the channel hand-off: one send per batch instead of one
+// per row, which is what makes the concurrent path worthwhile for cheap rows.
+const scanBatchSize = 256
+
+// scanPipeline pulls raw rows from produce and calls fn with the normalized
+// map. With workers <= 1 it is a straight loop; otherwise a producer feeds a
+// bounded pool of workers that normalize whole batches in parallel, and a
+// single collector calls fn — so fn never runs concurrently and no row
+// escapes by racing a channel pull. Row order is not preserved: snapshot rows
+// are keyed inserts, order-independent.
+func scanPipeline(
+	ctx context.Context,
+	cols []string,
+	workers int,
+	produce func() ([]any, bool, error),
+	fn func(map[string]any) error,
+) error {
+	if workers <= 1 {
+		for {
+			vals, ok, err := produce()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return nil
+			}
+			if err := fn(normalizeRow(cols, vals)); err != nil {
+				return err
+			}
 		}
 	}
-	return rows.Err()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Buffered to workers batches so the producer and the workers overlap
+	// without unbounded buffering (channel-based backpressure).
+	jobs := make(chan [][]any, workers)
+	results := make(chan []map[string]any, workers)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	// Producer: the only goroutine that touches the *sql.Rows. Rows are
+	// accumulated into batches before the hand-off.
+	g.Go(func() error {
+		defer close(jobs)
+		buf := make([][]any, 0, scanBatchSize)
+		flush := func() error {
+			if len(buf) == 0 {
+				return nil
+			}
+			b := buf
+			buf = make([][]any, 0, scanBatchSize)
+			select {
+			case jobs <- b:
+				return nil
+			case <-gctx.Done():
+				return gctx.Err()
+			}
+		}
+		for {
+			vals, ok, err := produce()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return flush()
+			}
+			buf = append(buf, vals)
+			if len(buf) == scanBatchSize {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
+	})
+
+	for i := 0; i < workers; i++ {
+		g.Go(func() error {
+			for b := range jobs {
+				out := make([]map[string]any, len(b))
+				for j := range b {
+					out[j] = normalizeRow(cols, b[j])
+				}
+				select {
+				case results <- out:
+				case <-gctx.Done():
+					return gctx.Err()
+				}
+			}
+			return nil
+		})
+	}
+
+	// Close results once every worker has drained jobs, so the collector's
+	// range terminates. On error the errgroup's context cancels the
+	// producer/workers and this still runs.
+	go func() {
+		_ = g.Wait()
+		close(results)
+	}()
+
+	var fnErr error
+	for b := range results {
+		for _, m := range b {
+			if err := fn(m); err != nil {
+				fnErr = err
+				cancel()
+				break
+			}
+		}
+		if fnErr != nil {
+			break
+		}
+	}
+	// Drain whatever is still buffered/in flight so a cancelled worker
+	// blocked on results can observe gctx and exit.
+	for range results {
+	}
+	if fnErr != nil {
+		return fnErr
+	}
+	return g.Wait()
+}
+
+// normalizeRow maps one raw row to a column-keyed map through the shared
+// scalar mapping.
+func normalizeRow(cols []string, vals []any) map[string]any {
+	m := make(map[string]any, len(cols))
+	for i, name := range cols {
+		m[name] = normalize(vals[i])
+	}
+	return m
 }
 
 func scanRow(rows *sql.Rows) ([]any, error) {

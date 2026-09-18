@@ -45,6 +45,9 @@ type Config struct {
 	SlotName string
 	Tables   []source.TableRef
 	Logger   *slog.Logger
+	// RetryCount is the transient-error reconnect budget for the
+	// replication stream (#166). 0 disables reconnect.
+	RetryCount int
 }
 
 // relEntry binds a pgoutput relation id to its introspected state and the
@@ -60,6 +63,8 @@ type Reader struct {
 	cfg     Config
 	db      *sql.DB
 	conn    *pgx.Conn
+	connCfg *pgx.ConnConfig // owned by the reader; reused to reconnect
+	retries int             // transient-error reconnect budget (#166)
 	out     chan<- rowchange.Change
 	bySrc   map[string]source.TableRef // "schema.table" → ref (PK + target)
 	states  map[string]*TableState     // "schema.table" → introspected state
@@ -149,6 +154,8 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		cfg:     cfg,
 		db:      cfg.DB,
 		conn:    conn,
+		connCfg: connCfg,
+		retries: cfg.RetryCount,
 		out:     out,
 		bySrc:   bySrc,
 		states:  states,
@@ -212,6 +219,11 @@ func (r *Reader) Master(ctx context.Context) (position.Position, error) {
 // StartFromLSN begins streaming from the given LSN, blocking until the
 // stream ends or ctx is cancelled. Call in a goroutine. An LSN of 0/0
 // starts at the slot's confirmed point.
+//
+// A transient stream failure (network blip, 08xxx/53xxx, admin shutdown) is
+// retried: the replication connection is re-dialed and the stream resumes
+// from the last position committed to the sink, up to r.retries times
+// (#166). A permanent failure is returned immediately.
 func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 	// The loop runs on its own cancelable ctx: Close stops it and waits
 	// for loopDone, so the conn is never closed mid-call from two
@@ -232,6 +244,46 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 	}
 	r.cfg.Logger.Info("reader start", "from", start.String())
 
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := r.runReplication(ctx, start)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !isTransient(err) || attempt >= r.retries {
+			return err
+		}
+		r.cfg.Logger.Warn("postgres: replication stream lost, reconnecting",
+			"attempt", attempt+1, "from", r.Synced().String(), "err", err)
+		if rerr := r.reconnect(ctx); rerr != nil {
+			return rerr
+		}
+		// Resume from the last position committed to the sink. At worst
+		// this replays a transaction, which the idempotent commit absorbs;
+		// it never skips data. With no commit yet, 0/0 lets the slot pick
+		// its confirmed_flush.
+		if p := r.confirmedLSN(); p != 0 {
+			start = &p
+		} else {
+			start = position.MustLSN("0/0")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(retryBackoff(attempt)):
+		}
+	}
+}
+
+// runReplication opens the logical replication stream and consumes it until
+// the stream ends or ctx is cancelled. It returns the terminating error;
+// StartFromLSN decides whether to reconnect.
+func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error {
 	err := pglogrepl.StartReplication(ctx, r.conn.PgConn(), r.cfg.SlotName, pglogrepl.LSN(*start),
 		pglogrepl.StartReplicationOptions{
 			Mode: pglogrepl.LogicalReplication,
@@ -268,9 +320,11 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 				nextStatus = time.Now().Add(statusInterval)
 				continue
 			}
+			// Wrap the PgError so isTransient can classify its SQLSTATE
+			// and decide whether a reconnect is warranted.
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) {
-				return fmt.Errorf("postgres: stream error %s: %s", pgErr.Code, pgErr.Message)
+				return fmt.Errorf("postgres: stream error %s: %w", pgErr.Code, pgErr)
 			}
 			return fmt.Errorf("postgres: receive: %w", err)
 		}
@@ -307,6 +361,24 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 			}
 		}
 	}
+}
+
+// reconnect closes the dead replication connection and dials a fresh one.
+// The in-flight transaction buffer is dropped: the connection died before
+// its commit, so those rows were never committed and must not be flushed.
+// Runs only in the StartFromLSN goroutine.
+func (r *Reader) reconnect(ctx context.Context) error {
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = r.conn.Close(closeCtx)
+	cancel()
+
+	conn, err := pgx.ConnectConfig(ctx, r.connCfg)
+	if err != nil {
+		return fmt.Errorf("postgres: replication reconnect: %w", err)
+	}
+	r.conn = conn
+	r.txn = r.txn[:0]
+	return nil
 }
 
 // Close stops the reader and its replication connection. It cancels the

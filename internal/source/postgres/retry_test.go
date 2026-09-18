@@ -89,3 +89,68 @@ func TestResolveRetryCount(t *testing.T) {
 		t.Fatalf("resolveRetryCount(-1) = %d, want 0", got)
 	}
 }
+
+func TestRetryTransientPermanentNotRetried(t *testing.T) {
+	attempts := 0
+	perm := &pgconn.PgError{Code: "28P01"} // invalid password
+	_, err := retryTransient(context.Background(), 5, func() (int, error) {
+		attempts++
+		return 0, perm
+	})
+	if !errors.Is(err, perm) {
+		t.Fatalf("err = %v, want the permanent error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("permanent error retried %d times, want 1", attempts)
+	}
+}
+
+func TestRetryTransientSucceedsAfterRetry(t *testing.T) {
+	attempts := 0
+	transient := &pgconn.PgError{Code: "08006"} // connection failure
+	v, err := retryTransient(context.Background(), 3, func() (int, error) {
+		attempts++
+		if attempts == 1 {
+			return 0, transient
+		}
+		return 42, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 42 || attempts != 2 {
+		t.Fatalf("v=%d attempts=%d, want 42/2", v, attempts)
+	}
+}
+
+func TestRetryTransientExhaustsBudget(t *testing.T) {
+	attempts := 0
+	transient := &pgconn.PgError{Code: "53300"} // too many connections
+	_, err := retryTransient(context.Background(), 1, func() (int, error) {
+		attempts++
+		return 0, transient
+	})
+	if !errors.Is(err, transient) {
+		t.Fatalf("err = %v, want the transient error", err)
+	}
+	if attempts != 2 { // initial + 1 retry
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestRetryTransientContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts := 0
+	transient := &pgconn.PgError{Code: "08006"}
+	_, err := retryTransient(ctx, 5, func() (int, error) {
+		attempts++
+		return 0, transient
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
