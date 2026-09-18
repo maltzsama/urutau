@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,7 +84,8 @@ func TestURIAddr(t *testing.T) {
 
 func TestURIQueryDSN(t *testing.T) {
 	u := &URI{User: "root", Password: "secret", Host: "localhost", Port: "3306", DB: "mydb"}
-	want := "root:secret@tcp(localhost:3306)/mydb?parseTime=true&loc=UTC"
+	want := "root:secret@tcp(localhost:3306)/mydb?parseTime=true&loc=UTC&time_zone=" +
+		url.QueryEscape("'"+mysqlTZOffset(time.UTC)+"'")
 	got, err := u.QueryDSN()
 	if err != nil {
 		t.Fatalf("QueryDSN: %v", err)
