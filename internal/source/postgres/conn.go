@@ -2,16 +2,17 @@ package postgres
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/maltzsama/urutau/spec"
 )
@@ -19,10 +20,12 @@ import (
 // Defaults applied when the operator leaves a tuning field unset on the
 // nested postgres block. Both mirror the OLake reference behavior.
 const (
-	defaultMaxThreads = 0 // resolved to runtime.NumCPU() at build time
 	defaultRetryCount = 3
 	maxMaxThreads     = 32
 )
+
+// sshDialTimeout bounds the TCP dial to the bastion and the SSH handshake.
+const sshDialTimeout = 15 * time.Second
 
 // ConnConfig holds the resolved connection parameters, built from either a
 // URI or the nested PostgresSource config.
@@ -31,8 +34,8 @@ type ConnConfig struct {
 	// to a distributed worker (the worker only receives kind + dsn).
 	QueryURI string
 	// ConnConfig is the native pgx config for replication and query
-	// connections. It carries TLSConfig and DialFunc (SSH) so both
-	// connection paths share one transport.
+	// connections. It carries TLSConfig (built by pgx from the DSN) and
+	// DialFunc (SSH) so both connection paths share one transport.
 	ConnConfig *pgx.ConnConfig
 	// MaxOpenConns is the resolved maxThreads value.
 	MaxOpenConns int
@@ -68,6 +71,13 @@ func BuildConnConfig(uri string) (*ConnConfig, error) {
 // BuildConnConfigFromPostgres constructs a ConnConfig from the nested
 // PostgresSource config. When present, source.uri is ignored for connection
 // building.
+//
+// The config is created by pgx.ParseConfig on the rendered DSN — never by
+// hand. pgx's ConnectConfig panics on a config it did not create, and it also
+// needs RuntimeParams initialized (Reader.New writes "replication" into it).
+// Parsing the DSN also gets pgx's native TLS handling for free (require,
+// verify-ca and verify-full all follow libpq semantics, including loading the
+// CA and client cert/key). Only the SSH DialFunc is layered on afterwards.
 func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 	if pg.Host == "" {
 		return nil, fmt.Errorf("postgres: host required")
@@ -75,39 +85,15 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 	if pg.Database == "" {
 		return nil, fmt.Errorf("postgres: database required")
 	}
-	port := pg.Port
-	if port == 0 {
-		port = 5432
-	}
 
-	cfg := &pgx.ConnConfig{}
-	cfg.Host = pg.Host
-	cfg.Port = uint16(port)
-	cfg.Database = pg.Database
-	cfg.User = pg.Username
-	cfg.Password = pg.Password
-
-	if len(pg.Params) > 0 {
-		cfg.RuntimeParams = make(map[string]string, len(pg.Params))
-		for k, v := range pg.Params {
-			cfg.RuntimeParams[k] = v
-		}
-	}
-
-	// TLS: a nil TLSConfig means no TLS. pgx defaults to TLS-require, so an
-	// absent/disable ssl block must clear it explicitly.
-	if pg.SSL != nil && pg.SSL.Mode != "" && pg.SSL.Mode != "disable" {
-		tlsCfg, err := buildTLSConfig(pg.SSL)
-		if err != nil {
-			return nil, fmt.Errorf("postgres: ssl: %w", err)
-		}
-		cfg.TLSConfig = tlsCfg
-	} else {
-		cfg.TLSConfig = nil
+	dsn := pg.DSN()
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse config: %w", err)
 	}
 
 	cc := &ConnConfig{
-		QueryURI:     pg.DSN(),
+		QueryURI:     dsn,
 		ConnConfig:   cfg,
 		MaxOpenConns: resolveMaxThreads(pg.MaxThreads),
 		RetryCount:   resolveRetryCount(pg.RetryCount),
@@ -155,94 +141,14 @@ func resolveRetryCount(n int) int {
 	return n
 }
 
-// buildTLSConfig builds a *tls.Config from the SSL config. Returns nil for
-// disable mode.
-func buildTLSConfig(ssl *spec.SSLConfig) (*tls.Config, error) {
-	if ssl.Mode == "" || ssl.Mode == "disable" {
-		return nil, nil
-	}
-
-	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-
-	switch ssl.Mode {
-	case "require":
-		// TLS but don't verify the server certificate.
-		cfg.InsecureSkipVerify = true
-	case "verify-ca":
-		pool, err := loadCA(ssl.CA)
-		if err != nil {
-			return nil, err
-		}
-		cfg.RootCAs = pool
-		// Go's default verification always checks the hostname; disable it
-		// and re-verify the chain by hand (DNSName left empty).
-		cfg.InsecureSkipVerify = true
-		cfg.VerifyConnection = verifyChainOnlyPostgres(cfg.RootCAs)
-	case "verify-full":
-		pool, err := loadCA(ssl.CA)
-		if err != nil {
-			return nil, err
-		}
-		cfg.RootCAs = pool
-	}
-
-	// Client certificate (mutual TLS).
-	if ssl.Cert != "" || ssl.Key != "" {
-		if ssl.Cert == "" || ssl.Key == "" {
-			return nil, fmt.Errorf("ssl.cert and ssl.key must be set together")
-		}
-		cert, err := tls.LoadX509KeyPair(ssl.Cert, ssl.Key)
-		if err != nil {
-			return nil, fmt.Errorf("load client certificate: %w", err)
-		}
-		cfg.Certificates = []tls.Certificate{cert}
-	}
-
-	return cfg, nil
-}
-
-func loadCA(path string) (*x509.CertPool, error) {
-	if path == "" {
-		return nil, fmt.Errorf("ssl.ca is required for this mode")
-	}
-	pem, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read ssl.ca %q: %w", path, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("ssl.ca %q: no certificates found", path)
-	}
-	return pool, nil
-}
-
-// verifyChainOnlyPostgres returns a tls.ConnectionState verifier that checks
-// the peer certificate chain against roots but not the hostname.
-func verifyChainOnlyPostgres(roots *x509.CertPool) func(tls.ConnectionState) error {
-	return func(cs tls.ConnectionState) error {
-		if len(cs.PeerCertificates) == 0 {
-			return fmt.Errorf("server presented no certificate")
-		}
-		opts := x509.VerifyOptions{
-			Roots:         roots,
-			Intermediates: x509.NewCertPool(),
-			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		}
-		for _, cert := range cs.PeerCertificates[1:] {
-			opts.Intermediates.AddCert(cert)
-		}
-		_, err := cs.PeerCertificates[0].Verify(opts)
-		return err
-	}
-}
-
 // sshTunnel owns one SSH client shared by every connection the source opens
 // through it. A fresh client is dialed on first use and reused; if a forward
 // fails the dead client is dropped so the next dial reconnects. Close tears
 // it down at shutdown.
 type sshTunnel struct {
-	addr   string
-	client *ssh.ClientConfig
+	addr      string
+	clientCfg *ssh.ClientConfig
+	dialer    net.Dialer
 
 	mu     sync.Mutex
 	conn   *ssh.Client
@@ -252,6 +158,34 @@ type sshTunnel struct {
 // newSSHTunnel validates the SSH config and prepares (but does not dial) the
 // tunnel. No network I/O happens until the first connection.
 func newSSHTunnel(cfg *spec.SSHConfig) (*sshTunnel, error) {
+	authMethods, err := sshAuthMethods(cfg)
+	if err != nil {
+		return nil, err
+	}
+	hostKey, err := hostKeyCallback(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	port := cfg.Port
+	if port == 0 {
+		port = 22
+	}
+	return &sshTunnel{
+		addr: fmt.Sprintf("%s:%d", cfg.Host, port),
+		clientCfg: &ssh.ClientConfig{
+			User:            cfg.Username,
+			Auth:            authMethods,
+			HostKeyCallback: hostKey,
+			Timeout:         sshDialTimeout,
+		},
+		dialer: net.Dialer{Timeout: sshDialTimeout},
+	}, nil
+}
+
+// sshAuthMethods builds the authentication methods from the config: password
+// and/or private key (with an optional passphrase).
+func sshAuthMethods(cfg *spec.SSHConfig) ([]ssh.AuthMethod, error) {
 	var authMethods []ssh.AuthMethod
 	if cfg.Password != "" {
 		authMethods = append(authMethods, ssh.Password(cfg.Password))
@@ -275,29 +209,42 @@ func newSSHTunnel(cfg *spec.SSHConfig) (*sshTunnel, error) {
 	if len(authMethods) == 0 {
 		return nil, fmt.Errorf("no authentication method configured")
 	}
+	return authMethods, nil
+}
 
-	port := cfg.Port
-	if port == 0 {
-		port = 22
+// hostKeyCallback verifies the bastion's host key against a known_hosts file.
+// The configured path wins; otherwise ~/.ssh/known_hosts is used when it
+// exists. A missing file is an error — host key verification is never
+// silently disabled.
+func hostKeyCallback(cfg *spec.SSHConfig) (ssh.HostKeyCallback, error) {
+	path := cfg.KnownHosts
+	if path == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			def := filepath.Join(home, ".ssh", "known_hosts")
+			if _, statErr := os.Stat(def); statErr == nil {
+				path = def
+			}
+		}
 	}
-	return &sshTunnel{
-		addr: fmt.Sprintf("%s:%d", cfg.Host, port),
-		client: &ssh.ClientConfig{
-			User:            cfg.Username,
-			Auth:            authMethods,
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec // operator-managed tunnel
-		},
-	}, nil
+	if path == "" {
+		return nil, fmt.Errorf("ssh.knownHosts is required (or provide a readable ~/.ssh/known_hosts); refusing to disable host key verification")
+	}
+	cb, err := knownhosts.New(path)
+	if err != nil {
+		return nil, fmt.Errorf("load known_hosts %q: %w", path, err)
+	}
+	return cb, nil
 }
 
 // Dial returns a connection forwarded through the tunnel. It matches
-// pgx.ConnConfig.DialFunc.
-func (t *sshTunnel) Dial(_ context.Context, network, addr string) (net.Conn, error) {
-	client, err := t.getClient()
+// pgx.ConnConfig.DialFunc and honors ctx for both the bastion dial and the
+// forwarded connection.
+func (t *sshTunnel) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	client, err := t.getClient(ctx)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := client.Dial(network, addr)
+	conn, err := client.DialContext(ctx, network, addr)
 	if err != nil {
 		// The cached client may be dead; drop it so the next dial reconnects.
 		t.drop(client)
@@ -306,7 +253,7 @@ func (t *sshTunnel) Dial(_ context.Context, network, addr string) (net.Conn, err
 	return conn, nil
 }
 
-func (t *sshTunnel) getClient() (*ssh.Client, error) {
+func (t *sshTunnel) getClient(ctx context.Context) (*ssh.Client, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed {
@@ -315,12 +262,18 @@ func (t *sshTunnel) getClient() (*ssh.Client, error) {
 	if t.conn != nil {
 		return t.conn, nil
 	}
-	client, err := ssh.Dial("tcp", t.addr, t.client)
+
+	netConn, err := t.dialer.DialContext(ctx, "tcp", t.addr)
 	if err != nil {
 		return nil, fmt.Errorf("ssh dial %s: %w", t.addr, err)
 	}
-	t.conn = client
-	return client, nil
+	conn, chans, reqs, err := ssh.NewClientConn(netConn, t.addr, t.clientCfg)
+	if err != nil {
+		_ = netConn.Close()
+		return nil, fmt.Errorf("ssh handshake %s: %w", t.addr, err)
+	}
+	t.conn = ssh.NewClient(conn, chans, reqs)
+	return t.conn, nil
 }
 
 func (t *sshTunnel) drop(client *ssh.Client) {

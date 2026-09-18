@@ -1,12 +1,42 @@
 package postgres
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/maltzsama/urutau/spec"
 )
+
+func TestHostKeyCallback(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := ssh.NewPublicKey(priv.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	kh := filepath.Join(dir, "known_hosts")
+	line := knownhosts.Line([]string{"bastion.example.com"}, pub)
+	if err := os.WriteFile(kh, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hostKeyCallback(&spec.SSHConfig{KnownHosts: kh}); err != nil {
+		t.Fatalf("hostKeyCallback: %v", err)
+	}
+	if _, err := hostKeyCallback(&spec.SSHConfig{KnownHosts: filepath.Join(dir, "missing")}); err == nil {
+		t.Fatal("want error for a missing known_hosts file")
+	}
+}
 
 func TestBuildConnConfigFromPostgresMinimal(t *testing.T) {
 	pg := &spec.PostgresSource{Host: "localhost", Database: "mydb"}
@@ -186,34 +216,56 @@ func TestBuildConnConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestBuildTLSConfigDisable(t *testing.T) {
-	cfg, err := buildTLSConfig(&spec.SSLConfig{Mode: "disable"})
+func TestBuildConnConfigFromPostgresTLSModes(t *testing.T) {
+	// disable -> no TLS
+	cc, err := BuildConnConfigFromPostgres(&spec.PostgresSource{
+		Host: "localhost", Database: "db", SSL: &spec.SSLConfig{Mode: "disable"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg != nil {
-		t.Fatal("disable mode should return nil config")
+	if cc.ConnConfig.TLSConfig != nil {
+		t.Fatal("disable mode must not configure TLS")
 	}
-}
 
-func TestBuildTLSConfigRequire(t *testing.T) {
-	cfg, err := buildTLSConfig(&spec.SSLConfig{Mode: "require"})
+	// require -> TLS without verification
+	cc, err = BuildConnConfigFromPostgres(&spec.PostgresSource{
+		Host: "localhost", Database: "db", SSL: &spec.SSLConfig{Mode: "require"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg == nil {
-		t.Fatal("require mode must return non-nil config")
+	if cc.ConnConfig.TLSConfig == nil {
+		t.Fatal("require mode must configure TLS")
 	}
-	if !cfg.InsecureSkipVerify {
-		t.Fatal("require mode should skip verify")
+	if !cc.ConnConfig.TLSConfig.InsecureSkipVerify {
+		t.Fatal("require mode should skip verification")
 	}
 }
 
-func TestBuildTLSConfigCertWithoutKey(t *testing.T) {
-	_, err := buildTLSConfig(&spec.SSLConfig{Mode: "require", Cert: "/cert.pem"})
+func TestBuildConnConfigFromPostgresCertWithoutKey(t *testing.T) {
+	_, err := BuildConnConfigFromPostgres(&spec.PostgresSource{
+		Host: "localhost", Database: "db", SSL: &spec.SSLConfig{Mode: "require", Cert: "/cert.pem"},
+	})
 	if err == nil {
 		t.Fatal("want error for cert without key")
 	}
+}
+
+func TestBuildConnConfigFromPostgresRuntimeParamsInitialized(t *testing.T) {
+	// Reader.New writes "replication" into RuntimeParams; a nil map panics.
+	cc, err := BuildConnConfigFromPostgres(&spec.PostgresSource{Host: "localhost", Database: "db"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.ConnConfig.RuntimeParams == nil {
+		t.Fatal("RuntimeParams must be initialized")
+	}
+	// The config must be one pgx created, or ConnectConfig panics.
+	if _, err := pgx.ParseConfig(cc.QueryURI); err != nil {
+		t.Fatalf("QueryURI must parse: %v", err)
+	}
+	cc.ConnConfig.Copy() // must not panic
 }
 
 func TestBuildConnConfigFromURIFallback(t *testing.T) {

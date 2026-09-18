@@ -93,7 +93,11 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 			problems = append(problems, "source.schemaRegistry: required when format is avro (Confluent-compatible registry base URL)")
 		}
 	}
-	if !o.credentialsFromEnv && s.Source.URI == "" && s.Source.Postgres == nil {
+	if s.Source.Postgres != nil && s.Source.Kind != "postgres" {
+		problems = append(problems, "source.postgres: only valid for kind postgres")
+	}
+	if !o.credentialsFromEnv && s.Source.URI == "" &&
+		(s.Source.Kind != "postgres" || s.Source.Postgres == nil) {
 		problems = append(problems, "source.uri or source.postgres: required")
 	}
 	if s.Source.URI != "" && s.Source.Postgres != nil {

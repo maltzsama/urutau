@@ -75,8 +75,8 @@ and reused.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `maxThreads` | 10 | Max concurrent connections for snapshot chunk SELECTs (1..32) |
-| `retryCount` | 0 | Transient-connection retries with exponential backoff |
+| `maxThreads` | `runtime.NumCPU()` | Max concurrent connections for snapshot chunk SELECTs (1..32) |
+| `retryCount` | 3 | Transient-connection retries with exponential backoff. 0 means "use the default" |
 
 ## Requirements
 

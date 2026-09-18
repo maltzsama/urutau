@@ -59,8 +59,8 @@ When present, `uri` is ignored for connection building.
 | `ssh.password` | no | SSH password |
 | `ssh.privateKey` | no | SSH private key path |
 | `ssh.passphrase` | no | Private key passphrase |
-| `maxThreads` | no | Max concurrent snapshot connections (1..32, default 10) |
-| `retryCount` | no | Transient-connection retries with backoff (default 0) |
+| `maxThreads` | no | Max concurrent snapshot connections (1..32, default `runtime.NumCPU()`) |
+| `retryCount` | no | Transient-connection retries with backoff (default 3; 0 means "use the default") |
 
 See [Sources](../sources/index.md) for driver-specific behavior — e.g. the MySQL `uri`
 accepts `timezone` and TLS (`tls`, `ssl-ca`, `ssl-cert`, `ssl-key`,

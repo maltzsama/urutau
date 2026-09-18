@@ -130,6 +130,11 @@ type SSHConfig struct {
 	// Passphrase decrypts the private key when encrypted. Empty means
 	// unencrypted.
 	Passphrase string `json:"passphrase,omitempty"`
+	// KnownHosts is the OpenSSH known_hosts file the bastion's host key is
+	// verified against. Empty falls back to ~/.ssh/known_hosts. Host key
+	// verification is never disabled: a missing file is an error, not a
+	// silent trust-everything.
+	KnownHosts string `json:"knownHosts,omitempty"`
 }
 
 // DSN renders the libpq keyword connection string for this structured config.

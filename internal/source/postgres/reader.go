@@ -124,8 +124,12 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 
 	var connCfg *pgx.ConnConfig
 	if cfg.ConnCfg != nil && cfg.ConnCfg.ConnConfig != nil {
-		// Use the pre-built ConnConfig from the nested postgres block.
-		connCfg = cfg.ConnCfg.ConnConfig
+		// Deep-copy before mutating: the source's ConnConfig is shared with
+		// the query connector (stdlib.GetConnector keeps a shallow copy), so
+		// writing "replication" into the shared RuntimeParams map would leak
+		// the replication mode into every query connection — and pgx rejects
+		// the extended protocol on a replication connection.
+		connCfg = cfg.ConnCfg.ConnConfig.Copy()
 	} else {
 		var err error
 		connCfg, err = pgx.ParseConfig(cfg.URI)

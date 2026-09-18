@@ -813,3 +813,12 @@ func TestValidatePostgresRejectsSchemeInHost(t *testing.T) {
 		t.Fatalf("want bare-hostname problem, got %v", err)
 	}
 }
+
+func TestValidatePostgresBlockRejectedForOtherKinds(t *testing.T) {
+	s := validSpec() // mysql source
+	s.Source.URI = ""
+	s.Source.Postgres = &PostgresSource{Host: "localhost", Database: "mydb"}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "only valid for kind postgres") {
+		t.Fatalf("want kind rejection, got %v", err)
+	}
+}
