@@ -104,6 +104,9 @@ func ParseOffsets(s string) (*Offsets, error) {
 				parts[int32(p)] = offset
 			}
 		}
+		if _, exists := o.Topics[topic]; exists {
+			return nil, fmt.Errorf("position: parse offsets %q: duplicate topic %q", s, topic)
+		}
 		o.Topics[topic] = parts
 	}
 	return o, nil
@@ -254,11 +257,32 @@ func (o *Offsets) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// UnmarshalJSON deserializes the offsets from a JSON object.
+// UnmarshalJSON deserializes the offsets from a JSON object. It detects
+// the legacy {"topic":"...","parts":[...]} format and migrates it into the
+// canonical {"topics":[{topic,parts}]} shape.
 func (o *Offsets) UnmarshalJSON(data []byte) error {
 	var raw offsetsJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
+	}
+	// Detect legacy format: {"topic":"orders","parts":[{"partition":0,"offset":10}]}
+	if len(raw.Topics) == 0 {
+		var legacy struct {
+			Topic string `json:"topic"`
+			Parts []struct {
+				Partition int32 `json:"partition"`
+				Offset    int64 `json:"offset"`
+			} `json:"parts"`
+		}
+		if err := json.Unmarshal(data, &legacy); err == nil && legacy.Topic != "" {
+			o.Topics = make(map[string]map[int32]int64, 1)
+			parts := make(map[int32]int64, len(legacy.Parts))
+			for _, p := range legacy.Parts {
+				parts[p.Partition] = p.Offset
+			}
+			o.Topics[legacy.Topic] = parts
+			return nil
+		}
 	}
 	o.Topics = make(map[string]map[int32]int64, len(raw.Topics))
 	for _, tj := range raw.Topics {

@@ -129,3 +129,41 @@ func TestOffsetsJSONRoundTrip(t *testing.T) {
 		t.Errorf("round trip = %q, want %q", got, want)
 	}
 }
+
+// Duplicate topic in the canonical text form is rejected — silently overwriting
+// loses partition offsets.
+func TestParseOffsetsDuplicateTopic(t *testing.T) {
+	_, err := ParseOffsets("orders:p0=10;orders:p1=20")
+	if err == nil {
+		t.Error("expected error for duplicate topic")
+	}
+}
+
+// The legacy {"topic":"...","parts":[...]} JSON format is migrated into the
+// canonical shape, preserving offsets.
+func TestOffsetsUnmarshalJSONLegacyFormat(t *testing.T) {
+	legacy := []byte(`{"topic":"orders","parts":[{"partition":0,"offset":10},{"partition":1,"offset":20}]}`)
+	var o Offsets
+	if err := o.UnmarshalJSON(legacy); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	parts, ok := o.Topics["orders"]
+	if !ok {
+		t.Fatalf("topics = %v, want orders entry", o.Topics)
+	}
+	if parts[0] != 10 || parts[1] != 20 {
+		t.Errorf("parts = %v, want {0:10, 1:20}", parts)
+	}
+}
+
+// The canonical {"topics":[...]} JSON format still works.
+func TestOffsetsUnmarshalJSONCanonicalFormat(t *testing.T) {
+	canonical := []byte(`{"topics":[{"topic":"orders","parts":[{"partition":0,"offset":10}]}]}`)
+	var o Offsets
+	if err := o.UnmarshalJSON(canonical); err != nil {
+		t.Fatalf("unmarshal canonical: %v", err)
+	}
+	if o.Topics["orders"][0] != 10 {
+		t.Errorf("orders:p0 = %d, want 10", o.Topics["orders"][0])
+	}
+}
