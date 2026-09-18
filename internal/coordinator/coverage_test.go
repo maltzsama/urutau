@@ -179,7 +179,7 @@ func TestAnyWorkerDown(t *testing.T) {
 
 func TestResolvePartitionRangesUnpartitioned(t *testing.T) {
 	c := &Coordinator{}
-	got, err := c.resolvePartitionRanges(context.Background(), spec.Table{}, source.TableRef{})
+	got, _, err := c.resolvePartitionRanges(context.Background(), spec.Table{}, source.TableRef{})
 	if err != nil {
 		t.Fatalf("resolvePartitionRanges: %v", err)
 	}

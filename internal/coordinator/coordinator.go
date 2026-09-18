@@ -144,10 +144,14 @@ type Coordinator struct {
 	// behavior byte for byte.
 	route           map[string][]*workerState
 	partitionRanges map[string][]source.Chunk
-	workers         map[string]*workerState
-	byTicket        map[string]*workerState
-	budget          *flowBudget
-	index           map[string]*positionIndex
+	// chunkers is the per-table chunker built at boot: reused for the
+	// snapshot so a partitioned table's chunker (forced to key-based
+	// chunking by Partitions) is the one the snapshot bounds come from.
+	chunkers map[string]source.ChunkSource
+	workers  map[string]*workerState
+	byTicket map[string]*workerState
+	budget   *flowBudget
+	index    map[string]*positionIndex
 
 	// runCtx outlives the helper goroutines that need cancellation (the
 	// wireRelay) but are called outside run's select.
@@ -451,6 +455,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// no chunker query at all, so this is a no-op for every unpartitioned
 	// table (the overwhelming common case today).
 	c.partitionRanges = make(map[string][]source.Chunk, len(c.cfg.Spec.Tables))
+	c.chunkers = make(map[string]source.ChunkSource, len(c.cfg.Spec.Tables))
 	// workerTarget maps every derived worker group name back to the table
 	// target it belongs to — provisionWorkers uses it to pick that
 	// table's own worker Pod template (one per table, rendered by the
@@ -461,7 +466,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return err
 		}
 		names := t.WorkerGroupNames(c.cfg.Spec.Pipeline)
-		ranges, err := c.resolvePartitionRanges(ctx, t, refs[i])
+		ranges, chunker, err := c.resolvePartitionRanges(ctx, t, refs[i])
 		if err != nil {
 			return fmt.Errorf("coordinator: %s: %w", t.Source, err)
 		}
@@ -469,6 +474,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return fmt.Errorf("coordinator: %s: resolved %d partition ranges for %d worker groups", t.Source, len(ranges), len(names))
 		}
 		c.partitionRanges[t.Target] = ranges
+		c.chunkers[t.Target] = chunker
 
 		owners := make([]*workerState, len(names))
 		for p, name := range names {
@@ -707,10 +713,14 @@ func (c *Coordinator) run(ctx context.Context) error {
 			if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 				c.log.Warn("coordinator: eventlog emit", "err", err)
 			}
-			chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
-			if err != nil {
-				snapDone <- fmt.Errorf("coordinator: chunker %s: %w", ref.Source, err)
-				return
+			chunker, ok := c.chunkers[ref.Target]
+			if !ok || chunker == nil {
+				var cerr error
+				chunker, cerr = c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
+				if cerr != nil {
+					snapDone <- fmt.Errorf("coordinator: chunker %s: %w", ref.Source, cerr)
+					return
+				}
 			}
 			if err := c.snapshotTable(snapCtx, rdr, chunker, ref, snapCfg); err != nil {
 				snapDone <- fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
@@ -828,24 +838,26 @@ func requireConcurrentSink(t spec.Table, snk any) error {
 	return nil
 }
 
-func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, error) {
+func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, source.ChunkSource, error) {
 	n := t.WorkerCount()
 	if n <= 1 {
-		return []source.Chunk{{}}, nil
+		// Unpartitioned: no chunker needed at boot; the snapshot builds it
+		// lazily (the common case pays no chunker construction here).
+		return []source.Chunk{{}}, nil, nil
 	}
 	chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 	if err != nil {
-		return nil, fmt.Errorf("workers: %d: chunker: %w", n, err)
+		return nil, nil, fmt.Errorf("workers: %d: chunker: %w", n, err)
 	}
 	ps, ok := chunker.(source.PartitionSource)
 	if !ok {
-		return nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", n)
+		return nil, nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", n)
 	}
 	ranges, err := ps.Partitions(ctx, n)
 	if err != nil {
-		return nil, fmt.Errorf("workers: %d: %w", n, err)
+		return nil, nil, fmt.Errorf("workers: %d: %w", n, err)
 	}
-	return ranges, nil
+	return ranges, chunker, nil
 }
 
 // supervisionConfig maps the Config knobs to the supervisor defaults.
@@ -1901,6 +1913,14 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			// structured filter and compiled by the worker's source, so the
 			// same code path resolves it in both modes.
 			ta.ColumnFilter = tbl.ColumnFilter
+			// The chunk column travels too: a partitioned table is chunked
+			// by its (single-column) key even without an explicit
+			// chunkColumn, and the worker's chunker must match the
+			// coordinator's or the key bounds would be read as CTID.
+			ta.ChunkColumn = tbl.ChunkColumn
+			if ta.ChunkColumn == "" && tbl.WorkerCount() > 1 && len(ref.PrimaryKey) == 1 {
+				ta.ChunkColumn = ref.PrimaryKey[0]
+			}
 			if tbl.Filter != nil {
 				filterB, ferr := json.Marshal(tbl.Filter)
 				if ferr != nil {

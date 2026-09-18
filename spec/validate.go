@@ -222,6 +222,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 
 		validateFilter(tbl.Filter, p+".filter", &problems)
 		validateColumnFilter(tbl, p, &problems)
+		validateChunkColumn(tbl, p, &problems)
 		validateMetadata(tbl, p, &problems)
 		validateCast(tbl, p, &problems)
 		validateColumns(tbl, s.Source, p, &problems)
@@ -335,6 +336,23 @@ func validateColumnFilter(tbl Table, path string, problems *[]string) {
 				"%s.columnFilter: must include primary key column %q (the sink resolves the key and sort order by column name)", path, pk))
 		}
 	}
+}
+
+// validateChunkColumn checks the snapshot chunking column. When set it must
+// name a primary-key column: the chunk range must stay routable to the same
+// worker as the live stream when workers > 1, which only holds for a key
+// column (the same constraint OLake's split column carries).
+func validateChunkColumn(tbl Table, path string, problems *[]string) {
+	if tbl.ChunkColumn == "" {
+		return
+	}
+	for _, pk := range tbl.PrimaryKey {
+		if pk == tbl.ChunkColumn {
+			return
+		}
+	}
+	*problems = append(*problems, fmt.Sprintf(
+		"%s.chunkColumn: %q is not a primary-key column (chunking must follow the key)", path, tbl.ChunkColumn))
 }
 
 // validatePartitionBy checks the closed grammar of partition expressions:

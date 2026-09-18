@@ -184,6 +184,7 @@ message TableAssignment {
   bool      staged               = 12; // workers>1 on a staging sink: stage data files, let the coordinator commit the cycle (WK-001 C5.5)
   repeated string column_filter   = 13; // source column projection (#162): the snapshot SELECT list
   bytes     filter                = 14; // JSON spec.Filter (#163): the source WHERE predicate, composed with the chunk bounds
+  string    chunk_column          = 15; // snapshot chunking column (#151); empty = the source's default (Postgres CTID)
 }
 
 message BatchConfig {

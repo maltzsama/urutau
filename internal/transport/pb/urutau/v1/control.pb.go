@@ -1434,6 +1434,7 @@ type TableAssignment struct {
 	Staged            bool                   `protobuf:"varint,12,opt,name=staged,proto3" json:"staged,omitempty"`                                // workers>1 on a staging sink: stage data files, let the coordinator commit the cycle (WK-001 C5.5)
 	ColumnFilter      []string               `protobuf:"bytes,13,rep,name=column_filter,json=columnFilter,proto3" json:"column_filter,omitempty"` // source column projection (#162): the snapshot SELECT list
 	Filter            []byte                 `protobuf:"bytes,14,opt,name=filter,proto3" json:"filter,omitempty"`                                 // JSON spec.Filter (#163): the source WHERE predicate, composed with the chunk bounds
+	ChunkColumn       string                 `protobuf:"bytes,15,opt,name=chunk_column,json=chunkColumn,proto3" json:"chunk_column,omitempty"`    // snapshot chunking column (#151); empty = the source's default (Postgres CTID)
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1564,6 +1565,13 @@ func (x *TableAssignment) GetFilter() []byte {
 		return x.Filter
 	}
 	return nil
+}
+
+func (x *TableAssignment) GetChunkColumn() string {
+	if x != nil {
+		return x.ChunkColumn
+	}
+	return ""
 }
 
 type BatchConfig struct {
@@ -2573,7 +2581,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a5\n" +
 	"\aAsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8b\x04\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xae\x04\n" +
 	"\x0fTableAssignment\x12!\n" +
 	"\fsource_table\x18\x01 \x01(\tR\vsourceTable\x12!\n" +
 	"\ftarget_table\x18\x02 \x01(\tR\vtargetTable\x123\n" +
@@ -2592,7 +2600,8 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\bmetadata\x18\v \x01(\fR\bmetadata\x12\x16\n" +
 	"\x06staged\x18\f \x01(\bR\x06staged\x12#\n" +
 	"\rcolumn_filter\x18\r \x03(\tR\fcolumnFilter\x12\x16\n" +
-	"\x06filter\x18\x0e \x01(\fR\x06filter\"h\n" +
+	"\x06filter\x18\x0e \x01(\fR\x06filter\x12!\n" +
+	"\fchunk_column\x18\x0f \x01(\tR\vchunkColumn\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
 	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xda\x02\n" +

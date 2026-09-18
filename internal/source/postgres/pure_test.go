@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 
 	"github.com/maltzsama/urutau/core"
@@ -179,25 +180,25 @@ func TestCanonicalSchemaNumericPrecision(t *testing.T) {
 }
 
 func TestNewChunkerBadSource(t *testing.T) {
-	_, err := NewChunker(nil, "no_schema_dot", "id", 1000)
+	_, err := NewChunker(context.Background(), nil, "no_schema_dot", "id", 1000)
 	if err == nil {
 		t.Error("bare source name: want error")
 	}
 }
 
 func TestNewChunkerBadChunkSize(t *testing.T) {
-	_, err := NewChunker(nil, "public.orders", "id", 0)
+	_, err := NewChunker(context.Background(), nil, "public.orders", "id", 0)
 	if err == nil {
 		t.Error("zero chunk size: want error")
 	}
-	_, err = NewChunker(nil, "public.orders", "id", -1)
+	_, err = NewChunker(context.Background(), nil, "public.orders", "id", -1)
 	if err == nil {
 		t.Error("negative chunk size: want error")
 	}
 }
 
 func TestNewChunkerValid(t *testing.T) {
-	c, err := NewChunker(nil, "public.orders", "id", 1000)
+	c, err := NewChunker(context.Background(), nil, "public.orders", "id", 1000)
 	if err != nil {
 		t.Fatalf("NewChunker: %v", err)
 	}
@@ -207,7 +208,7 @@ func TestNewChunkerValid(t *testing.T) {
 }
 
 func TestNewChunkerCompositeKey(t *testing.T) {
-	c, err := NewChunker(nil, "public.orders", "a, b", 1000)
+	c, err := NewChunker(context.Background(), nil, "public.orders", "a, b", 1000)
 	if err != nil {
 		t.Fatalf("NewChunker: %v", err)
 	}
@@ -217,7 +218,7 @@ func TestNewChunkerCompositeKey(t *testing.T) {
 }
 
 func TestNewChunkerKeyWithSpaces(t *testing.T) {
-	c, err := NewChunker(nil, "public.orders", " a , b , c ", 500)
+	c, err := NewChunker(context.Background(), nil, "public.orders", " a , b , c ", 500)
 	if err != nil {
 		t.Fatalf("NewChunker: %v", err)
 	}
