@@ -236,7 +236,7 @@ func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes
 	key := cycleKey(deletes, appends, pos)
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
-	p["cdc.cycle"] = key
+	p[propCycle] = key
 
 	var lastErr error
 	for attempt := 0; attempt < maxCommitTries; attempt++ {
@@ -300,10 +300,10 @@ var stagedBackoff = 200 * time.Millisecond
 // properties, matching the TableWriter's own commit paths.
 func addSnapshotProps(p iceberg.Properties, state string, pending []uint32) {
 	if state != "" {
-		p["cdc.snapshot.state"] = state
+		p[snapshot.PropSnapshotState] = state
 	}
 	if pending != nil {
-		p["cdc.snapshot.pending"] = snapshot.EncodePending(pending)
+		p[snapshot.PropSnapshotPending] = snapshot.EncodePending(pending)
 	}
 }
 
@@ -329,10 +329,10 @@ func cycleKey(deletes, appends []iceberg.DataFile, pos string) string {
 // files) or its head snapshot carries the cycle key. A retry that sees either
 // must not re-add the files — appends are not idempotent. Pure, for tests.
 func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key, pos string) bool {
-	if pos != "" && props["cdc.position"] == pos {
+	if pos != "" && props[propPosition] == pos {
 		return true
 	}
-	return head != nil && head.Summary != nil && head.Summary.Properties["cdc.cycle"] == key
+	return head != nil && head.Summary != nil && head.Summary.Properties[propCycle] == key
 }
 
 // encodeStaged frames a payload as its opaque descriptor: a magic byte, a
