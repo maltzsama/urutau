@@ -98,7 +98,6 @@ func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 		{core.MetaMsgTS},
 		{core.MetaMsgKey},
 		{core.MetaHeaders},
-		{core.MetaEnrichMiss},
 	}
 	for _, tc := range cases {
 		_, err := metaValue(tc.key, c, "src.t")
@@ -167,26 +166,6 @@ func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 	}
 	if got != core.PhaseStream {
 		t.Errorf("no phase = %v, want %v", got, core.PhaseStream)
-	}
-
-	// EnrichMiss true returns true.
-	em := rowMeta{EnrichMiss: true}
-	got, err = metaValue(core.MetaEnrichMiss, em, "t")
-	if err != nil {
-		t.Fatalf("enrich miss: %v", err)
-	}
-	if got != true {
-		t.Errorf("enrich miss = %v, want true", got)
-	}
-
-	// EnrichMiss false returns nil.
-	emFalse := rowMeta{EnrichMiss: false}
-	got, err = metaValue(core.MetaEnrichMiss, emFalse, "t")
-	if err != nil {
-		t.Fatalf("enrich miss false: %v", err)
-	}
-	if got != nil {
-		t.Errorf("enrich miss false = %v, want nil", got)
 	}
 }
 

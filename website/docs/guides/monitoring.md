@@ -61,7 +61,6 @@ maintenance worker is ephemeral and reports its pass back before exiting)
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `urutau_enrich_misses_total` | counter | Left-join misses (event passed with NULLs) |
 | `urutau_enrich_inner_dropped_total` | counter | Events dropped by an inner-join miss |
 | `urutau_enrich_evicted_total` | counter | Events evicted from the cold-start buffer |
 

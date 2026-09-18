@@ -82,13 +82,12 @@ func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, m
 // the wire record. Transport-envelope fields (stream/shard/headers) are nil
 // on the wire path: their fallback semantics are unchanged.
 type rowMeta struct {
-	Op         rowchange.Op
-	Position   string
-	CommitTS   time.Time
-	IngestTS   time.Time
-	Snapshot   bool
-	Phase      string
-	EnrichMiss bool
+	Op       rowchange.Op
+	Position string
+	CommitTS time.Time
+	IngestTS time.Time
+	Snapshot bool
+	Phase    string
 }
 
 func rowMetaOf(r *transport.BatchReader, i int) rowMeta {
@@ -191,11 +190,6 @@ func metaValue(key core.MetadataKey, c rowMeta, sourceTable string) (any, error)
 	case core.MetaMsgKey:
 		return nil, nil
 	case core.MetaHeaders:
-		return nil, nil
-	case core.MetaEnrichMiss:
-		if c.EnrichMiss {
-			return true, nil
-		}
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unknown metadata key %q", key)

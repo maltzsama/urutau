@@ -342,13 +342,12 @@ func (w *tableWriter) valueOf(col column, v any) (any, error) {
 
 // chRowMeta is the per-row metadata view the metadata resolvers need.
 type chRowMeta struct {
-	Op         rowchange.Op
-	Position   string
-	CommitTS   time.Time
-	IngestTS   time.Time
-	Snapshot   bool
-	Phase      string
-	EnrichMiss bool
+	Op       rowchange.Op
+	Position string
+	CommitTS time.Time
+	IngestTS time.Time
+	Snapshot bool
+	Phase    string
 }
 
 func clickhouseRowMetaOf(r *transport.BatchReader, i int) chRowMeta {
@@ -406,11 +405,6 @@ func metaValue(key core.MetadataKey, c chRowMeta, sourceTable string) (any, erro
 	case core.MetaMsgKey:
 		return nil, nil
 	case core.MetaHeaders:
-		return nil, nil
-	case core.MetaEnrichMiss:
-		if c.EnrichMiss {
-			return true, nil
-		}
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unknown metadata key %q", key)

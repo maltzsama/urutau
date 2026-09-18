@@ -43,14 +43,6 @@ const (
 	// an axis orthogonal to op — a snapshot row is semantically an insert.
 	MetaPhase MetadataKey = "phase"
 
-	// MetaEnrichMiss marks a row whose enrichment stage ran with a left
-	// join and found no reference match: true on a miss, NULL otherwise.
-	// It is set by the enrichment stage on the change and materialized only
-	// when the table declares it via metadata — like every catalog entry,
-	// declaring it is explicit. An inner join never produces it (a miss is
-	// a dropped row, and the count is the evidence).
-	MetaEnrichMiss MetadataKey = "enrich_miss"
-
 	// Transport metadata — the message-queue envelope (Kafka today, Kinesis
 	// next). Names are transport-neutral so they do not need renaming as
 	// sources are added. For CDC sources only MetaStream and MetaSequence
@@ -75,15 +67,12 @@ func (k MetadataKey) String() string { return string(k) }
 
 // ColumnType returns the canonical type the key lands as. Every metadata
 // column is nullable: snapshot rows carry NULL for commit_ts, the transport
-// envelope is NULL for CDC sources, and a left-join miss is NULL for
-// enrich_miss. The kind is the shape; nullability is a property of the value
-// and is always true for a metadata column.
+// envelope is NULL for CDC sources. The kind is the shape; nullability is a
+// property of the value and is always true for a metadata column.
 func (k MetadataKey) ColumnType() ColumnType {
 	switch k {
 	case MetaCommitTS, MetaIngestTS, MetaMsgTS:
 		return ColumnType{Kind: KindTimestampTZ, Nullable: true}
-	case MetaEnrichMiss:
-		return ColumnType{Kind: KindBool, Nullable: true}
 	default:
 		return ColumnType{Kind: KindString, Nullable: true}
 	}
@@ -124,12 +113,10 @@ type MetadataColumn struct {
 
 // MetadataCatalog is the closed catalog, in the order the keys are declared
 // above. It is the single source of truth: membership checks and the
-// catalog list in error messages both derive from it, so a key added here
-// cannot be missed by a validator (spec/validate.go once kept a hand-copied
-// map that silently omitted enrich_miss).
+// catalog list in error messages both derive from it.
 var MetadataCatalog = []MetadataKey{
 	MetaOp, MetaCommitTS, MetaIngestTS, MetaPosition, MetaSourceTable,
-	MetaPhase, MetaEnrichMiss, MetaStream, MetaShard, MetaSeq, MetaMsgTS,
+	MetaPhase, MetaStream, MetaShard, MetaSeq, MetaMsgTS,
 	MetaMsgKey, MetaHeaders,
 }
 
