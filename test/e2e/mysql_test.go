@@ -7,11 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/iceberg-go/table"
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/maltzsama/urutau/internal/runner"
-	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -132,18 +130,7 @@ func mysqlConn(t *testing.T) *sql.DB {
 // from a fresh snapshot (no committed position to resume from).
 func dropIcebergTable(t *testing.T, ctx context.Context) {
 	t.Helper()
-	cfg := icebergsink.Config{
-		URI:          env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog"),
-		Warehouse:    env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog"),
-		ClientID:     "root",
-		ClientSecret: "s3cr3t",
-		Scope:        "PRINCIPAL_ROLE:ALL",
-	}
-	cat, err := icebergsink.NewCatalog(ctx, cfg)
-	if err != nil {
-		t.Fatalf("catalog: %v", err)
-	}
-	_ = cat.DropTable(ctx, table.Identifier{"raw", "orders"})
+	dropIcebergTableNamed(t, ctx, "raw", "orders")
 }
 
 func dml(t *testing.T, db *sql.DB, q string) {
