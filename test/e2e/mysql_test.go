@@ -181,6 +181,25 @@ func waitTrino(t *testing.T, ctx context.Context, query string, want any) {
 	}
 }
 
+// waitTrinoAtLeast polls until a scalar query returns a value >= min,
+// tolerating transient errors (the table may not exist yet during setup).
+func waitTrinoAtLeast(t *testing.T, ctx context.Context, query string, min int64) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		rows, err := trinoQuery(ctx, query)
+		if err == nil && len(rows) == 1 && len(rows[0]) == 1 {
+			if n, ok := rows[0][0].(int64); ok && n >= min {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("trino wait >= %d %q: rows=%v err=%v", min, query, rows, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func assertTrino(t *testing.T, ctx context.Context, query string, want any) {
 	t.Helper()
 	rows := trinoRows(t, ctx, query)

@@ -173,9 +173,10 @@ func seedPostgresOrders(t *testing.T, db *sql.DB, from, count int) {
 
 // TestPostgresSnapshotConcurrentWrites covers #164's concurrent-write
 // acceptance: rows are inserted, updated, and deleted while the snapshot is
-// still scanning (500 rows / chunkSize 10 = 50 chunks). Each chunk runs in
-// a REPEATABLE READ, READ ONLY transaction, and the DBLog window proves the
-// caught-up point, so the target must converge with no loss and no duplicate.
+// still scanning (2000 rows / chunkSize 10 = 200 chunks, 20 worker batches).
+// Each chunk runs in a REPEATABLE READ, READ ONLY transaction, and the DBLog
+// window proves the caught-up point, so the target must converge with no loss
+// and no duplicate.
 func TestPostgresSnapshotConcurrentWrites(t *testing.T) {
 	requireE2E(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -186,10 +187,10 @@ func TestPostgresSnapshotConcurrentWrites(t *testing.T) {
 	pgExec(t, db, `TRUNCATE orders`)
 	dropE2ESlots(t, db)
 	dropIcebergTable(t, ctx)
-	// One bulk seed so the snapshot has enough chunks to overlap the writes.
+	// One bulk seed so the snapshot spans many chunks and outlives the writes.
 	pgExec(t, db, `INSERT INTO orders (id, v, amount, active)
 		SELECT g, 'seed-' || g, (g % 7)::double precision, g % 2 = 0
-		FROM generate_series(0, 499) g`)
+		FROM generate_series(0, 1999) g`)
 
 	s := loadPostgresPipeline(t)
 	s.Source.SlotName = slot
@@ -200,18 +201,22 @@ func TestPostgresSnapshotConcurrentWrites(t *testing.T) {
 	stop, checkRun := runPostgresPipeline(t, ctx, s)
 	defer stop()
 
-	// Writes land while the pipeline goroutine is mid-snapshot.
+	// Wait until the snapshot is provably mid-flight (a partial count) so the
+	// writes below genuinely overlap the scan instead of racing ahead of it.
+	waitTrinoAtLeast(t, ctx, `SELECT count(*) FROM orders`, 100)
+
+	// Writes land while the pipeline goroutine is still snapshotting.
 	for i := 0; i < 50; i++ {
 		pgExec(t, db, fmt.Sprintf(
 			`INSERT INTO orders (id, v, amount, active) VALUES (%d, 'conc-%d', 1.0, true)`, 10000+i, i))
 		pgExec(t, db, fmt.Sprintf(`UPDATE orders SET v = 'conc-upd-%d' WHERE id = %d`, i, i))
 	}
 	for i := 0; i < 10; i++ {
-		pgExec(t, db, fmt.Sprintf(`DELETE FROM orders WHERE id = %d`, 490+i))
+		pgExec(t, db, fmt.Sprintf(`DELETE FROM orders WHERE id = %d`, 1990+i))
 	}
 
-	// 500 seeded + 50 inserted - 10 deleted.
-	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(540))
+	// 2000 seeded + 50 inserted - 10 deleted.
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(2040))
 	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 0`, "conc-upd-0")
 	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 10000`, "conc-0")
 	// Upsert idempotency: a row touched during the snapshot is not duplicated.
