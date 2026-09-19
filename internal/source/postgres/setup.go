@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -169,4 +170,49 @@ func ConfirmedLSN(ctx context.Context, db *sql.DB, slotName string) (*position.L
 		return nil, fmt.Errorf("postgres: confirmed lsn: %w", err)
 	}
 	return position.ParseLSN(raw)
+}
+
+// ValidateSlotState reconciles a stored resume LSN with the slot's
+// confirmed_flush_lsn and returns the LSN the stream should start from (#156):
+//
+//   - resume == nil (first boot): start from the slot's confirmed point.
+//   - resume == confirmed: no drift.
+//   - resume < confirmed: the slot is ahead of the sink. The sink's stored
+//     point is behind what the server already confirmed (and may have
+//     recycled), so the slot's point is authoritative — warn and use it.
+//   - resume > confirmed: the sink claims a position the slot never confirmed,
+//     which means the slot was reset or replaced. Fail rather than risk
+//     resuming past unread WAL.
+func ValidateSlotState(ctx context.Context, db *sql.DB, slotName string, resume *position.LSN, logger *slog.Logger) (*position.LSN, error) {
+	confirmed, err := ConfirmedLSN(ctx, db, slotName)
+	if err != nil {
+		return nil, err
+	}
+	if resume == nil {
+		return confirmed, nil
+	}
+	switch resume.Compare(confirmed) {
+	case 0:
+		return confirmed, nil
+	case -1:
+		if logger != nil {
+			logger.Warn("postgres: stored position is behind the slot's confirmed_flush_lsn; resuming from the slot",
+				"slot", slotName, "stored", resume.String(), "confirmed", confirmed.String())
+		}
+		return confirmed, nil
+	default:
+		return nil, fmt.Errorf("postgres: stored position %s is ahead of slot %q confirmed_flush_lsn %s — the slot was reset or replaced; a full re-snapshot is required", resume.String(), slotName, confirmed.String())
+	}
+}
+
+// AdvanceSlot advances the logical slot's confirmed_flush_lsn to target,
+// letting the server recycle WAL the sink has already committed (#156). It is
+// idempotent and must run while the slot is inactive — before START_REPLICATION
+// attaches the walsender.
+func AdvanceSlot(ctx context.Context, db *sql.DB, slotName string, target position.LSN) error {
+	if _, err := db.ExecContext(ctx,
+		`SELECT pg_catalog.pg_replication_slot_advance($1, $2::pg_lsn)`, slotName, target.String()); err != nil {
+		return fmt.Errorf("postgres: advance slot %q to %s: %w", slotName, target.String(), err)
+	}
+	return nil
 }

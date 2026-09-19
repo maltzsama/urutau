@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 )
 
 var ErrNoPosition = errors.New("position: no known position")
@@ -114,6 +115,25 @@ func meet(a, b Position) (Position, bool) {
 		}
 	}
 	return nil, false
+}
+
+// Ahead returns the keys of ps whose position is strictly after global,
+// sorted for stable output. On resume from global, a stream that is ahead has
+// already-committed data past the resume point, so it replays from global
+// (idempotent under upsert) — the crash-recovery set. A nil global yields no
+// keys.
+func Ahead(global Position, ps map[string]Position) []string {
+	if global == nil {
+		return nil
+	}
+	var out []string
+	for name, p := range ps {
+		if p != nil && p.Compare(global) > 0 {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Parse decodes a committed position string using the parser for a source

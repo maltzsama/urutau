@@ -24,6 +24,9 @@ import (
 const (
 	defaultRetryCount = 3
 	maxMaxThreads     = 32
+	// defaultInitialWait and minInitialWait bound the CDC initial WAL wait.
+	defaultInitialWait = 300 * time.Second
+	minInitialWait     = 30 * time.Second
 )
 
 // sshDialTimeout bounds the TCP dial to the bastion and the SSH handshake.
@@ -43,6 +46,8 @@ type ConnConfig struct {
 	MaxOpenConns int
 	// RetryCount is the resolved number of transient-connection retries.
 	RetryCount int
+	// InitialWaitTime is the resolved CDC initial-WAL-message wait.
+	InitialWaitTime time.Duration
 
 	tunnel *sshTunnel
 }
@@ -63,10 +68,11 @@ func BuildConnConfig(uri string) (*ConnConfig, error) {
 		return nil, fmt.Errorf("postgres: parse uri: %w", err)
 	}
 	return &ConnConfig{
-		QueryURI:     uri,
-		ConnConfig:   cfg,
-		MaxOpenConns: resolveMaxThreads(0),
-		RetryCount:   defaultRetryCount,
+		QueryURI:        uri,
+		ConnConfig:      cfg,
+		MaxOpenConns:    resolveMaxThreads(0),
+		RetryCount:      defaultRetryCount,
+		InitialWaitTime: defaultInitialWait,
 	}, nil
 }
 
@@ -95,10 +101,11 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 	}
 
 	cc := &ConnConfig{
-		QueryURI:     dsn,
-		ConnConfig:   cfg,
-		MaxOpenConns: resolveMaxThreads(pg.MaxThreads),
-		RetryCount:   resolveRetryCount(pg.RetryCount),
+		QueryURI:        dsn,
+		ConnConfig:      cfg,
+		MaxOpenConns:    resolveMaxThreads(pg.MaxThreads),
+		RetryCount:      resolveRetryCount(pg.RetryCount),
+		InitialWaitTime: resolveInitialWaitTime(pg.InitialWaitTime),
 	}
 
 	// SSH: one tunnel per ConnConfig, shared by the query and replication
@@ -149,6 +156,20 @@ func resolveRetryCount(n int) int {
 		return 0
 	}
 	return n
+}
+
+// resolveInitialWaitTime applies the initialWaitTime default (300s). A
+// positive value below the minimum is clamped up (the spec validator rejects
+// it, this is defense in depth).
+func resolveInitialWaitTime(seconds int) time.Duration {
+	if seconds == 0 {
+		return defaultInitialWait
+	}
+	d := time.Duration(seconds) * time.Second
+	if d < minInitialWait {
+		return minInitialWait
+	}
+	return d
 }
 
 // sshTunnel owns one SSH client shared by every connection the source opens

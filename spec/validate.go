@@ -806,6 +806,9 @@ func validatePostgresSource(pg *PostgresSource, problems *[]string) {
 	if pg.RetryCount < 0 {
 		*problems = append(*problems, "source.postgres.retryCount: must be non-negative")
 	}
+	if pg.InitialWaitTime != 0 && pg.InitialWaitTime < 30 {
+		*problems = append(*problems, "source.postgres.initialWaitTime: must be at least 30 seconds")
+	}
 	if pg.SSL != nil {
 		validateSSLConfig(pg.SSL, problems)
 	}
