@@ -121,7 +121,11 @@ func (c *Chunker) minMax(ctx context.Context, col string) (minVal, maxVal any, e
 func typeDomainRanges(dataType string, n int) []source.Chunk {
 	if isStringType(dataType) {
 		return domainRanges(n, func(i int) any {
-			return string([]byte{byte(256 * i / n)})
+			// Split the printable-ASCII range: every boundary is a valid
+			// UTF-8 (ASCII) string, unlike a raw byte such as 0x80, which
+			// PostgreSQL rejects in a text predicate.
+			const lo, hi = 0x20, 0x7e
+			return string(rune(lo + (hi-lo)*i/n))
 		})
 	}
 	// Integer and float keys: split the int64 domain (a float key casts).

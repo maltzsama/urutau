@@ -3,6 +3,7 @@ package postgres
 import (
 	"math"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestCtidRanges(t *testing.T) {
@@ -141,6 +142,18 @@ func TestTypeDomainRanges(t *testing.T) {
 			}
 			if open != 1 {
 				t.Fatalf("got %d open-ended ranges, want exactly 1: %+v", open, got)
+			}
+			// Text boundaries must be valid UTF-8: PostgreSQL rejects a raw
+			// byte such as 0x80 in a text predicate.
+			if tc.dataType == "text" {
+				for i, ch := range got {
+					if ch.High == nil {
+						continue
+					}
+					if s, ok := ch.High[0].(string); !ok || !utf8.ValidString(s) {
+						t.Fatalf("range %d boundary %q is not valid UTF-8: %+v", i, ch.High[0], got)
+					}
+				}
 			}
 		})
 	}
