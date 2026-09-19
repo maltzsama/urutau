@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	errs "github.com/maltzsama/urutau/internal/errors"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -51,6 +52,10 @@ type Config struct {
 	// RetryCount is the transient-error reconnect budget for the
 	// replication stream (#166). 0 disables reconnect.
 	RetryCount int
+	// InitialWait bounds how long the reader waits for the first WAL message
+	// before failing with a non-retryable error (#154). Zero uses the
+	// default (300s).
+	InitialWait time.Duration
 	// Filters and Columns are the per-source read projection (#162/#163),
 	// keyed by "schema.table". The reader compiles the filter with the
 	// introspected column types, so numeric columns compare numerically.
@@ -128,6 +133,13 @@ type Reader struct {
 	conn    *pgx.Conn
 	connCfg *pgx.ConnConfig // owned by the reader; reused to reconnect
 	retries int             // transient-error reconnect budget (#166)
+	// initialWait bounds how long the reader waits for the first WAL message
+	// (#154). Resolved to the default when cfg.InitialWait is zero.
+	initialWait time.Duration
+	// primed is set once the reader has seen its first WAL data message. It
+	// persists across reconnects so the one-shot initial wait is never
+	// re-armed for a stream that has already proven data flows (#154).
+	primed  bool
 	out     chan<- rowchange.Change
 	bySrc   map[string]source.TableRef // "schema.table" → ref (PK + target)
 	states  map[string]*TableState     // "schema.table" → introspected state
@@ -143,6 +155,11 @@ type Reader struct {
 	// message. The DBLog window uses it to tag only transactions committed
 	// after the low watermark. Loop-goroutine only, like txn.
 	curLSN position.LSN
+
+	// curCommitTS is the current transaction's commit timestamp, from the
+	// Begin message (pgoutput proto_version=1). Stamped on every row of the
+	// transaction at enqueue. Loop-goroutine only, like txn.
+	curCommitTS time.Time
 
 	mu     sync.Mutex
 	synced *position.LSN // end LSN of the last committed transaction
@@ -231,12 +248,17 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		return nil, fmt.Errorf("postgres: replication connect: %w", err)
 	}
 
+	wait := cfg.InitialWait
+	if wait <= 0 {
+		wait = defaultInitialWait
+	}
 	return &Reader{
 		cfg:         cfg,
 		db:          cfg.DB,
 		conn:        conn,
 		connCfg:     connCfg,
 		retries:     cfg.RetryCount,
+		initialWait: wait,
 		out:         out,
 		bySrc:       bySrc,
 		states:      states,
@@ -401,9 +423,22 @@ func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error 
 	}
 
 	nextStatus := time.Now().Add(statusInterval)
+	// The initial-wait clock starts at the first receive attempt and is
+	// satisfied by the first WAL data message (r.primed, which survives a
+	// reconnect). After that the reader streams indefinitely (a correctly
+	// configured but idle table sends keepalives forever), so the wait is
+	// one-shot — it only catches a CDC that never produces row data (wrong
+	// slot, wrong publication).
+	started := time.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// Checked every iteration, not only on the status deadline: frequent
+		// keepalives can push that deadline forward forever, which would let a
+		// misconfigured stream hang past the configured wait (#154).
+		if initialWaitExceeded(r.primed, started, r.initialWait, time.Now()) {
+			return fmt.Errorf("postgres: no WAL message within %s: %w", r.initialWait, errs.ErrNoData)
 		}
 
 		recvCtx, cancel := context.WithDeadline(ctx, nextStatus)
@@ -453,6 +488,7 @@ func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error 
 				}
 			}
 		case pglogrepl.XLogDataByteID:
+			r.primed = true
 			walData, err := pglogrepl.ParseXLogData(copyData.Data[1:])
 			if err != nil {
 				return fmt.Errorf("postgres: xlog data: %w", err)
@@ -463,6 +499,14 @@ func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error 
 			}
 		}
 	}
+}
+
+// initialWaitExceeded reports whether the initial-wait deadline passed before
+// the stream saw its first WAL data message (#154). Once primed the wait is
+// satisfied for good: a correctly configured but idle source sends keepalives
+// forever and must not be killed.
+func initialWaitExceeded(primed bool, started time.Time, wait time.Duration, now time.Time) bool {
+	return !primed && now.Sub(started) > wait
 }
 
 // dialReplication closes the (dead) replication connection and dials a fresh
@@ -522,6 +566,9 @@ func (r *Reader) handleXLogData(ctx context.Context, xld pglogrepl.XLogData) err
 		}
 		r.txn = r.txn[:0]
 		r.curLSN = position.LSN(begin.FinalLSN)
+		// proto_version=1 carries the transaction commit time; every row of
+		// this transaction shares it.
+		r.curCommitTS = begin.CommitTime
 	case msgRelation:
 		if err := r.handleRelation(body); err != nil {
 			return err
@@ -688,6 +735,7 @@ func (r *Reader) enqueue(entry relEntry, op rowchange.Op, after, before map[stri
 		Op:       op,
 		Table:    entry.ref.Target,
 		IngestTS: time.Now(),
+		CommitTS: r.curCommitTS,
 	}
 	switch op {
 	case rowchange.OpDelete:

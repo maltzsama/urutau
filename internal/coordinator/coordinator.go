@@ -2066,6 +2066,7 @@ func coreCastOf(tbl spec.Table) (core.CastPolicy, error) {
 func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (position.Position, []source.TableRef, error) {
 	var positions []position.Position
 	var needsSnapshot []source.TableRef
+	byTarget := make(map[string]position.Position, len(refs))
 	for _, ref := range refs {
 		// The expected partition count travels to the sink: a per-partition
 		// Position() must not return a MinSafe over an incomplete owner set,
@@ -2081,6 +2082,7 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 				return nil, nil, fmt.Errorf("coordinator: %s cdc.position %q: %w", ref.Target, pos, err)
 			}
 			positions = append(positions, p)
+			byTarget[ref.Target] = p
 		} else {
 			needsSnapshot = append(needsSnapshot, ref)
 		}
@@ -2093,6 +2095,12 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	best, err := position.MinSafe(positions)
 	if err != nil {
 		return nil, nil, fmt.Errorf("coordinator: %w", err)
+	}
+	// Streams ahead of the resume point replay from it (idempotent under
+	// upsert); naming them makes a crash-recovery replay observable (#155).
+	if recovery := position.Ahead(best, byTarget); len(recovery) > 0 {
+		c.log.Info("crash recovery: streams ahead of the resume point replay from it",
+			"from", best.String(), "streams", recovery)
 	}
 	return best, needsSnapshot, nil
 }

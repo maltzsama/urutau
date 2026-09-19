@@ -259,9 +259,11 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	// Determine the replication URI and retry budget.
 	uri := a.spec.Source.URI
 	maxRetries := 0
+	initialWait := defaultInitialWait
 	if a.connCfg != nil {
 		uri = a.connCfg.QueryURI
 		maxRetries = a.connCfg.RetryCount
+		initialWait = a.connCfg.InitialWaitTime
 	}
 
 	// One channel for the whole reader life: New writes into it and the
@@ -273,15 +275,16 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	var err error
 	for attempt := 0; ; attempt++ {
 		rdr, err = New(ctx, Config{
-			URI:        uri,
-			ConnCfg:    a.connCfg,
-			DB:         a.db,
-			SlotName:   slot,
-			Tables:     refs,
-			Logger:     a.rt.Logger,
-			RetryCount: maxRetries,
-			Filters:    filters,
-			Columns:    columns,
+			URI:         uri,
+			ConnCfg:     a.connCfg,
+			DB:          a.db,
+			SlotName:    slot,
+			Tables:      refs,
+			Logger:      a.rt.Logger,
+			RetryCount:  maxRetries,
+			InitialWait: initialWait,
+			Filters:     filters,
+			Columns:     columns,
 		}, out)
 		if err == nil {
 			break
@@ -399,8 +402,18 @@ func (s stream) Start(ctx context.Context, from position.Position) error {
 	if !ok {
 		return fmt.Errorf("postgres: start position must be an LSN, got %T", from)
 	}
+	// Reconcile the stored resume with the slot before attaching the
+	// walsender, then advance the slot to the effective point so the server
+	// can recycle WAL the sink already committed (#156).
+	start, err := ValidateSlotState(ctx, s.db, s.cfg.SlotName, l, s.cfg.Logger)
+	if err != nil {
+		return err
+	}
+	if err := AdvanceSlot(ctx, s.db, s.cfg.SlotName, *start); err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
 	s.SetErr(errCh)
-	go func() { errCh <- s.StartFromLSN(ctx, l) }()
+	go func() { errCh <- s.StartFromLSN(ctx, start) }()
 	return nil
 }
