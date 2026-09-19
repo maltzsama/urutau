@@ -187,7 +187,7 @@ func (c *Chunker) loadPartitionPages(ctx context.Context) ([]int64, int64, error
 const partitionPagesTree = `
 	SELECT pt.relid::text,
 	       CEIL(1.05 * (pg_relation_size(pt.relid::oid) / current_setting('block_size')::int))::bigint
-	FROM pg_partition_tree($1 || '.' || $2) pt
+	FROM pg_partition_tree(format('%I.%I', $1::text, $2::text)::regclass) pt
 	WHERE pt.isleaf = true
 	ORDER BY 2 DESC`
 

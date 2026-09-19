@@ -18,6 +18,7 @@ import (
 type Column struct {
 	Name     string
 	DataType string // pg_type native name ("int8", "text", "timestamptz", …)
+	NotNull  bool   // attnotnull: the column cannot hold NULL
 }
 
 // TableState is the introspection result for one source table: the ordered
@@ -65,7 +66,7 @@ func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (
 
 func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]Column, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
+		SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -80,10 +81,11 @@ func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]Column, error
 	var out []Column
 	for rows.Next() {
 		var name, dataType string
-		if err := rows.Scan(&name, &dataType); err != nil {
+		var notNull bool
+		if err := rows.Scan(&name, &dataType, &notNull); err != nil {
 			return nil, err
 		}
-		out = append(out, Column{Name: name, DataType: dataType})
+		out = append(out, Column{Name: name, DataType: dataType, NotNull: notNull})
 	}
 	return out, rows.Err()
 }

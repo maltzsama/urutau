@@ -29,8 +29,10 @@ func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
 		return nil, fmt.Errorf("postgres: chunker: min/max: %w", err)
 	}
 	if minV == nil {
-		// Empty table: one open chunk covers nothing.
-		return [][]any{{nil}}, nil
+		// Empty table: no rows to copy, so no chunks. A single "open" chunk
+		// would carry a nil bound, which has no Arrow type and cannot cross
+		// the wire to a distributed worker.
+		return nil, nil
 	}
 
 	if c.chunkColumnKind == kindInt {
@@ -98,7 +100,8 @@ func (c *Chunker) nextBounds(ctx context.Context) ([][]any, error) {
 		return nil, fmt.Errorf("postgres: chunker: min: %w", err)
 	}
 	if minV == nil {
-		return [][]any{{nil}}, nil
+		// Empty table: no chunks (see batchBounds).
+		return nil, nil
 	}
 
 	bounds := [][]any{{minV}}

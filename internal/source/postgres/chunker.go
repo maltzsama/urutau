@@ -182,6 +182,12 @@ func (c *Chunker) resolveStrategy(ctx context.Context) error {
 	if i < 0 {
 		return fmt.Errorf("postgres: chunker: chunkColumn %q not found in %s", c.chunkColumn, c.qualifiedTable())
 	}
+	if !st.Columns[i].NotNull {
+		// The value-range and cursor predicates use >= / <, which exclude
+		// NULL: a nullable chunk column would silently drop every row whose
+		// key is NULL.
+		return fmt.Errorf("postgres: chunker: chunkColumn %q is nullable — NULL keys are excluded from the chunk predicates (declare it NOT NULL)", c.chunkColumn)
+	}
 	switch strings.ToLower(st.Columns[i].DataType) {
 	case "smallint", "integer", "bigint":
 		c.chunkColumnKind = kindInt
