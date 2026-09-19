@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"math"
 	"testing"
 )
 
@@ -64,5 +65,83 @@ func TestPartitionNumeric(t *testing.T) {
 		if got[i].High == nil || got[i+1].Low == nil || got[i].High[0] != got[i+1].Low[0] {
 			t.Fatalf("ranges not contiguous at %d: %+v", i, got)
 		}
+	}
+}
+
+func TestPartitionNumericSmallDomain(t *testing.T) {
+	// A domain narrower than the worker count: only the FINAL range may be
+	// open-ended; the extra middle ranges must be empty [max,max), never
+	// open-ended (an open middle range would swallow every key above max and
+	// starve the later workers).
+	c := &Chunker{pk: []string{"id"}}
+	got, err := c.partitionNumeric(int64(0), int64(2), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("got %d ranges, want 5", len(got))
+	}
+	for i, ch := range got {
+		if i < len(got)-1 && ch.High == nil {
+			t.Fatalf("range %d is open-ended; only the last may be: %+v", i, got)
+		}
+	}
+	if got[len(got)-1].High != nil {
+		t.Fatalf("last range high = %v, want nil (open)", got[len(got)-1].High)
+	}
+}
+
+func TestPartitionNumericFullDomain(t *testing.T) {
+	// The full int64 domain overflows min/step arithmetic; it must not panic
+	// or emit more than one open-ended range.
+	c := &Chunker{pk: []string{"id"}}
+	got, err := c.partitionNumeric(math.MinInt64, math.MaxInt64, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("got %d ranges, want 4", len(got))
+	}
+	open := 0
+	for _, ch := range got {
+		if ch.High == nil {
+			open++
+		}
+	}
+	if open != 1 {
+		t.Fatalf("got %d open-ended ranges, want exactly 1: %+v", open, got)
+	}
+}
+
+func TestTypeDomainRanges(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		dataType string
+	}{
+		{"int", "bigint"},
+		{"float", "double precision"},
+		{"text", "text"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := typeDomainRanges(tc.dataType, 4)
+			if len(got) != 4 {
+				t.Fatalf("got %d ranges, want 4", len(got))
+			}
+			open := 0
+			for i, ch := range got {
+				if ch.High == nil {
+					open++
+				}
+				if i > 0 && (ch.Low == nil) {
+					t.Fatalf("range %d low = nil; only the first may be open: %+v", i, got)
+				}
+				if i < len(got)-1 && ch.High == nil {
+					t.Fatalf("range %d open-ended; only the last may be: %+v", i, got)
+				}
+			}
+			if open != 1 {
+				t.Fatalf("got %d open-ended ranges, want exactly 1: %+v", open, got)
+			}
+		})
 	}
 }

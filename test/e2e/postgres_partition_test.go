@@ -92,3 +92,47 @@ func TestDistributedPostgresWorkers(t *testing.T) {
 	assertCount(t, ctx, `SELECT count(*) FROM orders WHERE id = 10000`, int64(1))
 	t.Log("workers>1 ok: range-partitioned snapshot and live stream")
 }
+
+// TestDistributedPostgresEmptyTable partitions an EMPTY table across two
+// workers: with no data to sample, the ranges must come from the key type's
+// domain (disjoint, never CTID, never overlapping). It then inserts rows and
+// checks each is captured exactly once — an overlap would duplicate them.
+func TestDistributedPostgresEmptyTable(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	db := pgConn(t)
+	pgExec(t, db, `TRUNCATE orders`)
+	dropE2ESlots(t, db)
+	dropIcebergTable(t, ctx)
+
+	s := loadPostgresPipeline(t)
+	s.Source.SlotName = "urutau_e2e_empty"
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 2}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	names := s.Tables[0].WorkerGroupNames(s.Pipeline)
+	if len(names) != 2 {
+		t.Fatalf("want 2 worker groups, got %d", len(names))
+	}
+	stop, waitDone := bootPipeline(t, ctx, addr, s, names[0], names[1])
+	defer func() { stop(); _ = waitDone() }()
+
+	time.Sleep(2 * time.Second)
+
+	pgExec(t, db, `INSERT INTO orders (id, v, amount, active)
+		SELECT g, 'empty-' || g, 1.0, true FROM generate_series(0, 99) g`)
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(100))
+	assertCount(t, ctx, `SELECT count(*) FROM orders WHERE id = 50`, int64(1))
+	t.Log("empty-table workers>1 ok: disjoint domain ranges, no duplicates")
+}
