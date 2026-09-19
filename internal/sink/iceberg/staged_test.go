@@ -157,26 +157,34 @@ func TestCycleCommittedDetectsALandedCommit(t *testing.T) {
 		t.Fatal("different positions must yield different cycle keys")
 	}
 
-	// Fast path: the table already holds the cycle's position.
-	if !cycleCommitted(iceberg.Properties{"cdc.position": "gtid:1-9"}, nil, key, "gtid:1-9") {
-		t.Fatal("a table already holding the cycle's position must be detected")
+	// The cycle key is durable in the TABLE properties, so a retry is
+	// detected even if a maintenance commit moved the head.
+	if !cycleCommitted(iceberg.Properties{"cdc.cycle": key}, nil, key) {
+		t.Fatal("a table property carrying the cycle key must be detected")
 	}
-	// The head snapshot carries the cycle key.
+	// The head snapshot carries the cycle key too.
 	head := &table.Snapshot{SnapshotID: 7, Summary: &table.Summary{
 		Operation:  table.OpAppend,
 		Properties: iceberg.Properties{"cdc.cycle": key},
 	}}
-	if !cycleCommitted(nil, head, key, "") {
+	if !cycleCommitted(nil, head, key) {
 		t.Fatal("a head snapshot carrying the cycle key must be detected")
 	}
 	// Nothing committed yet, or a different cycle.
-	if cycleCommitted(nil, nil, key, "gtid:1-9") {
+	if cycleCommitted(nil, nil, key) {
 		t.Fatal("an uncommitted cycle must not be reported as committed")
 	}
 	other := &table.Snapshot{SnapshotID: 8, Summary: &table.Summary{
 		Properties: iceberg.Properties{"cdc.cycle": "other"},
 	}}
-	if cycleCommitted(nil, other, key, "") {
+	if cycleCommitted(nil, other, key) {
 		t.Fatal("a different cycle key must not match")
+	}
+
+	// Regression: a DIFFERENT data cycle that merely shares the position must
+	// not be reported as committed. Every snapshot chunk carries the same low
+	// watermark, so the position alone cannot identify a data cycle.
+	if cycleCommitted(iceberg.Properties{"cdc.position": "gtid:1-9"}, nil, "a-different-data-cycle") {
+		t.Fatal("a cycle sharing the position but not the key must not be reported as committed")
 	}
 }

@@ -237,7 +237,7 @@ func TestResolvePartitionRanges(t *testing.T) {
 
 	ranges := []source.Chunk{{Low: nil, High: []any{int64(5)}}, {Low: []any{int64(5)}, High: nil}}
 	c := &Coordinator{qsrc: fakeQSource{chunker: partitionChunker{ranges: ranges}}}
-	got, err := c.resolvePartitionRanges(ctx, two, ref)
+	got, _, err := c.resolvePartitionRanges(ctx, two, ref)
 	if err != nil {
 		t.Fatalf("resolvePartitionRanges: %v", err)
 	}
@@ -247,20 +247,20 @@ func TestResolvePartitionRanges(t *testing.T) {
 
 	// A chunker that is not a PartitionSource fails loudly.
 	c.qsrc = fakeQSource{chunker: plainChunker{}}
-	if _, err := c.resolvePartitionRanges(ctx, two, ref); err == nil {
+	if _, _, err := c.resolvePartitionRanges(ctx, two, ref); err == nil {
 		t.Fatal("a non-partitioning chunker must fail")
 	}
 
 	// NewChunker error propagates.
 	boom := errors.New("no query conn")
 	c.qsrc = fakeQSource{err: boom}
-	if _, err := c.resolvePartitionRanges(ctx, two, ref); !errors.Is(err, boom) {
+	if _, _, err := c.resolvePartitionRanges(ctx, two, ref); !errors.Is(err, boom) {
 		t.Fatalf("resolvePartitionRanges(newchunker err) = %v, want boom", err)
 	}
 
 	// Partitions error propagates.
 	c.qsrc = fakeQSource{chunker: partitionChunker{err: boom}}
-	if _, err := c.resolvePartitionRanges(ctx, two, ref); !errors.Is(err, boom) {
+	if _, _, err := c.resolvePartitionRanges(ctx, two, ref); !errors.Is(err, boom) {
 		t.Fatalf("resolvePartitionRanges(partitions err) = %v, want boom", err)
 	}
 }

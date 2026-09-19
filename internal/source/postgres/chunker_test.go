@@ -107,7 +107,7 @@ func TestChunkScanUsesRepeatableReadReadOnly(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	c, err := NewChunker(db, "public.orders", "id", 100, WithWorkers(1), WithRetries(0))
+	c, err := NewChunker(context.Background(), db, "public.orders", "id", 100, WithWorkers(1), WithRetries(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestChunkScanUsesRepeatableReadReadOnly(t *testing.T) {
 }
 
 // The chunk SELECT must list the projected columns and compose the filter
-// with the chunk bounds (#162/#163).
+// with the chunk bounds. With no chunk column the default is CTID.
 func TestChunkScanProjectionAndFilterSQL(t *testing.T) {
 	db, err := sql.Open("urutau_capture_tx", "")
 	if err != nil {
@@ -138,13 +138,53 @@ func TestChunkScanProjectionAndFilterSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewChunker(db, "public.orders", "id", 100,
+	c, err := NewChunker(context.Background(), db, "public.orders", "id", 100,
 		WithWorkers(1), WithRetries(0),
 		WithColumns([]string{"id", "name"}),
 		WithFilter(filter))
 	if err != nil {
 		t.Fatal(err)
 	}
+	capturedChunkQuery = ""
+	err = c.Scan(context.Background(),
+		source.Chunk{Low: []any{"(0,0)"}, High: []any{"(1000,0)"}},
+		func(map[string]any) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := capturedChunkQuery
+	for _, want := range []string{
+		`SELECT "id", "name" FROM "public"."orders"`,
+		`ctid >= $1::tid`,
+		`ctid < $2::tid`,
+		`"status" = $3`,
+	} {
+		if !strings.Contains(q, want) {
+			t.Fatalf("chunk query %q missing %q", q, want)
+		}
+	}
+}
+
+// A configured chunk column switches to a key-based strategy: the range
+// predicate uses the column scalar, ordered by it (#151).
+func TestChunkScanKeyStrategySQL(t *testing.T) {
+	db, err := sql.Open("urutau_capture_tx", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// The capture driver has no pg_catalog, so resolveStrategy would fail
+	// introspection; build the chunker and set the strategy directly.
+	c, err := NewChunker(context.Background(), db, "public.orders", "id", 100,
+		WithWorkers(1), WithRetries(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.strategy = strategyBatch
+	c.chunkColumn = "id"
+	c.chunkColumnKind = kindInt
+
 	capturedChunkQuery = ""
 	err = c.Scan(context.Background(),
 		source.Chunk{Low: []any{int64(1)}, High: []any{int64(10)}},
@@ -154,10 +194,9 @@ func TestChunkScanProjectionAndFilterSQL(t *testing.T) {
 	}
 	q := capturedChunkQuery
 	for _, want := range []string{
-		`SELECT "id", "name" FROM "public"."orders"`,
-		`("id") >= ($1)`,
-		`("id") < ($2)`,
-		`"status" = $3`,
+		`SELECT * FROM "public"."orders"`,
+		`"id" >= $1`,
+		`"id" < $2`,
 		`ORDER BY "id"`,
 	} {
 		if !strings.Contains(q, want) {

@@ -85,7 +85,7 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 func specTablesFromAssignment(bySource map[string]*pb.TableAssignment) ([]spec.Table, error) {
 	tables := make([]spec.Table, 0, len(bySource))
 	for _, ta := range bySource {
-		t := spec.Table{Source: ta.SourceTable, ColumnFilter: ta.ColumnFilter}
+		t := spec.Table{Source: ta.SourceTable, ColumnFilter: ta.ColumnFilter, ChunkColumn: ta.ChunkColumn}
 		if len(ta.Filter) > 0 {
 			var f spec.Filter
 			if err := json.Unmarshal(ta.Filter, &f); err != nil {

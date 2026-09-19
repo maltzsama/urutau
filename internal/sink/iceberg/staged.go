@@ -253,7 +253,7 @@ func (s *Sink) commitStaged(ctx context.Context, ident table.Identifier, deletes
 			lastErr = err
 			continue
 		}
-		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key, pos) {
+		if cycleCommitted(tbl.Properties(), tbl.CurrentSnapshot(), key) {
 			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
@@ -324,12 +324,15 @@ func cycleKey(deletes, appends []iceberg.DataFile, pos string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// cycleCommitted reports whether the cycle is already durable: the table
-// already holds its position (the fast path, written atomically with the
-// files) or its head snapshot carries the cycle key. A retry that sees either
-// must not re-add the files — appends are not idempotent. Pure, for tests.
-func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key, pos string) bool {
-	if pos != "" && props[propPosition] == pos {
+// cycleCommitted reports whether the cycle is already durable. The cycle key
+// (a hash of its files and position) is the identity: it is written both to
+// the commit's snapshot summary and to the table properties, so a retry is
+// detected even after a maintenance commit has moved the head — appends are
+// not idempotent, so a re-add would duplicate rows. Two distinct cycles never
+// share a key, so the position alone is NOT a valid signal (every snapshot
+// chunk carries the snapshot's low watermark). Pure, for tests.
+func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key string) bool {
+	if key != "" && props[propCycle] == key {
 		return true
 	}
 	return head != nil && head.Summary != nil && head.Summary.Properties[propCycle] == key
