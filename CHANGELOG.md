@@ -1,5 +1,88 @@
 # Changelog
 
+## [0.3.0](https://github.com/maltzsama/urutau/compare/v0.2.0...v0.3.0) (2026-09-19)
+
+
+### Features
+
+* **iceberg:** opt-in schema evolution for add-column and safe promotion ([10ebef2](https://github.com/maltzsama/urutau/commit/10ebef26ac39637da9950d4ffd937dc353cdcd7c))
+* **iceberg:** set a sort order on the primary key at table creation ([6fb0d82](https://github.com/maltzsama/urutau/commit/6fb0d820c4006c4e9c646d938679fe9d5101a8de))
+* **iceberg:** sort order on the primary key + opt-in schema evolution ([aaf8eb0](https://github.com/maltzsama/urutau/commit/aaf8eb01f1f62935a719ff3a520d2bbe05f28f3b))
+* **kafka:** select which payload fields land as columns, in raw and avro ([54c0f36](https://github.com/maltzsama/urutau/commit/54c0f361f44ffff6c1d6872b564cc2a77270289c)), closes [#143](https://github.com/maltzsama/urutau/issues/143)
+* **mysql:** capture commit_ts from the binlog ([2456b45](https://github.com/maltzsama/urutau/commit/2456b456f0e3b294b19160706d71ce6cbf1449e8))
+* **mysql:** TLS for the replication and query connections ([1e827cc](https://github.com/maltzsama/urutau/commit/1e827cc1da812b13b20bed5b57c520a54416e38a))
+* **postgres:** add nested connection config with TLS, SSH, maxThreads, retryCount ([8a3c2be](https://github.com/maltzsama/urutau/commit/8a3c2bed6ab84289beba12a009aa0438e82a6fec))
+* **postgres:** concurrent row scan and transient retry for snapshot and CDC ([61a8339](https://github.com/maltzsama/urutau/commit/61a833943b4782a149116cb86ba716435cfa2840))
+* **postgres:** CTID chunking + workers&gt;1 range partitioning ([#151](https://github.com/maltzsama/urutau/issues/151), [#174](https://github.com/maltzsama/urutau/issues/174)) ([34ebee5](https://github.com/maltzsama/urutau/commit/34ebee54a09b80f13cb1e890e8262298fd02f647))
+* **postgres:** CTID chunking, chunkColumn strategies, workers&gt;1 partitioning ([e2ce4cc](https://github.com/maltzsama/urutau/commit/e2ce4cc99c9a1e5a3eec49215967681f92d572c0))
+* **postgres:** nested connection config ([#150](https://github.com/maltzsama/urutau/issues/150), [#149](https://github.com/maltzsama/urutau/issues/149), [#148](https://github.com/maltzsama/urutau/issues/148), [#165](https://github.com/maltzsama/urutau/issues/165), [#166](https://github.com/maltzsama/urutau/issues/166)) ([754ce86](https://github.com/maltzsama/urutau/commit/754ce863c23b22194f36e66b830af279d7102637))
+* **postgres:** phase 1b — finish SSH/TLS e2e, concurrent scan, snapshot/CDC retry ([fdb6bad](https://github.com/maltzsama/urutau/commit/fdb6badd170c495eb658adf5ef54ce58f410e832))
+* **postgres:** phase 2 — snapshot hardening ([#162](https://github.com/maltzsama/urutau/issues/162), [#163](https://github.com/maltzsama/urutau/issues/163), [#164](https://github.com/maltzsama/urutau/issues/164)) ([11dcd8b](https://github.com/maltzsama/urutau/commit/11dcd8b00d246ffefb18734682a7f8446315778d))
+* **postgres:** snapshot hardening — REPEATABLE READ, column projection, structured filter ([ed2b6ea](https://github.com/maltzsama/urutau/commit/ed2b6ea13998fcbc700a5f0977e1c5bde67e4fec))
+* update theme colors to golden yellow matching icon ([6aeb197](https://github.com/maltzsama/urutau/commit/6aeb197df3f6a4b8704186bed14441ebef9cb2eb))
+
+
+### Bug Fixes
+
+* dead-code cleanup and bug-hunt fixes ([bb8dd62](https://github.com/maltzsama/urutau/commit/bb8dd62d40a6c9f7c96935aa3bf68c49b508f9b2))
+* **iceberg:** detect a landed cycle from the table property, not just the head ([e694a85](https://github.com/maltzsama/urutau/commit/e694a853996f8901bde9d5ec7d90ef2c976e2dcf))
+* **iceberg:** do not drop snapshot batches that share a position ([c1fddf9](https://github.com/maltzsama/urutau/commit/c1fddf9dd6a50770cdd1a0c96146edffbd6b16c7))
+* **iceberg:** fingerprint the spec and schema in the staged descriptor ([a39d94f](https://github.com/maltzsama/urutau/commit/a39d94f12b61a62da31d083245a0f50cd8b33d70))
+* **iceberg:** harden catalog and retry error handling ([cf0b332](https://github.com/maltzsama/urutau/commit/cf0b332b8ebd8308fc2f99240099b26bc20e93a9))
+* **iceberg:** honour targetFileSize and stop rewriting files on every retry ([8a7dc9d](https://github.com/maltzsama/urutau/commit/8a7dc9d7f5322a2bf93eb6b0e4f51456b77957ff))
+* **iceberg:** make the staged cycle commit idempotent on a retry ([9603423](https://github.com/maltzsama/urutau/commit/9603423198ba0ddd8682a3e17fb70479f106ec3a))
+* **iceberg:** normalize a Time64 key to microseconds regardless of its unit ([1087773](https://github.com/maltzsama/urutau/commit/108777354bbc223a11235a9731085c1a8f59b9d9))
+* **iceberg:** sink correctness fixes from the bug hunt ([920c596](https://github.com/maltzsama/urutau/commit/920c5960b35067a59d7fe601d030f47227912876))
+* **iceberg:** snapshot batches sharing a position are silently dropped ([36f0dd0](https://github.com/maltzsama/urutau/commit/36f0dd016f195c78a15e153963f5e4d3b9906e4d))
+* **iceberg:** type metadata columns and reject unsupported PK keys ([c6180e2](https://github.com/maltzsama/urutau/commit/c6180e2c0fa74a0141802735164493da6d7166f4))
+* **iceberg:** validate after a lost create race and keep the writer's commits idempotent ([6a6f256](https://github.com/maltzsama/urutau/commit/6a6f256499e7789b217382251c636ddec62194fa))
+* **iceberg:** version the staged descriptor so a rolling upgrade still decodes ([5714f31](https://github.com/maltzsama/urutau/commit/5714f31b806ca1b7e78af53864e4846aab18d680))
+* **iceberg:** walk the position back through the branch ancestry, not the flat list ([acc67e5](https://github.com/maltzsama/urutau/commit/acc67e5c11393184bf88427bd9631eb8a28b929e))
+* **iceberg:** widen the maintenance retry budget past the writer's commit cadence ([a5daff5](https://github.com/maltzsama/urutau/commit/a5daff51871d25cb03e55ba843919ad303a777a7))
+* **iceberg:** write append-mode delete-with-image rows and reject int32 key overflow ([c75bc45](https://github.com/maltzsama/urutau/commit/c75bc456fabaa6fa5c3e763b7b56272194ff9f8e))
+* **kafka:** classify fetch and decode errors instead of retrying everything ([899e188](https://github.com/maltzsama/urutau/commit/899e1880ff279d5aa9f625e9af8474a96dbeb8df)), closes [#142](https://github.com/maltzsama/urutau/issues/142)
+* **kafka:** duplicate topic segments + legacy JSON migration ([6ab8511](https://github.com/maltzsama/urutau/commit/6ab85117513305dc4baef0343d112ee67b8836f6))
+* **kafka:** harden offsets, error handling and payload field extraction ([1f7c483](https://github.com/maltzsama/urutau/commit/1f7c48304a6cf8b529476b3bfdc22e2f5291bc7d))
+* **kafka:** key consumer offsets by topic and partition, not partition alone ([3c0bb23](https://github.com/maltzsama/urutau/commit/3c0bb23a8e07e17c999e2dde831be59431f9ef17)), closes [#141](https://github.com/maltzsama/urutau/issues/141)
+* **kafka:** tombstone + trailing data in raw decoder ([67f82c1](https://github.com/maltzsama/urutau/commit/67f82c1744bf44c974d8e6e5f3731ee5a3b5b07c))
+* **maintenance:** stop a failing operation from starving the others ([38788c2](https://github.com/maltzsama/urutau/commit/38788c29f0ce85844d90b41407794f35f56a3f3b))
+* **make:** match tab-separated, decimal coverage output in floor checks ([9cb9f01](https://github.com/maltzsama/urutau/commit/9cb9f016abad306c2d6e8d2093216ee8eb9cf81d))
+* **mysql:** DST-safe, zero-consistent temporal snapshot/CDC parity ([274d1fc](https://github.com/maltzsama/urutau/commit/274d1fcdb1d28f602b9fc439dfccda846b7ca017))
+* **mysql:** explicit timezone policy for temporal columns (snapshot/CDC parity) ([d498605](https://github.com/maltzsama/urutau/commit/d4986054d417bf10547cd04b0e8a977b8289b279))
+* **mysql:** pool charset decoders for concurrent readers ([2c5fc5c](https://github.com/maltzsama/urutau/commit/2c5fc5c3fdcf6c7d53877c1e2428d2b76aaa7167))
+* **mysql:** set the query session time_zone to the operator's timezone ([7a8be41](https://github.com/maltzsama/urutau/commit/7a8be416249f1e9a5abfd23023d4b5928f19ac6d))
+* navbar logo visibility in dark mode while preserving yellow eye ([e34d2d9](https://github.com/maltzsama/urutau/commit/e34d2d97a172131d739475aa3f55ef10fb0742b6))
+* **plugin,runner:** honor the declared timestamp unit and propagate source errors ([bb87d22](https://github.com/maltzsama/urutau/commit/bb87d22b00d6af226ef036f1ef0745a320ab3d20))
+* **plugin:** treat stream errors as errors, not clean end-of-stream ([586b639](https://github.com/maltzsama/urutau/commit/586b6391d561fed8a0205987d4a947ec5c9c5101))
+* **plugin:** validate flight record columns instead of panicking on skew ([ec8b175](https://github.com/maltzsama/urutau/commit/ec8b175e0e886ebb2f83ad4afda158400b7ad2c8))
+* **postgres:** address CodeRabbit review on nested connection config ([6f93cda](https://github.com/maltzsama/urutau/commit/6f93cdac17547465abcf0a8b34c147d19a69035a))
+* **postgres:** address CodeRabbit review on phase 1b ([ef32d6a](https://github.com/maltzsama/urutau/commit/ef32d6aeefadbb5ee09c2ce8ed7f7fc3798750a6))
+* **postgres:** address CodeRabbit review on phase 2 ([31b6119](https://github.com/maltzsama/urutau/commit/31b61192312afd995fb5042fc870f1077b8c38cf))
+* **postgres:** address greptile review on CTID/partitioning ([c8fad03](https://github.com/maltzsama/urutau/commit/c8fad035b689412ec6ce7618cb1881ab6c29e4e7))
+* **postgres:** address greptile review on phase 1b ([8ebcac3](https://github.com/maltzsama/urutau/commit/8ebcac3342043e01854d36477e47f4bc9534952c))
+* **postgres:** address greptile review on phase 2 filter/projection ([3e0ae22](https://github.com/maltzsama/urutau/commit/3e0ae229491427c4d401ecc87723fe60f67d53c3))
+* **postgres:** address greptile review on SSH tunnel and defaults ([4d45ece](https://github.com/maltzsama/urutau/commit/4d45ece1dcfb179588c51b8ee0f44bbb9f3fba3b))
+* **postgres:** close phase-1 gaps in nested connection config ([75838cd](https://github.com/maltzsama/urutau/commit/75838cd5ad3337d85993a1c2a84e525002c48f96))
+* **postgres:** correct partition ranges, nullable keys, empty-table bounds ([084cdd8](https://github.com/maltzsama/urutau/commit/084cdd8266abc2caee5a70256ea3569c19e6f012))
+* **postgres:** exact numeric filter comparison for numeric columns ([965c666](https://github.com/maltzsama/urutau/commit/965c666c87a1c1077a2dbc9ae75545c7b848974c))
+* **postgres:** handle numeric NaN/Infinity in the exact filter comparison ([f253ad7](https://github.com/maltzsama/urutau/commit/f253ad778bf50112d8389a35cc27ff86df0f8c9d))
+* **postgres:** valid UTF-8 text partition boundaries ([e893834](https://github.com/maltzsama/urutau/commit/e8938346bf1fb0625ebedc4f2ebe1e4900a7ea67))
+* **sink/iceberg:** only treat table-not-found as not started ([2b03392](https://github.com/maltzsama/urutau/commit/2b033921dcf4977d29038ecb875993446cb303c6))
+* **source/mysql:** cover gb2312, tis620 and utf32 charsets ([eec94bf](https://github.com/maltzsama/urutau/commit/eec94bf1f1771fe7520ba6db7378d2768b04ccf4))
+* **source/mysql:** decode ENUM and SET from their binlog encoding ([8298b13](https://github.com/maltzsama/urutau/commit/8298b13dfb6c4c3ef632b75a489dc89bf2abc1d8))
+* **source/mysql:** decode multi-byte East Asian charsets from the binlog ([0f3f3f0](https://github.com/maltzsama/urutau/commit/0f3f3f0cc53d11ce8d1ade4ab3aaee6d9861f585))
+* **source/mysql:** decode non-UTF-8 text columns from the binlog ([3e8c352](https://github.com/maltzsama/urutau/commit/3e8c352b9377389e1cc5570b29b6eaacad633ab3))
+* **source/mysql:** ENUM/SET, charsets, blocking send, and timestamp hardening ([fdf3199](https://github.com/maltzsama/urutau/commit/fdf31995d3b5ecfc111b59fc963e474ce818c2ef))
+* **source/mysql:** unblock OnRow on shutdown instead of hanging forever ([2507a1f](https://github.com/maltzsama/urutau/commit/2507a1fef82496b1aa9d5bcf114769713f4258c7))
+* **spec:** derive the metadata catalog from core so enrich_miss is reachable ([9e5f319](https://github.com/maltzsama/urutau/commit/9e5f3193e4e56f131ba728e6fd8f00781973cf37)), closes [#144](https://github.com/maltzsama/urutau/issues/144)
+* **test:** gofmt a registry test and drop an ineffectual assignment ([d00683b](https://github.com/maltzsama/urutau/commit/d00683bc8eac5063a64331f7aeaabb1b91c3f220))
+* theme colors orange for both modes, add GitHub stars button ([ca4d674](https://github.com/maltzsama/urutau/commit/ca4d674b366334fc40ce2f86788db75d7eb934bb))
+
+
+### Performance Improvements
+
+* **mysql:** cache charset decoders on the CDC decode path ([ef36adb](https://github.com/maltzsama/urutau/commit/ef36adb39691d1e7defe6aefaacc3daa32deaff0))
+
 ## [0.2.0](https://github.com/maltzsama/urutau/compare/v0.1.1...v0.2.0) (2026-09-17)
 
 
