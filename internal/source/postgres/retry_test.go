@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	errs "github.com/maltzsama/urutau/internal/errors"
 )
 
 func TestRetryBackoffCapped(t *testing.T) {
@@ -70,8 +72,8 @@ func TestIsTransientSQLState(t *testing.T) {
 		{"2", false},
 	}
 	for _, c := range cases {
-		if got := transientSQLState(c.code); got != c.want {
-			t.Errorf("transientSQLState(%q) = %v, want %v", c.code, got, c.want)
+		if got := errs.ClassifySQLState(c.code).Transient(); got != c.want {
+			t.Errorf("ClassifySQLState(%q).Transient() = %v, want %v", c.code, got, c.want)
 		}
 	}
 }
@@ -126,6 +128,30 @@ func TestResolveRetryCount(t *testing.T) {
 	}
 	if got := resolveRetryCount(-1); got != 0 {
 		t.Fatalf("resolveRetryCount(-1) = %d, want 0", got)
+	}
+}
+
+func TestResolveInitialWaitTime(t *testing.T) {
+	if got := resolveInitialWaitTime(0); got != defaultInitialWait {
+		t.Fatalf("resolveInitialWaitTime(0) = %v, want %v", got, defaultInitialWait)
+	}
+	if got := resolveInitialWaitTime(120); got != 120*time.Second {
+		t.Fatalf("resolveInitialWaitTime(120) = %v, want 120s", got)
+	}
+	if got := resolveInitialWaitTime(5); got != minInitialWait {
+		t.Fatalf("resolveInitialWaitTime(5) = %v, want the %v floor", got, minInitialWait)
+	}
+}
+
+func TestClassifyPgError(t *testing.T) {
+	if f, ok := classifyPgError(&pgconn.PgError{Code: "28P01"}); !ok || f != errs.AuthFailed {
+		t.Fatalf("classifyPgError(28P01) = %v, %v; want AuthFailed, true", f, ok)
+	}
+	if f, ok := classifyPgError(&pgconn.PgError{Code: "40001"}); !ok || f != errs.ConcurrencyConflict {
+		t.Fatalf("classifyPgError(40001) = %v, %v; want ConcurrencyConflict, true", f, ok)
+	}
+	if _, ok := classifyPgError(errors.New("plain")); ok {
+		t.Fatal("a non-PgError must not be claimed")
 	}
 }
 

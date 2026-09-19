@@ -295,32 +295,38 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 
 // ── Positions and catalog ────────────────────────────────────────────
 
-func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []core.TableRef) (position.Position, []core.TableRef, error) {
+func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []core.TableRef) (position.Position, []core.TableRef, []string, error) {
 	var positions []position.Position
 	var needsSnapshot []core.TableRef
+	byTarget := make(map[string]position.Position, len(refs))
 	for _, ref := range refs {
 		pos, err := snk.Position(ctx, ref)
 		if err != nil {
-			return nil, nil, fmt.Errorf("runner: %s: %w", ref.Target, err)
+			return nil, nil, nil, fmt.Errorf("runner: %s: %w", ref.Target, err)
 		}
 		if pos != "" {
 			p, err := src.ParsePosition(pos)
 			if err != nil {
-				return nil, nil, fmt.Errorf("runner: %s cdc.position %q: %w", ref.Target, pos, err)
+				return nil, nil, nil, fmt.Errorf("runner: %s cdc.position %q: %w", ref.Target, pos, err)
 			}
 			positions = append(positions, p)
+			byTarget[ref.Target] = p
 		} else {
 			needsSnapshot = append(needsSnapshot, ref)
 		}
 	}
 	if len(positions) == 0 {
-		return nil, needsSnapshot, nil
+		return nil, needsSnapshot, nil, nil
 	}
 	best, err := position.MinSafe(positions)
 	if err != nil {
-		return nil, nil, fmt.Errorf("runner: %w", err)
+		return nil, nil, nil, fmt.Errorf("runner: %w", err)
 	}
-	return best, needsSnapshot, nil
+	// Streams ahead of the resume point hold already-committed data past it;
+	// they replay from best (idempotent under upsert). Naming them makes a
+	// crash-recovery replay observable (#155).
+	recovery := position.Ahead(best, byTarget)
+	return best, needsSnapshot, recovery, nil
 }
 
 // readSnapshotProgress reads the snapshot state from the sink's table
@@ -737,7 +743,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
 
-	resume, needsSnapshot, err := resumeFrom(ctx, src, snk, refs)
+	resume, needsSnapshot, recovery, err := resumeFrom(ctx, src, snk, refs)
 	if err != nil {
 		closeQuery()
 		closeStages()
@@ -745,6 +751,10 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		return nil, err
 	}
 	log.Info("resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
+	if len(recovery) > 0 {
+		log.Info("crash recovery: streams ahead of the resume point replay from it",
+			"from", resumeOrNone(resume), "streams", recovery)
+	}
 	r.emit(eventlog.KindResume, map[string]any{
 		"from": resumeOrNone(resume), "snapshot_tables": len(needsSnapshot),
 	})

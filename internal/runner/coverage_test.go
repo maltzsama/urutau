@@ -53,9 +53,10 @@ func TestResumeFrom(t *testing.T) {
 	ctx := context.Background()
 	refs := []core.TableRef{{Target: "a"}, {Target: "b"}}
 
-	// All committed: MinSafe of the two, nothing to snapshot.
+	// All committed: MinSafe of the two, nothing to snapshot. Stream b is
+	// ahead of the resume point, so it is the crash-recovery replay set.
 	snk := &resumeSink{positions: map[string]string{"a": "0/10", "b": "0/20"}}
-	pos, needs, err := resumeFrom(ctx, resumeSource{}, snk, refs)
+	pos, needs, recovery, err := resumeFrom(ctx, resumeSource{}, snk, refs)
 	if err != nil {
 		t.Fatalf("resumeFrom: %v", err)
 	}
@@ -65,10 +66,13 @@ func TestResumeFrom(t *testing.T) {
 	if pos == nil || pos.String() != "0/10" {
 		t.Fatalf("resume = %v, want 0/10", pos)
 	}
+	if len(recovery) != 1 || recovery[0] != "b" {
+		t.Fatalf("recovery = %v, want [b]", recovery)
+	}
 
 	// One uncommitted: it needs a snapshot, the other sets the resume.
 	snk = &resumeSink{positions: map[string]string{"a": "0/10"}}
-	pos, needs, err = resumeFrom(ctx, resumeSource{}, snk, refs)
+	pos, needs, _, err = resumeFrom(ctx, resumeSource{}, snk, refs)
 	if err != nil {
 		t.Fatalf("resumeFrom(partial): %v", err)
 	}
@@ -81,7 +85,7 @@ func TestResumeFrom(t *testing.T) {
 
 	// Nothing committed: no resume, everything needs a snapshot.
 	snk = &resumeSink{positions: map[string]string{}}
-	pos, needs, err = resumeFrom(ctx, resumeSource{}, snk, refs)
+	pos, needs, _, err = resumeFrom(ctx, resumeSource{}, snk, refs)
 	if err != nil {
 		t.Fatalf("resumeFrom(fresh): %v", err)
 	}
@@ -91,13 +95,13 @@ func TestResumeFrom(t *testing.T) {
 
 	// A sink read error propagates.
 	snk = &resumeSink{posErr: errors.New("catalog down")}
-	if _, _, err := resumeFrom(ctx, resumeSource{}, snk, refs); err == nil {
+	if _, _, _, err := resumeFrom(ctx, resumeSource{}, snk, refs); err == nil {
 		t.Fatal("a Position error must propagate")
 	}
 
 	// A bad stored position propagates.
 	snk = &resumeSink{positions: map[string]string{"a": "0/10", "b": "0/20"}}
-	if _, _, err := resumeFrom(ctx, badResumeSource{}, snk, refs); err == nil {
+	if _, _, _, err := resumeFrom(ctx, badResumeSource{}, snk, refs); err == nil {
 		t.Fatal("a ParsePosition error must propagate")
 	}
 }

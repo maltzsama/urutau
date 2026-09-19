@@ -105,6 +105,13 @@ type PostgresSource struct {
 	// omitempty, so an explicit 0 is indistinguishable from omission and
 	// resolves to the default rather than disabling retries.
 	RetryCount int `json:"retryCount,omitempty"`
+	// InitialWaitTime is the maximum number of seconds the CDC reader waits
+	// for the first WAL message before failing with a non-retryable error.
+	// It detects a misconfigured CDC (wrong slot, wrong publication, no WAL
+	// traffic) that would otherwise hang forever. The timer resets on every
+	// received message. 0 (omitted) resolves to the default 300; an explicit
+	// value below 30 is rejected.
+	InitialWaitTime int `json:"initialWaitTime,omitempty"`
 }
 
 // SSLConfig configures TLS for the PostgreSQL connection.
