@@ -110,6 +110,7 @@ See [Sinks](sinks.md) for each sink's semantics and limits.
 | `metadata` | no | Pipeline metadata columns (`op`, `commit_ts`, …) |
 | `cast` | no | Override a source column's canonical type |
 | `columnFilter` | no | Source column subset to read and emit. Must include every primary-key column |
+| `chunkColumn` | no | Snapshot chunking column for SQL sources. Must be a primary-key column; empty uses the source default (Postgres: CTID) |
 | `columns` | kafka | Explicit schema (no introspection) |
 | `bootstrap` | no | `snapshot` (default), `adopt`, `adopt-verify` |
 | `enrich` | no | Broadcast reference joins |
@@ -142,6 +143,19 @@ from the target schema. It applies to the snapshot `SELECT` list and to the
 CDC projection. Every primary-key column (declared, or introspected when not
 declared) must be included — the sink resolves the key and sort order by
 column name.
+
+### `chunkColumn`
+
+Selects the snapshot chunking strategy for a SQL source. Empty uses the
+source's default — for Postgres, physical **CTID** block ranges, which need no
+primary key and give uniform chunks regardless of key skew. When set, it must
+name a primary-key column: an integer/float column splits by value range
+(batch-size), any other type by cursor stepping (next-query).
+
+A table with `workers: {number: N > 1}` is always chunked by its
+(single-column) key, so each chunk range is routable to the same worker as the
+live stream; CTID is not routable and is used only for the single-worker
+snapshot.
 
 ### `writeMode`
 

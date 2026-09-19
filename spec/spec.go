@@ -392,6 +392,13 @@ type Table struct {
 	// must be listed — the sink resolves the equality key by column name,
 	// so an excluded key column would break the target table.
 	ColumnFilter []string `json:"columnFilter,omitempty"`
+	// ChunkColumn selects the snapshot chunking strategy for SQL sources.
+	// Empty uses the source's default (Postgres: physical CTID ranges).
+	// When set, it must name a primary-key column: an integer/float column
+	// splits by value range (batch-size), any other type by cursor stepping
+	// (next-query). A key-ordered column keeps the chunk range routable to
+	// the same worker as the live stream when workers > 1.
+	ChunkColumn string `json:"chunkColumn,omitempty"`
 	// Bootstrap configures how the initial snapshot is handled.
 	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
 	// Enrich joins each event against reference tables loaded in memory

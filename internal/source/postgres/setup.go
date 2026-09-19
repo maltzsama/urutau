@@ -89,9 +89,20 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 // pipeline: adds missing members, drops extra ones. All ALTER PUBLICATION
 // statements run inside a single transaction so a failure leaves the
 // publication in its previous state.
+//
+// The members come from pg_publication_rel (the tables added DIRECTLY), not
+// pg_publication_tables: that view expands a partitioned parent into its
+// partitions, so a publication of a partitioned table would look like it held
+// the leaf tables and syncPublication would try to DROP them (which fails —
+// they were never added directly).
 func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []source.TableRef) error {
 	rows, err := db.QueryContext(ctx, `
-		SELECT schemaname, tablename FROM pg_catalog.pg_publication_tables WHERE pubname = $1`, pub)
+		SELECT n.nspname, c.relname
+		FROM pg_catalog.pg_publication_rel pr
+		JOIN pg_catalog.pg_class c ON c.oid = pr.prrelid
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_catalog.pg_publication p ON p.oid = pr.prpubid
+		WHERE p.pubname = $1`, pub)
 	if err != nil {
 		return fmt.Errorf("postgres: publication members: %w", err)
 	}

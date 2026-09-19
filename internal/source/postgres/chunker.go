@@ -16,11 +16,39 @@ import (
 // psql builds queries with Postgres $N placeholders.
 var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
-// Chunker splits a table by its primary key, using the chunk-skipping
-// bounds trick shared with the MySQL source: pick every chunkSize-th key
-// with LIMIT 1 OFFSET n, then read the slice between consecutive bounds.
-// Bounds are only seeds for the half-open range, so the split stays
-// correct under concurrent inserts.
+// defaultChunkTargetBytes is the CTID strategy's target bytes per chunk when
+// the pipeline leaves sink.defaults.targetFileSize unset. It mirrors the sink's
+// own 512Mi default (and OLake's EffectiveParquetSize): pagesPerChunk =
+// ceil(targetBytes / blockSize), so one chunk lands roughly one target file.
+const defaultChunkTargetBytes = 512 << 20
+
+// chunkStrategy selects how a table's snapshot is split into chunks.
+type chunkStrategy int
+
+const (
+	// strategyCTID splits by physical block ranges (the default): no primary
+	// key required, uniform chunks regardless of key skew.
+	strategyCTID chunkStrategy = iota
+	// strategyBatch splits an integer/float chunk column by value range.
+	strategyBatch
+	// strategyNext steps a non-numeric chunk column by cursor.
+	strategyNext
+)
+
+// chunkColumnKind is the chunk column's numeric shape, deciding batch vs next.
+type chunkColumnKind int
+
+const (
+	kindOther chunkColumnKind = iota
+	kindInt
+	kindFloat
+)
+
+// Chunker splits a table into snapshot chunks. The strategy is CTID by
+// default; a configured chunk column switches to a key-based strategy
+// (batch-size for integer/float, next-query otherwise). A partitioned table
+// (workers > 1) always uses a key-based strategy, because the chunk range
+// must stay routable to the same worker as the live stream.
 type Chunker struct {
 	db        *sql.DB
 	schema    string
@@ -35,13 +63,23 @@ type Chunker struct {
 	// bounds queries (#166). 0 disables retry.
 	retries int
 	// columns is the projection (#162): the source columns to read. Empty
-	// means all. The chunk SELECT lists exactly these columns; ORDER BY and
-	// the chunk bounds still use the primary key, which may be outside the
-	// projection in append-only mode.
+	// means all.
 	columns []string
 	// filter is the compiled structured filter (#163), composed with the
 	// chunk bounds. Nil means no filter.
 	filter sq.Sqlizer
+
+	// strategy is the resolved chunking strategy.
+	strategy chunkStrategy
+	// chunkColumn is the configured chunk column (empty for CTID).
+	chunkColumn string
+	// chunkColumnKind is the chunk column's numeric shape (batch vs next).
+	chunkColumnKind chunkColumnKind
+	// targetBytes is the CTID strategy's target bytes per chunk.
+	targetBytes int64
+	// partitioned forces a key-based strategy: set by Partitions(n>1) so a
+	// partitioned table never chunks by CTID (CTID is not routable).
+	partitioned bool
 }
 
 // ChunkerOption tunes a Chunker.
@@ -78,8 +116,24 @@ func WithFilter(f sq.Sqlizer) ChunkerOption {
 	return func(c *Chunker) { c.filter = f }
 }
 
+// WithChunkColumn selects the chunk column (#151). Empty keeps the CTID
+// default.
+func WithChunkColumn(col string) ChunkerOption {
+	return func(c *Chunker) { c.chunkColumn = strings.TrimSpace(col) }
+}
+
+// WithTargetBytes sets the CTID strategy's target bytes per chunk (from
+// sink.defaults.targetFileSize). Non-positive keeps the default.
+func WithTargetBytes(n int64) ChunkerOption {
+	return func(c *Chunker) {
+		if n > 0 {
+			c.targetBytes = n
+		}
+	}
+}
+
 // NewChunker builds a chunker for one source table.
-func NewChunker(db *sql.DB, source, pk string, chunkSize int, opts ...ChunkerOption) (*Chunker, error) {
+func NewChunker(ctx context.Context, db *sql.DB, source, pk string, chunkSize int, opts ...ChunkerOption) (*Chunker, error) {
 	schema, table, ok := strings.Cut(source, ".")
 	if !ok {
 		return nil, fmt.Errorf("postgres: chunker: source %q must be schema.table", source)
@@ -96,57 +150,68 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int, opts ...ChunkerOpt
 		}
 	}
 	c := &Chunker{
-		db:        db,
-		schema:    schema,
-		table:     table,
-		pk:        pks,
-		chunkSize: chunkSize,
-		workers:   runtime.NumCPU(),
+		db:          db,
+		schema:      schema,
+		table:       table,
+		pk:          pks,
+		chunkSize:   chunkSize,
+		workers:     runtime.NumCPU(),
+		targetBytes: defaultChunkTargetBytes,
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
+	if err := c.resolveStrategy(ctx); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
-// PK returns the primary key columns the chunker splits by.
+// resolveStrategy picks the chunking strategy: CTID when no chunk column is
+// configured, otherwise batch-size (integer/float) or next-query.
+func (c *Chunker) resolveStrategy(ctx context.Context) error {
+	if c.chunkColumn == "" {
+		c.strategy = strategyCTID
+		return nil
+	}
+	st, err := QueryTable(ctx, c.db, c.schema, c.table)
+	if err != nil {
+		return fmt.Errorf("postgres: chunker: introspect %s: %w", c.qualifiedTable(), err)
+	}
+	i := st.FindColumn(c.chunkColumn)
+	if i < 0 {
+		return fmt.Errorf("postgres: chunker: chunkColumn %q not found in %s", c.chunkColumn, c.qualifiedTable())
+	}
+	if !st.Columns[i].NotNull {
+		// The value-range and cursor predicates use >= / <, which exclude
+		// NULL: a nullable chunk column would silently drop every row whose
+		// key is NULL.
+		return fmt.Errorf("postgres: chunker: chunkColumn %q is nullable — NULL keys are excluded from the chunk predicates (declare it NOT NULL)", c.chunkColumn)
+	}
+	switch strings.ToLower(st.Columns[i].DataType) {
+	case "smallint", "integer", "bigint":
+		c.chunkColumnKind = kindInt
+		c.strategy = strategyBatch
+	case "real", "double precision":
+		c.chunkColumnKind = kindFloat
+		c.strategy = strategyBatch
+	default:
+		c.strategy = strategyNext
+	}
+	return nil
+}
+
+// PK returns the primary key columns.
 func (c *Chunker) PK() []string { return c.pk }
 
-// Bounds returns the ordered list of chunk boundary keys: key[0] is the
-// lowest PK, followed by every chunkSize-th key, then nil (the open high
-// bound of the last chunk). The whole computation is retried on a transient
-// error, so a failure while fetching a boundary row is covered, not just the
-// initial QueryContext.
+// Bounds returns the ordered chunk boundary keys for the resolved strategy.
+// The whole computation is retried on a transient error.
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	var bounds [][]any
 	err := retryTransientErr(ctx, c.retries, func() error {
-		bounds = bounds[:0]
-		for offset := 0; ; offset += c.chunkSize {
-			query, args, err := c.boundsQuery(offset).ToSql()
-			if err != nil {
-				return fmt.Errorf("postgres: chunker bounds sql: %w", err)
-			}
-			rows, err := c.db.QueryContext(ctx, query, args...)
-			if err != nil {
-				return fmt.Errorf("postgres: chunker bounds: %w", err)
-			}
-			key, scanErr := scanRow(rows)
-			closeErr := rows.Close()
-			switch {
-			case scanErr == sql.ErrNoRows:
-				// Clean end of the key sequence: only here is an empty
-				// result the terminator, and only if the close was clean.
-				if closeErr != nil {
-					return fmt.Errorf("postgres: chunker bounds close: %w", closeErr)
-				}
-				return nil
-			case scanErr != nil:
-				return scanErr
-			case closeErr != nil:
-				return fmt.Errorf("postgres: chunker bounds close: %w", closeErr)
-			}
-			bounds = append(bounds, key)
-		}
+		var err error
+		bounds, err = c.bounds(ctx)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -154,13 +219,52 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	return bounds, nil
 }
 
-// boundsQuery selects the chunkSize-th key at the given offset.
-func (c *Chunker) boundsQuery(offset int) sq.SelectBuilder {
-	return psql.Select(quotedIdents(c.pk)...).
-		From(c.qualifiedTable()).
-		OrderBy(quotedIdents(c.pk)...).
-		Limit(1).
-		Offset(uint64(offset))
+func (c *Chunker) bounds(ctx context.Context) ([][]any, error) {
+	if c.strategy == strategyCTID && !c.partitioned {
+		return c.ctidBounds(ctx)
+	}
+	if c.partitioned {
+		// A partitioned table must chunk by key so the coordinator can clip
+		// each chunk to its worker's PK range.
+		return c.keyBounds(ctx)
+	}
+	switch c.strategy {
+	case strategyBatch:
+		return c.batchBounds(ctx)
+	default:
+		return c.nextBounds(ctx)
+	}
+}
+
+// keyBounds is the key-based bounds for a partitioned table: batch when the
+// single-column key is numeric, next-query otherwise.
+func (c *Chunker) keyBounds(ctx context.Context) ([][]any, error) {
+	if len(c.pk) != 1 {
+		return nil, fmt.Errorf("postgres: chunker: %s: partitioned chunking requires a single-column primary key", c.qualifiedTable())
+	}
+	st, err := QueryTable(ctx, c.db, c.schema, c.table)
+	if err != nil {
+		return nil, err
+	}
+	i := st.FindColumn(c.pk[0])
+	if i < 0 {
+		return nil, fmt.Errorf("postgres: chunker: key %q not found", c.pk[0])
+	}
+	c.chunkColumn = c.pk[0]
+	switch strings.ToLower(st.Columns[i].DataType) {
+	case "smallint", "integer", "bigint":
+		c.chunkColumnKind = kindInt
+		c.strategy = strategyBatch
+	case "real", "double precision":
+		c.chunkColumnKind = kindFloat
+		c.strategy = strategyBatch
+	default:
+		c.strategy = strategyNext
+	}
+	if c.strategy == strategyBatch {
+		return c.batchBounds(ctx)
+	}
+	return c.nextBounds(ctx)
 }
 
 // qualifiedTable is the quoted "schema"."table".
@@ -176,15 +280,13 @@ func (c *Chunker) selectList() []string {
 	return quotedIdents(c.columns)
 }
 
-// Scan executes the chunk SELECT and calls fn for every row, keyed by
-// column name. Values decode through the same scalar mapping the pgoutput
-// reader uses, so snapshot rows and stream rows land in Iceberg identically.
+// Scan executes the chunk SELECT and calls fn for every row, keyed by column
+// name. Values decode through the same scalar mapping the pgoutput reader
+// uses, so snapshot rows and stream rows land in Iceberg identically.
 //
 // The whole scan is retried on a transient error, covering a failure during
 // rows.Next/Scan and not just the initial QueryContext. Rows are buffered
-// until the scan completes, so a retry never re-delivers rows to fn — the
-// DBLog snapshot collects a chunk before relaying it, so a full re-scan is
-// safe and cannot duplicate.
+// until the scan completes, so a retry never re-delivers rows to fn.
 //
 // Within one scan, rows are normalized by a bounded pool of `workers`
 // goroutines, but fn is always invoked from a single goroutine, so it need
@@ -210,25 +312,40 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	return nil
 }
 
-// scanOnce runs one chunk SELECT, streaming normalized rows to fn.
-func (c *Chunker) scanOnce(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
-	// The query is composed with squirrel — no hand-built SQL. The chunk
-	// bounds narrow the PK range, the structured filter (#163) drops rows
-	// the operator does not want; both are ANDed, so neither widens the
-	// other. ORDER BY and the bounds reference the primary key, which the
-	// engine allows even when the key is not in the projection (#162).
+// chunkQuery builds the chunk SELECT: the projection, the strategy's range
+// predicate, and the structured filter, all ANDed.
+func (c *Chunker) chunkQuery(ch source.Chunk) (sq.SelectBuilder, error) {
 	q := psql.Select(c.selectList()...).From(c.qualifiedTable())
-	if ch.Low != nil {
-		q = q.Where(tupleCompare(">=", c.pk, ch.Low))
-	}
-	if ch.High != nil {
-		q = q.Where(tupleCompare("<", c.pk, ch.High))
+	switch {
+	case c.strategy == strategyCTID && !c.partitioned:
+		if ch.Low != nil {
+			q = q.Where(ctidCompare(">=", ch.Low[0]))
+		}
+		if ch.High != nil {
+			q = q.Where(ctidCompare("<", ch.High[0]))
+		}
+	default:
+		col := quoteIdent(c.chunkColumn)
+		if ch.Low != nil {
+			q = q.Where(sq.GtOrEq{col: ch.Low[0]})
+		}
+		if ch.High != nil {
+			q = q.Where(sq.Lt{col: ch.High[0]})
+		}
+		q = q.OrderBy(col)
 	}
 	if c.filter != nil {
 		q = q.Where(c.filter)
 	}
-	q = q.OrderBy(quotedIdents(c.pk)...)
+	return q, nil
+}
 
+// scanOnce runs one chunk SELECT, streaming normalized rows to fn.
+func (c *Chunker) scanOnce(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
+	q, err := c.chunkQuery(ch)
+	if err != nil {
+		return err
+	}
 	query, args, err := q.ToSql()
 	if err != nil {
 		return fmt.Errorf("postgres: chunk scan sql: %w", err)
@@ -482,19 +599,6 @@ func quotedList(cols []string) string {
 	return strings.Join(quotedIdents(cols), ", ")
 }
 
-// tupleCompare builds a row-constructor range comparison, e.g.
-// ("a", "b") >= (?, ?), which keeps composite primary keys lexicographic.
-// Squirrel has no tuple helper, so this uses its Expr escape hatch — the one
-// construct squirrel cannot express natively.
-func tupleCompare(op string, cols []string, vals []any) sq.Sqlizer {
-	holders := make([]string, len(vals))
-	for i := range holders {
-		holders[i] = "?"
-	}
-	expression := "(" + quotedList(cols) + ") " + op + " (" + strings.Join(holders, ", ") + ")"
-	return sq.Expr(expression, vals...)
-}
-
 // normalize maps driver values into the scalar subset shared with the
 // stream decoder.
 func normalize(v any) any {
@@ -504,4 +608,14 @@ func normalize(v any) any {
 	default:
 		return v
 	}
+}
+
+// numericStep is the batch strategy's value step for a chunk: the configured
+// chunk size (rows) used as a value range. At least 1.
+func (c *Chunker) numericStep() float64 {
+	step := float64(c.chunkSize)
+	if step < 1 {
+		step = 1
+	}
+	return step
 }

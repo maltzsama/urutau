@@ -114,6 +114,17 @@ transaction between slot creation and the stream start is lost.
 - **Snapshot consistency** — each chunk runs in a `REPEATABLE READ READ ONLY`
   transaction, so the chunk sees one consistent snapshot even under
   concurrent writes.
+- **Snapshot chunking** — the default is physical **CTID** block ranges: no
+  primary key required, uniform chunks regardless of key skew, sized from
+  `sink.defaults.targetFileSize` (default `512Mi`) divided by the server block
+  size. Range-partitioned tables are split proportionally across their leaf
+  partitions. Set [`chunkColumn`](../reference/pipeline-spec.md#chunkcolumn) to
+  chunk by a key column instead (value-range for integer/float, cursor
+  stepping otherwise).
+- **Worker partitioning** — `workers: {number: N > 1}` splits a single-column
+  primary key into `N` contiguous ranges that govern both the snapshot and the
+  live stream, so a key never changes owner. CTID is not routable, so a
+  partitioned table is always chunked by its key.
 - **Column projection** — [`columnFilter`](../reference/pipeline-spec.md#columnfilter)
   narrows the snapshot `SELECT` list and the CDC projection; the excluded
   columns are absent from the target. It must include the primary key.

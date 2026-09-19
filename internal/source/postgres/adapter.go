@@ -193,8 +193,9 @@ func (a Source) projectionFor(source string) (columns []string, filter sq.Sqlize
 
 // NewChunker builds the chunk SELECT source for one table. The concurrent
 // normalization pool (#161) and the snapshot-query retry budget (#166) come
-// from the resolved connection config (maxThreads / retryCount); the column
-// projection (#162) and the filter (#163) come from the spec table.
+// from the resolved connection config; the column projection (#162), the
+// filter (#163), and the chunk column / CTID target bytes (#151) come from the
+// spec.
 func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
 	opts := []ChunkerOption{}
 	if a.connCfg != nil {
@@ -210,7 +211,28 @@ func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource
 	if filter != nil {
 		opts = append(opts, WithFilter(filter))
 	}
-	return NewChunker(a.db, source, pk, chunkSize, opts...)
+	if t, ok := a.tableFor(source); ok && t.ChunkColumn != "" {
+		opts = append(opts, WithChunkColumn(t.ChunkColumn))
+	}
+	if tb := a.chunkTargetBytes(); tb > 0 {
+		opts = append(opts, WithTargetBytes(tb))
+	}
+	// The construction introspects the chunk column's type (a one-time boot
+	// query); a background context is fine here.
+	return NewChunker(context.Background(), a.db, source, pk, chunkSize, opts...)
+}
+
+// chunkTargetBytes parses sink.defaults.targetFileSize into the CTID
+// strategy's target bytes per chunk. 0 means the chunker default.
+func (a Source) chunkTargetBytes() int64 {
+	if a.spec == nil || a.spec.Sink.Defaults.TargetFileSize == "" {
+		return 0
+	}
+	n, err := spec.ParseBytes(a.spec.Sink.Defaults.TargetFileSize)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // CloseQuery releases the query connection and tears down the SSH tunnel.

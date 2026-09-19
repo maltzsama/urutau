@@ -875,3 +875,15 @@ func TestValidateFilterRejectsEmptyList(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateChunkColumnMustBePK(t *testing.T) {
+	s := validSpec()
+	s.Tables[0].ChunkColumn = "not_pk"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "not a primary-key column") {
+		t.Fatalf("want chunkColumn pk problem, got %v", err)
+	}
+	s.Tables[0].ChunkColumn = "id"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("chunkColumn on the pk must validate: %v", err)
+	}
+}
