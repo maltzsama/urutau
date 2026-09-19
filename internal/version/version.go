@@ -10,7 +10,7 @@ var (
 	// Version is the release version. The Makefile overrides it at build
 	// time via ldflags with the git tag, so an official binary always
 	// reports the tag it was built from.
-	Version = "0.2.0" // x-release-please-version
+	Version = "0.3.0" // x-release-please-version
 	Commit  = "none"
 	Date    = "unknown"
 )
