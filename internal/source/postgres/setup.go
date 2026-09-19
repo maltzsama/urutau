@@ -180,9 +180,12 @@ func ConfirmedLSN(ctx context.Context, db *sql.DB, slotName string) (*position.L
 //   - resume < confirmed: the slot is ahead of the sink. The sink's stored
 //     point is behind what the server already confirmed (and may have
 //     recycled), so the slot's point is authoritative — warn and use it.
-//   - resume > confirmed: the sink claims a position the slot never confirmed,
-//     which means the slot was reset or replaced. Fail rather than risk
-//     resuming past unread WAL.
+//   - resume > confirmed: the sink durably committed past the slot's last
+//     confirmed_flush_lsn (the server learns the applied position from a later
+//     standby-status update, so a crash can leave the slot behind). This is
+//     recoverable: the WAL from resume onward is still retained because the
+//     slot never confirmed past it, so advance the slot to the sink's point
+//     rather than forcing a re-snapshot.
 func ValidateSlotState(ctx context.Context, db *sql.DB, slotName string, resume *position.LSN, logger *slog.Logger) (*position.LSN, error) {
 	confirmed, err := ConfirmedLSN(ctx, db, slotName)
 	if err != nil {
@@ -201,7 +204,11 @@ func ValidateSlotState(ctx context.Context, db *sql.DB, slotName string, resume 
 		}
 		return confirmed, nil
 	default:
-		return nil, fmt.Errorf("postgres: stored position %s is ahead of slot %q confirmed_flush_lsn %s — the slot was reset or replaced; a full re-snapshot is required", resume.String(), slotName, confirmed.String())
+		if logger != nil {
+			logger.Warn("postgres: stored position is ahead of the slot's confirmed_flush_lsn; advancing the slot to the committed sink position",
+				"slot", slotName, "stored", resume.String(), "confirmed", confirmed.String())
+		}
+		return resume, nil
 	}
 }
 

@@ -43,13 +43,10 @@ func TestPostgresSlotValidationAndAdvance(t *testing.T) {
 		t.Fatalf("behind resume = %v, %v; want %v", got, err, confirmed)
 	}
 
-	// A resume ahead of the slot means the slot was reset/replaced: fail.
-	ahead := *confirmed + 1_000_000
-	if _, err := postgres.ValidateSlotState(ctx, db, slot, &ahead, nil); err == nil {
-		t.Fatal("a resume ahead of the slot must error")
-	}
-
-	// AdvanceSlot moves the slot's confirmed point to the target.
+	// A resume ahead of the slot (the sink committed past the last confirmed
+	// point) is recoverable: it is returned as the effective start, and the
+	// caller advances the slot to it. Move some WAL first so the target is a
+	// real, advanceable position.
 	pgExec(t, db, `SELECT pg_catalog.pg_switch_wal()`)
 	var curStr string
 	if err := db.QueryRowContext(ctx, `SELECT pg_catalog.pg_current_wal_lsn()::text`).Scan(&curStr); err != nil {
@@ -62,15 +59,20 @@ func TestPostgresSlotValidationAndAdvance(t *testing.T) {
 	if cur.Compare(confirmed) <= 0 {
 		t.Fatalf("current WAL %s is not ahead of confirmed %s", cur, confirmed)
 	}
-	if err := postgres.AdvanceSlot(ctx, db, slot, *cur); err != nil {
+	ahead := position.LSN((uint64(*confirmed) + uint64(*cur)) / 2)
+	got, err = postgres.ValidateSlotState(ctx, db, slot, &ahead, nil)
+	if err != nil || got.Compare(&ahead) != 0 {
+		t.Fatalf("ahead resume = %v, %v; want %v", got, err, ahead)
+	}
+	if err := postgres.AdvanceSlot(ctx, db, slot, ahead); err != nil {
 		t.Fatalf("advance slot: %v", err)
 	}
 	after, err := postgres.ConfirmedLSN(ctx, db, slot)
 	if err != nil {
 		t.Fatalf("confirmed after advance: %v", err)
 	}
-	if after.Compare(cur) != 0 {
-		t.Fatalf("confirmed after advance = %s, want %s", after, cur)
+	if after.Compare(&ahead) != 0 {
+		t.Fatalf("confirmed after advance = %s, want %s", after, ahead.String())
 	}
 	t.Log("slot validation + advance ok")
 }

@@ -136,10 +136,14 @@ type Reader struct {
 	// initialWait bounds how long the reader waits for the first WAL message
 	// (#154). Resolved to the default when cfg.InitialWait is zero.
 	initialWait time.Duration
-	out         chan<- rowchange.Change
-	bySrc       map[string]source.TableRef // "schema.table" → ref (PK + target)
-	states      map[string]*TableState     // "schema.table" → introspected state
-	relByID     map[uint32]relEntry        // relation id → state, from Relation messages
+	// primed is set once the reader has seen its first WAL data message. It
+	// persists across reconnects so the one-shot initial wait is never
+	// re-armed for a stream that has already proven data flows (#154).
+	primed  bool
+	out     chan<- rowchange.Change
+	bySrc   map[string]source.TableRef // "schema.table" → ref (PK + target)
+	states  map[string]*TableState     // "schema.table" → introspected state
+	relByID map[uint32]relEntry        // relation id → state, from Relation messages
 	// projections is the per-source read projection (#162/#163).
 	projections map[string]Projection
 
@@ -420,15 +424,21 @@ func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error 
 
 	nextStatus := time.Now().Add(statusInterval)
 	// The initial-wait clock starts at the first receive attempt and is
-	// satisfied by the first WAL data message. After that the reader streams
-	// indefinitely (a correctly configured but idle table sends keepalives
-	// forever), so the wait is one-shot — it only catches a CDC that never
-	// produces row data (wrong slot, wrong publication).
+	// satisfied by the first WAL data message (r.primed, which survives a
+	// reconnect). After that the reader streams indefinitely (a correctly
+	// configured but idle table sends keepalives forever), so the wait is
+	// one-shot — it only catches a CDC that never produces row data (wrong
+	// slot, wrong publication).
 	started := time.Now()
-	primed := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// Checked every iteration, not only on the status deadline: frequent
+		// keepalives can push that deadline forward forever, which would let a
+		// misconfigured stream hang past the configured wait (#154).
+		if initialWaitExceeded(r.primed, started, r.initialWait, time.Now()) {
+			return fmt.Errorf("postgres: no WAL message within %s: %w", r.initialWait, errs.ErrNoData)
 		}
 
 		recvCtx, cancel := context.WithDeadline(ctx, nextStatus)
@@ -441,9 +451,6 @@ func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error 
 			// The receive deadline is the status tick: report the applied
 			// LSN and keep going.
 			if errors.Is(err, context.DeadlineExceeded) {
-				if initialWaitExceeded(primed, started, r.initialWait, time.Now()) {
-					return fmt.Errorf("postgres: no WAL message within %s: %w", r.initialWait, errs.ErrNoData)
-				}
 				if serr := r.sendStandby(ctx); serr != nil {
 					return serr
 				}
@@ -481,7 +488,7 @@ func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error 
 				}
 			}
 		case pglogrepl.XLogDataByteID:
-			primed = true
+			r.primed = true
 			walData, err := pglogrepl.ParseXLogData(copyData.Data[1:])
 			if err != nil {
 				return fmt.Errorf("postgres: xlog data: %w", err)
