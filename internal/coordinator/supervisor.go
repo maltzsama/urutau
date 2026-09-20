@@ -146,9 +146,9 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// Send. With batches owed, terminate instead — the restart replays
 		// from the committed position (at-least-once). A reset is safe only
 		// when the worker owes nothing.
-		if idx := s.c.index[worker]; idx != nil && idx.InFlight() > 0 {
+		if n := s.c.inFlight(worker); n > 0 {
 			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) — a reset would drop them; terminating for replay",
-				worker, idx.InFlight())
+				worker, n)
 		}
 		s.recordReset(worker, now, window)
 		if len(s.resets[worker]) >= maxResets {
@@ -158,6 +158,16 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		s.c.resetWorker(w)
 	}
 	return nil
+}
+
+// inFlight reports how many batches the worker has been delivered but has not
+// acked. c.index is populated at boot and only read afterwards, so the map
+// lookup needs no lock; InFlight takes the index's own lock.
+func (c *Coordinator) inFlight(worker string) int {
+	if idx := c.index[worker]; idx != nil {
+		return idx.InFlight()
+	}
+	return 0
 }
 
 // recordReset pushes a reset timestamp into the worker's sliding window,
