@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
 	"regexp"
@@ -49,19 +50,18 @@ const (
 // caller (the worker dedicates one committer goroutine per table, which is
 // the design's serialization invariant).
 type TableWriter struct {
-	cat             catalog.Catalog
-	ident           table.Identifier
-	eqIDs           []int
-	dataSchema      *arrow.Schema
-	delSchema       *arrow.Schema
-	delCols         []string
-	maxTries        int
-	backoff         time.Duration
-	cast            core.CastPolicy
-	metaByName      map[string]core.MetadataColumn
-	sourceTable     string
-	recordBatchSize int64
-	targetFileSize  int64
+	cat            catalog.Catalog
+	ident          table.Identifier
+	eqIDs          []int
+	dataSchema     *arrow.Schema
+	delSchema      *arrow.Schema
+	delCols        []string
+	maxTries       int
+	backoff        time.Duration
+	cast           core.CastPolicy
+	metaByName     map[string]core.MetadataColumn
+	sourceTable    string
+	targetFileSize int64
 }
 
 // NewTableWriter loads the table, resolves the equality-delete key (the
@@ -103,19 +103,18 @@ func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identi
 	}
 
 	return &TableWriter{
-		cat:             cat,
-		ident:           ident,
-		eqIDs:           eqIDs,
-		dataSchema:      dataSchema,
-		delSchema:       delSchema,
-		delCols:         primaryKey,
-		maxTries:        5,
-		backoff:         200 * time.Millisecond,
-		cast:            cast,
-		metaByName:      metaByName,
-		sourceTable:     sourceTable,
-		recordBatchSize: 64 * 1024, // 64k rows per Arrow record batch
-		targetFileSize:  targetFileSize,
+		cat:            cat,
+		ident:          ident,
+		eqIDs:          eqIDs,
+		dataSchema:     dataSchema,
+		delSchema:      delSchema,
+		delCols:        primaryKey,
+		maxTries:       5,
+		backoff:        200 * time.Millisecond,
+		cast:           cast,
+		metaByName:     metaByName,
+		sourceTable:    sourceTable,
+		targetFileSize: targetFileSize,
 	}, nil
 }
 
@@ -169,6 +168,13 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// (columnar). The append path is fully columnar (projectRecord); the
 	// equality-delete keys are extracted for iceberg-go, whose API takes keys
 	// — the §4.1 library boundary, not a data-path materialization.
+	//
+	// An empty equality-delete key means the table has no primary key, which
+	// is only valid for append-only tables (the append branch above). Reject
+	// it here, before the key extraction fails obscurely.
+	if len(w.eqIDs) == 0 {
+		return fmt.Errorf("iceberg: %v: upsert requires a primary key", w.ident)
+	}
 	upsertBatch, deleteBatch, err := splitByOp(ctx, b)
 	if err != nil {
 		return err
@@ -433,9 +439,6 @@ func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Id
 	return err
 }
 
-// createTable creates the target table, reporting whether it was created.
-// A false return with a nil error means a concurrent creator won the race
-// (ErrTableAlreadyExists) — the caller must reload and validate that table.
 // sortOrderFor builds the table's default sort order over its identifier
 // (primary-key) columns, ascending with nulls first. A sort order clusters
 // equal-key rows together within data files, so equality-delete pruning and
@@ -460,6 +463,9 @@ func sortOrderFor(schema *iceberg.Schema, primaryKey []string) (table.SortOrder,
 	return table.NewSortOrder(1, fields)
 }
 
+// createTable creates the target table, reporting whether it was created.
+// A false return with a nil error means a concurrent creator won the race
+// (ErrTableAlreadyExists) — the caller must reload and validate that table.
 func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy, primaryKey []string) (bool, error) {
 	opts := []catalog.CreateTableOpt{
 		catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
@@ -510,8 +516,12 @@ func evolveTable(ctx context.Context, tbl *table.Table, want *iceberg.Schema) er
 }
 
 // evolveFields reconciles one level of fields, descending into structs so a
-// field added inside a nested column is caught too. Add/update calls stage
-// onto the UpdateSchema; iceberg-go validates them at Commit.
+// field added inside a nested struct is caught too. It does NOT descend into a
+// struct nested inside a list or map element, so a field added there is not
+// evolved — a limitation of this walk, not of Iceberg. Add/update calls stage
+// onto the UpdateSchema; iceberg-go validates them at Commit: a new required
+// column with no default is rejected, so adding a NOT NULL source column to an
+// existing table fails the boot with evolution on (correct, fail-closed).
 func evolveFields(us *table.UpdateSchema, path []string, existing, want []iceberg.NestedField) {
 	for _, wf := range want {
 		ef, ok := findNestedField(existing, wf.Name)
@@ -592,7 +602,7 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 		}
 	} else {
 		existSchema := existing.Schema()
-		for colName := range cast.Columns {
+		for _, colName := range sortedKeys(cast.Columns) {
 			newField, ok := schema.FindFieldByName(colName)
 			if !ok {
 				continue // column not in resolved schema — introspection will catch
@@ -666,6 +676,12 @@ func backoffDuration(base time.Duration, attempt int) time.Duration {
 // status code and retry a terminal error.
 var retryableHTTPStatus = regexp.MustCompile(`\b(408|429|500|502|503|504)\b`)
 
+// retryableMessage matches transient network/throttling error text. Each token
+// is anchored with \b so a substring inside an unrelated word cannot match.
+// "EOF" is deliberately NOT a token: a bare substring also matches a parse
+// error ("unexpected EOF in JSON"), so the io sentinels are checked separately.
+var retryableMessage = regexp.MustCompile(`\b(SlowDown|RequestTimeout|throttl\w*|Too Many Requests|connection refused|i/o timeout|broken pipe|reset by peer)\b`)
+
 // isRetryableError classifies an error as transient (retryable) or
 // terminal. I/O and HTTP 5xx errors from the object store or catalog
 // are transient; schema, type, and 4xx errors are terminal.
@@ -673,22 +689,17 @@ func isRetryableError(err error) bool {
 	if errors.Is(err, table.ErrCommitFailed) {
 		return true
 	}
-	s := err.Error()
+	// A truncated or dropped stream is transient. Match the io sentinels, not
+	// the "EOF" substring: a parse error whose message merely contains "EOF"
+	// must not be retried as if it were a network failure.
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
 	// HTTP 5xx / 408 / 429 (whole tokens) or throttling/network errors from
 	// the REST catalog or S3. 429 and S3's SlowDown/RequestTimeout are the
 	// throttling signals a server overloaded enough to shed retries sends.
-	if retryableHTTPStatus.MatchString(s) {
-		return true
-	}
-	for _, tok := range []string{
-		"SlowDown", "RequestTimeout", "throttl", "Too Many Requests",
-		"connection refused", "EOF", "i/o timeout", "broken pipe", "reset by peer",
-	} {
-		if strings.Contains(s, tok) {
-			return true
-		}
-	}
-	return false
+	s := err.Error()
+	return retryableHTTPStatus.MatchString(s) || retryableMessage.MatchString(s)
 }
 
 // deleteRecord builds one arrow record with the primary key tuples.
@@ -709,6 +720,10 @@ func (w *TableWriter) deleteRecord(keys [][]any) (arrow.RecordBatch, error) {
 	}
 	return b.NewRecordBatch(), nil
 }
+
+// maxExactFloat64 is the largest integer magnitude a float64 represents
+// exactly (2^53). Beyond it, an int64→float64 conversion rounds silently.
+const maxExactFloat64 = int64(1) << 53
 
 // appendColumn appends values to an Arrow builder, converting each to the
 // field's target type and rejecting a value that does not fit.
@@ -806,8 +821,14 @@ func appendColumn(builder array.Builder, field arrow.Field, values []any) error 
 			case float32:
 				b.Append(float64(t))
 			case int64:
+				if t > maxExactFloat64 || t < -maxExactFloat64 {
+					return fmt.Errorf("iceberg: column %q: %v loses precision as float64", name, t)
+				}
 				b.Append(float64(t))
 			case int:
+				if int64(t) > maxExactFloat64 || int64(t) < -maxExactFloat64 {
+					return fmt.Errorf("iceberg: column %q: %v loses precision as float64", name, t)
+				}
 				b.Append(float64(t))
 			case int32:
 				b.Append(float64(t))

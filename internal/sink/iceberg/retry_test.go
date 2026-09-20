@@ -2,6 +2,8 @@ package iceberg
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -17,7 +19,8 @@ func TestIsRetryableError(t *testing.T) {
 		errors.New("s3: SlowDown: please reduce your request rate"),
 		errors.New("s3: RequestTimeout"),
 		errors.New("rpc error: connection refused"),
-		errors.New("s3: read: EOF"),
+		fmt.Errorf("s3: read: %w", io.EOF),
+		fmt.Errorf("s3: read: %w", io.ErrUnexpectedEOF),
 		errors.New("i/o timeout"),
 		table.ErrCommitFailed,
 	}
@@ -31,6 +34,9 @@ func TestIsRetryableError(t *testing.T) {
 		errors.New("iceberg: column x: unknown canonical kind"),
 		errors.New("iceberg: create table: schema mismatch"),
 		errors.New("iceberg: no such table"),
+		// A parse error whose message merely contains "EOF" must NOT be
+		// retried as if it were a network failure (issue #192).
+		errors.New("unexpected EOF in JSON"),
 	}
 	for _, e := range terminal {
 		if isRetryableError(e) {

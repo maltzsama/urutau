@@ -474,6 +474,7 @@ func TestAppendAndDeleteOnlyPaths(t *testing.T) {
 		t.Fatalf("position after DeleteOnly = %q, want 11", got)
 	}
 
+	//nolint:staticcheck // deliberately exercising the deprecated append-then-delete gotcha
 	if err := AppendAndDelete(ctx, tbl, data, []int{1}, deletes, iceberg.Properties{"cdc.position": "12"}); err != nil {
 		t.Fatalf("AppendAndDelete: %v", err)
 	}

@@ -248,7 +248,7 @@ func TestSortedKeys(t *testing.T) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	}
-	if len(sortedKeys(nil)) != 0 {
+	if len(sortedKeys(map[string]any(nil))) != 0 {
 		t.Fatal("nil map must yield no keys")
 	}
 }

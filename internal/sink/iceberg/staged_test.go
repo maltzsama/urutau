@@ -20,9 +20,9 @@ func TestEncodeStagedEmptyFraming(t *testing.T) {
 	}
 	// magic + specID + schema len + state len + pending count + deletes count + appends count
 	want := []byte{
-		stagedMagicV2,
+		stagedMagicV3,
 		0, 0, 0, 0, // spec ID
-		0, 0, 0, 0, // schema string length
+		0, 0, 0, 0, // schema fingerprint length (nil schema → empty)
 		0, 0, 0, 0, // snapshot state length
 		0, 0, 0, 0, // pending list count
 		0, 0, 0, 0, // delete file count
