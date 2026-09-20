@@ -20,7 +20,7 @@ func TestCapabilities(t *testing.T) {
 	if !c.Snapshot || !c.ChunkQuery || !c.Stream || !c.BeforeImage {
 		t.Fatalf("capabilities = %+v", c)
 	}
-	if len(c.Modes) != 1 || c.Modes[0] != source.ModeCDC {
+	if len(c.Modes) != 2 || c.Modes[0] != source.ModeCDC || c.Modes[1] != source.ModeIncremental {
 		t.Fatalf("modes = %v", c.Modes)
 	}
 }

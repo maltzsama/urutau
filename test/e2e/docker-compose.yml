@@ -83,6 +83,29 @@ services:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
       - ./postgres/tls:/certs:ro
 
+  # wal2json-enabled Postgres for the cdc.plugin: wal2json path (#153).
+  # Debezium's image bundles the wal2json plugin, so the runner can create the
+  # slot with plugin=wal2json. Host port 5435.
+  postgres-wal2json:
+    build:
+      context: ./postgres/wal2json
+    image: urutau-e2e-postgres-wal2json:17
+    ports:
+      - "5435:5432"
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20", "-c", "max_wal_senders=5", "-c", "output_plugin_libraries=wal2json"]
+    environment:
+      POSTGRES_USER: repl
+      POSTGRES_PASSWORD: replpass
+      POSTGRES_DB: shop
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repl -d shop"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+
   # SSH bastion for the structured source.postgres.ssh path (#148). Runs an
   # sshd with public-key auth and TCP forwarding; the tunnel targets the
   # plain postgres service by name. Host port 2222. Keys come from

@@ -14,59 +14,65 @@ import (
 	"github.com/maltzsama/urutau/position"
 )
 
-// wal2jsonMessage is one wal2json logical message (format-version 2). The
-// plugin emits one JSON object per message: begin/commit boundaries and one
-// object per row change.
-type wal2jsonMessage struct {
-	Action       string          `json:"action"` // B, C, I, U, D, T
+// wal2jsonStream is one wal2json message on the replication stream: the whole
+// transaction, with its commit coordinate (nextlsn) and commit time, and the
+// row changes inline. An idle message carries an empty change list.
+type wal2jsonStream struct {
+	NextLSN   string           `json:"nextlsn"`
+	Timestamp string           `json:"timestamp"`
+	Change    []wal2jsonChange `json:"change"`
+}
+
+// wal2jsonChange is one row change. An update carries the new row in
+// columnnames/columnvalues and the old row in oldkeys; a delete carries only
+// oldkeys (REPLICA IDENTITY FULL makes it the full row).
+type wal2jsonChange struct {
+	Kind         string          `json:"kind"` // insert | update | delete
 	Schema       string          `json:"schema"`
 	Table        string          `json:"table"`
 	ColumnNames  []string        `json:"columnnames"`
 	ColumnTypes  []string        `json:"columntypes"`
 	ColumnValues []any           `json:"columnvalues"`
 	OldKeys      *wal2jsonOldKey `json:"oldkeys"`
-	NextLSN      string          `json:"nextlsn"`
-	Timestamp    string          `json:"timestamp"`
 }
 
-// wal2jsonOldKey carries a delete's (or an update's old) row: with REPLICA
-// IDENTITY FULL, keynames/keyvalues hold every column.
+// wal2jsonOldKey is a change's old row.
 type wal2jsonOldKey struct {
 	KeyNames  []string `json:"keynames"`
 	KeyTypes  []string `json:"keytypes"`
 	KeyValues []any    `json:"keyvalues"`
 }
 
-// handleWal2json decodes one wal2json message into the transaction buffer and
-// flushes it at the commit boundary — the same enqueue/handleCommit path the
-// pgoutput decoder uses, so windows, projections and filters apply unchanged.
+// handleWal2json decodes one wal2json transaction and flushes it through the
+// same enqueue/handleCommit path the pgoutput decoder uses, so windows,
+// projections and filters apply unchanged. No Relation message exists: the
+// table is identified by name and looked up in the introspected state.
 func (r *Reader) handleWal2json(ctx context.Context, payload []byte) error {
-	var msg wal2jsonMessage
+	var msg wal2jsonStream
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		return fmt.Errorf("postgres: wal2json: %w", err)
 	}
-	switch msg.Action {
-	case "B":
-		r.txn = r.txn[:0]
-	case "C":
-		lsn, err := position.ParseLSN(msg.NextLSN)
-		if err != nil {
-			return fmt.Errorf("postgres: wal2json: commit lsn %q: %w", msg.NextLSN, err)
+	r.txn = r.txn[:0]
+	r.curCommitTS = parseWal2jsonTime(msg.Timestamp)
+	for i := range msg.Change {
+		if err := r.handleWal2jsonChange(msg.Change[i]); err != nil {
+			return err
 		}
-		r.curCommitTS = parseWal2jsonTime(msg.Timestamp)
-		return r.handleCommit(ctx, pglogrepl.LSN(*lsn))
-	case "I", "U", "D":
-		return r.handleWal2jsonChange(msg)
-	case "T":
-		r.cfg.Logger.Warn("postgres: wal2json truncate received; ignored (not part of the scalar milestone)")
 	}
-	return nil
+	// The commit coordinate rides every message (an idle one has no changes);
+	// advancing it keeps the synced watermark current on an idle source.
+	if msg.NextLSN == "" {
+		return nil
+	}
+	lsn, err := position.ParseLSN(msg.NextLSN)
+	if err != nil {
+		return fmt.Errorf("postgres: wal2json: commit lsn %q: %w", msg.NextLSN, err)
+	}
+	return r.handleCommit(ctx, pglogrepl.LSN(*lsn))
 }
 
-// handleWal2jsonChange maps one row change onto a rowchange.Change. The table
-// is identified by name (wal2json has no Relation message), so the ref,
-// introspected state and projection are looked up by "schema.table".
-func (r *Reader) handleWal2jsonChange(msg wal2jsonMessage) error {
+// handleWal2jsonChange maps one row change onto a rowchange.Change.
+func (r *Reader) handleWal2jsonChange(msg wal2jsonChange) error {
 	src := msg.Schema + "." + msg.Table
 	ref, ok := r.bySrc[src]
 	if !ok {
@@ -89,8 +95,8 @@ func (r *Reader) handleWal2jsonChange(msg wal2jsonMessage) error {
 		}
 	}
 
-	switch msg.Action {
-	case "I":
+	switch msg.Kind {
+	case "insert":
 		keep, err := entry.proj.keep(after)
 		if err != nil {
 			return err
@@ -99,7 +105,7 @@ func (r *Reader) handleWal2jsonChange(msg wal2jsonMessage) error {
 			return nil
 		}
 		r.enqueue(entry, rowchange.OpInsert, entry.proj.project(after), nil)
-	case "U":
+	case "update":
 		if entry.proj.hasFilter() {
 			afterMatch, err := entry.proj.keep(after)
 			if err != nil {
@@ -120,7 +126,7 @@ func (r *Reader) handleWal2jsonChange(msg wal2jsonMessage) error {
 			}
 		}
 		r.enqueue(entry, rowchange.OpUpdate, entry.proj.project(after), entry.proj.project(before))
-	case "D":
+	case "delete":
 		if before == nil {
 			return fmt.Errorf("postgres: wal2json: delete %s: no old row", src)
 		}

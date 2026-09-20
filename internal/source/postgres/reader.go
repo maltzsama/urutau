@@ -522,7 +522,6 @@ func (r *Reader) pluginArgs() []string {
 			`"include-lsn" 'on'`,
 			`"include-timestamp" 'on'`,
 			`"pretty-print" 'off'`,
-			`"format-version" '2'`,
 		}
 	}
 	return []string{

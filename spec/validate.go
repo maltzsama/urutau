@@ -169,6 +169,21 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 			seenTarget[tbl.Target] = true
 		}
 
+		// Sync mode: a cursor column selects incremental, and only
+		// incremental carries one.
+		switch tbl.Mode {
+		case "", "cdc":
+			if tbl.Cursor != "" {
+				problems = append(problems, p+".cursor: only valid with mode: incremental")
+			}
+		case "incremental":
+			if tbl.Cursor == "" {
+				problems = append(problems, p+".cursor: required with mode: incremental")
+			}
+		default:
+			problems = append(problems, fmt.Sprintf("%s.mode: unsupported %q (want cdc | incremental)", p, tbl.Mode))
+		}
+
 		mode := tbl.WriteMode
 		if mode == "" {
 			mode = s.Sink.Defaults.WriteMode

@@ -58,8 +58,9 @@ const (
 
 // Phase values for the __phase wire column and the phase metadata column.
 const (
-	PhaseSnapshot = "snapshot" // rows read by a DBLog chunk SELECT
-	PhaseStream   = "stream"   // live CDC events
+	PhaseSnapshot    = "snapshot"    // rows read by a DBLog chunk SELECT
+	PhaseStream      = "stream"      // live CDC events
+	PhaseIncremental = "incremental" // rows read by a cursor pass (#157)
 )
 
 // String renders the key name.

@@ -100,7 +100,6 @@ cannot carry a tunnel — so the worker also needs the private key at the
 configured path (see the [Kubernetes guide](../guides/deploy-kubernetes.md)).
 
 ## Table discovery
-
 Instead of listing every table, `discover: true` replicates **all** tables the
 connected user may `SELECT`. The spec then omits `tables` entirely — discovery
 and an explicit `tables` list are **mutually exclusive** (declaring both is a
@@ -184,6 +183,31 @@ render a per-table worker Pod template. It renders **one generic template**
 instead, and the coordinator clones it for every discovered target. Nothing
 extra to configure — see the
 [Kubernetes guide](../guides/deploy-kubernetes.md).
+
+## Incremental mode
+
+A table can sync by **cursor column** instead of the replication log: it reads
+`SELECT ... WHERE <cursor> > <last> ORDER BY <cursor>` on every boot and stores
+the last cursor value. No replication slot, no publication — useful for slowly
+changing tables or servers where logical replication is not available.
+
+```yaml
+tables:
+  - source: public.accounts
+    target: raw.accounts
+    primaryKey: [id]
+    mode: incremental
+    cursor: updated_at
+```
+
+- The cursor column must be `NOT NULL`; the pass reads past the stored value.
+- Rows are upserted (`op: insert`) with `__phase: incremental`. **Deletes are
+  not detected** — an incremental read only sees rows that still exist.
+- The cursor lives in the `cdc.cursor` table property, written in the same
+  commit as the rows, so a restart resumes exactly where it left off.
+- Incremental and CDC tables can share one pipeline: the slot covers only the
+  CDC tables. Incremental mode is currently supported in the **collapsed
+  runner** (not distributed mode).
 
 ## Requirements
 
