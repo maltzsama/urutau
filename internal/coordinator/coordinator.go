@@ -1864,16 +1864,28 @@ func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwne
 			&compute.RecordDatum{Value: rec}, &compute.ArrayDatum{Value: idxArr.Data()})
 		idxArr.Release()
 		if err != nil {
-			for _, r := range out {
-				if r != nil {
-					r.Release()
-				}
-			}
+			releaseRecords(out)
 			return nil, fmt.Errorf("partition %d: %w", p, err)
 		}
-		out[p] = datum.(*compute.RecordDatum).Value
+		// Take returns a *RecordDatum for a record input; guard the assertion
+		// so a future kernel change cannot panic the coordinator (issue #211).
+		rd, ok := datum.(*compute.RecordDatum)
+		if !ok {
+			releaseRecords(out)
+			return nil, fmt.Errorf("partition %d: unexpected Take datum %T", p, datum)
+		}
+		out[p] = rd.Value
 	}
 	return out, nil
+}
+
+// releaseRecords releases every non-nil record in a splitByOwner result.
+func releaseRecords(recs []arrow.RecordBatch) {
+	for _, r := range recs {
+		if r != nil {
+			r.Release()
+		}
+	}
 }
 
 // onHello processes a worker's ready Hello: it carries the phase and the
