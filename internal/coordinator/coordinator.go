@@ -453,6 +453,16 @@ func (c *Coordinator) run(ctx context.Context) error {
 	c.refs = refs
 	c.canonical = canonical
 
+	// Fail loud on an upsert table with no key BEFORE resolving or
+	// provisioning worker groups: a discovered keyless table would otherwise
+	// create worker Deployments and then abort, leaving orphaned resources
+	// across repeated boot failures.
+	for _, ref := range refs {
+		if err := dataplane.RequireUpsertKey(ref.Target, ref.PrimaryKey, tableBySource[ref.Source].WriteMode.ChangeMode()); err != nil {
+			return fmt.Errorf("coordinator: %w", err)
+		}
+	}
+
 	// Resolve worker groups: one per partition, derived
 	// "<pipeline>-<target>-<index>" name (spec.Table.WorkerGroupNames) —
 	// there is no operator-chosen worker name, so two tables can never
@@ -568,9 +578,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return err
 		}
 		mode := tbl.WriteMode.ChangeMode()
-		if err := dataplane.RequireUpsertKey(ref.Target, ref.PrimaryKey, mode); err != nil {
-			return fmt.Errorf("coordinator: %w", err)
-		}
 		if err := snk.EnsureTable(ctx, ref, resolvedSchemas[ref.Source], tbl.PartitionBy, cast, mode); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
