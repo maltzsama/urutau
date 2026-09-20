@@ -1902,7 +1902,12 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.noteAck(worker, time.Now())
 	pos, err := c.src.ParsePosition(ack.Position)
 	if err != nil {
+		// The position format is a shared contract; a worker that cannot
+		// produce a valid one is broken, and the ack's batch would sit at the
+		// head of the index forever, leaking its budget charge with no visible
+		// error (issue #210). Terminate for replay instead of continuing.
 		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
+		c.fail(fmt.Errorf("coordinator: worker %s: unparsable ack position %q: %w", worker, ack.Position, err))
 		return
 	}
 	freed := c.index[worker].truncate(ack.Table, pos)
