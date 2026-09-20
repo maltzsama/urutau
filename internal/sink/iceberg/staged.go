@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
+	"os"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -31,14 +33,24 @@ var _ sink.StagingWriter = (*TableWriter)(nil)
 var _ sink.StagedCommitter = (*Sink)(nil)
 
 // The descriptor is framed by a leading magic byte so a malformed or foreign
-// payload is rejected before decoding. stagedMagicV2 is the current,
-// fingerprinted format; stagedMagic is the pre-fingerprint format released in
-// 0.2.0, still accepted on decode so a rolling upgrade (an old worker's
-// descriptor reaching a new coordinator) does not stall a staged cycle.
+// payload is rejected before decoding. stagedMagicV3 is the current format, its
+// schema fingerprint a structural hash (not iceberg.Schema.String());
+// stagedMagicV2 (the string fingerprint) and stagedMagic (the pre-fingerprint
+// format released in 0.2.0) are still accepted on decode, so an older worker's
+// descriptor reaching a newer coordinator does not stall a staged cycle.
 const (
 	stagedMagic   = 0x57 // 'W' — legacy (no spec/schema fingerprint)
-	stagedMagicV2 = 0x58 // 'X' — fingerprinted
+	stagedMagicV2 = 0x58 // 'X' — fingerprinted (iceberg.Schema.String())
+	stagedMagicV3 = 0x59 // 'Y' — fingerprinted (structural hash)
 )
+
+// rejectLegacyStaged makes decodeStaged reject the pre-fingerprint descriptor
+// format (magic 0x57). It is the kill switch for the rolling-upgrade window:
+// once every worker is past the upgrade, an operator can set
+// URUTAU_ICEBERG_REJECT_LEGACY_STAGED=1 so a stale legacy descriptor fails
+// loudly instead of being silently accepted. It is a var, not a const, so a
+// test can flip it.
+var rejectLegacyStaged = os.Getenv("URUTAU_ICEBERG_REJECT_LEGACY_STAGED") == "1"
 
 // stagedPayload is the decoded form of a WriteStaged descriptor: the delete
 // files and the data files one delivery produced, plus the snapshot state
@@ -365,13 +377,13 @@ func cycleCommitted(props iceberg.Properties, head *table.Snapshot, key string) 
 // lists (deletes, appends).
 func encodeStaged(p stagedPayload, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.WriteByte(stagedMagicV2)
+	buf.WriteByte(stagedMagicV3)
 	// The decoder re-supplies the table's CURRENT spec and schema; a change
 	// between staging and commit makes iceberg-go's codec silently mis-type
 	// partition values, so fingerprint both and reject a mismatch loudly
 	// (issue #124).
 	writeUint32(&buf, uint32(spec.ID()))
-	writeString(&buf, schemaString(schema))
+	writeString(&buf, schemaFingerprint(schema))
 	writeString(&buf, p.snapshotState)
 	writeUint32List(&buf, p.snapshotPending)
 	if err := writeFileList(&buf, p.deletes, spec, schema, version); err != nil {
@@ -383,8 +395,9 @@ func encodeStaged(p stagedPayload, spec iceberg.PartitionSpec, schema *iceberg.S
 	return buf.Bytes(), nil
 }
 
-// schemaString renders a schema for the descriptor fingerprint. A nil schema
-// (tests, or an unpartitioned edge) is the empty string.
+// schemaString renders a schema for the legacy v2 descriptor fingerprint. A
+// nil schema (tests, or an unpartitioned edge) is the empty string. New
+// descriptors use schemaFingerprint instead.
 func schemaString(schema *iceberg.Schema) string {
 	if schema == nil {
 		return ""
@@ -392,27 +405,119 @@ func schemaString(schema *iceberg.Schema) string {
 	return schema.String()
 }
 
+// schemaFingerprint is a structural hash of a schema's field IDs, names and
+// types (pre-order, descending into nested types), used as the descriptor's
+// schema fingerprint. It deliberately does NOT use iceberg.Schema.String():
+// that is iceberg-go's own formatting, so a formatting change in a library
+// upgrade would change the fingerprint and reject every in-flight descriptor
+// for no correctness gain. A nil schema is the empty string.
+func schemaFingerprint(schema *iceberg.Schema) string {
+	if schema == nil {
+		return ""
+	}
+	h := sha256.New()
+	fingerprintFields(h, schema.Fields())
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// fingerprintFields writes one level of fields into h, then recurses into a
+// struct/list/map field's nested fields. The \x1f and \x1e separators keep
+// adjacent fields unambiguous.
+func fingerprintFields(h hash.Hash, fields []iceberg.NestedField) {
+	for _, f := range fields {
+		// hash.Hash.Write never returns an error; the formatting cannot fail.
+		_, _ = fmt.Fprintf(h, "%d\x1f%s\x1f%s\x1f%t\x1e", f.ID, f.Name, fingerprintType(f.Type), f.Required)
+		switch t := f.Type.(type) {
+		case *iceberg.StructType:
+			fingerprintFields(h, t.FieldList)
+		case *iceberg.ListType:
+			fingerprintFields(h, []iceberg.NestedField{t.ElementField()})
+		case *iceberg.MapType:
+			fingerprintFields(h, []iceberg.NestedField{t.KeyField(), t.ValueField()})
+		}
+	}
+}
+
+// fingerprintType renders a type as a stable, structural token rather than
+// iceberg-go's String(): primitives by kind (with their parameters), nested
+// types by kind only — their fields are written by the caller's recursion.
+func fingerprintType(t iceberg.Type) string {
+	switch v := t.(type) {
+	case iceberg.BooleanType:
+		return "boolean"
+	case iceberg.Int32Type:
+		return "int"
+	case iceberg.Int64Type:
+		return "long"
+	case iceberg.Float32Type:
+		return "float"
+	case iceberg.Float64Type:
+		return "double"
+	case iceberg.DateType:
+		return "date"
+	case iceberg.TimeType:
+		return "time"
+	case iceberg.TimestampType:
+		return "timestamp"
+	case iceberg.TimestampTzType:
+		return "timestamptz"
+	case iceberg.TimestampNsType:
+		return "timestamp_ns"
+	case iceberg.TimestampTzNsType:
+		return "timestamptz_ns"
+	case iceberg.StringType:
+		return "string"
+	case iceberg.UUIDType:
+		return "uuid"
+	case iceberg.BinaryType:
+		return "binary"
+	case iceberg.UnknownType:
+		return "unknown"
+	case iceberg.VariantType:
+		return "variant"
+	case iceberg.FixedType:
+		return fmt.Sprintf("fixed[%d]", v.Len())
+	case iceberg.DecimalType:
+		return fmt.Sprintf("decimal(%d,%d)", v.Precision(), v.Scale())
+	case *iceberg.StructType:
+		return "struct"
+	case *iceberg.ListType:
+		return "list"
+	case *iceberg.MapType:
+		return "map"
+	default:
+		return fmt.Sprintf("%T", t)
+	}
+}
+
 // decodeStaged decodes a descriptor, dispatching on the leading magic: the
-// fingerprinted v2 format or the pre-fingerprint legacy one (accepted so a
-// mixed-version rolling upgrade keeps committing). spec, schema and version
-// are the table's current ones; v2 checks them against the fingerprint.
+// structurally-fingerprinted v3 format, the string-fingerprinted v2 format, or
+// the pre-fingerprint legacy one (accepted so a mixed-version rolling upgrade
+// keeps committing). spec, schema and version are the table's current ones; the
+// fingerprinted formats check them against the fingerprint.
 func decodeStaged(data []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
 	if len(data) < 1 {
 		return stagedPayload{}, fmt.Errorf("staged descriptor: empty")
 	}
 	switch data[0] {
+	case stagedMagicV3:
+		return decodeStagedFingerprinted(data[1:], spec, schema, version, schemaFingerprint(schema))
 	case stagedMagicV2:
-		return decodeStagedV2(data[1:], spec, schema, version)
+		return decodeStagedFingerprinted(data[1:], spec, schema, version, schemaString(schema))
 	case stagedMagic:
+		if rejectLegacyStaged {
+			return stagedPayload{}, fmt.Errorf("staged descriptor: legacy (pre-fingerprint) format rejected by URUTAU_ICEBERG_REJECT_LEGACY_STAGED")
+		}
 		return decodeStagedLegacy(data[1:], spec, schema, version)
 	default:
 		return stagedPayload{}, fmt.Errorf("staged descriptor: bad magic")
 	}
 }
 
-// decodeStagedV2 decodes the fingerprinted format, rejecting a spec or schema
-// drift since staging.
-func decodeStagedV2(body []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int) (stagedPayload, error) {
+// decodeStagedFingerprinted decodes a fingerprinted format, rejecting a spec or
+// schema drift since staging. schemaFP is the fingerprint the descriptor must
+// carry: the structural hash (v3) or iceberg.Schema.String() (v2).
+func decodeStagedFingerprinted(body []byte, spec iceberg.PartitionSpec, schema *iceberg.Schema, version int, schemaFP string) (stagedPayload, error) {
 	r := bytes.NewReader(body)
 	specID, err := readUint32(r)
 	if err != nil {
@@ -425,7 +530,7 @@ func decodeStagedV2(body []byte, spec iceberg.PartitionSpec, schema *iceberg.Sch
 	if err != nil {
 		return stagedPayload{}, err
 	}
-	if encSchema != schemaString(schema) {
+	if encSchema != schemaFP {
 		return stagedPayload{}, fmt.Errorf("staged descriptor: table schema changed since staging")
 	}
 	return decodeStagedBody(r, spec, schema, version)
