@@ -61,7 +61,10 @@ When present, `uri` is ignored for connection building.
 | `ssh.passphrase` | no | Private key passphrase |
 | `maxThreads` | no | Max concurrent snapshot connections and row-normalization workers (1..32, default `runtime.NumCPU()`) |
 | `retryCount` | no | Transient-error retries with backoff for snapshot queries and replication reconnect (default 3; 0 means "use the default") |
-| `initialWaitTime` | no | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30, default 300) |
+| `cdc.plugin` | no | Logical decoding plugin: `pgoutput` (default) or `wal2json` |
+| `cdc.initialWaitTime` | no | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30, default 300) |
+| `tables[].mode` | no | `cdc` (default, log-based) or `incremental` (cursor column, no slot; Postgres, collapsed runner) |
+| `tables[].cursor` | no | Cursor column, required when `mode: incremental` |
 | `schemas` | no | Limits `discover` to these schemas (default: every accessible schema) |
 | `discover` | no | Replicates **every** table the user may `SELECT` (base tables and partitioned parents) instead of an explicit `tables` list. Mutually exclusive with `tables`; targets derive as `<sink.namespace>.<table>`. See [Table discovery](../sources/postgres.md#table-discovery) |
 

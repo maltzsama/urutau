@@ -329,6 +329,62 @@ func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []co
 	return best, needsSnapshot, recovery, nil
 }
 
+// runIncremental reads each incremental table once (#157) and pushes the rows
+// through the worker's ingest path — the same path a snapshot uses, minus the
+// window. The cursor is read from cdc.cursor and persisted post-commit by the
+// OnCommit callback, so the data and the cursor advance together.
+func (r *Runner) runIncremental(ctx context.Context, src source.Source, snk sink.Sink, refs []core.TableRef, specBySource map[string]spec.Table, w *worker.Worker, ingest chan worker.Ingest) error {
+	inc, ok := src.(source.IncrementalSource)
+	if !ok {
+		return fmt.Errorf("runner: source does not support incremental mode")
+	}
+	for _, ref := range refs {
+		t := specBySource[ref.Source]
+		// The committed cdc.position IS the cursor for an incremental table:
+		// the batch watermark was written atomically with the rows.
+		after, err := snk.Position(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
+		}
+		next, rows, err := inc.Incremental(ctx, ref, t.Cursor, after)
+		if err != nil {
+			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		changes := make([]rowchange.Change, len(rows))
+		for i, row := range rows {
+			key := make([]any, 0, len(ref.PrimaryKey))
+			for _, pk := range ref.PrimaryKey {
+				key = append(key, row[pk])
+			}
+			changes[i] = rowchange.Change{
+				Op:       rowchange.OpInsert,
+				Table:    ref.Target,
+				Key:      key,
+				After:    row,
+				Position: next,
+				Snapshot: false,
+				Phase:    core.PhaseIncremental,
+				IngestTS: time.Now(),
+			}
+		}
+		rec, err := transport.RecordFromChanges(changes, transport.MergeSchema(changes, w.KnownSchema(ref.Target)), nil)
+		if err != nil {
+			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
+		}
+		dpb := &dataplane.Batch{Table: ref.Target, Record: rec, Mode: dataplane.UpsertMode, Watermark: []byte(next)}
+		select {
+		case ingest <- worker.Ingest{Table: ref.Target, Batch: dpb}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		r.log.Info("incremental read", "table", ref.Source, "rows", len(rows), "cursor", next)
+	}
+	return nil
+}
+
 // readSnapshotProgress reads the snapshot state from the sink's table
 // properties.
 func readSnapshotProgress(ctx context.Context, snk sink.Sink, ref core.TableRef) (*snapshot.SnapshotProgress, error) {
@@ -584,6 +640,20 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		specByTarget[t.Target] = t
 	}
 
+	// Split by sync mode (#157): incremental tables do not use the slot,
+	// publication or CDC resume — they run a cursor pass below. Everything
+	// else stays on the CDC path.
+	var cdcRefs, incrRefs []core.TableRef
+	incrRefByTarget := map[string]core.TableRef{}
+	for _, ref := range refs {
+		if specBySource[ref.Source].Mode == spec.ModeIncremental {
+			incrRefs = append(incrRefs, ref)
+			incrRefByTarget[ref.Target] = ref
+		} else {
+			cdcRefs = append(cdcRefs, ref)
+		}
+	}
+
 	// Enrich stages are built and, for any wildcard reference, loaded
 	// SYNCHRONOUSLY here — BEFORE EnsureTable — so a wildcard select's real
 	// destination columns are known in time to correct resolved/wire before
@@ -746,6 +816,13 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 			"table": b.Table, "rows": rows,
 			"upserts": up, "deletes": del, "position": string(b.Watermark),
 		})
+		// An incremental table's cursor is the batch watermark, written
+		// atomically with the rows by the sink's commit — never a separate
+		// property, which would race the data commit. It never feeds the
+		// LSN/confirmed point, so the position parse does not apply.
+		if _, ok := incrRefByTarget[b.Table]; ok {
+			return
+		}
 		// A garbage position string never advances the confirmed point.
 		p, err := src.ParsePosition(string(b.Watermark))
 		if err != nil {
@@ -757,7 +834,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	workerErr := make(chan error, 1)
 	go func() { workerErr <- w.Run(ctx, ingest) }()
 
-	resume, needsSnapshot, recovery, err := resumeFrom(ctx, src, snk, refs)
+	resume, needsSnapshot, recovery, err := resumeFrom(ctx, src, snk, cdcRefs)
 	if err != nil {
 		closeQuery()
 		closeStages()
@@ -772,32 +849,6 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	r.emit(eventlog.KindResume, map[string]any{
 		"from": resumeOrNone(resume), "snapshot_tables": len(needsSnapshot),
 	})
-
-	// Reader (one replication connection) → relay → ingest. The reader
-	// constructor also performs the source's server-side setup (Postgres
-	// slot and publication).
-	rdr, err := src.Open(ctx, refs)
-	if err != nil {
-		closeQuery()
-		closeStages()
-		closeStages()
-		return nil, err
-	}
-	// A source that can take the source schema (optional interface) gets it
-	// now so the source boundary gates on drift and encodes stable batches
-	// with the source types the sink casts, keyed by the TARGET the changes
-	// are addressed to.
-	if si, ok := rdr.(source.SchemaSetter); ok {
-		byTarget := make(map[string]core.Schema, len(refs))
-		for _, t := range s.Tables {
-			if cs, ok := wire[t.Source]; ok {
-				byTarget[t.Target] = cs
-			}
-		}
-		si.SetSourceSchemas(byTarget)
-	}
-	r.rdr = rdr
-	rdr.SetConfirmed(r.confirmedPosition)
 
 	// Per-table bootstrap config, resolved once: the stream start below and
 	// the snapshot loop both consult it.
@@ -821,28 +872,61 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		}
 	}
 
-	start := resume
-	if start == nil && len(explicitPositions) > 0 {
-		// An adopted table with an explicit start position overrides the
-		// source default. The minimum across tables is the safe choice: the
-		// stream is one per source, and starting too late would skip data.
-		start = position.Min(explicitPositions)
-	}
-	if start == nil {
-		if m, err := src.InitialPosition(ctx); err != nil {
-			return nil, fmt.Errorf("runner: initial position: %w", err)
-		} else {
-			start = m
+	// Reader (one replication connection) → relay → ingest, only when there
+	// are CDC tables. The reader constructor also performs the source's
+	// server-side setup (Postgres slot and publication). An all-incremental
+	// pipeline opens no replication connection at all.
+	var rdr source.Reader
+	var router *relay
+	var routerDone chan error
+	if len(cdcRefs) > 0 {
+		rdr, err = src.Open(ctx, cdcRefs)
+		if err != nil {
+			closeQuery()
+			closeStages()
+			closeStages()
+			return nil, err
 		}
-	}
+		// A source that can take the source schema (optional interface) gets
+		// it now so the source boundary gates on drift and encodes stable
+		// batches with the source types the sink casts.
+		if si, ok := rdr.(source.SchemaSetter); ok {
+			byTarget := make(map[string]core.Schema, len(refs))
+			for _, t := range s.Tables {
+				if cs, ok := wire[t.Source]; ok {
+					byTarget[t.Target] = cs
+				}
+			}
+			si.SetSourceSchemas(byTarget)
+		}
+		r.rdr = rdr
+		rdr.SetConfirmed(r.confirmedPosition)
 
-	// Pull: the reader is pull-based; the relay starts it and routes batches.
-	if err := rdr.Start(ctx, start); err != nil {
-		return nil, fmt.Errorf("runner: start stream: %w", err)
+		start := resume
+		if start == nil && len(explicitPositions) > 0 {
+			// An adopted table with an explicit start position overrides the
+			// source default. The minimum across tables is the safe choice:
+			// the stream is one per source, and starting too late would skip
+			// data.
+			start = position.Min(explicitPositions)
+		}
+		if start == nil {
+			if m, err := src.InitialPosition(ctx); err != nil {
+				return nil, fmt.Errorf("runner: initial position: %w", err)
+			} else {
+				start = m
+			}
+		}
+
+		// Pull: the reader is pull-based; the relay starts it and routes
+		// batches.
+		if err := rdr.Start(ctx, start); err != nil {
+			return nil, fmt.Errorf("runner: start stream: %w", err)
+		}
+		router = newRelay(ingest, w)
+		routerDone = make(chan error, 1)
+		go func() { routerDone <- router.run(ctx, rdr) }()
 	}
-	router := newRelay(ingest, w)
-	routerDone := make(chan error, 1)
-	go func() { routerDone <- router.run(ctx, rdr) }()
 
 	// Snapshot phase: DBLog for tables with no committed position. Skip
 	// when the source does not support snapshot (e.g. Kafka).
@@ -939,6 +1023,21 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		}
 	}
 
+	// Incremental pass (#157): one cursor read per incremental table, through
+	// the same worker/ingest path as a snapshot. No slot, no window.
+	if len(incrRefs) > 0 {
+		if err := r.runIncremental(ctx, src, snk, incrRefs, specBySource, w, ingest); err != nil {
+			if r.rdr != nil {
+				r.rdr.Close()
+			}
+			closeQuery()
+			closeStages()
+			closeStages()
+			closeStages()
+			return nil, err
+		}
+	}
+
 	r.workerErr = workerErr
 	r.routerDone = routerDone
 
@@ -958,7 +1057,9 @@ func (r *Runner) Run(ctx context.Context) error {
 			map[string]any{"reason": reason})
 		r.ev.Close()
 	}
-	r.rdr.Close()
+	if r.rdr != nil {
+		r.rdr.Close()
+	}
 	r.closeQuery()
 	for _, st := range r.enrichStages {
 		st.Stop()

@@ -54,13 +54,14 @@ func isPartitionedParent(ctx context.Context, db *sql.DB, schema, table string) 
 //
 //   - REPLICA IDENTITY FULL on every replicated table, so updates and
 //     deletes carry the full old row (parity with MySQL's row_image=FULL);
-//   - the logical publication listing exactly the pipeline's tables;
-//   - the logical decoding slot (pgoutput).
+//   - for pgoutput, the logical publication listing exactly the pipeline's
+//     tables;
+//   - the logical decoding slot with the selected plugin.
 //
 // The slot is the consistency anchor: created before the snapshot starts,
 // it guarantees no transaction between slot creation and the stream start
 // is ever lost.
-func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []source.TableRef) error {
+func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []source.TableRef, plugin string) error {
 	if !slotNameRe.MatchString(slotName) {
 		return fmt.Errorf("postgres: slot name %q must match %s", slotName, slotNameRe)
 	}
@@ -76,16 +77,67 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 		}
 	}
 
-	// publish_via_partition_root (PG13+): without it, logical decoding
-	// publishes a partitioned table's changes under each LEAF relation, and
-	// the reader — bound to the parent's relation id — silently ignores them,
-	// so the target goes stale after the snapshot. On an older server, reject
-	// a partitioned table rather than lose its live changes.
+	for _, ref := range tables {
+		schema, table, _ := strings.Cut(ref.Source, ".")
+		if _, err := db.ExecContext(ctx,
+			fmt.Sprintf(`ALTER TABLE %s.%s REPLICA IDENTITY FULL`,
+				quoteIdent(schema), quoteIdent(table))); err != nil {
+			return fmt.Errorf("postgres: replica identity %s: %w", ref.Source, err)
+		}
+	}
+
+	// pgoutput filters through a publication; wal2json does not use one.
+	if plugin == "pgoutput" {
+		if err := ensurePublication(ctx, db, slotName, tables); err != nil {
+			return err
+		}
+	}
+
+	var slotExists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = $1)`, slotName,
+	).Scan(&slotExists); err != nil {
+		return fmt.Errorf("postgres: slot lookup: %w", err)
+	}
+	if !slotExists {
+		if _, err := db.ExecContext(ctx,
+			`SELECT pg_catalog.pg_create_logical_replication_slot($1, $2)`, slotName, plugin); err != nil {
+			return fmt.Errorf("postgres: create slot: %w", err)
+		}
+	} else {
+		// A slot is bound to the plugin and database it was created with.
+		// Reusing it after switching either would start replication with the
+		// wrong options and decode the wrong payload, so fail loud.
+		var existingPlugin, existingDB string
+		if err := db.QueryRowContext(ctx,
+			`SELECT plugin, database FROM pg_catalog.pg_replication_slots WHERE slot_name = $1`, slotName,
+		).Scan(&existingPlugin, &existingDB); err != nil {
+			return fmt.Errorf("postgres: slot lookup: %w", err)
+		}
+		if existingPlugin != plugin {
+			return fmt.Errorf("postgres: slot %q was created with plugin %q, not %q — drop and recreate it to switch plugins", slotName, existingPlugin, plugin)
+		}
+		var currentDB string
+		if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&currentDB); err != nil {
+			return fmt.Errorf("postgres: current database: %w", err)
+		}
+		if existingDB != currentDB {
+			return fmt.Errorf("postgres: slot %q belongs to database %q, not %q", slotName, existingDB, currentDB)
+		}
+	}
+	return nil
+}
+
+// ensurePublication creates or syncs the pgoutput publication, with
+// publish_via_partition_root (PG13+) so a partitioned parent's changes arrive
+// as the parent rather than under each leaf relation the reader cannot bind.
+// On an older server a partitioned table is rejected rather than silently
+// losing its live changes.
+func ensurePublication(ctx context.Context, db *sql.DB, slotName string, tables []source.TableRef) error {
 	viaRoot, err := publishViaPartitionRootSupported(ctx, db)
 	if err != nil {
 		return err
 	}
-
 	for _, ref := range tables {
 		schema, table, _ := strings.Cut(ref.Source, ".")
 		if !viaRoot {
@@ -96,11 +148,6 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 			if partitioned {
 				return fmt.Errorf("postgres: %s is a partitioned table but the server is older than PostgreSQL 13 (no publish_via_partition_root); its live changes would be dropped — upgrade to 13+, or replicate the leaf tables explicitly", ref.Source)
 			}
-		}
-		if _, err := db.ExecContext(ctx,
-			fmt.Sprintf(`ALTER TABLE %s.%s REPLICA IDENTITY FULL`,
-				quoteIdent(schema), quoteIdent(table))); err != nil {
-			return fmt.Errorf("postgres: replica identity %s: %w", ref.Source, err)
 		}
 	}
 
@@ -134,19 +181,6 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 				fmt.Sprintf(`ALTER PUBLICATION %s SET (publish_via_partition_root = true)`, quoteIdent(pub))); err != nil {
 				return fmt.Errorf("postgres: publication partition root: %w", err)
 			}
-		}
-	}
-
-	var slotExists bool
-	if err := db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = $1)`, slotName,
-	).Scan(&slotExists); err != nil {
-		return fmt.Errorf("postgres: slot lookup: %w", err)
-	}
-	if !slotExists {
-		if _, err := db.ExecContext(ctx,
-			`SELECT pg_catalog.pg_create_logical_replication_slot($1, 'pgoutput')`, slotName); err != nil {
-			return fmt.Errorf("postgres: create slot: %w", err)
 		}
 	}
 	return nil

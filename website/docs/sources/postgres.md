@@ -38,7 +38,9 @@ source:
       application_name: urutau
     maxThreads: 10
     retryCount: 3
-    initialWaitTime: 300
+    cdc:
+      plugin: pgoutput
+      initialWaitTime: 300
     ssl:
       mode: verify-full
       ca: /etc/ssl/ca.pem
@@ -78,7 +80,8 @@ and reused.
 |-------|---------|-------------|
 | `maxThreads` | `runtime.NumCPU()` | Max concurrent connections for snapshot chunk SELECTs (1..32), and the size of the concurrent row-normalization pool |
 | `retryCount` | 3 | Transient-error retries with exponential backoff: snapshot queries are retried, and a lost replication stream reconnects and resumes from the committed position. 0 means "use the default" |
-| `initialWaitTime` | 300 | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30). Detects a misconfigured slot or publication that would otherwise hang forever; the timer is satisfied by the first WAL data message |
+| `cdc.plugin` | `pgoutput` | Logical decoding plugin: `pgoutput` (binary) or `wal2json` (JSON). wal2json must be installed on the server; the slot is created with the selected plugin |
+| `cdc.initialWaitTime` | 300 | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30). Detects a misconfigured slot or publication that would otherwise hang forever; the timer is satisfied by the first WAL data message |
 | `schemas` | all accessible | Limits `discover` to these schemas |
 | `discover` | `false` | Replicates every table the user may `SELECT` (base tables and partitioned parents) instead of an explicit `tables` list. Mutually exclusive with `tables` |
 
@@ -97,7 +100,6 @@ cannot carry a tunnel — so the worker also needs the private key at the
 configured path (see the [Kubernetes guide](../guides/deploy-kubernetes.md)).
 
 ## Table discovery
-
 Instead of listing every table, `discover: true` replicates **all** tables the
 connected user may `SELECT`. The spec then omits `tables` entirely — discovery
 and an explicit `tables` list are **mutually exclusive** (declaring both is a
@@ -181,6 +183,33 @@ render a per-table worker Pod template. It renders **one generic template**
 instead, and the coordinator clones it for every discovered target. Nothing
 extra to configure — see the
 [Kubernetes guide](../guides/deploy-kubernetes.md).
+
+## Incremental mode
+
+A table can sync by **cursor column** instead of the replication log: it reads
+`SELECT ... WHERE <cursor> > <last> ORDER BY <cursor>` on every boot and stores
+the last cursor value. No replication slot, no publication — useful for slowly
+changing tables or servers where logical replication is not available.
+
+```yaml
+tables:
+  - source: public.accounts
+    target: raw.accounts
+    primaryKey: [id]
+    mode: incremental
+    cursor: updated_at
+```
+
+- The cursor column must be `NOT NULL`; the pass reads past the stored value.
+- Rows are upserted (`op: insert`) with `__phase: incremental`. **Deletes are
+  not detected** — an incremental read only sees rows that still exist.
+- The cursor is the table's committed `cdc.position`, written in the **same
+  commit** as the rows, so a restart resumes exactly where it left off. The
+  resume predicate is `>=`, so a non-unique cursor (e.g. `updated_at`) never
+  drops a row that shares the last value.
+- Incremental and CDC tables can share one pipeline: the slot covers only the
+  CDC tables. Incremental mode is currently supported in the **collapsed
+  runner** (not distributed mode).
 
 ## Requirements
 
@@ -272,7 +301,9 @@ source:
       privateKey: /home/user/.ssh/id_ed25519
     maxThreads: 10
     retryCount: 3
-    initialWaitTime: 300
+    cdc:
+      plugin: pgoutput
+      initialWaitTime: 300
 sink:
   uri: http://polaris:8181/api/catalog
   namespace: raw

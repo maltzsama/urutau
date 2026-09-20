@@ -673,7 +673,7 @@ func TestValidatePostgresRejectsBadInitialWaitTime(t *testing.T) {
 		Source: Source{
 			Kind:     "postgres",
 			SlotName: "test_slot",
-			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", InitialWaitTime: 5},
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", CDC: &CDCConfig{InitialWaitTime: 5}},
 		},
 		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
 		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
@@ -682,7 +682,7 @@ func TestValidatePostgresRejectsBadInitialWaitTime(t *testing.T) {
 		t.Fatalf("want initialWaitTime problem, got %v", err)
 	}
 	// The minimum itself is accepted.
-	s.Source.Postgres.InitialWaitTime = 30
+	s.Source.Postgres.CDC.InitialWaitTime = 30
 	if err := s.Validate(); err != nil {
 		t.Fatalf("initialWaitTime=30 must be valid, got %v", err)
 	}
@@ -724,6 +724,34 @@ func TestValidatePostgresDiscover(t *testing.T) {
 	warns := s.Warnings()
 	if len(warns) == 0 || !strings.Contains(warns[0], "schemas") {
 		t.Fatalf("want a schemas warning, got %v", warns)
+	}
+}
+
+func TestValidateTableMode(t *testing.T) {
+	base := func() *Spec {
+		return &Spec{
+			Pipeline: "pg",
+			Source:   Source{Kind: "postgres", SlotName: "s", Postgres: &PostgresSource{Host: "h", Database: "d"}},
+			Sink:     Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		}
+	}
+	// incremental without cursor: error.
+	s := base()
+	s.Tables = []Table{{Source: "public.t", Target: "raw.t", PrimaryKey: []string{"id"}, Mode: "incremental"}}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "cursor") {
+		t.Fatalf("incremental without cursor must error, got %v", err)
+	}
+	// cursor without incremental: error.
+	s = base()
+	s.Tables = []Table{{Source: "public.t", Target: "raw.t", PrimaryKey: []string{"id"}, Cursor: "id"}}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "cursor") {
+		t.Fatalf("cursor without incremental must error, got %v", err)
+	}
+	// incremental with cursor: valid.
+	s = base()
+	s.Tables = []Table{{Source: "public.t", Target: "raw.t", PrimaryKey: []string{"id"}, Mode: "incremental", Cursor: "id"}}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("incremental with cursor must be valid, got %v", err)
 	}
 }
 

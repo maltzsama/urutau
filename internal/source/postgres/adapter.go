@@ -3,7 +3,9 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,7 +36,7 @@ func capabilities() source.Capabilities {
 		ChunkQuery:          true,
 		Stream:              true,
 		MaxConnections:      10,
-		Modes:               []source.Mode{source.ModeCDC},
+		Modes:               []source.Mode{source.ModeCDC, source.ModeIncremental},
 		BeforeImage:         true,  // old tuple carries the deleted row (PK-only unless REPLICA IDENTITY FULL)
 		MonotonicSequence:   false, // commit LSNs are monotonic but not per-message coordinates
 		RecoverablePosition: true,  // LSN allows exact resume
@@ -112,9 +114,91 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
+// Incremental implements source.IncrementalSource (#157): one cursor pass,
+// SELECT <projection> FROM <table> WHERE [filter AND] <cursor> > $1
+// ORDER BY <cursor>. It returns the new cursor — the last row's cursor value,
+// or "" when no rows — and the decoded rows. No slot, no publication.
+func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, after string) (string, []map[string]any, error) {
+	if a.db == nil {
+		return "", nil, fmt.Errorf("postgres: incremental requires a query connection")
+	}
+	schema, table, ok := strings.Cut(t.Source, ".")
+	if !ok {
+		return "", nil, fmt.Errorf("postgres: incremental: source %q must be schema.table", t.Source)
+	}
+	st, err := QueryTable(ctx, a.db, schema, table)
+	if err != nil {
+		return "", nil, fmt.Errorf("postgres: incremental: introspect %s: %w", t.Source, err)
+	}
+	ci := st.FindColumn(cursor)
+	if ci < 0 {
+		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q not found in %s", cursor, t.Source)
+	}
+	if !st.Columns[ci].NotNull {
+		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q is nullable — NULL cursors are excluded from the predicate", cursor)
+	}
+
+	specTable, _ := a.tableFor(t.Source)
+	// The cursor must be read to checkpoint it: a projection that omits it
+	// would leave the cursor empty and break the next resume.
+	if len(specTable.ColumnFilter) > 0 && !slices.Contains(specTable.ColumnFilter, cursor) {
+		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
+	}
+	q := psql.Select("*").From(quoteIdent(schema) + "." + quoteIdent(table))
+	if len(specTable.ColumnFilter) > 0 {
+		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quoteIdent(schema) + "." + quoteIdent(table))
+	}
+	if after != "" {
+		// >=, not >: a non-unique cursor (updated_at) can have new rows at the
+		// same value as the last checkpoint. Re-reading the boundary is
+		// idempotent under upsert and never drops a row.
+		q = q.Where(sq.Expr(quoteIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, after))
+	}
+	if specTable.Filter != nil {
+		f, err := filterToSquirrel(specTable.Filter)
+		if err != nil {
+			return "", nil, fmt.Errorf("postgres: incremental: %s: %w", t.Source, err)
+		}
+		q = q.Where(f)
+	}
+	q = q.OrderBy(quoteIdent(cursor))
+	query, args, err := q.ToSql()
+	if err != nil {
+		return "", nil, fmt.Errorf("postgres: incremental sql: %w", err)
+	}
+
+	rows, err := a.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return "", nil, fmt.Errorf("postgres: incremental: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	colsMeta, err := rows.Columns()
+	if err != nil {
+		return "", nil, err
+	}
+	var out []map[string]any
+	var next string
+	for {
+		vals, err := scanRow(rows)
+		if errors.Is(err, sql.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		m := normalizeRow(colsMeta, vals)
+		next = fmt.Sprint(m[cursor])
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, err
+	}
+	return next, out, nil
+}
+
 // Discover implements source.Discoverer (#152): every table the connected
 // user may SELECT, limited to schemas when non-empty. It returns base tables
-// ('r') and partitioned parents ('p') only:
 //
 //   - matviews ('m') and foreign tables ('f') are excluded because
 //     EnsureSetup runs REPLICA IDENTITY FULL and CREATE PUBLICATION on every
@@ -307,10 +391,12 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	uri := a.spec.Source.URI
 	maxRetries := 0
 	initialWait := defaultInitialWait
+	plugin := "pgoutput"
 	if a.connCfg != nil {
 		uri = a.connCfg.QueryURI
 		maxRetries = a.connCfg.RetryCount
 		initialWait = a.connCfg.InitialWaitTime
+		plugin = a.connCfg.Plugin
 	}
 
 	// One channel for the whole reader life: New writes into it and the
@@ -330,6 +416,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 			Logger:      a.rt.Logger,
 			RetryCount:  maxRetries,
 			InitialWait: initialWait,
+			Plugin:      plugin,
 			Filters:     filters,
 			Columns:     columns,
 		}, out)

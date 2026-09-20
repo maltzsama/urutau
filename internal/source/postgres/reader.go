@@ -56,6 +56,9 @@ type Config struct {
 	// before failing with a non-retryable error (#154). Zero uses the
 	// default (300s).
 	InitialWait time.Duration
+	// Plugin is the logical decoding plugin: "pgoutput" (default) or
+	// "wal2json".
+	Plugin string
 	// Filters and Columns are the per-source read projection (#162/#163),
 	// keyed by "schema.table". The reader compiles the filter with the
 	// introspected column types, so numeric columns compare numerically.
@@ -139,7 +142,9 @@ type Reader struct {
 	// primed is set once the reader has seen its first WAL data message. It
 	// persists across reconnects so the one-shot initial wait is never
 	// re-armed for a stream that has already proven data flows (#154).
-	primed  bool
+	primed bool
+	// plugin is the logical decoding plugin ("pgoutput"|"wal2json").
+	plugin  string
 	out     chan<- rowchange.Change
 	bySrc   map[string]source.TableRef // "schema.table" → ref (PK + target)
 	states  map[string]*TableState     // "schema.table" → introspected state
@@ -190,7 +195,10 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 	if cfg.DB == nil {
 		return nil, fmt.Errorf("postgres: reader: query db required")
 	}
-	if err := EnsureSetup(ctx, cfg.DB, cfg.SlotName, cfg.Tables); err != nil {
+	if cfg.Plugin == "" {
+		cfg.Plugin = "pgoutput"
+	}
+	if err := EnsureSetup(ctx, cfg.DB, cfg.SlotName, cfg.Tables, cfg.Plugin); err != nil {
 		return nil, err
 	}
 
@@ -259,6 +267,7 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		connCfg:     connCfg,
 		retries:     cfg.RetryCount,
 		initialWait: wait,
+		plugin:      cfg.Plugin,
 		out:         out,
 		bySrc:       bySrc,
 		states:      states,
@@ -410,13 +419,8 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 func (r *Reader) runReplication(ctx context.Context, start *position.LSN) error {
 	err := pglogrepl.StartReplication(ctx, r.conn.PgConn(), r.cfg.SlotName, pglogrepl.LSN(*start),
 		pglogrepl.StartReplicationOptions{
-			Mode: pglogrepl.LogicalReplication,
-			// PluginArgs are joined verbatim into the options list, so
-			// each pair carries its own quoting: ("name" 'value', …).
-			PluginArgs: []string{
-				`"proto_version" '1'`,
-				`"publication_names" '` + publicationFor(r.cfg.SlotName) + `'`,
-			},
+			Mode:       pglogrepl.LogicalReplication,
+			PluginArgs: r.pluginArgs(),
 		})
 	if err != nil {
 		return fmt.Errorf("postgres: start replication: %w", err)
@@ -509,6 +513,23 @@ func initialWaitExceeded(primed bool, started time.Time, wait time.Duration, now
 	return !primed && now.Sub(started) > wait
 }
 
+// pluginArgs returns the START_REPLICATION options for the selected plugin.
+// The args are joined verbatim into the options list, so each pair carries
+// its own quoting: ("name" 'value', …).
+func (r *Reader) pluginArgs() []string {
+	if r.plugin == "wal2json" {
+		return []string{
+			`"include-lsn" 'on'`,
+			`"include-timestamp" 'on'`,
+			`"pretty-print" 'off'`,
+		}
+	}
+	return []string{
+		`"proto_version" '1'`,
+		`"publication_names" '` + publicationFor(r.cfg.SlotName) + `'`,
+	}
+}
+
 // dialReplication closes the (dead) replication connection and dials a fresh
 // one. The in-flight transaction buffer is dropped: the connection died
 // before its commit, so those rows were never committed and must not be
@@ -556,6 +577,9 @@ func (r *Reader) handleXLogData(ctx context.Context, xld pglogrepl.XLogData) err
 	payload := xld.WALData
 	if len(payload) == 0 {
 		return nil
+	}
+	if r.plugin == "wal2json" {
+		return r.handleWal2json(ctx, payload)
 	}
 	body := payload[1:]
 	switch payload[0] {

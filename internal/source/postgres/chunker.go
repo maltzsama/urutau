@@ -18,8 +18,8 @@ var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
 // defaultChunkTargetBytes is the CTID strategy's target bytes per chunk when
 // the pipeline leaves sink.defaults.targetFileSize unset. It mirrors the sink's
-// own 512Mi default (and OLake's EffectiveParquetSize): pagesPerChunk =
-// ceil(targetBytes / blockSize), so one chunk lands roughly one target file.
+// own 512Mi default: pagesPerChunk = ceil(targetBytes / blockSize), so one
+// chunk lands roughly one target file.
 const defaultChunkTargetBytes = 512 << 20
 
 // chunkStrategy selects how a table's snapshot is split into chunks.

@@ -453,6 +453,15 @@ func (c *Coordinator) run(ctx context.Context) error {
 	c.refs = refs
 	c.canonical = canonical
 
+	// Incremental mode (#157) is implemented in the collapsed runner only.
+	// Reject it here rather than treat an incremental table as CDC and open a
+	// slot for it.
+	for _, t := range c.cfg.Spec.Tables {
+		if t.Mode == spec.ModeIncremental {
+			return fmt.Errorf("coordinator: %s: incremental mode is not supported in distributed mode yet — run this table in the collapsed runner", t.Target)
+		}
+	}
+
 	// Fail loud on an upsert table with no key BEFORE resolving or
 	// provisioning worker groups: a discovered keyless table would otherwise
 	// create worker Deployments and then abort, leaving orphaned resources

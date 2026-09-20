@@ -228,21 +228,21 @@ func TestNewChunkerKeyWithSpaces(t *testing.T) {
 }
 
 func TestEnsureSetupBadSlotName(t *testing.T) {
-	err := EnsureSetup(t.Context(), nil, "bad-name!", []source.TableRef{{Source: "public.t"}})
+	err := EnsureSetup(t.Context(), nil, "bad-name!", []source.TableRef{{Source: "public.t"}}, "pgoutput")
 	if err == nil {
 		t.Error("bad slot name: want error")
 	}
 }
 
 func TestEnsureSetupEmptyTables(t *testing.T) {
-	err := EnsureSetup(t.Context(), nil, "slot", nil)
+	err := EnsureSetup(t.Context(), nil, "slot", nil, "pgoutput")
 	if err == nil {
 		t.Error("empty tables: want error")
 	}
 }
 
 func TestEnsureSetupBareSourceName(t *testing.T) {
-	err := EnsureSetup(t.Context(), nil, "slot", []source.TableRef{{Source: "no_dot"}})
+	err := EnsureSetup(t.Context(), nil, "slot", []source.TableRef{{Source: "no_dot"}}, "pgoutput")
 	if err == nil {
 		t.Error("bare source name: want error")
 	}

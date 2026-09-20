@@ -222,3 +222,13 @@ type Discoverer interface {
 	// schemas when non-empty.
 	Discover(ctx context.Context, schemas []string) ([]TableRef, error)
 }
+
+// IncrementalSource is the optional source capability for tables in
+// incremental mode (spec.Table.Mode == "incremental"): a cursor-bounded read
+// with no replication slot. Incremental runs one pass and returns the new
+// cursor value — the last row's cursor, or "" when no rows — plus the decoded
+// rows. The cursor travels as a string; the source coerces it against the
+// cursor column's type.
+type IncrementalSource interface {
+	Incremental(ctx context.Context, t TableRef, cursor string, after string) (next string, rows []map[string]any, err error)
+}

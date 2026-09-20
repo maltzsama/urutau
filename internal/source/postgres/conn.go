@@ -48,6 +48,8 @@ type ConnConfig struct {
 	RetryCount int
 	// InitialWaitTime is the resolved CDC initial-WAL-message wait.
 	InitialWaitTime time.Duration
+	// Plugin is the resolved logical decoding plugin ("pgoutput"|"wal2json").
+	Plugin string
 
 	tunnel *sshTunnel
 }
@@ -73,6 +75,7 @@ func BuildConnConfig(uri string) (*ConnConfig, error) {
 		MaxOpenConns:    resolveMaxThreads(0),
 		RetryCount:      defaultRetryCount,
 		InitialWaitTime: defaultInitialWait,
+		Plugin:          "pgoutput",
 	}, nil
 }
 
@@ -105,7 +108,8 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 		ConnConfig:      cfg,
 		MaxOpenConns:    resolveMaxThreads(pg.MaxThreads),
 		RetryCount:      resolveRetryCount(pg.RetryCount),
-		InitialWaitTime: resolveInitialWaitTime(pg.InitialWaitTime),
+		InitialWaitTime: resolveInitialWaitTime(cdcInitialWait(pg)),
+		Plugin:          resolvePlugin(pg),
 	}
 
 	// SSH: one tunnel per ConnConfig, shared by the query and replication
@@ -170,6 +174,23 @@ func resolveInitialWaitTime(seconds int) time.Duration {
 		return minInitialWait
 	}
 	return d
+}
+
+// cdcInitialWait reads the initial-wait seconds from the cdc block (0 when
+// unset, which resolveInitialWaitTime turns into the default).
+func cdcInitialWait(pg *spec.PostgresSource) int {
+	if pg.CDC == nil {
+		return 0
+	}
+	return pg.CDC.InitialWaitTime
+}
+
+// resolvePlugin returns the logical decoding plugin, defaulting to pgoutput.
+func resolvePlugin(pg *spec.PostgresSource) string {
+	if pg.CDC != nil && pg.CDC.Plugin != "" {
+		return pg.CDC.Plugin
+	}
+	return "pgoutput"
 }
 
 // sshTunnel owns one SSH client shared by every connection the source opens

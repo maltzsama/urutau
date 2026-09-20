@@ -31,6 +31,14 @@ const (
 	WriteModeAppendIdempotent WriteMode = "append-idempotent"
 )
 
+// Sync modes for spec.Table.Mode.
+const (
+	// ModeCDC is log-based change data capture (the default).
+	ModeCDC = "cdc"
+	// ModeIncremental is a cursor-column read with no replication slot.
+	ModeIncremental = "incremental"
+)
+
 // ChangeMode maps the spec's declared write mode onto the engine's write
 // shape. Append-idempotent is physically append — its identity is a declared
 // transport coordinate for downstream dedup and verification, not a
@@ -113,12 +121,19 @@ type PostgresSource struct {
 	// pipeline can replicate a whole schema without enumerating it.
 	// Mutually exclusive with an explicit tables list.
 	Discover bool `json:"discover,omitempty"`
-	// InitialWaitTime is the maximum number of seconds the CDC reader waits
-	// for the first WAL message before failing with a non-retryable error.
-	// It detects a misconfigured CDC (wrong slot, wrong publication, no WAL
-	// traffic) that would otherwise hang forever. The timer resets on every
-	// received message. 0 (omitted) resolves to the default 300; an explicit
-	// value below 30 is rejected.
+	// CDC holds the logical-decoding knobs for the replication reader.
+	CDC *CDCConfig `json:"cdc,omitempty"`
+}
+
+// CDCConfig holds the PostgreSQL logical-decoding knobs.
+type CDCConfig struct {
+	// Plugin selects the logical decoding plugin: "pgoutput" (default) or
+	// "wal2json".
+	Plugin string `json:"plugin,omitempty"`
+	// InitialWaitTime is the maximum number of seconds the reader waits for
+	// the first WAL message before failing with a non-retryable error (min
+	// 30, default 300). It detects a misconfigured slot or publication that
+	// would otherwise hang forever.
 	InitialWaitTime int `json:"initialWaitTime,omitempty"`
 }
 
@@ -414,6 +429,13 @@ type Table struct {
 	// (next-query). A key-ordered column keeps the chunk range routable to
 	// the same worker as the live stream when workers > 1.
 	ChunkColumn string `json:"chunkColumn,omitempty"`
+	// Mode selects the sync model: "" or "cdc" (default, log-based) or
+	// "incremental" (cursor column, no replication slot). Only sources that
+	// declare ModeIncremental support it (Postgres today).
+	Mode string `json:"mode,omitempty"`
+	// Cursor names the column incremental mode orders by (e.g. updated_at).
+	// Required when Mode is "incremental".
+	Cursor string `json:"cursor,omitempty"`
 	// Bootstrap configures how the initial snapshot is handled.
 	Bootstrap *Bootstrap `json:"bootstrap,omitempty"`
 	// Enrich joins each event against reference tables loaded in memory
