@@ -67,8 +67,16 @@ type Config struct {
 	ChunkSize     int
 	WindowTimeout time.Duration
 	CaughtUpPoll  time.Duration
-	ServerID      uint32
-	Heartbeat     time.Duration
+	// SnapshotChunkTimeout bounds one snapshot chunk round-trip (ChunkRequest
+	// sent → ChunkReady received → gated rows flushed). It is the snapshot
+	// watchdog: without it, a worker that attaches but stops draining wedges
+	// the run forever (the supervisor does not run during the snapshot). It
+	// must exceed WindowTimeout, or a slow-but-healthy catch-up would look
+	// wedged; the default is 10m, raised above WindowTimeout when that is set
+	// higher. Zero means the default.
+	SnapshotChunkTimeout time.Duration
+	ServerID             uint32
+	Heartbeat            time.Duration
 	// MaxParallelChunks would cap concurrent chunk SELECTs during snapshot.
 	// The snapshot is currently strictly sequential (one chunk in flight,
 	// waitChunkReady blocks), so the knob is validated but reserved — it is
@@ -114,6 +122,10 @@ type Config struct {
 // workerQueueCap bounds one worker's in-flight batches — the structural
 // backpressure hop of design §1.1 (workerCh cap 64).
 const workerQueueCap = 64
+
+// defaultSnapshotChunkTimeout is the snapshot watchdog's default when the
+// config is silent (see Config.SnapshotChunkTimeout).
+const defaultSnapshotChunkTimeout = 10 * time.Minute
 
 // queuedBatch is one serialized batch waiting for the Flight stream.
 type queuedBatch struct {
@@ -298,6 +310,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.FlowPerWorkerMin <= 0 {
 		cfg.FlowPerWorkerMin = 16 << 20
+	}
+	// The snapshot watchdog must outlast WaitCaughtUp's own window timeout
+	// (default 5m), or a slow-but-healthy catch-up would look like a wedged
+	// worker and fail the run.
+	if cfg.SnapshotChunkTimeout <= 0 {
+		cfg.SnapshotChunkTimeout = defaultSnapshotChunkTimeout
+	}
+	if cfg.WindowTimeout > 0 && cfg.SnapshotChunkTimeout <= cfg.WindowTimeout {
+		cfg.SnapshotChunkTimeout = cfg.WindowTimeout + 5*time.Minute
 	}
 	c := &Coordinator{
 		cfg:         cfg,
@@ -1369,58 +1390,81 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		if i == 0 {
 			c.openWindow(ref.Target, partition)
 		}
-
-		boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
+		// The snapshot watchdog: a worker that attaches but stops draining
+		// would otherwise block the chunk round-trip (send, wait, flush)
+		// forever — the supervisor does not run during the snapshot (issue
+		// #206). The deadline must outlast WaitCaughtUp's own window timeout,
+		// or a slow-but-healthy catch-up would look wedged (Config doc).
+		timeout := c.cfg.SnapshotChunkTimeout
+		if timeout <= 0 {
+			timeout = defaultSnapshotChunkTimeout
+		}
+		chunkCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, ch, chunkID, epoch)
+		cancel()
 		if err != nil {
-			return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
-		}
-		req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Bounds: boundsB}
-
-		select {
-		case w.out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-
-		if err := c.waitChunkReady(ctx, ref.Source, chunkID, epoch); err != nil {
-			return err
-		}
-		c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID)
-
-		// The worker has the chunk rows in its window; prove the reader is
-		// caught up before releasing anything that touches this window. The
-		// high watermark is the source's FIXED position after the SELECT —
-		// never a live master — so a busy source cannot keep the window open
-		// forever.
-		high, err := rdr.Master(ctx)
-		if err != nil {
-			return fmt.Errorf("dblog: chunk %d: master: %w", chunkID, err)
-		}
-		if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
-			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
-		}
-		at := rdr.Synced()
-
-		// Release this chunk's gated live events (InWindow-tagged) ahead of
-		// the Closes marker — FIFO keeps them before it. The gate stays
-		// open: the next chunk's backlog must not race ahead of these.
-		if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
-			return err
-		}
-		// The Closes marker belongs to exactly this partition's worker —
-		// not routed through enqueueBatch's table-wide lookup, since a
-		// marker carries no rows for enqueueBatch to route by key.
-		if err := c.enqueueTo(ctx, w, nil, &pb.BatchMeta{
-			Table:  ref.Target,
-			LowPos: at.String(),
-			Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
-		}); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("coordinator: snapshot %s: chunk %d did not complete within %s (the worker may be wedged): %w",
+					ref.Source, chunkID, timeout, err)
+			}
 			return err
 		}
 	}
 	// Seal this partition's gate and release anything collected after its
 	// last chunk. Other partitions' gates (if any) are untouched.
 	return c.closeWindow(ctx, ref.Target, partition)
+}
+
+// snapshotChunk runs one chunk's round-trip: send the ChunkRequest, wait for
+// the worker's ChunkReady, prove the reader caught up, then release the gated
+// live rows and the Closes marker. ctx carries the watchdog deadline, so a
+// worker that never acks the chunk fails the run instead of wedging it.
+func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, epoch uint64) error {
+	boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
+	if err != nil {
+		return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
+	}
+	req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Bounds: boundsB}
+
+	select {
+	case w.out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	if err := c.waitChunkReady(ctx, ref.Source, chunkID, epoch); err != nil {
+		return err
+	}
+	c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID)
+
+	// The worker has the chunk rows in its window; prove the reader is
+	// caught up before releasing anything that touches this window. The
+	// high watermark is the source's FIXED position after the SELECT —
+	// never a live master — so a busy source cannot keep the window open
+	// forever.
+	high, err := rdr.Master(ctx)
+	if err != nil {
+		return fmt.Errorf("dblog: chunk %d: master: %w", chunkID, err)
+	}
+	if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
+		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+	}
+	at := rdr.Synced()
+
+	// Release this chunk's gated live events (InWindow-tagged) ahead of
+	// the Closes marker — FIFO keeps them before it. The gate stays
+	// open: the next chunk's backlog must not race ahead of these.
+	if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
+		return err
+	}
+	// The Closes marker belongs to exactly this partition's worker —
+	// not routed through enqueueBatch's table-wide lookup, since a
+	// marker carries no rows for enqueueBatch to route by key.
+	return c.enqueueTo(ctx, w, nil, &pb.BatchMeta{
+		Table:  ref.Target,
+		LowPos: at.String(),
+		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
+	})
 }
 
 // clipChunksToRange keeps only the chunks that intersect partitionRange,
