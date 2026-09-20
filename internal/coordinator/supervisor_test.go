@@ -133,3 +133,22 @@ func TestSupervisorRecordResetWindowSlides(t *testing.T) {
 		t.Fatalf("resets in window = %d, want 2 (oldest expired)", got)
 	}
 }
+
+// #208: recordReset returns the post-insert count read under the same lock, so
+// the crashloop check that follows cannot race a concurrent reset.
+func TestRecordResetReturnsWindowedCount(t *testing.T) {
+	s := newSupervisor(&Coordinator{})
+	now := time.Now()
+	window := time.Minute
+
+	if n := s.recordReset("w", now, window); n != 1 {
+		t.Fatalf("count = %d, want 1", n)
+	}
+	if n := s.recordReset("w", now.Add(time.Second), window); n != 2 {
+		t.Fatalf("count = %d, want 2", n)
+	}
+	// An entry older than the window is expired before counting.
+	if n := s.recordReset("w", now.Add(2*window), window); n != 1 {
+		t.Fatalf("count = %d, want 1 after expiry", n)
+	}
+}
