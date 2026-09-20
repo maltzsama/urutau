@@ -23,10 +23,15 @@ func Append(ctx context.Context, tbl *table.Table, rec arrow.RecordBatch, props 
 }
 
 // AppendAndDelete appends a data file and an equality-delete file in a single
-// transaction. In iceberg-go v0.6.0 this stages TWO snapshots (append, then
-// delete); the delete carries the higher sequence number and applies to the
-// freshly appended file too. It is kept as the naive pattern the spike uses to
-// document the gotcha — a correct upsert must delete-then-append instead.
+// transaction.
+//
+// Deprecated: it has KNOWN-INCORRECT semantics and must not be used for a
+// production upsert. In iceberg-go v0.6.0 this stages TWO snapshots (append,
+// then delete); the delete carries the higher sequence number and applies to
+// the freshly appended file too, so the appended row is removed — the append is
+// wasted. A correct upsert deletes-then-appends (separate commits), as the sink
+// does. It is kept only as the naive pattern the spike uses to document the
+// gotcha.
 func AppendAndDelete(ctx context.Context, tbl *table.Table, data arrow.RecordBatch, eqFieldIDs []int, deletes arrow.RecordBatch, props iceberg.Properties) error {
 	txn := tbl.NewTransaction()
 	if err := txn.AppendTable(ctx, array.NewTableFromRecords(data.Schema(), []arrow.RecordBatch{data}), -1, props); err != nil {

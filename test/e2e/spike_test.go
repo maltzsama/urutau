@@ -115,6 +115,7 @@ func TestSpike(t *testing.T) {
 	// delete (higher sequence number) applies to the appended file too, so the
 	// row is removed — the append is wasted. Naive append+delete-in-one-commit
 	// is a data-loss trap in iceberg-go.
+	//nolint:staticcheck // deliberately exercising the deprecated append-then-delete gotcha
 	must(t, urutauiceberg.AppendAndDelete(ctx, tbl, spikeRecord(3, "y"), []int{1}, deleteRecord(3), props("p6")))
 	tbl = reload(t, ctx, cat, ident)
 
