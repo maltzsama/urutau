@@ -10,10 +10,13 @@ import (
 
 // FromCanonical maps a canonical core.Schema into an Iceberg schema. This is
 // the sink side of the canonical type system: sources map into core.Kind,
-// sinks map out of it. Field IDs are allocated sequentially through the
-// whole tree — a nested struct's fields continue the counter — so they are
-// deterministic and stable: adding a field inside a nested struct is additive
-// schema evolution that does not invalidate older readers' field IDs.
+// sinks map out of it. Field IDs are allocated sequentially in pre-order
+// through the whole tree — a nested struct's fields continue the counter — so
+// they are deterministic for a given canonical schema. They are NOT stable
+// under edits: inserting or reordering a field shifts every subsequent ID, so
+// this mapping must never be used to diff two schemas. Schema evolution goes
+// through iceberg-go's UpdateSchema.AddColumn, which allocates independent IDs
+// (see evolveTable).
 func FromCanonical(cs core.Schema) (*iceberg.Schema, error) {
 	nextID := 1
 	fields := make([]iceberg.NestedField, 0, len(cs.Columns))

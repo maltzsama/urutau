@@ -14,9 +14,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
-// sortedKeys returns a map's string keys in sorted order, so map writes are
-// reproducible regardless of Go's randomized map iteration.
-func sortedKeys(m map[string]any) []string {
+// sortedKeys returns a map's string keys in sorted order, so map writes (and
+// map-driven iteration such as the cast-column check) are reproducible
+// regardless of Go's randomized map iteration.
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
