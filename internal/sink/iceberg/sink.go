@@ -150,7 +150,14 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 		}
 		return nil, fmt.Errorf("iceberg: properties %v: %w", s.ident(ref.Target), err)
 	}
-	return tbl.Properties(), nil
+	// tbl.Properties() returns the table's live property map; copy it so a
+	// caller cannot mutate the catalog metadata through the returned map.
+	live := tbl.Properties()
+	out := make(map[string]string, len(live))
+	for k, v := range live {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // Close is a no-op: the REST catalog is stateless and holds no connection.

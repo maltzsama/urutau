@@ -89,6 +89,12 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.B
 		}
 	}
 	if idx < 0 {
+		// A missing column is a null for a nullable field, but an error for a
+		// required one: silently nulling a required column would write data
+		// the schema says cannot be null.
+		if !field.Nullable {
+			return nil, fmt.Errorf("iceberg: required column %q is missing from the wire", field.Name)
+		}
 		return nullColumn(field.Type, src.NumRows()), nil
 	}
 	col := src.Column(idx)
@@ -345,12 +351,20 @@ func splitByOp(ctx context.Context, b *dataplane.Batch) (upserts, deletes *datap
 		return nil, nil, fmt.Errorf("iceberg: filter deletes: %w", err)
 	}
 	if fUp.NumRows() > 0 {
-		upserts = &dataplane.Batch{Table: b.Table, Record: fUp, Watermark: b.Watermark}
+		// Copy the whole batch and replace only the Record, so every other
+		// field (Mode, SnapshotState, SnapshotPending, …) travels with the
+		// split instead of being silently dropped. The copy does not share
+		// b.Record (it is replaced), so there is no double-Release.
+		up := *b
+		up.Record = fUp
+		upserts = &up
 	} else {
 		fUp.Release()
 	}
 	if fDel.NumRows() > 0 {
-		deletes = &dataplane.Batch{Table: b.Table, Record: fDel, Watermark: b.Watermark}
+		del := *b
+		del.Record = fDel
+		deletes = &del
 	} else {
 		fDel.Release()
 	}
