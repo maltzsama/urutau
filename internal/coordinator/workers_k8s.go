@@ -28,6 +28,11 @@ import (
 // the same directory pipeline.yaml itself lives in.
 const workerConfigDir = "/etc/urutau"
 
+// defaultWorkerTemplateTarget keys the generic worker template a discovery
+// pipeline gets (it has no tables at operator time, so no per-table template
+// exists). The coordinator falls back to it for any discovered target.
+const defaultWorkerTemplateTarget = "_default"
+
 // serviceAccountNamespaceFile is the namespace every in-cluster
 // ServiceAccount projection carries — avoids a Downward API env var just
 // for this.
@@ -81,8 +86,12 @@ func workerPodTemplateAvailable(workerTarget map[string]string) bool {
 	if len(workerTarget) == 0 {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(workerConfigDir, workerPodTemplateFile(anyTarget(workerTarget))))
-	return err == nil
+	for _, f := range workerPodTemplateCandidates(anyTarget(workerTarget)) {
+		if _, err := os.Stat(filepath.Join(workerConfigDir, f)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // inClusterClient builds the coordinator's in-cluster Kubernetes client, its
@@ -124,16 +133,32 @@ func workerPodTemplateFile(target string) string {
 	return "worker-pod-template." + target + ".yaml"
 }
 
+// workerPodTemplateCandidates lists the template files to try for a target,
+// most specific first: the table's own, then the generic discovery template
+// the operator renders for a pipeline that lists no tables (#152).
+func workerPodTemplateCandidates(target string) []string {
+	own := workerPodTemplateFile(target)
+	if target == defaultWorkerTemplateTarget {
+		return []string{own}
+	}
+	return []string{own, workerPodTemplateFile(defaultWorkerTemplateTarget)}
+}
+
 func loadWorkerPodTemplate(target string) (corev1.PodTemplateSpec, error) {
-	b, err := os.ReadFile(filepath.Join(workerConfigDir, workerPodTemplateFile(target)))
-	if err != nil {
-		return corev1.PodTemplateSpec{}, err
+	var lastErr error
+	for _, f := range workerPodTemplateCandidates(target) {
+		b, err := os.ReadFile(filepath.Join(workerConfigDir, f))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		var tmpl corev1.PodTemplateSpec
+		if err := yaml.Unmarshal(b, &tmpl); err != nil {
+			return corev1.PodTemplateSpec{}, fmt.Errorf("decode pod template: %w", err)
+		}
+		return tmpl, nil
 	}
-	var tmpl corev1.PodTemplateSpec
-	if err := yaml.Unmarshal(b, &tmpl); err != nil {
-		return corev1.PodTemplateSpec{}, fmt.Errorf("decode pod template: %w", err)
-	}
-	return tmpl, nil
+	return corev1.PodTemplateSpec{}, lastErr
 }
 
 // coordinatorPodOwner identifies this coordinator's own Pod, found by its

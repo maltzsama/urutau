@@ -217,8 +217,17 @@ spec:
 
 ```sh
 kubectl create secret generic shop-postgres-ssh \
-  --from-file=privateKey=~/.ssh/id_ed25519
+  --from-file=privateKey=~/.ssh/id_ed25519 \
+  --from-file=known_hosts=~/.ssh/known_hosts
 ```
+
+The Secret holds two keys — `privateKey` and `known_hosts` — mounted at
+`/etc/urutau/ssh/privateKey` and `/etc/urutau/ssh/known_hosts`; the inline
+spec's `ssh.privateKey` and `ssh.knownHosts` must name those paths. The same
+Secret is mounted into the **coordinator** (which opens the replication
+connection) and into the worker Pods. When a scoped `source.snapshotUri` is
+set, the workers connect directly and the key is mounted only into the
+coordinator.
 
 ```sh
 kubectl apply -f config/samples/cdcpipeline.yaml

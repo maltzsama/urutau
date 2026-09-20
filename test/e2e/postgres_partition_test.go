@@ -40,7 +40,16 @@ func TestPostgresPartitionedSnapshot(t *testing.T) {
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(2000))
 	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 1500`, "part-1500")
 	checkRun()
-	t.Log("partitioned CTID snapshot ok: 2000 rows across two leaf partitions")
+
+	// Live DML on a leaf partition must replicate as the parent: the
+	// publication publishes via the partition root, so the reader (bound to
+	// the parent's relation id) sees the change instead of ignoring the leaf.
+	pgExec(t, db, `UPDATE orders_part SET v = 'part-updated' WHERE id = 1500`)
+	pgExec(t, db, `DELETE FROM orders_part WHERE id = 500`)
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 1500`, "part-updated")
+	waitTrino(t, ctx, `SELECT count(*) FROM orders WHERE id = 500`, int64(0))
+	checkRun()
+	t.Log("partitioned CTID snapshot ok: 2000 rows across two leaf partitions + live CDC")
 }
 
 // TestDistributedPostgresWorkers covers workers>1 range partitioning (#174):

@@ -142,9 +142,18 @@ func TestWorkerPodTemplateCarriesWarehouse(t *testing.T) {
 }
 
 // #170: a configured SSH Secret is mounted as a read-only file volume into
-// the worker Pod; without it, no volume is added.
+// the worker Pod when the source tunnels without a scoped snapshotUri;
+// without it, no volume is added.
 func TestWorkerPodTemplateMountsSSHKey(t *testing.T) {
 	cr := pipelineCR("orders", "ns")
+	cr.Spec.Definition.Inline["source"] = map[string]any{
+		"kind":     "postgres",
+		"slotName": "s",
+		"postgres": map[string]any{
+			"host": "db", "database": "shop",
+			"ssh": map[string]any{"host": "bastion", "username": "u", "privateKey": sshMountPath + "/privateKey"},
+		},
+	}
 	tbl := urutauspec.Table{Source: "shop.orders", Target: "raw.orders"}
 
 	// No secret: no ssh volume/mount.
@@ -164,6 +173,71 @@ func TestWorkerPodTemplateMountsSSHKey(t *testing.T) {
 	mounts := tmpl.Spec.Containers[0].VolumeMounts
 	if len(mounts) != 1 || mounts[0].MountPath != sshMountPath || !mounts[0].ReadOnly {
 		t.Fatalf("ssh mount = %+v, want read-only at %s", mounts, sshMountPath)
+	}
+}
+
+// A scoped snapshotUri makes the worker connect directly, so the SSH key must
+// not be mounted into worker Pods (only the coordinator needs it).
+func TestWorkerPodTemplateSuppressesSSHWithSnapshotURI(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Definition.Inline["source"] = map[string]any{
+		"kind":        "postgres",
+		"slotName":    "s",
+		"snapshotUri": "postgres://readonly@db/shop",
+		"postgres": map[string]any{
+			"host": "db", "database": "shop",
+			"ssh": map[string]any{"host": "bastion", "username": "u", "privateKey": sshMountPath + "/privateKey"},
+		},
+	}
+	cr.Spec.Secrets.SSH = "ssh-secret"
+	tmpl := workerPodTemplate(cr, "urutau:v1", urutauspec.Table{Source: "shop.orders", Target: "raw.orders"})
+	if len(tmpl.Spec.Volumes) != 0 {
+		t.Fatalf("a scoped snapshotUri must suppress the worker SSH mount, got %+v", tmpl.Spec.Volumes)
+	}
+}
+
+// The coordinator opens the replication connection, so it needs the SSH key
+// even when a scoped snapshotUri spares the workers.
+func TestCoordinatorStatefulSetMountsSSHKey(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Definition.Inline["source"] = map[string]any{
+		"kind":        "postgres",
+		"slotName":    "s",
+		"snapshotUri": "postgres://readonly@db/shop",
+		"postgres": map[string]any{
+			"host": "db", "database": "shop",
+			"ssh": map[string]any{"host": "bastion", "username": "u", "privateKey": sshMountPath + "/privateKey"},
+		},
+	}
+	cr.Spec.Secrets.SSH = "ssh-secret"
+	ss := coordinatorStatefulSet(cr, "urutau:v1")
+	var found bool
+	for _, m := range ss.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if m.MountPath == sshMountPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("coordinator must mount the SSH key, mounts = %+v", ss.Spec.Template.Spec.Containers[0].VolumeMounts)
+	}
+}
+
+// A discovery pipeline lists no tables, so the operator renders one generic
+// worker template the coordinator clones for every discovered target.
+func TestCoordinatorConfigMapGenericTemplateForDiscovery(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Definition.Inline["source"] = map[string]any{
+		"kind":     "postgres",
+		"slotName": "s",
+		"postgres": map[string]any{"host": "db", "database": "shop", "discover": true},
+	}
+	delete(cr.Spec.Definition.Inline, "tables")
+	cm, err := coordinatorConfigMap(cr, "urutau:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cm.Data[workerPodTemplateKey(defaultWorkerTemplateTarget)]; !ok {
+		t.Fatalf("discovery must render a generic worker template, got keys %v", keysOf(cm.Data))
 	}
 }
 

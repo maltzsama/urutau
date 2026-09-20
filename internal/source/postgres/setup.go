@@ -20,6 +20,19 @@ var slotNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // publication per pipeline slot.
 func publicationFor(slotName string) string { return slotName + "_pub" }
 
+// publishViaPartitionRootSupported reports whether the server supports the
+// publish_via_partition_root publication option (PostgreSQL 13+). On an older
+// server the option is omitted rather than failing setup; partitioned-table
+// live CDC then relies on the reader binding the leaf relations.
+func publishViaPartitionRootSupported(ctx context.Context, db *sql.DB) bool {
+	var vnum int
+	if err := db.QueryRowContext(ctx,
+		`SELECT current_setting('server_version_num')::int`).Scan(&vnum); err != nil {
+		return false
+	}
+	return vnum >= 130000
+}
+
 // EnsureSetup makes the server side ready, idempotently:
 //
 //   - REPLICA IDENTITY FULL on every replicated table, so updates and
@@ -57,18 +70,36 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 	).Scan(&exists); err != nil {
 		return fmt.Errorf("postgres: publication lookup: %w", err)
 	}
+	// publish_via_partition_root (PG13+): without it, logical decoding
+	// publishes a partitioned table's changes under each LEAF relation, and
+	// the reader — bound to the parent's relation id — silently ignores them,
+	// so the target goes stale after the snapshot. Set it at creation and
+	// repair an existing publication.
+	viaRoot := publishViaPartitionRootSupported(ctx, db)
 	if !exists {
 		defs := make([]string, 0, len(tables))
 		for _, ref := range tables {
 			schema, table, _ := strings.Cut(ref.Source, ".")
 			defs = append(defs, quoteIdent(schema)+"."+quoteIdent(table))
 		}
+		opts := ""
+		if viaRoot {
+			opts = " WITH (publish_via_partition_root = true)"
+		}
 		if _, err := db.ExecContext(ctx,
-			fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`, quoteIdent(pub), strings.Join(defs, ", "))); err != nil {
+			fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s%s`, quoteIdent(pub), strings.Join(defs, ", "), opts)); err != nil {
 			return fmt.Errorf("postgres: create publication: %w", err)
 		}
-	} else if err := syncPublication(ctx, db, pub, tables); err != nil {
-		return err
+	} else {
+		if err := syncPublication(ctx, db, pub, tables); err != nil {
+			return err
+		}
+		if viaRoot {
+			if _, err := db.ExecContext(ctx,
+				fmt.Sprintf(`ALTER PUBLICATION %s SET (publish_via_partition_root = true)`, quoteIdent(pub))); err != nil {
+				return fmt.Errorf("postgres: publication partition root: %w", err)
+			}
+		}
 	}
 
 	var slotExists bool
