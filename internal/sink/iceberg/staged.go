@@ -68,6 +68,30 @@ func (w *TableWriter) WriteStaged(ctx context.Context, b *dataplane.Batch) ([]by
 	}
 	spec, schema, version := tbl.Spec(), tbl.Schema(), tbl.Metadata().Version()
 
+	payload := stagedPayload{snapshotState: b.SnapshotState, snapshotPending: b.SnapshotPending}
+
+	if b.Mode != dataplane.UpsertMode {
+		// Append mode: the worker has already decided which rows an
+		// append-only table carries — a delete that DOES carry an image is
+		// written as its before-image row (DELETE IMAGE CONTRACT). Splitting
+		// here would route those rows into the delete bucket append mode never
+		// reads and drop them, so the whole batch is appended as-is. Mirrors
+		// Commit.
+		if b.Record != nil && b.Record.NumRows() > 0 {
+			rec, err := w.projectRecord(ctx, b)
+			if err != nil {
+				return nil, err
+			}
+			defer rec.Release()
+			files, err := w.writeDataFiles(ctx, tbl, rec)
+			if err != nil {
+				return nil, err
+			}
+			payload.appends = files
+		}
+		return encodeStaged(payload, spec, schema, version)
+	}
+
 	upsertBatch, deleteBatch, err := splitByOp(ctx, b)
 	if err != nil {
 		return nil, err
@@ -79,26 +103,23 @@ func (w *TableWriter) WriteStaged(ctx context.Context, b *dataplane.Batch) ([]by
 		defer deleteBatch.Release()
 	}
 
-	payload := stagedPayload{snapshotState: b.SnapshotState, snapshotPending: b.SnapshotPending}
-	if b.Mode == dataplane.UpsertMode {
-		keys, err := extractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
+	keys, err := extractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) > 0 {
+		rec, err := w.deleteRecord(keys)
 		if err != nil {
 			return nil, err
 		}
-		if len(keys) > 0 {
-			rec, err := w.deleteRecord(keys)
-			if err != nil {
-				return nil, err
-			}
-			defer rec.Release()
-			// WriteEqualityDeletes writes the delete files and stages them on
-			// the transaction; we never commit it — CommitStaged does.
-			files, err := tbl.NewTransaction().WriteEqualityDeletes(ctx, w.eqIDs, oneBatch(rec))
-			if err != nil {
-				return nil, fmt.Errorf("iceberg: stage deletes %v: %w", w.ident, err)
-			}
-			payload.deletes = files
+		defer rec.Release()
+		// WriteEqualityDeletes writes the delete files and stages them on
+		// the transaction; we never commit it — CommitStaged does.
+		files, err := tbl.NewTransaction().WriteEqualityDeletes(ctx, w.eqIDs, oneBatch(rec))
+		if err != nil {
+			return nil, fmt.Errorf("iceberg: stage deletes %v: %w", w.ident, err)
 		}
+		payload.deletes = files
 	}
 	if upsertBatch != nil && upsertBatch.Record.NumRows() > 0 {
 		rec, err := w.projectRecord(ctx, upsertBatch)
