@@ -1007,4 +1007,13 @@ func TestValidateRejectsEmptyPathComponent(t *testing.T) {
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "target") {
 		t.Fatalf("an empty target component must error, got %v", err)
 	}
+
+	// A non-Iceberg sink treats the namespace as a single identifier: the
+	// Iceberg path rule must not apply to it.
+	s = base()
+	s.Sink.Type = "clickhouse"
+	s.Sink.Namespace = "a..b"
+	if err := s.Validate(); err != nil && strings.Contains(err.Error(), "empty path component") {
+		t.Fatalf("a non-Iceberg sink must not get the Iceberg path rule: %v", err)
+	}
 }

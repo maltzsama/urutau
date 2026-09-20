@@ -113,9 +113,14 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	if !o.credentialsFromEnv && s.Sink.URI == "" {
 		problems = append(problems, "sink.uri: required")
 	}
+	// Iceberg treats every dot in a namespace/target as a path separator, so an
+	// empty component is a malformed identifier. Other sinks (e.g. ClickHouse)
+	// treat the namespace as a single identifier and may accept dots
+	// literally, so this check is scoped to the Iceberg sink.
+	icebergSink := s.Sink.Type == "" || s.Sink.Type == "iceberg+rest"
 	if s.Sink.Namespace == "" {
 		problems = append(problems, "sink.namespace: required")
-	} else if hasEmptyPathComponent(s.Sink.Namespace) {
+	} else if icebergSink && hasEmptyPathComponent(s.Sink.Namespace) {
 		problems = append(problems, fmt.Sprintf("sink.namespace: %q has an empty path component (a namespace level cannot be blank)", s.Sink.Namespace))
 	}
 	// sink.type is validated by the driver registry (admission webhook +
@@ -160,7 +165,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 		}
 		if tbl.Target == "" {
 			problems = append(problems, p+".target: required")
-		} else if hasEmptyPathComponent(tbl.Target) {
+		} else if icebergSink && hasEmptyPathComponent(tbl.Target) {
 			problems = append(problems, fmt.Sprintf("%s.target: %q has an empty path component (a namespace level or the table name cannot be blank)", p, tbl.Target))
 		}
 		if tbl.Source != "" {
