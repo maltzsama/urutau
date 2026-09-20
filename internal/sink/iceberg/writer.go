@@ -273,10 +273,11 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 				continue
 			}
 		}
-		if pos != "" {
-			if err := txn.SetProperties(p); err != nil {
-				return err
-			}
+		// Persist the position AND the snapshot state: a snapshot-only
+		// transition (no position) must still advance, matching
+		// commitStagedProps.
+		if err := txn.SetProperties(p); err != nil {
+			return err
 		}
 		if _, err := txn.Commit(ctx); err != nil {
 			if !isRetryableError(err) {
