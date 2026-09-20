@@ -629,6 +629,10 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		t := specBySource[ref.Source]
 		cast := casts[ref.Source]
 		mode := t.WriteMode.ChangeMode()
+		if err := dataplane.RequireUpsertKey(ref.Target, ref.PrimaryKey, mode); err != nil {
+			closeStages()
+			return nil, fmt.Errorf("runner: %w", err)
+		}
 		if err := snk.EnsureTable(ctx, ref, resolved[ref.Source], t.PartitionBy, cast, mode); err != nil {
 			closeStages()
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)

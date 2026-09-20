@@ -567,7 +567,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := snk.EnsureTable(ctx, ref, resolvedSchemas[ref.Source], tbl.PartitionBy, cast, tbl.WriteMode.ChangeMode()); err != nil {
+		mode := tbl.WriteMode.ChangeMode()
+		if err := dataplane.RequireUpsertKey(ref.Target, ref.PrimaryKey, mode); err != nil {
+			return fmt.Errorf("coordinator: %w", err)
+		}
+		if err := snk.EnsureTable(ctx, ref, resolvedSchemas[ref.Source], tbl.PartitionBy, cast, mode); err != nil {
 			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
 		}
 	}
