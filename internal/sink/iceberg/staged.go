@@ -526,6 +526,11 @@ func readUint32List(r *bytes.Reader) ([]uint32, error) {
 	if count > r.Len()/4 {
 		return nil, fmt.Errorf("staged descriptor: list count %d exceeds %d remaining bytes", count, r.Len())
 	}
+	if count == 0 {
+		// Preserve "absent" as nil, so the CommitStaged aggregation's
+		// "last non-empty wins" works and the empty-cycle guard is reachable.
+		return nil, nil
+	}
 	xs := make([]uint32, 0, count)
 	for i := 0; i < count; i++ {
 		if _, err := io.ReadFull(r, n[:]); err != nil {

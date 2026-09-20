@@ -113,8 +113,15 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	if !o.credentialsFromEnv && s.Sink.URI == "" {
 		problems = append(problems, "sink.uri: required")
 	}
+	// Iceberg treats every dot in a namespace/target as a path separator, so an
+	// empty component is a malformed identifier. Other sinks (e.g. ClickHouse)
+	// treat the namespace as a single identifier and may accept dots
+	// literally, so this check is scoped to the Iceberg sink.
+	icebergSink := s.Sink.Type == "" || s.Sink.Type == "iceberg+rest"
 	if s.Sink.Namespace == "" {
 		problems = append(problems, "sink.namespace: required")
+	} else if icebergSink && hasEmptyPathComponent(s.Sink.Namespace) {
+		problems = append(problems, fmt.Sprintf("sink.namespace: %q has an empty path component (a namespace level cannot be blank)", s.Sink.Namespace))
 	}
 	// sink.type is validated by the driver registry (admission webhook +
 	// driver.OpenSink at boot), not here. We only normalize the default.
@@ -158,6 +165,8 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 		}
 		if tbl.Target == "" {
 			problems = append(problems, p+".target: required")
+		} else if icebergSink && hasEmptyPathComponent(tbl.Target) {
+			problems = append(problems, fmt.Sprintf("%s.target: %q has an empty path component (a namespace level or the table name cannot be blank)", p, tbl.Target))
 		}
 		if tbl.Source != "" {
 			if seenSource[tbl.Source] {
@@ -854,6 +863,18 @@ func validateCDCConfig(cdc *CDCConfig, problems *[]string) {
 	if cdc.InitialWaitTime != 0 && cdc.InitialWaitTime < 30 {
 		*problems = append(*problems, "source.postgres.cdc.initialWaitTime: must be at least 30 seconds")
 	}
+}
+
+// hasEmptyPathComponent reports whether a dotted path has an empty level, e.g.
+// "a..b", ".a" or "a." — a malformed namespace/target that must fail early
+// instead of reaching the catalog as an empty namespace or table name.
+func hasEmptyPathComponent(s string) bool {
+	for _, part := range strings.Split(s, ".") {
+		if part == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateSSLConfig(ssl *SSLConfig, problems *[]string) {
