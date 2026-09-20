@@ -63,12 +63,12 @@ func TestFilterSchemaColumns(t *testing.T) {
 			{Name: "secret", Type: core.ColumnType{Kind: core.KindString}},
 		},
 	}
-	got := filterSchemaColumns(cs, []string{"id", "name"})
+	got := core.FilterSchemaColumns(cs, []string{"id", "name"})
 	if len(got.Columns) != 2 || got.Columns[0].Name != "id" || got.Columns[1].Name != "name" {
 		t.Fatalf("filterSchemaColumns = %v", got.Columns)
 	}
 	// Empty filter keeps all.
-	if len(filterSchemaColumns(cs, nil).Columns) != 3 {
+	if len(core.FilterSchemaColumns(cs, nil).Columns) != 3 {
 		t.Fatal("empty filter must keep every column")
 	}
 }

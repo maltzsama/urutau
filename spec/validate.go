@@ -75,6 +75,9 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 			problems = append(problems, fmt.Sprintf("source.serverId: %q is not a valid uint32 (the MySQL replication server id)", s.Source.ServerID))
 		}
 	}
+	if s.Source.MaxReconnectAttempts < 0 {
+		problems = append(problems, "source.maxReconnectAttempts: must be non-negative")
+	}
 	// Decoder format: raw is a message-log landing mode (kafka only) and it
 	// has no upsert semantics — every message is an insert.
 	switch s.Source.Format {

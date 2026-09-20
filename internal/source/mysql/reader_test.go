@@ -43,7 +43,10 @@ func TestDecodeInsert(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3", testCommitTS)
+	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3", testCommitTS)
+	if err != nil || !emit {
+		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	}
 
 	if c.Op != rowchange.OpInsert || c.Table != "raw.orders" || c.Position != "u:1-3" {
 		t.Fatalf("change = %+v", c)
@@ -70,7 +73,10 @@ func TestDecodeDeleteKeepsBeforeOnly(t *testing.T) {
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4", testCommitTS)
+	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4", testCommitTS)
+	if err != nil || !emit {
+		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	}
 
 	if c.Op != rowchange.OpDelete {
 		t.Fatalf("op = %v", c.Op)
@@ -89,7 +95,10 @@ func TestDecodeUpdateCarriesBeforeAndAfter(t *testing.T) {
 	before := []any{int64(7), []byte("old"), 1.0}
 	after := []any{int64(7), []byte("new"), 2.0}
 
-	c := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
+	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
+	if err != nil || !emit {
+		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	}
 
 	if c.After["v"] != "new" || c.Before["v"] != "old" {
 		t.Fatalf("update before/after = %v / %v", c.Before, c.After)

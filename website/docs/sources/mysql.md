@@ -31,9 +31,31 @@ so a SELECT-only user and the same TLS/timezone settings reach it too.
   where it stopped.
 - A user with `REPLICATION SLAVE` and `REPLICATION CLIENT`.
 
+The runner **validates these at boot** ([#182](https://github.com/maltzsama/urutau/issues/182)):
+`log_bin`, `binlog_format`, `gtid_mode` and `enforce_gtid_consistency` are read
+in one query and a wrong value fails loud, before the replication connection
+opens. `binlog_row_image` other than `FULL` logs a warning (a partial
+after-image can silently drop columns) instead of failing. The resume GTID is
+also compared against `@@GLOBAL.gtid_purged`: if the binlog the pipeline still
+needs was purged, boot fails with a clear "re-snapshot required" error rather
+than skipping the gap.
+
 ## Behavior
 
 - **Position** — a cumulative GTID set, written atomically with every commit.
+- **Column projection** — [`columnFilter`](../reference/pipeline-spec.md#columnfilter)
+  narrows the snapshot `SELECT` list and the CDC projection; the excluded
+  columns are absent from the target. It must include the primary key.
+- **Row filter** — [`filter`](../reference/pipeline-spec.md#filter) is pushed
+  into the snapshot `WHERE` and evaluated on each CDC row. A row that leaves
+  the filter produces a delete, so an upsert target drops the stale row. A
+  `DECIMAL` column is compared exactly, not through a float.
+- **`chunkColumn`** — MySQL chunks by primary key only. A `chunkColumn` that
+  names a different column is rejected at boot.
+- **Reconnect** — `source.maxReconnectAttempts` (default 3) bounds the binlog
+  reader's reconnect budget, so a permanently broken stream (purged binlog,
+  revoked grant, server-id collision) fails instead of retrying forever. A
+  binlog read error 1236 surfaces as a distinct, actionable error.
 - **Charset** — a string column's bytes arrive in the column's own character
   set and are decoded to UTF-8 using its collation (`latin1`, `sjis`, `gbk`,
   ...), matching what the snapshot `SELECT` returns over a utf8mb4 connection.
@@ -66,6 +88,7 @@ source:
   kind: mysql
   uri: mysql://repl:replpass@mysql:3306/shop?timezone=America/Sao_Paulo
   serverId: "1101"
+  maxReconnectAttempts: 3
 sink:
   uri: http://polaris:8181/api/catalog
   namespace: raw
@@ -75,4 +98,7 @@ tables:
     target: raw.orders
     primaryKey: [id]
     createIfNotExists: true
+    columnFilter: [id, v, amount]   # drop any other source column
+    filter:
+      where: {col: status, op: eq, value: active}
 ```

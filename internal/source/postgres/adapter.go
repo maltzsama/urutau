@@ -110,7 +110,7 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	if err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: schema %s: %w", t.Source, err)
 	}
-	cs = filterSchemaColumns(cs, t.ColumnFilter)
+	cs = core.FilterSchemaColumns(cs, t.ColumnFilter)
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
@@ -273,25 +273,6 @@ func checkColumnFilterCoversPK(columnFilter, pk []string) error {
 		}
 	}
 	return nil
-}
-
-// filterSchemaColumns keeps only the named columns, preserving the source
-// order. An empty filter keeps every column.
-func filterSchemaColumns(cs core.Schema, columns []string) core.Schema {
-	if len(columns) == 0 {
-		return cs
-	}
-	keep := make(map[string]bool, len(columns))
-	for _, c := range columns {
-		keep[c] = true
-	}
-	out := core.Schema{PrimaryKey: cs.PrimaryKey}
-	for _, c := range cs.Columns {
-		if keep[c.Name] {
-			out.Columns = append(out.Columns, c)
-		}
-	}
-	return out
 }
 
 // tableFor returns the spec table matching a source identifier.
@@ -474,7 +455,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 				if cerr := checkFilterColumns(st, t.Filter); cerr != nil {
 					return nil, fmt.Errorf("postgres: %s: %w", ref.Source, cerr)
 				}
-				cs = filterSchemaColumns(cs, t.ColumnFilter)
+				cs = core.FilterSchemaColumns(cs, t.ColumnFilter)
 			}
 			schemas[ref.Target] = cs
 		}

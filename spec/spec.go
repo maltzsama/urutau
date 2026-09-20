@@ -72,6 +72,11 @@ type Source struct {
 	SnapshotMode  string `json:"snapshotMode,omitempty"`
 	BootstrapAdds string `json:"bootstrapServers,omitempty"`
 	GroupID       string `json:"groupId,omitempty"`
+	// MaxReconnectAttempts bounds the MySQL binlog reader's reconnect budget
+	// (go-mysql canal's max_reconnect_attempts). 0 (omitted) resolves to the
+	// default 3. Without a bound a permanently broken stream — purged binlog,
+	// revoked grant, server_id collision — retries forever instead of failing.
+	MaxReconnectAttempts int `json:"maxReconnectAttempts,omitempty"`
 	// PartitionedByPrimaryKey declares the Kafka topics are partitioned by
 	// the key, so ordering (and thus upsert correctness) holds within a
 	// key. Kafka only orders inside a partition: if the same key landed in

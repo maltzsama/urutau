@@ -196,6 +196,26 @@ func (s Schema) Column(name string) (Column, bool) {
 	return Column{}, false
 }
 
+// FilterSchemaColumns keeps only the named columns, preserving order and the
+// primary key. An empty list returns the schema unchanged. Shared by the SQL
+// sources so a columnFilter narrows the introspected shape identically.
+func FilterSchemaColumns(cs Schema, columns []string) Schema {
+	if len(columns) == 0 {
+		return cs
+	}
+	keep := make(map[string]bool, len(columns))
+	for _, c := range columns {
+		keep[c] = true
+	}
+	out := Schema{PrimaryKey: cs.PrimaryKey}
+	for _, c := range cs.Columns {
+		if keep[c.Name] {
+			out.Columns = append(out.Columns, c)
+		}
+	}
+	return out
+}
+
 // KeyIndexes resolves PrimaryKey into column positions, in key order.
 func (s Schema) KeyIndexes() ([]int, error) {
 	idx := make(map[string]int, len(s.Columns))

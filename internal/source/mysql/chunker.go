@@ -25,10 +25,18 @@ type Chunker struct {
 	// UTC; Scan re-tags naive temporals into loc so a snapshot row matches the
 	// CDC decode of the same row (issue #139).
 	loc *time.Location
+	// columns is the read projection (#162/#183): the SELECT list. Empty
+	// means all columns.
+	columns []string
+	// filter is the compiled row filter (#163/#183), composed with the chunk
+	// bounds.
+	filter filterSQL
 }
 
 // NewChunker builds a chunker for one source table. loc may be nil (UTC).
-func NewChunker(db *sql.DB, source, pk string, chunkSize int, loc *time.Location) (*Chunker, error) {
+// columns is the read projection (empty means all); filter is the compiled
+// row filter (empty means none).
+func NewChunker(db *sql.DB, source, pk string, chunkSize int, loc *time.Location, columns []string, filter filterSQL) (*Chunker, error) {
 	schema, table, ok := strings.Cut(source, ".")
 	if !ok {
 		return nil, fmt.Errorf("mysql: chunker: source %q must be db.table", source)
@@ -54,6 +62,8 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int, loc *time.Location
 		pk:        pks,
 		chunkSize: chunkSize,
 		loc:       loc,
+		columns:   columns,
+		filter:    filter,
 	}, nil
 }
 
@@ -109,11 +119,24 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	if len(cond) > 0 {
 		where = " WHERE " + strings.Join(cond, " AND ")
 	}
+	// The row filter (#163/#183) is composed with the chunk bounds; its args
+	// follow the bound args in placeholder order.
+	if !c.filter.empty() {
+		if where == "" {
+			where = " WHERE " + c.filter.where
+		} else {
+			where += " AND (" + c.filter.where + ")"
+		}
+		args = append(args, c.filter.args...)
+	}
 
-	// With no row filter the SELECT must still read the whole row; select *
-	// keeps it simple and correct for the spike.
-	query := fmt.Sprintf("SELECT * FROM `%s`.`%s`%s ORDER BY %s",
-		c.schema, c.table, where, cols)
+	// The projection (#162/#183) narrows the SELECT list; empty means all.
+	selectCols := "*"
+	if len(c.columns) > 0 {
+		selectCols = "`" + strings.Join(c.columns, "`, `") + "`"
+	}
+	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`%s ORDER BY %s",
+		selectCols, c.schema, c.table, where, cols)
 
 	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
