@@ -63,17 +63,31 @@ func TestCanonicalSchemaFixedBinary(t *testing.T) {
 	}
 }
 
-// A present but unparseable decimal precision/scale is an error, not a silent
-// 0 (which would look like a legitimate default and hide broken introspection).
-func TestMapColumnTypeDecimalBadPrecisionErrors(t *testing.T) {
-	col := schema.TableColumn{Type: schema.TYPE_DECIMAL, RawType: "decimal", EnumValues: []string{"garbage"}}
-	if _, err := mapColumnType(col); err == nil {
-		t.Fatal("unparseable decimal precision/scale must error")
-	}
-	// A valid "precision,scale" parses.
-	col = schema.TableColumn{Type: schema.TYPE_DECIMAL, RawType: "decimal(10,2)", EnumValues: []string{"10,2"}}
+// Decimal precision/scale ride MaxSize/FixedSize since #180 — EnumValues now
+// carries the real ENUM member list. The old "precision,scale" string and its
+// parse error are gone; buildColumn parses the spec, so mapColumnType only
+// ever sees numbers.
+func TestMapColumnTypeDecimalPrecisionScale(t *testing.T) {
+	col := schema.TableColumn{Type: schema.TYPE_DECIMAL, RawType: "decimal(10,2)", MaxSize: 10, FixedSize: 2}
 	ct, err := mapColumnType(col)
-	if err != nil || ct.Precision != 10 || ct.Scale != 2 {
+	if err != nil || ct.Kind != core.KindDecimal || ct.Precision != 10 || ct.Scale != 2 {
 		t.Fatalf("decimal(10,2) = %+v err=%v", ct, err)
+	}
+
+	// Unsized: the canal runtime path, where go-mysql's AddColumn does not
+	// size a decimal column. 0/0 lets the sink infer its own defaults rather
+	// than this layer inventing MySQL's 10,0.
+	bare := schema.TableColumn{Type: schema.TYPE_DECIMAL, RawType: "decimal"}
+	ct, err = mapColumnType(bare)
+	if err != nil || ct.Kind != core.KindDecimal || ct.Precision != 0 || ct.Scale != 0 {
+		t.Fatalf("bare decimal = %+v err=%v", ct, err)
+	}
+
+	// A malformed column_type cannot produce a bogus precision: buildColumn
+	// leaves 0 rather than guessing, so nothing downstream sees a spec that
+	// the source never actually read.
+	garbage := buildColumn("amount", "decimal", "decimal(garbage)", "", 0, 0)
+	if garbage.MaxSize != 0 || garbage.FixedSize != 0 {
+		t.Fatalf("garbage decimal spec = %d,%d, want 0,0", garbage.MaxSize, garbage.FixedSize)
 	}
 }
