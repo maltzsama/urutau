@@ -49,18 +49,20 @@ func mapColumnType(col schema.TableColumn) (core.ColumnType, error) {
 	case schema.TYPE_FLOAT:
 		return core.ColumnType{Kind: core.KindFloat64}, nil
 	case schema.TYPE_DECIMAL:
-		// Precision and scale are carried via EnumValues[0] as "precision,scale"
-		// by the introspection path (queryColumns). When absent (canal runtime),
-		// both default to 0 — the sink infers its own defaults. A PRESENT but
-		// unparseable value is an error: silently returning 0 would look like a
-		// legitimate default and hide a broken introspection.
-		precision, scale := 0, 0
-		if len(col.EnumValues) == 1 {
-			if _, err := fmt.Sscanf(col.EnumValues[0], "%d,%d", &precision, &scale); err != nil {
-				return core.ColumnType{}, fmt.Errorf("decimal precision/scale %q: %w", col.EnumValues[0], err)
-			}
-		}
-		return core.ColumnType{Kind: core.KindDecimal, Precision: precision, Scale: scale}, nil
+		// Precision and scale ride MaxSize/FixedSize, which buildColumn fills
+		// from information_schema. They used to ride EnumValues[0] as
+		// "precision,scale", which collided with the real ENUM member list
+		// that path now populates (#180).
+		//
+		// The canal runtime path leaves both at 0: go-mysql's AddColumn does
+		// not size a decimal column. That is unchanged by #180 — EnumValues
+		// was empty there too — and the sink infers its own defaults rather
+		// than this layer inventing MySQL's 10,0.
+		return core.ColumnType{
+			Kind:      core.KindDecimal,
+			Precision: int(col.MaxSize),
+			Scale:     int(col.FixedSize),
+		}, nil
 	case schema.TYPE_STRING, schema.TYPE_ENUM, schema.TYPE_SET:
 		return core.ColumnType{Kind: core.KindString}, nil
 	case schema.TYPE_DATE:

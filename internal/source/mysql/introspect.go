@@ -4,9 +4,24 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/go-mysql-org/go-mysql/schema"
+)
+
+const (
+	columnsSQL = `
+		SELECT column_name, data_type, column_type, collation_name,
+		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0)
+		FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ?
+		ORDER BY ordinal_position`
+
+	pkSQL = `
+		SELECT column_name FROM information_schema.key_column_usage
+		WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'
+		ORDER BY ordinal_position`
 )
 
 // QueryTable introspects one table via information_schema, producing the
@@ -34,12 +49,7 @@ func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (
 }
 
 func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableColumn, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT column_name, data_type, column_type,
-		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0)
-		FROM information_schema.columns
-		WHERE table_schema = ? AND table_name = ?
-		ORDER BY ordinal_position`, s, t)
+	rows, err := db.QueryContext(ctx, columnsSQL, s, t)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: columns: %w", err)
 	}
@@ -47,25 +57,158 @@ func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableC
 
 	var out []schema.TableColumn
 	for rows.Next() {
-		var name, dataType, colType string
-		var precision, scale int
-		if err := rows.Scan(&name, &dataType, &colType, &precision, &scale); err != nil {
+		var (
+			name, dataType, colType string
+			collation               sql.NullString
+			precision, scale        int
+		)
+		if err := rows.Scan(&name, &dataType, &colType, &collation, &precision, &scale); err != nil {
 			return nil, err
 		}
-		col := schema.TableColumn{Name: name, RawType: colType, Type: mapTypeByName(dataType)}
-		if col.Type == schema.TYPE_DECIMAL {
-			col.EnumValues = []string{fmt.Sprintf("%d,%d", precision, scale)}
-		}
-		out = append(out, col)
+		out = append(out, buildColumn(name, dataType, colType, collation.String, precision, scale))
 	}
 	return out, rows.Err()
 }
 
+// buildColumn assembles one schema.TableColumn from an information_schema
+// row. The classification comes from data_type, but every modifier —
+// unsignedness, fixed size, ENUM/SET members — lives only in column_type, so
+// both are needed.
+//
+// Deriving these here is what makes the mapColumnType and normalizeCol
+// branches that read them reachable at all: the canal path gets them from
+// go-mysql's own AddColumn, and before #180 the introspection path silently
+// left them at their zero values. A BIGINT UNSIGNED was declared KindInt64
+// and wrapped negative above 2^63; binary(16) lost its fixed size; a
+// non-UTF-8 column lost the collation its charset decoder keys on.
+func buildColumn(name, dataType, columnType, collation string, precision, scale int) schema.TableColumn {
+	col := schema.TableColumn{
+		Name:      name,
+		RawType:   columnType,
+		Type:      mapTypeByName(dataType),
+		Collation: collation,
+	}
+
+	// "unsigned" and "zerofill" both imply unsignedness, matching go-mysql
+	// (schema.AddColumn): a zerofill column is unsigned by definition.
+	lower := strings.ToLower(columnType)
+	col.IsUnsigned = strings.Contains(lower, "unsigned") || strings.Contains(lower, "zerofill")
+
+	switch col.Type {
+	case schema.TYPE_ENUM:
+		col.EnumValues = parseMemberList(columnType, "enum")
+	case schema.TYPE_SET:
+		col.SetValues = parseMemberList(columnType, "set")
+	case schema.TYPE_BINARY:
+		// Only BINARY is fixed-width; VARBINARY's size is a maximum.
+		if strings.HasPrefix(lower, "binary") {
+			col.FixedSize = parseSize(columnType)
+		}
+		col.MaxSize = parseSize(columnType)
+	case schema.TYPE_DECIMAL:
+		// Precision and scale come from the dedicated information_schema
+		// columns when present; RawType is the fallback so the canal path
+		// (which has no information_schema row) resolves the same values.
+		if precision == 0 && scale == 0 {
+			precision, scale = parseDecimalSpec(columnType)
+		}
+		col.MaxSize = uint(precision)
+		col.FixedSize = uint(scale)
+	case schema.TYPE_STRING:
+		if strings.HasPrefix(lower, "char") {
+			col.FixedSize = parseSize(columnType)
+		}
+		col.MaxSize = parseSize(columnType)
+	}
+	return col
+}
+
+// parenBody returns the text between the first balanced parentheses of s.
+// ok is false when there is no well-formed pair — including ")(" , where
+// scanning for each character independently would otherwise yield a
+// backwards slice.
+func parenBody(s string) (string, bool) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return "", false
+	}
+	closeIdx := strings.IndexByte(s[open:], ')')
+	if closeIdx < 0 {
+		return "", false
+	}
+	return s[open+1 : open+closeIdx], true
+}
+
+// parseSize reads the first parenthesised number of a column_type, e.g.
+// binary(16) or varchar(64). Absent or malformed parentheses give 0.
+func parseSize(columnType string) uint {
+	body, ok := parenBody(columnType)
+	if !ok {
+		return 0
+	}
+	// decimal(20,4): the size is the part before the comma.
+	if comma := strings.IndexByte(body, ','); comma >= 0 {
+		body = body[:comma]
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(body), 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint(n)
+}
+
+// parseDecimalSpec reads precision and scale from a decimal(p,s) column_type.
+// A bare "decimal" yields 0,0 — MySQL's own defaults are 10,0, but inventing
+// them here would hide a column the introspection failed to describe. An
+// unparseable part yields 0 for the same reason: Atoi's zero IS the "not
+// described" value, so the error needs no separate branch.
+func parseDecimalSpec(columnType string) (precision, scale int) {
+	body, ok := parenBody(columnType)
+	if !ok {
+		return 0, 0
+	}
+	p, s, _ := strings.Cut(body, ",")
+	precision, _ = strconv.Atoi(strings.TrimSpace(p))
+	scale, _ = strconv.Atoi(strings.TrimSpace(s))
+	return precision, scale
+}
+
+// parseMemberList splits the member list of an ENUM or SET column_type, e.g.
+// enum('a','b'). MySQL escapes an embedded quote by doubling it: two single
+// quotes inside a member are one literal quote and must not end the member.
+func parseMemberList(columnType, prefix string) []string {
+	if !strings.HasPrefix(strings.ToLower(columnType), prefix+"(") ||
+		!strings.HasSuffix(columnType, ")") {
+		return nil
+	}
+	body := columnType[len(prefix)+1 : len(columnType)-1]
+
+	var (
+		out     []string
+		cur     strings.Builder
+		inQuote bool
+	)
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		switch {
+		case c == '\'' && inQuote && i+1 < len(body) && body[i+1] == '\'':
+			cur.WriteByte('\'') // doubled quote: one literal quote
+			i++
+		case c == '\'':
+			inQuote = !inQuote
+			if !inQuote {
+				out = append(out, cur.String())
+				cur.Reset()
+			}
+		case inQuote:
+			cur.WriteByte(c)
+		}
+	}
+	return out
+}
+
 func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT column_name FROM information_schema.key_column_usage
-		WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'
-		ORDER BY ordinal_position`, s, t)
+	rows, err := db.QueryContext(ctx, pkSQL, s, t)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: pk: %w", err)
 	}

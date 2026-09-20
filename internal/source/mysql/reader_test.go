@@ -653,6 +653,42 @@ func TestNormalizeColTemporalParity(t *testing.T) {
 	}
 }
 
+// FLOAT already agrees across paths and must keep agreeing (#181).
+//
+// Both readers deliver a MySQL FLOAT as float32 — go-sql-driver returns
+// float32 for a 4-byte FLOAT (measured against MySQL 8.4, not inferred), and
+// go-mysql's binlog decoder does the same. The codec widens float32 to
+// float64 once, identically, for both. So 0.1 lands as 0.10000000149011612
+// whichever path read it, which is the value MySQL actually stores.
+//
+// This test exists because the obvious "fix" — converting float32 to the
+// shortest float64 that round-trips, so the column reads back 0.1 — would
+// CREATE the divergence it appears to remove: the snapshot would then
+// disagree with the CDC path, and both with the stored bits. Do not add a
+// TYPE_FLOAT branch to normalizeCol without re-measuring both drivers.
+func TestNormalizeColFloatParity(t *testing.T) {
+	col := schema.TableColumn{Name: "f", Type: schema.TYPE_FLOAT, RawType: "float"}
+	for _, v := range []float32{0.1, 1.1, 3.14159, 2.675, 0.7} {
+		// Snapshot hands the driver's float32 to normalize; CDC hands the
+		// binlog's float32 to normalizeCol. Same input, so the assertion is
+		// that neither path rewrites it.
+		snap := normalize(v)
+		cdc := normalizeCol(col, v, time.UTC)
+		if snap != cdc {
+			t.Errorf("float %v: snapshot=%v (%T) cdc=%v (%T)", v, snap, snap, cdc, cdc)
+		}
+		if _, ok := cdc.(float32); !ok {
+			t.Errorf("float %v: cdc widened to %T — the codec owns widening, not the source", v, cdc)
+		}
+	}
+
+	// DOUBLE is float64 on both paths and must stay untouched too.
+	d := schema.TableColumn{Name: "d", Type: schema.TYPE_FLOAT, RawType: "double"}
+	if got := normalizeCol(d, float64(0.1), time.UTC); got != float64(0.1) {
+		t.Errorf("double 0.1 = %v (%T), want 0.1 (float64)", got, got)
+	}
+}
+
 // go-mysql returns MySQL's zero temporal as a string while the snapshot driver
 // (parseTime) returns time.Time{}; normalizeCol must make them agree, or the
 // same column has a different Go type by path.

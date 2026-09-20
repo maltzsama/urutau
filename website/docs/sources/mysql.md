@@ -45,7 +45,18 @@ so a SELECT-only user and the same TLS/timezone settings reach it too.
   transaction's commit time (microsecond precision on MySQL 8.0.1+).
 - **Unsigned / unmappable columns** — `BIGINT UNSIGNED` and other types with
   no lossless canonical form are carried as `unknown`; declare a
-  [`cast`](../reference/pipeline-spec.md#tables) to land them.
+  [`cast`](../reference/pipeline-spec.md#tables) to land them. Before
+  [#180](https://github.com/maltzsama/urutau/issues/180) the introspection
+  path did not read a column's unsignedness, so an unsigned column was
+  declared `int64` and wrapped negative above 2^63 instead of asking for the
+  cast; `BINARY(n)` similarly kept its declared length only on the CDC path.
+- **`FLOAT` keeps MySQL's stored precision** — a 4-byte `FLOAT` is read as
+  `float32` by both the snapshot and the CDC path and widened to `float64`
+  once, so the two agree on the value MySQL actually stores: `0.1` lands as
+  `0.10000000149011612`. Use `DOUBLE` for the 8-byte value. Rounding the
+  widened result back to the shortest representation would make the paths
+  disagree with each other and with the stored bits, so the source does not
+  do it ([#181](https://github.com/maltzsama/urutau/issues/181)).
 
 ## Example
 
