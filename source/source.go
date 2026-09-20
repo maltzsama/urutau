@@ -211,3 +211,14 @@ type QuerySource interface {
 	// CloseQuery releases the source's query connection.
 	CloseQuery() error
 }
+
+// Discoverer is the optional source capability that lists the tables the
+// pipeline should replicate when the spec omits an explicit table list
+// (spec.Source.Postgres.Discover). The returned refs carry empty primary
+// keys — Introspect derives them — and only Source is populated; the
+// orchestrator derives Target from the sink namespace.
+type Discoverer interface {
+	// Discover returns every table the connected user may SELECT, limited to
+	// schemas when non-empty.
+	Discover(ctx context.Context, schemas []string) ([]TableRef, error)
+}

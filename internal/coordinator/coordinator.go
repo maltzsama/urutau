@@ -392,6 +392,16 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return fmt.Errorf("coordinator: %w", err)
 	}
 
+	// A discovery pipeline lists no tables: the source enumerates them now.
+	// The write-back must land BEFORE the partition-range loop below, which
+	// indexes c.cfg.Spec.Tables positionally against refs — a second list
+	// would desync the ranges from the tables.
+	tables, err := source.ExpandTables(ctx, src, c.cfg.Spec)
+	if err != nil {
+		return fmt.Errorf("coordinator: %w", err)
+	}
+	c.cfg.Spec.Tables = tables
+
 	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
 	// canonical holds the WIRE shape (source types; the workers encode it
 	// and the sink casts). resolvedSchemas holds the sink's target shape
@@ -1899,6 +1909,19 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
 	}
+	// A structured postgres source that the DSN cannot fully express (an SSH
+	// tunnel has a DialFunc, not a DSN) travels as its JSON block so the
+	// worker rebuilds the same source (#170). A scoped SnapshotURI wins: the
+	// operator deliberately gave the worker a directly reachable read-only
+	// connection, and the replication credential stays coordinator-side
+	// (D-CD1) — so the block is withheld then.
+	if pg := c.cfg.Spec.Source.Postgres; pg != nil && c.cfg.Spec.Source.SnapshotURI == "" {
+		b, err := json.Marshal(pg)
+		if err != nil {
+			return nil, fmt.Errorf("coordinator: postgres config: %w", err)
+		}
+		assign.Postgres = b
+	}
 	for _, ref := range w.refs {
 		schemaB, err := transport.EncodeTableSchema(c.canonical[ref.Source])
 		if err != nil {
@@ -2014,15 +2037,15 @@ func writeModeToPB(m dataplane.WriteMode) pb.WriteMode {
 // chunk SELECT: the scoped read-only SnapshotURI when set, else the full
 // source URI (pre-scoping behavior). When the source is configured with the
 // structured source.postgres block instead of a URI, the block is rendered to
-// its libpq DSN here so the worker — which only receives kind + dsn — can
-// still open the query connection.
+// its libpq DSN here so the worker can still open the query connection.
 //
-// An SSH-tunneled structured source is rejected: a DSN cannot carry the SSH
-// DialFunc, so the worker would connect directly to the database and fail.
-// The operator must set a directly reachable snapshotUri for that case (or
-// wait for the worker-side tunnel, issue #170). The worker never opens a
-// replication connection, so a deployment can grant it a SELECT-only user and
-// keep the replication credential coordinator-side (D-CD1).
+// An SSH-tunneled structured source cannot be expressed by this DSN. When
+// SnapshotURI is unset, assignmentFor ships the whole source.postgres block
+// instead (Assignment.postgres, issue #170) and the worker builds the tunnel
+// from it; the DSN below is then only a fallback the worker ignores. The
+// worker never opens a replication connection, so a deployment can grant it a
+// SELECT-only user and keep the replication credential coordinator-side
+// (D-CD1).
 func (c *Coordinator) snapshotDSN() (string, error) {
 	if u := c.cfg.Spec.Source.SnapshotURI; u != "" {
 		return u, nil
@@ -2031,9 +2054,6 @@ func (c *Coordinator) snapshotDSN() (string, error) {
 		return u, nil
 	}
 	if pg := c.cfg.Spec.Source.Postgres; pg != nil {
-		if pg.SSH != nil {
-			return "", fmt.Errorf("coordinator: source.postgres.ssh is not supported in distributed mode — the worker cannot establish the tunnel from a DSN; set source.snapshotUri to a directly reachable read-only URI (see issue #170)")
-		}
 		return pg.DSN(), nil
 	}
 	return "", nil

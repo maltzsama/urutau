@@ -141,6 +141,32 @@ func TestWorkerPodTemplateCarriesWarehouse(t *testing.T) {
 	}
 }
 
+// #170: a configured SSH Secret is mounted as a read-only file volume into
+// the worker Pod; without it, no volume is added.
+func TestWorkerPodTemplateMountsSSHKey(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	tbl := urutauspec.Table{Source: "shop.orders", Target: "raw.orders"}
+
+	// No secret: no ssh volume/mount.
+	tmpl := workerPodTemplate(cr, "urutau:v1", tbl)
+	if len(tmpl.Spec.Volumes) != 0 || len(tmpl.Spec.Containers[0].VolumeMounts) != 0 {
+		t.Fatalf("no SSH secret must add no volume, got %+v / %+v",
+			tmpl.Spec.Volumes, tmpl.Spec.Containers[0].VolumeMounts)
+	}
+
+	// Secret set: one read-only mount at sshMountPath.
+	cr.Spec.Secrets.SSH = "ssh-secret"
+	tmpl = workerPodTemplate(cr, "urutau:v1", tbl)
+	if len(tmpl.Spec.Volumes) != 1 || tmpl.Spec.Volumes[0].Secret == nil ||
+		tmpl.Spec.Volumes[0].Secret.SecretName != "ssh-secret" {
+		t.Fatalf("ssh volume = %+v, want a secret volume for ssh-secret", tmpl.Spec.Volumes)
+	}
+	mounts := tmpl.Spec.Containers[0].VolumeMounts
+	if len(mounts) != 1 || mounts[0].MountPath != sshMountPath || !mounts[0].ReadOnly {
+		t.Fatalf("ssh mount = %+v, want read-only at %s", mounts, sshMountPath)
+	}
+}
+
 func keysOf(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

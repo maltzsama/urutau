@@ -186,6 +186,40 @@ Note what is **absent** from `definition.inline`: no `source.uri`, no
 else — tables, `serverId`, namespace, warehouse, worker counts — lives in
 the spec and travels with the CR.
 
+### SSH-tunneled Postgres sources
+
+When the database is reachable only through a bastion, the worker Pods need
+the SSH private key on disk (a DSN cannot carry an SSH tunnel). Set
+`secrets.ssh` to a Secret whose `privateKey` entry holds the key; the
+operator mounts it read-only at `/etc/urutau/ssh/privateKey` in every worker
+Pod, and the inline spec's `source.postgres.ssh.privateKey` names that path:
+
+```yaml
+spec:
+  secrets:
+    source: shop-postgres-creds
+    catalog: polaris-creds
+    ssh: shop-postgres-ssh          # Secret with key: privateKey
+  definition:
+    inline:
+      source:
+        kind: postgres
+        slotName: shop_slot
+        postgres:
+          host: db.internal
+          database: shop
+          ssh:
+            host: bastion.example.com
+            username: tunnel
+            privateKey: /etc/urutau/ssh/privateKey
+            knownHosts: /etc/urutau/ssh/known_hosts
+```
+
+```sh
+kubectl create secret generic shop-postgres-ssh \
+  --from-file=privateKey=~/.ssh/id_ed25519
+```
+
 ```sh
 kubectl apply -f config/samples/cdcpipeline.yaml
 ```

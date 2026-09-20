@@ -211,9 +211,9 @@ func TestSnapshotDSNPrefersScopedURI(t *testing.T) {
 	}
 }
 
-// A structured postgres source renders its block to a DSN for the worker, but
-// an SSH-tunneled one is rejected: the worker cannot build the tunnel from a
-// DSN.
+// A structured postgres source renders its block to a DSN for the worker.
+// An SSH-tunneled one renders the same DSN (the block itself travels
+// separately in the Assignment, #170); snapshotDSN no longer rejects it.
 func TestSnapshotDSNPostgres(t *testing.T) {
 	c := &Coordinator{cfg: Config{Spec: &spec.Spec{Source: spec.Source{
 		Kind:     "postgres",
@@ -231,8 +231,12 @@ func TestSnapshotDSNPostgres(t *testing.T) {
 		Kind:     "postgres",
 		Postgres: &spec.PostgresSource{Host: "db.internal", Database: "shop", SSH: &spec.SSHConfig{Host: "bastion", Username: "u", Password: "p"}},
 	}}}}
-	if _, err := c2.snapshotDSN(); err == nil || !strings.Contains(err.Error(), "ssh") {
-		t.Fatalf("want ssh rejection, got %v", err)
+	got, err = c2.snapshotDSN()
+	if err != nil {
+		t.Fatalf("snapshotDSN with SSH must not error (#170 ships the block instead): %v", err)
+	}
+	if !strings.Contains(got, "host=db.internal") {
+		t.Fatalf("snapshotDSN with SSH = %q, want the rendered DSN fallback", got)
 	}
 }
 

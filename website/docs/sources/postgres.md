@@ -79,14 +79,44 @@ and reused.
 | `maxThreads` | `runtime.NumCPU()` | Max concurrent connections for snapshot chunk SELECTs (1..32), and the size of the concurrent row-normalization pool |
 | `retryCount` | 3 | Transient-error retries with exponential backoff: snapshot queries are retried, and a lost replication stream reconnects and resumes from the committed position. 0 means "use the default" |
 | `initialWaitTime` | 300 | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30). Detects a misconfigured slot or publication that would otherwise hang forever; the timer is satisfied by the first WAL data message |
+| `schemas` | all accessible | Limits `discover` to these schemas |
+| `discover` | `false` | Replicates every table the user may `SELECT` (base tables and partitioned parents) instead of an explicit `tables` list. Mutually exclusive with `tables` |
+
+### Table discovery
+
+With `discover: true` the spec omits `tables` entirely; the source lists every
+table the connected user may `SELECT` at boot, and each target is derived as
+`<sink.namespace>.<table>`:
+
+```yaml
+source:
+  kind: postgres
+  slotName: shop_slot
+  postgres:
+    host: db.example.com
+    database: shop
+    username: repl
+    password: secret
+    discover: true
+    schemas: [public, analytics]
+sink:
+  namespace: raw
+```
+
+`public.orders` becomes `raw.orders`. Leaf partitions are **not** discovered —
+the partitioned parent covers their rows — and materialized views and foreign
+tables are skipped (they cannot take `REPLICA IDENTITY FULL` or join a
+publication). Two schemas holding the same table name collide on the derived
+target and are a boot error; list those tables explicitly with distinct targets.
 
 ### Distributed mode
 
 In [distributed mode](../guides/distributed.md) the worker opens the snapshot
-chunk `SELECT` from a DSN rendered from this block. `ssl.ca`, `ssl.cert` and
-`ssl.key` are sent as **paths**, so every worker must mount those files at the
-same paths as the coordinator. `ssh` is not supported in distributed mode —
-set `snapshotUri` to a directly reachable read-only URI instead.
+chunk `SELECT` from this block. `ssl.ca`, `ssl.cert` and `ssl.key` are sent as
+**paths**, so every worker must mount those files at the same paths as the
+coordinator. An `ssh` block is shipped to the worker in its Assignment — a DSN
+cannot carry a tunnel — so the worker also needs the private key at the
+configured path (see the [Kubernetes guide](../guides/deploy-kubernetes.md)).
 
 ## Requirements
 

@@ -69,6 +69,12 @@ type Definition struct {
 type Secrets struct {
 	Source  string `json:"source"`
 	Catalog string `json:"catalog"`
+	// SSH names the k8s Secret holding the SSH private key, mounted as a
+	// file into every worker Pod (distributed SSH tunnel, #170). The key
+	// lives under the secret key "privateKey", mounted read-only at
+	// /etc/urutau/ssh/privateKey — the path the inline spec's
+	// source.postgres.ssh.privateKey must name.
+	SSH string `json:"ssh,omitempty"`
 }
 
 // CoordinatorSpec tunes the coordinator deployment. CPU/Memory are

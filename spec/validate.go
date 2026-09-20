@@ -137,8 +137,13 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	}
 	validateMaintenance(s.Sink.Maintenance, s.Sink.Type, &problems)
 
-	if len(s.Tables) == 0 {
+	// A discovery pipeline declares no tables: the source lists them at boot.
+	discover := s.Source.Postgres != nil && s.Source.Postgres.Discover
+	if len(s.Tables) == 0 && !discover {
 		problems = append(problems, "tables: at least one required")
+	}
+	if discover && len(s.Tables) > 0 {
+		problems = append(problems, "source.postgres.discover: cannot be combined with an explicit tables list")
 	}
 
 	seenSource := map[string]bool{}
@@ -571,6 +576,9 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 // reject it but must be surfaced to the operator (eventlog, status).
 func (s *Spec) Warnings() []string {
 	var warns []string
+	if pg := s.Source.Postgres; pg != nil && len(pg.Schemas) > 0 && !pg.Discover {
+		warns = append(warns, "source.postgres.schemas: ignored without source.postgres.discover")
+	}
 	for i, tbl := range s.Tables {
 		mode := tbl.WriteMode
 		if mode == "" {

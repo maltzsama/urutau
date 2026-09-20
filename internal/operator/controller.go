@@ -528,20 +528,45 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 	if cr.Spec.Worker.MetricsAddr != "" {
 		cmd = append(cmd, "--metrics-addr", cr.Spec.Worker.MetricsAddr)
 	}
+	pod := corev1.PodSpec{
+		ServiceAccountName: coordinatorSAName(cr),
+		Containers: []corev1.Container{{
+			Name:      "worker",
+			Image:     image,
+			Command:   cmd,
+			Env:       env,
+			Resources: workerResources(cr, t),
+		}},
+	}
+	// An SSH-tunneled source needs the private key on the worker host: the
+	// DSN cannot carry a DialFunc, so the coordinator ships the structured
+	// postgres block (issue #170) and the worker reads the key from this
+	// mount. The key is a file, not an env var, so it comes as a Secret
+	// volume under the fixed name/path the inline spec's
+	// source.postgres.ssh.privateKey names.
+	if cr.Spec.Secrets.SSH != "" {
+		mode := int32(0o400)
+		pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, corev1.VolumeMount{
+			Name: "ssh-key", MountPath: sshMountPath, ReadOnly: true,
+		})
+		pod.Volumes = append(pod.Volumes, corev1.Volume{
+			Name: "ssh-key",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName:  cr.Spec.Secrets.SSH,
+				DefaultMode: &mode,
+			}},
+		})
+	}
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
-		Spec: corev1.PodSpec{
-			ServiceAccountName: coordinatorSAName(cr),
-			Containers: []corev1.Container{{
-				Name:      "worker",
-				Image:     image,
-				Command:   cmd,
-				Env:       env,
-				Resources: workerResources(cr, t),
-			}},
-		},
+		Spec:       pod,
 	}
 }
+
+// sshMountPath is where the SSH private key Secret is mounted into every
+// worker Pod; the inline spec's source.postgres.ssh.privateKey must name
+// sshMountPath/privateKey (the secret key the operator expects).
+const sshMountPath = "/etc/urutau/ssh"
 
 // inlineSinkWarehouse reads sink.warehouse out of the inline definition —
 // the one catalog setting the worker needs that is NOT in a Secret.

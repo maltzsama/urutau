@@ -112,6 +112,53 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
+// Discover implements source.Discoverer (#152): every table the connected
+// user may SELECT, limited to schemas when non-empty. It returns base tables
+// ('r') and partitioned parents ('p') only:
+//
+//   - matviews ('m') and foreign tables ('f') are excluded because
+//     EnsureSetup runs REPLICA IDENTITY FULL and CREATE PUBLICATION on every
+//     discovered table, and both fail on those relkinds;
+//   - leaf partitions are excluded (relispartition) because the parent
+//     already covers their rows — replicating parent and leaves doubles every
+//     row, and syncPublication's pg_publication_rel model expects the parent.
+func (a Source) Discover(ctx context.Context, schemas []string) ([]source.TableRef, error) {
+	if a.db == nil {
+		return nil, fmt.Errorf("postgres: discovery requires a query connection")
+	}
+	q := `
+		SELECT n.nspname, c.relname
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE has_table_privilege(c.oid, 'SELECT')
+		  AND has_schema_privilege(current_user, n.nspname, 'USAGE')
+		  AND c.relkind IN ('r','p')
+		  AND NOT c.relispartition
+		  AND n.nspname NOT LIKE 'pg\_%'
+		  AND n.nspname <> 'information_schema'`
+	var args []any
+	if len(schemas) > 0 {
+		q += ` AND n.nspname = ANY($1)`
+		args = append(args, schemas)
+	}
+	q += ` ORDER BY n.nspname, c.relname`
+
+	rows, err := a.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: discover: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []source.TableRef
+	for rows.Next() {
+		var schema, table string
+		if err := rows.Scan(&schema, &table); err != nil {
+			return nil, err
+		}
+		out = append(out, source.TableRef{Source: schema + "." + table})
+	}
+	return out, rows.Err()
+}
+
 // checkColumnFilterExists reports an error when a projected column is not in
 // the source table. A typo would otherwise silently narrow the target schema
 // (filterSchemaColumns drops unknown names) and then fail the snapshot with an

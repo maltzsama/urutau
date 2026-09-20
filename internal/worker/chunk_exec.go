@@ -25,6 +25,7 @@ import (
 type chunkExecutor struct {
 	kind     string
 	dsn      string
+	postgres []byte // JSON spec.PostgresSource (#170); empty = use dsn
 	chunkSz  int
 	epoch    uint64                         // the Assignment epoch; echoed on ChunkReady so a stale reply is ignored
 	bySource map[string]*pb.TableAssignment // source table → target/PK
@@ -42,6 +43,7 @@ func newChunkExecutor(assign *pb.Assignment, w *Worker, log *slog.Logger, send f
 	return &chunkExecutor{
 		kind:     assign.SourceKind,
 		dsn:      assign.SourceDsn,
+		postgres: assign.Postgres,
 		chunkSz:  int(assign.ChunkSize),
 		epoch:    assign.Epoch,
 		bySource: bySource,
@@ -54,7 +56,9 @@ func newChunkExecutor(assign *pb.Assignment, w *Worker, log *slog.Logger, send f
 // querySource opens the source's SQL surface on first use. The worker holds
 // kind + dsn from the assignment, plus each table's source read projection
 // (#162 column list, #163 filter) — reconstructed into a spec so the source
-// resolves the chunk SELECT the same way the coordinator's does. Tests preset
+// resolves the chunk SELECT the same way the coordinator's does. When the
+// assignment carries the structured postgres block (#170), that block is used
+// instead of the DSN: an SSH tunnel is a DialFunc, not a DSN. Tests preset
 // x.qsrc to bypass the driver registry.
 func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, error) {
 	if x.qsrc != nil {
@@ -64,8 +68,12 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 	if err != nil {
 		return nil, err
 	}
+	srcSpec, err := sourceSpecFor(x.kind, x.dsn, x.postgres)
+	if err != nil {
+		return nil, err
+	}
 	src, err := driver.OpenSource(&spec.Spec{
-		Source: spec.Source{Kind: x.kind, URI: x.dsn},
+		Source: srcSpec,
 		Tables: tables,
 	}, source.Runtime{Logger: x.log})
 	if err != nil {
@@ -77,6 +85,20 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 	}
 	x.qsrc = q
 	return q, nil
+}
+
+// sourceSpecFor builds the source config the worker opens its snapshot
+// connection from: the structured postgres block when the assignment carries
+// one (#170 — an SSH tunnel is a DialFunc, not a DSN), else kind + DSN.
+func sourceSpecFor(kind, dsn string, postgres []byte) (spec.Source, error) {
+	if len(postgres) == 0 {
+		return spec.Source{Kind: kind, URI: dsn}, nil
+	}
+	var pg spec.PostgresSource
+	if err := json.Unmarshal(postgres, &pg); err != nil {
+		return spec.Source{}, fmt.Errorf("worker: postgres config: %w", err)
+	}
+	return spec.Source{Kind: kind, Postgres: &pg}, nil
 }
 
 // specTablesFromAssignment reconstructs the per-table spec the source needs
