@@ -154,8 +154,8 @@ func parseDecimalSpec(columnType string) (precision, scale int) {
 }
 
 // parseMemberList splits the member list of an ENUM or SET column_type, e.g.
-// enum('a','b'). MySQL escapes an embedded quote by doubling it, so '' inside
-// a member is one literal quote and must not end the member.
+// enum('a','b'). MySQL escapes an embedded quote by doubling it: two single
+// quotes inside a member are one literal quote and must not end the member.
 func parseMemberList(columnType, prefix string) []string {
 	lower := strings.ToLower(columnType)
 	if !strings.HasPrefix(lower, prefix+"(") || !strings.HasSuffix(columnType, ")") {
