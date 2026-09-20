@@ -142,7 +142,14 @@ func (w *TableWriter) buildMetaColumn(src arrow.RecordBatch, key core.MetadataKe
 		bb := array.NewStringBuilder(memory.DefaultAllocator)
 		defer bb.Release()
 		for i := range opCol.Len() {
-			bb.Append(changeOpString(opCol.Value(i)))
+			if opCol.IsNull(i) {
+				return nil, fmt.Errorf("iceberg: __op is NULL at row %d", i)
+			}
+			s, err := changeOpString(opCol.Value(i))
+			if err != nil {
+				return nil, err
+			}
+			bb.Append(s)
 		}
 		return bb.NewStringArray(), nil
 
@@ -263,15 +270,19 @@ func timestampColumn(src arrow.RecordBatch, name string, dt arrow.DataType) (arr
 	return bb.NewTimestampArray(), nil
 }
 
-// changeOpString renders a rowchange op as its wire string.
-func changeOpString(op uint8) string {
-	switch op {
-	case 0:
-		return "insert"
-	case 1:
-		return "update"
+// changeOpString renders a rowchange op as its wire string. It switches on the
+// rowchange.Op* constants (not literals) and rejects an unknown op instead of
+// absorbing it as a delete — a future op must not silently become one.
+func changeOpString(op uint8) (string, error) {
+	switch rowchange.Op(op) {
+	case rowchange.OpInsert:
+		return "insert", nil
+	case rowchange.OpUpdate:
+		return "update", nil
+	case rowchange.OpDelete:
+		return "delete", nil
 	default:
-		return "delete"
+		return "", fmt.Errorf("iceberg: unknown __op %d", op)
 	}
 }
 
@@ -312,6 +323,9 @@ func splitByOp(ctx context.Context, b *dataplane.Batch) (upserts, deletes *datap
 	up := array.NewBooleanBuilder(memory.DefaultAllocator)
 	del := array.NewBooleanBuilder(memory.DefaultAllocator)
 	for i := range opCol.Len() {
+		if opCol.IsNull(i) {
+			return nil, nil, fmt.Errorf("iceberg: __op is NULL at row %d", i)
+		}
 		isDel := opCol.Value(i) == uint8(rowchange.OpDelete)
 		up.Append(!isDel)
 		del.Append(isDel)
