@@ -104,6 +104,26 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 			`SELECT pg_catalog.pg_create_logical_replication_slot($1, $2)`, slotName, plugin); err != nil {
 			return fmt.Errorf("postgres: create slot: %w", err)
 		}
+	} else {
+		// A slot is bound to the plugin and database it was created with.
+		// Reusing it after switching either would start replication with the
+		// wrong options and decode the wrong payload, so fail loud.
+		var existingPlugin, existingDB string
+		if err := db.QueryRowContext(ctx,
+			`SELECT plugin, database FROM pg_catalog.pg_replication_slots WHERE slot_name = $1`, slotName,
+		).Scan(&existingPlugin, &existingDB); err != nil {
+			return fmt.Errorf("postgres: slot lookup: %w", err)
+		}
+		if existingPlugin != plugin {
+			return fmt.Errorf("postgres: slot %q was created with plugin %q, not %q — drop and recreate it to switch plugins", slotName, existingPlugin, plugin)
+		}
+		var currentDB string
+		if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&currentDB); err != nil {
+			return fmt.Errorf("postgres: current database: %w", err)
+		}
+		if existingDB != currentDB {
+			return fmt.Errorf("postgres: slot %q belongs to database %q, not %q", slotName, existingDB, currentDB)
+		}
 	}
 	return nil
 }

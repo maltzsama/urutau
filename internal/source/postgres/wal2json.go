@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -49,7 +50,11 @@ type wal2jsonOldKey struct {
 // table is identified by name and looked up in the introspected state.
 func (r *Reader) handleWal2json(ctx context.Context, payload []byte) error {
 	var msg wal2jsonStream
-	if err := json.Unmarshal(payload, &msg); err != nil {
+	// UseNumber: a JSON number into float64 loses precision past 2^53, which
+	// would corrupt a bigint key or column value.
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.UseNumber()
+	if err := dec.Decode(&msg); err != nil {
 		return fmt.Errorf("postgres: wal2json: %w", err)
 	}
 	r.txn = r.txn[:0]
@@ -174,6 +179,8 @@ func coerceWal2json(v any, dataType string) (any, error) {
 	switch strings.ToLower(dataType) {
 	case "smallint", "integer", "bigint":
 		switch t := v.(type) {
+		case json.Number:
+			return t.Int64()
 		case float64:
 			return int64(t), nil
 		case string:
@@ -181,6 +188,8 @@ func coerceWal2json(v any, dataType string) (any, error) {
 		}
 	case "real", "double precision":
 		switch t := v.(type) {
+		case json.Number:
+			return t.Float64()
 		case float64:
 			return t, nil
 		case string:

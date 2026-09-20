@@ -340,11 +340,13 @@ func (r *Runner) runIncremental(ctx context.Context, src source.Source, snk sink
 	}
 	for _, ref := range refs {
 		t := specBySource[ref.Source]
-		props, err := snk.Properties(ctx, ref)
+		// The committed cdc.position IS the cursor for an incremental table:
+		// the batch watermark was written atomically with the rows.
+		after, err := snk.Position(ctx, ref)
 		if err != nil {
 			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
 		}
-		next, rows, err := inc.Incremental(ctx, ref, t.Cursor, props["cdc.cursor"])
+		next, rows, err := inc.Incremental(ctx, ref, t.Cursor, after)
 		if err != nil {
 			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
 		}
@@ -814,13 +816,11 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 			"table": b.Table, "rows": rows,
 			"upserts": up, "deletes": del, "position": string(b.Watermark),
 		})
-		// An incremental table persists its cursor as cdc.cursor, post-commit
-		// so the data and the cursor advance together. It never feeds the
+		// An incremental table's cursor is the batch watermark, written
+		// atomically with the rows by the sink's commit — never a separate
+		// property, which would race the data commit. It never feeds the
 		// LSN/confirmed point, so the position parse does not apply.
-		if ref, ok := incrRefByTarget[b.Table]; ok {
-			if err := snk.SetProperties(ctx, ref, map[string]string{"cdc.cursor": string(b.Watermark)}); err != nil {
-				log.Warn("runner: incremental cursor", "table", b.Table, "err", err)
-			}
+		if _, ok := incrRefByTarget[b.Table]; ok {
 			return
 		}
 		// A garbage position string never advances the confirmed point.

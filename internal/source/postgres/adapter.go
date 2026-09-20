@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -138,14 +139,20 @@ func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, afte
 	}
 
 	specTable, _ := a.tableFor(t.Source)
+	// The cursor must be read to checkpoint it: a projection that omits it
+	// would leave the cursor empty and break the next resume.
+	if len(specTable.ColumnFilter) > 0 && !slices.Contains(specTable.ColumnFilter, cursor) {
+		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
+	}
 	q := psql.Select("*").From(quoteIdent(schema) + "." + quoteIdent(table))
 	if len(specTable.ColumnFilter) > 0 {
 		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quoteIdent(schema) + "." + quoteIdent(table))
 	}
 	if after != "" {
-		// The stored cursor is a string; cast it to the column's type so a
-		// numeric or temporal cursor binds correctly.
-		q = q.Where(sq.Expr(quoteIdent(cursor)+" > ?::"+st.Columns[ci].DataType, after))
+		// >=, not >: a non-unique cursor (updated_at) can have new rows at the
+		// same value as the last checkpoint. Re-reading the boundary is
+		// idempotent under upsert and never drops a row.
+		q = q.Where(sq.Expr(quoteIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, after))
 	}
 	if specTable.Filter != nil {
 		f, err := filterToSquirrel(specTable.Filter)

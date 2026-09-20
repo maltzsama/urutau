@@ -1,6 +1,9 @@
 package postgres
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestCoerceWal2json(t *testing.T) {
 	cases := []struct {
@@ -8,9 +11,12 @@ func TestCoerceWal2json(t *testing.T) {
 		typ  string
 		want any
 	}{
+		{json.Number("42"), "bigint", int64(42)},
+		{json.Number("9007199254740993"), "bigint", int64(9007199254740993)},
+		{json.Number("3"), "integer", int64(3)},
 		{float64(42), "bigint", int64(42)},
-		{float64(3), "integer", int64(3)},
 		{"7", "bigint", int64(7)},
+		{json.Number("1.5"), "double precision", 1.5},
 		{float64(1.5), "double precision", 1.5},
 		{"1.5", "real", 1.5},
 		{"a", "text", "a"},

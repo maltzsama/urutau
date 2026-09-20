@@ -203,8 +203,10 @@ tables:
 - The cursor column must be `NOT NULL`; the pass reads past the stored value.
 - Rows are upserted (`op: insert`) with `__phase: incremental`. **Deletes are
   not detected** — an incremental read only sees rows that still exist.
-- The cursor lives in the `cdc.cursor` table property, written in the same
-  commit as the rows, so a restart resumes exactly where it left off.
+- The cursor is the table's committed `cdc.position`, written in the **same
+  commit** as the rows, so a restart resumes exactly where it left off. The
+  resume predicate is `>=`, so a non-unique cursor (e.g. `updated_at`) never
+  drops a row that shares the last value.
 - Incremental and CDC tables can share one pipeline: the slot covers only the
   CDC tables. Incremental mode is currently supported in the **collapsed
   runner** (not distributed mode).
