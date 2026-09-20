@@ -150,8 +150,7 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) — a reset would drop them; terminating for replay",
 				worker, n)
 		}
-		s.recordReset(worker, now, window)
-		if len(s.resets[worker]) >= maxResets {
+		if n := s.recordReset(worker, now, window); n >= maxResets {
 			return fmt.Errorf("coordinator: crashloop: worker %s: %d resets in %s",
 				worker, maxResets, window)
 		}
@@ -171,8 +170,10 @@ func (c *Coordinator) inFlight(worker string) int {
 }
 
 // recordReset pushes a reset timestamp into the worker's sliding window,
-// expiring entries older than window.
-func (s *supervisor) recordReset(worker string, now time.Time, window time.Duration) {
+// expiring entries older than window, and returns the resulting count — read
+// under the same lock, so the crashloop check that follows cannot race a
+// concurrent reset (issue #208).
+func (s *supervisor) recordReset(worker string, now time.Time, window time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := now.Add(-window)
@@ -183,6 +184,7 @@ func (s *supervisor) recordReset(worker string, now time.Time, window time.Durat
 		}
 	}
 	s.resets[worker] = append(kept, now)
+	return len(s.resets[worker])
 }
 
 // resetWorker bumps the epoch, cancels the worker's session, and waits for
