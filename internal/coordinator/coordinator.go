@@ -1617,7 +1617,10 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		subMeta.HighPos = "" // recomputed per sub-batch below
 		subBatch := &dataplane.Batch{Table: b.Table, Record: sub, Watermark: b.Watermark, Mode: b.Mode}
 		if err := c.enqueueTo(ctx, owners[p], subBatch, subMeta); err != nil {
-			sub.Release()
+			// enqueueTo already released subBatch (and its Record — the same
+			// pointer as sub), so do NOT release sub again; release only the
+			// sub-batches not yet sent (issue #217).
+			releaseRecords(subBatches[p+1:])
 			return err
 		}
 	}
