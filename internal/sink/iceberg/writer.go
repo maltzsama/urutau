@@ -872,13 +872,18 @@ func appendColumn(builder array.Builder, field arrow.Field, values []any) error 
 			}
 		}
 	case *array.FixedSizeBinaryBuilder:
+		want := b.Type().(*arrow.FixedSizeBinaryType).ByteWidth
 		for _, v := range values {
 			switch t := v.(type) {
 			case nil:
 				b.AppendNull()
 			case []byte:
 				// Fixed-size binary column (iceberg fixed(L)); uuid also
-				// travels as raw bytes here.
+				// travels as raw bytes here. Append panics on a wrong length,
+				// so check it and fail with a real error.
+				if len(t) != want {
+					return fmt.Errorf("iceberg: column %q: fixed-size binary value has %d bytes, want %d", name, len(t), want)
+				}
 				b.Append(t)
 			case string:
 				raw, err := uuidToBytes(t)
