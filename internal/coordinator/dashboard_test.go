@@ -138,3 +138,34 @@ func TestDashStateTablesPosition(t *testing.T) {
 		t.Errorf("Position = %q, want %q", got[0].Position, pos.String())
 	}
 }
+
+// #205: an operator restart must refuse a worker that owes in-flight batches,
+// exactly like the supervisor's own reset does — otherwise the click drops
+// delivered-but-unacked data silently.
+func TestRestartWorkerRefusesInFlight(t *testing.T) {
+	c, w := coordHarness()
+	ds := dashState{c}
+
+	// No in-flight: the restart is allowed and bumps the epoch.
+	if err := ds.RestartWorker(w.name); err != nil {
+		t.Fatalf("RestartWorker(idle) = %v, want nil", err)
+	}
+	if w.epoch != 1 {
+		t.Fatalf("idle restart must bump the epoch, got %d", w.epoch)
+	}
+
+	// With an in-flight batch: refused, and the epoch is NOT bumped.
+	c.index[w.name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+	err := ds.RestartWorker(w.name)
+	if err == nil {
+		t.Fatal("RestartWorker with in-flight batches must be refused")
+	}
+	if w.epoch != 1 {
+		t.Fatalf("a refused restart must not bump the epoch, got %d", w.epoch)
+	}
+
+	// Unknown worker.
+	if err := ds.RestartWorker("nope"); err == nil {
+		t.Fatal("an unknown worker must error")
+	}
+}

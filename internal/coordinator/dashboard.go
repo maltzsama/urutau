@@ -212,6 +212,13 @@ func (s dashState) RestartWorker(name string) error {
 	if !ok {
 		return fmt.Errorf("no worker %q", name)
 	}
+	// A reset cancels the session and bumps the epoch; batches already
+	// delivered die with it (the one-slot resend covers only a failed Send).
+	// The supervisor refuses the same reset, so the dashboard must too — an
+	// operator click must not be able to drop in-flight data (issue #205).
+	if n := c.inFlight(name); n > 0 {
+		return fmt.Errorf("coordinator: worker %s has %d in-flight batch(es) — a restart would drop them; wait for it to drain", name, n)
+	}
 	c.supervisor.recordReset(name, time.Now(), supervisionConfig(c.cfg).ResetWindow)
 	c.resetWorker(w)
 	return nil
