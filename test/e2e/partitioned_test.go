@@ -112,8 +112,10 @@ func TestDistributedPartitionedUpsert(t *testing.T) {
 }
 
 // TestDistributedPartitionedAppend runs a MySQL → Iceberg append table split
-// across THREE worker groups. Deletes are dropped (append semantics), and a
-// restart mid-stream must not duplicate or lose a row.
+// across THREE worker groups. A delete carries its before-image, so append
+// mode keeps it as a delete-marker row (onDelete: record, the default) — the
+// staged path must append it, not drop it (#186). A restart mid-stream must
+// not duplicate or lose a row.
 func TestDistributedPartitionedAppend(t *testing.T) {
 	requireE2E(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -137,15 +139,16 @@ func TestDistributedPartitionedAppend(t *testing.T) {
 	stop, waitDone := bootPipeline(t, ctx, addr, s, groups...)
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
 
-	// Inserts across every partition. A DELETE is dropped in append mode:
-	// the row stays.
+	// Inserts across every partition. A DELETE carries its before-image, so
+	// append mode keeps it as a delete-marker row (onDelete: record): id=100
+	// now has TWO rows (the original and the delete marker).
 	for i := 200; i < 230; i++ {
 		dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'live%d', %d.0)", i, i, i))
 	}
 	dml(t, db, `DELETE FROM orders WHERE id = 100`)
 
-	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(230))
-	assertTrino(t, ctx, `SELECT v FROM orders WHERE id = 100`, "seed100")
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(231))
+	assertCount(t, ctx, `SELECT count(*) FROM orders WHERE id = 100`, 2)
 	t.Log("partitioned append ok: snapshot + live inserts across all 3 partitions")
 
 	stop()
@@ -158,7 +161,7 @@ func TestDistributedPartitionedAppend(t *testing.T) {
 	dml(t, db, `INSERT INTO orders (id, v, amount) VALUES (300, 'resumed', 3.0)`)
 
 	stop2, waitDone2 := bootPipeline(t, ctx, addr, s, groups...)
-	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(231))
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(232))
 	assertTrino(t, ctx, `SELECT v FROM orders WHERE id = 300`, "resumed")
 	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, 231)
 	t.Log("partitioned append ok: restart resumed with no loss and no duplicate")

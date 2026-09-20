@@ -141,6 +141,17 @@ func (w *TableWriter) Close() error { return nil }
 func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	pos := string(b.Watermark)
 
+	if b.Record == nil || b.Record.NumRows() == 0 {
+		// An empty batch still carries a watermark and snapshot state; record
+		// them so a restart does not replay the interval forever. With no keys
+		// commitDeletes writes no delete files but still commits the position
+		// as a properties-only snapshot — the same the staged path does.
+		if pos == "" && b.SnapshotState == "" && b.SnapshotPending == nil {
+			return nil
+		}
+		return w.commitDeletes(ctx, nil, pos, b.SnapshotState, b.SnapshotPending)
+	}
+
 	if b.Mode != dataplane.UpsertMode {
 		// Append mode: the worker has already decided which rows an
 		// append-only table carries — appendRowsToKeep drops deletes with no
@@ -151,9 +162,6 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		// bucket append mode never reads (they would be dropped), and a batch
 		// of only such rows would commit nothing at all — leaving cdc.position
 		// unadvanced, so a restart replays the batch forever.
-		if b.Record == nil || b.Record.NumRows() == 0 {
-			return nil
-		}
 		return w.commitAppend(ctx, b, pos, b.SnapshotState, b.SnapshotPending)
 	}
 
@@ -200,23 +208,29 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 // together with the position (and snapshot state), retrying only the catalog
 // commit. The write-once shape keeps a retry from re-uploading the batch.
 func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos string, snapshotState string, snapshotPending []uint32) error {
-	rec, err := w.deleteRecord(keys)
-	if err != nil {
-		return err
-	}
-	defer rec.Release()
+	// With no keys there is nothing to delete — a properties-only commit
+	// (the empty-batch case). Writing a zero-row delete record would panic
+	// the parquet writer, so skip the record and file entirely.
+	var files []iceberg.DataFile
+	if len(keys) > 0 {
+		rec, err := w.deleteRecord(keys)
+		if err != nil {
+			return err
+		}
+		defer rec.Release()
 
-	// Write the delete files ONCE; only the catalog commit is retried below.
-	tbl, err := w.cat.LoadTable(ctx, w.ident)
-	if err != nil {
-		return fmt.Errorf("iceberg: load %v: %w", w.ident, err)
+		// Write the delete files ONCE; only the catalog commit is retried below.
+		tbl, err := w.cat.LoadTable(ctx, w.ident)
+		if err != nil {
+			return fmt.Errorf("iceberg: load %v: %w", w.ident, err)
+		}
+		files, err = tbl.NewTransaction().WriteEqualityDeletes(ctx, w.eqIDs, oneBatch(rec))
+		if err != nil {
+			return fmt.Errorf("iceberg: write equality deletes %v: %w", w.ident, err)
+		}
 	}
-	files, err := tbl.NewTransaction().WriteEqualityDeletes(ctx, w.eqIDs, oneBatch(rec))
-	if err != nil {
-		return fmt.Errorf("iceberg: write equality deletes %v: %w", w.ident, err)
-	}
-	if len(files) == 0 && pos == "" {
-		// No delete files and no position to advance — nothing pending.
+	if len(files) == 0 && pos == "" && snapshotState == "" && snapshotPending == nil {
+		// Nothing to delete, no position and no snapshot state to advance.
 		return nil
 	}
 
@@ -259,10 +273,11 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 				continue
 			}
 		}
-		if pos != "" {
-			if err := txn.SetProperties(p); err != nil {
-				return err
-			}
+		// Persist the position AND the snapshot state: a snapshot-only
+		// transition (no position) must still advance, matching
+		// commitStagedProps.
+		if err := txn.SetProperties(p); err != nil {
+			return err
 		}
 		if _, err := txn.Commit(ctx); err != nil {
 			if !isRetryableError(err) {
@@ -872,13 +887,18 @@ func appendColumn(builder array.Builder, field arrow.Field, values []any) error 
 			}
 		}
 	case *array.FixedSizeBinaryBuilder:
+		want := b.Type().(*arrow.FixedSizeBinaryType).ByteWidth
 		for _, v := range values {
 			switch t := v.(type) {
 			case nil:
 				b.AppendNull()
 			case []byte:
 				// Fixed-size binary column (iceberg fixed(L)); uuid also
-				// travels as raw bytes here.
+				// travels as raw bytes here. Append panics on a wrong length,
+				// so check it and fail with a real error.
+				if len(t) != want {
+					return fmt.Errorf("iceberg: column %q: fixed-size binary value has %d bytes, want %d", name, len(t), want)
+				}
 				b.Append(t)
 			case string:
 				raw, err := uuidToBytes(t)
