@@ -1403,7 +1403,11 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		err := c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, ch, chunkID, epoch)
 		cancel()
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
+			// A parent deadline/cancel (the run's own) surfaces here as
+			// DeadlineExceeded too; report it as-is rather than blaming a
+			// wedged worker. Only a chunk deadline with a live parent is the
+			// watchdog firing.
+			if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
 				return fmt.Errorf("coordinator: snapshot %s: chunk %d did not complete within %s (the worker may be wedged): %w",
 					ref.Source, chunkID, timeout, err)
 			}

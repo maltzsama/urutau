@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -54,5 +55,30 @@ func TestSnapshotPartitionWatchdogParentCancel(t *testing.T) {
 	err := c.snapshotPartition(ctx, fakeSourceReader{}, chunker, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
 	if err == nil || !strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("snapshotPartition = %v, want context canceled", err)
+	}
+}
+
+// A parent deadline (the run's own) is not a watchdog expiry either: it must
+// stay a deadline error, without the "worker may be wedged" wrap.
+func TestSnapshotPartitionWatchdogParentDeadline(t *testing.T) {
+	c, w := coordHarness()
+	w.out = make(chan *pb.CoordinatorMessage, 1)
+	c.chunkReady = make(chan *pb.ChunkReady, 1)
+	c.cfg.SnapshotChunkTimeout = time.Hour // the watchdog must not be the cause
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
+	chunker := fakeChunkSource{bounds: [][]any{{int64(50)}}}
+	err := c.snapshotPartition(ctx, fakeSourceReader{}, chunker, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
+	if err == nil {
+		t.Fatal("a parent deadline must fail the snapshot")
+	}
+	if strings.Contains(err.Error(), "wedged") {
+		t.Fatalf("a parent deadline must not be reported as a wedged worker: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("snapshotPartition = %v, want context.DeadlineExceeded", err)
 	}
 }
