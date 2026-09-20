@@ -126,3 +126,20 @@ func TestPositionIndexManifest(t *testing.T) {
 		t.Fatalf("batch ids = %d..%d, want 8..8", m.FirstBatchID, m.LastBatchID)
 	}
 }
+
+// #209: a batch larger than both the total budget and the per-worker floor
+// must not deadlock a worker holding nothing — otherwise the condition stays
+// true at used==0 and nothing can broadcast it awake.
+func TestFlowBudgetOversizedFirstBatchDoesNotDeadlock(t *testing.T) {
+	b := newFlowBudget(100, 10) // total 100, floor 10; n=200 exceeds both
+	done := make(chan error, 1)
+	go func() { done <- b.acquire(context.Background(), "a", 200) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("oversized first acquire: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("an oversized first batch deadlocked the worker")
+	}
+}
