@@ -2,7 +2,10 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	errs "github.com/maltzsama/urutau/internal/errors"
 )
@@ -56,8 +59,15 @@ func retryTransientErr(ctx context.Context, retries int, op func() error) error 
 // only delays the inevitable failure, so classification is explicit rather
 // than "retry everything".
 //
-// The SQLSTATE mapping lives in internal/errors (#159); the postgres package
-// registers its classifier in errors.go's init.
+// A PostgreSQL SQLSTATE decides it when present; otherwise the shared rules
+// (network, deadline, the no-data sentinel) apply.
 func isTransient(err error) bool {
-	return errs.Classify(err).Transient()
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return retryableSQLState(pgErr.Code)
+	}
+	return errs.Retryable(err)
 }

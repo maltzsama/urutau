@@ -28,24 +28,6 @@ func TestCtidRanges(t *testing.T) {
 	}
 }
 
-func TestCtidPartitionedBounds(t *testing.T) {
-	// Two leaves: 1000 pages and 200 pages; max 1000. A 100-page budget
-	// spreads proportionally, so every page lands in exactly one chunk and
-	// the starts are strictly increasing.
-	got := ctidPartitionedBoundsPages([]int64{1000, 200}, 1000, 100)
-	if len(got) < 2 {
-		t.Fatalf("want multiple chunks, got %v", got)
-	}
-	for i := 1; i < len(got); i++ {
-		if got[i][0] == got[i-1][0] {
-			t.Fatalf("duplicate start at %d: %v", i, got)
-		}
-	}
-	if got[0][0] != "(0,0)" {
-		t.Fatalf("first start = %v, want (0,0)", got[0][0])
-	}
-}
-
 func TestPartitionNumeric(t *testing.T) {
 	c := &Chunker{pk: []string{"id"}}
 	got, err := c.partitionNumeric(int64(0), int64(99), 4)

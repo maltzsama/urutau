@@ -307,10 +307,12 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	uri := a.spec.Source.URI
 	maxRetries := 0
 	initialWait := defaultInitialWait
+	plugin := "pgoutput"
 	if a.connCfg != nil {
 		uri = a.connCfg.QueryURI
 		maxRetries = a.connCfg.RetryCount
 		initialWait = a.connCfg.InitialWaitTime
+		plugin = a.connCfg.Plugin
 	}
 
 	// One channel for the whole reader life: New writes into it and the
@@ -330,6 +332,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 			Logger:      a.rt.Logger,
 			RetryCount:  maxRetries,
 			InitialWait: initialWait,
+			Plugin:      plugin,
 			Filters:     filters,
 			Columns:     columns,
 		}, out)

@@ -113,12 +113,19 @@ type PostgresSource struct {
 	// pipeline can replicate a whole schema without enumerating it.
 	// Mutually exclusive with an explicit tables list.
 	Discover bool `json:"discover,omitempty"`
-	// InitialWaitTime is the maximum number of seconds the CDC reader waits
-	// for the first WAL message before failing with a non-retryable error.
-	// It detects a misconfigured CDC (wrong slot, wrong publication, no WAL
-	// traffic) that would otherwise hang forever. The timer resets on every
-	// received message. 0 (omitted) resolves to the default 300; an explicit
-	// value below 30 is rejected.
+	// CDC holds the logical-decoding knobs for the replication reader.
+	CDC *CDCConfig `json:"cdc,omitempty"`
+}
+
+// CDCConfig holds the PostgreSQL logical-decoding knobs.
+type CDCConfig struct {
+	// Plugin selects the logical decoding plugin: "pgoutput" (default) or
+	// "wal2json".
+	Plugin string `json:"plugin,omitempty"`
+	// InitialWaitTime is the maximum number of seconds the reader waits for
+	// the first WAL message before failing with a non-retryable error (min
+	// 30, default 300). It detects a misconfigured slot or publication that
+	// would otherwise hang forever.
 	InitialWaitTime int `json:"initialWaitTime,omitempty"`
 }
 

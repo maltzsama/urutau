@@ -23,8 +23,9 @@ func ctidString(block int64) string {
 
 // ctidBounds splits the table by physical block range (the default strategy):
 // pagesPerChunk pages per chunk, so no primary key is required and the chunks
-// are uniform regardless of key skew. A partitioned parent has no storage of
-// its own, so its leaf partitions' pages drive a proportional split.
+// are uniform regardless of key skew. A chunk's size is the pipeline's target
+// file size divided by the server block size — one chunk lands roughly one
+// target file.
 func (c *Chunker) ctidBounds(ctx context.Context) ([][]any, error) {
 	blockSize, err := c.blockSize(ctx)
 	if err != nil {
@@ -35,18 +36,22 @@ func (c *Chunker) ctidBounds(ctx context.Context) ([][]any, error) {
 		pagesPerChunk = 1
 	}
 
-	partitioned, err := c.isPartitioned(ctx)
+	// A partitioned parent has no storage of its own (relpages = 0), and its
+	// CTID predicate is applied to every leaf independently — each leaf's ctid
+	// starts at (0,0). So the block range that bounds the parent is the
+	// LARGEST leaf's page count, not a sum.
+	relpages, err := c.relPages(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if !partitioned {
-		relpages, err := c.relPages(ctx)
-		if err != nil {
+	if partitioned, err := c.isPartitioned(ctx); err != nil {
+		return nil, err
+	} else if partitioned {
+		if relpages, err = c.maxLeafPages(ctx); err != nil {
 			return nil, err
 		}
-		return ctidRanges(relpages, pagesPerChunk), nil
 	}
-	return c.ctidPartitionedBounds(ctx, pagesPerChunk)
+	return ctidRanges(relpages, pagesPerChunk), nil
 }
 
 // ctidRanges generates the chunk starts [ (0,0), (N,0), (2N,0), … ]; the
@@ -61,46 +66,6 @@ func ctidRanges(relpages, pagesPerChunk int64) [][]any {
 	}
 	if len(bounds) == 0 {
 		bounds = append(bounds, []any{ctidString(0)})
-	}
-	return bounds
-}
-
-// ctidPartitionedBounds distributes the page budget proportionally across the
-// leaf partitions: a partition with more pages gets proportionally more
-// chunks, so the total chunk count stays near targetBytes/blockSize.
-func (c *Chunker) ctidPartitionedBounds(ctx context.Context, pagesPerChunk int64) ([][]any, error) {
-	pages, maxPages, err := c.loadPartitionPages(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return ctidPartitionedBoundsPages(pages, maxPages, pagesPerChunk), nil
-}
-
-// ctidPartitionedBoundsPages distributes the page budget proportionally
-// across the leaf partitions: a partition with more pages gets proportionally
-// more chunks, so the total chunk count stays near targetBytes/blockSize.
-func ctidPartitionedBoundsPages(pages []int64, maxPages, pagesPerChunk int64) [][]any {
-	if maxPages <= 0 {
-		// Every partition is empty: a single open chunk covers nothing.
-		return [][]any{{ctidString(0)}}
-	}
-	var bounds [][]any
-	for start := int64(0); start < maxPages; {
-		bounds = append(bounds, []any{ctidString(start)})
-		remaining := int64(0)
-		for _, p := range pages {
-			if p > start {
-				remaining++
-			}
-		}
-		if remaining < 1 {
-			remaining = 1
-		}
-		batch := int64(math.Ceil(float64(pagesPerChunk) / float64(remaining)))
-		if batch < 1 {
-			batch = 1
-		}
-		start += batch
 	}
 	return bounds
 }
@@ -149,64 +114,48 @@ func (c *Chunker) isPartitioned(ctx context.Context) (bool, error) {
 	return count > 0, nil
 }
 
-// loadPartitionPages returns each leaf partition's page count and the maximum
-// across them. pg_partition_tree() (PG 12+) is preferred; older servers use a
-// recursive CTE over pg_inherits.
-func (c *Chunker) loadPartitionPages(ctx context.Context) ([]int64, int64, error) {
+// maxLeafPages returns the largest leaf partition's page count, the block
+// range that bounds a partitioned parent's chunking. pg_partition_tree()
+// (PG 12+) is preferred; older servers use a recursive CTE over pg_inherits.
+func (c *Chunker) maxLeafPages(ctx context.Context) (int64, error) {
 	var version int
 	if err := c.db.QueryRowContext(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&version); err != nil {
-		return nil, 0, fmt.Errorf("postgres: chunker: server version: %w", err)
+		return 0, fmt.Errorf("postgres: chunker: server version: %w", err)
 	}
-	query := partitionPagesCTE
+	query := maxLeafPagesCTE
 	if version >= 120000 {
-		query = partitionPagesTree
+		query = maxLeafPagesTree
 	}
-	rows, err := c.db.QueryContext(ctx, query, c.schema, c.table)
-	if err != nil {
-		return nil, 0, fmt.Errorf("postgres: chunker: partition pages: %w", err)
+	var pages sql.NullInt64
+	if err := c.db.QueryRowContext(ctx, query, c.schema, c.table).Scan(&pages); err != nil {
+		return 0, fmt.Errorf("postgres: chunker: partition pages: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var pages []int64
-	var maxPages int64
-	for rows.Next() {
-		var name string
-		var p int64
-		if err := rows.Scan(&name, &p); err != nil {
-			return nil, 0, err
-		}
-		pages = append(pages, p)
-		if p > maxPages {
-			maxPages = p
-		}
+	if !pages.Valid {
+		return 0, nil
 	}
-	return pages, maxPages, rows.Err()
+	return pages.Int64, nil
 }
 
-// partitionPagesTree counts leaf-partition pages on PG 12+.
-const partitionPagesTree = `
-	SELECT pt.relid::text,
-	       CEIL(1.05 * (pg_relation_size(pt.relid::oid) / current_setting('block_size')::int))::bigint
+// maxLeafPagesTree returns the largest leaf's page count on PG 12+.
+const maxLeafPagesTree = `
+	SELECT MAX(pg_relation_size(pt.relid::oid) / current_setting('block_size')::int)::bigint
 	FROM pg_partition_tree(format('%I.%I', $1::text, $2::text)::regclass) pt
-	WHERE pt.isleaf = true
-	ORDER BY 2 DESC`
+	WHERE pt.isleaf`
 
-// partitionPagesCTE counts leaf-partition pages on PG < 12 via pg_inherits.
-const partitionPagesCTE = `
+// maxLeafPagesCTE returns the largest leaf's page count on PG < 12 via
+// pg_inherits (pg_partition_tree does not exist there).
+const maxLeafPagesCTE = `
 	WITH RECURSIVE partition_tree AS (
-		SELECT c.oid, c.relname AS name,
-		       CEIL(1.05 * (pg_relation_size(c.oid) / current_setting('block_size')::int))::bigint AS pages
+		SELECT c.oid
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2
 		UNION ALL
-		SELECT child.oid, child.relname,
-		       CEIL(1.05 * (pg_relation_size(child.oid) / current_setting('block_size')::int))::bigint
+		SELECT child.oid
 		FROM pg_inherits i
 		JOIN pg_class child ON child.oid = i.inhrelid
 		JOIN partition_tree pt ON pt.oid = i.inhparent
 	)
-	SELECT name, pages
+	SELECT MAX(pg_relation_size(oid) / current_setting('block_size')::int)::bigint
 	FROM partition_tree
-	WHERE NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhparent = partition_tree.oid)
-	ORDER BY pages DESC`
+	WHERE NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhparent = partition_tree.oid)`

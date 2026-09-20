@@ -814,14 +814,27 @@ func validatePostgresSource(pg *PostgresSource, problems *[]string) {
 	if pg.RetryCount < 0 {
 		*problems = append(*problems, "source.postgres.retryCount: must be non-negative")
 	}
-	if pg.InitialWaitTime != 0 && pg.InitialWaitTime < 30 {
-		*problems = append(*problems, "source.postgres.initialWaitTime: must be at least 30 seconds")
+	if pg.CDC != nil {
+		validateCDCConfig(pg.CDC, problems)
 	}
 	if pg.SSL != nil {
 		validateSSLConfig(pg.SSL, problems)
 	}
 	if pg.SSH != nil {
 		validateSSHConfig(pg.SSH, problems)
+	}
+}
+
+// validateCDCConfig checks the logical-decoding knobs.
+func validateCDCConfig(cdc *CDCConfig, problems *[]string) {
+	switch cdc.Plugin {
+	case "", "pgoutput", "wal2json":
+	default:
+		*problems = append(*problems, fmt.Sprintf(
+			"source.postgres.cdc.plugin: unsupported %q (want pgoutput | wal2json)", cdc.Plugin))
+	}
+	if cdc.InitialWaitTime != 0 && cdc.InitialWaitTime < 30 {
+		*problems = append(*problems, "source.postgres.cdc.initialWaitTime: must be at least 30 seconds")
 	}
 }
 

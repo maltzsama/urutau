@@ -38,7 +38,9 @@ source:
       application_name: urutau
     maxThreads: 10
     retryCount: 3
-    initialWaitTime: 300
+    cdc:
+      plugin: pgoutput
+      initialWaitTime: 300
     ssl:
       mode: verify-full
       ca: /etc/ssl/ca.pem
@@ -78,7 +80,8 @@ and reused.
 |-------|---------|-------------|
 | `maxThreads` | `runtime.NumCPU()` | Max concurrent connections for snapshot chunk SELECTs (1..32), and the size of the concurrent row-normalization pool |
 | `retryCount` | 3 | Transient-error retries with exponential backoff: snapshot queries are retried, and a lost replication stream reconnects and resumes from the committed position. 0 means "use the default" |
-| `initialWaitTime` | 300 | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30). Detects a misconfigured slot or publication that would otherwise hang forever; the timer is satisfied by the first WAL data message |
+| `cdc.plugin` | `pgoutput` | Logical decoding plugin: `pgoutput` (binary) or `wal2json` (JSON). wal2json must be installed on the server; the slot is created with the selected plugin |
+| `cdc.initialWaitTime` | 300 | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30). Detects a misconfigured slot or publication that would otherwise hang forever; the timer is satisfied by the first WAL data message |
 | `schemas` | all accessible | Limits `discover` to these schemas |
 | `discover` | `false` | Replicates every table the user may `SELECT` (base tables and partitioned parents) instead of an explicit `tables` list. Mutually exclusive with `tables` |
 
@@ -272,7 +275,9 @@ source:
       privateKey: /home/user/.ssh/id_ed25519
     maxThreads: 10
     retryCount: 3
-    initialWaitTime: 300
+    cdc:
+      plugin: pgoutput
+      initialWaitTime: 300
 sink:
   uri: http://polaris:8181/api/catalog
   namespace: raw

@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-
-	errs "github.com/maltzsama/urutau/internal/errors"
 )
 
 func TestRetryBackoffCapped(t *testing.T) {
@@ -72,8 +70,8 @@ func TestIsTransientSQLState(t *testing.T) {
 		{"2", false},
 	}
 	for _, c := range cases {
-		if got := errs.ClassifySQLState(c.code).Transient(); got != c.want {
-			t.Errorf("ClassifySQLState(%q).Transient() = %v, want %v", c.code, got, c.want)
+		if got := retryableSQLState(c.code); got != c.want {
+			t.Errorf("retryableSQLState(%q) = %v, want %v", c.code, got, c.want)
 		}
 	}
 }
@@ -143,15 +141,10 @@ func TestResolveInitialWaitTime(t *testing.T) {
 	}
 }
 
-func TestClassifyPgError(t *testing.T) {
-	if f, ok := classifyPgError(&pgconn.PgError{Code: "28P01"}); !ok || f != errs.AuthFailed {
-		t.Fatalf("classifyPgError(28P01) = %v, %v; want AuthFailed, true", f, ok)
-	}
-	if f, ok := classifyPgError(&pgconn.PgError{Code: "40001"}); !ok || f != errs.ConcurrencyConflict {
-		t.Fatalf("classifyPgError(40001) = %v, %v; want ConcurrencyConflict, true", f, ok)
-	}
-	if _, ok := classifyPgError(errors.New("plain")); ok {
-		t.Fatal("a non-PgError must not be claimed")
+func TestIsTransientNonPgError(t *testing.T) {
+	// A plain error has no SQLSTATE; the shared rules decide (not retryable).
+	if isTransient(errors.New("plain")) {
+		t.Fatal("a plain error must not be transient")
 	}
 }
 

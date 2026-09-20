@@ -673,7 +673,7 @@ func TestValidatePostgresRejectsBadInitialWaitTime(t *testing.T) {
 		Source: Source{
 			Kind:     "postgres",
 			SlotName: "test_slot",
-			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", InitialWaitTime: 5},
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", CDC: &CDCConfig{InitialWaitTime: 5}},
 		},
 		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
 		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
@@ -682,7 +682,7 @@ func TestValidatePostgresRejectsBadInitialWaitTime(t *testing.T) {
 		t.Fatalf("want initialWaitTime problem, got %v", err)
 	}
 	// The minimum itself is accepted.
-	s.Source.Postgres.InitialWaitTime = 30
+	s.Source.Postgres.CDC.InitialWaitTime = 30
 	if err := s.Validate(); err != nil {
 		t.Fatalf("initialWaitTime=30 must be valid, got %v", err)
 	}
