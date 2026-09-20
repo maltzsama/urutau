@@ -115,6 +115,8 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	}
 	if s.Sink.Namespace == "" {
 		problems = append(problems, "sink.namespace: required")
+	} else if hasEmptyPathComponent(s.Sink.Namespace) {
+		problems = append(problems, fmt.Sprintf("sink.namespace: %q has an empty path component (a namespace level cannot be blank)", s.Sink.Namespace))
 	}
 	// sink.type is validated by the driver registry (admission webhook +
 	// driver.OpenSink at boot), not here. We only normalize the default.
@@ -158,6 +160,8 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 		}
 		if tbl.Target == "" {
 			problems = append(problems, p+".target: required")
+		} else if hasEmptyPathComponent(tbl.Target) {
+			problems = append(problems, fmt.Sprintf("%s.target: %q has an empty path component (a namespace level or the table name cannot be blank)", p, tbl.Target))
 		}
 		if tbl.Source != "" {
 			if seenSource[tbl.Source] {
@@ -854,6 +858,18 @@ func validateCDCConfig(cdc *CDCConfig, problems *[]string) {
 	if cdc.InitialWaitTime != 0 && cdc.InitialWaitTime < 30 {
 		*problems = append(*problems, "source.postgres.cdc.initialWaitTime: must be at least 30 seconds")
 	}
+}
+
+// hasEmptyPathComponent reports whether a dotted path has an empty level, e.g.
+// "a..b", ".a" or "a." — a malformed namespace/target that must fail early
+// instead of reaching the catalog as an empty namespace or table name.
+func hasEmptyPathComponent(s string) bool {
+	for _, part := range strings.Split(s, ".") {
+		if part == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateSSLConfig(ssl *SSLConfig, problems *[]string) {

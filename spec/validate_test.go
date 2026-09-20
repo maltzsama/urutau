@@ -987,3 +987,24 @@ func TestValidateMaxReconnectAttempts(t *testing.T) {
 		t.Fatalf("want maxReconnectAttempts problem, got %v", err)
 	}
 }
+
+func TestValidateRejectsEmptyPathComponent(t *testing.T) {
+	base := func() *Spec {
+		return &Spec{
+			Pipeline: "pg",
+			Source:   Source{Kind: "postgres", SlotName: "s", Postgres: &PostgresSource{Host: "h", Database: "d"}},
+			Sink:     Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		}
+	}
+	s := base()
+	s.Sink.Namespace = "a..b"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "namespace") {
+		t.Fatalf("an empty namespace component must error, got %v", err)
+	}
+
+	s = base()
+	s.Tables = []Table{{Source: "public.t", Target: "raw.", PrimaryKey: []string{"id"}}}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "target") {
+		t.Fatalf("an empty target component must error, got %v", err)
+	}
+}
