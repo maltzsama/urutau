@@ -10,6 +10,20 @@ import (
 	"github.com/go-mysql-org/go-mysql/schema"
 )
 
+const (
+	columnsSQL = `
+		SELECT column_name, data_type, column_type, collation_name,
+		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0)
+		FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ?
+		ORDER BY ordinal_position`
+
+	pkSQL = `
+		SELECT column_name FROM information_schema.key_column_usage
+		WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'
+		ORDER BY ordinal_position`
+)
+
 // QueryTable introspects one table via information_schema, producing the
 // same schema.Table the canal decoder would fetch — so row decoding and
 // Iceberg schema derivation share one path.
@@ -35,12 +49,7 @@ func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (
 }
 
 func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableColumn, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT column_name, data_type, column_type, collation_name,
-		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0)
-		FROM information_schema.columns
-		WHERE table_schema = ? AND table_name = ?
-		ORDER BY ordinal_position`, s, t)
+	rows, err := db.QueryContext(ctx, columnsSQL, s, t)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: columns: %w", err)
 	}
@@ -48,9 +57,11 @@ func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableC
 
 	var out []schema.TableColumn
 	for rows.Next() {
-		var name, dataType, colType string
-		var collation sql.NullString
-		var precision, scale int
+		var (
+			name, dataType, colType string
+			collation               sql.NullString
+			precision, scale        int
+		)
 		if err := rows.Scan(&name, &dataType, &colType, &collation, &precision, &scale); err != nil {
 			return nil, err
 		}
@@ -112,20 +123,34 @@ func buildColumn(name, dataType, columnType, collation string, precision, scale 
 	return col
 }
 
+// parenBody returns the text between the first balanced parentheses of s.
+// ok is false when there is no well-formed pair — including ")(" , where
+// scanning for each character independently would otherwise yield a
+// backwards slice.
+func parenBody(s string) (string, bool) {
+	open := strings.IndexByte(s, '(')
+	if open < 0 {
+		return "", false
+	}
+	closeIdx := strings.IndexByte(s[open:], ')')
+	if closeIdx < 0 {
+		return "", false
+	}
+	return s[open+1 : open+closeIdx], true
+}
+
 // parseSize reads the first parenthesised number of a column_type, e.g.
 // binary(16) or varchar(64). Absent or malformed parentheses give 0.
 func parseSize(columnType string) uint {
-	open := strings.Index(columnType, "(")
-	closeIdx := strings.Index(columnType, ")")
-	if open < 0 || closeIdx < 0 || open > closeIdx {
+	body, ok := parenBody(columnType)
+	if !ok {
 		return 0
 	}
 	// decimal(20,4): the size is the part before the comma.
-	inner := columnType[open+1 : closeIdx]
-	if comma := strings.Index(inner, ","); comma >= 0 {
-		inner = inner[:comma]
+	if comma := strings.IndexByte(body, ','); comma >= 0 {
+		body = body[:comma]
 	}
-	n, err := strconv.ParseUint(strings.TrimSpace(inner), 10, 32)
+	n, err := strconv.ParseUint(strings.TrimSpace(body), 10, 32)
 	if err != nil {
 		return 0
 	}
@@ -134,22 +159,17 @@ func parseSize(columnType string) uint {
 
 // parseDecimalSpec reads precision and scale from a decimal(p,s) column_type.
 // A bare "decimal" yields 0,0 — MySQL's own defaults are 10,0, but inventing
-// them here would hide a column the introspection failed to describe.
+// them here would hide a column the introspection failed to describe. An
+// unparseable part yields 0 for the same reason: Atoi's zero IS the "not
+// described" value, so the error needs no separate branch.
 func parseDecimalSpec(columnType string) (precision, scale int) {
-	open := strings.Index(columnType, "(")
-	closeIdx := strings.Index(columnType, ")")
-	if open < 0 || closeIdx < 0 || open > closeIdx {
+	body, ok := parenBody(columnType)
+	if !ok {
 		return 0, 0
 	}
-	parts := strings.SplitN(columnType[open+1:closeIdx], ",", 2)
-	if p, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
-		precision = p
-	}
-	if len(parts) == 2 {
-		if s, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
-			scale = s
-		}
-	}
+	p, s, _ := strings.Cut(body, ",")
+	precision, _ = strconv.Atoi(strings.TrimSpace(p))
+	scale, _ = strconv.Atoi(strings.TrimSpace(s))
 	return precision, scale
 }
 
@@ -157,8 +177,8 @@ func parseDecimalSpec(columnType string) (precision, scale int) {
 // enum('a','b'). MySQL escapes an embedded quote by doubling it: two single
 // quotes inside a member are one literal quote and must not end the member.
 func parseMemberList(columnType, prefix string) []string {
-	lower := strings.ToLower(columnType)
-	if !strings.HasPrefix(lower, prefix+"(") || !strings.HasSuffix(columnType, ")") {
+	if !strings.HasPrefix(strings.ToLower(columnType), prefix+"(") ||
+		!strings.HasSuffix(columnType, ")") {
 		return nil
 	}
 	body := columnType[len(prefix)+1 : len(columnType)-1]
@@ -188,10 +208,7 @@ func parseMemberList(columnType, prefix string) []string {
 }
 
 func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT column_name FROM information_schema.key_column_usage
-		WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'
-		ORDER BY ordinal_position`, s, t)
+	rows, err := db.QueryContext(ctx, pkSQL, s, t)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: pk: %w", err)
 	}

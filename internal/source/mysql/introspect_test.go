@@ -145,6 +145,48 @@ func TestIntrospectDecimalPrecisionScale(t *testing.T) {
 	}
 }
 
+// parenBody must reject a malformed pair rather than slicing backwards.
+// Scanning for "(" and ")" independently reports a close before the open on
+// input like ")(" and produces a reversed range.
+func TestParenBody(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		body string
+		ok   bool
+	}{
+		{"binary(16)", "16", true},
+		{"decimal(20,4)", "20,4", true},
+		{"int(10) unsigned zerofill", "10", true},
+		{"enum('a','b')", "'a','b'", true},
+		{"decimal", "", false},
+		{"char(", "", false},
+		{"weird)(", "", false},
+	} {
+		body, ok := parenBody(tc.in)
+		if body != tc.body || ok != tc.ok {
+			t.Errorf("parenBody(%q) = %q,%v want %q,%v", tc.in, body, ok, tc.body, tc.ok)
+		}
+	}
+}
+
+// A member containing a comma must survive: the list is quote-delimited, not
+// comma-split.
+func TestParseMemberListCommaInMember(t *testing.T) {
+	got := parseMemberList("set('x,y','z')", "set")
+	if want := []string{"x,y", "z"}; !equalStrings(got, want) {
+		t.Errorf("parseMemberList = %v, want %v", got, want)
+	}
+}
+
+// MySQL doubles an embedded quote; two single quotes are one literal quote
+// and must not end the member.
+func TestParseMemberListDoubledQuote(t *testing.T) {
+	got := parseMemberList(`enum('it''s','b')`, "enum")
+	if want := []string{"it's", "b"}; !equalStrings(got, want) {
+		t.Errorf("parseMemberList = %v, want %v", got, want)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
