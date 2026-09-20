@@ -491,6 +491,18 @@ func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline, image string) (*corev1
 			}
 			data[workerPodTemplateKey(t.Target)] = string(b)
 		}
+		// A discovery pipeline lists no tables at operator time — the source
+		// enumerates them at boot — so no per-table template can be rendered.
+		// Emit one generic template the coordinator clones for every
+		// discovered target (#152).
+		if s.Source.Postgres != nil && s.Source.Postgres.Discover {
+			tmpl := workerPodTemplate(cr, image, urutauspec.Table{})
+			b, err := yaml.Marshal(tmpl)
+			if err != nil {
+				return nil, fmt.Errorf("render generic worker pod template: %w", err)
+			}
+			data[workerPodTemplateKey(defaultWorkerTemplateTarget)] = string(b)
+		}
 	}
 
 	return &corev1.ConfigMap{
@@ -506,6 +518,11 @@ func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline, image string) (*corev1
 func workerPodTemplateKey(target string) string {
 	return "worker-pod-template." + target + ".yaml"
 }
+
+// defaultWorkerTemplateTarget keys the generic worker template a discovery
+// pipeline gets (it has no tables at operator time). The coordinator falls
+// back to it for any discovered target without its own template.
+const defaultWorkerTemplateTarget = "_default"
 
 // workerPodTemplate builds one table's worker Pod template. It carries NO
 // --name — the coordinator stamps that on when it clones this template
@@ -528,19 +545,77 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 	if cr.Spec.Worker.MetricsAddr != "" {
 		cmd = append(cmd, "--metrics-addr", cr.Spec.Worker.MetricsAddr)
 	}
+	pod := corev1.PodSpec{
+		ServiceAccountName: coordinatorSAName(cr),
+		Containers: []corev1.Container{{
+			Name:      "worker",
+			Image:     image,
+			Command:   cmd,
+			Env:       env,
+			Resources: workerResources(cr, t),
+		}},
+	}
+	// An SSH-tunneled source needs the private key on the worker host: the
+	// DSN cannot carry a DialFunc, so the coordinator ships the structured
+	// postgres block (issue #170) and the worker reads the key from this
+	// mount. The key is a file, not an env var, so it comes as a Secret
+	// volume under the fixed name/path the inline spec's
+	// source.postgres.ssh.privateKey names.
+	if _, worker := sshMounts(cr); worker {
+		mode := int32(0o400)
+		pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, corev1.VolumeMount{
+			Name: "ssh-key", MountPath: sshMountPath, ReadOnly: true,
+		})
+		pod.Volumes = append(pod.Volumes, corev1.Volume{
+			Name: "ssh-key",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName:  cr.Spec.Secrets.SSH,
+				DefaultMode: &mode,
+			}},
+		})
+	}
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
-		Spec: corev1.PodSpec{
-			ServiceAccountName: coordinatorSAName(cr),
-			Containers: []corev1.Container{{
-				Name:      "worker",
-				Image:     image,
-				Command:   cmd,
-				Env:       env,
-				Resources: workerResources(cr, t),
-			}},
-		},
+		Spec:       pod,
 	}
+}
+
+// sshMountPath is where the SSH private key Secret is mounted into every
+// worker Pod; the inline spec's source.postgres.ssh.privateKey must name
+// sshMountPath/privateKey (the secret key the operator expects).
+const sshMountPath = "/etc/urutau/ssh"
+
+// inlineSpec parses the CR's inline definition; nil when absent or invalid
+// (the ConfigMap renderer surfaces the real error).
+func inlineSpec(cr *urutauv1alpha1.CDCPipeline) *urutauspec.Spec {
+	if len(cr.Spec.Definition.Inline) == 0 {
+		return nil
+	}
+	b, err := yaml.Marshal(cr.Spec.Definition.Inline)
+	if err != nil {
+		return nil
+	}
+	s, err := urutauspec.LoadYAML(strings.NewReader(string(b)))
+	if err != nil {
+		return nil
+	}
+	return s
+}
+
+// sshMounts reports whether the SSH key Secret must be mounted, and into
+// which pods. The coordinator always needs it when the source tunnels (it
+// opens the replication connection); a worker needs it only when the
+// structured block is shipped to it — a scoped snapshotUri makes the worker
+// connect directly, so the key would be an unused credential.
+func sshMounts(cr *urutauv1alpha1.CDCPipeline) (coordinator, worker bool) {
+	if cr.Spec.Secrets.SSH == "" {
+		return false, false
+	}
+	s := inlineSpec(cr)
+	if s == nil || s.Source.Postgres == nil || s.Source.Postgres.SSH == nil {
+		return false, false
+	}
+	return true, s.Source.SnapshotURI == ""
 }
 
 // inlineSinkWarehouse reads sink.warehouse out of the inline definition —
@@ -601,6 +676,21 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 				}},
 			}},
 		},
+	}
+
+	// The coordinator opens the replication connection, so it needs the SSH
+	// key too when the source tunnels — not just the workers (#170).
+	if coordinator, _ := sshMounts(cr); coordinator {
+		mode := int32(0o400)
+		tmpl.Spec.Containers[0].VolumeMounts = append(tmpl.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{Name: "ssh-key", MountPath: sshMountPath, ReadOnly: true})
+		tmpl.Spec.Volumes = append(tmpl.Spec.Volumes, corev1.Volume{
+			Name: "ssh-key",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName:  cr.Spec.Secrets.SSH,
+				DefaultMode: &mode,
+			}},
+		})
 	}
 
 	return &appsv1.StatefulSet{

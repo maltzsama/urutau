@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/maltzsama/urutau/core"
@@ -143,5 +144,40 @@ func TestSpecTablesFromAssignmentBadFilter(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("want an error for malformed filter JSON")
+	}
+}
+
+// #170: the structured postgres block from the assignment (SSH tunnel) wins
+// over the DSN; without it, kind + DSN is used.
+func TestSourceSpecFor(t *testing.T) {
+	// No block: kind + DSN.
+	s, err := sourceSpecFor("postgres", "host=db", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.URI != "host=db" || s.Postgres != nil {
+		t.Fatalf("no-block spec = %+v, want URI only", s)
+	}
+
+	// Block present: structured source, DSN ignored.
+	pg := spec.PostgresSource{Host: "db.internal", Database: "shop", SSH: &spec.SSHConfig{Host: "bastion", Username: "u"}}
+	b, err := json.Marshal(&pg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = sourceSpecFor("postgres", "ignored", b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Postgres == nil || s.Postgres.SSH == nil || s.Postgres.SSH.Host != "bastion" {
+		t.Fatalf("block spec = %+v, want the SSH postgres block", s)
+	}
+	if s.URI != "" {
+		t.Fatalf("block spec URI = %q, want empty (DSN ignored)", s.URI)
+	}
+
+	// Malformed block: error, not a silent DSN fallback.
+	if _, err := sourceSpecFor("postgres", "host=db", []byte("not json")); err == nil {
+		t.Fatal("want an error for a malformed postgres block")
 	}
 }

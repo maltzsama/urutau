@@ -331,4 +331,10 @@ func TestWorkerPodTemplateHelpers(t *testing.T) {
 	if _, err := loadWorkerPodTemplate("missing"); err == nil {
 		t.Fatal("a missing template file must error")
 	}
+	// A discovered target with no own template falls back to the generic one.
+	cands := workerPodTemplateCandidates("raw.discovered")
+	if len(cands) != 2 || cands[0] != "worker-pod-template.raw.discovered.yaml" ||
+		cands[1] != "worker-pod-template."+defaultWorkerTemplateTarget+".yaml" {
+		t.Fatalf("candidates = %v, want the table's own then the generic", cands)
+	}
 }

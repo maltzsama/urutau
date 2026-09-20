@@ -105,6 +105,14 @@ type PostgresSource struct {
 	// omitempty, so an explicit 0 is indistinguishable from omission and
 	// resolves to the default rather than disabling retries.
 	RetryCount int `json:"retryCount,omitempty"`
+	// Schemas limits table discovery to these schemas. Empty discovers every
+	// accessible schema. Ignored unless Discover is set.
+	Schemas []string `json:"schemas,omitempty"`
+	// Discover replaces the explicit tables list with every table the
+	// connected user may SELECT (base tables and partitioned parents), so a
+	// pipeline can replicate a whole schema without enumerating it.
+	// Mutually exclusive with an explicit tables list.
+	Discover bool `json:"discover,omitempty"`
 	// InitialWaitTime is the maximum number of seconds the CDC reader waits
 	// for the first WAL message before failing with a non-retryable error.
 	// It detects a misconfigured CDC (wrong slot, wrong publication, no WAL

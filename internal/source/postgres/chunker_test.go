@@ -63,6 +63,11 @@ func (captureTxConn) QueryContext(_ context.Context, query string, _ []driver.Na
 	return emptyRows{}, nil
 }
 
+// CheckNamedValue accepts any argument as-is: database/sql's default
+// converter rejects []string, which the real pgx stdlib encodes as text[]
+// (used by the discovery schema filter).
+func (captureTxConn) CheckNamedValue(*driver.NamedValue) error { return nil }
+
 type captureTx struct{}
 
 func (captureTx) Commit() error   { return nil }

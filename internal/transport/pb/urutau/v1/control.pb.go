@@ -1627,17 +1627,22 @@ func (x *BatchConfig) GetMaxInterval() *durationpb.Duration {
 }
 
 type Assignment struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	WorkerName    string                 `protobuf:"bytes,1,opt,name=worker_name,json=workerName,proto3" json:"worker_name,omitempty"`
-	Epoch         uint64                 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	RunId         string                 `protobuf:"bytes,3,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	Ticket        []byte                 `protobuf:"bytes,4,opt,name=ticket,proto3" json:"ticket,omitempty"` // Flight DoGet ticket
-	Tables        []*TableAssignment     `protobuf:"bytes,5,rep,name=tables,proto3" json:"tables,omitempty"`
-	Batching      *BatchConfig           `protobuf:"bytes,6,opt,name=batching,proto3" json:"batching,omitempty"`                       // already resolved, including worker override
-	ResumeFrom    string                 `protobuf:"bytes,7,opt,name=resume_from,json=resumeFrom,proto3" json:"resume_from,omitempty"` // min() position this worker resumes from
-	SourceKind    string                 `protobuf:"bytes,8,opt,name=source_kind,json=sourceKind,proto3" json:"source_kind,omitempty"` // "mysql" | "postgres" — how to parse positions
-	SourceDsn     string                 `protobuf:"bytes,9,opt,name=source_dsn,json=sourceDsn,proto3" json:"source_dsn,omitempty"`    // query connection for snapshot chunk SELECTs
-	ChunkSize     uint32                 `protobuf:"varint,10,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`  // DBLog chunk granularity for chunk SELECTs
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	WorkerName string                 `protobuf:"bytes,1,opt,name=worker_name,json=workerName,proto3" json:"worker_name,omitempty"`
+	Epoch      uint64                 `protobuf:"varint,2,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	RunId      string                 `protobuf:"bytes,3,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	Ticket     []byte                 `protobuf:"bytes,4,opt,name=ticket,proto3" json:"ticket,omitempty"` // Flight DoGet ticket
+	Tables     []*TableAssignment     `protobuf:"bytes,5,rep,name=tables,proto3" json:"tables,omitempty"`
+	Batching   *BatchConfig           `protobuf:"bytes,6,opt,name=batching,proto3" json:"batching,omitempty"`                       // already resolved, including worker override
+	ResumeFrom string                 `protobuf:"bytes,7,opt,name=resume_from,json=resumeFrom,proto3" json:"resume_from,omitempty"` // min() position this worker resumes from
+	SourceKind string                 `protobuf:"bytes,8,opt,name=source_kind,json=sourceKind,proto3" json:"source_kind,omitempty"` // "mysql" | "postgres" — how to parse positions
+	SourceDsn  string                 `protobuf:"bytes,9,opt,name=source_dsn,json=sourceDsn,proto3" json:"source_dsn,omitempty"`    // query connection for snapshot chunk SELECTs
+	ChunkSize  uint32                 `protobuf:"varint,10,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`  // DBLog chunk granularity for chunk SELECTs
+	// postgres is the JSON spec.PostgresSource the worker rebuilds its snapshot
+	// query source from, needed when the DSN alone cannot express the config —
+	// an SSH tunnel has a DialFunc, not a DSN. Empty means "use source_dsn"
+	// (a URI source, or a scoped read-only snapshotUri).
+	Postgres      []byte `protobuf:"bytes,11,opt,name=postgres,proto3" json:"postgres,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1740,6 +1745,13 @@ func (x *Assignment) GetChunkSize() uint32 {
 		return x.ChunkSize
 	}
 	return 0
+}
+
+func (x *Assignment) GetPostgres() []byte {
+	if x != nil {
+		return x.Postgres
+	}
+	return nil
 }
 
 // ── Acks ─────────────────────────────────────────────────────────────────
@@ -2604,7 +2616,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\fchunk_column\x18\x0f \x01(\tR\vchunkColumn\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
-	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xda\x02\n" +
+	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xf6\x02\n" +
 	"\n" +
 	"Assignment\x12\x1f\n" +
 	"\vworker_name\x18\x01 \x01(\tR\n" +
@@ -2622,7 +2634,8 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"source_dsn\x18\t \x01(\tR\tsourceDsn\x12\x1d\n" +
 	"\n" +
 	"chunk_size\x18\n" +
-	" \x01(\rR\tchunkSize\"\xda\x01\n" +
+	" \x01(\rR\tchunkSize\x12\x1a\n" +
+	"\bpostgres\x18\v \x01(\fR\bpostgres\"\xda\x01\n" +
 	"\x03Ack\x12\x19\n" +
 	"\bbatch_id\x18\x01 \x01(\x04R\abatchId\x12\x14\n" +
 	"\x05epoch\x18\x02 \x01(\x04R\x05epoch\x12\x14\n" +

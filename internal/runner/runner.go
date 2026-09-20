@@ -509,6 +509,16 @@ func rejectCollapsedPartitioning(s *spec.Spec) error {
 func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source, snk sink.Sink) (r *Runner, err error) {
 	log := cfg.Logger
 
+	// A discovery pipeline lists no tables: the source enumerates them now.
+	// Writing the expanded list back into s.Tables makes every later loop
+	// (rejectCollapsedPartitioning, introspection, enrich, plan lookups) see
+	// the discovered set without threading a second list through each.
+	tables, err := source.ExpandTables(ctx, src, s)
+	if err != nil {
+		return nil, fmt.Errorf("runner: %w", err)
+	}
+	s.Tables = tables
+
 	// workers>1 is a distributed-mode contract: the collapsed runner has a
 	// single in-process worker per table and would silently ignore the
 	// partition count, giving the user one worker when they declared N
@@ -619,6 +629,10 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		t := specBySource[ref.Source]
 		cast := casts[ref.Source]
 		mode := t.WriteMode.ChangeMode()
+		if err := dataplane.RequireUpsertKey(ref.Target, ref.PrimaryKey, mode); err != nil {
+			closeStages()
+			return nil, fmt.Errorf("runner: %w", err)
+		}
 		if err := snk.EnsureTable(ctx, ref, resolved[ref.Source], t.PartitionBy, cast, mode); err != nil {
 			closeStages()
 			return nil, fmt.Errorf("runner: ensure %s: %w", ref.Target, err)

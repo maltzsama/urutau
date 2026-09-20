@@ -688,6 +688,45 @@ func TestValidatePostgresRejectsBadInitialWaitTime(t *testing.T) {
 	}
 }
 
+func TestValidatePostgresDiscover(t *testing.T) {
+	base := func() *Spec {
+		return &Spec{
+			Pipeline: "pg",
+			Source: Source{
+				Kind:     "postgres",
+				SlotName: "test_slot",
+				Postgres: &PostgresSource{Host: "localhost", Database: "mydb", Discover: true},
+			},
+			Sink: Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		}
+	}
+
+	// discover with no tables: valid (the source lists them at boot).
+	if err := base().Validate(); err != nil {
+		t.Fatalf("discover-only must be valid, got %v", err)
+	}
+
+	// discover + explicit tables: rejected.
+	s := base()
+	s.Tables = []Table{{Source: "public.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "discover") {
+		t.Fatalf("want a discover/tables conflict, got %v", err)
+	}
+
+	// schemas without discover: advisory warning, not an error.
+	s = base()
+	s.Source.Postgres.Discover = false
+	s.Source.Postgres.Schemas = []string{"public"}
+	s.Tables = []Table{{Source: "public.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("schemas without discover must still validate, got %v", err)
+	}
+	warns := s.Warnings()
+	if len(warns) == 0 || !strings.Contains(warns[0], "schemas") {
+		t.Fatalf("want a schemas warning, got %v", warns)
+	}
+}
+
 func TestValidatePostgresRejectsBadSSLMode(t *testing.T) {
 	s := &Spec{
 		Pipeline: "pg",

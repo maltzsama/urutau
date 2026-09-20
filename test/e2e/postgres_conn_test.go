@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -167,6 +168,52 @@ func TestPostgresSSH(t *testing.T) {
 	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 101`, "ssh-live")
 	checkRun()
 	t.Log("SSH ok: snapshot + live replication through the bastion")
+}
+
+// TestDistributedPostgresSSH covers #170: in distributed mode the worker owns
+// the snapshot chunk SELECT and receives the structured postgres block (SSH
+// included) in its Assignment, because a DSN cannot carry a DialFunc. The
+// worker's snapshot must tunnel through the bastion.
+func TestDistributedPostgresSSH(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := lis.Addr().String()
+	_ = lis.Close()
+
+	db := pgConn(t)
+	pgExec(t, db, `TRUNCATE orders`)
+	dropE2ESlots(t, db)
+	dropIcebergTable(t, ctx)
+	seedPostgresOrders(t, db, 0, 50)
+
+	s := structuredPostgresSpec(t, &spec.PostgresSource{
+		Host: "postgres", Port: 5432, Database: "shop", Username: "repl", Password: "replpass",
+		SSH: &spec.SSHConfig{
+			Host: "127.0.0.1", Port: 2222, Username: "tunnel",
+			PrivateKey: "postgres/ssh/client_ed25519", KnownHosts: "postgres/ssh/known_hosts",
+		},
+	}, "urutau_e2e_ssh_dist")
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 2}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	names := s.Tables[0].WorkerGroupNames(s.Pipeline)
+	if len(names) != 2 {
+		t.Fatalf("want 2 worker groups, got %d", len(names))
+	}
+	stop, waitDone := bootPipeline(t, ctx, addr, s, names[0], names[1])
+	defer func() { stop(); _ = waitDone() }()
+
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(50))
+	waitTrino(t, ctx, `SELECT v FROM orders WHERE id = 25`, "seed-25")
+	t.Log("distributed SSH ok: worker snapshot through the bastion")
 }
 
 // TestPostgresReconnect kills the replication backend mid-stream and proves
