@@ -17,7 +17,7 @@ second, looser path.
 pipeline: orders            # required; names the run and its worker groups
 source: { … }               # required; where rows come from
 sink: { … }                 # required; where rows go
-tables: [ … ]               # required; at least one
+tables: [ … ]               # required; at least one — unless source.postgres.discover is set
 ```
 
 ## `source`
@@ -62,8 +62,8 @@ When present, `uri` is ignored for connection building.
 | `maxThreads` | no | Max concurrent snapshot connections and row-normalization workers (1..32, default `runtime.NumCPU()`) |
 | `retryCount` | no | Transient-error retries with backoff for snapshot queries and replication reconnect (default 3; 0 means "use the default") |
 | `initialWaitTime` | no | Seconds the CDC reader waits for the first WAL message before failing with a non-retryable error (minimum 30, default 300) |
-| `schemas` | no | Limits `discover` to these schemas (default: all accessible) |
-| `discover` | no | Replicates every table the user may `SELECT` (base tables and partitioned parents) instead of an explicit `tables` list; mutually exclusive with `tables` |
+| `schemas` | no | Limits `discover` to these schemas (default: every accessible schema) |
+| `discover` | no | Replicates **every** table the user may `SELECT` (base tables and partitioned parents) instead of an explicit `tables` list. Mutually exclusive with `tables`; targets derive as `<sink.namespace>.<table>`. See [Table discovery](../sources/postgres.md#table-discovery) |
 
 In distributed mode the worker opens the snapshot `SELECT` from a DSN rendered
 from this block. `ssl.ca`/`ssl.cert`/`ssl.key` travel as **paths**, so every

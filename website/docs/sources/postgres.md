@@ -82,32 +82,10 @@ and reused.
 | `schemas` | all accessible | Limits `discover` to these schemas |
 | `discover` | `false` | Replicates every table the user may `SELECT` (base tables and partitioned parents) instead of an explicit `tables` list. Mutually exclusive with `tables` |
 
-### Table discovery
+### Discovery
 
-With `discover: true` the spec omits `tables` entirely; the source lists every
-table the connected user may `SELECT` at boot, and each target is derived as
-`<sink.namespace>.<table>`:
-
-```yaml
-source:
-  kind: postgres
-  slotName: shop_slot
-  postgres:
-    host: db.example.com
-    database: shop
-    username: repl
-    password: secret
-    discover: true
-    schemas: [public, analytics]
-sink:
-  namespace: raw
-```
-
-`public.orders` becomes `raw.orders`. Leaf partitions are **not** discovered —
-the partitioned parent covers their rows — and materialized views and foreign
-tables are skipped (they cannot take `REPLICA IDENTITY FULL` or join a
-publication). Two schemas holding the same table name collide on the derived
-target and are a boot error; list those tables explicitly with distinct targets.
+See [Table discovery](#table-discovery) below — `discover: true` replaces the
+explicit `tables` list. `schemas` limits which schemas are scanned.
 
 ### Distributed mode
 
@@ -117,6 +95,92 @@ chunk `SELECT` from this block. `ssl.ca`, `ssl.cert` and `ssl.key` are sent as
 coordinator. An `ssh` block is shipped to the worker in its Assignment — a DSN
 cannot carry a tunnel — so the worker also needs the private key at the
 configured path (see the [Kubernetes guide](../guides/deploy-kubernetes.md)).
+
+## Table discovery
+
+Instead of listing every table, `discover: true` replicates **all** tables the
+connected user may `SELECT`. The spec then omits `tables` entirely — discovery
+and an explicit `tables` list are **mutually exclusive** (declaring both is a
+validation error).
+
+```yaml
+pipeline: shop
+source:
+  kind: postgres
+  slotName: shop_slot
+  postgres:
+    host: db.example.com
+    database: shop
+    username: repl
+    password: secret
+    discover: true
+    schemas: [public, analytics]   # optional; omit to scan every accessible schema
+sink:
+  uri: http://polaris:8181/api/catalog
+  namespace: raw
+  warehouse: quickstart_catalog
+```
+
+There is no `tables:` block. Every discovered table is written to
+`<sink.namespace>.<table name>`: `public.orders` → `raw.orders`,
+`analytics.events` → `raw.events`.
+
+### What is discovered — and what is not
+
+| Included | Excluded | Why |
+|----------|----------|-----|
+| Base tables (`relkind = 'r'`) | Leaf partitions (`relispartition`) | The partitioned **parent** already holds every leaf's rows; replicating both would write each row twice. |
+| Partitioned parents (`relkind = 'p'`) | Materialized views (`'m'`) | They cannot take `REPLICA IDENTITY FULL` or join a publication. |
+| | Foreign tables (`'f'`) | Same, and their rows live on another server. |
+| | `pg_*`, `information_schema` | System catalogs. |
+
+A table is included only when the connected user has `SELECT` on the table
+**and** `USAGE` on its schema.
+
+### Target names
+
+The source **schema is dropped**, not prefixed — the target is
+`<sink.namespace>.<table name>`. So `public.orders` and `analytics.orders` both
+derive `raw.orders`: a **collision**, which is a **boot error**, not a silent
+overwrite. To replicate two schemas that share a table name, use an explicit
+`tables` list with distinct targets (discovery off).
+
+### Primary keys
+
+Discovery declares no keys. For each discovered table the source reads the
+table's **actual primary key** from the catalog and replicates it in the default
+`upsert` mode. A table **without** a primary key has no equality key: the
+pipeline fails at boot with a clear error rather than writing an unkeyed upsert.
+Replicate such a table with `writeMode: append` and an explicit `tables` list
+(which means discovery off for that pipeline). A partitioned parent needs a
+primary key on the parent, as usual.
+
+### Re-discovery on every start
+
+Discovery runs at each start, before the snapshot and the publication sync:
+
+- A table **added** since the last run is discovered, added to the publication,
+  and snapshotted (it has no committed position yet).
+- A table **removed** is dropped from the publication.
+- A table whose **schema changed** is re-introspected.
+
+No restart flag is needed — the discovered set is recomputed on every boot.
+
+### Partitioned tables and CDC
+
+A discovered partitioned parent is replicated as **one** logical table. Its
+live changes are published as the parent (the publication is created with
+`publish_via_partition_root = true`), which requires **PostgreSQL 13+**. On an
+older server a partitioned table is rejected at setup, rather than silently
+dropping its live stream.
+
+### Distributed (Kubernetes) mode
+
+A discovery pipeline has no tables at operator time, so the operator cannot
+render a per-table worker Pod template. It renders **one generic template**
+instead, and the coordinator clones it for every discovered target. Nothing
+extra to configure — see the
+[Kubernetes guide](../guides/deploy-kubernetes.md).
 
 ## Requirements
 
