@@ -33,6 +33,19 @@ func publishViaPartitionRootSupported(ctx context.Context, db *sql.DB) bool {
 	return vnum >= 130000
 }
 
+// isPartitionedParent reports whether schema.table is a partitioned table
+// (relkind 'p'). On a server without publish_via_partition_root, replicating
+// one would silently drop its live changes.
+func isPartitionedParent(ctx context.Context, db *sql.DB, schema, table string) bool {
+	var partitioned bool
+	err := db.QueryRowContext(ctx, `
+		SELECT c.relkind = 'p'
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, schema, table).Scan(&partitioned)
+	return err == nil && partitioned
+}
+
 // EnsureSetup makes the server side ready, idempotently:
 //
 //   - REPLICA IDENTITY FULL on every replicated table, so updates and
@@ -51,10 +64,25 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 		return fmt.Errorf("postgres: ensure: no tables")
 	}
 
+	// Validate every source name before touching the database: a malformed
+	// spec must fail without a query.
 	for _, ref := range tables {
-		schema, table, ok := strings.Cut(ref.Source, ".")
-		if !ok {
+		if _, _, ok := strings.Cut(ref.Source, "."); !ok {
 			return fmt.Errorf("postgres: ensure: source %q must be schema.table", ref.Source)
+		}
+	}
+
+	// publish_via_partition_root (PG13+): without it, logical decoding
+	// publishes a partitioned table's changes under each LEAF relation, and
+	// the reader — bound to the parent's relation id — silently ignores them,
+	// so the target goes stale after the snapshot. On an older server, reject
+	// a partitioned table rather than lose its live changes.
+	viaRoot := publishViaPartitionRootSupported(ctx, db)
+
+	for _, ref := range tables {
+		schema, table, _ := strings.Cut(ref.Source, ".")
+		if !viaRoot && isPartitionedParent(ctx, db, schema, table) {
+			return fmt.Errorf("postgres: %s is a partitioned table but the server is older than PostgreSQL 13 (no publish_via_partition_root); its live changes would be dropped — upgrade to 13+, or replicate the leaf tables explicitly", ref.Source)
 		}
 		if _, err := db.ExecContext(ctx,
 			fmt.Sprintf(`ALTER TABLE %s.%s REPLICA IDENTITY FULL`,
@@ -70,12 +98,6 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 	).Scan(&exists); err != nil {
 		return fmt.Errorf("postgres: publication lookup: %w", err)
 	}
-	// publish_via_partition_root (PG13+): without it, logical decoding
-	// publishes a partitioned table's changes under each LEAF relation, and
-	// the reader — bound to the parent's relation id — silently ignores them,
-	// so the target goes stale after the snapshot. Set it at creation and
-	// repair an existing publication.
-	viaRoot := publishViaPartitionRootSupported(ctx, db)
 	if !exists {
 		defs := make([]string, 0, len(tables))
 		for _, ref := range tables {
