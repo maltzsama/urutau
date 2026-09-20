@@ -37,7 +37,7 @@ func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 // A nil CompactionConfig must fall through to iceberg-go's own
 // compaction.DefaultConfig() untouched.
 func TestCompactionConfigFromDefaults(t *testing.T) {
-	cfg := compactionConfigFrom(nil)
+	cfg := compactionConfigFrom(nil, discardLogger())
 	def := compaction.DefaultConfig()
 	if cfg.TargetFileSizeBytes != def.TargetFileSizeBytes || cfg.MinInputFiles != def.MinInputFiles {
 		t.Errorf("nil config = %+v, want iceberg-go's own default %+v", cfg, def)
@@ -45,7 +45,7 @@ func TestCompactionConfigFromDefaults(t *testing.T) {
 }
 
 func TestCompactionConfigFromTargetFileSize(t *testing.T) {
-	cfg := compactionConfigFrom(&spec.CompactionConfig{TargetFileSize: "128Mi"})
+	cfg := compactionConfigFrom(&spec.CompactionConfig{TargetFileSize: "128Mi"}, discardLogger())
 	want := int64(128 * 1024 * 1024)
 	if cfg.TargetFileSizeBytes != want {
 		t.Fatalf("TargetFileSizeBytes = %d, want %d", cfg.TargetFileSizeBytes, want)
@@ -65,43 +65,43 @@ func TestCompactionConfigFromTargetFileSize(t *testing.T) {
 // rejects it first), but compactionConfigFrom must not panic or produce a
 // zero/negative size if it somehow does — it silently keeps the default.
 func TestCompactionConfigFromBadTargetFileSizeKeepsDefault(t *testing.T) {
-	def := compactionConfigFrom(nil)
-	cfg := compactionConfigFrom(&spec.CompactionConfig{TargetFileSize: "not-a-size"})
+	def := compactionConfigFrom(nil, discardLogger())
+	cfg := compactionConfigFrom(&spec.CompactionConfig{TargetFileSize: "not-a-size"}, discardLogger())
 	if cfg.TargetFileSizeBytes != def.TargetFileSizeBytes {
 		t.Errorf("bad TargetFileSize changed the default: got %d, want %d", cfg.TargetFileSizeBytes, def.TargetFileSizeBytes)
 	}
 }
 
 func TestCompactionConfigFromMinInputFiles(t *testing.T) {
-	cfg := compactionConfigFrom(&spec.CompactionConfig{MinInputFiles: 10})
+	cfg := compactionConfigFrom(&spec.CompactionConfig{MinInputFiles: 10}, discardLogger())
 	if cfg.MinInputFiles != 10 {
 		t.Fatalf("MinInputFiles = %d, want 10", cfg.MinInputFiles)
 	}
 }
 
 func TestDurationOr(t *testing.T) {
-	if got := durationOr("", 5*time.Minute); got != 5*time.Minute {
+	if got := durationOr("", 5*time.Minute, discardLogger(), "x"); got != 5*time.Minute {
 		t.Errorf("empty string: got %v, want default", got)
 	}
-	if got := durationOr("not-a-duration", 5*time.Minute); got != 5*time.Minute {
+	if got := durationOr("not-a-duration", 5*time.Minute, discardLogger(), "x"); got != 5*time.Minute {
 		t.Errorf("malformed: got %v, want default", got)
 	}
-	if got := durationOr("0s", 5*time.Minute); got != 5*time.Minute {
+	if got := durationOr("0s", 5*time.Minute, discardLogger(), "x"); got != 5*time.Minute {
 		t.Errorf("zero duration: got %v, want default (a zero interval would busy-loop)", got)
 	}
-	if got := durationOr("10m", 5*time.Minute); got != 10*time.Minute {
+	if got := durationOr("10m", 5*time.Minute, discardLogger(), "x"); got != 10*time.Minute {
 		t.Errorf("valid: got %v, want 10m", got)
 	}
 }
 
 func TestIntOr(t *testing.T) {
-	if got := intOr(0, 1); got != 1 {
+	if got := intOr(0, 1, discardLogger(), "x"); got != 1 {
 		t.Errorf("zero: got %d, want default", got)
 	}
-	if got := intOr(-1, 1); got != 1 {
+	if got := intOr(-1, 1, discardLogger(), "x"); got != 1 {
 		t.Errorf("negative: got %d, want default", got)
 	}
-	if got := intOr(3, 1); got != 3 {
+	if got := intOr(3, 1, discardLogger(), "x"); got != 3 {
 		t.Errorf("positive: got %d, want 3", got)
 	}
 }

@@ -32,17 +32,25 @@ type Sink struct {
 // Open dials the catalog and ensures the namespace, returning a Sink that
 // satisfies the full sink.Sink contract.
 func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
+	// Fail fast: an empty client id/secret would build the literal credential
+	// ":" and surface as a confusing OAuth error from the catalog. Name the
+	// missing field instead.
+	clientID := cfg.Options[driver.OptClientID]
+	clientSecret := cfg.Options[driver.OptClientSecret]
+	if clientID == "" || clientSecret == "" {
+		return nil, fmt.Errorf("iceberg: sink.clientId and sink.clientSecret are required")
+	}
 	cat, err := NewCatalog(ctx, Config{
 		URI:          cfg.URI,
 		Warehouse:    cfg.Options[driver.OptWarehouse],
-		ClientID:     cfg.Options[driver.OptClientID],
-		ClientSecret: cfg.Options[driver.OptClientSecret],
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
 		Scope:        cfg.Options[driver.OptScope],
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := EnsureNamespace(ctx, cat, table.Identifier{cfg.Namespace}); err != nil {
+	if err := EnsureNamespace(ctx, cat, splitIdentifier(cfg.Namespace)); err != nil {
 		return nil, err
 	}
 	return &Sink{
@@ -54,34 +62,53 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 }
 
 // evolveSchemaFrom reports whether the sink.evolveSchema option is on. Only
-// the exact "true" enables it; an absent or malformed value keeps the
-// fail-closed default.
-func evolveSchemaFrom(s string) bool { return s == "true" }
+// the exact "true" enables it; an absent value keeps the fail-closed default,
+// and a non-empty value that is neither "true" nor "false" is invalid — it is
+// logged, not silently ignored.
+func evolveSchemaFrom(s string) bool {
+	if s != "" && s != "true" && s != "false" {
+		slog.Default().Warn("iceberg: ignoring invalid sink.evolveSchema", "value", s)
+	}
+	return s == "true"
+}
 
 // targetFileSizeFrom parses the spec's byte-size string ("128Mi", "512Mi")
-// into bytes. Empty or malformed yields 0 — "no override", iceberg-go's own
-// default. spec.Validate already rejected malformed strings before a spec
-// reaches here, so the fallback is defense, not the primary path. It must go
-// through spec.ParseBytes (the "Mi"/"Gi" grammar), not strconv.ParseInt: the
-// spec stores the operator's spelling, not a plain byte count.
+// into bytes. Empty yields 0 — "no override", iceberg-go's own default; a
+// non-empty but malformed or non-positive value is invalid and logged.
+// spec.Validate already rejected malformed strings before a spec reaches here,
+// so the fallback is defense, not the primary path. It must go through
+// spec.ParseBytes (the "Mi"/"Gi" grammar), not strconv.ParseInt: the spec
+// stores the operator's spelling, not a plain byte count.
 func targetFileSizeFrom(s string) int64 {
 	if s == "" {
 		return 0
 	}
 	n, err := spec.ParseBytes(s)
 	if err != nil || n <= 0 {
+		slog.Default().Warn("iceberg: ignoring invalid sink.defaults.targetFileSize", "value", s)
 		return 0
 	}
 	return n
 }
 
-// ident resolves a target table name into an iceberg identifier, falling
-// back to the namespace for bare names.
+// ident resolves a target table name into an iceberg identifier. A dotted
+// target is the full path — the namespace levels followed by the table — so a
+// multi-level namespace ("a.b.c" -> namespace a.b, table c) is not mis-split
+// into a table literally named "b.c". A bare name takes the configured
+// namespace.
 func (s *Sink) ident(target string) table.Identifier {
-	if ns, name, ok := strings.Cut(target, "."); ok {
-		return table.Identifier{ns, name}
+	if target == "" {
+		return splitIdentifier(s.ns)
 	}
-	return table.Identifier{s.ns, target}
+	if strings.Contains(target, ".") {
+		return splitIdentifier(target)
+	}
+	return append(splitIdentifier(s.ns), target)
+}
+
+// splitIdentifier splits a dotted path into its levels.
+func splitIdentifier(s string) table.Identifier {
+	return strings.Split(s, ".")
 }
 
 // EnsureTable creates the target table from the canonical schema if absent,

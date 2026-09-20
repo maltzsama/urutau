@@ -204,7 +204,7 @@ func (m *Maintainer) compactOnce(ctx context.Context) (did bool, err error) {
 		return false, fmt.Errorf("iceberg maintenance: compaction: load table: %w", err)
 	}
 
-	compCfg := compactionConfigFrom(m.cfg.Compaction)
+	compCfg := compactionConfigFrom(m.cfg.Compaction, m.log)
 	plan, err := compaction.Analyze(ctx, tbl, compCfg)
 	if err != nil {
 		return false, fmt.Errorf("iceberg maintenance: compaction: analyze: %w", err)
@@ -291,8 +291,8 @@ func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {
 
 	txn := tbl.NewTransaction()
 	if err := txn.ExpireSnapshots(
-		table.WithRetainLast(intOr(e.RetainLast, defaultSnapshotExpiryRetain)),
-		table.WithOlderThan(durationOr(e.MaxAge, defaultSnapshotExpiryMaxAge)),
+		table.WithRetainLast(intOr(e.RetainLast, defaultSnapshotExpiryRetain, m.log, "retainLast")),
+		table.WithOlderThan(durationOr(e.MaxAge, defaultSnapshotExpiryMaxAge, m.log, "maxAge")),
 	); err != nil {
 		return fmt.Errorf("iceberg maintenance: snapshot expiry: %w", err)
 	}
@@ -326,7 +326,7 @@ func (m *Maintainer) cleanOrphans(ctx context.Context) error {
 		return fmt.Errorf("iceberg maintenance: orphan cleanup: load table: %w", err)
 	}
 
-	result, err := tbl.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(durationOr(o.OlderThan, defaultOrphanCleanupOlderThan)))
+	result, err := tbl.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(durationOr(o.OlderThan, defaultOrphanCleanupOlderThan, m.log, "olderThan")))
 	if err != nil {
 		if m.metrics != nil {
 			m.metrics.OrphanCleanupRun(identString(m.ident), 0, 0, err)
@@ -348,13 +348,16 @@ func (m *Maintainer) cleanOrphans(ctx context.Context) error {
 // the doc comments on spec.CompactionConfig) where the operator left a
 // field unset. TargetFileSize is parsed once here rather than in Validate,
 // which only rejects malformed strings.
-func compactionConfigFrom(c *spec.CompactionConfig) compaction.Config {
+func compactionConfigFrom(c *spec.CompactionConfig, log *slog.Logger) compaction.Config {
 	cfg := compaction.DefaultConfig()
 	if c == nil {
 		return cfg
 	}
 	if c.TargetFileSize != "" {
-		if n, err := spec.ParseBytes(c.TargetFileSize); err == nil && n > 0 {
+		n, err := spec.ParseBytes(c.TargetFileSize)
+		if err != nil || n <= 0 {
+			log.Warn("iceberg: ignoring invalid maintenance.compaction.targetFileSize", "value", c.TargetFileSize)
+		} else {
 			cfg.TargetFileSizeBytes = n
 			cfg.MinFileSizeBytes = n * 3 / 4
 			cfg.MaxFileSizeBytes = n * 9 / 5
@@ -367,23 +370,30 @@ func compactionConfigFrom(c *spec.CompactionConfig) compaction.Config {
 }
 
 // durationOr parses a spec duration string, falling back to def when s is
-// empty or malformed. Validate already rejects malformed strings before a
-// spec reaches here, so the fallback on parse error is defense, not the
-// primary path.
-func durationOr(s string, def time.Duration) time.Duration {
+// empty. A non-empty but malformed (or non-positive) value is invalid, not
+// unset: it is replaced by the default and logged, so a configuration mistake
+// is visible. Validate already rejects malformed strings before a spec reaches
+// here, so this is defense, not the primary path.
+func durationOr(s string, def time.Duration, log *slog.Logger, field string) time.Duration {
 	if s == "" {
 		return def
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
+		log.Warn("iceberg: ignoring invalid maintenance duration", "field", field, "value", s)
 		return def
 	}
 	return d
 }
 
-// intOr returns n, or def when n is zero (an unset config value).
-func intOr(n int, def int) int {
-	if n <= 0 {
+// intOr returns n, or def when n is zero (an unset config value). A negative
+// value is invalid: it is replaced by the default and logged.
+func intOr(n int, def int, log *slog.Logger, field string) int {
+	if n == 0 {
+		return def
+	}
+	if n < 0 {
+		log.Warn("iceberg: ignoring negative maintenance value", "field", field, "value", n)
 		return def
 	}
 	return n
