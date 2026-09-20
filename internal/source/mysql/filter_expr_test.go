@@ -93,3 +93,44 @@ func TestProjectionRejectsUnknownFilterColumn(t *testing.T) {
 		t.Fatal("a filter on an unknown column must error")
 	}
 }
+
+func TestProjectionKeepCaseInsensitive(t *testing.T) {
+	tbl := &schema.Table{
+		Schema: "shop", Name: "orders",
+		Columns: []schema.TableColumn{
+			{Name: "id", Type: schema.TYPE_NUMBER},
+			{Name: "status", Type: schema.TYPE_STRING, Collation: "utf8mb4_0900_ai_ci"},
+			{Name: "code", Type: schema.TYPE_STRING, Collation: "utf8mb4_bin"},
+		},
+	}
+	// A _ci column matches case-insensitively, matching the snapshot.
+	p, err := newProjection(nil, &spec.Filter{
+		Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "active"},
+	}, tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := p.keep(map[string]any{"status": "ACTIVE"}); err != nil || !ok {
+		t.Fatalf("_ci keep(ACTIVE) = %v, %v; want true", ok, err)
+	}
+	// A _bin column stays case-sensitive.
+	b, err := newProjection(nil, &spec.Filter{
+		Predicate: &spec.Predicate{Column: "code", Op: spec.OpEq, Value: "abc"},
+	}, tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := b.keep(map[string]any{"code": "ABC"}); err != nil || ok {
+		t.Fatalf("_bin keep(ABC) = %v, %v; want false", ok, err)
+	}
+}
+
+func TestRequireFullImage(t *testing.T) {
+	tbl := ordersTable()
+	if err := requireFullImage(tbl, []any{int64(1), "a", 1.0}); err != nil {
+		t.Fatalf("a full row must pass: %v", err)
+	}
+	if err := requireFullImage(tbl, []any{int64(1)}); err == nil {
+		t.Fatal("a partial row must fail loud")
+	}
+}

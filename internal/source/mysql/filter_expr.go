@@ -147,10 +147,25 @@ func filterExprPredicate(p *spec.Predicate, tbl *schema.Table) (string, error) {
 	lhs := raw
 	if columnIsNumeric(tbl, p.Column) {
 		lhs = "float(" + raw + ")"
+	} else if columnIsCaseInsensitive(tbl, p.Column) {
+		// The snapshot compares in the column's case-insensitive collation;
+		// lower() reproduces the common case so the two paths agree.
+		lhs = "lower(" + raw + ")"
+	}
+	// literal renders a filter value, matching the LHS collation when needed.
+	literal := func(v any) (string, error) {
+		l, err := exprLiteral(v)
+		if err != nil {
+			return "", err
+		}
+		if columnIsCaseInsensitive(tbl, p.Column) {
+			return "lower(" + l + ")", nil
+		}
+		return l, nil
 	}
 	switch p.Op {
 	case spec.OpEq, spec.OpNeq, spec.OpLt, spec.OpLte, spec.OpGt, spec.OpGte:
-		lit, err := exprLiteral(p.Value)
+		lit, err := literal(p.Value)
 		if err != nil {
 			return "", err
 		}
@@ -162,7 +177,7 @@ func filterExprPredicate(p *spec.Predicate, tbl *schema.Table) (string, error) {
 		}
 		lits := make([]string, 0, len(vals))
 		for _, v := range vals {
-			l, err := exprLiteral(v)
+			l, err := literal(v)
 			if err != nil {
 				return "", err
 			}
@@ -259,6 +274,26 @@ func columnIsNumeric(tbl *schema.Table, name string) bool {
 // columnIsDecimal reports whether the column is DECIMAL, compared exactly.
 func columnIsDecimal(tbl *schema.Table, name string) bool {
 	return columnType(tbl, name) == schema.TYPE_DECIMAL
+}
+
+// columnIsCaseInsensitive reports whether the column is a string type with a
+// case-insensitive collation (MySQL's default). The snapshot compares in that
+// collation, so the CDC must match: a `_ci` string column is compared through
+// lower(). (Accent-insensitivity is not reproduced.)
+func columnIsCaseInsensitive(tbl *schema.Table, name string) bool {
+	if tbl == nil {
+		return false
+	}
+	i := tbl.FindColumn(name)
+	if i < 0 {
+		return false
+	}
+	switch tbl.Columns[i].Type {
+	case schema.TYPE_STRING, schema.TYPE_ENUM, schema.TYPE_SET:
+	default:
+		return false
+	}
+	return strings.Contains(strings.ToLower(tbl.Columns[i].Collation), "_ci")
 }
 
 func columnType(tbl *schema.Table, name string) int {

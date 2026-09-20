@@ -437,6 +437,14 @@ func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replic
 func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) (rowchange.Change, bool, error) {
 	proj := r.projections[ref.Source]
 	loc := r.loc()
+	if err := requireFullImage(tbl, after); err != nil {
+		return rowchange.Change{}, false, err
+	}
+	if before != nil {
+		if err := requireFullImage(tbl, before); err != nil {
+			return rowchange.Change{}, false, err
+		}
+	}
 	c := rowchange.Change{
 		Op:       op,
 		Table:    ref.Target,
@@ -516,6 +524,18 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 		c.After = proj.project(full)
 		return c, true, nil
 	}
+}
+
+// requireFullImage fails loud when the binlog row carries fewer columns than
+// the table. That happens only under binlog_row_image != FULL, where unchanged
+// columns are omitted — decoding such a row would silently treat the missing
+// columns as nil and corrupt the target. The boot preflight warns; this is the
+// runtime guarantee that a partial image never lands.
+func requireFullImage(tbl *schema.Table, row []any) error {
+	if len(row) < len(tbl.Columns) {
+		return fmt.Errorf("mysql: binlog row image carries %d of %d columns — set binlog_row_image=FULL (a partial image cannot be decoded safely)", len(row), len(tbl.Columns))
+	}
+	return nil
 }
 
 // loc returns the operator's temporal location, defaulting to UTC.
