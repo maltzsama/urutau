@@ -35,13 +35,20 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 	if sb == nil {
 		return
 	}
+	// Read the worker and its epoch under c.mu: resetWorker writes w.epoch
+	// under c.mu from the supervisor/dashboard goroutines, so an unlocked read
+	// here is a data race (issue #207).
+	c.mu.Lock()
 	w := c.workers[worker]
 	if w == nil {
+		c.mu.Unlock()
 		c.log.Warn("coordinator: staged batch from unknown worker", "worker", worker)
 		return
 	}
-	if sb.Epoch != w.epoch {
-		c.log.Warn("coordinator: stale staged epoch", "worker", worker, "have", w.epoch, "got", sb.Epoch)
+	epoch := w.epoch
+	c.mu.Unlock()
+	if sb.Epoch != epoch {
+		c.log.Warn("coordinator: stale staged epoch", "worker", worker, "have", epoch, "got", sb.Epoch)
 		return
 	}
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
