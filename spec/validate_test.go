@@ -975,3 +975,15 @@ func TestValidateChunkColumnMustBePK(t *testing.T) {
 		t.Fatalf("chunkColumn on the pk must validate: %v", err)
 	}
 }
+
+func TestValidateMaxReconnectAttempts(t *testing.T) {
+	s := &Spec{
+		Pipeline: "mysql",
+		Source:   Source{Kind: "mysql", URI: "mysql://repl@db/shop", ServerID: "1101", MaxReconnectAttempts: -1},
+		Sink:     Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables:   []Table{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "maxReconnectAttempts") {
+		t.Fatalf("want maxReconnectAttempts problem, got %v", err)
+	}
+}

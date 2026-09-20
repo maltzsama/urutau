@@ -47,18 +47,29 @@ type Config struct {
 	// DATETIME/TIMESTAMP/DATE values so they match the snapshot query (issue
 	// #139). Nil means UTC.
 	TimeLocation *time.Location
+	// MaxReconnectAttempts bounds the canal reconnect budget (#182). 0 means
+	// infinite retry in go-mysql, which would hide a permanently broken
+	// stream; the adapter resolves the spec's default before it reaches here.
+	MaxReconnectAttempts int
+	// Projections is the per-source read projection (#183), keyed by
+	// "db.table": the columns to emit and the compiled filter. Built by the
+	// adapter from the introspected table.
+	Projections map[string]projection
 }
 
 // Reader wraps a canal instance and decodes its row events.
 type Reader struct {
-	cfg     Config
-	canal   *canal.Canal
-	out     chan<- rowchange.Change
-	bySrc   map[string]TableRef // "db.table" → ref (PK + target)
-	mu      sync.Mutex
-	curSet  *position.GTID // accumulated GTID set through the current transaction
-	curGTID string         // curSet.String() — the position rows of this txn carry
-	curTxn  *position.GTID // single GTID of the transaction being decoded (window check)
+	cfg   Config
+	canal *canal.Canal
+	out   chan<- rowchange.Change
+	bySrc map[string]TableRef // "db.table" → ref (PK + target)
+	// projections is the per-source read projection (#183): the columns to
+	// emit and the compiled filter, applied on each decoded row.
+	projections map[string]projection
+	mu          sync.Mutex
+	curSet      *position.GTID // accumulated GTID set through the current transaction
+	curGTID     string         // curSet.String() — the position rows of this txn carry
+	curTxn      *position.GTID // single GTID of the transaction being decoded (window check)
 	// curCommitTS is the transaction's commit time, captured on the GTID
 	// event and stamped onto every row of the transaction (issue #137).
 	curCommitTS time.Time
@@ -131,7 +142,7 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		return nil, fmt.Errorf("mysql: new canal: %w", err)
 	}
 
-	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc, done: make(chan struct{})}
+	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc, projections: cfg.Projections, done: make(chan struct{})}
 	c.SetEventHandler(r)
 	return r, nil
 }
@@ -154,6 +165,9 @@ func canalConfig(cfg Config, includeRegex []string) *canal.Config {
 		ParseTime: true,
 		Logger:    cfg.Logger,
 		TLSConfig: cfg.TLSConfig,
+		// A finite reconnect budget: 0 would retry a permanently broken
+		// stream forever instead of surfacing the failure (#182).
+		MaxReconnectAttempts: cfg.MaxReconnectAttempts,
 	}
 }
 
@@ -201,6 +215,13 @@ func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error 
 		// as this call's own error rather than through ctx.Done(). It is
 		// an orderly stop, not a stream failure.
 		if err != nil && !errors.Is(err, errReaderStopped) {
+			// 1236 ER_MASTER_FATAL_ERROR_READING_BINLOG: the binlog was
+			// purged or the position is invalid — a distinct, actionable
+			// condition, not a generic stream end (#182).
+			var myErr *gomysql.MyError
+			if errors.As(err, &myErr) && myErr.Code == gomysql.ER_MASTER_FATAL_ERROR_READING_BINLOG {
+				return fmt.Errorf("mysql: binlog purged or position invalid (error %d): %w", myErr.Code, err)
+			}
 			return fmt.Errorf("mysql: stream ended: %w", err)
 		}
 		return nil
@@ -330,7 +351,13 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	switch e.Action {
 	case canal.InsertAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos, commitTS)
+			c, emit, err := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos, commitTS)
+			if err != nil {
+				return err
+			}
+			if !emit {
+				continue
+			}
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -338,7 +365,13 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			c := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos, commitTS)
+			c, emit, err := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos, commitTS)
+			if err != nil {
+				return err
+			}
+			if !emit {
+				continue
+			}
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -347,7 +380,13 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
-			c := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos, commitTS)
+			c, emit, err := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos, commitTS)
+			if err != nil {
+				return err
+			}
+			if !emit {
+				continue
+			}
 			c.Window = win
 			if err := r.emit(c); err != nil {
 				return err
@@ -387,10 +426,17 @@ func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replic
 	return nil
 }
 
-// decode maps one row (in table column order) to a rowchange. key is built from
-// the spec primary key columns, in spec order. commitTS is the transaction's
-// commit time, carried onto every row of the transaction.
-func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) rowchange.Change {
+// decode maps one row (in table column order) to a rowchange, applying the
+// table's read projection and filter (#183). It returns emit=false when the
+// filter excludes the row. key is built from the spec primary key columns, in
+// spec order. commitTS is the transaction's commit time, carried onto every
+// row of the transaction.
+//
+// The binlog puts the deleted row in the after slot for a DELETE and the old
+// row in before / the new row in after for an UPDATE.
+func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) (rowchange.Change, bool, error) {
+	proj := r.projections[ref.Source]
+	loc := r.loc()
 	c := rowchange.Change{
 		Op:       op,
 		Table:    ref.Target,
@@ -398,29 +444,78 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 		CommitTS: commitTS,
 		IngestTS: time.Now(),
 	}
-
-	key := make([]any, 0, len(ref.PrimaryKey))
-	for _, pk := range ref.PrimaryKey {
-		if idx := tbl.FindColumn(pk); idx >= 0 {
-			key = append(key, after[idx])
-		} else {
-			key = append(key, nil)
+	keyFrom := func(row []any) []any {
+		key := make([]any, 0, len(ref.PrimaryKey))
+		for _, pk := range ref.PrimaryKey {
+			if idx := tbl.FindColumn(pk); idx >= 0 && idx < len(row) {
+				key = append(key, row[idx])
+			} else {
+				key = append(key, nil)
+			}
 		}
+		return key
 	}
-	c.Key = key
 
-	loc := r.loc()
-	if op == rowchange.OpDelete {
+	switch op {
+	case rowchange.OpDelete:
+		full := rowToMap(tbl, after, loc)
+		keep, err := proj.keep(full)
+		if err != nil {
+			return rowchange.Change{}, false, err
+		}
+		if !keep {
+			return rowchange.Change{}, false, nil
+		}
+		c.Key = keyFrom(after)
+		c.Before = proj.project(full)
+		return c, true, nil
+	case rowchange.OpUpdate:
+		fullAfter := rowToMap(tbl, after, loc)
+		var fullBefore map[string]any
 		if before != nil {
-			c.Before = rowToMap(tbl, before, loc)
+			fullBefore = rowToMap(tbl, before, loc)
 		}
-		return c
+		afterKeep, err := proj.keep(fullAfter)
+		if err != nil {
+			return rowchange.Change{}, false, err
+		}
+		beforeKeep := false
+		if fullBefore != nil {
+			if beforeKeep, err = proj.keep(fullBefore); err != nil {
+				return rowchange.Change{}, false, err
+			}
+		}
+		switch {
+		case !afterKeep && !beforeKeep:
+			return rowchange.Change{}, false, nil
+		case beforeKeep && !afterKeep:
+			// The row left the filter: emit a delete so an upsert target
+			// removes the now-excluded row instead of keeping a stale copy.
+			c.Op = rowchange.OpDelete
+			c.Key = keyFrom(before)
+			c.Before = proj.project(fullBefore)
+			return c, true, nil
+		default:
+			c.Key = keyFrom(after)
+			c.After = proj.project(fullAfter)
+			if fullBefore != nil {
+				c.Before = proj.project(fullBefore)
+			}
+			return c, true, nil
+		}
+	default: // insert
+		full := rowToMap(tbl, after, loc)
+		keep, err := proj.keep(full)
+		if err != nil {
+			return rowchange.Change{}, false, err
+		}
+		if !keep {
+			return rowchange.Change{}, false, nil
+		}
+		c.Key = keyFrom(after)
+		c.After = proj.project(full)
+		return c, true, nil
 	}
-	c.After = rowToMap(tbl, after, loc)
-	if before != nil {
-		c.Before = rowToMap(tbl, before, loc)
-	}
-	return c
 }
 
 // loc returns the operator's temporal location, defaulting to UTC.

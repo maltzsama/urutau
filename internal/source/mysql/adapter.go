@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/schema"
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/maltzsama/urutau/core"
@@ -82,16 +83,80 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 			pk = append(pk, st.Columns[idx].Name)
 		}
 	}
+	// A column projection must name real columns and keep every key column:
+	// the sink resolves the key and the snapshot SELECT uses the projection
+	// verbatim (#183).
+	if err := checkColumnFilterExists(st, t.ColumnFilter); err != nil {
+		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: %s: %w", t.Source, err)
+	}
+	if err := checkColumnFilterCoversPK(t.ColumnFilter, pk); err != nil {
+		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: %s: %w", t.Source, err)
+	}
 	cs, err := CanonicalSchema(st)
 	if err != nil {
 		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: schema %s: %w", t.Source, err)
 	}
+	cs = core.FilterSchemaColumns(cs, t.ColumnFilter)
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
-// NewChunker builds the chunk SELECT source for one table.
+// tableFor returns the spec table matching a source identifier.
+func (a Source) tableFor(source string) (spec.Table, bool) {
+	for _, t := range a.spec.Tables {
+		if t.Source == source {
+			return t, true
+		}
+	}
+	return spec.Table{}, false
+}
+
+// checkColumnFilterExists reports an error when a projected column is not in
+// the source table — a typo would otherwise silently narrow the target schema
+// (FilterSchemaColumns drops unknown names).
+func checkColumnFilterExists(tbl *schema.Table, columnFilter []string) error {
+	for _, c := range columnFilter {
+		if tbl.FindColumn(c) < 0 {
+			return fmt.Errorf("columnFilter %q not found in the source table", c)
+		}
+	}
+	return nil
+}
+
+// checkColumnFilterCoversPK reports an error when a primary-key column is not
+// in the projection — the sink resolves the equality key by column name.
+func checkColumnFilterCoversPK(columnFilter, pk []string) error {
+	if len(columnFilter) == 0 || len(pk) == 0 {
+		return nil
+	}
+	keep := make(map[string]bool, len(columnFilter))
+	for _, c := range columnFilter {
+		keep[c] = true
+	}
+	for _, k := range pk {
+		if !keep[k] {
+			return fmt.Errorf("columnFilter must include primary key column %q", k)
+		}
+	}
+	return nil
+}
+
+// NewChunker builds the chunk SELECT source for one table. The column
+// projection (#162/#183) and row filter (#163/#183) come from the spec; a
+// chunkColumn that differs from the primary key is rejected — MySQL chunks by
+// primary key only.
 func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
-	return NewChunker(a.db, source, pk, chunkSize, a.loc)
+	t, _ := a.tableFor(source)
+	// A chunkColumn equal to the PK is what MySQL already does; only a
+	// different one is unsupported. (The coordinator fills chunkColumn with
+	// the PK for workers>1, so rejecting every non-empty value would break it.)
+	if t.ChunkColumn != "" && t.ChunkColumn != pk {
+		return nil, fmt.Errorf("mysql: %s: chunkColumn %q is not supported — MySQL chunks by primary key (%q) only", source, t.ChunkColumn, pk)
+	}
+	filter, err := compileFilterSQL(t.Filter)
+	if err != nil {
+		return nil, err
+	}
+	return NewChunker(a.db, source, pk, chunkSize, a.loc, t.ColumnFilter, filter)
 }
 
 // CloseQuery releases the query connection.
@@ -108,26 +173,20 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan rowchange.Change, 1024)
-	rdr, err := New(ctx, Config{
-		Addr:         conn.Addr(),
-		User:         conn.User,
-		Password:     conn.Password,
-		ServerID:     a.rt.ServerID,
-		Heartbeat:    a.rt.Heartbeat,
-		Tables:       refs,
-		Logger:       a.rt.Logger,
-		TLSConfig:    conn.TLSConfig(),
-		TimeLocation: conn.TimeLocation(),
-	}, out)
-	if err != nil {
-		return nil, err
+	// Preflight before opening the replication connection: a server that
+	// cannot produce the events the reader needs must fail loud, not boot
+	// healthy and replicate nothing (#182).
+	if warn, verr := ValidateServer(ctx, a.db); verr != nil {
+		return nil, verr
+	} else if warn != "" {
+		a.rt.Logger.Warn("mysql: server preflight", "warning", warn)
 	}
-	puller := sourcepull.New(out)
-	// Introspect each table so live batches encode against the canonical
-	// schema — a stable shape per table, never a per-drain inference.
+	out := make(chan rowchange.Change, 1024)
+	// Introspect each table once: the canonical schema (stable wire shape) and
+	// the read projection (#183: the column list and the compiled filter).
+	schemas := make(map[string]core.Schema, len(refs))
+	projections := make(map[string]projection, len(refs))
 	if a.db != nil {
-		schemas := make(map[string]core.Schema, len(refs))
 		for _, ref := range refs {
 			schemaName, tableName, ok := strings.Cut(ref.Source, ".")
 			if !ok {
@@ -141,11 +200,35 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 			if serr != nil {
 				return nil, fmt.Errorf("mysql: schema %s: %w", ref.Source, serr)
 			}
-			schemas[ref.Target] = cs
+			t, _ := a.tableFor(ref.Source)
+			proj, perr := newProjection(t.ColumnFilter, t.Filter, st)
+			if perr != nil {
+				return nil, fmt.Errorf("mysql: %s: %w", ref.Source, perr)
+			}
+			schemas[ref.Target] = core.FilterSchemaColumns(cs, t.ColumnFilter)
+			projections[ref.Source] = proj
 		}
-		puller.SetSchemas(schemas)
 	}
-	return stream{Reader: rdr, out: out, Puller: puller}, nil
+
+	rdr, err := New(ctx, Config{
+		Addr:                 conn.Addr(),
+		User:                 conn.User,
+		Password:             conn.Password,
+		ServerID:             a.rt.ServerID,
+		Heartbeat:            a.rt.Heartbeat,
+		Tables:               refs,
+		Logger:               a.rt.Logger,
+		TLSConfig:            conn.TLSConfig(),
+		TimeLocation:         conn.TimeLocation(),
+		MaxReconnectAttempts: resolveMaxReconnectAttempts(a.spec.Source.MaxReconnectAttempts),
+		Projections:          projections,
+	}, out)
+	if err != nil {
+		return nil, err
+	}
+	puller := sourcepull.New(out)
+	puller.SetSchemas(schemas)
+	return stream{Reader: rdr, db: a.db, out: out, Puller: puller}, nil
 }
 
 // InitialPosition returns the master's executed GTID set — the same query
@@ -171,6 +254,7 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 // universe ends at the CDC decoder; the worker is fully columnar.
 type stream struct {
 	*Reader
+	db  *sql.DB
 	out chan rowchange.Change
 	*sourcepull.Puller
 }
@@ -181,8 +265,50 @@ func (s stream) Start(ctx context.Context, from position.Position) error {
 	if !ok {
 		return fmt.Errorf("mysql: start position must be a GTID set, got %T", from)
 	}
+	if err := s.checkNotPurged(ctx, g); err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
 	s.SetErr(errCh)
 	go func() { errCh <- s.StartFromGTID(ctx, g) }()
 	return nil
+}
+
+// checkNotPurged compares the resume GTID against the server's gtid_purged. If
+// a purged transaction is not contained in the resume set, the binlog the
+// pipeline still needs is gone — resuming would skip the gap silently, so it
+// fails loud instead. An empty resume (first boot) needs no check: the
+// snapshot covers the history.
+func (s stream) checkNotPurged(ctx context.Context, resume *position.GTID) error {
+	if resume == nil || resume.String() == "" {
+		return nil
+	}
+	var raw string
+	if err := s.db.QueryRowContext(ctx, `SELECT @@GLOBAL.gtid_purged`).Scan(&raw); err != nil {
+		return fmt.Errorf("mysql: gtid_purged: %w", err)
+	}
+	purged, err := position.ParseGTID(raw)
+	if err != nil {
+		return fmt.Errorf("mysql: gtid_purged %q: %w", raw, err)
+	}
+	if !resume.Contains(purged) {
+		return fmt.Errorf("mysql: binlog purged past the resume position: %s is not contained in %s — a re-snapshot is required", purged, resume)
+	}
+	return nil
+}
+
+// defaultMaxReconnectAttempts is the MySQL canal reconnect budget when the
+// spec leaves source.maxReconnectAttempts unset.
+const defaultMaxReconnectAttempts = 3
+
+// resolveMaxReconnectAttempts applies the default. A negative value is clamped
+// to 0 (the spec validator rejects it; this is defense in depth).
+func resolveMaxReconnectAttempts(n int) int {
+	if n == 0 {
+		return defaultMaxReconnectAttempts
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
 }

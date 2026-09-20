@@ -28,6 +28,7 @@ tables: [ … ]               # required; at least one — unless source.postgre
 | `uri` | yes* | Connection string: a MySQL/Postgres DSN, or the Kafka broker list. On Kubernetes, filled from `URUTAU_SOURCE_URI`. *Mutually exclusive with `postgres` |
 | `snapshotUri` | no | Read-only URI for the snapshot `SELECT`; lets a worker run as a SELECT-only user. Falls back to `uri` |
 | `serverId` | mysql | Replication server id (string holding a `uint32`). Must be unique per MySQL instance |
+| `maxReconnectAttempts` | no | MySQL binlog reader reconnect budget (default 3). Without a bound a permanently broken stream retries forever |
 | `slotName` | postgres | Logical replication slot; required for Postgres |
 | `snapshotMode` | no | `none` disables the snapshot. Must be `none` for Kafka |
 | `groupId` | kafka | Consumer group |
