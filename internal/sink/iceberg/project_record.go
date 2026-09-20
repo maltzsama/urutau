@@ -391,6 +391,13 @@ func extractKeys(batches []*dataplane.Batch, pkCols []string) ([][]any, error) {
 // would write a NULL key that matches no row, so the delete would silently
 // never apply.
 func scalarValue(col arrow.Array, row int) (any, error) {
+	// A NULL key value cannot be an equality-delete key: the delete would
+	// match no row. Falling through to c.Value(row) is worse — the array's
+	// zero value (0, "", false) matches the row whose PK is exactly that, so
+	// the delete would erase the WRONG row. Fail loud instead.
+	if col.IsNull(row) {
+		return nil, fmt.Errorf("iceberg: NULL primary-key value cannot be an equality-delete key")
+	}
 	switch c := col.(type) {
 	case *array.Int64:
 		return c.Value(row), nil
