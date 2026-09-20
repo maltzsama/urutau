@@ -43,8 +43,12 @@ const (
 	// isRetryableError classification and backoffDuration jitter as the
 	// writer.
 	maintainerMaxTries = 8
-	maintainerBackoff  = time.Second
 )
+
+// maintainerBackoff is the maintenance retry base delay (see maintainerMaxTries
+// for the budget rationale). It is a var, not a const, so a test can collapse
+// the backoff instead of waiting ~two minutes.
+var maintainerBackoff = time.Second
 
 // Maintainer executes the three Iceberg table-maintenance operations
 // (compaction, snapshot expiry, orphan cleanup) for one table. It is
@@ -316,21 +320,46 @@ func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {
 // than SnapshotExpiryConfig.MaxAge — this one protects against deleting a
 // file a concurrent read or in-flight commit might still reference, not
 // against stranding cdc.position recovery.
+//
+// Retried on the same terms as compact and expireSnapshots: the LoadTable
+// competes with a concurrent CDC commit on the metadata pointer, so a
+// transient failure gets a short retry rather than skipping the run.
 func (m *Maintainer) cleanOrphans(ctx context.Context) error {
+	var lastErr error
+	for attempt := 0; attempt < maintainerMaxTries; attempt++ {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, backoffDuration(maintainerBackoff, attempt)); err != nil {
+				return err
+			}
+		}
+		err := m.cleanOrphansOnce(ctx)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			if m.metrics != nil {
+				m.metrics.OrphanCleanupRun(identString(m.ident), 0, 0, err)
+			}
+			return err
+		}
+		lastErr = err
+	}
+	if m.metrics != nil {
+		m.metrics.OrphanCleanupRun(identString(m.ident), 0, 0, lastErr)
+	}
+	return fmt.Errorf("%w: orphan cleanup on %v: %w", ErrCommitExhausted, m.ident, lastErr)
+}
+
+// cleanOrphansOnce runs one orphan-cleanup attempt against the table.
+func (m *Maintainer) cleanOrphansOnce(ctx context.Context) error {
 	o := m.cfg.OrphanCleanup
 	tbl, err := m.cat.LoadTable(ctx, m.ident)
 	if err != nil {
-		if m.metrics != nil {
-			m.metrics.OrphanCleanupRun(identString(m.ident), 0, 0, err)
-		}
 		return fmt.Errorf("iceberg maintenance: orphan cleanup: load table: %w", err)
 	}
 
 	result, err := tbl.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(durationOr(o.OlderThan, defaultOrphanCleanupOlderThan, m.log, "olderThan")))
 	if err != nil {
-		if m.metrics != nil {
-			m.metrics.OrphanCleanupRun(identString(m.ident), 0, 0, err)
-		}
 		return fmt.Errorf("iceberg maintenance: orphan cleanup: %w", err)
 	}
 
