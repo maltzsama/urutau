@@ -69,9 +69,6 @@ type TableWriter struct {
 // The cast policy is applied to source column values during projection; the
 // metadata columns are projected from the change header.
 func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identifier, primaryKey []string, cast core.CastPolicy, meta []core.MetadataColumn, sourceTable string, targetFileSize int64) (*TableWriter, error) {
-	if len(primaryKey) == 0 {
-		return nil, fmt.Errorf("iceberg: %v: primary key is required", ident)
-	}
 	tbl, err := cat.LoadTable(ctx, ident)
 	if err != nil {
 		return nil, fmt.Errorf("iceberg: load %v: %w", ident, err)
@@ -171,6 +168,13 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// (columnar). The append path is fully columnar (projectRecord); the
 	// equality-delete keys are extracted for iceberg-go, whose API takes keys
 	// — the §4.1 library boundary, not a data-path materialization.
+	//
+	// An empty equality-delete key means the table has no primary key, which
+	// is only valid for append-only tables (the append branch above). Reject
+	// it here, before the key extraction fails obscurely.
+	if len(w.eqIDs) == 0 {
+		return fmt.Errorf("iceberg: %v: upsert requires a primary key", w.ident)
+	}
 	upsertBatch, deleteBatch, err := splitByOp(ctx, b)
 	if err != nil {
 		return err

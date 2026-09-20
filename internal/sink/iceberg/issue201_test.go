@@ -12,6 +12,8 @@ import (
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
 // #201.1: an int64 beyond 2^53 cannot be represented exactly as float64 and
@@ -35,12 +37,30 @@ func TestAppendColumnInt64Float64Precision(t *testing.T) {
 	}
 }
 
-// #201.4: NewTableWriter rejects an empty primary key before touching the
-// catalog (a nil catalog proves the early return).
-func TestNewTableWriterRejectsEmptyPrimaryKey(t *testing.T) {
-	_, err := NewTableWriter(context.Background(), nil, table.Identifier{"raw", "t"}, nil, core.CastPolicy{}, nil, "", 0)
-	if err == nil || !strings.Contains(err.Error(), "primary key") {
-		t.Fatalf("empty primary key = %v, want a primary-key error", err)
+// #201.4: an upsert commit needs an equality-delete key; the writer rejects an
+// empty one before key extraction fails obscurely. An append-only table (no
+// primary key) never reaches this branch, so it must still construct.
+func TestCommitUpsertRequiresPrimaryKey(t *testing.T) {
+	b := wireBatch(t, [3]any{int64(1), "x", rowchange.OpInsert})
+	defer b.Release()
+	b.Mode = dataplane.UpsertMode
+
+	w := &TableWriter{ident: table.Identifier{"raw", "t"}}
+	if err := w.Commit(context.Background(), b); err == nil || !strings.Contains(err.Error(), "primary key") {
+		t.Fatalf("upsert with no primary key = %v, want a primary-key error", err)
+	}
+}
+
+// An append-only table has no primary key; NewTableWriter must still build.
+func TestNewTableWriterAllowsEmptyPrimaryKeyForAppend(t *testing.T) {
+	ctx := context.Background()
+	s := hadoopSink(t)
+	ref := core.TableRef{Target: "events"} // append-only: no primary key
+	if err := s.EnsureTable(ctx, ref, canonicalSchema(), nil, core.CastPolicy{}, dataplane.AppendMode); err != nil {
+		t.Fatalf("EnsureTable(append): %v", err)
+	}
+	if _, err := NewTableWriter(ctx, s.cat, s.ident("events"), nil, core.CastPolicy{}, nil, "src.events", 0); err != nil {
+		t.Fatalf("an append-only table must construct a writer with no primary key: %v", err)
 	}
 }
 
