@@ -289,7 +289,12 @@ func (r *CoordinatorReconciler) ensure(ctx context.Context, desired client.Objec
 }
 
 // deleteCoordinator removes the coordinator StatefulSet (the worker pods are
-// GC'd by ownership).
+// GC'd by ownership). The finalizer is removed as soon as the StatefulSet
+// delete is issued, not when the owned Pods are gone: the cascade GC is
+// asynchronous, so a pipeline recreated immediately can briefly coexist with
+// the old generation's Pods (issue #254). That is accepted — the names are
+// per-pipeline and the old Pods carry the old ownerReference, so they cannot
+// be adopted by the new generation.
 func (r *CoordinatorReconciler) deleteCoordinator(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) error {
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
 		Name:      coordinatorName(cr),
@@ -363,9 +368,18 @@ func coordinatorRole(cr *urutauv1alpha1.CDCPipeline) *rbacv1.Role {
 	rules := []rbacv1.PolicyRule{
 		{
 			APIGroups:     []string{"urutau.io"},
-			Resources:     []string{"cdcpipelines", "cdcpipelines/status"},
+			Resources:     []string{"cdcpipelines"},
 			ResourceNames: []string{cr.Name},
 			Verbs:         []string{"get", "update", "patch"},
+		},
+		{
+			// The status subresource is its own rule without resourceNames:
+			// some authorizers ignore resourceNames on a subresource, so
+			// scoping it to cr.Name would silently deny the coordinator its
+			// own status (issue #257). It stays in the pipeline's namespace.
+			APIGroups: []string{"urutau.io"},
+			Resources: []string{"cdcpipelines/status"},
+			Verbs:     []string{"get", "update", "patch"},
 		},
 		{
 			APIGroups: []string{"apps"},
