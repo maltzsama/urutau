@@ -58,6 +58,16 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 	schema := baseSchema()
 	bb := array.NewRecordBuilder(alloc, schema)
 
+	// Metadata columns looked up by name: a reorder of WireMetadataFields()
+	// then fails on the builder type assertion here, rather than writing to
+	// the wrong field silently (issue #222).
+	opCol := colIndex(schema, "__op")
+	posCol := colIndex(schema, "__pos")
+	commitCol := colIndex(schema, "__commit_ts")
+	ingestCol := colIndex(schema, "__ingest_ts")
+	snapshotCol := colIndex(schema, "__snapshot")
+	phaseCol := colIndex(schema, "__phase")
+
 	// Track last value per PK for __before_val (real before-image).
 	lastVal := make(map[int64]string)
 
@@ -91,7 +101,7 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 				op = OpUpdate
 			}
 		}
-		bb.Field(5).(*array.Uint8Builder).Append(op)
+		bb.Field(opCol).(*array.Uint8Builder).Append(op)
 
 		// __before_val: last known val for this PK (real before-image for
 		// updates/deletes), null for inserts.
@@ -114,20 +124,20 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 
 		// __pos: monotonically increasing within batch (§3.3 precondition)
 		pos := fmt.Sprintf("pos-%04d", i)
-		bb.Field(6).(*array.StringBuilder).Append(pos)
+		bb.Field(posCol).(*array.StringBuilder).Append(pos)
 
 		// __commit_ts (nanoseconds per M2a decision)
 		ts := timeFromNsOffset(int64(i))
-		bb.Field(7).(*array.TimestampBuilder).AppendTime(ts)
+		bb.Field(commitCol).(*array.TimestampBuilder).AppendTime(ts)
 
 		// __ingest_ts (microseconds — same as commit for test purposes)
-		bb.Field(8).(*array.TimestampBuilder).AppendTime(ts)
+		bb.Field(ingestCol).(*array.TimestampBuilder).AppendTime(ts)
 
 		// __snapshot (boolean — false for live data)
-		bb.Field(9).(*array.BooleanBuilder).Append(false)
+		bb.Field(snapshotCol).(*array.BooleanBuilder).Append(false)
 
 		// __phase (string — "stream" for live data)
-		bb.Field(10).(*array.StringBuilder).Append("stream")
+		bb.Field(phaseCol).(*array.StringBuilder).Append("stream")
 	}
 
 	rec := bb.NewRecordBatch()
