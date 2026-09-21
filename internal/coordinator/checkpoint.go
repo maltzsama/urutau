@@ -75,11 +75,19 @@ func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*po
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for worker, idx := range index {
+			// Snapshot the worker names first: index is populated at boot and
+			// never mutated today, but iterating a copy is robust to a future
+			// dynamically-added worker (issue #213).
+			workers := make([]string, 0, len(index))
+			for w := range index {
+				workers = append(workers, w)
+			}
+			for _, worker := range workers {
+				idx := index[worker]
 				if !idx.Dirty() {
 					continue
 				}
-				m := idx.Manifest()
+				m, gen := idx.Manifest()
 				body, err := json.Marshal(m)
 				if err != nil {
 					log.Warn("checkpoint: marshal", "run", runID, "worker", worker, "err", err)
