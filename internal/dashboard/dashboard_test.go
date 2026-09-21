@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -169,5 +170,46 @@ func TestStreamSendsSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(got.String(), `"pipeline":"shop"`) {
 		t.Fatalf("snapshot missing the pipeline: %q", got.String())
+	}
+}
+
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("boom") }
+
+// #225: writeSSE must surface the writer's error so the stream loop can abort
+// on a disconnected client.
+func TestWriteSSEReturnsError(t *testing.T) {
+	if err := writeSSE(errWriter{}, "ev", []byte("x")); err == nil {
+		t.Fatal("writeSSE must return the writer's error")
+	}
+}
+
+// #226: Record must copy the caller's fields map, not store it by reference.
+func TestEventsRecordClonesFields(t *testing.T) {
+	e := NewEvents(4)
+	fields := map[string]any{"worker": "w", "k": "v"}
+	e.Record("commit", fields)
+	fields["k"] = "mutated"
+
+	got := e.List("", "", 10)
+	if len(got) != 1 || got[0].Fields["k"] != "v" {
+		t.Fatalf("Record stored the caller's map: %+v", got)
+	}
+}
+
+// #227: a cyclic map logged as an attr must not recurse until stack overflow.
+func TestJSONSafeValueCyclicTerminates(t *testing.T) {
+	m := map[string]any{}
+	m["self"] = m
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = jsonSafeAttrs(map[string]any{"m": m})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("jsonSafeAttrs on a cyclic map did not terminate")
 	}
 }
