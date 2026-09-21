@@ -368,6 +368,14 @@ func EncodeKey(record arrow.RecordBatch, row int, pkIdxs []int, pkCols []string)
 		typeTimestamp byte = 0x0B
 		typeBinary    byte = 0x0C
 		typeFSB       byte = 0x0D // FixedSizeBinary (UUID)
+		// Narrow integer widths carry their OWN tag: reusing typeInt32 for an
+		// Int16 payload would make the tag ambiguous with a truncated Int32
+		// (issue #220).
+		typeInt8   byte = 0x0E
+		typeInt16  byte = 0x0F
+		typeUInt8  byte = 0x10
+		typeUInt16 byte = 0x11
+		typeUInt32 byte = 0x12
 	)
 	var buf []byte
 	var lenBuf [4]byte
@@ -384,6 +392,14 @@ func EncodeKey(record arrow.RecordBatch, row int, pkIdxs []int, pkCols []string)
 			return nil, fmt.Errorf("dataplane: encode key: null in PK column %q at row %d", col, row)
 		}
 		switch a := arr.(type) {
+		case *array.Int8:
+			buf = append(buf, typeInt8)
+			buf = append(buf, byte(a.Value(row)))
+		case *array.Int16:
+			buf = append(buf, typeInt16)
+			var v [2]byte
+			binary.LittleEndian.PutUint16(v[:], uint16(a.Value(row)))
+			buf = append(buf, v[:]...)
 		case *array.Int32:
 			buf = append(buf, typeInt32)
 			binary.LittleEndian.PutUint32(lenBuf[:], uint32(a.Value(row)))
@@ -393,6 +409,18 @@ func EncodeKey(record arrow.RecordBatch, row int, pkIdxs []int, pkCols []string)
 			var v [8]byte
 			binary.LittleEndian.PutUint64(v[:], uint64(a.Value(row)))
 			buf = append(buf, v[:]...)
+		case *array.Uint8:
+			buf = append(buf, typeUInt8)
+			buf = append(buf, a.Value(row))
+		case *array.Uint16:
+			buf = append(buf, typeUInt16)
+			var v [2]byte
+			binary.LittleEndian.PutUint16(v[:], a.Value(row))
+			buf = append(buf, v[:]...)
+		case *array.Uint32:
+			buf = append(buf, typeUInt32)
+			binary.LittleEndian.PutUint32(lenBuf[:], a.Value(row))
+			buf = append(buf, lenBuf[:]...)
 		case *array.Uint64:
 			buf = append(buf, typeUInt64)
 			var v [8]byte

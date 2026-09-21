@@ -6,6 +6,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/internal/dataplane"
 )
@@ -377,4 +378,61 @@ func TestEncodeKeyV4AllTypes(t *testing.T) {
 	if key1[0] != 0x01 { // typeInt32
 		t.Errorf("first key byte = 0x%02X, want 0x01 (Int32 prefix)", key1[0])
 	}
+}
+
+// #220: EncodeKey covers the narrow integer widths, each with its own type
+// tag, so equal values of different types never collide.
+func TestEncodeKeyNarrowIntWidths(t *testing.T) {
+	types := []arrow.DataType{
+		arrow.PrimitiveTypes.Int8,
+		arrow.PrimitiveTypes.Int16,
+		arrow.PrimitiveTypes.Int32,
+		arrow.PrimitiveTypes.Int64,
+		arrow.PrimitiveTypes.Uint8,
+		arrow.PrimitiveTypes.Uint16,
+		arrow.PrimitiveTypes.Uint32,
+		arrow.PrimitiveTypes.Uint64,
+	}
+	seen := map[string]arrow.DataType{}
+	for _, typ := range types {
+		rec := singleIntRecord(t, typ, 1)
+		key, err := dataplane.EncodeKey(rec, 0, []int{0}, []string{"k"})
+		rec.Release()
+		if err != nil {
+			t.Fatalf("%s: %v", typ, err)
+		}
+		if prev, dup := seen[string(key)]; dup {
+			t.Fatalf("%s key collides with %s (both encode the value 1)", typ, prev)
+		}
+		seen[string(key)] = typ
+	}
+}
+
+func singleIntRecord(t *testing.T, typ arrow.DataType, v int64) arrow.RecordBatch {
+	t.Helper()
+	schema := arrow.NewSchema([]arrow.Field{{Name: "k", Type: typ}}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	switch tb := b.Field(0).(type) {
+	case *array.Int8Builder:
+		tb.Append(int8(v))
+	case *array.Int16Builder:
+		tb.Append(int16(v))
+	case *array.Int32Builder:
+		tb.Append(int32(v))
+	case *array.Int64Builder:
+		tb.Append(v)
+	case *array.Uint8Builder:
+		tb.Append(uint8(v))
+	case *array.Uint16Builder:
+		tb.Append(uint16(v))
+	case *array.Uint32Builder:
+		tb.Append(uint32(v))
+	case *array.Uint64Builder:
+		tb.Append(uint64(v))
+	default:
+		t.Fatalf("unhandled builder %T", b.Field(0))
+	}
+	rec := b.NewRecordBatch()
+	b.Release()
+	return rec
 }
