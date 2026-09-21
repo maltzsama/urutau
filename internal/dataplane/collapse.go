@@ -140,6 +140,9 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	if err != nil {
 		return nil, nil, fmt.Errorf("dataplane: collapse op mask: %w", err)
 	}
+	// MakeArray retains the array data (array.setData calls data.Retain), so
+	// releasing the datum here is safe: delBool owns its own reference
+	// (issue #221).
 	delBool := delEq.(*compute.ArrayDatum).MakeArray().(*array.Boolean)
 	delEq.Release()
 	defer delBool.Release()
@@ -148,6 +151,7 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	if err != nil {
 		return nil, nil, fmt.Errorf("dataplane: collapse op mask: %w", err)
 	}
+	// Same retain contract as delBool above (issue #221).
 	insUpdBool := insUpdNot.(*compute.ArrayDatum).MakeArray().(*array.Boolean)
 	insUpdNot.Release()
 	defer insUpdBool.Release()
