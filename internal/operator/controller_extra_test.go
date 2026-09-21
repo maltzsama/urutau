@@ -223,3 +223,32 @@ func TestCoordinatorRoleStatusSubresourceUnscoped(t *testing.T) {
 		t.Fatalf("cdcpipelines rule resourceNames = %v, want [orders]", role.Rules[0].ResourceNames)
 	}
 }
+
+// #249: serverId uniqueness is enforced at admission, across CRs in the
+// namespace.
+func TestWebhookRejectsDuplicateServerID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = urutauv1alpha1.AddToScheme(scheme)
+
+	existing := pipelineCR("a", "ns")
+	existing.Spec.Definition.Inline["source"].(map[string]any)["serverId"] = "77"
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	v := &pipelineValidator{client: cli}
+
+	dup := pipelineCR("b", "ns")
+	dup.Spec.Definition.Inline["source"].(map[string]any)["serverId"] = "77"
+	if _, err := v.ValidateCreate(context.Background(), dup); err == nil {
+		t.Fatal("webhook accepted a duplicate serverId")
+	}
+
+	distinct := pipelineCR("c", "ns")
+	distinct.Spec.Definition.Inline["source"].(map[string]any)["serverId"] = "88"
+	if _, err := v.ValidateCreate(context.Background(), distinct); err != nil {
+		t.Fatalf("webhook rejected a distinct serverId: %v", err)
+	}
+
+	// Updating the same CR is not a collision with itself.
+	if _, err := v.ValidateUpdate(context.Background(), existing, existing); err != nil {
+		t.Fatalf("webhook rejected a self-update: %v", err)
+	}
+}

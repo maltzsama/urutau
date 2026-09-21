@@ -10,7 +10,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +25,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
@@ -36,6 +36,11 @@ import (
 )
 
 const finalizer = "urutau.io/finalizer"
+
+// operatorFieldManager owns the fields the operator applies via Server-Side
+// Apply, so a re-apply replaces them and leaves foreign fields (webhook
+// defaults) alone.
+const operatorFieldManager = "urutau-operator"
 
 // specHashAnnotation stamps the resolved spec onto the pod template so a
 // ConfigMap change (which alone never restarts a pod) rolls the coordinator
@@ -238,52 +243,22 @@ func (r *CoordinatorReconciler) eventf(cr *urutauv1alpha1.CDCPipeline, etype, re
 	r.Recorder.Eventf(cr, etype, reason, msg, args...)
 }
 
-// ensure reconciles the desired object with the cluster: create when
-// absent, otherwise update in place (carrying the resource version and any
-// immutable fields from the live object). This is what makes the CR
-// declarative — a spec change propagates on the next reconcile instead of
-// requiring delete-and-recreate.
+// ensure reconciles the desired object with the cluster via Server-Side
+// Apply. Apply merges the operator's fields into the live object: it does not
+// clobber fields the operator does not manage — a mutating webhook's defaults
+// (#252) — and it needs no reflect.DeepEqual, which always differed on the
+// API-server metadata (UID, generation, managedFields) and so wrote on every
+// reconcile (#251). Apply creates the object when absent and leaves
+// API-server-assigned immutable fields (a Service's clusterIP) alone, since the
+// desired object does not set them.
 func (r *CoordinatorReconciler) ensure(ctx context.Context, desired client.Object, what string) error {
-	key := types.NamespacedName{Name: desired.GetName(), Namespace: desired.GetNamespace()}
-	existing, ok := desired.DeepCopyObject().(client.Object)
-	if !ok {
-		return fmt.Errorf("%s: deep copy", what)
+	gvk, err := apiutil.GVKForObject(desired, r.Scheme())
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
 	}
-	err := r.Get(ctx, key, existing)
-	switch {
-	case apierrors.IsNotFound(err):
-		if err := r.Create(ctx, desired); err != nil {
-			return fmt.Errorf("create %s: %w", what, err)
-		}
-		return nil
-	case err != nil:
-		return err
-	}
-	// Immutable fields must survive the update: the Service cluster IP is
-	// assigned once, and the StatefulSet selector/serviceName cannot rowchange.
-	switch d := desired.(type) {
-	case *corev1.Service:
-		e := existing.(*corev1.Service)
-		d.Spec.ClusterIP = e.Spec.ClusterIP
-		d.Spec.ClusterIPs = e.Spec.ClusterIPs
-		d.Spec.IPFamilies = e.Spec.IPFamilies
-	case *appsv1.StatefulSet:
-		e := existing.(*appsv1.StatefulSet)
-		if e.Spec.Selector != nil {
-			d.Spec.Selector = e.Spec.Selector
-		}
-		if e.Spec.ServiceName != "" {
-			d.Spec.ServiceName = e.Spec.ServiceName
-		}
-	}
-	desired.SetResourceVersion(existing.GetResourceVersion())
-	// Skip the update if the desired state is identical to the live state.
-	// This avoids unnecessary API writes on every reconcile.
-	if reflect.DeepEqual(existing, desired) {
-		return nil
-	}
-	if err := r.Update(ctx, desired); err != nil {
-		return fmt.Errorf("update %s: %w", what, err)
+	desired.GetObjectKind().SetGroupVersionKind(gvk)
+	if err := r.Patch(ctx, desired, client.Apply, client.FieldOwner(operatorFieldManager), client.ForceOwnership); err != nil {
+		return fmt.Errorf("apply %s: %w", what, err)
 	}
 	return nil
 }

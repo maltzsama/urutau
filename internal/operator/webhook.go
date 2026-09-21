@@ -7,6 +7,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"sigs.k8s.io/yaml"
@@ -19,23 +20,24 @@ import (
 // SetupWebhookWithManager registers the validating webhook.
 func (r *CoordinatorReconciler) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewWebhookManagedBy(mgr).For(&urutauv1alpha1.CDCPipeline{}).
-		WithValidator(&pipelineValidator{}).Complete()
+		WithValidator(&pipelineValidator{client: mgr.GetClient()}).Complete()
 }
 
 // pipelineValidator validates CDCPipeline spec mutations. The hard rules
-// reuse the same server-side validation the coordinator boot runs.
-type pipelineValidator struct{}
+// reuse the same server-side validation the coordinator boot runs. The client
+// (nil in unit tests) lets it check serverId uniqueness across CRs.
+type pipelineValidator struct{ client client.Client }
 
 var _ webhook.CustomValidator = (*pipelineValidator)(nil)
 
 // ValidateCreate rejects a spec that fails the resolved-spec validation.
 func (v *pipelineValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	return nil, validatePipeline(obj)
+	return nil, v.validate(ctx, obj)
 }
 
 // ValidateUpdate allows unchanged spec; otherwise validates like create.
 func (v *pipelineValidator) ValidateUpdate(ctx context.Context, old, new runtime.Object) (admission.Warnings, error) {
-	return nil, validatePipeline(new)
+	return nil, v.validate(ctx, new)
 }
 
 // ValidateDelete is always allowed.
@@ -43,7 +45,7 @@ func (v *pipelineValidator) ValidateDelete(ctx context.Context, obj runtime.Obje
 	return nil, nil
 }
 
-func validatePipeline(obj runtime.Object) error {
+func (v *pipelineValidator) validate(ctx context.Context, obj runtime.Object) error {
 	cr, ok := obj.(*urutauv1alpha1.CDCPipeline)
 	if !ok {
 		return fmt.Errorf("expected CDCPipeline, got %T", obj)
@@ -107,8 +109,25 @@ func validatePipeline(obj runtime.Object) error {
 		}
 	}
 
-	// serverId uniqueness across CRs is enforced by the operator at
-	// reconcile time (it lists all CRs); the webhook checks the shape here.
+	// serverId must be unique across pipelines: two pipelines sharing a MySQL
+	// server_id fight over the same replication stream and corrupt it. Enforce
+	// it here, where the client is available (issue #249).
+	if sid := inlineServerID(cr); sid != "" && v.client != nil {
+		var list urutauv1alpha1.CDCPipelineList
+		if err := v.client.List(ctx, &list, client.InNamespace(cr.Namespace)); err != nil {
+			return fmt.Errorf("spec.definition.inline: list pipelines: %w", err)
+		}
+		for i := range list.Items {
+			other := &list.Items[i]
+			if other.Name == cr.Name {
+				continue
+			}
+			if inlineServerID(other) == sid {
+				return fmt.Errorf("spec.definition.inline: source.serverId %q is already used by pipeline %q", sid, other.Name)
+			}
+		}
+	}
+
 	if cr.Spec.Coordinator.Snapshot.ChunkSize < 0 {
 		return fmt.Errorf("coordinator.snapshot.chunkSize must be >= 0")
 	}
@@ -116,4 +135,21 @@ func validatePipeline(obj runtime.Object) error {
 		return fmt.Errorf("coordinator.snapshot.maxParallelChunks must be >= 0")
 	}
 	return nil
+}
+
+// inlineServerID returns the source.serverId declared by a CR's inline
+// definition, or "" (no inline definition, or none declared).
+func inlineServerID(cr *urutauv1alpha1.CDCPipeline) string {
+	if len(cr.Spec.Definition.Inline) == 0 {
+		return ""
+	}
+	b, err := yaml.Marshal(cr.Spec.Definition.Inline)
+	if err != nil {
+		return ""
+	}
+	s, err := spec.LoadYAML(bytes.NewReader(b))
+	if err != nil {
+		return ""
+	}
+	return s.Source.ServerID
 }
