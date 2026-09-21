@@ -144,3 +144,25 @@ func TestWindowNoEventsClosesEmitsAll(t *testing.T) {
 		t.Fatalf("batch position = %q, want p5 (marker)", b.Position)
 	}
 }
+
+// #266: AddWindowRows precomputes the window's key set once, so the live path
+// tests membership instead of re-scanning the chunk per row.
+func TestAddWindowRowsBuildsKeySet(t *testing.T) {
+	fc := &fakeCommitter{}
+	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
+	regTable(t, w, "raw.orders", fc, dataplane.UpsertMode)
+	snap := []rowchange.Change{
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}},
+		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "b"}},
+	}
+	if err := w.AddWindowRows("raw.orders", 7, toWindow(t, "raw.orders", snap)); err != nil {
+		t.Fatalf("AddWindowRows: %v", err)
+	}
+	p := w.tables["raw.orders"]
+	p.winMu.Lock()
+	win := p.windows[7]
+	p.winMu.Unlock()
+	if win == nil || len(win.keys) != 2 {
+		t.Fatalf("window keys = %v, want 2 precomputed keys", win)
+	}
+}

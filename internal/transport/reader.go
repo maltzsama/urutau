@@ -200,6 +200,17 @@ func (r *BatchReader) Value(name string, i int) (any, bool) {
 	return v, true
 }
 
+// IsNull reports whether the data column name is NULL at row i. ok is false
+// when the column does not exist. O(1) — unlike Value, it decodes nothing,
+// so a hot path that only needs null-ness should use it (issue #273).
+func (r *BatchReader) IsNull(name string, i int) (bool, bool) {
+	idx, ok := r.dataIndex[name]
+	if !ok {
+		return false, false
+	}
+	return r.rec.Column(idx).IsNull(i), true
+}
+
 // ColumnKind returns the canonical Kind of a data column as carried on the
 // wire. A cast kernel needs it to disambiguate representations that share a
 // Go type ([]byte binary vs uuid; int32 integer vs date; int64 integer vs
