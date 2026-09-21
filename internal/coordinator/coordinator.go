@@ -1617,7 +1617,10 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		subMeta.HighPos = "" // recomputed per sub-batch below
 		subBatch := &dataplane.Batch{Table: b.Table, Record: sub, Watermark: b.Watermark, Mode: b.Mode}
 		if err := c.enqueueTo(ctx, owners[p], subBatch, subMeta); err != nil {
-			sub.Release()
+			// enqueueTo already released subBatch (and its Record — the same
+			// pointer as sub), so do NOT release sub again; release only the
+			// sub-batches not yet sent (issue #217).
+			releaseRecords(subBatches[p+1:])
 			return err
 		}
 	}
@@ -1710,7 +1713,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	}
 	select {
 	case w.queue <- queuedBatch{body: body, meta: metaBytes}:
-		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n})
+		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
 		return nil
 	case <-ctx.Done():
 		c.budget.release(w.name, n)
@@ -1864,16 +1867,29 @@ func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwne
 			&compute.RecordDatum{Value: rec}, &compute.ArrayDatum{Value: idxArr.Data()})
 		idxArr.Release()
 		if err != nil {
-			for _, r := range out {
-				if r != nil {
-					r.Release()
-				}
-			}
+			releaseRecords(out)
 			return nil, fmt.Errorf("partition %d: %w", p, err)
 		}
-		out[p] = datum.(*compute.RecordDatum).Value
+		// Take returns a *RecordDatum for a record input; guard the assertion
+		// so a future kernel change cannot panic the coordinator (issue #211).
+		rd, ok := datum.(*compute.RecordDatum)
+		if !ok {
+			datum.Release()
+			releaseRecords(out)
+			return nil, fmt.Errorf("partition %d: unexpected Take datum %T", p, datum)
+		}
+		out[p] = rd.Value
 	}
 	return out, nil
+}
+
+// releaseRecords releases every non-nil record in a splitByOwner result.
+func releaseRecords(recs []arrow.RecordBatch) {
+	for _, r := range recs {
+		if r != nil {
+			r.Release()
+		}
+	}
 }
 
 // onHello processes a worker's ready Hello: it carries the phase and the
@@ -1902,12 +1918,20 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.noteAck(worker, time.Now())
 	pos, err := c.src.ParsePosition(ack.Position)
 	if err != nil {
+		// The position format is a shared contract; a worker that cannot
+		// produce a valid one is broken, and the ack's batch would sit at the
+		// head of the index forever, leaking its budget charge with no visible
+		// error (issue #210). Terminate for replay instead of continuing.
 		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
+		c.fail(fmt.Errorf("coordinator: worker %s: unparsable ack position %q: %w", worker, ack.Position, err))
 		return
 	}
-	freed := c.index[worker].truncate(ack.Table, pos)
+	freed, freedOversized := c.index[worker].truncate(ack.Table, pos)
 	if freed > 0 {
 		c.budget.release(worker, freed)
+	}
+	if freedOversized {
+		c.budget.clearOversized(worker)
 	}
 	// The ack is evidence of a durable commit: record it and recompute the
 	// pipeline-wide minimum the source's retention may advance to. Keyed by

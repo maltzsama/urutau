@@ -7,6 +7,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
+	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
 )
 
@@ -219,5 +220,28 @@ func TestSplitByOwnerOmitsEmptyPartitions(t *testing.T) {
 	}
 	if subs[1] != nil || subs[2] != nil {
 		t.Fatalf("empty partitions must be nil, got subs[1]=%v subs[2]=%v", subs[1], subs[2])
+	}
+}
+
+// #217: the enqueueBatch error path must not double-release the current
+// sub-batch (enqueueTo already owns its release) and must free the rest. A
+// cancelled context exercises that path without a live stream.
+func TestEnqueueBatchErrorReleasesRemainingSubBatches(t *testing.T) {
+	c, w0 := coordHarness()
+	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
+	c.workers["w1"] = w1
+	c.route["raw.orders"] = []*workerState{w0, w1}
+	c.index["w1"] = newPositionIndex("run-1")
+	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
+	c.partitionRanges = map[string][]source.Chunk{
+		"raw.orders": {{Low: nil, High: []any{int64(100)}}, {Low: []any{int64(100)}, High: nil}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	b := wireBatchIDs(t, 1, 150)
+	if err := c.enqueueBatch(ctx, b, &pb.BatchMeta{Table: "raw.orders"}); err == nil {
+		t.Fatal("a cancelled context must fail the enqueue")
 	}
 }

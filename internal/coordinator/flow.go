@@ -20,6 +20,14 @@ type flowBudget struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 	used map[string]int64
+	// oversizedOwner is the worker holding the single oversized batch the
+	// budget admits at once. A batch larger than the whole ceiling can never
+	// fit it, so waiting for room would deadlock (nothing can free the budget
+	// when nothing is in flight). It is admitted regardless of the sum as
+	// long as no OTHER oversized batch is in flight — that bounds the
+	// over-ceiling memory to one batch while still making progress. Cleared
+	// when that worker's charge returns to zero.
+	oversizedOwner string
 }
 
 func newFlowBudget(totalBytes, perWorkerMin int64) *flowBudget {
@@ -58,13 +66,27 @@ func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error 
 	stop := context.AfterFunc(ctx, func() { b.cond.Broadcast() })
 	defer stop()
 
-	for b.sum()+n > b.totalBytes && b.used[worker]+n > b.perWorkerMin {
+	oversized := n > b.totalBytes
+	for {
+		if oversized {
+			// An oversized batch can never fit the ceiling, so waiting for
+			// room would deadlock; admit it when no other oversized batch is
+			// in flight (issue #209).
+			if b.oversizedOwner == "" {
+				break
+			}
+		} else if b.sum()+n <= b.totalBytes || b.used[worker]+n <= b.perWorkerMin {
+			break
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		b.cond.Wait()
 	}
 	b.used[worker] += n
+	if oversized {
+		b.oversizedOwner = worker
+	}
 	return nil
 }
 
@@ -74,6 +96,25 @@ func (b *flowBudget) release(worker string, n int64) {
 	b.used[worker] -= n
 	if b.used[worker] <= 0 {
 		delete(b.used, worker)
+		if b.oversizedOwner == worker {
+			b.oversizedOwner = ""
+		}
+	}
+	b.mu.Unlock()
+	b.cond.Broadcast()
+}
+
+// isOversized reports whether n is larger than the whole budget — a batch that
+// can never fit the ceiling and so takes the single oversized slot.
+func (b *flowBudget) isOversized(n int64) bool { return n > b.totalBytes }
+
+// clearOversized frees the oversized slot when its batch is acked, so a later
+// oversized batch is not blocked while the owner keeps normal traffic in
+// flight (issue #209 review).
+func (b *flowBudget) clearOversized(worker string) {
+	b.mu.Lock()
+	if b.oversizedOwner == worker {
+		b.oversizedOwner = ""
 	}
 	b.mu.Unlock()
 	b.cond.Broadcast()
@@ -93,6 +134,9 @@ type inflightBatch struct {
 	table string
 	high  position.Position // nil for position-less snapshot rows
 	bytes int64
+	// oversized marks a batch larger than the whole flow budget, so its ack
+	// can release the budget's single oversized slot.
+	oversized bool
 }
 
 // positionIndex tracks each worker's unacked batches so an Ack can release
@@ -172,15 +216,15 @@ type PositionManifest struct {
 // truncate records an Ack and pops every head batch the commit covers: a
 // positioned batch pops once its table acked at or beyond its high
 // position; a position-less batch (snapshot window rows) pops once its
-// table has any ack. It returns the bytes released.
-func (p *positionIndex) truncate(table string, pos position.Position) int64 {
+// table has any ack. It returns the bytes released and whether an oversized
+// batch was among them (so its budget slot can be freed).
+func (p *positionIndex) truncate(table string, pos position.Position) (freed int64, freedOversized bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if cur, ok := p.acked[table]; !ok || advances(pos, cur) {
 		p.acked[table] = pos
 		p.dirty = true
 	}
-	var freed int64
 	for len(p.head) > 0 {
 		h := p.head[0]
 		if h.high == nil {
@@ -191,10 +235,13 @@ func (p *positionIndex) truncate(table string, pos position.Position) int64 {
 			break
 		}
 		freed += h.bytes
+		if h.oversized {
+			freedOversized = true
+		}
 		p.head = p.head[1:]
 		p.dirty = true
 	}
-	return freed
+	return freed, freedOversized
 }
 
 // advances reports whether pos is provably strictly greater than cur. An
