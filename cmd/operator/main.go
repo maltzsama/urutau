@@ -37,11 +37,13 @@ func run() error {
 		metricsAddr   string
 		probeAddr     string
 		image         string
+		fieldManager  string
 		enableWebhook bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe endpoint")
 	flag.StringVar(&image, "coordinator-image", "", "coordinator container image (required)")
+	flag.StringVar(&fieldManager, "field-manager", operator.DefaultFieldManager, "Server-Side Apply field manager name (must be unique per controller managing the same objects)")
 	flag.BoolVar(&enableWebhook, "enable-webhook", true, "enable the admission webhook")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -73,8 +75,9 @@ func run() error {
 	// One reconciler instance serves both the controller and the webhook so
 	// any future state (caches, limits) is shared, not duplicated.
 	r := &operator.CoordinatorReconciler{
-		Client: mgr.GetClient(),
-		Image:  image,
+		Client:       mgr.GetClient(),
+		Image:        image,
+		FieldManager: fieldManager,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller: %w", err)

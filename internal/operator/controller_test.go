@@ -649,3 +649,58 @@ func TestReconcilerUnbricksOnSpecChange(t *testing.T) {
 	}
 	t.Fatal("a corrected spec never cleared the terminal state")
 }
+
+// #251/#252: ensure uses Server-Side Apply, so a foreign field on a managed
+// object survives a reconcile (it merges, it does not replace).
+func TestReconcilePreservesForeignFields(t *testing.T) {
+	requireEnvtest(t)
+	nsName := "test-merge-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	_ = cli.Create(testCtx, ns)
+
+	cr := pipelineCR("merge", nsName)
+	if err := cli.Create(testCtx, cr); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+	sts := waitForSTS(t, nsName, "merge-coordinator")
+
+	// A foreign label the operator does not manage.
+	if sts.Labels == nil {
+		sts.Labels = map[string]string{}
+	}
+	sts.Labels["example.com/foreign"] = "keep"
+	if err := cli.Update(testCtx, sts); err != nil {
+		t.Fatalf("add foreign label: %v", err)
+	}
+
+	// Trigger a reconcile by changing a mutable knob.
+	fresh := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "merge", Namespace: nsName}, fresh); err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	fresh.Spec.Coordinator.MetricsAddr = ":9999"
+	if err := cli.Update(testCtx, fresh); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+
+	// Wait for the reconcile to observe the new generation, then assert the
+	// foreign label survived.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		got := &urutauv1alpha1.CDCPipeline{}
+		if err := cli.Get(testCtx, types.NamespacedName{Name: "merge", Namespace: nsName}, got); err != nil {
+			t.Fatalf("get CR: %v", err)
+		}
+		if got.Status.ObservedGeneration == got.Generation {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	got := &appsv1.StatefulSet{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "merge-coordinator", Namespace: nsName}, got); err != nil {
+		t.Fatalf("get statefulset: %v", err)
+	}
+	if got.Labels["example.com/foreign"] != "keep" {
+		t.Fatalf("a foreign label was clobbered by the reconcile: %v", got.Labels)
+	}
+}
