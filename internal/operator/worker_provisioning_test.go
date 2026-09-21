@@ -112,7 +112,7 @@ func TestCoordinatorConfigMapRendersOneTemplatePerTable(t *testing.T) {
 		t.Fatalf("coordinatorConfigMap: %v", err)
 	}
 	for _, target := range []string{"raw.orders", "raw.customers"} {
-		key := workerPodTemplateKey(target)
+		key := urutauspec.WorkerPodTemplateKey(target)
 		body, ok := cm.Data[key]
 		if !ok {
 			t.Fatalf("missing worker pod template key %q, got keys %v", key, keysOf(cm.Data))
@@ -236,7 +236,7 @@ func TestCoordinatorConfigMapGenericTemplateForDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := cm.Data[workerPodTemplateKey(defaultWorkerTemplateTarget)]; !ok {
+	if _, ok := cm.Data[urutauspec.WorkerPodTemplateKey(urutauspec.DefaultWorkerTemplateTarget)]; !ok {
 		t.Fatalf("discovery must render a generic worker template, got keys %v", keysOf(cm.Data))
 	}
 }

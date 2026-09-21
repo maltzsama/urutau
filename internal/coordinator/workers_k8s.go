@@ -21,17 +21,14 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
+
+	"github.com/maltzsama/urutau/spec"
 )
 
 // workerConfigDir is where the operator mounts the coordinator's
 // ConfigMap (internal/operator's coordinatorStatefulSet VolumeMount) —
 // the same directory pipeline.yaml itself lives in.
 const workerConfigDir = "/etc/urutau"
-
-// defaultWorkerTemplateTarget keys the generic worker template a discovery
-// pipeline gets (it has no tables at operator time, so no per-table template
-// exists). The coordinator falls back to it for any discovered target.
-const defaultWorkerTemplateTarget = "_default"
 
 // serviceAccountNamespaceFile is the namespace every in-cluster
 // ServiceAccount projection carries — avoids a Downward API env var just
@@ -129,19 +126,15 @@ func anyTarget(workerTarget map[string]string) string {
 	return ""
 }
 
-func workerPodTemplateFile(target string) string {
-	return "worker-pod-template." + target + ".yaml"
-}
-
 // workerPodTemplateCandidates lists the template files to try for a target,
 // most specific first: the table's own, then the generic discovery template
 // the operator renders for a pipeline that lists no tables (#152).
 func workerPodTemplateCandidates(target string) []string {
-	own := workerPodTemplateFile(target)
-	if target == defaultWorkerTemplateTarget {
+	own := spec.WorkerPodTemplateKey(target)
+	if target == spec.DefaultWorkerTemplateTarget {
 		return []string{own}
 	}
-	return []string{own, workerPodTemplateFile(defaultWorkerTemplateTarget)}
+	return []string{own, spec.WorkerPodTemplateKey(spec.DefaultWorkerTemplateTarget)}
 }
 
 func loadWorkerPodTemplate(target string) (corev1.PodTemplateSpec, error) {

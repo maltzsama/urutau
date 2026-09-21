@@ -309,6 +309,11 @@ func (r *CoordinatorReconciler) deleteCoordinator(ctx context.Context, cr *uruta
 
 // specHash fingerprints the resolved spec (definition + coordinator knobs +
 // secrets) so template changes roll the coordinator.
+//
+// Its stability depends on sigs.k8s.io/yaml.Marshal being deterministic (it
+// marshals through JSON with sorted keys); a non-deterministic marshaller would
+// change the hash on every reconcile and roll the coordinator needlessly
+// (issue #259).
 func specHash(cr *urutauv1alpha1.CDCPipeline) string {
 	b, err := yaml.Marshal(cr.Spec)
 	if err != nil {
@@ -493,10 +498,9 @@ func coordinatorService(cr *urutauv1alpha1.CDCPipeline) *corev1.Service {
 // pipeline that never sets spec.image is completely unaffected.
 func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline, image string) (*corev1.ConfigMap, error) {
 	name := coordinatorName(cr)
+	// The caller has already run validateSpec (which requires inline), so this
+	// does not repeat that check (issue #255).
 	inline := cr.Spec.Definition.Inline
-	if len(inline) == 0 {
-		return nil, fmt.Errorf("definition.inline is required (image/s3 planner not implemented)")
-	}
 	payload, err := yaml.Marshal(inline)
 	if err != nil {
 		return nil, fmt.Errorf("render inline spec: %w", err)
@@ -514,7 +518,7 @@ func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline, image string) (*corev1
 			if err != nil {
 				return nil, fmt.Errorf("render worker pod template for %s: %w", t.Target, err)
 			}
-			data[workerPodTemplateKey(t.Target)] = string(b)
+			data[urutauspec.WorkerPodTemplateKey(t.Target)] = string(b)
 		}
 		// A discovery pipeline lists no tables at operator time — the source
 		// enumerates them at boot — so no per-table template can be rendered.
@@ -526,7 +530,7 @@ func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline, image string) (*corev1
 			if err != nil {
 				return nil, fmt.Errorf("render generic worker pod template: %w", err)
 			}
-			data[workerPodTemplateKey(defaultWorkerTemplateTarget)] = string(b)
+			data[urutauspec.WorkerPodTemplateKey(urutauspec.DefaultWorkerTemplateTarget)] = string(b)
 		}
 	}
 
@@ -536,18 +540,6 @@ func coordinatorConfigMap(cr *urutauv1alpha1.CDCPipeline, image string) (*corev1
 		Data: data,
 	}, nil
 }
-
-// workerPodTemplateKey names one table's worker pod template key in the
-// coordinator ConfigMap. The coordinator derives this same key from
-// spec.Table.Target when reading it back — never invented independently.
-func workerPodTemplateKey(target string) string {
-	return "worker-pod-template." + target + ".yaml"
-}
-
-// defaultWorkerTemplateTarget keys the generic worker template a discovery
-// pipeline gets (it has no tables at operator time). The coordinator falls
-// back to it for any discovered target without its own template.
-const defaultWorkerTemplateTarget = "_default"
 
 // workerPodTemplate builds one table's worker Pod template. It carries NO
 // --name — the coordinator stamps that on when it clones this template

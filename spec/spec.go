@@ -618,3 +618,16 @@ func ParseDurationOrDefault(s string, def time.Duration, log *slog.Logger, field
 	}
 	return d
 }
+
+// DefaultWorkerTemplateTarget keys the generic worker pod template the operator
+// renders for a discovery pipeline (one that lists no tables); the coordinator
+// clones it for every discovered target (#152).
+const DefaultWorkerTemplateTarget = "_default"
+
+// WorkerPodTemplateKey names one table's worker pod template in the
+// coordinator's ConfigMap. The operator writes the key and the coordinator
+// reads it at boot, so the two must agree exactly — the shared definition keeps
+// them from drifting (#256).
+func WorkerPodTemplateKey(target string) string {
+	return "worker-pod-template." + target + ".yaml"
+}

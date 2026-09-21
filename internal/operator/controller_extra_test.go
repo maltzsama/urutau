@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	urutauspec "github.com/maltzsama/urutau/spec"
 )
 
 func TestValidateSpecRequiresInline(t *testing.T) {
@@ -145,10 +146,10 @@ func TestCoordinatorCommand(t *testing.T) {
 }
 
 func TestWorkerPodTemplateKey(t *testing.T) {
-	got := workerPodTemplateKey("orders")
+	got := urutauspec.WorkerPodTemplateKey("orders")
 	want := "worker-pod-template.orders.yaml"
 	if got != want {
-		t.Errorf("workerPodTemplateKey = %q, want %q", got, want)
+		t.Errorf("WorkerPodTemplateKey = %q, want %q", got, want)
 	}
 }
 
