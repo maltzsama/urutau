@@ -102,13 +102,13 @@ func TestPositionIndexDirty(t *testing.T) {
 	}
 
 	// Manifest does NOT clear dirty (checkpoint writes it later)
-	_ = idx.Manifest()
+	_, gen := idx.Manifest()
 	if !idx.Dirty() {
 		t.Fatal("Manifest should not clear dirty")
 	}
 
 	// MarkClean clears it
-	idx.MarkClean()
+	idx.MarkClean(gen)
 	if idx.Dirty() {
 		t.Fatal("MarkClean should clear dirty")
 	}
@@ -119,7 +119,8 @@ func TestPositionIndexDirty(t *testing.T) {
 		t.Fatal("truncate should set dirty")
 	}
 
-	idx.MarkClean()
+	_, gen = idx.Manifest()
+	idx.MarkClean(gen)
 
 	// duplicate truncate (same position) should NOT set dirty
 	idx.truncate("t1", positionFixture("pos-1"))

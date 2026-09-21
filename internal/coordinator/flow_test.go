@@ -114,7 +114,7 @@ func TestPositionIndexManifest(t *testing.T) {
 	p.add(inflightBatch{id: 8, table: "raw.items", high: nil, bytes: 5})
 	p.truncate("raw.orders", pos)
 
-	m := p.Manifest()
+	m, _ := p.Manifest()
 	if m.RunID != "run-abc" {
 		t.Fatalf("run_id = %q, want run-abc", m.RunID)
 	}
@@ -226,5 +226,26 @@ func TestOversizedSlotReleasedOnAckNotOnDrain(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("the oversized slot was not released by the oversized batch's ack")
+	}
+}
+
+// #215: MarkClean must not clear a dirty flag set by a mutation that raced the
+// Manifest — otherwise that change is skipped until the next mutation.
+func TestMarkCleanOnlyClearsItsGeneration(t *testing.T) {
+	p := newPositionIndex("run")
+	p.add(inflightBatch{id: 1, table: "t", bytes: 1})
+	_, gen := p.Manifest()
+
+	// A mutation after the manifest bumps the generation.
+	p.add(inflightBatch{id: 2, table: "t", bytes: 1})
+	p.MarkClean(gen) // stale gen: must NOT clear
+	if !p.Dirty() {
+		t.Fatal("MarkClean with a stale generation must not clear dirty")
+	}
+
+	_, gen2 := p.Manifest()
+	p.MarkClean(gen2)
+	if p.Dirty() {
+		t.Fatal("MarkClean with the current generation must clear dirty")
 	}
 }

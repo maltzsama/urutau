@@ -148,7 +148,8 @@ type positionIndex struct {
 	head  []inflightBatch
 	acked map[string]position.Position
 	runID string
-	dirty bool // set on add/truncate; cleared by MarkClean
+	dirty bool   // set on add/truncate; cleared by MarkClean
+	gen   uint64 // bumped on every mutation; MarkClean only clears its own gen
 }
 
 func newPositionIndex(runID string) *positionIndex {
@@ -167,6 +168,7 @@ func (p *positionIndex) add(b inflightBatch) {
 	defer p.mu.Unlock()
 	p.head = append(p.head, b)
 	p.dirty = true
+	p.gen++
 }
 
 // Dirty reports whether the manifest changed since the last MarkClean.
@@ -176,17 +178,22 @@ func (p *positionIndex) Dirty() bool {
 	return p.dirty
 }
 
-// MarkClean clears the dirty flag after a successful checkpoint write.
-func (p *positionIndex) MarkClean() {
+// MarkClean clears the dirty flag after a successful checkpoint write, but
+// only if the index has not changed since gen was taken by Manifest. Otherwise
+// an add/truncate racing the write would have its dirty flag wrongly cleared
+// and its change skipped until the next unrelated mutation (issue #215).
+func (p *positionIndex) MarkClean(gen uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.dirty = false
+	if p.gen == gen {
+		p.dirty = false
+	}
 }
 
 // Manifest snapshots the acked positions and the in-flight batch-id range
 // for the async S3 checkpoint (design §6) — a small file; the data is never
 // persisted.
-func (p *positionIndex) Manifest() PositionManifest {
+func (p *positionIndex) Manifest() (PositionManifest, uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	m := PositionManifest{
@@ -200,7 +207,7 @@ func (p *positionIndex) Manifest() PositionManifest {
 		m.FirstBatchID = p.head[0].id
 		m.LastBatchID = p.head[len(p.head)-1].id
 	}
-	return m
+	return m, p.gen
 }
 
 // PositionManifest is the on-disk checkpoint: per-table acked positions and
@@ -224,6 +231,7 @@ func (p *positionIndex) truncate(table string, pos position.Position) (freed int
 	if cur, ok := p.acked[table]; !ok || advances(pos, cur) {
 		p.acked[table] = pos
 		p.dirty = true
+		p.gen++
 	}
 	for len(p.head) > 0 {
 		h := p.head[0]
@@ -240,6 +248,7 @@ func (p *positionIndex) truncate(table string, pos position.Position) (freed int
 		}
 		p.head = p.head[1:]
 		p.dirty = true
+		p.gen++
 	}
 	return freed, freedOversized
 }

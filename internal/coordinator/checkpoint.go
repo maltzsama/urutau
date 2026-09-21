@@ -109,7 +109,10 @@ func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*po
 					// happened (audit #12).
 					continue
 				}
-				idx.MarkClean()
+				// MarkClean only clears if the index has not changed since the
+				// Manifest, so a batch that arrived during the upload is not
+				// silently skipped (issue #215).
+				idx.MarkClean(gen)
 			}
 		}
 	}
