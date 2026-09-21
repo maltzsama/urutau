@@ -56,7 +56,10 @@ func NewStageSupervisor(cfg pipeline.StageConfig, logger *slog.Logger) *StageSup
 }
 
 // Dead returns a channel closed when the stage becomes unhealthy
-// (circuit breaker tripped or non-recoverable error).
+// (circuit breaker tripped or non-recoverable error). It is the UNIFIED death
+// signal over the Stage's two low-level ones — the Flight client's Dead and
+// the process's Exited() — so callers should select on this rather than on the
+// Stage's fields (issue #280). DeadErr returns the reason once Dead is closed.
 func (s *StageSupervisor) Dead() <-chan struct{} { return s.dead }
 
 // DeadErr returns the reason the stage died.

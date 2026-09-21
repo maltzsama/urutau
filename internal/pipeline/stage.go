@@ -37,7 +37,7 @@ type StageConfig struct {
 
 // Stage couples a plugin process to its Flight client. It is the
 // lifecycle owner: Spawn starts the binary, Connect dials the Flight
-// service, and Close tears everything down in order.
+// service, and Stop tears everything down in order.
 //
 // Death signals are distinct (issue #274):
 //   - Exited() is the OS process's exit channel, valid immediately after
@@ -45,6 +45,13 @@ type StageConfig struct {
 //   - Dead is the Flight client's unhealthy channel and DeadErr its reason;
 //     both are set by Connect. Before Connect they are nil — select on
 //     Exited() (not Dead) to detect a process that died before dialling.
+//   - DeadErr() is only meaningful AFTER <-Dead: it may return nil before the
+//     channel closes, and the reason is fixed once it does (issue #278).
+//
+// The fields are exported for the orchestration's convenience, but the Stage is
+// otherwise OPAQUE after Spawn/Connect: do not mutate Client/Proc/Dead/DeadErr
+// — they are owned by the lifecycle (issue #277). The supervisor's Dead() is
+// the unified signal over the two low-level channels (issue #280).
 type Stage struct {
 	Cfg    StageConfig
 	Proc   *proc.Process
@@ -100,9 +107,15 @@ func (s *Stage) Connect(ctx context.Context) error {
 
 // Stop gracefully shuts down the stage: Flight shutdown, then process
 // termination with a hard-kill fallback. It is safe to call after Spawn even
-// if Connect failed (Client is nil) — proc.Stop is idempotent. The Flight
-// shutdown error is propagated, not swallowed: a graceful shutdown whose
-// plugin Shutdown never landed must not look like a clean stop (issue #275).
+// if Connect failed (Client is nil) — proc.Stop is idempotent, so a
+// `defer stage.Stop(ctx)` after a failed Connect is fine (issue #281). The
+// Flight shutdown error is propagated, not swallowed: a graceful shutdown
+// whose plugin Shutdown never landed must not look like a clean stop (issue
+// #275).
+//
+// ctx bounds the Flight Shutdown only. The process teardown uses proc.Stop's
+// own terminate → hardStopGrace → kill sequence, independent of ctx
+// (issue #279).
 func (s *Stage) Stop(ctx context.Context) error {
 	var shutdownErr error
 	if s.Client != nil {
