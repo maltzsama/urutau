@@ -24,6 +24,13 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	if batch.Record == nil || batch.Record.NumRows() == 0 {
 		return nil, nil, nil
 	}
+	if len(pkCols) == 0 {
+		// An empty key would collapse every row into one group (EncodeKey
+		// returns a nil key for each), silently dropping all but the last.
+		// The upsert guard lives upstream; the low-level API must fail loud
+		// (issue #218).
+		return nil, nil, fmt.Errorf("dataplane: collapse: no primary key columns — an empty key collapses every row into one")
+	}
 
 	nrows := int(batch.Record.NumRows())
 
