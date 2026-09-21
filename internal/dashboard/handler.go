@@ -183,7 +183,11 @@ func logEntryOf(rec logging.Record) logEntry {
 func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 	// The metrics server (observability.ServeMux) imposes a 10s WriteTimeout;
 	// an SSE stream is long-lived, so clear that per-connection deadline.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		// A middleware that does not implement Unwrap() makes this fail and
+		// the stream later dies on the global write timeout with no log.
+		h.log.Warn("dashboard: clear SSE write deadline", "err", err)
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
