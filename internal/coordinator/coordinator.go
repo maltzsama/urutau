@@ -1375,7 +1375,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 		if len(clipChunksToRange(allChunks, ranges[p])) == 0 {
 			emptyOwners = append(emptyOwners, w.name)
 		}
-		if err := c.snapshotPartition(ctx, rdr, chunker, ref, ranges[p], p, w, cfg); err != nil {
+		if err := c.snapshotPartition(ctx, rdr, allChunks, ref, ranges[p], p, w, cfg); err != nil {
 			return fmt.Errorf("partition %d: %w", p, err)
 		}
 	}
@@ -1394,12 +1394,10 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 // the window/gate lifecycle (openWindow/flushWindow/closeWindow) is
 // scoped to this partition alone, so a different partition's concurrent
 // snapshot (if any) is never gated or released by this one's chunks.
-func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
-	bounds, err := chunker.Bounds(ctx)
-	if err != nil {
-		return err
-	}
-	chunks := clipChunksToRange(snapshot.Chunks(bounds), partitionRange)
+// allChunks is computed once by snapshotTable (one Bounds query per table,
+// not per partition — issue #216).
+func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, allChunks []source.Chunk, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
+	chunks := clipChunksToRange(allChunks, partitionRange)
 	if len(chunks) == 0 {
 		return nil // this partition's range contains no rows right now
 	}

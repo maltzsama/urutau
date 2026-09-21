@@ -191,14 +191,10 @@ func TestSnapshotPartitionEarlyExits(t *testing.T) {
 	c, w := coordHarness()
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
 
-	boom := errors.New("bounds failed")
-	if err := c.snapshotPartition(ctx, fakeSourceReader{}, fakeChunkSource{err: boom}, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{}); !errors.Is(err, boom) {
-		t.Fatalf("snapshotPartition(bounds err) = %v, want boom", err)
-	}
-
-	// A range that excludes every chunk returns nil without sending.
+	// A range that excludes every chunk returns nil without sending. allChunks
+	// is computed once by snapshotTable (issue #216).
 	err := c.snapshotPartition(ctx, fakeSourceReader{},
-		fakeChunkSource{bounds: [][]any{{int64(50)}}},
+		snapshot.Chunks([][]any{{int64(50)}}),
 		ref, source.Chunk{Low: []any{int64(0)}, High: []any{int64(10)}}, 0, w, snapshot.SnapshotConfig{})
 	if err != nil {
 		t.Fatalf("snapshotPartition(empty clip) = %v", err)
