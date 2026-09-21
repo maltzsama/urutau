@@ -84,7 +84,7 @@ func driveTurns(t *testing.T, m sink.Maintainer, sched *Schedule, cfg *spec.Main
 	now := time.Now()
 	for elapsed := time.Duration(0); elapsed < span; elapsed += tick {
 		now = now.Add(tick)
-		RunTurn(context.Background(), m, "raw.orders", cfg, sched, quietLogger(), now)
+		RunTurn(context.Background(), m, "raw.orders", cfg, sched, quietLogger(), func() time.Time { return now })
 	}
 }
 
@@ -199,5 +199,52 @@ func TestRunLoopDispatchesPerOperation(t *testing.T) {
 
 	if got := m.count(sink.MaintenanceCompaction); got == 0 {
 		t.Error("compaction never completed")
+	}
+}
+
+// advanceMaintainer advances a virtual clock when it runs, so a test can prove
+// RunTurn records the completion time.
+type advanceMaintainer struct {
+	advance time.Duration
+	bump    func(time.Duration)
+}
+
+func (m *advanceMaintainer) RunOnce(context.Context, []sink.MaintenanceOp) error {
+	m.bump(m.advance)
+	return nil
+}
+
+// #244: RunTurn must record each operation's completion time (clock() after
+// the op), not the turn's start, so a long operation does not re-fire
+// immediately on the next tick.
+func TestRunTurnMarksCompletionTime(t *testing.T) {
+	base := time.Now()
+	now := base
+	m := &advanceMaintainer{advance: 10 * time.Minute, bump: func(d time.Duration) { now = now.Add(d) }}
+	cfg := &spec.Maintenance{Enabled: true, Compaction: &spec.CompactionConfig{Interval: "5m"}}
+	sched := NewSchedule()
+
+	RunTurn(context.Background(), m, "raw.orders", cfg, sched, quietLogger(), func() time.Time { return now })
+
+	// Marked at base+10m, so at base+6m compaction is NOT due (it was marked
+	// at the turn start, it would be: 6m >= 5m).
+	if due := sched.Due("raw.orders", cfg, base.Add(6*time.Minute)); len(due) != 0 {
+		t.Fatalf("compaction marked at the turn start, not completion: due=%v", due)
+	}
+	// 16m after completion it is due again.
+	if due := sched.Due("raw.orders", cfg, base.Add(16*time.Minute)); len(due) != 1 {
+		t.Fatalf("compaction not due 16m after completion: %v", due)
+	}
+}
+
+// #246: CheckInterval must return the floor for a disabled config, mirroring
+// Due, which never returns anything then.
+func TestCheckIntervalDisabled(t *testing.T) {
+	if got := CheckInterval(nil); got != time.Second {
+		t.Fatalf("CheckInterval(nil) = %v, want 1s", got)
+	}
+	disabled := &spec.Maintenance{Enabled: false, Compaction: &spec.CompactionConfig{Interval: "1h"}}
+	if got := CheckInterval(disabled); got != time.Second {
+		t.Fatalf("CheckInterval(disabled) = %v, want 1s (not 30m)", got)
 	}
 }

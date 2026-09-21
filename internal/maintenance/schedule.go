@@ -112,11 +112,13 @@ func intervalFor(cfg *spec.Maintenance, op sink.MaintenanceOp) (time.Duration, b
 }
 
 // CheckInterval is how often a scheduler should look for due operations:
-// half the shortest enabled interval, so a due operation runs within its
-// own interval rather than waiting for a coarse fixed poll. Floor of one
-// second keeps a very short interval (tests, demos) from spinning.
+// half the shortest enabled interval, so a due operation runs within its own
+// interval rather than waiting for a coarse fixed poll. Floored at one second,
+// which keeps a very short interval (tests, demos) from spinning. A disabled
+// config (nil, or Enabled false) has no due operations, so it returns the
+// floor too, mirroring Due (issue #246).
 func CheckInterval(cfg *spec.Maintenance) time.Duration {
-	if cfg == nil {
+	if cfg == nil || !cfg.Enabled {
 		return time.Second
 	}
 	min := time.Duration(0)
@@ -184,25 +186,29 @@ func RunLoop(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Mai
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
-			RunTurn(ctx, m, table, cfg, sched, log, now)
+		case <-ticker.C:
+			RunTurn(ctx, m, table, cfg, sched, log, time.Now)
 		}
 	}
 }
 
-// RunTurn runs one maintenance turn: the operations due at now, each
-// dispatched on its own, with successes recorded as they happen. RunLoop
-// calls it on every tick; it is exported so a scheduler driving a virtual
-// clock (tests, and any future non-ticker driver) exercises the same
-// bookkeeping rather than a copy of it.
+// RunTurn runs one maintenance turn: the operations due at clock(), each
+// dispatched on its own, with each success recorded at its own completion time
+// (clock() again). RunLoop calls it on every tick; it is exported so a
+// scheduler driving a virtual clock (tests, and any future non-ticker driver)
+// exercises the same bookkeeping rather than a copy of it. clock is time.Now
+// in production; tests inject a virtual clock.
 //
 // See RunLoop's doc comment for why operations are dispatched singly and
 // why a failure does not abandon the rest of the turn.
-func RunTurn(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Maintenance, sched *Schedule, log *slog.Logger, now time.Time) {
+func RunTurn(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Maintenance, sched *Schedule, log *slog.Logger, clock func() time.Time) {
 	if log == nil {
 		log = slog.Default()
 	}
-	for _, op := range sched.Due(table, cfg, now) {
+	if clock == nil {
+		clock = time.Now
+	}
+	for _, op := range sched.Due(table, cfg, clock()) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -211,22 +217,19 @@ func RunTurn(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Mai
 
 			continue
 		}
-		sched.MarkRun(table, []sink.MaintenanceOp{op}, now)
+		// Record the operation's own completion time, not the turn's start:
+		// the collapsed runner and the coordinator must agree (the coordinator
+		// marks the report time), and a long operation must not re-fire
+		// immediately on the next tick (issue #244).
+		sched.MarkRun(table, []sink.MaintenanceOp{op}, clock())
 	}
 }
 
-// durationOrDefault parses a spec duration string, falling back to def when
-// empty or malformed. Validate rejects malformed strings before a spec
-// reaches here, so the fallback is defense, not the primary path.
+// durationOrDefault applies the shared spec duration rule, silently: the
+// schedule has no logger, and Validate rejects malformed durations before a
+// spec reaches here.
 func durationOrDefault(s string, def time.Duration) time.Duration {
-	if s == "" {
-		return def
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil || d <= 0 {
-		return def
-	}
-	return d
+	return spec.ParseDurationOrDefault(s, def, nil, "")
 }
 
 // WorkerName derives the DNS-1123 name of a table's ephemeral maintenance

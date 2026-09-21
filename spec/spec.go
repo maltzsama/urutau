@@ -6,6 +6,7 @@ package spec
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -593,4 +594,27 @@ type Bootstrap struct {
 	StartAt BootstrapStartAt `json:"startAt,omitempty"`
 	// Position is the explicit position string when StartAt is "explicit".
 	Position string `json:"position,omitempty"`
+}
+
+// ParseDurationOrDefault parses a Go duration string, falling back to def when
+// it is empty or malformed (non-positive). invalid reports a non-empty value
+// that failed to parse, so a caller with a logger can warn. Validate rejects
+// malformed maintenance durations before a spec reaches a caller, so the
+// fallback is defense, not the primary path.
+//
+// It lives here because both the maintenance scheduler and the Iceberg
+// maintainer resolve maintenance durations from the same spec fields; a single
+// rule keeps the two modes from drifting.
+func ParseDurationOrDefault(s string, def time.Duration, log *slog.Logger, field string) time.Duration {
+	if s == "" {
+		return def
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		if log != nil {
+			log.Warn("spec: ignoring invalid duration", "field", field, "value", s, "default", def)
+		}
+		return def
+	}
+	return d
 }
