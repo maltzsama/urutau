@@ -20,7 +20,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -50,12 +52,32 @@ type Config struct {
 	// next Emit opens the next one. Zero or negative is clamped to the
 	// default (8 MiB) — never a rotation per event.
 	MaxObjectBytes int64
+	// Logger receives the best-effort warnings (a dropped buffer, a failed
+	// close PUT). Nil means slog.Default().
+	Logger *slog.Logger
 }
 
 // defaultMaxObjectBytes is the rotation threshold when the config is
 // silent: large enough that a commit-rate run rotates rarely, small enough
 // that each PUT stays cheap.
 const defaultMaxObjectBytes = int64(8 << 20)
+
+// maxBufferFactor caps the unrotated buffer at maxObjectBytes × this. While
+// the S3 backlog is non-empty rotation is deferred, so without a cap the
+// buffer grows with the outage (outage × event rate) and can OOM the
+// coordinator. Overflow drops the oldest lines and warns (issue #230).
+const maxBufferFactor = 4
+
+// maxBacklogPerEmit bounds how many rotated objects one Emit drains, so a
+// large backlog does not hold putMu across all of them (issue #233).
+const maxBacklogPerEmit = 16
+
+func orDefaultLogger(l *slog.Logger) *slog.Logger {
+	if l == nil {
+		return slog.Default()
+	}
+	return l
+}
 
 // Event kinds emitted by the runner.
 const (
@@ -87,11 +109,15 @@ type Run struct {
 	key            string // current object; mutated under mu on rotation
 	seq            int    // rotations so far; 0 before the first
 	maxObjectBytes int64
+	maxBufferBytes int64 // hard cap on buf; overflow drops the oldest lines
 	putter         putter
+	log            *slog.Logger
 	mu             sync.Mutex // buffer + closed + emitted + key/seq + pending
 	putMu          sync.Mutex // serializes PUTs (see Emit for the lock order)
 	buf            []byte
 	closed         bool
+	closing        bool           // Close in progress: no new Emit may start
+	inflight       sync.WaitGroup // in-flight Emits, so Close can quiesce them
 	emitted        int
 	// pending holds rotated objects whose PUT failed, in creation order.
 	// They are retried — before the next own PUT and by Close — because the
@@ -150,7 +176,9 @@ func New(ctx context.Context, cfg Config) (*Run, error) {
 		key:            base + "events-000000.jsonl",
 		seq:            0,
 		maxObjectBytes: max,
+		maxBufferBytes: max * maxBufferFactor,
 		putter:         &s3Putter{client: client},
+		log:            orDefaultLogger(cfg.Logger),
 	}, nil
 }
 
@@ -169,7 +197,9 @@ func NewWithPutter(bucket, prefix string, maxObjectBytes int64, p putter) *Run {
 		key:            base + "events-000000.jsonl",
 		seq:            0,
 		maxObjectBytes: maxObjectBytes,
+		maxBufferBytes: maxObjectBytes * maxBufferFactor,
 		putter:         p,
+		log:            slog.Default(),
 	}
 }
 
@@ -214,42 +244,49 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	}
 
 	r.mu.Lock()
-	if r.closed {
+	if r.closed || r.closing {
 		r.mu.Unlock()
 		return fmt.Errorf("eventlog: run %s is closed", r.id)
 	}
-	// Drain the undelivered rotated objects; they are retried, in order,
-	// before this emit's own PUT.
+	// Count this Emit so Close can quiesce in-flight emits before snapshotting
+	// pending/buf — otherwise an Emit's failed-PUT re-queue can land after the
+	// snapshot and be lost (issue #229).
+	r.inflight.Add(1)
+	defer r.inflight.Done()
 	pending := r.pending
 	r.pending = nil
 	r.buf = append(r.buf, line...)
 	r.buf = append(r.buf, '\n')
 	r.emitted++
+	// Bound the buffer ONLY while rotation is deferred (backlog non-empty): an
+	// S3 outage then grows buf without limit until OOM (issue #230). With no
+	// backlog, rotation resets buf, so the cap must not run — it would empty
+	// the buffer before the rotation check and stop rotation entirely.
+	if len(pending) > 0 && len(r.buf) > int(r.maxBufferBytes) {
+		if dropped := r.dropOldestLocked(); dropped > 0 {
+			r.log.Warn("eventlog: dropped buffered events under backlog",
+				"run", r.id, "bytes", dropped, "emitted", r.emitted)
+		}
+	}
 	body := slices.Clone(r.buf)
 	key := r.key
-	// Rotation: the event that crosses the threshold travels in the object
-	// being closed; the next Emit opens the next one. One rotation = one
-	// PUT, zero extra. The key is ALWAYS derived from baseKey — deriving
-	// from the current key corrupts from the second rotation on. buf/key/seq
-	// mutate only under mu.
-	//
-	// Rotation is DEFERRED while the backlog is non-empty: sealing a new
-	// object behind a failing PUT would orphan its buffer (the loss R-1
-	// fixes). The buffer keeps accumulating instead, so nothing is sealed
-	// until delivery works.
 	rotated := len(pending) == 0 && len(r.buf) >= int(r.maxObjectBytes)
 	if rotated {
 		r.seq++
 		r.buf = nil
 		r.key = r.baseKey + fmt.Sprintf("events-%06d.jsonl", r.seq)
 	}
-	// putMu is acquired BEFORE releasing mu. The race that forces this
-	// order is between two Emits: both clone the body under mu, and whoever
-	// releases mu first could reach putMu after the other — inverting the
-	// PUT order relative to the append order, so a smaller PUT could land
-	// last on S3's last-writer-wins and the event would vanish. Holding
-	// putMu across the PUT (and mu until it is taken) makes PUT order ==
-	// append order by construction.
+	// Drain at most maxBacklogPerEmit rotated objects per call, so putMu is
+	// not held across an arbitrarily large backlog (issue #233). The rest stay
+	// queued, in order, for the next Emit.
+	if len(pending) > maxBacklogPerEmit {
+		rest := pending[maxBacklogPerEmit:]
+		pending = pending[:maxBacklogPerEmit]
+		r.pending = append(append([]pendingObject{}, rest...), r.pending...)
+	}
+	// putMu is acquired BEFORE releasing mu (same order as always): two Emits
+	// could otherwise invert the PUT order relative to the append order and a
+	// smaller PUT could land last on S3's last-writer-wins.
 	r.putMu.Lock()
 	r.mu.Unlock()
 
@@ -289,22 +326,25 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 // rotated object still awaiting delivery — is re-uploaded best-effort. A
 // failed last Emit left its line in the buffer (the contract is best-effort,
 // the event stays accepted), and without the re-flush a graceful shutdown
-// would lose exactly that final event. The close PUTs are serialized against
-// in-flight Emits through putMu, so the objects never land smaller than what
-// was accepted.
+// would lose exactly that final event.
 //
-// Lock order: mu is released BEFORE putMu is taken — the inverse of Emit,
-// and safe here. The Emit race (both Emits clone the body and compete for
-// putMu) does not exist for the one-shot close, and the closed flag set
-// under mu prevents re-entry. Serializing with in-flight PUTs comes from
-// putMu itself; holding mu during the wait would pin the append lock for
-// up to one putTimeout for no additional correctness.
-func (r *Run) Close() {
+// It waits for in-flight Emits before snapshotting pending/buf: an Emit's
+// failed-PUT re-queue happens under mu, without putMu, so without the wait a
+// re-queue landing between the snapshot and the PUTs would be orphaned
+// (issue #229). The returned error aggregates the best-effort PUT failures, so
+// a graceful shutdown that lost the trail's tail is not silent (issue #231).
+func (r *Run) Close() error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return
+		return nil
 	}
+	r.closing = true // no new Emit may start
+	r.mu.Unlock()
+
+	r.inflight.Wait() // no re-queue can populate pending after this
+
+	r.mu.Lock()
 	r.closed = true
 	pending := r.pending
 	r.pending = nil
@@ -315,17 +355,40 @@ func (r *Run) Close() {
 	r.putMu.Lock()
 	defer r.putMu.Unlock()
 	if len(pending) == 0 && len(body) == 0 {
-		return
+		return nil
 	}
 	putCtx, cancel := context.WithTimeout(context.Background(), putTimeout)
 	defer cancel()
 	// Deliver the backlog first, then the current buffer — best-effort.
+	var errs []error
 	for _, po := range pending {
-		_ = r.putter.Put(putCtx, r.bucket, po.key, po.body)
+		if err := r.putter.Put(putCtx, r.bucket, po.key, po.body); err != nil {
+			errs = append(errs, fmt.Errorf("put %s/%s: %w", r.bucket, po.key, err))
+		}
 	}
 	if len(body) > 0 {
-		_ = r.putter.Put(putCtx, r.bucket, key, body)
+		if err := r.putter.Put(putCtx, r.bucket, key, body); err != nil {
+			errs = append(errs, fmt.Errorf("put %s/%s: %w", r.bucket, key, err))
+		}
 	}
+	return errors.Join(errs...)
+}
+
+// dropOldestLocked trims r.buf to its last maxObjectBytes bytes, aligned to a
+// line boundary, and returns the number of bytes dropped. Callers must hold mu.
+func (r *Run) dropOldestLocked() int {
+	target := len(r.buf) - int(r.maxObjectBytes)
+	if target <= 0 {
+		return 0
+	}
+	if i := bytes.IndexByte(r.buf[target:], '\n'); i >= 0 {
+		target += i + 1
+	} else {
+		target = len(r.buf)
+	}
+	dropped := target
+	r.buf = append(r.buf[:0], r.buf[target:]...)
+	return dropped
 }
 
 func newRunID() string {
@@ -345,13 +408,13 @@ func parseURI(uri string) (bucket, prefix string, err error) {
 	if !ok {
 		return "", "", fmt.Errorf("eventlog: store uri %q must be s3://<bucket>/<prefix>", uri)
 	}
-	bucket, prefix, ok = strings.Cut(rest, "/")
+	bucket, prefix, _ = strings.Cut(rest, "/")
 	if bucket == "" {
 		return "", "", fmt.Errorf("eventlog: store uri %q lacks a bucket", uri)
 	}
-	if !ok {
-		prefix = ""
-	}
+	// Normalize a trailing slash so s3://bucket and s3://bucket/ derive the
+	// same base key (issue #232).
+	prefix = strings.Trim(prefix, "/")
 	return bucket, prefix, nil
 }
 

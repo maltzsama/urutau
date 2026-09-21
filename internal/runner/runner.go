@@ -600,7 +600,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		defer func() {
 			if r == nil {
 				_ = ev.Emit(ctx, eventlog.KindJobStopped, map[string]any{"reason": "startup_failed"})
-				ev.Close()
+				_ = ev.Close()
 			}
 		}()
 	}
@@ -1055,7 +1055,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		_ = r.ev.Emit(context.Background(), eventlog.KindJobStopped,
 			map[string]any{"reason": reason})
-		r.ev.Close()
+		_ = r.ev.Close()
 	}
 	if r.rdr != nil {
 		r.rdr.Close()
