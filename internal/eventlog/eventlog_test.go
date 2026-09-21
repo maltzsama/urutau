@@ -2,6 +2,7 @@ package eventlog
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -126,7 +127,7 @@ func TestEmitClosedReturnsError(t *testing.T) {
 	p := &fakePutter{}
 	r := NewWithPutter("bucket", "prefix", 0, p)
 
-	r.Close()
+	_ = r.Close()
 	if err := r.Emit(context.Background(), "job_stopped", nil); err == nil {
 		t.Fatal("expected error on closed run")
 	}
@@ -152,8 +153,8 @@ func TestEmitBestEffort(t *testing.T) {
 
 func TestCloseIdempotent(t *testing.T) {
 	r := NewWithPutter("bucket", "prefix", 0, &fakePutter{})
-	r.Close()
-	r.Close() // should not panic
+	_ = r.Close()
+	_ = r.Close() // should not panic
 }
 
 func TestNewRunID(t *testing.T) {
@@ -304,7 +305,7 @@ func TestCloseReFlushesFailedLastEvent(t *testing.T) {
 		t.Fatal("expected the failing PUT to error the emit")
 	}
 
-	r.Close()
+	_ = r.Close()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -336,11 +337,11 @@ func TestCloseSerializesWithInFlightEmits(t *testing.T) {
 	go func() {
 		defer close(closed)
 		time.Sleep(10 * time.Millisecond)
-		r.Close()
+		_ = r.Close()
 	}()
 	wg.Wait()
-	<-closed  // the first Close finished, including its final PUT
-	r.Close() // idempotency only now
+	<-closed      // the first Close finished, including its final PUT
+	_ = r.Close() // idempotency only now
 
 	accepted := r.Emitted()
 	if accepted == 0 {
@@ -467,7 +468,7 @@ func TestCloseAfterRotationFlushesCurrentObject(t *testing.T) {
 	}
 	current := r.ObjectKey() // single-threaded test; r.seq read without mu
 
-	r.Close()
+	_ = r.Close()
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -609,7 +610,7 @@ func TestCloseDeliversPendingObject(t *testing.T) {
 	if err := r.Emit(context.Background(), "final", nil); err == nil {
 		t.Fatal("expected the rotation PUT to fail")
 	}
-	r.Close()
+	_ = r.Close()
 
 	// The pending object (the first key) carries the event.
 	last := p.lastPerKey()
@@ -665,5 +666,133 @@ func TestRotationKeySortOrder(t *testing.T) {
 		if created[i] != sorted[i] {
 			t.Fatalf("keys do not sort in creation order at %d: created=%q sorted=%q", i, created[i], sorted[i])
 		}
+	}
+}
+
+// gatePutter blocks its first PUT until released, then fails it, so a
+// concurrent Close can be driven to race an Emit's re-queue.
+type gatePutter struct {
+	entered, release chan struct{}
+	mu               sync.Mutex
+	first            bool
+	ok               []string
+}
+
+func (g *gatePutter) Put(_ context.Context, _, key string, _ []byte) error {
+	g.mu.Lock()
+	isFirst := !g.first
+	g.first = true
+	g.mu.Unlock()
+	if isFirst {
+		close(g.entered)
+		<-g.release
+		return errors.New("s3 down")
+	}
+	g.mu.Lock()
+	g.ok = append(g.ok, key)
+	g.mu.Unlock()
+	return nil
+}
+
+// #229: Close must wait for an in-flight Emit's re-queue before snapshotting,
+// so a rotated object is not orphaned.
+func TestCloseWaitsForInFlightEmit(t *testing.T) {
+	g := &gatePutter{entered: make(chan struct{}), release: make(chan struct{})}
+	r := NewWithPutter("b", "p", 1, g) // threshold 1: the first Emit rotates
+
+	emitDone := make(chan struct{})
+	go func() {
+		defer close(emitDone)
+		_ = r.Emit(context.Background(), "commit", map[string]any{"n": 1})
+	}()
+	<-g.entered // the Emit is inside its PUT, holding putMu
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- r.Close() }()
+
+	// Let the failed PUT return; Close must then deliver the re-queued object.
+	close(g.release)
+	<-emitDone
+	<-closeDone
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// The rotated object is the one being closed (events-000000); Close must
+	// have re-PUT it after the Emit's failed PUT re-queued it.
+	found := false
+	for _, k := range g.ok {
+		if strings.HasSuffix(k, "events-000000.jsonl") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Close did not deliver the re-queued rotated object; delivered=%v", g.ok)
+	}
+}
+
+// #230: while the backlog is non-empty, rotation is deferred, so the buffer
+// must be capped (with a drop) rather than growing without bound.
+func TestEmitBoundsBufferUnderBacklog(t *testing.T) {
+	p := &fakePutter{err: errors.New("down")}
+	r := NewWithPutter("b", "p", 64, p)
+	for i := 0; i < 1000; i++ {
+		_ = r.Emit(context.Background(), "commit", map[string]any{"pad": strings.Repeat("y", 50)})
+	}
+	r.mu.Lock()
+	buf := len(r.buf)
+	max := r.maxBufferBytes
+	r.mu.Unlock()
+	if int64(buf) > max+200 {
+		t.Fatalf("buffer grew to %d, want <= %d", buf, max)
+	}
+}
+
+// #231: Close surfaces a best-effort PUT failure instead of swallowing it.
+func TestCloseReturnsPutError(t *testing.T) {
+	p := &fakePutter{err: errors.New("down")}
+	r := NewWithPutter("b", "p", 1<<20, p)
+	_ = r.Emit(context.Background(), "commit", map[string]any{"n": 1}) // leaves a line
+	if err := r.Close(); err == nil {
+		t.Fatal("Close must return the PUT failure")
+	}
+}
+
+// #232: s3://bucket and s3://bucket/ must derive the same base key.
+func TestParseURINormalizesTrailingSlash(t *testing.T) {
+	b1, p1, err := parseURI("s3://bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, p2, err := parseURI("s3://bucket/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b1 != b2 || p1 != p2 {
+		t.Fatalf("trailing slash changed the parse: (%q,%q) vs (%q,%q)", b1, p1, b2, p2)
+	}
+	_, p3, err := parseURI("s3://bucket/prefix/")
+	if err != nil || p3 != "prefix" {
+		t.Fatalf("prefix = %q, err %v; want prefix", p3, err)
+	}
+}
+
+// #233: one Emit drains at most maxBacklogPerEmit rotated objects, so putMu is
+// not held across an arbitrarily large backlog.
+func TestEmitDrainsBacklogInBoundedChunks(t *testing.T) {
+	p := &fakePutter{}
+	r := NewWithPutter("b", "p", 1<<20, p)
+	r.mu.Lock()
+	for i := 0; i < 40; i++ {
+		r.pending = append(r.pending, pendingObject{key: fmt.Sprintf("k%d", i), body: []byte("x")})
+	}
+	r.mu.Unlock()
+
+	_ = r.Emit(context.Background(), "commit", map[string]any{"n": 1})
+
+	r.mu.Lock()
+	after := len(r.pending)
+	r.mu.Unlock()
+	if after < 40-maxBacklogPerEmit {
+		t.Fatalf("one Emit drained too much: %d left, want >= %d", after, 40-maxBacklogPerEmit)
 	}
 }

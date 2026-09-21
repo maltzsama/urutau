@@ -381,7 +381,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return fmt.Errorf("coordinator: eventlog: %w", err)
 		}
 		c.ev = ev
-		defer ev.Close()
+		defer func() {
+			if err := ev.Close(); err != nil {
+				c.log.Warn("coordinator: eventlog close", "err", err)
+			}
+		}()
 		if err := c.emit(eventlog.KindJobStarted, map[string]any{
 			"pipeline": c.cfg.Spec.Pipeline,
 			"source":   c.cfg.Spec.Source.Kind,
