@@ -403,16 +403,10 @@ func compactionConfigFrom(c *spec.CompactionConfig, log *slog.Logger) compaction
 // unset: it is replaced by the default and logged, so a configuration mistake
 // is visible. Validate already rejects malformed strings before a spec reaches
 // here, so this is defense, not the primary path.
+// durationOr resolves a maintenance duration with the shared spec rule,
+// warning on an invalid value (the iceberg maintainer has a logger).
 func durationOr(s string, def time.Duration, log *slog.Logger, field string) time.Duration {
-	if s == "" {
-		return def
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil || d <= 0 {
-		log.Warn("iceberg: ignoring invalid maintenance duration", "field", field, "value", s)
-		return def
-	}
-	return d
+	return spec.ParseDurationOrDefault(s, def, log, field)
 }
 
 // intOr returns n, or def when n is zero (an unset config value). A negative
