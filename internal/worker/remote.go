@@ -347,11 +347,16 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		if cfg.FaultAckGate != nil && cfg.FaultAckGate.Load() {
 			return
 		}
+		// Carry the equality-delete count so the coordinator's dashboard
+		// metrics (deletes, collapse ratio) are not always zero in distributed
+		// mode (issue #263).
+		_, deletes := CountOps(b)
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
 			Table:    b.Table,
 			Epoch:    assign.Epoch,
 			Position: string(b.Watermark),
 			Rows:     uint64(rows),
+			Deletes:  uint64(deletes),
 		}}})
 	})
 

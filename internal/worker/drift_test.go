@@ -218,3 +218,22 @@ func TestSchemaDriftContinuesPastConformingStruct(t *testing.T) {
 		t.Fatalf("drift = %+v, want address.late — the scan stopped at the conforming struct", d)
 	}
 }
+
+// #261: a column null in row 0 but populated later is drift, not padding.
+func TestSchemaDriftNullFirstRowIsStillDrift(t *testing.T) {
+	b := driftBatch(t,
+		[]arrow.Field{idField, {Name: "late", Type: arrow.BinaryTypes.String, Nullable: true}},
+		func(rb *array.RecordBuilder) {
+			rb.Field(0).(*array.Int64Builder).Append(1)
+			rb.Field(1).(*array.StringBuilder).AppendNull()
+			rb.Field(0).(*array.Int64Builder).Append(2)
+			rb.Field(1).(*array.StringBuilder).Append("present")
+		})
+	d, hit, err := schemaDrift(b, testSchema()) // testSchema has no "late"
+	if err != nil {
+		t.Fatalf("schemaDrift: %v", err)
+	}
+	if !hit || d.Column != "late" {
+		t.Fatalf("drift = %+v, want late (null first row, value later)", d)
+	}
+}

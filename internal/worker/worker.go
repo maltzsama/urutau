@@ -189,6 +189,11 @@ func (w *Worker) SetStaged(target string) error {
 	if _, ok := p.committer.(sink.StagingWriter); !ok {
 		return fmt.Errorf("worker: staged table %s: writer does not implement StagingWriter", target)
 	}
+	// The staged delivery callback is required: without it the first batch
+	// fails at stageBatch, not at boot (issue #269).
+	if w.onStaged == nil {
+		return fmt.Errorf("worker: staged table %s: no staged delivery callback set (OnStaged)", target)
+	}
 	p.staged = true
 	return nil
 }
@@ -1070,8 +1075,8 @@ func schemaDrift(b *dataplane.Batch, schema core.Schema) (SchemaDrift, bool, err
 		col := rec.Column(i)
 		declared, ok := schema.Column(name)
 		if !ok {
-			if col.IsNull(0) {
-				continue // padding artifact — no source value, no drift
+			if col.NullN() == col.Len() {
+				continue // entirely null — a padding artifact, no source value
 			}
 			return SchemaDrift{Column: name, Kind: "added"}, true, nil
 		}
@@ -1119,8 +1124,8 @@ func nestedDrift(path string, st *array.Struct, declared []core.Column) (SchemaD
 			}
 		}
 		if decl == nil {
-			if child.IsNull(0) {
-				continue // padding artifact — no source value, no drift
+			if child.NullN() == child.Len() {
+				continue // entirely null — a padding artifact, no source value
 			}
 			return SchemaDrift{Column: full, Kind: "added"}, true
 		}
