@@ -70,6 +70,13 @@ func validatePipeline(obj runtime.Object) error {
 		return fmt.Errorf("spec.definition: image, s3 and inline are mutually exclusive")
 	}
 
+	// image/s3 need the planner, which is not implemented; the reconciler
+	// would mark such a CR terminated. Reject at admission so the failure is an
+	// apply-time error, not a terminal pipeline state (issue #253).
+	if def.Image != "" || def.S3 != "" {
+		return fmt.Errorf("spec.definition: image/s3 is not implemented yet; use inline")
+	}
+
 	// An inline definition is validated with the same rules the coordinator
 	// runs at boot — validation stays single and server-side.
 	if len(def.Inline) > 0 {

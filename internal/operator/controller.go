@@ -97,10 +97,21 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	// Terminal: the operator PARTS WAYS. Nothing recreates the job.
+	// Terminal: the operator PARTS WAYS — until the spec changes. A corrected
+	// apply (ObservedGeneration < Generation) clears the terminal state and
+	// reconciles again, so a bad spec is not a permanent brick (issue #248).
 	if cr.Status.Terminated != nil {
-		log.Info("pipeline terminated; not reconciling", "reason", cr.Status.Terminated.Reason)
-		return ctrl.Result{}, nil
+		if cr.Status.ObservedGeneration >= cr.Generation {
+			log.Info("pipeline terminated; not reconciling", "reason", cr.Status.Terminated.Reason)
+			return ctrl.Result{}, nil
+		}
+		log.Info("pipeline spec changed; clearing terminal state",
+			"reason", cr.Status.Terminated.Reason,
+			"observed", cr.Status.ObservedGeneration, "generation", cr.Generation)
+		cr.Status.Terminated = nil
+		if err := r.Status().Update(ctx, cr); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if !controllerutil.ContainsFinalizer(cr, finalizer) {
@@ -836,17 +847,32 @@ func int32Ptr(v int32) *int32 { return &v }
 // cluster. Missing secrets cause pods to fail at startup; catching them here
 // gives a clear terminal state instead of a cryptic CrashLoopBackOff.
 func (r *CoordinatorReconciler) validateSecrets(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) error {
-	for _, name := range []string{cr.Spec.Secrets.Source, cr.Spec.Secrets.Catalog} {
-		if name == "" {
+	// Each referenced Secret must carry the keys the pod mounts (issue #250):
+	// uri is required for the source and catalog; the OAuth2 keys are optional
+	// (coordinatorEnv marks them so); the SSH key lives under "privateKey".
+	for _, n := range []struct {
+		name string
+		keys []string
+	}{
+		{cr.Spec.Secrets.Source, []string{"uri"}},
+		{cr.Spec.Secrets.Catalog, []string{"uri"}},
+		{cr.Spec.Secrets.SSH, []string{"privateKey"}},
+	} {
+		if n.name == "" {
 			continue
 		}
 		secret := &corev1.Secret{}
-		key := types.NamespacedName{Name: name, Namespace: cr.Namespace}
+		key := types.NamespacedName{Name: n.name, Namespace: cr.Namespace}
 		if err := r.Get(ctx, key, secret); err != nil {
 			if apierrors.IsNotFound(err) {
-				return fmt.Errorf("secret %q not found in namespace %q", name, cr.Namespace)
+				return fmt.Errorf("secret %q not found in namespace %q", n.name, cr.Namespace)
 			}
-			return fmt.Errorf("check secret %q: %w", name, err)
+			return fmt.Errorf("check secret %q: %w", n.name, err)
+		}
+		for _, k := range n.keys {
+			if _, ok := secret.Data[k]; !ok {
+				return fmt.Errorf("secret %q is missing required key %q", n.name, k)
+			}
 		}
 	}
 	return nil

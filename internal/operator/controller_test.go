@@ -240,7 +240,13 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 	if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh); err != nil {
 		t.Fatalf("get CR: %v", err)
 	}
-	fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
+	setTerminated := func() {
+		fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
+		// markTerminated records the generation it terminated at; without it
+		// the reconciler would read a spec change and clear the state (#248).
+		fresh.Status.ObservedGeneration = fresh.Generation
+	}
+	setTerminated()
 	for i := 0; i < 10; i++ {
 		if err := cli.Status().Update(testCtx, fresh); err == nil {
 			break
@@ -251,7 +257,7 @@ func TestReconcilerStopsAtTerminated(t *testing.T) {
 		if err := cli.Get(testCtx, types.NamespacedName{Name: "dead", Namespace: nsName}, fresh); err != nil {
 			t.Fatalf("reget CR: %v", err)
 		}
-		fresh.Status.Terminated = &urutauv1alpha1.Terminated{Reason: "crashloop", At: "now"}
+		setTerminated()
 	}
 	// The reconciler reads the manager's cache: wait until the termination
 	// is visible there, or the delete-event reconcile below can still see
@@ -306,6 +312,21 @@ func TestWebhookRejectsEmptyOrAmbiguousDefinition(t *testing.T) {
 	cr2.Spec.Definition.Image = "urutau-runtime:dev"
 	if _, err := v.ValidateCreate(testCtx, cr2); err == nil {
 		t.Fatal("webhook accepted image AND inline")
+	}
+
+	// image/s3 need the planner (not implemented): rejected at admission so a
+	// bad apply is an apply-time error, not a terminated pipeline (#253).
+	img := pipelineCR("img", "test-ops-unique")
+	img.Spec.Definition.Inline = nil
+	img.Spec.Definition.Image = "urutau-runtime:dev"
+	if _, err := v.ValidateCreate(testCtx, img); err == nil {
+		t.Fatal("webhook accepted an image-only definition")
+	}
+	s3 := pipelineCR("s3", "test-ops-unique")
+	s3.Spec.Definition.Inline = nil
+	s3.Spec.Definition.S3 = "s3://bucket/spec.yaml"
+	if _, err := v.ValidateCreate(testCtx, s3); err == nil {
+		t.Fatal("webhook accepted an s3-only definition")
 	}
 
 	// A valid inline definition with an invalid spec is rejected by the
@@ -578,4 +599,53 @@ func TestWorkerPodTemplateMetricsAddr(t *testing.T) {
 	if strings.Contains(cmd, "--metrics-addr") {
 		t.Fatalf("worker command = %q, must not carry --metrics-addr when unset", cmd)
 	}
+}
+
+// #248: a terminated pipeline must be un-bricked by a corrected spec (a new
+// generation), not stay dead forever.
+func TestReconcilerUnbricksOnSpecChange(t *testing.T) {
+	requireEnvtest(t)
+	nsName := "test-unbrick-" + fmt.Sprint(time.Now().UnixNano()%100000)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
+	_ = cli.Create(testCtx, ns)
+
+	cr := pipelineCR("unbrick", nsName)
+	cr.Spec.Definition.Inline = nil
+	if err := cli.Create(testCtx, cr); err != nil {
+		t.Fatalf("create CR: %v", err)
+	}
+
+	// Wait for the invalid spec to terminate it.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		fresh := &urutauv1alpha1.CDCPipeline{}
+		if err := cli.Get(testCtx, types.NamespacedName{Name: "unbrick", Namespace: nsName}, fresh); err == nil && fresh.Status.Terminated != nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// A corrected spec (valid inline) bumps the generation; the reconciler
+	// must clear the terminal state and proceed to create the coordinator.
+	fresh := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "unbrick", Namespace: nsName}, fresh); err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	fresh.Spec.Definition.Inline = pipelineCR("x", nsName).Spec.Definition.Inline
+	if err := cli.Update(testCtx, fresh); err != nil {
+		t.Fatalf("update CR: %v", err)
+	}
+
+	waitForSTS(t, nsName, "unbrick-coordinator")
+	for time.Now().Before(deadline.Add(20 * time.Second)) {
+		got := &urutauv1alpha1.CDCPipeline{}
+		if err := cli.Get(testCtx, types.NamespacedName{Name: "unbrick", Namespace: nsName}, got); err != nil {
+			t.Fatalf("get CR: %v", err)
+		}
+		if got.Status.Terminated == nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("a corrected spec never cleared the terminal state")
 }
