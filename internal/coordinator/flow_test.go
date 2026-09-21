@@ -77,20 +77,20 @@ func TestPositionIndexTruncatesByHead(t *testing.T) {
 
 	// Acking orders past 1-10 pops only the first batch: the unconfirmed
 	// raw.items batch blocks the rest.
-	if freed, _ := p.truncate("raw.orders", lo); freed != 10 {
+	if freed, _, _ := p.truncate("raw.orders", lo); freed != 10 {
 		t.Fatalf("first truncate freed %d, want 10", freed)
 	}
 	// Acking items past 1-20 pops items AND the orders batch behind it? No —
 	// head order: items is at the head after the first pop; acking it frees
 	// items, then the head becomes orders@1-30 which the orders ack (1-10)
 	// does not cover.
-	if freed, _ := p.truncate("raw.items", hi); freed != 20 {
+	if freed, _, _ := p.truncate("raw.items", hi); freed != 20 {
 		t.Fatalf("second truncate freed %d, want 20", freed)
 	}
-	if freed, _ := p.truncate("raw.orders", lo); freed != 0 {
+	if freed, _, _ := p.truncate("raw.orders", lo); freed != 0 {
 		t.Fatalf("stale ack freed %d, want 0", freed)
 	}
-	if freed, _ := p.truncate("raw.orders", hi2); freed != 30 {
+	if freed, _, _ := p.truncate("raw.orders", hi2); freed != 30 {
 		t.Fatalf("final truncate freed %d, want 30", freed)
 	}
 }
@@ -102,7 +102,7 @@ func TestPositionIndexPositionlessPopsOnAnyAck(t *testing.T) {
 	p.add(inflightBatch{table: "raw.orders", high: nil, bytes: 7}) // snapshot rows
 	p.add(inflightBatch{table: "raw.orders", high: pos, bytes: 3}) // closes marker
 
-	if freed, _ := p.truncate("raw.orders", pos); freed != 10 {
+	if freed, _, _ := p.truncate("raw.orders", pos); freed != 10 {
 		t.Fatalf("freed %d, want 10 (positionless pops once its table acked)", freed)
 	}
 }
@@ -208,7 +208,7 @@ func TestOversizedSlotReleasedOnAckNotOnDrain(t *testing.T) {
 	idx.add(inflightBatch{id: 2, table: "t", high: positionFixture("p2"), bytes: 10})
 
 	// The ack covers only the oversized batch (p1), not p2.
-	freed, freedOversized := idx.truncate("t", positionFixture("p1"))
+	freed, freedOversized, _ := idx.truncate("t", positionFixture("p1"))
 	if freed != 200 || !freedOversized {
 		t.Fatalf("truncate = %d, %v; want 200, true", freed, freedOversized)
 	}

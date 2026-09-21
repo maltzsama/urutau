@@ -140,14 +140,14 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 			continue
 		}
 		// CD-2: a reset cancels the session but is NOT a failure — the
-		// worker reconnects and drains the queue, which holds only NEW
-		// batches. Any in-flight (unacked) batch would be lost silently:
-		// not in the queue, and the one-slot resend covers only a failed
-		// Send. With batches owed, terminate instead — the restart replays
-		// from the committed position (at-least-once). A reset is safe only
-		// when the worker owes nothing.
+		// worker reconnects and drains the queue. The in-flight (unacked)
+		// batches are redelivered on reconnect (issue #235), so a reset no
+		// longer loses them — but it replays them, duplicating the work (and
+		// plain appends). With batches owed, terminate instead for a clean
+		// replay from the committed position. A reset is safe only when the
+		// worker owes nothing.
 		if n := s.c.inFlight(worker); n > 0 {
-			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) — a reset would drop them; terminating for replay",
+			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) — a reset would replay them; terminating for a clean replay",
 				worker, n)
 		}
 		if n := s.recordReset(worker, now, window); n >= maxResets {

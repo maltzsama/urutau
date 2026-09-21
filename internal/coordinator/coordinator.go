@@ -129,6 +129,7 @@ const defaultSnapshotChunkTimeout = 10 * time.Minute
 
 // queuedBatch is one serialized batch waiting for the Flight stream.
 type queuedBatch struct {
+	id   uint64 // the inflight batch id, to correlate an ack with the sent list
 	body []byte // complete Arrow IPC stream
 	meta []byte // BatchMeta proto
 }
@@ -267,11 +268,13 @@ type workerState struct {
 	epoch    uint64 // last accepted epoch (guards stale Hellos)
 	cancel   context.CancelFunc
 
-	// resend holds a batch popped from the queue whose Flight Send failed:
-	// the next DoGet delivers it before draining the queue. A pop-then-send
-	// that dropped the batch on stream death silently lost data (audit #2).
-	resendMu sync.Mutex
-	resend   *queuedBatch
+	// sent holds the batches popped from the queue and delivered (or whose
+	// Send was attempted) but not yet acked, in send order. On session loss
+	// the next DoGet redelivers them before draining the queue, so a batch
+	// whose ack was lost is replayed rather than dropped — at-least-once, the
+	// data-loss fix for issue #235. Pruned by the ack that covers each id.
+	sentMu sync.Mutex
+	sent   []queuedBatch
 
 	// committed: target table → position the worker reported after its last
 	// commit. Refreshed on every ready Hello (design §5.6.1).
@@ -279,8 +282,8 @@ type workerState struct {
 
 	// activeGet guards one DoGet stream per worker. Two concurrent streams
 	// on the same ticket would each pop the queue, splitting batches across
-	// readers — a batch sent to a dying stream is lost (the one-slot resend
-	// cannot cover two readers).
+	// readers — and each would append to the sent list, duplicating them on
+	// the next redelivery.
 	activeGet atomic.Bool
 }
 
@@ -1736,7 +1739,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 		}
 	}
 	select {
-	case w.queue <- queuedBatch{body: body, meta: metaBytes}:
+	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes}:
 		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
 		return nil
 	case <-ctx.Done():
@@ -1950,12 +1953,17 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.fail(fmt.Errorf("coordinator: worker %s: unparsable ack position %q: %w", worker, ack.Position, err))
 		return
 	}
-	freed, freedOversized := c.index[worker].truncate(ack.Table, pos)
+	freed, freedOversized, popped := c.index[worker].truncate(ack.Table, pos)
 	if freed > 0 {
 		c.budget.release(worker, freed)
 	}
 	if freedOversized {
 		c.budget.clearOversized(worker)
+	}
+	// The ack is durable evidence: the popped batches can leave the sent list
+	// and need no redelivery (issue #235). c.workers is immutable after boot.
+	if w := c.workers[worker]; w != nil {
+		w.dropSent(popped)
 	}
 	// The ack is evidence of a durable commit: record it and recompute the
 	// pipeline-wide minimum the source's retention may advance to. Keyed by
@@ -2489,11 +2497,12 @@ type flightServer struct {
 // stream in DataBody and a BatchMeta proto in AppMetadata — both produced
 // at enqueue time, so the server only moves bytes.
 //
-// A batch is only abandoned once a Send succeeds. If the stream dies
-// mid-Send, the batch stays on the worker's resend slot and the next DoGet
-// delivers it BEFORE draining the queue — FIFO must not reorder it behind
-// younger batches, and the budget charge is only released by an Ack that
-// truncates past it (audit #2).
+// A batch that has left the queue is kept on the worker's sent list until an
+// Ack covers it. On session loss the next DoGet redelivers the whole sent list
+// before draining the queue, so a delivered-but-unacked batch is replayed
+// rather than dropped — at-least-once (issue #235). FIFO is preserved: the
+// sent list is in send order, ahead of the queue's head, and the budget charge
+// is released only by the Ack that truncates past the batch.
 func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoGetServer) error {
 	w, ok := s.c.byTicket[string(req.Ticket)]
 	if !ok {
@@ -2503,46 +2512,62 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 		return status.Error(codes.ResourceExhausted, "coordinator: a DoGet stream is already active for this worker")
 	}
 	defer w.activeGet.Store(false)
-	for {
-		// Deliver any resend first: it was popped ahead of the queue's head,
-		// so it must land ahead of it too.
-		w.resendMu.Lock()
-		pending := w.resend
-		w.resendMu.Unlock()
-		if pending != nil {
-			if err := stream.Send(&flight.FlightData{
-				DataHeader:  []byte("urutau-batch"),
-				DataBody:    pending.body,
-				AppMetadata: pending.meta,
-			}); err != nil {
-				return err // keep resend for the next attempt
-			}
-			w.resendMu.Lock()
-			if w.resend == pending {
-				w.resend = nil
-			}
-			w.resendMu.Unlock()
-			continue
-		}
 
+	// Redeliver everything a previous session delivered but never had acked.
+	// The list is pruned by the ack, so what remains here is exactly the
+	// in-flight window of a lost session.
+	w.sentMu.Lock()
+	redeliver := append([]queuedBatch(nil), w.sent...)
+	w.sentMu.Unlock()
+	for _, qb := range redeliver {
+		if err := stream.Send(&flight.FlightData{
+			DataHeader:  []byte("urutau-batch"),
+			DataBody:    qb.body,
+			AppMetadata: qb.meta,
+		}); err != nil {
+			return err // still on the sent list; the next session retries
+		}
+	}
+
+	for {
 		select {
 		case qb := <-w.queue:
+			// Record before sending: a batch that has left the queue must be
+			// redeliverable until its ack arrives.
+			w.sentMu.Lock()
+			w.sent = append(w.sent, qb)
+			w.sentMu.Unlock()
 			if err := stream.Send(&flight.FlightData{
 				DataHeader:  []byte("urutau-batch"),
 				DataBody:    qb.body,
 				AppMetadata: qb.meta,
 			}); err != nil {
-				w.resendMu.Lock()
-				if w.resend == nil {
-					w.resend = &qb
-				}
-				w.resendMu.Unlock()
-				return err
+				return err // still on the sent list; the next session retries
 			}
 		case <-stream.Context().Done():
 			return stream.Context().Err()
 		}
 	}
+}
+
+// dropSent removes the batches an ack covered from the worker's sent list.
+func (w *workerState) dropSent(ids []uint64) {
+	if len(ids) == 0 {
+		return
+	}
+	drop := make(map[uint64]struct{}, len(ids))
+	for _, id := range ids {
+		drop[id] = struct{}{}
+	}
+	w.sentMu.Lock()
+	kept := w.sent[:0]
+	for _, qb := range w.sent {
+		if _, ok := drop[qb.id]; !ok {
+			kept = append(kept, qb)
+		}
+	}
+	w.sent = kept
+	w.sentMu.Unlock()
 }
 
 // ── Positions ─────────────────────────────────────────────────────────

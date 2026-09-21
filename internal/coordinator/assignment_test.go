@@ -39,20 +39,21 @@ func (s *fakeDoGetStream) Send(d *flight.FlightData) error {
 
 func (s *fakeDoGetStream) Context() context.Context { return s.ctx }
 
-// TestDoGetResendOnSendFailure covers audit #2: a batch popped from the
-// queue must survive a failed Flight Send — the next DoGet delivers it
-// BEFORE draining the queue, so FIFO order is preserved.
-func TestDoGetResendOnSendFailure(t *testing.T) {
+// TestDoGetRedeliversSentOnSendFailure covers audit #2 and issue #235: a
+// batch popped from the queue must survive a failed Flight Send — it stays on
+// the sent list, and the next DoGet redelivers it BEFORE draining the queue,
+// so FIFO order is preserved.
+func TestDoGetRedeliversSentOnSendFailure(t *testing.T) {
 	c := &Coordinator{byTicket: map[string]*workerState{}}
 	w := &workerState{name: "w", queue: make(chan queuedBatch, 2)}
-	w.queue <- queuedBatch{body: []byte("b1")}
-	w.queue <- queuedBatch{body: []byte("b2")}
+	w.queue <- queuedBatch{id: 1, body: []byte("b1")}
+	w.queue <- queuedBatch{id: 2, body: []byte("b2")}
 	c.byTicket["t"] = w
 	srv := &flightServer{c: c}
 	ticket := &flight.Ticket{Ticket: []byte("t")}
 
 	// First DoGet: the first Send fails; the popped batch must move to the
-	// resend slot, never vanish.
+	// sent list, never vanish.
 	s1 := &fakeDoGetStream{ctx: context.Background(), fail: true}
 	if err := srv.DoGet(ticket, s1); err == nil {
 		t.Fatal("first DoGet should fail on the failed Send")
@@ -60,14 +61,15 @@ func TestDoGetResendOnSendFailure(t *testing.T) {
 	if len(s1.sent) != 0 {
 		t.Fatalf("first DoGet sent %d batches, want 0", len(s1.sent))
 	}
-	w.resendMu.Lock()
-	gotResend := w.resend
-	w.resendMu.Unlock()
-	if gotResend == nil || string(gotResend.body) != "b1" {
-		t.Fatalf("resend slot = %v, want b1", gotResend)
+	w.sentMu.Lock()
+	got := append([]queuedBatch(nil), w.sent...)
+	w.sentMu.Unlock()
+	if len(got) != 1 || string(got[0].body) != "b1" {
+		t.Fatalf("sent list = %v, want [b1]", got)
 	}
 
-	// Second DoGet: delivers the resend before the queue, then b2, in order.
+	// Second DoGet: redelivers the sent list before the queue, then b2, in
+	// order.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s2 := &fakeDoGetStream{ctx: ctx, sentCh: make(chan []byte, 4)}
@@ -88,10 +90,24 @@ func TestDoGetResendOnSendFailure(t *testing.T) {
 	}
 	cancel()
 	<-done
-	w.resendMu.Lock()
-	defer w.resendMu.Unlock()
-	if w.resend != nil {
-		t.Fatal("resend slot should be cleared after delivery")
+
+	// Both stay on the sent list until an ack covers them (dropSent).
+	w.sentMu.Lock()
+	n := len(w.sent)
+	w.sentMu.Unlock()
+	if n != 2 {
+		t.Fatalf("sent list has %d entries, want 2 (cleared only on ack)", n)
+	}
+}
+
+// TestDropSentPrunesAcked covers issue #235: the ack that pops an index batch
+// removes exactly that batch from the sent list, so an acked batch is never
+// redelivered.
+func TestDropSentPrunesAcked(t *testing.T) {
+	w := &workerState{sent: []queuedBatch{{id: 1}, {id: 2}, {id: 3}}}
+	w.dropSent([]uint64{1, 3})
+	if len(w.sent) != 1 || w.sent[0].id != 2 {
+		t.Fatalf("sent = %+v, want only id 2", w.sent)
 	}
 }
 
@@ -306,4 +322,46 @@ func TestAssignmentTicketRandom(t *testing.T) {
 	if string(t1) == "urutau/" {
 		t.Fatal("ticket must not be deterministic")
 	}
+}
+
+// TestDoGetRedeliversUnackedAfterSuccess covers issue #235: a batch whose Send
+// succeeded but whose ack was lost (session died) is redelivered to the next
+// session, not dropped.
+func TestDoGetRedeliversUnackedAfterSuccess(t *testing.T) {
+	c := &Coordinator{byTicket: map[string]*workerState{}}
+	w := &workerState{name: "w", queue: make(chan queuedBatch, 1)}
+	w.queue <- queuedBatch{id: 7, body: []byte("b1")}
+	c.byTicket["t"] = w
+	srv := &flightServer{c: c}
+	ticket := &flight.Ticket{Ticket: []byte("t")}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	s1 := &fakeDoGetStream{ctx: ctx1, sentCh: make(chan []byte, 4)}
+	done1 := make(chan error, 1)
+	go func() { done1 <- srv.DoGet(ticket, s1) }()
+	select {
+	case <-s1.sentCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first DoGet did not deliver b1")
+	}
+	cancel1()
+	<-done1
+
+	// New session: b1 is redelivered even though its Send succeeded, because
+	// no ack covered it.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	s2 := &fakeDoGetStream{ctx: ctx2, sentCh: make(chan []byte, 4)}
+	done2 := make(chan error, 1)
+	go func() { done2 <- srv.DoGet(ticket, s2) }()
+	select {
+	case b := <-s2.sentCh:
+		if string(b) != "b1" {
+			t.Fatalf("redelivered %q, want b1", b)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an unacked batch was not redelivered on reconnect")
+	}
+	cancel2()
+	<-done2
 }
