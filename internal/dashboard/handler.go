@@ -263,14 +263,26 @@ func jsonSafeValue(v any, depth int) any {
 		float32, float64, json.Number:
 		return v
 	case map[string]any:
-		return jsonSafeAttrs(t)
+		if depth >= maxJSONDepth {
+			return maxDepthMarker
+		}
+		out := make(map[string]any, len(t))
+		for k, vv := range t {
+			out[k] = jsonSafeValue(vv, depth+1)
+		}
+		return out
 	case []any:
+		if depth >= maxJSONDepth {
+			return maxDepthMarker
+		}
 		out := make([]any, len(t))
 		for i, vv := range t {
-			out[i] = jsonSafeValue(vv)
+			out[i] = jsonSafeValue(vv, depth+1)
 		}
 		return out
 	default:
+		// Channels, funcs, errors and flat maps — no map[string]any/[]any
+		// recursion, so fmt.Sprint cannot cycle here.
 		return fmt.Sprint(v)
 	}
 }
