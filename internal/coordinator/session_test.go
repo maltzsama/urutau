@@ -17,10 +17,10 @@ import (
 )
 
 // CD-T1: a stall with unacked (in-flight) batches must TERMINATE, not reset.
-// A reset cancels the session but the worker reconnects and drains only the
-// queue — the in-flight batches are neither queued nor in the one-slot
-// resend, so a reset would drop them silently. Terminating restarts the run
-// and replays from the committed position.
+// A reset cancels the session; the in-flight batches are redelivered on
+// reconnect (issue #235), but that replays them (duplicating the work).
+// Terminating instead restarts the run and replays cleanly from the committed
+// position.
 func TestSupervisorResetWithInFlightTerminates(t *testing.T) {
 	s, _ := supervisorHarness()
 	c := s.c
@@ -170,7 +170,7 @@ func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
 	// queued.
 	p := newPositionIndex("run-p2a")
 	p.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
-	if freed, _ := p.truncate("t", opaquePos("cookie-2")); freed != 0 {
+	if freed, _, _ := p.truncate("t", opaquePos("cookie-2")); freed != 0 {
 		t.Fatalf("incomparable ack freed %d, want 0 (must not truncate)", freed)
 	}
 	if p.InFlight() != 1 {
@@ -180,7 +180,7 @@ func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
 	// Identity DOES cover it (same cookie).
 	p2 := newPositionIndex("run-p2b")
 	p2.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
-	if freed, _ := p2.truncate("t", opaquePos("cookie-1")); freed != 5 {
+	if freed, _, _ := p2.truncate("t", opaquePos("cookie-1")); freed != 5 {
 		t.Fatalf("identical ack freed %d, want 5", freed)
 	}
 }

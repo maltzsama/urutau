@@ -223,9 +223,10 @@ type PositionManifest struct {
 // truncate records an Ack and pops every head batch the commit covers: a
 // positioned batch pops once its table acked at or beyond its high
 // position; a position-less batch (snapshot window rows) pops once its
-// table has any ack. It returns the bytes released and whether an oversized
-// batch was among them (so its budget slot can be freed).
-func (p *positionIndex) truncate(table string, pos position.Position) (freed int64, freedOversized bool) {
+// table has any ack. It returns the bytes released, whether an oversized
+// batch was among them, and the ids of the popped batches (so the worker's
+// sent list can be pruned — issue #235).
+func (p *positionIndex) truncate(table string, pos position.Position) (freed int64, freedOversized bool, popped []uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if cur, ok := p.acked[table]; !ok || advances(pos, cur) {
@@ -246,11 +247,12 @@ func (p *positionIndex) truncate(table string, pos position.Position) (freed int
 		if h.oversized {
 			freedOversized = true
 		}
+		popped = append(popped, h.id)
 		p.head = p.head[1:]
 		p.dirty = true
 		p.gen++
 	}
-	return freed, freedOversized
+	return freed, freedOversized, popped
 }
 
 // advances reports whether pos is provably strictly greater than cur. An
