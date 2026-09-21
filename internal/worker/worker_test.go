@@ -10,6 +10,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
@@ -357,4 +358,59 @@ func batchUpserts(b rowchange.Batch) []rowchange.Change {
 func batchDeletes(b rowchange.Batch) []rowchange.Change {
 	_, d := byOp(b)
 	return d
+}
+
+// #260: the ack must fire AFTER a successful commit, never before.
+func TestAckFiresAfterCommit(t *testing.T) {
+	var order []string
+	w := New(Config{MaxInterval: 10 * time.Millisecond})
+	regTable(t, w, "raw.orders", CommitterFunc(func(context.Context, *dataplane.Batch) error {
+		order = append(order, "commit")
+		return nil
+	}), dataplane.UpsertMode)
+	w.OnCommit(func(*dataplane.Batch, int) { order = append(order, "ack") })
+
+	ing := make(chan Ingest, 2)
+	for _, in := range ingestFromChanges(t, []rowchange.Change{chg("raw.orders", rowchange.OpInsert, 1, "a", "0/1")}) {
+		ing <- in
+	}
+	close(ing)
+	if err := w.Run(context.Background(), ing); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(order) != 2 || order[0] != "commit" || order[1] != "ack" {
+		t.Fatalf("order = %v, want [commit ack]", order)
+	}
+}
+
+// #260: a failed commit must not ack (the coordinator would advance its
+// confirmed position over undurable data).
+func TestFailedCommitDoesNotAck(t *testing.T) {
+	var acked bool
+	w := New(Config{MaxInterval: 10 * time.Millisecond})
+	regTable(t, w, "raw.orders", CommitterFunc(func(context.Context, *dataplane.Batch) error {
+		return errors.New("boom")
+	}), dataplane.UpsertMode)
+	w.OnCommit(func(*dataplane.Batch, int) { acked = true })
+
+	ing := make(chan Ingest, 2)
+	for _, in := range ingestFromChanges(t, []rowchange.Change{chg("raw.orders", rowchange.OpInsert, 1, "a", "0/1")}) {
+		ing <- in
+	}
+	close(ing)
+	if err := w.Run(context.Background(), ing); err == nil {
+		t.Fatal("a failed commit must fail the run")
+	}
+	if acked {
+		t.Fatal("the ack fired without a successful commit")
+	}
+}
+
+// #265: dialOpts must return an error when TLS is enabled but the client
+// credentials are invalid, not silently dial plaintext.
+func TestDialOptsRejectsBadTLS(t *testing.T) {
+	_, err := dialOpts(grpctls.Config{CertFile: "/nonexistent", KeyFile: "/nonexistent", ClientCAFile: "/nonexistent"})
+	if err == nil {
+		t.Fatal("dialOpts must error on invalid TLS credentials, not fall back to plaintext")
+	}
 }

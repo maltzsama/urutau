@@ -40,7 +40,11 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	conn, err := grpc.NewClient(cfg.Coordinator, dialOpts(cfg.TLS)...)
+	opts, err := dialOpts(cfg.TLS)
+	if err != nil {
+		return fmt.Errorf("worker: maintenance: %w", err)
+	}
+	conn, err := grpc.NewClient(cfg.Coordinator, opts...)
 	if err != nil {
 		return fmt.Errorf("worker: maintenance: dial: %w", err)
 	}
@@ -119,6 +123,10 @@ func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.Mainte
 		URI:       cfg.Sink.URI,
 		Namespace: cfg.Namespace,
 		Options:   cfg.Sink.Options,
+		// The sink parses the opaque position string it reads back with this
+		// kind (position.Parse); an empty kind defaults to MySQL GTID, so a
+		// Postgres LSN would be parsed as a GTID set (issue #262).
+		SourceKind: cfg.Sink.SourceKind,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("worker: maintenance: open sink: %w", err)

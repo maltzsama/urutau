@@ -468,17 +468,6 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 			rb.batch.Release()
 			return fmt.Errorf("worker: table %s: batch has no write mode set", p.target)
 		}
-		// The Ack fires here, BEFORE the data is durable — it already did
-		// with one worker (the sink Commit follows). In staged mode the
-		// durable point moves to the coordinator's CommitStaged, so the
-		// window ack→durable widens from one call to a whole cycle: a
-		// discarded cycle or a coordinator crash before the commit leaves
-		// the ack counted and the source slot advanced over data that never
-		// reached the table (WK-001 C5, documented in the plan). The
-		// protocol is deliberately unchanged.
-		if w.onCommit != nil {
-			w.onCommit(rb.batch, rb.rows)
-		}
 		if p.staged {
 			if err := w.stageBatch(ctx, p, rb.batch); err != nil {
 				rb.batch.Release()
@@ -493,6 +482,16 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
 			}
 			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
+		}
+		// Ack only AFTER the batch is durable (non-staged) or staged for the
+		// coordinator's commit (staged). Acking first advanced the
+		// coordinator's confirmed position over data that a failed commit
+		// never made durable — a crash then re-read past the lost window
+		// (issue #260). In staged mode the durable point is the coordinator's
+		// CommitStaged, so this ack is a delivery receipt, but it must still
+		// follow a successful stage.
+		if w.onCommit != nil {
+			w.onCommit(rb.batch, rb.rows)
 		}
 		rb.batch.Release()
 		if w.metrics != nil {
