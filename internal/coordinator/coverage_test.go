@@ -407,15 +407,16 @@ func TestEnqueueBatchDataAndMarker(t *testing.T) {
 		t.Fatalf("in-flight = %d, want 1", got)
 	}
 
-	// Marker: needs refs + a canonical schema for the table.
+	// Marker: needs refs + a canonical schema for the table. Markers go
+	// through enqueueTo (issue #214).
 	cs := transport.InferSchemaFromChanges([]rowchange.Change{{
 		Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(1)},
 		After: map[string]any{"id": int64(1)}, Position: "0/11", IngestTS: time.Now(),
 	}})
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	c.canonical = map[string]core.Schema{"shop.orders": cs}
-	if err := c.enqueueBatch(ctx, nil, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
-		t.Fatalf("enqueueBatch(marker): %v", err)
+	if err := c.enqueueTo(ctx, w, nil, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
+		t.Fatalf("enqueueTo(marker): %v", err)
 	}
 	if len(w.queue) != 2 {
 		t.Fatalf("queue after marker = %d, want 2", len(w.queue))

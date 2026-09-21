@@ -1562,19 +1562,10 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	}
 
 	if b == nil {
-		// A marker with no target worker specified goes to every
-		// partition owner — used by callers with no single partition in
-		// mind (there are none of these left in this codebase; every
-		// window-lifecycle marker now goes through snapshotTable's
-		// explicit per-partition enqueueTo calls instead). Kept as the
-		// safe default for any other caller of the plain enqueueBatch
-		// marker path, rather than silently picking one owner.
-		for _, w := range owners {
-			if err := c.enqueueTo(ctx, w, nil, cloneBatchMeta(meta)); err != nil {
-				return err
-			}
-		}
-		return nil
+		// Window-lifecycle markers are enqueued to one explicit partition
+		// owner via enqueueTo (snapshotTable does this per partition);
+		// enqueueBatch carries source batches only (issue #214).
+		return fmt.Errorf("coordinator: enqueueBatch requires a batch; window markers go through enqueueTo")
 	}
 
 	if len(owners) == 1 {
