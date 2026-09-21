@@ -171,7 +171,7 @@ func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
 	// queued.
 	p := newPositionIndex("run-p2a")
 	p.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
-	if freed := p.truncate("t", opaquePos("cookie-2")); freed != 0 {
+	if freed, _ := p.truncate("t", opaquePos("cookie-2")); freed != 0 {
 		t.Fatalf("incomparable ack freed %d, want 0 (must not truncate)", freed)
 	}
 	if p.InFlight() != 1 {
@@ -181,7 +181,7 @@ func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
 	// Identity DOES cover it (same cookie).
 	p2 := newPositionIndex("run-p2b")
 	p2.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
-	if freed := p2.truncate("t", opaquePos("cookie-1")); freed != 5 {
+	if freed, _ := p2.truncate("t", opaquePos("cookie-1")); freed != 5 {
 		t.Fatalf("identical ack freed %d, want 5", freed)
 	}
 }

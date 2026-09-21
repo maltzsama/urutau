@@ -1713,7 +1713,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	}
 	select {
 	case w.queue <- queuedBatch{body: body, meta: metaBytes}:
-		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n})
+		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
 		return nil
 	case <-ctx.Done():
 		c.budget.release(w.name, n)
@@ -1926,9 +1926,12 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.fail(fmt.Errorf("coordinator: worker %s: unparsable ack position %q: %w", worker, ack.Position, err))
 		return
 	}
-	freed := c.index[worker].truncate(ack.Table, pos)
+	freed, freedOversized := c.index[worker].truncate(ack.Table, pos)
 	if freed > 0 {
 		c.budget.release(worker, freed)
+	}
+	if freedOversized {
+		c.budget.clearOversized(worker)
 	}
 	// The ack is evidence of a durable commit: record it and recompute the
 	// pipeline-wide minimum the source's retention may advance to. Keyed by
