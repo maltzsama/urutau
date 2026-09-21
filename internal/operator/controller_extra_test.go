@@ -1,10 +1,17 @@
 package operator
 
 import (
+	"context"
+	"strings"
 	"testing"
 
-	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
 )
 
 func TestValidateSpecRequiresInline(t *testing.T) {
@@ -141,5 +148,49 @@ func TestWorkerPodTemplateKey(t *testing.T) {
 	want := "worker-pod-template.orders.yaml"
 	if got != want {
 		t.Errorf("workerPodTemplateKey = %q, want %q", got, want)
+	}
+}
+
+// #250: validateSecrets must check the required keys, not just that the Secret
+// object exists.
+func TestValidateSecretsChecksKeys(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	mk := func(name string, data map[string][]byte) *corev1.Secret {
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"}, Data: data}
+	}
+	cr := &urutauv1alpha1.CDCPipeline{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns"},
+		Spec: urutauv1alpha1.CDCPipelineSpec{
+			Secrets: urutauv1alpha1.Secrets{Source: "src", Catalog: "cat", SSH: "ssh"},
+		},
+	}
+	with := func(objs ...client.Object) *CoordinatorReconciler {
+		return &CoordinatorReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()}
+	}
+
+	// Source secret missing "uri".
+	if err := with(
+		mk("src", map[string][]byte{"nope": nil}),
+		mk("cat", map[string][]byte{"uri": nil}),
+		mk("ssh", map[string][]byte{"privateKey": nil}),
+	).validateSecrets(context.Background(), cr); err == nil || !strings.Contains(err.Error(), "uri") {
+		t.Fatalf("missing uri = %v, want an error naming uri", err)
+	}
+	// SSH secret missing "privateKey".
+	if err := with(
+		mk("src", map[string][]byte{"uri": nil}),
+		mk("cat", map[string][]byte{"uri": nil}),
+		mk("ssh", map[string][]byte{}),
+	).validateSecrets(context.Background(), cr); err == nil || !strings.Contains(err.Error(), "privateKey") {
+		t.Fatalf("missing privateKey = %v, want an error naming privateKey", err)
+	}
+	// All present.
+	if err := with(
+		mk("src", map[string][]byte{"uri": nil}),
+		mk("cat", map[string][]byte{"uri": nil}),
+		mk("ssh", map[string][]byte{"privateKey": nil}),
+	).validateSecrets(context.Background(), cr); err != nil {
+		t.Fatalf("valid secrets: %v", err)
 	}
 }
