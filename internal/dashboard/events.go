@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"maps"
 	"sync"
 	"time"
 )
@@ -41,7 +42,9 @@ func (e *Events) Record(kind string, fields map[string]any) Event {
 		TS:      time.Now().UTC().Format(time.RFC3339Nano),
 		Type:    kind,
 		Message: kind,
-		Fields:  fields,
+		// Clone so a caller that reuses its fields map (a pool, a buffer, a
+		// loop) cannot mutate the ring's history (issue #226).
+		Fields: maps.Clone(fields),
 	}
 	if v, ok := fields["worker"].(string); ok {
 		ev.Worker = v
