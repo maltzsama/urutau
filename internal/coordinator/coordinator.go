@@ -755,6 +755,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 		defer c.snapshotActive.Store(false)
 		defer snapCancel()
 		defer close(snapDone)
+		// A cancelled snapshot returns before closeWindow, leaving batches
+		// held in an open gate. Release them when the phase ends (normally a
+		// no-op — closeWindow already drained each partition) so shutdown does
+		// not leak Arrow batches (issue #212). gateHold re-checks the window
+		// under gateMu before appending, so clearing it here cannot race a
+		// late gate.
+		defer c.releaseAllGates()
 		snapCfg := snapshot.SnapshotConfig{
 			WindowTimeout: c.cfg.WindowTimeout,
 			CaughtUpPoll:  c.cfg.CaughtUpPoll,
@@ -1236,6 +1243,26 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 		}
 	}
 	return nil
+}
+
+// releaseAllGates closes every open gate and releases the batches held in it.
+// Called when the snapshot phase ends, so an aborted snapshot (ctx cancelled
+// before closeWindow) does not leak the gated batches (issue #212). gateHold
+// re-checks the window under gateMu before appending, so a gate cleared here
+// cannot be re-populated afterwards.
+func (c *Coordinator) releaseAllGates() {
+	c.gateMu.Lock()
+	var held []*dataplane.Batch
+	for k := range c.gateOn {
+		held = append(held, c.gateBuf[k]...)
+		delete(c.gateOn, k)
+		delete(c.gateWin, k)
+		delete(c.gateBuf, k)
+	}
+	c.gateMu.Unlock()
+	for _, b := range held {
+		b.Release()
+	}
 }
 
 // recordConfirmed stores a worker's latest durably-committed position and

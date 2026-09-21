@@ -520,3 +520,26 @@ func TestNewCheckpointBuildsClient(t *testing.T) {
 		t.Fatalf("default interval = %v, want 10s", cp.interval)
 	}
 }
+
+// #212: an aborted snapshot returns before closeWindow, so releaseAllGates
+// must drain any batches still held in an open gate.
+func TestReleaseAllGatesDrainsHeldBatches(t *testing.T) {
+	c, _ := coordHarness()
+	ctx := context.Background()
+	c.openWindow("raw.orders", 0)
+	if !c.gateHold(ctx, &dataplane.Batch{Table: "raw.orders"}) {
+		t.Fatal("a batch must be held while a window is open")
+	}
+
+	c.releaseAllGates()
+
+	c.gateMu.Lock()
+	open := len(c.gateOn)
+	c.gateMu.Unlock()
+	if open != 0 {
+		t.Fatalf("releaseAllGates left %d open gate(s)", open)
+	}
+	if c.gateHold(ctx, &dataplane.Batch{Table: "raw.orders"}) {
+		t.Fatal("a cleared gate must not hold")
+	}
+}
