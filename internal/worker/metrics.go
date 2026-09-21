@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -80,5 +81,9 @@ func (w *Worker) MetricsSnapshot() *pb.WorkerMetricsReport {
 			Evicted:      ec.Evicted,
 		})
 	}
+	// The report is built by ranging several maps, so the table order would
+	// otherwise vary between snapshots. Sort it for a stable wire report
+	// (issue #267).
+	sort.Slice(rep.Tables, func(i, j int) bool { return rep.Tables[i].Table < rep.Tables[j].Table })
 	return rep
 }

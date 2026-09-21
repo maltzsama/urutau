@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,18 +99,30 @@ func (s *sessionSender) send(msg *pb.WorkerMessage) error {
 // sessionWithRetry opens the Session stream, tolerating a coordinator that
 // is still booting its listener.
 func sessionWithRetry(ctx context.Context, conn *grpc.ClientConn, log *slog.Logger) (pb.UrutauControl_SessionClient, error) {
+	const maxTries = 10
+	const base = 250 * time.Millisecond
+	const cap = 30 * time.Second
 	var last error
-	for attempt := 0; attempt < 10; attempt++ {
+	for attempt := 0; attempt < maxTries; attempt++ {
 		s, err := pb.NewUrutauControlClient(conn).Session(ctx)
 		if err == nil {
 			return s, nil
 		}
 		last = err
 		log.Warn("worker: session retry", "attempt", attempt+1, "err", err)
+		// Exponential backoff with jitter: a coordinator rolling out (a new
+		// Pod, a TLS cert swap) takes longer than a fixed 5s budget, and
+		// jitter keeps a fleet of workers from retrying in lockstep
+		// (issue #270).
+		d := base << attempt
+		if d > cap {
+			d = cap
+		}
+		d += time.Duration(rand.Int64N(int64(d)/2 + 1))
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(d):
 		}
 	}
 	return nil, last

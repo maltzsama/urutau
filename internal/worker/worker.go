@@ -276,7 +276,11 @@ func newTablePipeline(target string, c sink.TableWriter, mode dataplane.WriteMod
 // snapshot source produced (no row decode). Live InWindow events mark keys
 // in touched; Closes emits the batch minus the touched rows.
 type snapshotWindow struct {
-	batch   *dataplane.Batch
+	batch *dataplane.Batch
+	// keys is the set of PK key-strings the window holds, computed once when
+	// the chunk is stored. markBatchSideEffects tests membership here instead
+	// of re-scanning the batch per live row (issue #266).
+	keys    map[string]struct{}
 	touched map[string]struct{}
 }
 
@@ -294,7 +298,16 @@ func (w *Worker) AddWindowRows(target string, chunkID uint32, batch *dataplane.B
 		batch.Release()
 		return fmt.Errorf("worker: window rows: duplicate chunk %d for %s", chunkID, target)
 	}
-	p.windows[chunkID] = &snapshotWindow{batch: batch, touched: make(map[string]struct{})}
+	// Precompute the window's key set once: the live path tests membership per
+	// row, and re-scanning the whole chunk per row was O(rows × windows ×
+	// window-rows) during the snapshot (issue #266).
+	keys := make(map[string]struct{}, batch.Record.NumRows())
+	if r, err := transport.NewBatchReader(batch.Record, p.knownSchema.PrimaryKey); err == nil {
+		for i := range r.NumRows() {
+			keys[rowchange.KeyString(r.Key(i))] = struct{}{}
+		}
+	}
+	p.windows[chunkID] = &snapshotWindow{batch: batch, keys: keys, touched: make(map[string]struct{})}
 	return nil
 }
 
@@ -953,7 +966,7 @@ func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) 
 					continue
 				}
 				// Only touch a key the window actually holds.
-				if rowHoldsKey(win, k, p.knownSchema.PrimaryKey) {
+				if _, held := win.keys[k]; held {
 					win.touched[k] = struct{}{}
 					p.dropped++
 				}
@@ -962,21 +975,6 @@ func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) 
 		}
 	}
 	return nil
-}
-
-// rowHoldsKey reports whether the stored window batch holds a row with the
-// given key string.
-func rowHoldsKey(win *snapshotWindow, key string, pk []string) bool {
-	reader, err := transport.NewBatchReader(win.batch.Record, pk)
-	if err != nil {
-		return false
-	}
-	for i := range reader.NumRows() {
-		if rowchange.KeyString(reader.Key(i)) == key {
-			return true
-		}
-	}
-	return false
 }
 
 // partitionSnapshotRows splits a merged batch's row indices into untouched
@@ -1043,11 +1041,12 @@ func appendRowsToKeep(ctx context.Context, p *tablePipeline, w *Worker, b *datap
 }
 
 // rowHasImage reports whether the row carries a value in a non-PK column —
-// a delete with an image is appendable; a key-only tombstone is not.
+// a delete with an image is appendable; a key-only tombstone is not. It is
+// only called for delete rows and returns on the first non-null column.
 func rowHasImage(r *transport.BatchReader, nonPK []string, i int) bool {
 	for _, name := range nonPK {
-		v, ok := r.Value(name, i)
-		if ok && v != nil {
+		// IsNull is O(1) and allocates nothing; Value decodes the cell.
+		if null, ok := r.IsNull(name, i); ok && !null {
 			return true
 		}
 	}
