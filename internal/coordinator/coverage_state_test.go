@@ -313,7 +313,7 @@ func TestMaintenanceSessionRejectsWhenDisabled(t *testing.T) {
 // ── k8s helpers (no cluster) ─────────────────────────────────────────
 
 func TestWorkerPodTemplateHelpers(t *testing.T) {
-	if got := workerPodTemplateFile("raw.orders"); got != "worker-pod-template.raw.orders.yaml" {
+	if got := spec.WorkerPodTemplateKey("raw.orders"); got != "worker-pod-template.raw.orders.yaml" {
 		t.Fatalf("workerPodTemplateFile = %q", got)
 	}
 	if got := anyTarget(nil); got != "" {
@@ -334,7 +334,7 @@ func TestWorkerPodTemplateHelpers(t *testing.T) {
 	// A discovered target with no own template falls back to the generic one.
 	cands := workerPodTemplateCandidates("raw.discovered")
 	if len(cands) != 2 || cands[0] != "worker-pod-template.raw.discovered.yaml" ||
-		cands[1] != "worker-pod-template."+defaultWorkerTemplateTarget+".yaml" {
+		cands[1] != "worker-pod-template."+spec.DefaultWorkerTemplateTarget+".yaml" {
 		t.Fatalf("candidates = %v, want the table's own then the generic", cands)
 	}
 }
