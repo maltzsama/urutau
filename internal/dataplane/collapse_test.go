@@ -226,3 +226,15 @@ func TestCollapseMissingOpColumn(t *testing.T) {
 		t.Fatal("expected error for missing __op column")
 	}
 }
+
+// #218: an empty PK list would collapse every row into one group (EncodeKey
+// returns a nil key for each) and silently drop all but the last.
+func TestCollapseRejectsEmptyPrimaryKey(t *testing.T) {
+	alloc := checkedAlloc(t)
+	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
+	defer b.Release()
+
+	if _, _, err := dataplane.Collapse(context.Background(), alloc, b, nil); err == nil {
+		t.Fatal("an empty primary key list must error")
+	}
+}
