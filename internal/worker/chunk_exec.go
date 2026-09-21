@@ -94,6 +94,12 @@ func sourceSpecFor(kind, dsn string, postgres []byte) (spec.Source, error) {
 	if len(postgres) == 0 {
 		return spec.Source{Kind: kind, URI: dsn}, nil
 	}
+	// A postgres block only makes sense for a postgres source; a mismatched
+	// kind would build a nonsensical spec the driver then mis-handles
+	// (issue #268).
+	if kind != "postgres" {
+		return spec.Source{}, fmt.Errorf("worker: postgres config set for non-postgres source kind %q", kind)
+	}
 	var pg spec.PostgresSource
 	if err := json.Unmarshal(postgres, &pg); err != nil {
 		return spec.Source{}, fmt.Errorf("worker: postgres config: %w", err)
@@ -138,6 +144,12 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	}
 	if x.chunkSz <= 0 {
 		x.chunkSz = 10000
+	}
+	// The coordinator prevents a keyless assignment (requirePartitionKey), but
+	// the worker must not depend on that: an empty key joins to "" and
+	// NewChunker fails with a cryptic message (issue #271).
+	if len(ta.PrimaryKey) == 0 {
+		return fmt.Errorf("worker: chunk for %s: the assignment carries no primary key", req.Table)
 	}
 	q, err := x.querySource(ctx)
 	if err != nil {

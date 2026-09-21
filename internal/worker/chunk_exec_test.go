@@ -180,4 +180,21 @@ func TestSourceSpecFor(t *testing.T) {
 	if _, err := sourceSpecFor("postgres", "host=db", []byte("not json")); err == nil {
 		t.Fatal("want an error for a malformed postgres block")
 	}
+
+	// A postgres block with a non-postgres kind is rejected (issue #268).
+	if _, err := sourceSpecFor("mysql", "", []byte(`{"host":"h"}`)); err == nil {
+		t.Fatal("sourceSpecFor accepted a postgres block for a mysql source")
+	}
+}
+
+// #271: run rejects an assignment with no primary key before touching the
+// source, instead of failing later with a cryptic chunker error.
+func TestChunkExecutorRejectsEmptyPrimaryKey(t *testing.T) {
+	x := &chunkExecutor{
+		chunkSz:  10,
+		bySource: map[string]*pb.TableAssignment{"src.t": {SourceTable: "src.t", TargetTable: "dst.t"}},
+	}
+	if err := x.run(context.Background(), &pb.ChunkRequest{Table: "src.t"}); err == nil {
+		t.Fatal("run accepted an assignment with no primary key")
+	}
 }

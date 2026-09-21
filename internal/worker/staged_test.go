@@ -35,9 +35,6 @@ func TestStagedPipelineShipsDescriptorInsteadOfCommitting(t *testing.T) {
 	w := New(Config{MaxRows: 1, MaxInterval: time.Hour})
 	w.Register("t", sc, dataplane.UpsertMode)
 	w.SetKnownSchema("t", testSchema())
-	if err := w.SetStaged("t"); err != nil {
-		t.Fatalf("SetStaged: %v", err)
-	}
 	var gotDesc []byte
 	var gotTable string
 	w.OnStaged(func(table string, _ uint64, desc []byte, _, _ string, _ []uint32) error {
@@ -45,6 +42,9 @@ func TestStagedPipelineShipsDescriptorInsteadOfCommitting(t *testing.T) {
 		gotDesc = desc
 		return nil
 	})
+	if err := w.SetStaged("t"); err != nil {
+		t.Fatalf("SetStaged: %v", err)
+	}
 
 	ing := make(chan Ingest, 2)
 	for _, in := range ingestFromChanges(t, []rowchange.Change{chg("t", rowchange.OpInsert, 1, "v", "p1")}) {
@@ -89,14 +89,14 @@ func TestStagedFlushesPerCycleSeq(t *testing.T) {
 	w := New(Config{MaxRows: 10000, MaxInterval: time.Hour})
 	w.Register("t", sc, dataplane.UpsertMode)
 	w.SetKnownSchema("t", testSchema())
-	if err := w.SetStaged("t"); err != nil {
-		t.Fatalf("SetStaged: %v", err)
-	}
 	var seqs []uint64
 	w.OnStaged(func(_ string, seq uint64, _ []byte, _, _ string, _ []uint32) error {
 		seqs = append(seqs, seq)
 		return nil
 	})
+	if err := w.SetStaged("t"); err != nil {
+		t.Fatalf("SetStaged: %v", err)
+	}
 
 	ing := make(chan Ingest, 4)
 	ing <- seqIngest(t, "t", 5, chg("t", rowchange.OpInsert, 1, "a", "p1"))
@@ -132,14 +132,14 @@ func TestStagedDeliversEmptyDescriptorWhenRowsDropped(t *testing.T) {
 	w.Register("t", sc, dataplane.AppendMode)
 	w.SetKnownSchema("t", testSchema())
 	w.SetDropDeletes("t", true)
-	if err := w.SetStaged("t"); err != nil {
-		t.Fatalf("SetStaged: %v", err)
-	}
 	var seqs []uint64
 	w.OnStaged(func(_ string, seq uint64, _ []byte, _, _ string, _ []uint32) error {
 		seqs = append(seqs, seq)
 		return nil
 	})
+	if err := w.SetStaged("t"); err != nil {
+		t.Fatalf("SetStaged: %v", err)
+	}
 
 	ing := make(chan Ingest, 2)
 	ing <- seqIngest(t, "t", 7, chg("t", rowchange.OpDelete, 1, "", "p1"))
@@ -149,5 +149,16 @@ func TestStagedDeliversEmptyDescriptorWhenRowsDropped(t *testing.T) {
 	}
 	if len(seqs) != 1 || seqs[0] != 7 {
 		t.Fatalf("staged seqs = %v, want [7] (an empty delivery for the dropped cycle)", seqs)
+	}
+}
+
+// #269: SetStaged must reject a staged table with no delivery callback, at
+// boot rather than on the first batch.
+func TestSetStagedRequiresOnStaged(t *testing.T) {
+	sc := &stagingCommitter{desc: []byte("d")}
+	w := New(Config{MaxRows: 1, MaxInterval: time.Hour})
+	w.Register("t", sc, dataplane.UpsertMode)
+	if err := w.SetStaged("t"); err == nil {
+		t.Fatal("SetStaged accepted a staged table with no OnStaged callback")
 	}
 }
