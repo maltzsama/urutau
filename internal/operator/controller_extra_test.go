@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -192,5 +193,32 @@ func TestValidateSecretsChecksKeys(t *testing.T) {
 		mk("ssh", map[string][]byte{"privateKey": nil}),
 	).validateSecrets(context.Background(), cr); err != nil {
 		t.Fatalf("valid secrets: %v", err)
+	}
+}
+
+// #257: the status subresource must be its own rule without resourceNames —
+// some authorizers ignore resourceNames on a subresource, so scoping it to the
+// pipeline name would silently deny the coordinator its own status.
+func TestCoordinatorRoleStatusSubresourceUnscoped(t *testing.T) {
+	cr := &urutauv1alpha1.CDCPipeline{ObjectMeta: metav1.ObjectMeta{Name: "orders"}}
+	role := coordinatorRole(cr)
+
+	var statusRule *rbacv1.PolicyRule
+	for i := range role.Rules {
+		for _, res := range role.Rules[i].Resources {
+			if res == "cdcpipelines/status" {
+				statusRule = &role.Rules[i]
+			}
+		}
+	}
+	if statusRule == nil {
+		t.Fatal("no rule grants cdcpipelines/status")
+	}
+	if len(statusRule.ResourceNames) != 0 {
+		t.Fatalf("status rule is scoped by resourceNames: %v", statusRule.ResourceNames)
+	}
+	// The main resource stays scoped to this pipeline.
+	if len(role.Rules[0].ResourceNames) != 1 || role.Rules[0].ResourceNames[0] != "orders" {
+		t.Fatalf("cdcpipelines rule resourceNames = %v, want [orders]", role.Rules[0].ResourceNames)
 	}
 }
