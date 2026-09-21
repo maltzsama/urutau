@@ -473,11 +473,17 @@ func EncodeKey(record arrow.RecordBatch, row int, pkIdxs []int, pkCols []string)
 			binary.LittleEndian.PutUint64(v[:], uint64(a.Value(row)))
 			buf = append(buf, v[:]...)
 		case *array.Decimal128:
+			// Encode the 16 raw bytes instead of ValueStr's base-10 string:
+			// no heap allocation on the Collapse hot path. Two decimals of
+			// equal magnitude but different scale (1.5 vs 1.50) have distinct
+			// bit patterns — exactly as ValueStr produces distinct strings, so
+			// the collapse behaviour is unchanged (issue #223).
 			buf = append(buf, typeDecimal)
-			s := a.ValueStr(row)
-			binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(s)))
-			buf = append(buf, lenBuf[:]...)
-			buf = append(buf, s...)
+			dec := a.Value(row)
+			var raw [16]byte
+			binary.LittleEndian.PutUint64(raw[0:8], dec.LowBits())
+			binary.LittleEndian.PutUint64(raw[8:16], uint64(dec.HighBits()))
+			buf = append(buf, raw[:]...)
 		case *array.Binary:
 			buf = append(buf, typeBinary)
 			b := a.Value(row)

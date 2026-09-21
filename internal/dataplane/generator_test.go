@@ -6,6 +6,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/internal/dataplane"
@@ -435,4 +436,58 @@ func singleIntRecord(t *testing.T, typ arrow.DataType, v int64) arrow.RecordBatc
 	rec := b.NewRecordBatch()
 	b.Release()
 	return rec
+}
+
+// #223: the Decimal128 encoding is by raw bytes (no ValueStr). Equal values
+// must encode equally and different values must differ.
+func TestEncodeKeyDecimal128Stable(t *testing.T) {
+	dtype := &arrow.Decimal128Type{Precision: 10, Scale: 2}
+	schema := arrow.NewSchema([]arrow.Field{{Name: "k", Type: dtype}}, nil)
+	b := array.NewDecimal128Builder(memory.DefaultAllocator, dtype)
+	b.Append(decimal128.FromI64(150))
+	b.Append(decimal128.FromI64(150))
+	b.Append(decimal128.FromI64(151))
+	arr := b.NewDecimal128Array()
+	b.Release()
+	rec := array.NewRecordBatch(schema, []arrow.Array{arr}, 3)
+	arr.Release()
+	defer rec.Release()
+
+	k0, err := dataplane.EncodeKey(rec, 0, []int{0}, []string{"k"})
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+	k1, err := dataplane.EncodeKey(rec, 1, []int{0}, []string{"k"})
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+	k2, err := dataplane.EncodeKey(rec, 2, []int{0}, []string{"k"})
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+	if !bytes.Equal(k0, k1) {
+		t.Fatal("equal decimals must encode equally")
+	}
+	if bytes.Equal(k0, k2) {
+		t.Fatal("different decimals must encode differently")
+	}
+}
+
+func BenchmarkEncodeKeyDecimal128(b *testing.B) {
+	dtype := &arrow.Decimal128Type{Precision: 18, Scale: 2}
+	schema := arrow.NewSchema([]arrow.Field{{Name: "k", Type: dtype}}, nil)
+	bl := array.NewDecimal128Builder(memory.DefaultAllocator, dtype)
+	bl.Append(decimal128.FromI64(123456789))
+	arr := bl.NewDecimal128Array()
+	bl.Release()
+	rec := array.NewRecordBatch(schema, []arrow.Array{arr}, 1)
+	arr.Release()
+	defer rec.Release()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := dataplane.EncodeKey(rec, 0, []int{0}, []string{"k"}); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
