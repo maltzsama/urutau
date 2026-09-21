@@ -755,6 +755,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 		defer c.snapshotActive.Store(false)
 		defer snapCancel()
 		defer close(snapDone)
+		// A cancelled snapshot returns before closeWindow, leaving batches
+		// held in an open gate. Release them when the phase ends (normally a
+		// no-op — closeWindow already drained each partition) so shutdown does
+		// not leak Arrow batches (issue #212). gateHold re-checks the window
+		// under gateMu before appending, so clearing it here cannot race a
+		// late gate.
+		defer c.releaseAllGates()
 		snapCfg := snapshot.SnapshotConfig{
 			WindowTimeout: c.cfg.WindowTimeout,
 			CaughtUpPoll:  c.cfg.CaughtUpPoll,
@@ -1238,6 +1245,30 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 	return nil
 }
 
+// releaseAllGates closes every open gate and releases the batches held in it.
+// Called when the snapshot phase ends, so an aborted snapshot (ctx cancelled
+// before closeWindow) does not leak the gated batches (issue #212). gateHold
+// re-checks the window under gateMu before appending, so a gate cleared here
+// cannot be re-populated afterwards.
+func (c *Coordinator) releaseAllGates() {
+	c.gateMu.Lock()
+	var held []*dataplane.Batch
+	for k := range c.gateOn {
+		held = append(held, c.gateBuf[k]...)
+		delete(c.gateOn, k)
+		delete(c.gateWin, k)
+		delete(c.gateBuf, k)
+	}
+	// Wake any pump blocked on a full gate so it re-checks and sees the gate
+	// gone (gateHold returns false and the batch flows as live).
+	close(c.gateDrain)
+	c.gateDrain = make(chan struct{})
+	c.gateMu.Unlock()
+	for _, b := range held {
+		b.Release()
+	}
+}
+
 // recordConfirmed stores a worker's latest durably-committed position and
 // recomputes the pipeline-wide minimum. The minimum uses the position's own
 // ordering — LSNs and GTID sets are not lexicographically ordered, and a
@@ -1348,7 +1379,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 		if len(clipChunksToRange(allChunks, ranges[p])) == 0 {
 			emptyOwners = append(emptyOwners, w.name)
 		}
-		if err := c.snapshotPartition(ctx, rdr, chunker, ref, ranges[p], p, w, cfg); err != nil {
+		if err := c.snapshotPartition(ctx, rdr, allChunks, ref, ranges[p], p, w, cfg); err != nil {
 			return fmt.Errorf("partition %d: %w", p, err)
 		}
 	}
@@ -1367,12 +1398,10 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 // the window/gate lifecycle (openWindow/flushWindow/closeWindow) is
 // scoped to this partition alone, so a different partition's concurrent
 // snapshot (if any) is never gated or released by this one's chunks.
-func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
-	bounds, err := chunker.Bounds(ctx)
-	if err != nil {
-		return err
-	}
-	chunks := clipChunksToRange(snapshot.Chunks(bounds), partitionRange)
+// allChunks is computed once by snapshotTable (one Bounds query per table,
+// not per partition — issue #216).
+func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, allChunks []source.Chunk, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
+	chunks := clipChunksToRange(allChunks, partitionRange)
 	if len(chunks) == 0 {
 		return nil // this partition's range contains no rows right now
 	}
@@ -1500,19 +1529,19 @@ func clipChunksToRange(chunks []source.Chunk, partitionRange source.Chunk) []sou
 	return out
 }
 
-// enqueueBatch queues ONE serialized batch on a worker's Flight stream and
+// enqueueBatch queues ONE source batch on a worker's Flight stream and
 // charges its share of the global flow budget. A full budget blocks here —
 // the backpressure that stalls the pump and, through it, the reader. The
 // charge is released when the worker's Ack covers the batch's position
 // (onAck).
 //
-// Two shapes:
-//   - b != nil: a source batch, serialized ONCE as-is (no per-row re-encode).
-//     meta may be nil (plain live) or carry a window tag. Table and the
-//     commit position are derived from the batch when the meta lacks them.
-//     OWNERSHIP: enqueueBatch always releases b on every exit.
-//   - b == nil: a marker batch (window Closes) — an empty record whose meta
-//     carries the position and the window tag.
+// b must be non-nil: it is a source batch, serialized ONCE as-is (no per-row
+// re-encode). meta may be nil (plain live) or carry a window tag; the table
+// and commit position are derived from the batch when the meta lacks them.
+// OWNERSHIP: enqueueBatch always releases b on every exit.
+//
+// Window-lifecycle markers (the empty Closes record) are NOT this function's
+// job — they go to one explicit partition owner via enqueueTo.
 func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta *pb.BatchMeta) error {
 	if b != nil {
 		defer b.Release()
@@ -1535,19 +1564,10 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	}
 
 	if b == nil {
-		// A marker with no target worker specified goes to every
-		// partition owner — used by callers with no single partition in
-		// mind (there are none of these left in this codebase; every
-		// window-lifecycle marker now goes through snapshotTable's
-		// explicit per-partition enqueueTo calls instead). Kept as the
-		// safe default for any other caller of the plain enqueueBatch
-		// marker path, rather than silently picking one owner.
-		for _, w := range owners {
-			if err := c.enqueueTo(ctx, w, nil, cloneBatchMeta(meta)); err != nil {
-				return err
-			}
-		}
-		return nil
+		// Window-lifecycle markers are enqueued to one explicit partition
+		// owner via enqueueTo (snapshotTable does this per partition);
+		// enqueueBatch carries source batches only (issue #214).
+		return fmt.Errorf("coordinator: enqueueBatch requires a batch; window markers go through enqueueTo")
 	}
 
 	if len(owners) == 1 {

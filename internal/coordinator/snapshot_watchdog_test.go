@@ -24,10 +24,10 @@ func TestSnapshotPartitionWatchdog(t *testing.T) {
 	c.cfg.SnapshotChunkTimeout = 50 * time.Millisecond
 
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
-	chunker := fakeChunkSource{bounds: [][]any{{int64(50)}}}
+	allChunks := snapshot.Chunks([][]any{{int64(50)}})
 
 	start := time.Now()
-	err := c.snapshotPartition(context.Background(), fakeSourceReader{}, chunker, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
+	err := c.snapshotPartition(context.Background(), fakeSourceReader{}, allChunks, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
 	if err == nil {
 		t.Fatal("a wedged worker must fail the snapshot, not hang")
 	}
@@ -51,8 +51,8 @@ func TestSnapshotPartitionWatchdogParentCancel(t *testing.T) {
 	cancel()
 
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
-	chunker := fakeChunkSource{bounds: [][]any{{int64(50)}}}
-	err := c.snapshotPartition(ctx, fakeSourceReader{}, chunker, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
+	allChunks := snapshot.Chunks([][]any{{int64(50)}})
+	err := c.snapshotPartition(ctx, fakeSourceReader{}, allChunks, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
 	if err == nil || !strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("snapshotPartition = %v, want context canceled", err)
 	}
@@ -70,8 +70,8 @@ func TestSnapshotPartitionWatchdogParentDeadline(t *testing.T) {
 	defer cancel()
 
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
-	chunker := fakeChunkSource{bounds: [][]any{{int64(50)}}}
-	err := c.snapshotPartition(ctx, fakeSourceReader{}, chunker, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
+	allChunks := snapshot.Chunks([][]any{{int64(50)}})
+	err := c.snapshotPartition(ctx, fakeSourceReader{}, allChunks, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
 	if err == nil {
 		t.Fatal("a parent deadline must fail the snapshot")
 	}

@@ -75,11 +75,14 @@ func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*po
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// index is populated at boot and never mutated afterwards, so
+			// ranging it is safe. A dynamically added worker would require
+			// synchronizing this iteration (and the map) first.
 			for worker, idx := range index {
 				if !idx.Dirty() {
 					continue
 				}
-				m := idx.Manifest()
+				m, gen := idx.Manifest()
 				body, err := json.Marshal(m)
 				if err != nil {
 					log.Warn("checkpoint: marshal", "run", runID, "worker", worker, "err", err)
@@ -101,7 +104,10 @@ func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*po
 					// happened (audit #12).
 					continue
 				}
-				idx.MarkClean()
+				// MarkClean only clears if the index has not changed since the
+				// Manifest, so a batch that arrived during the upload is not
+				// silently skipped (issue #215).
+				idx.MarkClean(gen)
 			}
 		}
 	}

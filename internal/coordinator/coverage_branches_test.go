@@ -101,21 +101,23 @@ func TestEnqueueBatchPartitionedErrors(t *testing.T) {
 	}
 }
 
-func TestEnqueueBatchMarkerToEveryOwner(t *testing.T) {
+// A window-lifecycle marker goes through enqueueTo to one partition owner (the
+// production path); enqueueBatch carries source batches only and rejects a nil
+// batch (issue #214).
+func TestEnqueueToMarkerAndEnqueueBatchRejectsNil(t *testing.T) {
 	c, w0 := coordHarness()
-	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
-	c.workers["w1"] = w1
-	c.route["raw.orders"] = []*workerState{w0, w1}
-	c.index["w1"] = newPositionIndex("run-1")
 	cs := transportSchema(t)
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	c.canonical = map[string]core.Schema{"shop.orders": cs}
 
-	if err := c.enqueueBatch(context.Background(), nil, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
-		t.Fatalf("enqueueBatch(marker): %v", err)
+	if err := c.enqueueTo(context.Background(), w0, nil, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
+		t.Fatalf("enqueueTo(marker): %v", err)
 	}
-	if len(w0.queue) != 1 || len(w1.queue) != 1 {
-		t.Fatalf("marker queues = %d, %d; want 1, 1", len(w0.queue), len(w1.queue))
+	if len(w0.queue) != 1 {
+		t.Fatalf("marker queue = %d, want 1", len(w0.queue))
+	}
+	if err := c.enqueueBatch(context.Background(), nil, &pb.BatchMeta{Table: "raw.orders"}); err == nil {
+		t.Fatal("enqueueBatch must reject a nil batch")
 	}
 }
 
@@ -189,14 +191,10 @@ func TestSnapshotPartitionEarlyExits(t *testing.T) {
 	c, w := coordHarness()
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
 
-	boom := errors.New("bounds failed")
-	if err := c.snapshotPartition(ctx, fakeSourceReader{}, fakeChunkSource{err: boom}, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{}); !errors.Is(err, boom) {
-		t.Fatalf("snapshotPartition(bounds err) = %v, want boom", err)
-	}
-
-	// A range that excludes every chunk returns nil without sending.
+	// A range that excludes every chunk returns nil without sending. allChunks
+	// is computed once by snapshotTable (issue #216).
 	err := c.snapshotPartition(ctx, fakeSourceReader{},
-		fakeChunkSource{bounds: [][]any{{int64(50)}}},
+		snapshot.Chunks([][]any{{int64(50)}}),
 		ref, source.Chunk{Low: []any{int64(0)}, High: []any{int64(10)}}, 0, w, snapshot.SnapshotConfig{})
 	if err != nil {
 		t.Fatalf("snapshotPartition(empty clip) = %v", err)

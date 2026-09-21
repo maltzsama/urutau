@@ -61,14 +61,13 @@ func TestSupervisorResetWithoutInFlightRecovers(t *testing.T) {
 
 // CD-T4: a marker batch for a table with no canonical schema (not in refs)
 // must error in the coordinator, not encode a zero-column record that the
-// worker rejects with a misleading column error.
-func TestEnqueueBatchMarkerUnknownTableErrors(t *testing.T) {
-	c := &Coordinator{
-		route:     map[string][]*workerState{"t": {{name: "w1", queue: make(chan queuedBatch, 1)}}},
-		refs:      nil,
-		canonical: map[string]core.Schema{},
-	}
-	err := c.enqueueBatch(context.Background(), nil, &pb.BatchMeta{Table: "t"})
+// worker rejects with a misleading column error. Markers go through enqueueTo
+// (issue #214).
+func TestEnqueueToMarkerUnknownTableErrors(t *testing.T) {
+	c, w := coordHarness()
+	c.refs = nil
+	c.canonical = map[string]core.Schema{}
+	err := c.enqueueTo(context.Background(), w, nil, &pb.BatchMeta{Table: "raw.orders"})
 	if err == nil || !strings.Contains(err.Error(), "canonical schema") {
 		t.Fatalf("err = %v, want a marker-schema error", err)
 	}
