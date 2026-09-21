@@ -17,6 +17,12 @@ Duplicates are possible; **loss is not**. Resume re-reads from the last
 committed position, and a batch already covered by the destination is
 skipped rather than re-applied.
 
+This holds without a full restart too: if a worker's session to the
+coordinator is lost, the batches the worker was **delivered but had not yet
+acked** are redelivered on reconnect — the in-flight window is not dropped to a
+dropped session. Replaying a batch the worker had already committed but not
+acked is the duplicate case above, not loss.
+
 The consequence for destinations: writes must be **idempotent by key**. An
 upsert of the same key with the same value is a no-op; a delete of an
 already-deleted key is success, not an error. Every built-in sink satisfies

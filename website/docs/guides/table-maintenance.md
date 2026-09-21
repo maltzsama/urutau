@@ -57,6 +57,13 @@ other two, or any combination.
 
 If `maintenance.enabled` is `false` or absent, no maintenance runs.
 
+Every `interval` below is a **throttle measured from the previous run's
+completion**, not a fixed start-time schedule: a run that takes longer than its
+interval does not immediately re-fire — the next run starts one full interval
+after the last one *finished*. So `interval: 5m` means "at most once every 5
+minutes of quiet time between runs", not "at 5-minute wall-clock boundaries".
+This is the same in single-process and distributed mode.
+
 ## Compaction
 
 Compaction merges small files into `targetFileSize`-sized outputs using

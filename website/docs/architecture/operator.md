@@ -203,6 +203,31 @@ Two details are easy to get wrong when writing this RBAC by hand:
   `core/pods` get — even though the operator never touches a Deployment or
   a Pod. The coordinator does, through the per-pipeline Role.
 
+## How the operator applies objects
+
+The reconciler writes every managed object (the coordinator StatefulSet,
+Service, ConfigMap, RBAC, and worker templates) with **Server-Side Apply**,
+under a field manager named by `--field-manager` (default `urutau-operator`).
+Two consequences:
+
+- Fields the operator does not manage are **left alone** — a mutating webhook's
+  injected defaults, or an API-server-assigned `clusterIP`, survive a
+  reconcile. The operator owns only the fields it declares.
+- A reconcile that changes nothing writes nothing: Apply is a no-op when the
+  owned fields already match, so a steady-state reconcile does not churn the
+  API.
+
+The field manager name must be unique per controller managing the same objects;
+a second controller against the same objects needs a different
+`--field-manager`, or the two contend for field ownership.
+
+## serverId uniqueness
+
+`source.serverId` (MySQL) must be **unique across pipelines** reading the same
+source server: two pipelines sharing one `server_id` fight over the same
+replication stream and corrupt it. The admission webhook rejects a duplicate
+`serverId` within a namespace at apply time.
+
 ## Concurrent writers: two different fixes for the same problem
 
 Naively, N workers committing to one table race on the position: the last

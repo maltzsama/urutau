@@ -125,6 +125,7 @@ The Kubernetes operator. Plain flags (no subcommands); see
 | `--metrics-bind-address` | `:8080` | Metrics endpoint |
 | `--health-probe-bind-address` | `:8081` | `/healthz` + `/readyz` endpoint |
 | `--enable-webhook` | `true` | Serve the validating admission webhook |
+| `--field-manager` | `urutau-operator` | Server-Side Apply field manager — the name the operator applies objects as. Must be unique per controller managing the same objects. |
 
 The operator also accepts the controller-runtime zap flags
 (`--zap-log-level`, `--zap-encoder`, `--zap-devel`, …).
