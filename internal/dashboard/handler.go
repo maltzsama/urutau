@@ -195,7 +195,9 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // don't let a proxy buffer the stream
 
 	if b, err := json.Marshal(h.snapshot()); err == nil {
-		writeSSE(w, "snapshot", b)
+		if err := writeSSE(w, "snapshot", b); err != nil {
+			return // the client is gone
+		}
 		flusher.Flush()
 	}
 
@@ -207,10 +209,16 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case msg := <-ch:
-			writeSSE(w, msg.event, msg.data)
+			// A write error means the client disconnected; abort now rather
+			// than waiting for the next tick or r.Context().Done() (issue #225).
+			if err := writeSSE(w, msg.event, msg.data); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-ticker.C:
-			_, _ = io.WriteString(w, ": ping\n\n")
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -218,26 +226,36 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func writeSSE(w io.Writer, event string, data []byte) {
-	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+func writeSSE(w io.Writer, event string, data []byte) error {
+	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	return err
 }
 
 // jsonSafeAttrs recursively replaces values json.Marshal cannot encode (maps
 // with non-string keys, channels, funcs, …) with their text form, so one odd
 // attr can never 500 the whole logs endpoint. The log buffer already stores
 // JSON-safe values; this is defense in depth.
+// maxJSONDepth bounds jsonSafeValue's recursion. A cyclic map logged as an attr
+// would otherwise recurse until stack overflow — a fatal error the net/http
+// recover cannot catch (issue #227). The terminal branch returns a fixed
+// marker, NOT fmt.Sprint: fmt does not detect map cycles and would itself
+// overflow.
+const maxJSONDepth = 8
+
+const maxDepthMarker = "<max-depth>"
+
 func jsonSafeAttrs(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
 	}
 	out := make(map[string]any, len(m))
 	for k, v := range m {
-		out[k] = jsonSafeValue(v)
+		out[k] = jsonSafeValue(v, 1)
 	}
 	return out
 }
 
-func jsonSafeValue(v any) any {
+func jsonSafeValue(v any, depth int) any {
 	switch t := v.(type) {
 	case nil, bool, string,
 		int, int8, int16, int32, int64,
