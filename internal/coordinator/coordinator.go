@@ -1259,6 +1259,10 @@ func (c *Coordinator) releaseAllGates() {
 		delete(c.gateWin, k)
 		delete(c.gateBuf, k)
 	}
+	// Wake any pump blocked on a full gate so it re-checks and sees the gate
+	// gone (gateHold returns false and the batch flows as live).
+	close(c.gateDrain)
+	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
 	for _, b := range held {
 		b.Release()
@@ -1525,19 +1529,19 @@ func clipChunksToRange(chunks []source.Chunk, partitionRange source.Chunk) []sou
 	return out
 }
 
-// enqueueBatch queues ONE serialized batch on a worker's Flight stream and
+// enqueueBatch queues ONE source batch on a worker's Flight stream and
 // charges its share of the global flow budget. A full budget blocks here —
 // the backpressure that stalls the pump and, through it, the reader. The
 // charge is released when the worker's Ack covers the batch's position
 // (onAck).
 //
-// Two shapes:
-//   - b != nil: a source batch, serialized ONCE as-is (no per-row re-encode).
-//     meta may be nil (plain live) or carry a window tag. Table and the
-//     commit position are derived from the batch when the meta lacks them.
-//     OWNERSHIP: enqueueBatch always releases b on every exit.
-//   - b == nil: a marker batch (window Closes) — an empty record whose meta
-//     carries the position and the window tag.
+// b must be non-nil: it is a source batch, serialized ONCE as-is (no per-row
+// re-encode). meta may be nil (plain live) or carry a window tag; the table
+// and commit position are derived from the batch when the meta lacks them.
+// OWNERSHIP: enqueueBatch always releases b on every exit.
+//
+// Window-lifecycle markers (the empty Closes record) are NOT this function's
+// job — they go to one explicit partition owner via enqueueTo.
 func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta *pb.BatchMeta) error {
 	if b != nil {
 		defer b.Release()
