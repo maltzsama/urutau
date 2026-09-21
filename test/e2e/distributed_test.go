@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"errors"
@@ -664,6 +665,57 @@ func TestObservabilityEndpoints(t *testing.T) {
 		t.Fatalf("statusz missing state:\n%s", statusBody)
 	}
 	t.Log("observability ok: /metrics and /statusz served")
+
+	// Dashboard API: the JSON endpoints the SPA reads.
+	pipelineBody, err := httpGet("/api/v1/pipeline")
+	if err != nil {
+		t.Fatalf("dashboard pipeline: %v", err)
+	}
+	if !strings.Contains(pipelineBody, `"pipeline"`) {
+		t.Fatalf("dashboard pipeline missing fields:\n%s", pipelineBody)
+	}
+	workersBody, err := httpGet("/api/v1/workers")
+	if err != nil {
+		t.Fatalf("dashboard workers: %v", err)
+	}
+	if !strings.Contains(workersBody, w1) {
+		t.Fatalf("dashboard workers missing %s:\n%s", w1, workersBody)
+	}
+
+	// The SPA is served at /.
+	spa, err := httpGet("/")
+	if err != nil {
+		t.Fatalf("dashboard SPA: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(spa), "<html") {
+		t.Fatalf("dashboard root did not serve the SPA:\n%.200s", spa)
+	}
+
+	// The SSE stream sends a snapshot frame on connect. Closing the client must
+	// not wedge the server (issue #225): the next dashboard request still works.
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+metricsAddr+"/api/v1/stream", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse connect: %v", err)
+	}
+	br := bufio.NewReader(resp.Body)
+	sawSnapshot := false
+	for i := 0; i < 100 && !sawSnapshot; i++ {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if strings.HasPrefix(line, "event: snapshot") {
+			sawSnapshot = true
+		}
+	}
+	_ = resp.Body.Close() // abrupt client disconnect
+	if !sawSnapshot {
+		t.Fatal("SSE stream did not send a snapshot frame on connect")
+	}
+	if _, err := httpGet("/api/v1/pipeline"); err != nil {
+		t.Fatalf("dashboard after an SSE disconnect: %v", err)
+	}
 
 	cStop()
 }
