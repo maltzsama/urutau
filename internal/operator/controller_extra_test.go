@@ -252,3 +252,15 @@ func TestWebhookRejectsDuplicateServerID(t *testing.T) {
 		t.Fatalf("webhook rejected a self-update: %v", err)
 	}
 }
+
+// The SSA field manager is configurable, not hardcoded.
+func TestFieldManagerDefaultAndOverride(t *testing.T) {
+	r := &CoordinatorReconciler{}
+	if got := r.fieldManager(); got != DefaultFieldManager {
+		t.Fatalf("default fieldManager = %q, want %q", got, DefaultFieldManager)
+	}
+	r.FieldManager = "custom-controller"
+	if got := r.fieldManager(); got != "custom-controller" {
+		t.Fatalf("fieldManager = %q, want custom-controller", got)
+	}
+}

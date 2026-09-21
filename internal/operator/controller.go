@@ -37,10 +37,10 @@ import (
 
 const finalizer = "urutau.io/finalizer"
 
-// operatorFieldManager owns the fields the operator applies via Server-Side
-// Apply, so a re-apply replaces them and leaves foreign fields (webhook
-// defaults) alone.
-const operatorFieldManager = "urutau-operator"
+// DefaultFieldManager is the Server-Side Apply field owner used when a
+// CoordinatorReconciler does not set FieldManager. A deployment can override
+// it (e.g. to run two controllers that manage the same objects).
+const DefaultFieldManager = "urutau-operator"
 
 // specHashAnnotation stamps the resolved spec onto the pod template so a
 // ConfigMap change (which alone never restarts a pod) rolls the coordinator
@@ -52,6 +52,20 @@ type CoordinatorReconciler struct {
 	client.Client
 	Image    string
 	Recorder record.EventRecorder
+	// FieldManager is the Server-Side Apply field owner for the objects this
+	// controller applies. Empty means DefaultFieldManager. Set it when another
+	// controller also manages these objects, so their field ownership does not
+	// collide.
+	FieldManager string
+}
+
+// fieldManager returns the configured Server-Side Apply field owner, or the
+// default when unset.
+func (r *CoordinatorReconciler) fieldManager() string {
+	if r.FieldManager != "" {
+		return r.FieldManager
+	}
+	return DefaultFieldManager
 }
 
 // +kubebuilder:rbac:groups=urutau.io,resources=cdcpipelines,verbs=get;list;watch;create;update;patch
@@ -257,7 +271,7 @@ func (r *CoordinatorReconciler) ensure(ctx context.Context, desired client.Objec
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	desired.GetObjectKind().SetGroupVersionKind(gvk)
-	if err := r.Patch(ctx, desired, client.Apply, client.FieldOwner(operatorFieldManager), client.ForceOwnership); err != nil {
+	if err := r.Patch(ctx, desired, client.Apply, client.FieldOwner(r.fieldManager()), client.ForceOwnership); err != nil {
 		return fmt.Errorf("apply %s: %w", what, err)
 	}
 	return nil
