@@ -47,7 +47,12 @@ const DefaultFieldManager = "urutau-operator"
 // through a template update.
 const specHashAnnotation = "urutau.io/spec-hash"
 
-// CoordinatorReconciler reconciles a CDCPipeline.
+// CoordinatorReconciler is the OPERATOR's reconciler for the CDCPipeline CR:
+// the process that owns and applies the coordinator workload. The name
+// describes WHAT it manages — the coordinator StatefulSet/Service/ConfigMap it
+// creates, updates and deletes — not what it is. Every coordinator* helper
+// (coordinatorName, coordinatorStatefulSet, …) follows the same convention:
+// they name the object the operator provisions.
 type CoordinatorReconciler struct {
 	client.Client
 	Image    string
