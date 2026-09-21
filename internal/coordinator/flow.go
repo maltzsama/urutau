@@ -58,11 +58,12 @@ func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error 
 	stop := context.AfterFunc(ctx, func() { b.cond.Broadcast() })
 	defer stop()
 
-	// A worker holding nothing always acquires its first batch, even one
-	// larger than the whole budget: blocking it would deadlock (the condition
-	// stays true at used==0, and nothing can broadcast it awake — issue #209).
-	// Past that first batch the normal per-worker floor applies.
-	for b.sum()+n > b.totalBytes && b.used[worker] > 0 && b.used[worker]+n > b.perWorkerMin {
+	// When nothing is in flight (sum==0) no ack can free budget, so blocking
+	// would deadlock — a batch larger than the whole budget must still be
+	// admitted (issue #209). This admits at most ONE oversized batch at a
+	// time: once charged, sum>0, so every other worker blocks on the normal
+	// conditions. Past that, the usual ceiling and per-worker floor apply.
+	for b.sum()+n > b.totalBytes && b.sum() > 0 && b.used[worker]+n > b.perWorkerMin {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

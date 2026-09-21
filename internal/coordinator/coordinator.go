@@ -1874,6 +1874,7 @@ func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwne
 		// so a future kernel change cannot panic the coordinator (issue #211).
 		rd, ok := datum.(*compute.RecordDatum)
 		if !ok {
+			datum.Release()
 			releaseRecords(out)
 			return nil, fmt.Errorf("partition %d: unexpected Take datum %T", p, datum)
 		}

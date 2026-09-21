@@ -143,3 +143,29 @@ func TestFlowBudgetOversizedFirstBatchDoesNotDeadlock(t *testing.T) {
 		t.Fatal("an oversized first batch deadlocked the worker")
 	}
 }
+
+// #209 (review): the oversized-first-batch allowance must admit at most one
+// oversized batch at a time — once one is charged, sum>0 and a second blocks,
+// so total in-flight memory cannot grow by one oversized batch per worker.
+func TestFlowBudgetSecondOversizedBatchBlocks(t *testing.T) {
+	b := newFlowBudget(100, 10)
+	if err := b.acquire(context.Background(), "a", 200); err != nil {
+		t.Fatalf("first oversized acquire: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.acquire(context.Background(), "b", 200) }()
+	select {
+	case <-done:
+		t.Fatal("a second oversized batch must block while the first is in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	b.release("a", 200)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("acquire after release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the second oversized batch never unblocked")
+	}
+}
