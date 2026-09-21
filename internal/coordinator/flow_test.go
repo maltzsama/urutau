@@ -127,9 +127,9 @@ func TestPositionIndexManifest(t *testing.T) {
 	}
 }
 
-// #209: a batch larger than both the total budget and the per-worker floor
-// must not deadlock a worker holding nothing — otherwise the condition stays
-// true at used==0 and nothing can broadcast it awake.
+// #209: a batch larger than the whole budget must not deadlock — it can never
+// fit the ceiling, so waiting for room (with nothing in flight to free it)
+// would hang forever.
 func TestFlowBudgetOversizedFirstBatchDoesNotDeadlock(t *testing.T) {
 	b := newFlowBudget(100, 10) // total 100, floor 10; n=200 exceeds both
 	done := make(chan error, 1)
@@ -167,5 +167,25 @@ func TestFlowBudgetSecondOversizedBatchBlocks(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("the second oversized batch never unblocked")
+	}
+}
+
+// #209 (review): the single oversized slot must not require global quiescence.
+// An oversized batch proceeds even while another worker holds a small charge,
+// so it cannot be starved by continuous normal traffic.
+func TestFlowBudgetOversizedProceedsUnderLoad(t *testing.T) {
+	b := newFlowBudget(100, 10)
+	if err := b.acquire(context.Background(), "a", 50); err != nil {
+		t.Fatalf("acquire a: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.acquire(context.Background(), "b", 200) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("oversized acquire under load: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("an oversized batch starved while another worker held a charge")
 	}
 }

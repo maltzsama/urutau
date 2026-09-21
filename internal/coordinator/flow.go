@@ -20,6 +20,14 @@ type flowBudget struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 	used map[string]int64
+	// oversizedOwner is the worker holding the single oversized batch the
+	// budget admits at once. A batch larger than the whole ceiling can never
+	// fit it, so waiting for room would deadlock (nothing can free the budget
+	// when nothing is in flight). It is admitted regardless of the sum as
+	// long as no OTHER oversized batch is in flight — that bounds the
+	// over-ceiling memory to one batch while still making progress. Cleared
+	// when that worker's charge returns to zero.
+	oversizedOwner string
 }
 
 func newFlowBudget(totalBytes, perWorkerMin int64) *flowBudget {
@@ -58,18 +66,27 @@ func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error 
 	stop := context.AfterFunc(ctx, func() { b.cond.Broadcast() })
 	defer stop()
 
-	// When nothing is in flight (sum==0) no ack can free budget, so blocking
-	// would deadlock — a batch larger than the whole budget must still be
-	// admitted (issue #209). This admits at most ONE oversized batch at a
-	// time: once charged, sum>0, so every other worker blocks on the normal
-	// conditions. Past that, the usual ceiling and per-worker floor apply.
-	for b.sum()+n > b.totalBytes && b.sum() > 0 && b.used[worker]+n > b.perWorkerMin {
+	oversized := n > b.totalBytes
+	for {
+		if oversized {
+			// An oversized batch can never fit the ceiling, so waiting for
+			// room would deadlock; admit it when no other oversized batch is
+			// in flight (issue #209).
+			if b.oversizedOwner == "" {
+				break
+			}
+		} else if b.sum()+n <= b.totalBytes || b.used[worker]+n <= b.perWorkerMin {
+			break
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		b.cond.Wait()
 	}
 	b.used[worker] += n
+	if oversized {
+		b.oversizedOwner = worker
+	}
 	return nil
 }
 
@@ -79,6 +96,9 @@ func (b *flowBudget) release(worker string, n int64) {
 	b.used[worker] -= n
 	if b.used[worker] <= 0 {
 		delete(b.used, worker)
+		if b.oversizedOwner == worker {
+			b.oversizedOwner = ""
+		}
 	}
 	b.mu.Unlock()
 	b.cond.Broadcast()
