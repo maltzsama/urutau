@@ -1939,6 +1939,20 @@ func (c *Coordinator) onHello(worker string, h *pb.Hello) {
 		"committed", len(h.Committed))
 }
 
+// onSchemaDrift records a worker's schema-drift report, so the log and the
+// event trail surface WHY a worker is stopping instead of a bare
+// CrashLoopBackOff (issue #272).
+func (c *Coordinator) onSchemaDrift(worker string, d *pb.SchemaDrift) {
+	if d == nil {
+		return
+	}
+	c.log.Error("coordinator: worker schema drift",
+		"worker", worker, "table", d.Table, "column", d.Column, "kind", d.Kind)
+	c.emitLog(eventlog.KindSchemaDrift, map[string]any{
+		"worker": worker, "table": d.Table, "column": d.Column, "kind": d.Kind,
+	})
+}
+
 // onAck advances the worker's position index: every head batch the commit
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
@@ -2091,6 +2105,9 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			// structured filter and compiled by the worker's source, so the
 			// same code path resolves it in both modes.
 			ta.ColumnFilter = tbl.ColumnFilter
+			// onDelete travels with the assignment: the worker applies it to
+			// an append-only table (issue #264).
+			ta.OnDelete = string(tbl.OnDelete)
 			// The chunk column travels too: a partitioned table is chunked
 			// by its (single-column) key even without an explicit
 			// chunkColumn, and the worker's chunker must match the
@@ -2368,6 +2385,8 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			case *pb.WorkerMessage_Error:
 				sess.done <- errors.New("coordinator: worker error: " + m.Error.Detail)
 				return
+			case *pb.WorkerMessage_SchemaDrift:
+				c.onSchemaDrift(hello.WorkerName, m.SchemaDrift)
 			}
 		}
 	}()

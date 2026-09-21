@@ -365,3 +365,30 @@ func TestDoGetRedeliversUnackedAfterSuccess(t *testing.T) {
 	cancel2()
 	<-done2
 }
+
+// #264: onDelete travels with the assignment, so an append-only table drops
+// deletes in distributed mode too.
+func TestAssignmentCarriesOnDelete(t *testing.T) {
+	c := &Coordinator{
+		cfg: Config{Spec: &spec.Spec{
+			Source: spec.Source{Kind: "mysql"},
+			Tables: []spec.Table{{
+				Source:    "shop.a",
+				Target:    "lake.a",
+				WriteMode: spec.WriteModeAppend,
+				OnDelete:  spec.OnDeleteSkip,
+			}},
+		}},
+		canonical: map[string]core.Schema{
+			"shop.a": {Columns: []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}}},
+		},
+	}
+	w := &workerState{name: "w", refs: []source.TableRef{{Source: "shop.a", Target: "lake.a"}}}
+	msg, err := c.assignmentFor(w)
+	if err != nil {
+		t.Fatalf("assignmentFor: %v", err)
+	}
+	if got := msg.GetAssign().Tables[0].GetOnDelete(); got != "skip" {
+		t.Fatalf("assignment on_delete = %q, want skip", got)
+	}
+}

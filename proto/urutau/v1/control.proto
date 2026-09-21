@@ -23,7 +23,17 @@ message WorkerMessage {
     StagedBatch staged       = 6;  // staged data files, one per delivery (WK-001 C5)
     MaintenanceResult maintenance_result = 7;  // one ephemeral maintenance pass's outcome
     WorkerMetricsReport worker_metrics = 8;    // periodic worker-side series the coordinator cannot derive from acks
+    SchemaDrift         schema_drift   = 9;    // the worker detected schema drift and is stopping (issue #272)
   }
+}
+
+// SchemaDrift reports a column the source carries that the declared schema
+// lacks; the worker fails after sending it, so the coordinator can surface the
+// reason instead of a bare CrashLoopBackOff.
+message SchemaDrift {
+  string table  = 1;
+  string column = 2;
+  string kind   = 3; // "added"
 }
 
 message CoordinatorMessage {
@@ -185,6 +195,7 @@ message TableAssignment {
   repeated string column_filter   = 13; // source column projection (#162): the snapshot SELECT list
   bytes     filter                = 14; // JSON spec.Filter (#163): the source WHERE predicate, composed with the chunk bounds
   string    chunk_column          = 15; // snapshot chunking column (#151); empty = the source's default (Postgres CTID)
+  string    on_delete             = 16; // spec.OnDelete ("skip" | "record" | ""); append-only delete handling (issue #264)
 }
 
 message BatchConfig {

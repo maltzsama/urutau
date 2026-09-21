@@ -276,6 +276,10 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 				return err
 			}
 		}
+		// onDelete: skip — an append-only table drops deletes (issue #264).
+		if ta.OnDelete == string(spec.OnDeleteSkip) {
+			w.SetDropDeletes(ta.TargetTable, true)
+		}
 		pkByTable[ta.TargetTable] = ta.PrimaryKey
 		// Start's remaining first loads (any explicit-select reference,
 		// plus the refresh ticker for everything) stay asynchronous — the
@@ -296,6 +300,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	w.OnSchemaDrift(func(d SchemaDrift) {
 		cfg.Logger.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
 			"action", "coordinator must assign a schema with the column; declare it in the spec")
+		// Tell the coordinator WHY the worker is about to die, so it surfaces
+		// the reason instead of a bare CrashLoopBackOff (issue #272).
+		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_SchemaDrift{SchemaDrift: &pb.SchemaDrift{
+			Table: d.Table, Column: d.Column, Kind: d.Kind,
+		}}})
 	})
 
 	// Report phase + committed positions (design §5.6.1): STREAMING if any
