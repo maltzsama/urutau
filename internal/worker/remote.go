@@ -133,7 +133,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	// Control and Flight all die together — the split-brain correction of
 	// design §5.3. dialOpts carries the keepalive that turns a silently
 	// frozen coordinator into an error in ~15s.
-	conn, err := grpc.NewClient(cfg.Coordinator, dialOpts(cfg.TLS)...)
+	opts, err := dialOpts(cfg.TLS)
+	if err != nil {
+		return err
+	}
+	conn, err := grpc.NewClient(cfg.Coordinator, opts...)
 	if err != nil {
 		return fmt.Errorf("worker: dial: %w", err)
 	}
@@ -533,12 +537,17 @@ func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.
 // server GOAWAYs the client for pinging too much. The max message size must
 // cover a full snapshot window chunk (default 4Mi is too small for real
 // batches).
-func dialOpts(tlsCfg grpctls.Config) []grpc.DialOption {
+func dialOpts(tlsCfg grpctls.Config) ([]grpc.DialOption, error) {
 	creds := grpc.WithTransportCredentials(insecure.NewCredentials())
 	if tlsCfg.Enabled() {
-		if c, err := tlsCfg.ClientCreds(); err == nil {
-			creds = grpc.WithTransportCredentials(c)
+		c, err := tlsCfg.ClientCreds()
+		if err != nil {
+			// No correct plaintext fallback when TLS is configured: dialing
+			// insecure against a TLS coordinator is a silent downgrade
+			// (issue #265).
+			return nil, fmt.Errorf("worker: TLS client credentials: %w", err)
 		}
+		creds = grpc.WithTransportCredentials(c)
 	}
 	return []grpc.DialOption{
 		creds,
@@ -551,7 +560,7 @@ func dialOpts(tlsCfg grpctls.Config) []grpc.DialOption {
 			grpc.MaxCallRecvMsgSize(128<<20),
 			grpc.MaxCallSendMsgSize(128<<20),
 		),
-	}
+	}, nil
 }
 
 // batchReceiver routes decoded Flight batches into the worker core, skipping
