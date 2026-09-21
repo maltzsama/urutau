@@ -74,6 +74,10 @@ type Config struct {
 	// must exceed WindowTimeout, or a slow-but-healthy catch-up would look
 	// wedged; the default is 10m, raised above WindowTimeout when that is set
 	// higher. Zero means the default.
+	//
+	// There is no CLI flag or spec field for it today: the default IS the
+	// operator-facing behavior, and a deployment that needs a different value
+	// sets this field programmatically.
 	SnapshotChunkTimeout time.Duration
 	ServerID             uint32
 	Heartbeat            time.Duration

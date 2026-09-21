@@ -67,7 +67,12 @@ type Source struct {
 	// the worker never needs replication credentials, so a deployment can
 	// grant the worker a SELECT-only user. When empty, URI is used (the
 	// pre-scoping behavior).
-	SnapshotURI   string `json:"snapshotUri,omitempty"`
+	SnapshotURI string `json:"snapshotUri,omitempty"`
+	// ServerID is the MySQL replication server_id. It MUST be unique across
+	// every pipeline reading from the same source server: two pipelines
+	// sharing one server_id fight over the same replication stream and
+	// corrupt it. The operator's admission webhook rejects a duplicate
+	// serverId within a namespace.
 	ServerID      string `json:"serverId,omitempty"`
 	SlotName      string `json:"slotName,omitempty"`
 	SnapshotMode  string `json:"snapshotMode,omitempty"`
@@ -296,6 +301,9 @@ type Maintenance struct {
 // protect there either).
 type CompactionConfig struct {
 	// Interval between compaction runs. Go duration syntax. Default "5m".
+	// Measured from the previous run's COMPLETION, not from a fixed
+	// schedule: a run longer than the interval does not re-fire immediately
+	// (the interval is a throttle between runs, not a start-time cadence).
 	Interval string `json:"interval,omitempty"`
 	// TargetFileSize is the desired output file size after compaction, e.g.
 	// "512Mi". Default "512Mi" (iceberg-go's own default).
@@ -328,6 +336,8 @@ type CompactionConfig struct {
 // to keep for time-travel queries."
 type SnapshotExpiryConfig struct {
 	// Interval between expiry runs. Go duration syntax. Default "10m".
+	// Measured from the previous run's COMPLETION, not from a fixed
+	// schedule (a throttle between runs, not a start-time cadence).
 	Interval string `json:"interval,omitempty"`
 	// RetainLast is the minimum number of snapshots kept regardless of age.
 	// Default 1.
@@ -344,6 +354,8 @@ type SnapshotExpiryConfig struct {
 // (that one protects position recovery, not file references).
 type OrphanCleanupConfig struct {
 	// Interval between cleanup runs. Go duration syntax. Default "1h".
+	// Measured from the previous run's COMPLETION, not from a fixed
+	// schedule (a throttle between runs, not a start-time cadence).
 	Interval string `json:"interval,omitempty"`
 	// OlderThan: only files older than this are eligible for deletion. Go
 	// duration syntax. Default "72h" (3 days) — iceberg-go's own default.
