@@ -440,6 +440,28 @@ docker compose -f test/e2e/docker-compose.yml exec -T trino \
   trino --execute "SELECT count(*) FROM iceberg.raw.orders"
 ```
 
+### Fully in-cluster (no host docker)
+
+Running the whole stack inside the cluster avoids a host docker daemon
+competing for memory, and — unlike the host-gateway setup — lets Polaris
+vend an **in-cluster** S3 endpoint the pods reach directly. `test/e2e`
+carries the same data services as the compose file (MySQL, RustFS, Polaris,
+Trino) as kustomize manifests:
+
+```sh title="In-cluster e2e stack"
+kubectl apply -k test/e2e     # ns e2e: mysql, rustfs, polaris, trino + bootstrap jobs
+kubectl -n e2e wait --for=condition=complete job/bucket-init job/polaris-setup --timeout=300s
+
+# then deploy the operator and a CR whose URIs point at the in-cluster services:
+#   source:  mysql://root:rootpass@mysql.e2e.svc.cluster.local:3306/shop
+#   catalog: http://polaris.e2e.svc.cluster.local:8181/api/catalog
+```
+
+The `quickstart_catalog` is created with the rustfs Service FQDN as its S3
+endpoint, so the coordinator and workers reach the warehouse with no host
+gateway involved. Seed `shop.orders` before the coordinator boots — a
+partitioned table splits its primary-key range from the rows that exist.
+
 ## Updating a pipeline
 
 Edit the CR and re-apply. The operator stamps a hash of the spec onto the

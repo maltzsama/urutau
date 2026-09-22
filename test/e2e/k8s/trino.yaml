@@ -1,0 +1,58 @@
+# Trino: verifies the written Iceberg table. Its catalog config
+# (../trino/catalog/iceberg.properties) is reused verbatim via
+# configMapGenerator; it points at the polaris and rustfs Services, which
+# resolve in this namespace. Trino sizes its heap from the container limit
+# (-XX:MaxRAMPercentage=80 in the image's jvm.config).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino
+  labels:
+    app: trino
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trino
+  template:
+    metadata:
+      labels:
+        app: trino
+    spec:
+      containers:
+        - name: trino
+          image: trinodb/trino:470
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: catalog
+              mountPath: /etc/trino/catalog
+          readinessProbe:
+            httpGet:
+              path: /v1/info
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: catalog
+          configMap:
+            name: trino-catalog
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino
+spec:
+  selector:
+    app: trino
+  ports:
+    - port: 8080
+      targetPort: 8080

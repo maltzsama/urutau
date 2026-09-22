@@ -1,0 +1,99 @@
+# One-shot bootstrap jobs, the in-cluster twins of the compose
+# `bucket-init` and `polaris-setup` services. Each retries until its
+# dependency answers, so they need no ordering guarantees.
+#
+#   bucket-init    creates the `warehouse` bucket RustFS does not create.
+#   polaris-setup  creates quickstart_catalog with IN-CLUSTER S3 endpoints
+#                  (http://rustfs.e2e.svc.cluster.local:9000), so the coordinator and workers
+#                  reach the warehouse directly — no host gateway.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bucket-init
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bucket-init
+          image: amazon/aws-cli:latest
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: urutau
+            - name: AWS_SECRET_ACCESS_KEY
+              value: urutau_dev_secret
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              until aws --endpoint-url http://rustfs.e2e.svc.cluster.local:9000 s3 ls >/dev/null 2>&1; do
+                echo waiting for rustfs...; sleep 2
+              done
+              aws --endpoint-url http://rustfs.e2e.svc.cluster.local:9000 s3 mb s3://warehouse || true
+              echo bucket ready
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: polaris-setup
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: polaris-setup
+          image: alpine/curl:8.11.1
+          env:
+            - name: CLIENT_ID
+              value: root
+            - name: CLIENT_SECRET
+              value: s3cr3t
+            - name: CATALOG_NAME
+              value: quickstart_catalog
+            - name: REALM
+              value: POLARIS
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              TOKEN_URL=http://polaris:8181/api/catalog/v1/oauth/tokens
+              until curl -sf -X POST "$TOKEN_URL" \
+                  -H 'Content-Type: application/x-www-form-urlencoded' \
+                  -d "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&scope=PRINCIPAL_ROLE:ALL" >/dev/null; do
+                echo waiting for polaris...; sleep 3
+              done
+              TOKEN=$(curl -sf -X POST "$TOKEN_URL" \
+                -H 'Content-Type: application/x-www-form-urlencoded' \
+                -d "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&scope=PRINCIPAL_ROLE:ALL" \
+                | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+              test -n "$TOKEN"
+              MGMT=http://polaris:8181/api/management/v1/catalogs
+              if [ "$(curl -s -o /dev/null -w '%{http_code}' "$MGMT/${CATALOG_NAME}" -H "Authorization: Bearer $TOKEN" -H "Polaris-Realm: ${REALM}")" != "200" ]; then
+                curl -sf -X POST "$MGMT" \
+                  -H "Authorization: Bearer $TOKEN" -H "Polaris-Realm: ${REALM}" \
+                  -H 'Content-Type: application/json' \
+                  -d '{"catalog":{"name":"'${CATALOG_NAME}'","type":"INTERNAL","readOnly":false,"properties":{"default-base-location":"s3://warehouse"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://warehouse"],"endpoint":"http://rustfs.e2e.svc.cluster.local:9000","endpointInternal":"http://rustfs.e2e.svc.cluster.local:9000","pathStyleAccess":true,"region":"us-east-1"}}}'
+              fi
+              curl -sf -X PUT "$MGMT/${CATALOG_NAME}/catalog-roles/catalog_admin/grants" \
+                -H "Authorization: Bearer $TOKEN" -H "Polaris-Realm: ${REALM}" \
+                -H 'Content-Type: application/json' \
+                -d '{"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}' || true
+              echo catalog created
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

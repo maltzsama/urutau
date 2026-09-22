@@ -1,0 +1,32 @@
+# The e2e dependency stack as in-cluster workloads, for running the whole
+# pipeline (and KEDA autoscaling) inside minikube with no host docker
+# competing for memory:
+#
+#   kubectl apply -k test/e2e
+#
+# It mirrors test/e2e/docker-compose.yml's data services — MySQL (source),
+# RustFS + Polaris (the Iceberg REST catalog and its S3 store) and Trino (to
+# verify the written table). The manifests live in k8s/; the MySQL init SQL
+# and the Trino catalog properties are reused verbatim from this directory
+# via configMapGenerator, so the compose and the cluster stay in lockstep.
+#
+# Tear down with:  kubectl delete -k test/e2e
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: e2e
+
+resources:
+  - k8s/namespace.yaml
+  - k8s/mysql.yaml
+  - k8s/rustfs.yaml
+  - k8s/polaris.yaml
+  - k8s/trino.yaml
+  - k8s/jobs.yaml
+
+configMapGenerator:
+  - name: mysql-init
+    files:
+      - init.sql=mysql/init/init.sql
+  - name: trino-catalog
+    files:
+      - iceberg.properties=trino/catalog/iceberg.properties
