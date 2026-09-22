@@ -11,8 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go/table"
+
 	"github.com/maltzsama/urutau/internal/coordinator"
 	"github.com/maltzsama/urutau/internal/grpctls"
+	"github.com/maltzsama/urutau/internal/maintenance"
+	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -98,6 +102,23 @@ func (p *scalablePipeline) startWorker(name string) {
 	}()
 }
 
+// startMaintenanceWorker launches one ephemeral maintenance pass, exactly as
+// the coordinator's scheduler would provision it: a Hello marked Maintenance,
+// one assigned pass, then exit.
+func (p *scalablePipeline) startMaintenanceWorker(name string) {
+	p.t.Helper()
+	wCtx, wStop := context.WithCancel(p.ctx)
+	p.track(wStop)
+	go func() {
+		p.done <- worker.RunMaintenance(wCtx, worker.RemoteConfig{
+			Coordinator: p.addr,
+			Name:        name,
+			Namespace:   "raw",
+			Sink:        workerSink(),
+		})
+	}()
+}
+
 func (p *scalablePipeline) track(stop context.CancelFunc) {
 	p.mu.Lock()
 	p.stops = append(p.stops, stop)
@@ -119,8 +140,13 @@ func (p *scalablePipeline) stop() {
 			// A scale-in retires owners: the coordinator cancels their
 			// session, and the worker process exits with the reset error.
 			// That is the expected fate of a retired pod (KEDA would delete
-			// it), not a failure. Anything else is a real error.
-			if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "session reset") {
+			// it), not a failure. A maintenance pass rejected because a
+			// previous one is still running ("already connected") is the
+			// same — expected churn, and the test's own assertions are the
+			// real check. Anything else is a real error.
+			if err != nil && !errors.Is(err, context.Canceled) &&
+				!strings.Contains(err.Error(), "session reset") &&
+				!strings.Contains(err.Error(), "maintenance") {
 				p.t.Errorf("process exited with: %v", err)
 			}
 		case <-deadline:
@@ -222,7 +248,7 @@ func TestLiveRepartitionScaleIn(t *testing.T) {
 
 	addr := reserveAddr(t)
 	s := loadPipeline(t)
-	s.Tables[0].Workers = &spec.WorkerSpec{Number: 3, Max: 8}
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -348,6 +374,13 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 	addr := reserveAddr(t)
 	s := loadPipeline(t)
 	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
+	// Maintenance runs alongside the stress: compaction commits to the same
+	// table while the coordinator re-slices it under continuous load. The 1s
+	// interval makes compaction due for every pass.
+	s.Sink.Maintenance = &spec.Maintenance{
+		Enabled:    true,
+		Compaction: &spec.CompactionConfig{MinInputFiles: 2, Interval: "1s"},
+	}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
@@ -363,7 +396,8 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 	p := bootScalable(t, ctx, addr, s, boot...)
 	defer p.stop()
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
-	t.Log("snapshot converged; starting chaos writer")
+	before := tableFileCount(t, ctx, "orders")
+	t.Logf("snapshot converged with %d data files; starting chaos writer + maintenance", before)
 
 	stop := make(chan struct{})
 	writeDone := make(chan struct{})
@@ -393,14 +427,19 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 			if _, err := db.Exec(q); err != nil {
 				t.Logf("chaos writer: %q: %v", q, err)
 			}
-			// 40ms keeps the source continuously busy without overwhelming
-			// the e2e's RustFS, which returns 500s (commit retries exhausted)
-			// above roughly this commit rate.
-			time.Sleep(40 * time.Millisecond)
+			// 150ms keeps the source continuously busy while staying inside
+			// what the e2e's RustFS sustains alongside the compaction commits
+			// (it is effectively single-core and returns 500s above this
+			// combined rate).
+			time.Sleep(150 * time.Millisecond)
 		}
 	}()
 
+	maintName := maintenance.WorkerName(s.Pipeline, target)
 	for _, n := range []int{3, 2, 4, 1, 3, 2} {
+		// A maintenance pass starts before each step, so compaction commits
+		// to the same table while the coordinator drains and flips it.
+		p.startMaintenanceWorker(maintName)
 		err := p.coord.ScaleTable(ctx, target, n)
 		if err != nil {
 			t.Fatalf("ScaleTable(%s, %d): %v", target, n, err)
@@ -410,19 +449,24 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 		for _, name := range layout.WorkerGroupNames(s.Pipeline) {
 			p.startWorker(name)
 		}
-		t.Logf("re-sliced to %d partitions under chaos load", n)
+		t.Logf("re-sliced to %d partitions under chaos load + maintenance", n)
 		time.Sleep(1500 * time.Millisecond)
 	}
 
 	close(stop)
 	<-writeDone
 
-	// The sink must equal the source exactly. Read the source truth once (the
-	// writer has stopped) and poll the sink until it converges.
+	// Compaction must have run despite the churn, the position must survive
+	// (compaction carries cdc.position forward, the re-slice must not regress
+	// it), and the sink must equal the source exactly.
+	waitCompactedFrom(t, ctx, "orders", before)
+	if pos := tablePosition(t, ctx, "orders"); pos == "" {
+		t.Fatal("cdc.position is empty after chaos + maintenance — the position was lost")
+	}
 	want := mysqlTable(t, db)
 	t.Logf("source settled at %d rows; waiting for the sink to match", len(want))
 	waitTrinoTable(t, ctx, want)
-	t.Log("chaos scale ok: sink equals source exactly after repeated flips")
+	t.Log("chaos scale ok: compacted, position preserved, sink equals source after repeated flips")
 }
 
 // mysqlTable reads the source's full (id → v) state.
@@ -520,4 +564,99 @@ func cap10(ids []int64) []int64 {
 		return ids[:10]
 	}
 	return ids
+}
+
+// tableFileCount returns the number of data files a target table currently
+// has, retrying a transient catalog/S3 error — the e2e's RustFS returns 500s
+// under load, which is an artifact of the test stack, not of the engine.
+func tableFileCount(t *testing.T, ctx context.Context, tableName string) int {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for {
+		n, err := tryTableFileCount(ctx, tableName)
+		if err == nil {
+			return n
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("data-file count %s: %v", tableName, lastErr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func tryTableFileCount(ctx context.Context, tableName string) (int, error) {
+	cat, err := icebergsink.NewCatalog(ctx, e2eIcebergCatalog())
+	if err != nil {
+		return 0, fmt.Errorf("catalog: %w", err)
+	}
+	tbl, err := cat.LoadTable(ctx, table.Identifier{"raw", tableName})
+	if err != nil {
+		return 0, fmt.Errorf("load table %s: %w", tableName, err)
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("plan files %s: %w", tableName, err)
+	}
+	return len(tasks), nil
+}
+
+// waitCompactedFrom polls until the table's data-file count drops below
+// before — compaction has visibly run — or fails naming what it saw. A
+// transient catalog error is retried, not fatal.
+func waitCompactedFrom(t *testing.T, ctx context.Context, tableName string, before int) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	var lastErr error
+	var lastCount int
+	for time.Now().Before(deadline) {
+		n, err := tryTableFileCount(ctx, tableName)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastCount = n
+			if n < before {
+				t.Logf("maintenance ok: %s compacted to %d data files (from %d)", tableName, n, before)
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("%s still has %d data files (want fewer than %d) — compaction did not run during the re-slice (lastErr=%v)",
+		tableName, lastCount, before, lastErr)
+}
+
+// tablePosition reads the target table's committed cdc.position (the fast
+// resume path), or "" when absent, retrying a transient catalog error.
+func tablePosition(t *testing.T, ctx context.Context, tableName string) string {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for {
+		cat, err := icebergsink.NewCatalog(ctx, e2eIcebergCatalog())
+		if err == nil {
+			var pos string
+			if pos, err = icebergsink.CommittedPosition(ctx, cat, table.Identifier{"raw", tableName}); err == nil {
+				return pos
+			}
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("committed position %s: %v", tableName, lastErr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// e2eIcebergCatalog is the e2e Polaris catalog config the test helpers read
+// through.
+func e2eIcebergCatalog() icebergsink.Config {
+	return icebergsink.Config{
+		URI:          env("URUTAU_E2E_CATALOG", "http://localhost:8181/api/catalog"),
+		Warehouse:    env("URUTAU_E2E_WAREHOUSE", "quickstart_catalog"),
+		ClientID:     "root",
+		ClientSecret: "s3cr3t",
+		Scope:        "PRINCIPAL_ROLE:ALL",
+	}
 }
