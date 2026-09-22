@@ -203,6 +203,25 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
 	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
+	// Installed BEFORE the assignment loop: SetStaged below refuses a staged
+	// table whose delivery callback is unset, so installing this afterwards
+	// failed every partitioned run on a staging sink at boot. It depends
+	// only on sender and assign, both already bound above.
+	// Staged deliveries (WK-001 C5): the data files are written but not
+	// committed; the coordinator groups them by cycle and commits. seq 0 is
+	// a worker-generated snapshot/window batch, committed on arrival. A send
+	// failure must surface — a dropped descriptor is an uncommittable cycle.
+	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32) error {
+		return sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Staged{Staged: &pb.StagedBatch{
+			Table:           table,
+			Seq:             seq,
+			Descriptor_:     desc,
+			Position:        pos,
+			SnapshotState:   state,
+			SnapshotPending: pending,
+			Epoch:           assign.Epoch,
+		}}})
+	})
 	var stages []*enrich.Stage
 	pkByTable := make(map[string][]string, len(assign.Tables))
 	for _, ta := range assign.Tables {
@@ -379,22 +398,6 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 			Position: string(b.Watermark),
 			Rows:     uint64(rows),
 			Deletes:  uint64(deletes),
-		}}})
-	})
-
-	// Staged deliveries (WK-001 C5): the data files are written but not
-	// committed; the coordinator groups them by cycle and commits. seq 0 is
-	// a worker-generated snapshot/window batch, committed on arrival. A send
-	// failure must surface — a dropped descriptor is an uncommittable cycle.
-	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32) error {
-		return sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Staged{Staged: &pb.StagedBatch{
-			Table:           table,
-			Seq:             seq,
-			Descriptor_:     desc,
-			Position:        pos,
-			SnapshotState:   state,
-			SnapshotPending: pending,
-			Epoch:           assign.Epoch,
 		}}})
 	})
 
