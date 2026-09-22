@@ -1,0 +1,16 @@
+apiVersion: v2
+name: urutau-operator
+description: >-
+  Urutau operator — reconciles CDCPipeline custom resources into per-pipeline
+  coordinator StatefulSets. An alternative install path to the kustomize base
+  in config/ (make k8s-deploy); both ship the same resources.
+type: application
+version: 0.1.0
+appVersion: "0.3.0"
+home: https://github.com/maltzsama/urutau
+sources:
+  - https://github.com/maltzsama/urutau
+keywords:
+  - cdc
+  - iceberg
+  - replication

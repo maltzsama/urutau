@@ -97,6 +97,27 @@ kubectl -n urutau-system get deploy,pod
 The operator logs should show the webhook registering at
 `/validate-urutau-io-v1alpha1-cdcpipeline` and the controller starting.
 
+### Helm install (alternative)
+
+A Helm chart ships at `charts/urutau-operator/` as a second, parallel install
+path — it is not a replacement for the kustomize base, and neither is
+deprecated. It drives the namespace, image, replicas, resources and the
+webhook's cert-manager dependency from values:
+
+```sh
+helm install urutau charts/urutau-operator \
+  --namespace urutau-system --create-namespace \
+  --wait
+```
+
+The namespace comes from `--namespace` in all three places the kustomize base
+hardcodes `urutau-system` (the `Certificate` dnsNames, the `inject-ca-from`
+annotation, and the webhook `clientConfig.service.namespace`), so installing
+into a different namespace needs no edits. cert-manager is a hard prerequisite
+unless you set `webhook.enabled=false`. See the chart's
+[README](https://github.com/maltzsama/urutau/tree/main/charts/urutau-operator)
+for the values.
+
 ## 3. Provide credentials as Secrets
 
 Credentials are **never** inline in the CR. The operator mounts Secrets
