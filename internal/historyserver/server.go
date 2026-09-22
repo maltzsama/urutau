@@ -7,9 +7,11 @@ package historyserver
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -17,6 +19,12 @@ import (
 
 	"github.com/maltzsama/urutau/internal/eventlog"
 )
+
+// staticFS is the embedded single-page frontend: a pipeline picker → run
+// picker → read-only event view, all plain fetch() polling.
+//
+//go:embed static
+var staticFS embed.FS
 
 // Config tunes the server.
 type Config struct {
@@ -83,6 +91,10 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/v1/pipelines", s.listPipelines)
 	mux.HandleFunc("GET /api/v1/pipelines/{name}/runs", s.listRuns)
 	mux.HandleFunc("GET /api/v1/pipelines/{name}/runs/{runId}/events", s.readRun)
+	// The SPA. staticFS is embedded at build time, so a missing subdir is a
+	// build error, not a runtime one.
+	sub, _ := fs.Sub(staticFS, "static")
+	mux.Handle("GET /", http.FileServer(http.FS(sub)))
 	return mux
 }
 

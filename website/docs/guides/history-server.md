@@ -44,6 +44,10 @@ S3 credentials and region come from the standard `AWS_*` environment (or
 `--region`/`--endpoint`/`--access-key`/`--secret-key` for a MinIO-style
 store). Give it **read-only** access — it never writes.
 
+Open <http://localhost:8080/> for a small embedded web UI: a pipeline picker
+→ run picker → read-only event view, all plain `fetch()` polling against the
+API below (no streaming — a terminated run has nothing to push).
+
 ## API
 
 | Route | Returns |
