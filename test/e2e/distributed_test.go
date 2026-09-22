@@ -17,6 +17,7 @@ import (
 
 	"github.com/apache/iceberg-go/table"
 	"github.com/maltzsama/urutau/internal/coordinator"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/sink"
@@ -160,7 +161,7 @@ func TestWorkerSuicide(t *testing.T) {
 		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second})
 	}()
 	go func() {
-		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
+		cErr <- coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true}, Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
 	}()
 
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(20))
@@ -230,7 +231,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 	go func() {
 		// AckTimeout generous: this test exercises the drain, not
 		// supervision — a slow Iceberg commit must not look like a crash.
-		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 2 * time.Minute})
+		cErr <- coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true}, Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 2 * time.Minute})
 	}()
 
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(20))
@@ -297,7 +298,7 @@ func bootPipelineLogged(t *testing.T, ctx context.Context, addr string, s *spec.
 	}
 	cCtx, cStop := context.WithCancel(ctx)
 	go func() {
-		done <- coordinator.Run(cCtx, coordinator.Config{
+		done <- coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true},
 			Spec:          s,
 			ListenAddr:    addr,
 			ServerID:      1102, // distinct from the collapsed runs' 1101
@@ -557,7 +558,7 @@ func TestCrashloopKillsJob(t *testing.T) {
 	}()
 	// Aggressive supervision: stale after 5s, only 2 resets allowed, 1m window.
 	go func() {
-		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 5 * time.Second, MaxResets: 2, ResetWindow: time.Minute})
+		cErr <- coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true}, Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 5 * time.Second, MaxResets: 2, ResetWindow: time.Minute})
 	}()
 
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(10))
@@ -621,7 +622,7 @@ func TestObservabilityEndpoints(t *testing.T) {
 		_ = worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
 	}()
 	go func() {
-		_ = coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, MetricsAddr: metricsAddr, AckTimeout: 2 * time.Minute})
+		_ = coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true}, Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, MetricsAddr: metricsAddr, AckTimeout: 2 * time.Minute})
 	}()
 
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(5))
@@ -748,7 +749,7 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 	cCtx, cStop := context.WithCancel(ctx)
 	cErr := make(chan error, 1)
 	go func() {
-		cErr <- coordinator.Run(cCtx, coordinator.Config{Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 10 * time.Second, MaxResets: 10, ResetWindow: time.Minute})
+		cErr <- coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true}, Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, AckTimeout: 10 * time.Second, MaxResets: 10, ResetWindow: time.Minute})
 	}()
 
 	// First worker: acks the snapshot normally, then the gate stops its

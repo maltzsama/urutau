@@ -66,6 +66,7 @@ type coordinatorFlags struct {
 	eventlogURI     string
 	checkpointURI   string
 	checkpointSec   int
+	allowInsecure   bool
 	pluginPaths     []string
 	logLevel        string
 	logFormat       string
@@ -125,6 +126,7 @@ func runCmd() *cobra.Command {
 	fl.StringVar(&f.tlsCert, "tls-cert", "", "server certificate for the control plane (mTLS; all three TLS flags required)")
 	fl.StringVar(&f.tlsKey, "tls-key", "", "server private key for the control plane (mTLS)")
 	fl.StringVar(&f.tlsCA, "tls-ca", "", "CA that signs worker client certs (mTLS)")
+	fl.BoolVar(&f.allowInsecure, "allow-insecure-control-plane", false, "run the control plane without mTLS (plaintext); the assignment carries the source DSN, so this is an explicit opt-out of the fail-closed default")
 	// source
 	fl.Uint32Var(&f.serverID, "server-id", 1101, "MySQL server id for this replicator")
 	fl.IntVar(&f.chunkSize, "chunk-size", 10000, "DBLog snapshot chunk size (rows per chunk)")
@@ -150,8 +152,14 @@ func runCmd() *cobra.Command {
 
 // validate rejects incoherent flag combinations before any I/O.
 func (f *coordinatorFlags) validate() error {
-	tlsCfg := grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA}
+	tlsCfg := grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA, AllowInsecure: f.allowInsecure}
 	if err := tlsCfg.Validate(); err != nil {
+		return err
+	}
+	// Fail fast on a plaintext control plane at flag-parse time, before the
+	// spec read — the coordinator's Run enforces the same rule for
+	// programmatic callers.
+	if err := tlsCfg.RequireTLS(); err != nil {
 		return err
 	}
 	if f.maxParallel < 0 {
@@ -193,7 +201,7 @@ func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger, logBuffer *
 		ResetWindow:       f.resetWindow,
 		MetricsAddr:       f.metricsAddr,
 		LogBuffer:         logBuffer,
-		TLS:               grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA},
+		TLS:               grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA, AllowInsecure: f.allowInsecure},
 		Logger:            logger,
 	}
 }

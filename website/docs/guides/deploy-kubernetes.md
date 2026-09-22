@@ -287,6 +287,18 @@ To turn the webhook off (e.g. cert-manager unavailable), run the operator
 with `--enable-webhook=false`; the reconciler still validates, so you lose
 the admission-time check, not correctness.
 
+## Control-plane security
+
+The coordinator↔worker channel carries the **source DSN** in the worker
+assignment. The coordinator binary refuses to boot without mTLS unless
+`--allow-insecure-control-plane` is passed explicitly. The operator does not
+wire control-plane mTLS yet, so it passes that opt-out: the DSN travels
+plaintext **inside the cluster**. That is acceptable when the network and
+nodes are trusted; wire mTLS (a cert-manager `Certificate` for the
+coordinator Service plus worker client certs) before running the control
+plane across an untrusted network. See
+[Distributed mode](distributed.md#secure-the-control-plane).
+
 ## Multi-tenant install (namespace per team)
 
 The default install (`config/default`) binds the operator's `ClusterRole`

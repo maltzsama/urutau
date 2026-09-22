@@ -61,14 +61,16 @@ from `URUTAU_SINK_URI`, `URUTAU_SINK_CLIENT_ID`, and friends — see the
 
 ## Secure the control plane
 
-The Flight assignment carries the **source DSN**, credentials included. On
-a network you do not fully trust, run the control plane under mTLS: give
-the coordinator `--tls-cert`/`--tls-key`/`--tls-ca` and every worker the
-matching client flags. With no TLS flags the coordinator logs a warning
-and speaks plaintext:
+The Flight assignment carries the **source DSN**, credentials included. Run
+the control plane under mTLS: give the coordinator
+`--tls-cert`/`--tls-key`/`--tls-ca` and every worker the matching client
+flags. With no TLS flags the coordinator **refuses to boot** — it will not
+send the DSN in the clear by omission. To accept plaintext explicitly (e.g. a
+trusted network), pass `--allow-insecure-control-plane`, which downgrades the
+failure to a startup warning:
 
 ```
-WARN coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA
+WARN coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA (running because --allow-insecure-control-plane was set)
 ```
 
 A minimal CA plus a server certificate for the coordinator and a client

@@ -3,14 +3,16 @@
 // which carries the source DSN — and every Shutdown/Ack ride plaintext on
 // the wire (CD-1b).
 //
-// An empty Config means the caller chose plaintext; it is the caller's job
-// to warn loudly (the coordinator does). All three fields must be set to
-// enable mTLS.
+// An empty Config means plaintext. The coordinator treats that as an error at
+// boot unless AllowInsecure is set explicitly (fail closed, not silently over
+// the wire); it is still the caller's job to warn. All three fields must be
+// set to enable mTLS.
 package grpctls
 
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 
@@ -23,11 +25,26 @@ type Config struct {
 	CertFile     string // this side's certificate
 	KeyFile      string // this side's private key
 	ClientCAFile string // CA that signs the peer cert (server: client CA; client: server CA)
+	// AllowInsecure accepts a plaintext control plane. It is the explicit
+	// opt-out of the fail-closed default: RequireTLS errors when no material
+	// is set and this is false.
+	AllowInsecure bool
 }
 
 // Enabled reports whether any TLS material was configured.
 func (c Config) Enabled() bool {
 	return c.CertFile != "" || c.KeyFile != "" || c.ClientCAFile != ""
+}
+
+// RequireTLS reports whether the config is a usable mTLS set, or a plaintext
+// config the caller explicitly allowed. It is the fail-closed gate the
+// coordinator runs at boot: with no material and no AllowInsecure, the
+// control plane would send the source DSN in the clear, so boot must fail.
+func (c Config) RequireTLS() error {
+	if c.Enabled() || c.AllowInsecure {
+		return nil
+	}
+	return errors.New("grpctls: control plane is plaintext — the assignment carries the source DSN; set cert, key and CA, or allow insecure explicitly")
 }
 
 func (c Config) validate() error {
