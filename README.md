@@ -1,4 +1,4 @@
-# <img src="./internal/dashboard/static/img/icon.svg" width="64" alt=""> Urutau
+# <img src="./website/static/img/favicon.svg" width="64" alt=""> Urutau
 
 *Tupi–Guaraní for the potoo — a nightjar that stands motionless through the night, watching. A fitting name for a process that spends its life quietly watching a binlog.*
 
