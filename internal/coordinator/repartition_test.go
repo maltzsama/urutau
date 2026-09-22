@@ -146,6 +146,11 @@ func TestScaleInDropsOwnerAndShrinksRanges(t *testing.T) {
 	if _, ok := c.byTicket[string(dropped.ticket)]; ok {
 		t.Fatalf("retired owner %q still holds a ticket", dropped.name)
 	}
+	// Its position index stays: the ack path dereferences c.index without
+	// c.mu, so deleting it under an in-flight batch would panic.
+	if c.index[dropped.name] == nil {
+		t.Fatalf("retired owner %q lost its position index: the ack path would nil-panic", dropped.name)
+	}
 	c.confirmedMu.Lock()
 	_, stillConfirmed := c.confirmed[dropped.name]
 	c.confirmedMu.Unlock()

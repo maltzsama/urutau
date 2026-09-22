@@ -160,12 +160,13 @@ func TestLiveRepartitionScaleOut(t *testing.T) {
 	}
 	t.Log("re-sliced to 3 partitions under live load")
 
-	// The two new groups have no pod yet: start them, as KEDA would.
-	scaled := []string{
-		fmt.Sprintf("%s-%s-1", s.Pipeline, target),
-		fmt.Sprintf("%s-%s-2", s.Pipeline, target),
-	}
-	for _, name := range scaled {
+	// The two new groups have no pod yet: start them, as KEDA would. The
+	// names come from the same derivation the coordinator uses, so a
+	// change to that scheme fails here rather than silently starting a
+	// worker nothing routes to.
+	scaledSpec := s.Tables[0]
+	scaledSpec.Workers = &spec.WorkerSpec{Number: 3}
+	for _, name := range scaledSpec.WorkerGroupNames(s.Pipeline)[1:] {
 		p.startWorker(name)
 	}
 	<-writeDone

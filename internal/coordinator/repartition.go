@@ -289,7 +289,12 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	}
 	delete(c.workers, w.name)
 	delete(c.byTicket, string(w.ticket))
-	delete(c.index, w.name)
+	// c.index is deliberately NOT deleted: enqueueTo and onAck index it
+	// without holding c.mu (coordinator.go:1797, :2024) and dereference the
+	// result directly, so removing the entry under a live in-flight batch
+	// would race them into a nil-map-value panic. The entry is drained by
+	// the loop above and costs one empty index per retired owner, bounded
+	// by the run's lifetime.
 	c.mu.Unlock()
 
 	c.confirmedMu.Lock()
