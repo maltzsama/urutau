@@ -356,17 +356,31 @@ func TestLiveRepartitionScaleOutAppend(t *testing.T) {
 	t.Log("append scale-out ok: no loss, no duplicate")
 }
 
-// TestLiveRepartitionChaosScale hammers the re-slice: a mixed INSERT/UPDATE/
-// DELETE writer keeps the source changing while the table is scaled up and
-// down repeatedly (1→3→2→4→1→3→2), workers joining and leaving at each step.
-// The sink must end up equal to the source exactly — every row, no stale
-// value, no duplicate, no loss.
+// TestLiveRepartitionChaosScale hammers the re-slice under a continuously
+// busy source: a mixed INSERT/UPDATE/DELETE writer keeps the table changing
+// while it is scaled up and down repeatedly (1→3→2→4→1→3→2), workers joining
+// and leaving at each step. The sink must end up equal to the source exactly
+// — every row, no stale value, no duplicate, no loss.
 //
 // The tidy tests exercise one flip with the load aimed after it. This one
 // exercises back-to-back flips: workers retiring and rejoining, deletes
 // crossing a moved boundary, and inserts that extend the key range under a
 // running layout, so every re-slice resolves fresh boundaries.
 func TestLiveRepartitionChaosScale(t *testing.T) {
+	runChaosScale(t, false)
+}
+
+// TestLiveRepartitionChaosScaleWithMaintenance is the same stress with table
+// maintenance running alongside it: a compaction pass starts before each
+// scale, so its RewriteDataFiles commits to the table the coordinator is
+// draining and flipping, and it reads cdc.position while the re-slice
+// advances it. Compaction must still run, the position must survive, and the
+// sink must still equal the source.
+func TestLiveRepartitionChaosScaleWithMaintenance(t *testing.T) {
+	runChaosScale(t, true)
+}
+
+func runChaosScale(t *testing.T, withMaintenance bool) {
 	requireE2E(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -374,12 +388,12 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 	addr := reserveAddr(t)
 	s := loadPipeline(t)
 	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
-	// Maintenance runs alongside the stress: compaction commits to the same
-	// table while the coordinator re-slices it under continuous load. The 1s
-	// interval makes compaction due for every pass.
-	s.Sink.Maintenance = &spec.Maintenance{
-		Enabled:    true,
-		Compaction: &spec.CompactionConfig{MinInputFiles: 2, Interval: "1s"},
+	if withMaintenance {
+		// The 1s interval makes compaction due for every pass.
+		s.Sink.Maintenance = &spec.Maintenance{
+			Enabled:    true,
+			Compaction: &spec.CompactionConfig{MinInputFiles: 2, Interval: "1s"},
+		}
 	}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
@@ -396,8 +410,11 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 	p := bootScalable(t, ctx, addr, s, boot...)
 	defer p.stop()
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
-	before := tableFileCount(t, ctx, "orders")
-	t.Logf("snapshot converged with %d data files; starting chaos writer + maintenance", before)
+	var before int
+	if withMaintenance {
+		before = tableFileCount(t, ctx, "orders")
+	}
+	t.Log("snapshot converged; starting chaos writer")
 
 	stop := make(chan struct{})
 	writeDone := make(chan struct{})
@@ -428,20 +445,20 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 				t.Logf("chaos writer: %q: %v", q, err)
 			}
 			// 150ms keeps the source continuously busy while staying inside
-			// what the e2e's RustFS sustains alongside the compaction commits
-			// (it is effectively single-core and returns 500s above this
-			// combined rate).
+			// what the e2e's RustFS sustains (it is effectively single-core
+			// and returns 500s above this rate, more so with compaction).
 			time.Sleep(150 * time.Millisecond)
 		}
 	}()
 
 	maintName := maintenance.WorkerName(s.Pipeline, target)
 	for _, n := range []int{3, 2, 4, 1, 3, 2} {
-		// A maintenance pass starts before each step, so compaction commits
-		// to the same table while the coordinator drains and flips it.
-		p.startMaintenanceWorker(maintName)
-		err := p.coord.ScaleTable(ctx, target, n)
-		if err != nil {
+		if withMaintenance {
+			// A pass starts before each step, so compaction commits to the
+			// same table while the coordinator drains and flips it.
+			p.startMaintenanceWorker(maintName)
+		}
+		if err := p.coord.ScaleTable(ctx, target, n); err != nil {
 			t.Fatalf("ScaleTable(%s, %d): %v", target, n, err)
 		}
 		layout := s.Tables[0]
@@ -449,24 +466,28 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 		for _, name := range layout.WorkerGroupNames(s.Pipeline) {
 			p.startWorker(name)
 		}
-		t.Logf("re-sliced to %d partitions under chaos load + maintenance", n)
+		t.Logf("re-sliced to %d partitions under chaos load", n)
 		time.Sleep(1500 * time.Millisecond)
 	}
 
 	close(stop)
 	<-writeDone
 
-	// Compaction must have run despite the churn, the position must survive
-	// (compaction carries cdc.position forward, the re-slice must not regress
-	// it), and the sink must equal the source exactly.
-	waitCompactedFrom(t, ctx, "orders", before)
-	if pos := tablePosition(t, ctx, "orders"); pos == "" {
-		t.Fatal("cdc.position is empty after chaos + maintenance — the position was lost")
+	if withMaintenance {
+		// Compaction must have run despite the churn, and the position must
+		// survive (compaction carries cdc.position forward; the re-slice must
+		// not regress it).
+		waitCompactedFrom(t, ctx, "orders", before)
+		if pos := tablePosition(t, ctx, "orders"); pos == "" {
+			t.Fatal("cdc.position is empty after chaos + maintenance — the position was lost")
+		}
 	}
+
+	// The sink must equal the source exactly.
 	want := mysqlTable(t, db)
 	t.Logf("source settled at %d rows; waiting for the sink to match", len(want))
 	waitTrinoTable(t, ctx, want)
-	t.Log("chaos scale ok: compacted, position preserved, sink equals source after repeated flips")
+	t.Log("chaos scale ok: sink equals source exactly after repeated flips")
 }
 
 // mysqlTable reads the source's full (id → v) state.
