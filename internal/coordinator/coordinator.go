@@ -121,6 +121,10 @@ type Config struct {
 	// MaxWorkers caps the partitions one table may be scaled to when the
 	// table declares no cap of its own. Default 32.
 	MaxWorkers int
+	// OnReady, when set, receives the running coordinator once its
+	// routing is published. It is how a scaler reaches ScaleTable
+	// in-process (issue #312); the operator wires the HTTP action to it.
+	OnReady func(*Coordinator)
 
 	// MetricsAddr serves /metrics (Prometheus), /statusz (live state), and the
 	// dashboard (issue #97). Empty disables the endpoint.
@@ -605,6 +609,9 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Publish the boot layout once: every runtime reader loads this
 	// snapshot, and a re-slice swaps in a successor (issue #312).
 	c.publishRouting(&routing{owners: bootOwners, ranges: bootRanges})
+	if c.cfg.OnReady != nil {
+		c.cfg.OnReady(c)
+	}
 	if err := c.provisionWorkers(ctx, workerTarget); err != nil {
 		return fmt.Errorf("coordinator: %w", err)
 	}
