@@ -1,0 +1,64 @@
+.codeBlockHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--code-block-border);
+  background: var(--code-block-header-bg);
+  font-size: 12px;
+  font-family: var(--ifm-font-family-monospace);
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+}
+
+.dots {
+  display: flex;
+  gap: 6px;
+}
+
+.dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--code-block-dots-color);
+}
+
+.headerTitle {
+  margin-left: 8px;
+  color: var(--code-block-header-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.codeBlockContent {
+  position: relative;
+  direction: ltr;
+  border-radius: inherit;
+}
+
+.codeBlockFooter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px;
+  border-top: 1px solid var(--code-block-border);
+  background: var(--code-block-footer-bg);
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 13px;
+  border-bottom-left-radius: 16px;
+  border-bottom-right-radius: 16px;
+}
+
+.footerIcon {
+  flex-shrink: 0;
+  color: var(--code-block-footer-icon);
+}
+
+.footerCommand {
+  color: var(--code-block-footer-text);
+  font-family: inherit;
+  font-size: inherit;
+  background: none;
+  padding: 0;
+  border: none;
+}

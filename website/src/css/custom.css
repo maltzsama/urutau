@@ -1,3 +1,66 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&display=swap');
+
+@font-face {
+  font-family: 'Future Socialism';
+  src: url('/fonts/Future Socialism.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
+.hero__title,
+.navbar__title {
+  font-family: 'Future Socialism', sans-serif;
+}
+
+:is([data-theme='light'], [data-theme='dark']) .hero__title {
+  font-weight: 300;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+  font-size: 3.75rem;
+  color: white;
+}
+
+@media (min-width: 640px) {
+  :is([data-theme='light'], [data-theme='dark']) .hero__title {
+    font-size: 6rem;
+  }
+}
+
+:is([data-theme='light'], [data-theme='dark']) .hero__subtitle {
+  max-width: 48rem;
+  margin-inline: auto;
+  margin-top: 1.5rem;
+  font-size: 1.5rem;
+  font-weight: 300;
+  line-height: 1.6;
+  color: white;
+}
+
+@media (min-width: 640px) {
+  :is([data-theme='light'], [data-theme='dark']) .hero__subtitle {
+    font-size: 1.75rem;
+  }
+}
+
+[data-theme='dark'] .hero__title,
+[data-theme='dark'] .hero__subtitle {
+  color: #0a0a0a;
+}
+
+[data-theme='dark'] .hero__subtitle {
+  color: #1a1a1a;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  font-family: 'Fraunces', ui-serif, Georgia, serif;
+}
+
 :root {
   --ifm-color-primary: #e09521;
   --ifm-color-primary-dark: #c9861e;
@@ -7,7 +70,25 @@
   --ifm-color-primary-lighter: #eaab44;
   --ifm-color-primary-lightest: #f0c06e;
   --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+
+  --ifm-heading-margin-top: 2.5rem;
+  --ifm-global-radius: 0px;
+  --ifm-code-border-radius: 16px;
+  --ifm-global-shadow-lw: none;
+  --ifm-global-shadow-md: none;
+  --ifm-global-shadow-tl: none;
+
+  --docusaurus-highlighted-code-line-bg: rgba(224, 149, 33, 0.15);
+
+  /* Code block – light theme */
+  --code-block-bg: hsl(0, 0%, 98%);
+  --code-block-border: hsl(0, 0%, 88%);
+  --code-block-header-bg: hsl(0, 0%, 95%);
+  --code-block-header-text: hsl(0, 0%, 45%);
+  --code-block-dots-color: hsl(0, 0%, 80%);
+  --code-block-footer-bg: hsl(0, 0%, 96%);
+  --code-block-footer-text: hsl(38, 52%, 54%);
+  --code-block-footer-icon: hsl(188, 42%, 38%);
 }
 
 [data-theme='dark'] {
@@ -18,5 +99,91 @@
   --ifm-color-primary-light: #e7a238;
   --ifm-color-primary-lighter: #eaab44;
   --ifm-color-primary-lightest: #f0c06e;
-  --docusaurus-highlighted-code-line-bg: rgba(224, 149, 33, 0.1);
+
+  --ifm-background-color: #121212;
+  --ifm-background-surface-color: #1e1e1e;
+
+  --docusaurus-highlighted-code-line-bg: rgba(224, 149, 33, 0.2);
+
+  /* Code block – dark theme */
+  --code-block-bg: hsl(240, 25%, 3%);
+  --code-block-border: hsl(240, 14%, 14%);
+  --code-block-header-bg: hsl(240, 18%, 7%);
+  --code-block-header-text: hsl(38, 12%, 62%);
+  --code-block-dots-color: hsla(240, 12%, 16%, 0.6);
+  --code-block-footer-bg: hsla(240, 18%, 7%, 0.4);
+  --code-block-footer-text: hsla(38, 52%, 74%, 0.9);
+  --code-block-footer-icon: hsl(188, 42%, 48%);
+}
+
+
+.navbar {
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
+  box-shadow: none;
+}
+
+
+.hero {
+  padding: 6rem 2rem;
+}
+
+.button {
+  border-radius: 0px;
+  font-weight: bold;
+  border-width: 2px;
+}
+
+/* Code block container overrides */
+.codeBlockContainer {
+  background: var(--code-block-bg);
+  border: 1px solid var(--code-block-border);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  margin-bottom: var(--ifm-leading);
+}
+
+[data-theme='dark'] .codeBlockContainer {
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+}
+
+/* Code area font size and line height */
+.codeBlockContainer pre {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* Grain texture effect */
+.bg-grain {
+  background-image: radial-gradient(circle at 1px 1px, hsl(40, 30%, 92% / 0.04) 1px, transparent 0);
+  background-size: 32px 32px;
+}
+
+[data-theme='dark'] .bg-grain {
+  background-image: radial-gradient(circle at 1px 1px, hsl(40, 30%, 92% / 0.04) 1px, transparent 0);
+}
+
+/* Apply grain to docs main content */
+.docMainContainer > div {
+  position: relative;
+}
+
+.docMainContainer > div::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(circle at 1px 1px, hsl(40, 30%, 92% / 0.03) 1px, transparent 0);
+  background-size: 32px 32px;
+  z-index: 0;
+}
+
+[data-theme='dark'] .docMainContainer > div::before {
+  background-image: radial-gradient(circle at 1px 1px, hsl(40, 30%, 92% / 0.04) 1px, transparent 0);
+}
+
+/* Ensure content stays above the grain */
+.docMainContainer > div > article,
+.docMainContainer > div > aside {
+  position: relative;
+  z-index: 1;
 }
