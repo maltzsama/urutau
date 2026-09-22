@@ -2,8 +2,10 @@ package e2e
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -24,14 +26,15 @@ type scalablePipeline struct {
 	addr  string
 	coord *coordinator.Coordinator
 
-	mu    sync.Mutex
-	stops []context.CancelFunc
-	done  chan error
+	mu      sync.Mutex
+	running map[string]bool
+	stops   []context.CancelFunc
+	done    chan error
 }
 
 func bootScalable(t *testing.T, ctx context.Context, addr string, s *spec.Spec, workers ...string) *scalablePipeline {
 	t.Helper()
-	p := &scalablePipeline{t: t, ctx: ctx, addr: addr, done: make(chan error, 64)}
+	p := &scalablePipeline{t: t, ctx: ctx, addr: addr, done: make(chan error, 64), running: map[string]bool{}}
 
 	ready := make(chan *coordinator.Coordinator, 1)
 	cCtx, cStop := context.WithCancel(ctx)
@@ -64,13 +67,23 @@ func bootScalable(t *testing.T, ctx context.Context, addr string, s *spec.Spec, 
 	return p
 }
 
-// startWorker brings up one worker group, as a new pod would.
+// startWorker brings up one worker group, as a new pod would. It is
+// idempotent: a name already running is left alone, so a re-slice can call it
+// for a whole target layout and a worker retired by a previous scale is
+// restarted when the layout brings its name back.
 func (p *scalablePipeline) startWorker(name string) {
 	p.t.Helper()
+	p.mu.Lock()
+	if p.running[name] {
+		p.mu.Unlock()
+		return
+	}
+	p.running[name] = true
+	p.mu.Unlock()
 	wCtx, wStop := context.WithCancel(p.ctx)
 	p.track(wStop)
 	go func() {
-		p.done <- worker.RunRemote(wCtx, worker.RemoteConfig{
+		err := worker.RunRemote(wCtx, worker.RemoteConfig{
 			Coordinator: p.addr,
 			Name:        name,
 			Namespace:   "raw",
@@ -78,6 +91,10 @@ func (p *scalablePipeline) startWorker(name string) {
 			MaxRows:     100,
 			MaxInterval: 2 * time.Second,
 		})
+		p.mu.Lock()
+		delete(p.running, name)
+		p.mu.Unlock()
+		p.done <- err
 	}()
 }
 
@@ -311,4 +328,200 @@ func TestLiveRepartitionScaleOutAppend(t *testing.T) {
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(260))
 	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, 260)
 	t.Log("append scale-out ok: no loss, no duplicate")
+}
+
+// TestLiveRepartitionChaosScale hammers the re-slice: a mixed INSERT/UPDATE/
+// DELETE writer keeps the source changing while the table is scaled up and
+// down repeatedly (1→3→2→4→1→3→2), workers joining and leaving at each step.
+// The sink must end up equal to the source exactly — every row, no stale
+// value, no duplicate, no loss.
+//
+// The tidy tests exercise one flip with the load aimed after it. This one
+// exercises back-to-back flips: workers retiring and rejoining, deletes
+// crossing a moved boundary, and inserts that extend the key range under a
+// running layout, so every re-slice resolves fresh boundaries.
+func TestLiveRepartitionChaosScale(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	addr := reserveAddr(t)
+	s := loadPipeline(t)
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	target := s.Tables[0].Target
+	boot := s.Tables[0].WorkerGroupNames(s.Pipeline)
+
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 200)
+
+	p := bootScalable(t, ctx, addr, s, boot...)
+	defer p.stop()
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
+	t.Log("snapshot converged; starting chaos writer")
+
+	stop := make(chan struct{})
+	writeDone := make(chan struct{})
+	// writeMu serializes the writer with a re-slice. The coordinator's flip
+	// waits for the table to owe nothing, which a continuously busy source
+	// never reaches, so the test quiesces the writer for the duration of each
+	// ScaleTable — a brief lull, the shape the current barrier supports.
+	var writeMu sync.Mutex
+	go func() {
+		defer close(writeDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var q string
+			switch i % 3 {
+			case 0:
+				id := 300 + i/3 // monotonic: extends the key range
+				q = fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'ins%d', %d.0)", id, i, id)
+			case 1:
+				id := (i / 3) % 200
+				q = fmt.Sprintf("UPDATE orders SET v = 'upd%d' WHERE id = %d", i, id)
+			case 2:
+				id := 100 + (i/3)%50
+				q = fmt.Sprintf("DELETE FROM orders WHERE id = %d", id)
+			}
+			writeMu.Lock()
+			_, err := db.Exec(q)
+			writeMu.Unlock()
+			if err != nil {
+				t.Logf("chaos writer: %q: %v", q, err)
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+
+	for _, n := range []int{3, 2, 4, 1, 3, 2} {
+		writeMu.Lock()
+		err := p.coord.ScaleTable(ctx, target, n)
+		writeMu.Unlock()
+		if err != nil {
+			t.Fatalf("ScaleTable(%s, %d): %v", target, n, err)
+		}
+		layout := s.Tables[0]
+		layout.Workers = &spec.WorkerSpec{Number: n}
+		for _, name := range layout.WorkerGroupNames(s.Pipeline) {
+			p.startWorker(name)
+		}
+		t.Logf("re-sliced to %d partitions under chaos load", n)
+		time.Sleep(1500 * time.Millisecond)
+	}
+
+	close(stop)
+	<-writeDone
+
+	// The sink must equal the source exactly. Read the source truth once (the
+	// writer has stopped) and poll the sink until it converges.
+	want := mysqlTable(t, db)
+	t.Logf("source settled at %d rows; waiting for the sink to match", len(want))
+	waitTrinoTable(t, ctx, want)
+	t.Log("chaos scale ok: sink equals source exactly after repeated flips")
+}
+
+// mysqlTable reads the source's full (id → v) state.
+func mysqlTable(t *testing.T, db *sql.DB) map[int64]string {
+	t.Helper()
+	rows, err := db.Query("SELECT id, v FROM orders")
+	if err != nil {
+		t.Fatalf("mysql read: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int64]string{}
+	for rows.Next() {
+		var id int64
+		var v string
+		if err := rows.Scan(&id, &v); err != nil {
+			t.Fatalf("mysql scan: %v", err)
+		}
+		out[id] = v
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("mysql rows: %v", err)
+	}
+	return out
+}
+
+// trinoTable reads the sink's full (id → v) state.
+func trinoTable(ctx context.Context) (map[int64]string, error) {
+	rows, err := trinoQuery(ctx, "SELECT id, v FROM orders")
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64]string{}
+	for _, r := range rows {
+		if len(r) != 2 {
+			return nil, fmt.Errorf("row has %d columns, want 2", len(r))
+		}
+		id, ok := r[0].(int64)
+		if !ok {
+			return nil, fmt.Errorf("id column is %T, want int64", r[0])
+		}
+		v, ok := r[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("v column is %T, want string", r[1])
+		}
+		out[id] = v
+	}
+	return out, nil
+}
+
+// waitTrinoTable polls the sink until its full (id → v) state equals want, or
+// fails with a bounded diff after the deadline.
+func waitTrinoTable(t *testing.T, ctx context.Context, want map[int64]string) {
+	t.Helper()
+	deadline := time.Now().Add(120 * time.Second)
+	var lastErr error
+	for {
+		got, err := trinoTable(ctx)
+		if err == nil && maps.Equal(got, want) {
+			return
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			got, _ = trinoTable(ctx)
+			missing, extra, wrong := diffTables(want, got)
+			t.Fatalf("sink never matched source: want %d rows, got %d; missing=%v extra=%v wrongValue=%v lastErr=%v",
+				len(want), len(got), cap10(missing), cap10(extra), cap10(wrong), lastErr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// diffTables reports the ids the sink is missing, has extra, or holds with a
+// stale value.
+func diffTables(want, got map[int64]string) (missing, extra, wrong []int64) {
+	for id, v := range want {
+		gv, ok := got[id]
+		switch {
+		case !ok:
+			missing = append(missing, id)
+		case gv != v:
+			wrong = append(wrong, id)
+		}
+	}
+	for id := range got {
+		if _, ok := want[id]; !ok {
+			extra = append(extra, id)
+		}
+	}
+	return missing, extra, wrong
+}
+
+// cap10 bounds a diff slice for the failure message.
+func cap10(ids []int64) []int64 {
+	if len(ids) > 10 {
+		return ids[:10]
+	}
+	return ids
 }

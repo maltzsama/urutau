@@ -144,6 +144,13 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	// acked, every staged cycle committed. Replication must not lose a row
 	// and a pause costs only latency, so waiting is the right trade. Other
 	// tables keep streaming through the shared reader.
+	//
+	// NOTE: this requires the table to go quiet. Under sustained load it
+	// never does, so a re-slice driven while the source is continuously busy
+	// times out the drain. Gating the table's input (the DBLog window's
+	// whole-table gate) fixes the convergence but the release must then wait
+	// for the new owners to attach and must not overlap the next re-slice —
+	// a follow-up, not this change.
 	if err := c.drainForFlip(ctx, target, owners); err != nil {
 		return fmt.Errorf("coordinator: scale %s: drain: %w", target, err)
 	}
