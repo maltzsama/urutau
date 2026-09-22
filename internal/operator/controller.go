@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +48,17 @@ const DefaultFieldManager = "urutau-operator"
 // ConfigMap change (which alone never restarts a pod) rolls the coordinator
 // through a template update.
 const specHashAnnotation = "urutau.io/spec-hash"
+
+const (
+	// coordinatorGRPCPort is the control-plane port workers dial. It is the
+	// Service port and the port in coordinatorClusterAddr.
+	coordinatorGRPCPort = 50051
+	// defaultCoordinatorMetricsAddr is where the coordinator serves
+	// /metrics, /statusz and the dashboard when the CR leaves
+	// coordinator.metricsAddr empty. The operator always sets it (rather
+	// than leaving it to the CR author) so the probes have an endpoint.
+	defaultCoordinatorMetricsAddr = ":9090"
+)
 
 // CoordinatorReconciler is the OPERATOR's reconciler for the CDCPipeline CR:
 // the process that owns and applies the coordinator workload. The name
@@ -664,6 +677,7 @@ func (r *CoordinatorReconciler) resolveImage(cr *urutauv1alpha1.CDCPipeline) str
 func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv1.StatefulSet {
 	labels := selectorLabels(cr)
 	name := coordinatorName(cr)
+	metricsPort := coordinatorMetricsPort(cr)
 
 	tmpl := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -673,11 +687,41 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 		Spec: corev1.PodSpec{
 			ServiceAccountName: coordinatorSAName(cr),
 			Containers: []corev1.Container{{
-				Name:         "coordinator",
-				Image:        image,
-				Command:      coordinatorCommand(cr),
-				Env:          coordinatorEnv(cr),
-				Resources:    resourceRequirements(cr.Spec.Coordinator.CPU, "", cr.Spec.Coordinator.Memory, ""),
+				Name:      "coordinator",
+				Image:     image,
+				Command:   coordinatorCommand(cr),
+				Env:       coordinatorEnv(cr),
+				Resources: resourceRequirements(cr.Spec.Coordinator.CPU, "", cr.Spec.Coordinator.Memory, ""),
+				Ports: []corev1.ContainerPort{
+					{Name: "grpc", ContainerPort: coordinatorGRPCPort},
+					{Name: "metrics", ContainerPort: metricsPort},
+				},
+				// /statusz is the coordinator's live-state endpoint, served
+				// alongside /metrics on the (operator-guaranteed) metrics
+				// address. The startup probe gives a slow boot — source open,
+				// resume, a large initial snapshot — room to finish without
+				// the liveness probe restarting the pod mid-snapshot.
+				StartupProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+						Path: "/statusz", Port: intstr.FromInt(int(metricsPort)),
+					}},
+					PeriodSeconds:    10,
+					FailureThreshold: 60, // up to 10m of boot before liveness kicks in
+				},
+				LivenessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+						Path: "/statusz", Port: intstr.FromInt(int(metricsPort)),
+					}},
+					PeriodSeconds:    20,
+					FailureThreshold: 3,
+				},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+						Path: "/statusz", Port: intstr.FromInt(int(metricsPort)),
+					}},
+					PeriodSeconds:    10,
+					FailureThreshold: 3,
+				},
 				VolumeMounts: []corev1.VolumeMount{{Name: "spec", MountPath: "/etc/urutau"}},
 			}},
 			Volumes: []corev1.Volume{{
@@ -737,10 +781,38 @@ func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
 	if sup.Window != "" {
 		args = append(args, "--reset-window", sup.Window)
 	}
-	if cr.Spec.Coordinator.MetricsAddr != "" {
-		args = append(args, "--metrics-addr", cr.Spec.Coordinator.MetricsAddr)
-	}
+	// Always pass a metrics address: the operator guarantees one so the
+	// /statusz probes have a stable endpoint, instead of leaving it to the
+	// CR author (an empty value disables /statusz entirely).
+	args = append(args, "--metrics-addr", coordinatorMetricsAddr(cr))
 	return args
+}
+
+// coordinatorMetricsAddr is the effective metrics/statusz listen address: the
+// CR's own value, or the operator default when unset. The operator always
+// sets it (rather than leaving it to the CR author) because an empty value
+// disables /statusz entirely — the endpoint the probes depend on.
+func coordinatorMetricsAddr(cr *urutauv1alpha1.CDCPipeline) string {
+	if cr.Spec.Coordinator.MetricsAddr != "" {
+		return cr.Spec.Coordinator.MetricsAddr
+	}
+	return defaultCoordinatorMetricsAddr
+}
+
+// coordinatorMetricsPort extracts the numeric port from the effective metrics
+// address, for the container port and the probes. A malformed address falls
+// back to the default's port; the coordinator fails on the same flag at boot
+// anyway, and a probe on the wrong port is no worse than none.
+func coordinatorMetricsPort(cr *urutauv1alpha1.CDCPipeline) int32 {
+	_, portStr, err := net.SplitHostPort(coordinatorMetricsAddr(cr))
+	if err != nil {
+		return 9090
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p <= 0 || p > 65535 {
+		return 9090
+	}
+	return int32(p)
 }
 
 // coordinatorEnv mounts the referenced Secrets as environment variables.
