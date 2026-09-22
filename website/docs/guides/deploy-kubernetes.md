@@ -287,6 +287,74 @@ To turn the webhook off (e.g. cert-manager unavailable), run the operator
 with `--enable-webhook=false`; the reconciler still validates, so you lose
 the admission-time check, not correctness.
 
+## Multi-tenant install (namespace per team)
+
+The default install (`config/default`) binds the operator's `ClusterRole`
+**cluster-wide**. That is fine when the cluster is yours: the operator only
+ever acts on the namespaces that hold `CDCPipeline`s. On a shared cluster it
+is a real blast radius — the binding grants `pods/delete` and
+`deployments`/`statefulsets` writes in *every* namespace, so a compromised
+operator is not confined to its tenants.
+
+For a shared cluster, install the multi-tenant overlay instead. It keeps the
+same `ClusterRole` (the permission *set* is unchanged) but drops the
+cluster-wide binding and binds the operator into each managed namespace with
+a `RoleBinding` — scoping the permissions to where you actually run
+pipelines:
+
+```sh
+kubectl apply -k config/multi-tenant
+```
+
+The convention is **one namespace per team**. `config/multi-tenant/tenant-example.yaml`
+is a complete onboarding for one namespace; copy it per team and:
+
+1. Give the namespace a `RoleBinding` to the operator's `ClusterRole` (the
+   operator's ServiceAccount lives in `urutau-system`):
+
+   ```yaml
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: RoleBinding
+   metadata:
+     name: urutau-operator
+     namespace: team-a
+   roleRef:
+     apiGroup: rbac.authorization.k8s.io
+     kind: ClusterRole
+     name: urutau-operator-role
+   subjects:
+     - kind: ServiceAccount
+       name: urutau-operator
+       namespace: urutau-system
+   ```
+
+2. Add that namespace to the operator's `--watch-namespaces` (the overlay
+   patches this arg). The two must stay in sync: the operator's cache never
+   lists a namespace it has no `RoleBinding` in, and a `RoleBinding` in a
+   namespace it does not watch is unused.
+
+The operator then reconciles `CDCPipeline`s only in the namespaces you list —
+a `CDCPipeline` created elsewhere is simply invisible to it, not an error.
+
+### Bounding a tenant's footprint
+
+The overlay also ships a `ResourceQuota` and `LimitRange` per namespace, so a
+team cannot exhaust the cluster. Size the quota against what a `CDCPipeline`
+will actually request:
+
+- the **coordinator** uses `coordinator.cpu` / `coordinator.memory`;
+- each **worker** Deployment uses `worker.cpu` + `worker.cpu_overhead` and
+  `worker.memory` + `worker.memory_overhead` — or the table's own
+  `workers.cpu` / `workers.memory` when set, which overrides the worker
+  default;
+- a pipeline's footprint is the coordinator **plus the sum over its tables of
+  `workers.number` × the per-worker request**.
+
+So a pipeline with three workers at `500m`/`1Gi` (request) and a `1`/`1Gi`
+coordinator needs roughly `2.5` CPU and `4Gi` of requests. The
+`count/cdcpipelines.urutau.io` entry caps how many pipelines the namespace
+may submit.
+
 ## Local end-to-end with minikube
 
 The repo's `test/e2e/docker-compose.yml` gives you MySQL and a Polaris

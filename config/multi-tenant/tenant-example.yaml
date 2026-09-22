@@ -1,0 +1,63 @@
+# One tenant namespace, fully onboarded: the operator manages CDCPipelines
+# here only because of the RoleBinding below, and the quota bounds what the
+# team can consume. Copy this file per team and add the namespace to
+# --watch-namespaces in kustomization.yaml.
+#
+# Size the ResourceQuota against the CDCPipeline's own requests: the
+# coordinator container uses coordinator.cpu/memory, and every worker
+# Deployment uses worker.cpu+worker.cpu_overhead / worker.memory+
+# worker.memory_overhead (a table's own workers.cpu/memory overrides worker).
+# A pipeline's footprint is the coordinator plus the SUM over tables of
+# workers.number × the per-worker request.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: urutau-tenant-example
+  labels:
+    app.kubernetes.io/part-of: urutau
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: urutau-operator
+  namespace: urutau-tenant-example
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: urutau-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: urutau-operator
+    namespace: urutau-system
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: urutau-tenant-quota
+  namespace: urutau-tenant-example
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    # Bound the number of pipelines a namespace can submit. count/ works for
+    # the namespaced CDCPipeline custom resource.
+    count/cdcpipelines.urutau.io: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: urutau-tenant-defaults
+  namespace: urutau-tenant-example
+spec:
+  limits:
+    # A Pod that declares no resources (e.g. a hand-written worker template)
+    # still gets a bounded request/limit instead of BestEffort.
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        cpu: 500m
+        memory: 512Mi

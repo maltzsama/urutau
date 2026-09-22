@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Multi-tenant install. The default install (config/default) binds the
+# operator's ClusterRole cluster-wide, so its pods/delete and
+# deployments/statefulsets write permissions reach every namespace. This
+# overlay instead scopes the operator to the namespaces you manage:
+#
+#   - the cluster-wide ClusterRoleBinding is deleted;
+#   - each managed namespace gets its own RoleBinding referencing the SAME
+#     ClusterRole (the permission set does not change, only its scope);
+#   - the operator runs with --watch-namespaces, so its cache never lists a
+#     namespace it has no RoleBinding in.
+#
+#   kubectl apply -k config/multi-tenant
+#
+# Onboard a tenant by copying tenant-example.yaml, then adding its namespace
+# to the --watch-namespaces value below. The two must stay in sync: a
+# namespace in the cache with no RoleBinding fails to list.
+resources:
+  - ../default
+  - tenant-example.yaml
+
+patches:
+  # Drop the cluster-wide binding inherited from ../default.
+  - target:
+      kind: ClusterRoleBinding
+      name: urutau-operator-rolebinding
+    patch: |
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: urutau-operator-rolebinding
+  # Scope the manager cache. Keep this list equal to the namespaces that have
+  # a RoleBinding.
+  - target:
+      kind: Deployment
+      name: urutau-operator
+    patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --watch-namespaces=urutau-tenant-example
