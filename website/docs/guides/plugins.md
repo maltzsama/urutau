@@ -70,7 +70,7 @@ There's still no separate invariant checklist to read; your `Init()` just
 registers Go interfaces (`source.Source`, `sink.Sink`) that the same Flight
 machinery wraps either way.
 
-```go
+```go title="Plugin Init function"
 // package main
 func Init() error {
     driver.RegisterSource("my_source", source.Capabilities{
@@ -82,7 +82,7 @@ func Init() error {
 }
 ```
 
-```sh
+```sh command="urutau run --plugin ./my_plugin.so -f pipeline.yaml"
 go build -buildmode=plugin -o my_plugin.so
 urutau run --plugin ./my_plugin.so -f pipeline.yaml
 ```

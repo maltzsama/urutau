@@ -73,7 +73,7 @@ aligned by construction.
 A context column reaches the destination table **only if you name it**, per
 column, with the name you want:
 
-```yaml
+```yaml title="Metadata column mapping"
 tables:
   - source: shop.orders
     target: raw.orders

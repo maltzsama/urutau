@@ -10,7 +10,7 @@ UI. All endpoints are served on the same address as `/metrics` (set via
 
 ## Base URL
 
-```
+```text title="Base URL"
 http://<coordinator>:9090
 ```
 
@@ -255,7 +255,7 @@ A periodic `: ping` comment keeps idle proxies from timing out.
 
 **Example (browser):**
 
-```javascript
+```javascript title="SSE browser example"
 const es = new EventSource('/api/v1/stream');
 es.addEventListener('snapshot', (e) => {
   const state = JSON.parse(e.data);
@@ -269,7 +269,7 @@ es.addEventListener('state', (e) => {
 
 **Example (curl):**
 
-```sh
+```sh title="SSE curl example"
 curl -N http://coordinator:9090/api/v1/stream
 ```
 
@@ -332,7 +332,7 @@ coordinator is ready to serve traffic.
 
 All error responses return plain text in the body:
 
-```
+```text title="Error response example"
 no such stream
 ```
 

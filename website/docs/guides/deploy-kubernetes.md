@@ -19,7 +19,7 @@ cluster to own scheduling, restarts, and scaling.
 You submit **one** object — a `CDCPipeline`. The operator reconciles it
 into everything else:
 
-```
+```text title="Operator reconciliation tree"
 CDCPipeline (you)
   └─ operator ──────────────► ServiceAccount + Role + RoleBinding   (per-pipeline identity)
                               Service (headless, :50051)            (stable coordinator address)
@@ -40,10 +40,10 @@ partition names. This mirrors Spark's driver/executor model. The
 - **cert-manager** — the validating webhook needs a TLS certificate, and
   the manifests obtain it from cert-manager. Install it once per cluster:
 
-  ```sh
-  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.2/cert-manager.yaml
-  kubectl -n cert-manager rollout status deploy/cert-manager deploy/cert-manager-cainjector deploy/cert-manager-webhook
-  ```
+```sh title="Install cert-manager"
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.2/cert-manager.yaml
+kubectl -n cert-manager rollout status deploy/cert-manager deploy/cert-manager-cainjector deploy/cert-manager-webhook
+```
 
 - An image containing the Urutau binaries. The repo ships one Dockerfile
   that builds **all four** binaries into a single image
@@ -54,14 +54,14 @@ partition names. This mirrors Spark's driver/executor model. The
 
 For a real cluster, build and push:
 
-```sh
+```sh title="Build and push image"
 make docker OPERATOR_IMAGE=ghcr.io/you/urutau:v1.2.3
 docker push ghcr.io/you/urutau:v1.2.3
 ```
 
 Then point the deployment at it:
 
-```sh
+```sh title="Deploy with kustomize"
 cd config/default
 kustomize edit set image urutau=ghcr.io/you/urutau:v1.2.3
 cd ../..
@@ -75,13 +75,13 @@ so the coordinator and workers follow automatically.
 For **minikube**, build straight into the cluster's Docker daemon — no
 registry, and it retags even while a Pod still holds the old image:
 
-```sh
+```sh title="Build for minikube"
 make k8s-load          # eval $(minikube docker-env) && docker build -t urutau:dev .
 ```
 
 ## 2. Install the operator
 
-```sh
+```sh command="make k8s-deploy"
 make k8s-deploy        # kubectl apply -k config/default
 ```
 
@@ -89,7 +89,7 @@ This creates the namespace `urutau-system`, the `CDCPipeline` CRD, the
 operator's RBAC, the operator Deployment, and the webhook
 `Service`/`Certificate`/`ValidatingWebhookConfiguration`. Check it:
 
-```sh
+```sh title="Check operator status"
 kubectl -n urutau-system get deploy,pod
 # deployment.apps/urutau-operator   1/1   Running
 ```
@@ -104,7 +104,7 @@ path — it is not a replacement for the kustomize base, and neither is
 deprecated. It drives the namespace, image, replicas, resources and the
 webhook's cert-manager dependency from values:
 
-```sh
+```sh title="Helm install"
 helm install urutau charts/urutau-operator \
   --namespace urutau-system --create-namespace \
   --wait
@@ -135,7 +135,7 @@ engine resolves them at boot. The key convention is fixed:
 | `clientSecret` | `URUTAU_SINK_CLIENT_SECRET` | `sink.clientSecret` |
 | `scope` | `URUTAU_SINK_SCOPE` | `sink.scope` |
 
-```sh
+```sh title="Create secrets"
 kubectl create secret generic shop-mysql-creds \
   --from-literal=uri='mysql://repl:replpass@mysql.default.svc:3306/shop'
 
@@ -156,7 +156,7 @@ webhook (which cannot read your Secrets) validates the inline spec
 `config/samples/cdcpipeline.yaml` is a complete, working example. The
 essential shape:
 
-```yaml
+```yaml title="CDCPipeline CR"
 apiVersion: urutau.io/v1alpha1
 kind: CDCPipeline
 metadata:
@@ -215,7 +215,7 @@ the SSH private key on disk (a DSN cannot carry an SSH tunnel). Set
 operator mounts it read-only at `/etc/urutau/ssh/privateKey` in every worker
 Pod, and the inline spec's `source.postgres.ssh.privateKey` names that path:
 
-```yaml
+```yaml title="SSH-tunneled Postgres source"
 spec:
   secrets:
     source: shop-postgres-creds
@@ -236,7 +236,7 @@ spec:
             knownHosts: /etc/urutau/ssh/known_hosts
 ```
 
-```sh
+```sh title="Create SSH secret"
 kubectl create secret generic shop-postgres-ssh \
   --from-file=privateKey=~/.ssh/id_ed25519 \
   --from-file=known_hosts=~/.ssh/known_hosts
@@ -250,13 +250,13 @@ connection) and into the worker Pods. When a scoped `source.snapshotUri` is
 set, the workers connect directly and the key is mounted only into the
 coordinator.
 
-```sh
+```sh command="kubectl apply -f config/samples/cdcpipeline.yaml"
 kubectl apply -f config/samples/cdcpipeline.yaml
 ```
 
 ## 5. Watch it come up
 
-```sh
+```sh title="Watch pods come up"
 kubectl get cdcpipelines -A
 kubectl -n default get pod
 # shop-mysql-coordinator-0                 1/1   Running
@@ -274,7 +274,7 @@ and `worker session` lines for each worker. The workers log
 Read it back through a real query engine — do not trust the write. With
 the repo's e2e stack (see [Local end-to-end](#local-end-to-end-with-minikube)):
 
-```sh
+```sh title="Query via Trino"
 docker compose -f test/e2e/docker-compose.yml exec -T trino \
   trino --execute "SELECT * FROM iceberg.raw.orders ORDER BY id"
 ```
@@ -290,7 +290,7 @@ coordinator runs at boot (`spec.Validate` plus the driver registry), so a
 bad spec is rejected at `kubectl apply` time instead of surfacing as a
 CrashLoopBackOff:
 
-```sh
+```sh title="Webhook rejection example"
 $ kubectl apply -f bad.yaml
 Error from server (Forbidden): admission webhook "vcdcpipeline.urutau.io" denied the request:
 spec.definition.inline: driver: unknown source kind "bogus" (registered: [kafka mysql postgres])
@@ -335,7 +335,7 @@ cluster-wide binding and binds the operator into each managed namespace with
 a `RoleBinding` — scoping the permissions to where you actually run
 pipelines:
 
-```sh
+```sh command="kubectl apply -k config/multi-tenant"
 kubectl apply -k config/multi-tenant
 ```
 
@@ -345,21 +345,21 @@ is a complete onboarding for one namespace; copy it per team and:
 1. Give the namespace a `RoleBinding` to the operator's `ClusterRole` (the
    operator's ServiceAccount lives in `urutau-system`):
 
-   ```yaml
-   apiVersion: rbac.authorization.k8s.io/v1
-   kind: RoleBinding
-   metadata:
-     name: urutau-operator
-     namespace: team-a
-   roleRef:
-     apiGroup: rbac.authorization.k8s.io
-     kind: ClusterRole
-     name: urutau-operator-role
-   subjects:
-     - kind: ServiceAccount
-       name: urutau-operator
-       namespace: urutau-system
-   ```
+```yaml title="RoleBinding for tenant"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: urutau-operator
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: urutau-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: urutau-operator
+    namespace: urutau-system
+```
 
 2. Add that namespace to the operator's `--watch-namespaces` (the overlay
    patches this arg). The two must stay in sync: the operator's cache never
@@ -399,14 +399,14 @@ catalog on the **host**. From inside a minikube pod they are reachable at
    cluster DNS, so pods fail with `no such host`. Check, and patch if
    needed:
 
-   ```sh
-   kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' | grep hosts
-   # if empty:
-   kubectl -n kube-system get cm coredns -o json | jq \
-     '.data.Corefile |= (split("\n") | (.[0:1] + ["    hosts {","        192.168.49.1 host.minikube.internal","        fallthrough","    }"] + .[1:]) | join("\n"))' \
-     | kubectl apply -f -
-   kubectl -n kube-system rollout restart deploy/coredns
-   ```
+```sh title="CoreDNS patch"
+kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}' | grep hosts
+# if empty:
+kubectl -n kube-system get cm coredns -o json | jq \
+  '.data.Corefile |= (split("\n") | (.[0:1] + ["    hosts {","        192.168.49.1 host.minikube.internal","        fallthrough","    }"] + .[1:]) | join("\n"))' \
+  | kubectl apply -f -
+kubectl -n kube-system rollout restart deploy/coredns
+```
 
    Or just use `192.168.49.1` directly in the Secret URIs.
 
@@ -417,7 +417,7 @@ catalog on the **host**. From inside a minikube pod they are reachable at
 
 Full loop:
 
-```sh
+```sh title="Full minikube loop"
 # 1. host services
 docker compose -f test/e2e/docker-compose.yml up -d --wait mysql polaris trino rustfs bucket-init polaris-setup
 
@@ -446,7 +446,7 @@ Edit the CR and re-apply. The operator stamps a hash of the spec onto the
 coordinator's Pod template, so a spec change rolls the StatefulSet, which
 re-reads the ConfigMap and re-provisions workers.
 
-```sh
+```sh title="Update pipeline"
 kubectl edit cdcpipelines shop-mysql
 ```
 
@@ -456,7 +456,7 @@ Pod to pick it up.
 
 ## Teardown
 
-```sh
+```sh title="Teardown"
 kubectl delete cdcpipelines --all -A     # stops pipelines, GCs their workers
 make k8s-undeploy                        # removes the operator + CRD
 ```

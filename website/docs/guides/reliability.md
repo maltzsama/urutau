@@ -51,7 +51,7 @@ survives a sink failure. Credentials and endpoint come from the standard
 The trail is laid out under a shared root so it is discoverable with plain
 S3 listing — no database, no index:
 
-```
+```text title="Audit trail path convention"
 s3://<bucket>/<prefix>/<pipeline>/run-<id>/events-NNNNNN.jsonl
 ```
 
@@ -68,7 +68,7 @@ over.
 On Kubernetes, set it in the `CDCPipeline` — the operator renders the same
 flag. Without it, an operator-managed pipeline writes **no** trail:
 
-```yaml
+```yaml title="Eventlog configuration"
 spec:
   coordinator:
     eventlog:

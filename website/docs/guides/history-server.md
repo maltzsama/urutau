@@ -20,7 +20,7 @@ just read-only object-storage credentials.
 The history server reads what the coordinator wrote. An operator-managed
 pipeline writes nothing unless you set `spec.coordinator.eventlog`:
 
-```yaml
+```yaml title="Eventlog configuration"
 spec:
   coordinator:
     eventlog:
@@ -34,7 +34,7 @@ exactly what the server lists. A pipeline with no `eventlog` has no history.
 
 ## Run it
 
-```sh
+```sh command="urutau-history-server serve --root s3://my-trails/urutau --listen :8080"
 urutau-history-server serve \
   --root s3://my-trails/urutau \
   --listen :8080
@@ -44,7 +44,7 @@ S3 credentials and region come from the standard `AWS_*` environment (or
 `--region`/`--endpoint`/`--access-key`/`--secret-key` for a MinIO-style
 store). Give it **read-only** access — it never writes.
 
-Open <http://localhost:8080/> for a small embedded web UI: a pipeline picker
+Open [http://localhost:8080/](http://localhost:8080/) for a small embedded web UI: a pipeline picker
 → run picker → read-only event view, all plain `fetch()` polling against the
 API below (no streaming — a terminated run has nothing to push).
 
@@ -62,7 +62,7 @@ Events are paginated: pass the returned `nextCursor` to fetch the next page
 free-form payload (a `commit` event's table, a `worker_reset` event's reason,
 and so on).
 
-```sh
+```sh title="Query the API"
 curl -s localhost:8080/api/v1/pipelines | jq
 curl -s localhost:8080/api/v1/pipelines/shop/runs | jq
 curl -s 'localhost:8080/api/v1/pipelines/shop/runs/<runId>/events' | jq

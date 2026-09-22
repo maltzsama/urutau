@@ -12,7 +12,7 @@ deletes never remove anything.
 
 ## Minimal config
 
-```yaml
+```yaml title="Append-only pipeline"
 pipeline: orders-audit
 source:
   kind: mysql
@@ -50,7 +50,7 @@ any source with `format: raw`, which is always append-only), `onDelete`
 must be `skip`, or `spec.Validate()` rejects the pipeline at boot with
 exactly that reason.
 
-```yaml
+```yaml title="Kafka append-only (onDelete: skip)"
 tables:
   - source: shop.orders-avro
     target: kafka_avro.orders

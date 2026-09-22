@@ -20,7 +20,7 @@ different layers, and they don't share all their fields:
 **`api/v1alpha1.WorkerDefaults`** — the CRD's `spec.worker`, a
 **pipeline-wide default**:
 
-```go
+```go title="WorkerDefaults struct"
 type WorkerDefaults struct {
 	CPU            string `json:"cpu,omitempty"`
 	CPUOverhead    string `json:"cpu_overhead,omitempty"`
@@ -32,7 +32,7 @@ type WorkerDefaults struct {
 **`spec.WorkerSpec`** — the pipeline YAML's `table.workers`, a **per-table
 override**:
 
-```go
+```go title="WorkerSpec struct"
 type WorkerSpec struct {
 	Number int    `json:"number,omitempty"`
 	CPU    string `json:"cpu,omitempty"`
@@ -56,7 +56,7 @@ this feature existed.
 
 For each table, the coordinator's worker Deployment resources resolve as:
 
-```go
+```go title="workerResources function"
 func workerResources(cr *CDCPipeline, t spec.Table) corev1.ResourceRequirements {
 	cpu, memory := cr.Spec.Worker.CPU, cr.Spec.Worker.Memory
 	if t.Workers != nil {
@@ -82,7 +82,7 @@ is a single long-lived process, not a pool sized like the workers.
 
 ## Example
 
-```yaml
+```yaml title="CDCPipeline with worker overrides"
 apiVersion: urutau.io/v1alpha1
 kind: CDCPipeline
 metadata:

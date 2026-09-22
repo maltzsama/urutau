@@ -41,7 +41,7 @@ Kafka has nothing to introspect, so `columns` must be declared explicitly for
 
 ## Example
 
-```yaml
+```yaml title="Kafka pipeline"
 pipeline: shop
 source:
   kind: kafka

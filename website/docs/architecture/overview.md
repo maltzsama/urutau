@@ -140,7 +140,7 @@ bucket — the configuration where synchronous durability works). A separate
 Redpanda overlay (`test/e2e/docker-compose.kafka.yml`) adds a Kafka
 broker + Confluent-compatible schema registry for the Kafka+Avro suite.
 
-```sh
+```sh title="Run e2e tests"
 make e2e-test         # compose up --wait, then URUTAU_E2E=1 go test ./test/e2e
 make e2e-down         # tear the stack down
 make e2e-kafka-up     # + the Redpanda overlay, for Kafka+Avro tests

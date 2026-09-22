@@ -81,7 +81,7 @@ bytes).
 
 ## 5. Signature and complexity
 
-```go
+```go title="EncodeKey signature"
 func EncodeKey(record arrow.RecordBatch, row int, pkIdxs []int, pkCols []string) ([]byte, error)
 ```
 
