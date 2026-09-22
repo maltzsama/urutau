@@ -139,13 +139,14 @@ func (fakeStagedSink) CommitStaged(context.Context, core.TableRef, [][]byte, str
 // its commits are owned by the coordinator's cycle, so its worker's ack must
 // not advance the confirmed position.
 func TestIsStagedTable(t *testing.T) {
-	c := &Coordinator{
-		snk: fakeStagedSink{},
-		route: map[string][]*workerState{
+	c := &Coordinator{snk: fakeStagedSink{}}
+	c.publishRouting(&routing{
+		owners: map[string][]*workerState{
 			"orders": {{name: "w0"}, {name: "w1"}},
 			"items":  {{name: "w2"}},
 		},
-	}
+		ranges: map[string][]source.Chunk{},
+	})
 	if !c.isStagedTable("orders") {
 		t.Fatal("partitioned table on a staging sink must be staged")
 	}

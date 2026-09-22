@@ -51,7 +51,6 @@ func coordHarness() (*Coordinator, *workerState) {
 		log:         slog.New(slog.DiscardHandler),
 		src:         fakeSource{},
 		workers:     map[string]*workerState{"w0": w},
-		route:       map[string][]*workerState{"raw.orders": {w}},
 		budget:      newFlowBudget(1<<20, 1<<10),
 		index:       map[string]*positionIndex{"w0": newPositionIndex("run-1")},
 		confirmed:   map[string]position.Position{},
@@ -61,6 +60,10 @@ func coordHarness() (*Coordinator, *workerState) {
 		gateDrain:   make(chan struct{}),
 	}
 	c.supervisor = newSupervisor(c)
+	c.publishRouting(&routing{
+		owners: map[string][]*workerState{"raw.orders": {w}},
+		ranges: map[string][]source.Chunk{},
+	})
 	return c, w
 }
 
@@ -328,7 +331,7 @@ func TestOnAckStagedTableDoesNotAdvanceConfirmed(t *testing.T) {
 	c.tableStats = map[string]*tableStats{}
 	c.maintStats = map[string]map[string]*maintStats{}
 	c.snk = fakeStagedSink{}
-	c.route["raw.orders"] = []*workerState{{name: "w0"}, {name: "w1"}}
+	c.setRouteForTest("raw.orders", []*workerState{{name: "w0"}, {name: "w1"}})
 
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Position: "0/10"})
 	if len(c.confirmed) != 0 {

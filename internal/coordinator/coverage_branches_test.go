@@ -72,7 +72,7 @@ func TestEnqueueBatchPartitionedErrors(t *testing.T) {
 	c, w0 := coordHarness()
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
-	c.route["raw.orders"] = []*workerState{w0, w1}
+	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.index["w1"] = newPositionIndex("run-1")
 
 	// No primary key to route by.
@@ -82,20 +82,20 @@ func TestEnqueueBatchPartitionedErrors(t *testing.T) {
 
 	// Range count does not match owner count.
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	c.partitionRanges = map[string][]source.Chunk{
+	c.setRangesForTest(map[string][]source.Chunk{
 		"raw.orders": {{Low: nil, High: nil}},
-	}
+	})
 	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
 		t.Fatal("a range/owner count mismatch must error")
 	}
 
 	// A row whose key matches no range.
-	c.partitionRanges = map[string][]source.Chunk{
+	c.setRangesForTest(map[string][]source.Chunk{
 		"raw.orders": {
 			{Low: []any{int64(100)}, High: []any{int64(200)}},
 			{Low: []any{int64(200)}, High: nil},
 		},
-	}
+	})
 	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
 		t.Fatal("a key outside every range must error")
 	}
@@ -154,14 +154,14 @@ func TestSnapshotTableErrors(t *testing.T) {
 	}
 
 	// Range/owner count mismatch.
-	c.route["raw.orders"] = []*workerState{{name: "w0"}, {name: "w1"}}
-	c.partitionRanges = map[string][]source.Chunk{"raw.orders": {{}}}
+	c.setRouteForTest("raw.orders", []*workerState{{name: "w0"}, {name: "w1"}})
+	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}}})
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{}, ref, snapshot.SnapshotConfig{}); err == nil {
 		t.Fatal("range/owner mismatch must error")
 	}
 
 	// Bounds error.
-	c.partitionRanges = map[string][]source.Chunk{"raw.orders": {{}, {}}}
+	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}, {}}})
 	boom := errors.New("bounds failed")
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{err: boom}, ref, snapshot.SnapshotConfig{}); !errors.Is(err, boom) {
 		t.Fatalf("snapshotTable(bounds err) = %v, want boom", err)
@@ -175,9 +175,9 @@ func TestSnapshotTableSeedsEmptyOwners(t *testing.T) {
 	c.snk = seeder
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
 	// One owner whose range (0,10) excludes every chunk (the domain starts at 50).
-	c.partitionRanges = map[string][]source.Chunk{
+	c.setRangesForTest(map[string][]source.Chunk{
 		"raw.orders": {{Low: []any{int64(0)}, High: []any{int64(10)}}},
-	}
+	})
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{bounds: [][]any{{int64(50)}}}, ref, snapshot.SnapshotConfig{}); err != nil {
 		t.Fatalf("snapshotTable: %v", err)
 	}

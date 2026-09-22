@@ -230,12 +230,12 @@ func TestEnqueueBatchErrorReleasesRemainingSubBatches(t *testing.T) {
 	c, w0 := coordHarness()
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
-	c.route["raw.orders"] = []*workerState{w0, w1}
+	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.index["w1"] = newPositionIndex("run-1")
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	c.partitionRanges = map[string][]source.Chunk{
+	c.setRangesForTest(map[string][]source.Chunk{
 		"raw.orders": {{Low: nil, High: []any{int64(100)}}, {Low: []any{int64(100)}, High: nil}},
-	}
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

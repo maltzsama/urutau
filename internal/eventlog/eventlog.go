@@ -109,6 +109,12 @@ const (
 	KindJobTerminated   = "job_terminated"
 	KindSchemaDrift     = "schema_drift"
 	KindDeleteDropped   = "delete_dropped"
+	// KindWorkerRetired records an owner removed by a scale-in; its key
+	// range is inherited by the remaining owners.
+	KindWorkerRetired = "worker_retired"
+	// KindTableRepartitioned records a live re-slice of one table's
+	// partition ranges (issue #312).
+	KindTableRepartitioned = "table_repartitioned"
 )
 
 // Run accumulates one run's events and uploads the trail object as it
