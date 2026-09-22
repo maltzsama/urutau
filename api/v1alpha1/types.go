@@ -89,6 +89,22 @@ type CoordinatorSpec struct {
 	CPU            string          `json:"cpu,omitempty"`
 	Memory         string          `json:"memory,omitempty"`
 	MetricsAddr    string          `json:"metricsAddr,omitempty"`
+	// Eventlog, when set, is where the coordinator writes its per-run audit
+	// trail. The operator renders it as --eventlog s3://<bucket>/<rootPrefix>;
+	// the durable JSONL trail is what a history server reads back.
+	Eventlog *EventlogSpec `json:"eventlog,omitempty"`
+}
+
+// EventlogSpec points the coordinator's audit trail at an S3 store. It is a
+// bucket + root prefix rather than a free-form URI so every pipeline shares
+// one discoverable root (a history server lists under the root; see the
+// eventlog key convention).
+type EventlogSpec struct {
+	// Bucket is the S3 bucket holding the trail.
+	Bucket string `json:"bucket"`
+	// RootPrefix is the key prefix every pipeline's trail lives under, e.g.
+	// "urutau". Empty means the bucket root.
+	RootPrefix string `json:"rootPrefix,omitempty"`
 }
 
 // SnapshotSpec tunes the DBLog snapshot phase.
