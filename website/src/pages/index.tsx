@@ -2,6 +2,7 @@ import type {ReactNode} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
+import {useColorMode} from '@docusaurus/theme-common';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
 
@@ -9,11 +10,12 @@ import styles from './index.module.css';
 
 function HomepageHeader() {
   const {siteConfig} = useDocusaurusContext();
+  const {colorMode} = useColorMode();
   return (
     <header className={clsx('hero hero--primary', styles.heroBanner)}>
       <div className="container">
         <img
-          src="/urutau/img/icon.svg"
+          src={colorMode === 'dark' ? '/urutau/img/icon.svg' : '/urutau/img/icon-dark.svg'}
           alt="Urutau"
           className={styles.heroLogo}
           width={120}
