@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -37,6 +38,12 @@ type tableStats struct {
 
 // rateWindow is how often the per-table rows/s rate is recomputed.
 const rateWindow = 5 * time.Second
+
+// lagInterval is how often the per-table lag gauge is recomputed. Lag grows
+// between commits, so it cannot be set on the ack path (that would pin it to
+// ~0 after every commit); it needs its own clock, mirroring the dashboard's
+// on-demand Tables().
+const lagInterval = 5 * time.Second
 
 // maintStats is the per-table, per-operation maintenance aggregate, folded from
 // each maintenance worker's reported MaintenanceResult.
@@ -273,6 +280,38 @@ func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64
 	c.lastAck[worker] = at
 	c.statsMu.Unlock()
 	c.pushDashState()
+}
+
+// lagLoop keeps urutau_coordinator_lag_seconds current. The dashboard computes
+// the same value on demand in Tables(); a Prometheus gauge needs an active
+// updater, so this recomputes time.Since(lastCommit) per table on a timer and
+// publishes it. It stops when the run context is cancelled.
+func (c *Coordinator) lagLoop(ctx context.Context) {
+	t := time.NewTicker(lagInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c.publishLag()
+		}
+	}
+}
+
+// publishLag sets the per-table lag gauge to the time since that table's last
+// commit. A table that has never committed has no series — a permanent 0 would
+// alert on a pipeline that simply has not started.
+func (c *Coordinator) publishLag() {
+	now := time.Now()
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	for table, ts := range c.tableStats {
+		if ts == nil || ts.lastCommit.IsZero() {
+			continue
+		}
+		c.metrics.LagSeconds.WithLabelValues(table).Set(now.Sub(ts.lastCommit).Seconds())
+	}
 }
 
 // recordMaintStats folds one maintenance operation result into the per-table,
