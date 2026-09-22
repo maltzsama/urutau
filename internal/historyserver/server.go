@@ -1,0 +1,209 @@
+// Package historyserver serves a read-only, request/response API over
+// terminated pipeline runs, backed by the durable eventlog trail in S3. It is
+// deliberately not the live dashboard: a terminated run has nothing to push,
+// so this is plain polling, and discovery is S3-only (no Kubernetes API, no
+// database).
+package historyserver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/maltzsama/urutau/internal/eventlog"
+)
+
+// Config tunes the server.
+type Config struct {
+	// Root is the shared eventlog root the trail was written under.
+	Root eventlog.RootConfig
+	// Listen is the HTTP address, e.g. ":8080".
+	Listen string
+	// PageLimit caps the events returned per request (default 1000).
+	PageLimit int
+	Logger    *slog.Logger
+}
+
+// Store is the read side the server needs. The eventlog package satisfies it
+// through eventlogStore; tests supply a fake.
+type Store interface {
+	ListPipelines(ctx context.Context) ([]eventlog.PipelineSummary, error)
+	ListRuns(ctx context.Context, pipeline string) ([]eventlog.RunSummary, error)
+	ReadRun(ctx context.Context, pipeline, runID string) ([]eventlog.Event, error)
+}
+
+const defaultPageLimit = 1000
+
+// Run serves the API until ctx is cancelled.
+func Run(ctx context.Context, cfg Config) error {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.PageLimit <= 0 {
+		cfg.PageLimit = defaultPageLimit
+	}
+	s := &server{store: &eventlogStore{root: cfg.Root}, log: cfg.Logger, pageLimit: cfg.PageLimit}
+
+	srv := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           s.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		cfg.Logger.Info("history-server listening", "addr", cfg.Listen)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		return err
+	}
+}
+
+type server struct {
+	store     Store
+	log       *slog.Logger
+	pageLimit int
+}
+
+func (s *server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/pipelines", s.listPipelines)
+	mux.HandleFunc("GET /api/v1/pipelines/{name}/runs", s.listRuns)
+	mux.HandleFunc("GET /api/v1/pipelines/{name}/runs/{runId}/events", s.readRun)
+	return mux
+}
+
+type pipelineJSON struct {
+	Name string `json:"name"`
+}
+
+type runJSON struct {
+	ID      string `json:"id"`
+	Started string `json:"started,omitempty"`
+}
+
+type eventJSON struct {
+	Timestamp time.Time      `json:"timestamp"`
+	RunID     string         `json:"runId"`
+	Kind      string         `json:"kind"`
+	Fields    map[string]any `json:"fields,omitempty"`
+}
+
+func (s *server) listPipelines(w http.ResponseWriter, r *http.Request) {
+	pipes, err := s.store.ListPipelines(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]pipelineJSON, 0, len(pipes))
+	for _, p := range pipes {
+		out = append(out, pipelineJSON{Name: p.Name})
+	}
+	s.writeJSON(w, map[string]any{"pipelines": out})
+}
+
+func (s *server) listRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.store.ListRuns(r.Context(), r.PathValue("name"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]runJSON, 0, len(runs))
+	for _, run := range runs {
+		rj := runJSON{ID: run.ID}
+		if !run.Started.IsZero() {
+			rj.Started = run.Started.UTC().Format(time.RFC3339)
+		}
+		out = append(out, rj)
+	}
+	s.writeJSON(w, map[string]any{"runs": out})
+}
+
+func (s *server) readRun(w http.ResponseWriter, r *http.Request) {
+	events, err := s.store.ReadRun(r.Context(), r.PathValue("name"), r.PathValue("runId"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	page, next, err := paginate(events, r.URL.Query().Get("cursor"), s.pageLimit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	out := make([]eventJSON, 0, len(page))
+	for _, e := range page {
+		out = append(out, eventJSON{Timestamp: e.Timestamp, RunID: e.RunID, Kind: e.Kind, Fields: e.Fields})
+	}
+	resp := map[string]any{"events": out}
+	if next != "" {
+		resp["nextCursor"] = next
+	}
+	s.writeJSON(w, resp)
+}
+
+// paginate slices items from an offset cursor. The cursor is opaque to the
+// client; today it is a decimal offset into the (already materialized) events.
+func paginate[T any](items []T, cursor string, limit int) ([]T, string, error) {
+	off := 0
+	if cursor != "" {
+		v, err := strconv.Atoi(cursor)
+		if err != nil || v < 0 {
+			return nil, "", fmt.Errorf("invalid cursor %q", cursor)
+		}
+		off = v
+	}
+	if off > len(items) {
+		off = len(items)
+	}
+	end := off + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	next := ""
+	if end < len(items) {
+		next = strconv.Itoa(end)
+	}
+	return items[off:end], next, nil
+}
+
+func (s *server) writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		s.log.Warn("history-server: encode", "err", err)
+	}
+}
+
+func (s *server) fail(w http.ResponseWriter, err error) {
+	s.log.Warn("history-server: request failed", "err", err)
+	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
+// eventlogStore adapts the eventlog read primitives to Store.
+type eventlogStore struct {
+	root eventlog.RootConfig
+}
+
+func (s *eventlogStore) ListPipelines(ctx context.Context) ([]eventlog.PipelineSummary, error) {
+	return eventlog.ListPipelines(ctx, s.root)
+}
+
+func (s *eventlogStore) ListRuns(ctx context.Context, pipeline string) ([]eventlog.RunSummary, error) {
+	return eventlog.ListRuns(ctx, s.root, pipeline)
+}
+
+func (s *eventlogStore) ReadRun(ctx context.Context, pipeline, runID string) ([]eventlog.Event, error) {
+	return eventlog.ReadRun(ctx, s.root, pipeline, runID)
+}

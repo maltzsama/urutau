@@ -1,4 +1,4 @@
-# GoReleaser builds the four binaries and attaches them to the GitHub
+# GoReleaser builds the five binaries and attaches them to the GitHub
 # Release that release-please created. It does NOT create the release
 # itself (release.mode: append) and does NOT own the changelog
 # (release-please does) — see .github/workflows/release.yml.
@@ -47,7 +47,16 @@ builds:
     flags: [-trimpath]
     ldflags: *ldflags
 
-# One archive per OS/arch holding all four binaries — they ship together
+  - id: urutau-history-server
+    main: ./cmd/history-server
+    binary: urutau-history-server
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: *ldflags
+
+# One archive per OS/arch holding all five binaries — they ship together
 # (the operator runs the coordinator and worker from the same image).
 archives:
   - id: default

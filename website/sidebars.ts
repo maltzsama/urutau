@@ -24,6 +24,7 @@ const sidebars: SidebarsConfig = {
         'guides/monitoring',
         'guides/dashboard',
         'guides/reliability',
+        'guides/history-server',
         'guides/troubleshooting',
       ],
     },
