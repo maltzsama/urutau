@@ -7,6 +7,18 @@
 // never fail the pipeline. A rotated object whose PUT fails is retained and
 // retried (see Run.pending), so a transient never drops a sealed object.
 //
+// # Key convention
+//
+// The object layout is a shared, structured root so a reader can discover
+// pipelines and runs with nothing but S3 list calls (no database):
+//
+//	s3://<bucket>/<prefix>/<pipeline>/run-<id>/events-NNNNNN.jsonl
+//
+// Listing <prefix>/ yields the pipeline names; listing <prefix>/<pipeline>/
+// yields the run ids. Config.Pipeline supplies the segment; an empty
+// Pipeline omits it (<prefix>/run-<id>/), for callers that are not a named
+// pipeline.
+//
 // Every Emit uploads the whole current object (one atomic PUT per event).
 // At CDC commit rates the object stays tiny and every upload replaces the
 // last — a crash at any instant leaves a consistent trail up to the
@@ -40,6 +52,11 @@ import (
 type Config struct {
 	// URI is the store root: s3://<bucket>/<prefix>.
 	URI string
+	// Pipeline is the pipeline name, inserted as a path segment between the
+	// URI prefix and the run: <prefix>/<pipeline>/run-<id>/. It is what
+	// makes the trail discoverable by listing alone (see the package doc).
+	// Empty omits the segment, for callers that are not a named pipeline.
+	Pipeline string
 	// Region defaults to us-east-1 when unset.
 	Region string
 	// Endpoint overrides the S3 API target; empty uses the AWS default.
@@ -168,7 +185,7 @@ func New(ctx context.Context, cfg Config) (*Run, error) {
 	if max <= 0 {
 		max = defaultMaxObjectBytes
 	}
-	base := strings.TrimSuffix(prefix, "/") + "/run-" + id + "/"
+	base := runBaseKey(prefix, cfg.Pipeline, id)
 	return &Run{
 		id:             id,
 		bucket:         bucket,
@@ -189,7 +206,7 @@ func NewWithPutter(bucket, prefix string, maxObjectBytes int64, p putter) *Run {
 		maxObjectBytes = defaultMaxObjectBytes
 	}
 	id := newRunID()
-	base := strings.TrimSuffix(prefix, "/") + "/run-" + id + "/"
+	base := runBaseKey(prefix, "", id)
 	return &Run{
 		id:             id,
 		bucket:         bucket,
@@ -201,6 +218,24 @@ func NewWithPutter(bucket, prefix string, maxObjectBytes int64, p putter) *Run {
 		putter:         p,
 		log:            slog.Default(),
 	}
+}
+
+// runBaseKey is one run's immutable key prefix:
+// <prefix>[/<pipeline>]/run-<id>/ . The pipeline segment is what a
+// database-free reader lists under to discover pipelines, then runs.
+func runBaseKey(prefix, pipeline, id string) string {
+	parts := make([]string, 0, 2)
+	if p := strings.Trim(prefix, "/"); p != "" {
+		parts = append(parts, p)
+	}
+	if p := strings.Trim(pipeline, "/"); p != "" {
+		parts = append(parts, p)
+	}
+	base := strings.Join(parts, "/")
+	if base != "" {
+		base += "/"
+	}
+	return base + "run-" + id + "/"
 }
 
 // ID returns the run identifier.
