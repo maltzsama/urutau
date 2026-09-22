@@ -487,6 +487,15 @@ func (t Table) WorkerCount() int {
 	return t.Workers.Number
 }
 
+// WorkerGroupPrefix is the shared prefix of a table's worker group names —
+// "<pipeline>-<target>". It is also the name of the StatefulSet whose
+// ordinals are the partition indices (a pod's hostname is
+// "<prefix>-<index>", which is exactly WorkerGroupNames[index]), so KEDA
+// scales one replica count for the whole table.
+func WorkerGroupPrefix(pipeline, target string) string {
+	return fmt.Sprintf("%s-%s", pipeline, target)
+}
+
 // WorkerGroupNames returns this table's derived worker group names — one
 // per partition, "<pipeline>-<target>-<index>" for index in
 // [0, WorkerCount()). This is the ONLY way a worker group is named: there
@@ -495,9 +504,10 @@ func (t Table) WorkerCount() int {
 // provisioning always derive the same names from the same inputs.
 func (t Table) WorkerGroupNames(pipeline string) []string {
 	n := t.WorkerCount()
+	prefix := WorkerGroupPrefix(pipeline, t.Target)
 	names := make([]string, n)
 	for i := 0; i < n; i++ {
-		names[i] = fmt.Sprintf("%s-%s-%d", pipeline, t.Target, i)
+		names[i] = fmt.Sprintf("%s-%d", prefix, i)
 	}
 	return names
 }

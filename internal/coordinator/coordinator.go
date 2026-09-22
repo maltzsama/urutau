@@ -35,6 +35,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
@@ -192,6 +195,18 @@ type Coordinator struct {
 	byTicket   map[string]*workerState
 	budget     *flowBudget
 	index      map[string]*positionIndex
+
+	// Kubernetes worker provisioning (issue #298): the in-cluster client is
+	// built lazily and cached (workerClientset). workerK8s is set at boot
+	// when the operator rendered worker pod templates — the switch that
+	// turns provisioning and the replica reconcile loop on. Both stay false
+	// for a pipeline that never sets spec.image, so the coordinator makes
+	// zero Kubernetes API calls.
+	k8sMu     sync.Mutex
+	k8sClient kubernetes.Interface
+	k8sNS     string
+	k8sOwner  metav1.OwnerReference
+	workerK8s bool
 
 	// runCtx outlives the helper goroutines that need cancellation (the
 	// wireRelay) but are called outside run's select.
@@ -624,6 +639,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if c.cfg.OnReady != nil {
 		c.cfg.OnReady(c)
 	}
+	c.workerK8s = workerPodTemplateAvailable(workerTarget)
 	if err := c.provisionWorkers(ctx, workerTarget); err != nil {
 		return fmt.Errorf("coordinator: %w", err)
 	}
@@ -890,6 +906,12 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Supervision after the snapshot phase: acks only flow once the stream
 	// is live, so a long snapshot must not look like a stale worker.
 	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
+
+	// Replica reconcile after the snapshot too: the snapshot assigns chunks
+	// by the boot routing, and a re-slice mid-snapshot would move a range
+	// out from under it. KEDA owns the worker replica count; this follows it
+	// (issue #298). A no-op unless Kubernetes worker provisioning is on.
+	go c.scaleReconcileLoop(ctx)
 
 	// Block until the world ends. ctx.Done is checked first on every pass so
 	// a cancelled run never races a session defer's context.Canceled into

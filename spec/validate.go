@@ -180,6 +180,17 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 			}
 			seenTarget[tbl.Target] = true
 		}
+		if tbl.Workers != nil {
+			if tbl.Workers.Number < 0 {
+				problems = append(problems, p+".workers.number: must be >= 0")
+			}
+			if tbl.Workers.Max < 0 {
+				problems = append(problems, p+".workers.max: must be >= 0")
+			}
+			if tbl.Workers.Max > 0 && tbl.Workers.Max < tbl.WorkerCount() {
+				problems = append(problems, fmt.Sprintf("%s.workers.max: %d is below workers.number (%d) — autoscaling never drops below the configured count", p, tbl.Workers.Max, tbl.WorkerCount()))
+			}
+		}
 
 		// Sync mode: a cursor column selects incremental, and only
 		// incremental carries one.

@@ -2,7 +2,8 @@
 #
 # The operator turns this into a per-pipeline ServiceAccount, a headless
 # Service, a ConfigMap holding this definition, and a coordinator
-# StatefulSet; the coordinator provisions the three worker Deployments.
+# StatefulSet; the coordinator provisions one worker StatefulSet per table
+# (replicas = the table's workers.number).
 #
 # Create it:
 #   kubectl create secret generic shop-mysql-creds \
@@ -43,9 +44,9 @@ spec:
       maxResets: 5
       window: 15m
 
-  # The resource default for every worker Deployment; a table's own
-  # workers.cpu/memory overrides it. cpu/memory are the request,
-  # cpu+cpu_overhead / memory+memory_overhead the limit.
+  # The resource default for every worker; a table's own workers.cpu/memory
+  # overrides it. cpu/memory are the request, cpu+cpu_overhead /
+  # memory+memory_overhead the limit.
   worker:
     cpu: "500m"
     cpu_overhead: "100m"
@@ -72,3 +73,8 @@ spec:
           createIfNotExists: true
           workers:
             number: 3
+            # KEDA autoscaling cap (issue #298): with the operator started
+            # with --keda-prometheus-address, it renders a ScaledObject that
+            # scales this table's worker StatefulSet between number and max
+            # on urutau_coordinator_lag_seconds. Omit max for a fixed count.
+            max: 6

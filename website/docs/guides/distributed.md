@@ -157,8 +157,9 @@ has the details.
 
 A running coordinator can re-slice a table across a different number of
 workers — adding or removing owners and swapping the routing snapshot
-atomically, with no coordinator restart. A scaler (KEDA, or an operator by
-hand) drives it via `Coordinator.ScaleTable`.
+atomically, with no coordinator restart. The coordinator's `ScaleTable` does
+the re-slice; under Kubernetes, KEDA drives it from the per-table lag metric
+(see [Autoscaling with KEDA](#autoscaling-with-keda)).
 
 The sequence is **prepare → commit**, and every wait is bounded: a step that
 cannot complete fails the scale and leaves the old layout in place, so a
@@ -198,6 +199,29 @@ behind it in the table's send order (issue #312).
 
 A table's `workers.max` caps how far it may scale **up**; it never blocks a
 scale-down. A table that sets it ignores the coordinator's default (32).
+
+### Autoscaling with KEDA
+
+In Kubernetes, a table's workers run as **one StatefulSet** named
+`<pipeline>-<target>`, with `replicas = workers.number` at boot. A StatefulSet
+pod's hostname is `<statefulset>-<ordinal>` — exactly the derived worker group
+name — so a replica *is* its partition, with no identity plumbing.
+
+That single replica count is what KEDA scales. Start the operator with
+`--keda-prometheus-address <url>` and it renders one `ScaledObject` per table
+that sets `workers.max`:
+
+- `minReplicaCount` = `workers.number`, `maxReplicaCount` = `workers.max`;
+- a Prometheus trigger on `urutau_coordinator_lag_seconds{table="<target>"}`,
+  with `--keda-lag-threshold` (default 30s) as the per-replica lag target.
+
+The coordinator never writes the replica count — it **follows** it. A reconcile
+loop reads each worker StatefulSet's `spec.replicas` and calls `ScaleTable` when
+the routing owner count diverges, so KEDA (or a manual `kubectl scale`) is the
+only writer and the two never fight. A cluster without the KEDA CRD is
+unaffected: the operator logs and skips the ScaledObject.
+
+Omit `workers.max` and the count is fixed — no ScaledObject, no autoscaling.
 
 ## Next steps
 
