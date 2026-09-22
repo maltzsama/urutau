@@ -10,14 +10,40 @@ import (
 // supervisor touches: a workers map and a logger. Metrics and eventlog are
 // left nil (both are nil-guarded).
 func supervisorHarness() (*supervisor, map[string]*workerState) {
+	// The worker holds one queued batch: a stale-ack reset only applies to a
+	// worker that OWES work. An attached worker with nothing pending is idle,
+	// not stuck, and tick must leave it alone (issue #312).
 	workers := map[string]*workerState{
-		"w1": {name: "w1", attached: true},
+		"w1": {name: "w1", attached: true, queue: make(chan queuedBatch, 4)},
 	}
+	workers["w1"].queue <- queuedBatch{id: 1}
 	c := &Coordinator{workers: workers, log: slog.New(slog.DiscardHandler)}
 	s := newSupervisor(c)
 	c.supervisor = s // resetWorker reaches it via c.supervisor
 	s.noteAck("w1", time.Now())
 	return s, workers
+}
+
+// An attached worker that owes nothing is idle, not stale: a quiet table (or
+// one that just went through a re-slice) must not be reset, because the reset
+// discards its open staged cycles and loses the rows they carry.
+func TestSupervisorLeavesIdleWorkerAlone(t *testing.T) {
+	workers := map[string]*workerState{
+		"w1": {name: "w1", attached: true, queue: make(chan queuedBatch, 4)},
+	}
+	c := &Coordinator{workers: workers, log: slog.New(slog.DiscardHandler)}
+	s := newSupervisor(c)
+	c.supervisor = s
+	workers["w1"].cancel = func() {}
+	// Last ack long past the timeout, but nothing queued and nothing in flight.
+	s.noteAck("w1", time.Now().Add(-time.Minute))
+
+	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute}); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if workers["w1"].epoch != 0 || s.isPending("w1") {
+		t.Fatalf("idle worker was reset: epoch=%d pending=%v", workers["w1"].epoch, s.isPending("w1"))
+	}
 }
 
 // A worker that stops acking past the timeout is reset: epoch bumps and the
@@ -50,7 +76,10 @@ func TestSupervisorTickResetsStaleWorker(t *testing.T) {
 // A freshly-attached worker that has not acked yet is stale too.
 func TestSupervisorTickFreshAttachedNoAckIsStale(t *testing.T) {
 	s, workers := supervisorHarness()
-	workers["w2"] = &workerState{name: "w2", attached: true} // never acked
+	// Never acked AND owes a batch: that is stale. (Owing nothing would make
+	// it merely idle — see TestSupervisorLeavesIdleWorkerAlone.)
+	workers["w2"] = &workerState{name: "w2", attached: true, queue: make(chan queuedBatch, 4)}
+	workers["w2"].queue <- queuedBatch{id: 2}
 	w := workers["w2"]
 	cancelled := false
 	w.cancel = func() { cancelled = true }

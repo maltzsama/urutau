@@ -169,12 +169,12 @@ func Collapse(ctx context.Context, alloc memory.Allocator, batch *Batch, pkCols 
 	}
 
 	if filteredUpserts.NumRows() > 0 {
-		upserts = &Batch{Table: batch.Table, Record: filteredUpserts, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending, Seq: batch.Seq}
+		upserts = &Batch{Table: batch.Table, Record: filteredUpserts, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending, Seq: batch.Seq, Staged: batch.Staged}
 	} else {
 		filteredUpserts.Release()
 	}
 	if filteredDeletes.NumRows() > 0 {
-		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending, Seq: batch.Seq}
+		deletes = &Batch{Table: batch.Table, Record: filteredDeletes, Watermark: batch.Watermark, Mode: batch.Mode, SnapshotState: batch.SnapshotState, SnapshotPending: batch.SnapshotPending, Seq: batch.Seq, Staged: batch.Staged}
 	} else {
 		filteredDeletes.Release()
 	}

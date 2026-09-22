@@ -677,6 +677,9 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		// The coordinator's monotonic batch sequence (WK-001 C2): the sink
 		// uses it to order N concurrent writers of a partitioned table.
 		Seq: meta.BatchId,
+		// The coordinator's per-batch commit-mode decision (WK-001 C5): stage
+		// and ship the descriptor, or commit directly.
+		Staged: meta.Staged,
 	}
 
 	switch {

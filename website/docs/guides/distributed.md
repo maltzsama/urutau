@@ -153,6 +153,37 @@ A sink that does not support concurrent writers rejects
 [Operator](../architecture/operator.md#concurrent-writers-two-different-fixes-for-the-same-problem)
 has the details.
 
+## Runtime scaling
+
+A running coordinator can re-slice a table across a different number of
+workers — adding or removing owners and swapping the routing snapshot
+atomically, with no coordinator restart and no downtime for other tables. A
+scaler (KEDA, or an operator by hand) drives it via `Coordinator.ScaleTable`.
+
+The sequence is ordered so no key is ever routed to an owner that cannot
+commit it:
+
+1. **Drain** — the affected table must owe nothing (no in-flight batch, no
+   open staged cycle) before the flip. Only that table pauses; the shared
+   reader keeps streaming every other table. Nothing is torn down: every
+   owner keeps its session, epoch and queue. Replication must not lose a
+   row, and a pause costs only latency, so waiting is the right trade.
+2. **Flip** — the routing snapshot swaps atomically. A reader that loaded
+   the old snapshot keeps routing a whole batch by it, so a batch is never
+   split across two layouts.
+3. **Retire** (scale-in only) — each removed owner drains, then is detached.
+
+The commit mode travels **per batch** (`BatchMeta.staged`), decided by the
+coordinator at send time, not frozen in the worker's assignment. That is
+what makes a table that *becomes* partitioned under a running worker safe:
+the surviving owner, which attached when the table was unpartitioned,
+stages the batches the coordinator now marks staged instead of committing
+them directly — a direct commit would leave its staged cycle open and block
+every cycle behind it in the table's send order (issue #312).
+
+`workers.max` (or the coordinator-wide `--max-workers`) caps how far a table
+may scale **up**; it never blocks a scale-down.
+
 ## Next steps
 
 - **Automate the lifecycle**: [Deploy on Kubernetes](deploy-kubernetes.md).

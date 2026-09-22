@@ -110,6 +110,17 @@ type Batch struct {
 	// Couchbase via its transaction, and the plugin sink is blocked from
 	// workers>1. Do not look for other consumers.
 	Seq uint64
+
+	// Staged tells the worker to stage this batch (write data/delete files,
+	// ship the descriptor, let the coordinator commit the cycle) instead of
+	// committing it directly. The coordinator sets it per batch from the
+	// table's commit mode (BatchMeta.staged), so a table that changes mode on
+	// a re-slice — 1 owner to N on a staging sink — is consistent from the
+	// first batch after the flip. Without it the surviving owner, whose mode
+	// was frozen at attach time, would commit directly while the coordinator
+	// expected a staged delivery, leaving its cycle open and blocking the
+	// send-order drain of every cycle behind it (issue #312).
+	Staged bool
 }
 
 // Release frees the Arrow buffers held by the Record. Safe to call on a

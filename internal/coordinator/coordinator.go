@@ -184,11 +184,14 @@ type Coordinator struct {
 	// chunkers is the per-table chunker built at boot: reused for the
 	// snapshot so a partitioned table's chunker (forced to key-based
 	// chunking by Partitions) is the one the snapshot bounds come from.
-	chunkers map[string]source.ChunkSource
-	workers  map[string]*workerState
-	byTicket map[string]*workerState
-	budget   *flowBudget
-	index    map[string]*positionIndex
+	// A re-slice builds one on demand for a table booted unpartitioned, so
+	// chunkersMu guards the map against the snapshot goroutine's read.
+	chunkers   map[string]source.ChunkSource
+	chunkersMu sync.Mutex
+	workers    map[string]*workerState
+	byTicket   map[string]*workerState
+	budget     *flowBudget
+	index      map[string]*positionIndex
 
 	// runCtx outlives the helper goroutines that need cancellation (the
 	// wireRelay) but are called outside run's select.
@@ -827,8 +830,8 @@ func (c *Coordinator) run(ctx context.Context) error {
 			if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 				c.log.Warn("coordinator: eventlog emit", "err", err)
 			}
-			chunker, ok := c.chunkers[ref.Target]
-			if !ok || chunker == nil {
+			chunker := c.lookupChunker(ref.Target)
+			if chunker == nil {
 				var cerr error
 				chunker, cerr = c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 				if cerr != nil {
@@ -1727,6 +1730,12 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if meta.BatchId == 0 {
 		meta.BatchId = c.batchSeq.Add(1)
 	}
+	// The coordinator owns the table's commit mode and states it per batch:
+	// a staging sink with >1 owner stages (the coordinator commits the
+	// cycle), everything else commits directly. Setting it here, at send
+	// time, keeps every owner on the same mode even when the table changes
+	// mode under it (1 owner → N on a re-slice, issue #312).
+	meta.Staged = c.isStagedTable(meta.Table)
 
 	var body []byte
 	var metaBytes []byte
@@ -2128,6 +2137,10 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			SchemaArrow:       schemaB,
 			// A partitioned table on a staging sink: the worker stages its
 			// data files and the coordinator commits the cycle (WK-001 C5).
+			// This is the mode at ATTACH time; live batches carry the current
+			// mode per batch (BatchMeta.staged), so a table that becomes
+			// partitioned under this worker (issue #312) is staged from the
+			// next batch even though this flag is stale.
 			Staged: c.isStagedTable(ref.Target),
 		}
 		// The table's write shape travels with the assignment so the worker's
@@ -2485,7 +2498,12 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
 	}
 	c.pushDashState() // the worker is no longer attached
-	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
+	// A session cancelled by the coordinator — a supervisor reset or a
+	// re-slice retiring an owner — surfaces as errSessionReset OR, when the
+	// recv goroutine wins the race, as context.Canceled. Neither is a worker
+	// failure; only a real stream error is. Treating the cancel as a failure
+	// ended the whole run the moment a scale-in retired an owner.
+	if !errors.Is(retErr, errSessionReset) && !errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)

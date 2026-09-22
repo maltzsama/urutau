@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -98,7 +99,11 @@ func (p *scalablePipeline) stop() {
 	for {
 		select {
 		case err := <-p.done:
-			if err != nil && !errors.Is(err, context.Canceled) {
+			// A scale-in retires owners: the coordinator cancels their
+			// session, and the worker process exits with the reset error.
+			// That is the expected fate of a retired pod (KEDA would delete
+			// it), not a failure. Anything else is a real error.
+			if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "session reset") {
 				p.t.Errorf("process exited with: %v", err)
 			}
 		case <-deadline:
@@ -244,4 +249,66 @@ func TestLiveRepartitionScaleIn(t *testing.T) {
 	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(230))
 	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, 230)
 	t.Log("scale-in ok: surviving owner inherited every range, no loss, no duplicate")
+}
+
+// TestLiveRepartitionScaleOutAppend proves the re-slice is safe for an
+// append-only table. There is no upsert, so nothing is overwritten and no
+// carve-range snapshot is needed — the staged cycles just have to commit.
+// Before the per-batch mode fix this failed the same way upsert did: the
+// surviving owner committed directly while the coordinator expected a staged
+// delivery, leaving its cycle open and blocking the new owners' cycles.
+func TestLiveRepartitionScaleOutAppend(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+
+	addr := reserveAddr(t)
+	s := loadPipeline(t)
+	s.Tables[0].WriteMode = spec.WriteModeAppend
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	target := s.Tables[0].Target
+	boot := s.Tables[0].WorkerGroupNames(s.Pipeline)
+
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergTable(t, ctx)
+	dropAll(t, db)
+	seedOrders(t, db, 0, 200)
+
+	p := bootScalable(t, ctx, addr, s, boot...)
+	defer p.stop()
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
+	t.Log("append snapshot converged with 1 partition")
+
+	// Inserts only: append mode has no upsert, so each row is a new append.
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for i := 200; i < 260; i++ {
+			dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'live%d', %d.0)", i, i, i))
+			time.Sleep(40 * time.Millisecond)
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	if err := p.coord.ScaleTable(ctx, target, 3); err != nil {
+		t.Fatalf("ScaleTable(%s, 3): %v", target, err)
+	}
+	t.Log("re-sliced to 3 partitions under live load (append)")
+	scaledSpec := s.Tables[0]
+	scaledSpec.Workers = &spec.WorkerSpec{Number: 3}
+	for _, name := range scaledSpec.WorkerGroupNames(s.Pipeline)[1:] {
+		p.startWorker(name)
+	}
+	<-writeDone
+
+	// Every id 0..259 present exactly once: no loss at the boundary, and no
+	// duplicate from a re-read (the failure mode an unsolicited snapshot
+	// would cause in append mode).
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(260))
+	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, 260)
+	t.Log("append scale-out ok: no loss, no duplicate")
 }

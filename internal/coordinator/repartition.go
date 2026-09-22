@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,7 +118,7 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 		return fmt.Errorf("coordinator: scale %s: partitioning requires a primary key", target)
 	}
 
-	ranges, err := c.rangesFor(ctx, target, n)
+	ranges, err := c.rangesFor(ctx, target, n, ref)
 	if err != nil {
 		return fmt.Errorf("coordinator: scale %s: %w", target, err)
 	}
@@ -137,11 +138,14 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 		c.seedConfirmed(next[len(owners):])
 	}
 
-	// Per-table barrier: a staged cycle groups one binlog batch's
-	// sub-batches and must commit atomically. Flipping mid-cycle would
-	// leave a cycle expecting an owner the new layout no longer routes to.
-	if err := c.drainStagedCycles(ctx, target); err != nil {
-		return fmt.Errorf("coordinator: scale %s: drain cycles: %w", target, err)
+	// Per-table barrier: quiesce this table before the flip. Nothing is
+	// torn down here — every owner keeps its session, epoch and queue. The
+	// flip just waits until the table owes nothing: every in-flight batch
+	// acked, every staged cycle committed. Replication must not lose a row
+	// and a pause costs only latency, so waiting is the right trade. Other
+	// tables keep streaming through the shared reader.
+	if err := c.drainForFlip(ctx, target, owners); err != nil {
+		return fmt.Errorf("coordinator: scale %s: drain: %w", target, err)
 	}
 
 	snap := cur.clone()
@@ -208,6 +212,9 @@ func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerSt
 	}
 	c.workers[name] = w
 	c.index[name] = newPositionIndex(c.runID)
+	// Seed the ack clock before the pod can attach, or the supervisor's
+	// next tick sees an attached worker with no lastAck and resets it.
+	c.supervisor.noteRegistered(name, time.Now())
 	return w, nil
 }
 
@@ -232,26 +239,39 @@ func (c *Coordinator) seedConfirmed(added []*workerState) {
 	}
 }
 
-// drainStagedCycles blocks until target has no open staged cycle, so the
-// routing flip never splits one cycle across two layouts. Only this table
-// is held: the shared reader keeps streaming every other table.
-func (c *Coordinator) drainStagedCycles(ctx context.Context, target string) error {
-	if !c.isStagedTable(target) {
-		return nil
-	}
+// drainForFlip blocks until target owes nothing: no in-flight batch on any
+// current owner and no open staged cycle. Only this table is held; the
+// shared reader keeps streaming every other table.
+func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []*workerState) error {
 	deadline := time.NewTimer(c.drainTimeout())
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if c.staged.openFor(core.TableRef{Target: target}) == 0 {
+		pending := 0
+		// In-flight batches first. positionIndex frees a worker's queue
+		// strictly from the head, in send order, and a batch leaves only
+		// when the table's acked position covers it. After a flip the owner
+		// receives a DIFFERENT key range, whose acks need not cover the
+		// batch still at its head, so the queue can wedge: the owner stops
+		// acking, the supervisor calls it stale, and the reset discards its
+		// open staged cycles — silently losing the rows they carried.
+		for _, w := range owners {
+			pending += c.inFlight(w.name) + len(w.queue)
+		}
+		// Then the staged cycles, which must commit as one unit and so must
+		// not span two layouts.
+		if c.stagesCycles() {
+			pending += c.staged.openFor(core.TableRef{Target: target})
+		}
+		if pending == 0 {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("staged cycles still open after %s", c.drainTimeout())
+			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s", pending, c.drainTimeout())
 		case <-tick.C:
 		}
 	}
@@ -266,12 +286,7 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
-	drained := false
-	for !drained {
-		if c.inFlight(w.name) == 0 && len(w.queue) == 0 {
-			drained = true
-			break
-		}
+	for c.inFlight(w.name) != 0 || len(w.queue) != 0 {
 		select {
 		case <-ctx.Done():
 			return
@@ -312,13 +327,22 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 // rangesFor resolves n contiguous key ranges for target from the table's
 // chunker. n == 1 is the unpartitioned single unbounded range, matching
 // boot behavior byte for byte.
-func (c *Coordinator) rangesFor(ctx context.Context, target string, n int) ([]source.Chunk, error) {
+func (c *Coordinator) rangesFor(ctx context.Context, target string, n int, ref source.TableRef) ([]source.Chunk, error) {
 	if n <= 1 {
 		return []source.Chunk{{}}, nil
 	}
-	chunker, ok := c.chunkers[target]
-	if !ok || chunker == nil {
-		return nil, fmt.Errorf("no chunker: table was booted unpartitioned")
+	// A table booted with one worker has no chunker: resolvePartitionRanges
+	// short-circuits before building one. Scaling such a table out is the
+	// main case this feature exists for, so build it on demand here the same
+	// way boot does, and keep it for the next re-slice.
+	chunker := c.lookupChunker(target)
+	if chunker == nil {
+		built, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
+		if err != nil {
+			return nil, fmt.Errorf("chunker: %w", err)
+		}
+		c.storeChunker(target, built)
+		chunker = built
 	}
 	ps, ok := chunker.(source.PartitionSource)
 	if !ok {
@@ -405,4 +429,21 @@ func (c *Coordinator) setRangesForTest(ranges map[string][]source.Chunk) {
 	snap := c.loadRouting().clone()
 	snap.ranges = ranges
 	c.publishRouting(snap)
+}
+
+// lookupChunker returns target's chunker, or nil when none is built yet.
+func (c *Coordinator) lookupChunker(target string) source.ChunkSource {
+	c.chunkersMu.Lock()
+	defer c.chunkersMu.Unlock()
+	return c.chunkers[target]
+}
+
+// storeChunker memoizes a chunker built on demand by a re-slice.
+func (c *Coordinator) storeChunker(target string, ch source.ChunkSource) {
+	c.chunkersMu.Lock()
+	defer c.chunkersMu.Unlock()
+	if c.chunkers == nil {
+		c.chunkers = map[string]source.ChunkSource{}
+	}
+	c.chunkers[target] = ch
 }

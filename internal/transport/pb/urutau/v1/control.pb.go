@@ -2424,13 +2424,20 @@ func (x *Shutdown) GetDrain() bool {
 // The FlightData body is raw Arrow IPC; BatchMeta travels in
 // FlightData.app_metadata.
 type BatchMeta struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"` // target table
-	LowPos        string                 `protobuf:"bytes,2,opt,name=low_pos,json=lowPos,proto3" json:"low_pos,omitempty"`
-	HighPos       string                 `protobuf:"bytes,3,opt,name=high_pos,json=highPos,proto3" json:"high_pos,omitempty"`
-	BatchId       uint64                 `protobuf:"varint,4,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
-	Epoch         uint64                 `protobuf:"varint,5,opt,name=epoch,proto3" json:"epoch,omitempty"` // same guard as Ack
-	Window        *WindowTag             `protobuf:"bytes,6,opt,name=window,proto3" json:"window,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Table   string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"` // target table
+	LowPos  string                 `protobuf:"bytes,2,opt,name=low_pos,json=lowPos,proto3" json:"low_pos,omitempty"`
+	HighPos string                 `protobuf:"bytes,3,opt,name=high_pos,json=highPos,proto3" json:"high_pos,omitempty"`
+	BatchId uint64                 `protobuf:"varint,4,opt,name=batch_id,json=batchId,proto3" json:"batch_id,omitempty"`
+	Epoch   uint64                 `protobuf:"varint,5,opt,name=epoch,proto3" json:"epoch,omitempty"` // same guard as Ack
+	Window  *WindowTag             `protobuf:"bytes,6,opt,name=window,proto3" json:"window,omitempty"`
+	// staged tells the worker to stage this batch (write files, ship the
+	// descriptor, let the coordinator commit the cycle) instead of committing
+	// it directly. The coordinator decides per batch, so a table that changes
+	// commit mode on a re-slice (1 owner → N) is consistent from the first
+	// batch after the flip: the surviving owner stages too, and its cycle is
+	// not left open blocking the new owners' cycles.
+	Staged        bool `protobuf:"varint,7,opt,name=staged,proto3" json:"staged,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2505,6 +2512,13 @@ func (x *BatchMeta) GetWindow() *WindowTag {
 		return x.Window
 	}
 	return nil
+}
+
+func (x *BatchMeta) GetStaged() bool {
+	if x != nil {
+		return x.Staged
+	}
+	return false
 }
 
 type WindowTag struct {
@@ -2774,14 +2788,15 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05table\x18\x02 \x01(\tR\x05table\"Q\n" +
 	"\bShutdown\x12/\n" +
 	"\x05grace\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\x05grace\x12\x14\n" +
-	"\x05drain\x18\x02 \x01(\bR\x05drain\"\xb4\x01\n" +
+	"\x05drain\x18\x02 \x01(\bR\x05drain\"\xcc\x01\n" +
 	"\tBatchMeta\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x17\n" +
 	"\alow_pos\x18\x02 \x01(\tR\x06lowPos\x12\x19\n" +
 	"\bhigh_pos\x18\x03 \x01(\tR\ahighPos\x12\x19\n" +
 	"\bbatch_id\x18\x04 \x01(\x04R\abatchId\x12\x14\n" +
 	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\x12,\n" +
-	"\x06window\x18\x06 \x01(\v2\x14.urutau.v1.WindowTagR\x06window\"w\n" +
+	"\x06window\x18\x06 \x01(\v2\x14.urutau.v1.WindowTagR\x06window\x12\x16\n" +
+	"\x06staged\x18\a \x01(\bR\x06staged\"w\n" +
 	"\tWindowTag\x12\x1b\n" +
 	"\tin_window\x18\x01 \x01(\bR\binWindow\x12\x16\n" +
 	"\x06closes\x18\x02 \x01(\bR\x06closes\x12\x19\n" +

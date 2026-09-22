@@ -207,6 +207,25 @@ func TestScaleRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+// A table booted with one worker has no chunker: scaling it out must build
+// one on demand, which is the main case this feature exists for. The e2e hit
+// this as "no chunker: table was booted unpartitioned".
+func TestScaleOutBuildsChunkerForUnpartitionedTable(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.chunkers = map[string]source.ChunkSource{} // booted unpartitioned
+	c.qsrc = fakeQSource{chunker: &scalingChunker{}}
+
+	if err := c.ScaleTable(context.Background(), "raw.orders", 2); err != nil {
+		t.Fatalf("ScaleTable on a table booted unpartitioned: %v", err)
+	}
+	if owners, _ := c.loadRouting().ownersOf("raw.orders"); len(owners) != 2 {
+		t.Fatalf("owners = %d, want 2", len(owners))
+	}
+	if c.lookupChunker("raw.orders") == nil {
+		t.Fatal("the chunker built on demand must be memoized for the next re-slice")
+	}
+}
+
 func TestScaleToSameCountIsNoop(t *testing.T) {
 	c, ch := scaleHarness(t)
 	if err := c.ScaleTable(context.Background(), "raw.orders", 1); err != nil {
@@ -214,6 +233,34 @@ func TestScaleToSameCountIsNoop(t *testing.T) {
 	}
 	if ch.calls != 0 {
 		t.Fatalf("a no-op scale must not re-resolve ranges, got %d calls", ch.calls)
+	}
+}
+
+// The flip must wait on in-flight batches, not only staged cycles. The
+// positionIndex frees a worker's queue strictly from the head, and after a
+// flip the owner's new key range need not produce acks that cover the batch
+// still at that head — the queue wedges, the supervisor calls the owner
+// stale, and the reset discards its staged cycles. The e2e hit exactly this.
+func TestScaleWaitsForInFlightBatches(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.cfg.ScaleDrainTimeout = 500 * time.Millisecond
+	owners, _ := c.loadRouting().ownersOf("raw.orders")
+
+	// One batch delivered and unacked on the current owner.
+	c.index[owners[0].name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+	if c.inFlight(owners[0].name) == 0 {
+		t.Fatal("precondition: the owner must have an in-flight batch")
+	}
+
+	err := c.ScaleTable(context.Background(), "raw.orders", 3)
+	if err == nil {
+		t.Fatal("the flip must wait for in-flight batches")
+	}
+	if !strings.Contains(err.Error(), "drain") {
+		t.Fatalf("want a drain error, got %v", err)
+	}
+	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+		t.Fatalf("owners = %d, want the pre-scale 1 (no flip)", len(got))
 	}
 }
 
@@ -242,8 +289,8 @@ func TestScaleWaitsForOpenStagedCycle(t *testing.T) {
 	if err == nil {
 		t.Fatal("a scale must not flip while a cycle is open")
 	}
-	if !strings.Contains(err.Error(), "drain cycles") {
-		t.Fatalf("want a drain-cycles error, got %v", err)
+	if !strings.Contains(err.Error(), "drain") {
+		t.Fatalf("want a drain error, got %v", err)
 	}
 	// The layout is unchanged: the flip did not happen.
 	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 2 {

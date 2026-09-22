@@ -80,7 +80,9 @@ func TestRestartWorkerResetsKnownWorker(t *testing.T) {
 }
 
 func TestSupervisorRunTerminatesCrashloop(t *testing.T) {
-	c, _ := coordHarness()
+	c, w := coordHarness()
+	// The worker must OWE work to be stale; owing nothing makes it idle.
+	w.queue <- queuedBatch{id: 1}
 	c.supervisor.noteAck("w0", time.Now().Add(-time.Hour))
 
 	ctx, cancel := context.WithCancel(context.Background())
