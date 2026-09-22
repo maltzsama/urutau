@@ -13,11 +13,17 @@ checkpoints — see [Reliability](reliability.md).
 ## Metrics
 
 Pass `--metrics-addr :9090` (coordinator) or `--metrics-addr :9091`
-(worker) to serve Prometheus metrics on `/metrics`. Empty disables the
-endpoint. In Kubernetes the operator stamps the same flags from
+(worker) to serve Prometheus metrics on `/metrics`. For the worker, empty
+disables the endpoint. In Kubernetes the operator stamps the same flags from
 `spec.coordinator.metricsAddr` and `spec.worker.metricsAddr` — each Pod
 binds its own IP, so the same value works for both roles, but the knobs are
 separate. Scrape the Pods directly (no aggregation happens between them).
+
+The **coordinator** in Kubernetes always has an address: the operator
+defaults `spec.coordinator.metricsAddr` to `:9090` when the CR leaves it
+empty, because its liveness/readiness probes target `/statusz` on that same
+address (an empty value would disable the endpoint the probes depend on).
+Set `spec.coordinator.metricsAddr` to move it; the probes follow.
 
 **Coordinator**
 

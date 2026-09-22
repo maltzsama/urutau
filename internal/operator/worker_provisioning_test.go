@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"strings"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -270,6 +271,39 @@ func TestCoordinatorStatefulSetAppliesResources(t *testing.T) {
 	c := sts.Spec.Template.Spec.Containers[0]
 	if c.Resources.Requests.Cpu().String() != "1" || c.Resources.Requests.Memory().String() != "2Gi" {
 		t.Fatalf("coordinator resources = %+v, want cpu=1 memory=2Gi", c.Resources)
+	}
+}
+
+// The coordinator Pod declares its ports and carries probes against /statusz.
+// The operator must guarantee a metrics address even when the CR leaves it
+// empty, or the probe has no endpoint to hit.
+func TestCoordinatorStatefulSetProbesAndPorts(t *testing.T) {
+	cr := pipelineCR("orders", "ns") // no Coordinator.MetricsAddr
+	sts := coordinatorStatefulSet(cr, "urutau:v1")
+	c := sts.Spec.Template.Spec.Containers[0]
+
+	if c.StartupProbe == nil || c.LivenessProbe == nil || c.ReadinessProbe == nil {
+		t.Fatalf("coordinator must carry startup/liveness/readiness probes, got %+v", c)
+	}
+	if got := c.LivenessProbe.HTTPGet.Path; got != "/statusz" {
+		t.Fatalf("liveness path = %q, want /statusz", got)
+	}
+	if !strings.Contains(strings.Join(c.Command, " "), "--metrics-addr :9090") {
+		t.Fatalf("command = %v, want the operator default --metrics-addr :9090", c.Command)
+	}
+	ports := map[string]int32{}
+	for _, p := range c.Ports {
+		ports[p.Name] = p.ContainerPort
+	}
+	if ports["grpc"] != 50051 || ports["metrics"] != 9090 {
+		t.Fatalf("ports = %v, want grpc=50051 metrics=9090", ports)
+	}
+
+	// A custom metrics address moves the probe port with it.
+	cr.Spec.Coordinator.MetricsAddr = ":1234"
+	c2 := coordinatorStatefulSet(cr, "urutau:v1").Spec.Template.Spec.Containers[0]
+	if got := c2.LivenessProbe.HTTPGet.Port.IntValue(); got != 1234 {
+		t.Fatalf("probe port = %d, want 1234", got)
 	}
 }
 
