@@ -23,7 +23,7 @@ separate. Scrape the Pods directly (no aggregation happens between them).
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `urutau_coordinator_lag_seconds` | gauge | Reader-to-worker lag |
+| `urutau_coordinator_lag_seconds` | gauge (table) | Seconds since the table's last commit — grows between commits |
 | `urutau_coordinator_inflight_bytes` | gauge (worker) | Unacked batch bytes per worker |
 | `urutau_coordinator_worker_resets_total` | counter (reason) | Worker resets by reason |
 | `urutau_coordinator_commits_total` | counter (table) | Commits acked by the worker |

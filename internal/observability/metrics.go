@@ -15,7 +15,7 @@ type Metrics struct {
 	reg *prometheus.Registry
 
 	// Coordinator.
-	LagSeconds    prometheus.Gauge
+	LagSeconds    *prometheus.GaugeVec
 	InflightBytes *prometheus.GaugeVec
 	WorkerResets  *prometheus.CounterVec
 	CommitsTotal  *prometheus.CounterVec
@@ -56,8 +56,9 @@ func New() *Metrics {
 	reg := prometheus.NewRegistry()
 	m := &Metrics{reg: reg}
 
-	m.LagSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "urutau_coordinator_lag_seconds", Help: "reader-to-worker lag in seconds."})
+	m.LagSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "urutau_coordinator_lag_seconds", Help: "reader-to-worker lag in seconds, per table."},
+		[]string{"table"})
 	m.InflightBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "urutau_coordinator_inflight_bytes", Help: "unacked batch bytes per worker."},
 		[]string{"worker"})

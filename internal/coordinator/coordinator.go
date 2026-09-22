@@ -382,6 +382,13 @@ func Run(ctx context.Context, cfg Config) error {
 func (c *Coordinator) run(ctx context.Context) error {
 	c.runCtx = ctx
 
+	// Lag grows between commits, so the gauge needs its own clock: setting it
+	// on the ack path would pin it near zero after every commit and never let
+	// it rise. Mirrors the dashboard's on-demand Tables().
+	if c.metrics != nil {
+		go c.lagLoop(ctx)
+	}
+
 	if cfg := c.cfg.Eventlog; cfg != nil {
 		ev, err := eventlog.New(ctx, *cfg)
 		if err != nil {
