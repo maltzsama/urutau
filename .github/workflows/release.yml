@@ -67,6 +67,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # cosign keyless signing is OIDC-based (no keys to manage) and the
+      # buildx SBOM/provenance attestations use the same token; without this
+      # the sign step fails rather than degrading.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,7 +94,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
             type=raw,value=latest
 
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: build/Dockerfile
@@ -98,6 +103,29 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Attach SBOM and provenance attestations to the pushed manifest.
+          sbom: true
+          provenance: true
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
             COMMIT=${{ github.sha }}
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Sign by digest, not by tag: the manifest list the tags point at is
+      # mutable, the digest is not. The signature is what `cosign verify`
+      # (and the docs in SECURITY.md) checks.
+      - name: Sign image (keyless)
+        run: cosign sign --yes ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+
+      # Fail the release on a fixable CRITICAL/HIGH CVE in the pushed image,
+      # so an unsigned/scanned image is not the only difference between a
+      # green and a red release.
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH

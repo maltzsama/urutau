@@ -33,6 +33,23 @@ highest-value targets are:
   and the sinks.
 - **The plugin seam** — the Arrow Flight subprocess contract and its token.
 
+## Verifying released images
+
+The container image published to `ghcr.io/maltzsama/urutau` is signed with
+[cosign](https://docs.sigstore.dev/cosign/overview/) in keyless mode (OIDC via
+the GitHub Actions workflow identity) and carries SBOM and provenance
+attestations. Verify a tag before running it:
+
+```sh
+cosign verify ghcr.io/maltzsama/urutau:latest \
+  --certificate-identity-regexp '^https://github.com/maltzsama/urutau/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Each release is also scanned for vulnerabilities; the workflow fails on any
+fixable `CRITICAL`/`HIGH` CVE, so a published tag has no known fixable
+high-severity finding at the time it was built.
+
 ## Supported versions
 
 The latest release is supported. Fixes land on `main` and ship in the next
