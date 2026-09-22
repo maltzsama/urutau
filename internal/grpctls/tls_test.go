@@ -163,3 +163,17 @@ func TestValidateRejectsPartialAndAcceptsEmpty(t *testing.T) {
 		t.Fatalf("full config must pass Validate: %v", err)
 	}
 }
+
+// RequireTLS is the fail-closed gate: plaintext is refused unless the caller
+// opted in explicitly, and any TLS material satisfies it.
+func TestRequireTLS(t *testing.T) {
+	if err := (Config{}).RequireTLS(); err == nil {
+		t.Fatal("plaintext config must be refused")
+	}
+	if err := (Config{AllowInsecure: true}).RequireTLS(); err != nil {
+		t.Fatalf("AllowInsecure must pass: %v", err)
+	}
+	if err := (Config{CertFile: "c", KeyFile: "k", ClientCAFile: "ca"}).RequireTLS(); err != nil {
+		t.Fatalf("mTLS config must pass: %v", err)
+	}
+}

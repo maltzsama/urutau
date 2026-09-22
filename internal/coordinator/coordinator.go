@@ -297,6 +297,12 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	// Fail closed: a plaintext control plane sends the source DSN in the
+	// clear. Refuse at boot unless the caller explicitly allowed it — a
+	// warning on the wire is not a control (CD-1b).
+	if err := cfg.TLS.RequireTLS(); err != nil {
+		return fmt.Errorf("coordinator: %w", err)
+	}
 	// The spec's source.serverId wins over cfg.ServerID when declared —
 	// the pipeline's own server id travels with it; cfg.ServerID is only
 	// a default for when the spec is silent. Spec.Validate (already run
@@ -701,7 +707,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		opts = append(opts, tlsOpt)
 		c.log.Info("coordinator: control plane mTLS enabled")
 	} else {
-		c.log.Warn("coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA")
+		c.log.Warn("coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA (running because --allow-insecure-control-plane was set)")
 	}
 	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterUrutauControlServer(grpcServer, &controlServer{c: c})

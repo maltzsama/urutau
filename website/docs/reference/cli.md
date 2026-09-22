@@ -64,6 +64,7 @@ server, not a one-shot.
 | `--tls-cert` | _(off)_ | Server certificate for the control plane (mTLS) |
 | `--tls-key` | _(off)_ | Server private key (mTLS) |
 | `--tls-ca` | _(off)_ | CA that signs worker client certs (mTLS) |
+| `--allow-insecure-control-plane` | `false` | Run the control plane plaintext (explicit opt-out of the fail-closed default) |
 | `--server-id` | `1101` | MySQL replication server id (spec wins) |
 | `--chunk-size` | `10000` | Snapshot chunk size |
 | `--max-parallel-chunks` | `0` | Concurrent chunk `SELECT`s (`0` = serial) |
@@ -78,10 +79,12 @@ server, not a one-shot.
 | `--plugin` | _(none)_ | Go plugin path; repeatable |
 
 **mTLS:** set all three of `--tls-cert`, `--tls-key`, `--tls-ca`, or none.
-Without them the control plane is **plaintext**, and the coordinator warns
-loudly at startup — the Flight assignment carries the source DSN, so
-plaintext leaks credentials on the wire. Always use mTLS outside a trusted
-network. See [Distributed mode](../guides/distributed.md#secure-the-control-plane).
+With none the control plane is **plaintext**, and the coordinator **refuses
+to boot** — the Flight assignment carries the source DSN, so plaintext leaks
+credentials on the wire. Pass `--allow-insecure-control-plane` to accept
+plaintext explicitly (it then warns at startup instead of failing). Always use
+mTLS outside a trusted network. See
+[Distributed mode](../guides/distributed.md#secure-the-control-plane).
 
 ## `urutau-worker`
 

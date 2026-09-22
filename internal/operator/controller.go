@@ -786,6 +786,12 @@ func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
 	// /statusz probes have a stable endpoint, instead of leaving it to the
 	// CR author (an empty value disables /statusz entirely).
 	args = append(args, "--metrics-addr", coordinatorMetricsAddr(cr))
+	// The operator does not wire control-plane TLS yet (coordinator and
+	// workers run in-cluster, but the source DSN still rides the wire in the
+	// assignment). Opt into plaintext explicitly so the coordinator's
+	// fail-closed default does not crash-loop every managed pipeline;
+	// wiring real mTLS is future work.
+	args = append(args, "--allow-insecure-control-plane")
 	return args
 }
 

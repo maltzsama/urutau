@@ -25,9 +25,10 @@ highest-value targets are:
   the audit trail. A credential leaking through a log line or an error string
   is a security bug, not a cosmetic one.
 - **The control plane** — the coordinator↔worker gRPC/Flight channel carries
-  the source DSN in the worker assignment. Running it without mTLS is
-  documented as plaintext and warns at startup; a way to read it *despite*
-  TLS is a bug.
+  the source DSN in the worker assignment. The coordinator refuses to boot
+  without mTLS unless `--allow-insecure-control-plane` is passed explicitly
+  (fail closed, not plaintext by omission); a way to read it *despite* TLS is
+  a bug.
 - **SQL and identifier handling** — table names, column names, and filters come
   from the pipeline spec and are interpolated into queries against the source
   and the sinks.

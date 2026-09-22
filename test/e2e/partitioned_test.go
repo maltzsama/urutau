@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/coordinator"
+	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -207,7 +208,7 @@ func TestDistributedPartitionedWorkerKilled(t *testing.T) {
 		t.Cleanup(cStop)
 		cErr := make(chan error, 1)
 		go func() {
-			cErr <- coordinator.Run(cCtx, coordinator.Config{
+			cErr <- coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true},
 				Spec: s, ListenAddr: addr, ServerID: 1102,
 				Heartbeat: 5 * time.Second, ChunkSize: 10,
 				WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond,
