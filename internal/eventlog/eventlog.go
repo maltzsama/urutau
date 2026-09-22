@@ -167,19 +167,10 @@ func New(ctx context.Context, cfg Config) (*Run, error) {
 	if err != nil {
 		return nil, err
 	}
-	awsCfg, err := loadAWSConfig(ctx, cfg)
+	client, err := newS3Client(ctx, cfg.Region, cfg.Endpoint, cfg.AccessKey, cfg.SecretKey)
 	if err != nil {
 		return nil, fmt.Errorf("eventlog: aws config: %w", err)
 	}
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		if cfg.AccessKey != "" && cfg.SecretKey != "" {
-			o.Credentials = credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
-		}
-		if cfg.Endpoint != "" {
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
-			o.UsePathStyle = true
-		}
-	})
 	id := newRunID()
 	max := cfg.MaxObjectBytes
 	if max <= 0 {
@@ -453,14 +444,33 @@ func parseURI(uri string) (bucket, prefix string, err error) {
 	return bucket, prefix, nil
 }
 
-func loadAWSConfig(ctx context.Context, cfg Config) (aws.Config, error) {
-	region := cfg.Region
+// newS3Client builds the S3 client both the writer and the reader use.
+// Credentials follow the standard AWS chain unless an explicit key pair is
+// given; Endpoint overrides the API target for MinIO-style stores and implies
+// path-style addressing.
+func newS3Client(ctx context.Context, region, endpoint, accessKey, secretKey string) (*s3.Client, error) {
+	awsCfg, err := loadAWSConfig(ctx, region, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if accessKey != "" && secretKey != "" {
+			o.Credentials = credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")
+		}
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+			o.UsePathStyle = true
+		}
+	}), nil
+}
+
+func loadAWSConfig(ctx context.Context, region, endpoint string) (aws.Config, error) {
 	if region == "" {
 		region = "us-east-1"
 	}
 	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	if cfg.Endpoint != "" {
-		opts = append(opts, awsconfig.WithBaseEndpoint(cfg.Endpoint))
+	if endpoint != "" {
+		opts = append(opts, awsconfig.WithBaseEndpoint(endpoint))
 	}
 	return awsconfig.LoadDefaultConfig(ctx, opts...)
 }
