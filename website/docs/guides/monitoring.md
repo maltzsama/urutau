@@ -121,6 +121,13 @@ curl -s http://coordinator:9090/statusz | jq
 | `urutau_worker_commit_failures_total` rising | The catalog is rejecting commits — a data-loss risk if it persists. |
 | `urutau_enrich_evicted_total` rising | The cold-start buffer is too small or the reference refresh is too slow. |
 
+These four conditions ship as a `PrometheusRule` at
+`config/monitoring/prometheusrule.yaml` — apply it where the Prometheus
+Operator runs (`kubectl apply -f config/monitoring/prometheusrule.yaml`).
+Commit failures are the only `critical`; the rest are `warning`. It is not
+part of `config/default`, which installs without the Prometheus Operator's
+CRDs.
+
 ## Next
 
 - **What survives a crash, and how to prove what happened**:

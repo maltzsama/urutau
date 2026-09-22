@@ -1,0 +1,59 @@
+# Alerts for a running Urutau pipeline. The conditions mirror the "What to
+# alert on" table in website/docs/guides/monitoring.md — no thresholds beyond
+# what that page already implies.
+#
+# This is a monitoring.coreos.com/v1 PrometheusRule: it needs the Prometheus
+# Operator's CRDs in-cluster. It is deliberately NOT part of config/default
+# (which must install without the Prometheus Operator); apply it only where
+# you run Prometheus Operator:
+#
+#   kubectl apply -f config/monitoring/prometheusrule.yaml
+#
+# The metric names must exist in internal/observability (a test guards this).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: urutau-pipeline-alerts
+  labels:
+    app.kubernetes.io/part-of: urutau
+spec:
+  groups:
+    - name: urutau.rules
+      rules:
+        # Lag is per table (urutau_coordinator_lag_seconds{table=...}); a
+        # growing derivative means the reader is falling behind. Usually the
+        # sink, not the reader.
+        - alert: UrutauLagGrowing
+          expr: deriv(urutau_coordinator_lag_seconds[10m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Reader-to-worker lag is growing for {{ $labels.table }}"
+            description: "urutau_coordinator_lag_seconds has been increasing for 15m (instance {{ $labels.instance }}, table {{ $labels.table }}) — usually the sink, not the reader."
+        - alert: UrutauWorkerResetsRising
+          expr: increase(urutau_coordinator_worker_resets_total[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Worker resets on {{ $labels.worker }} (reason={{ $labels.reason }})"
+            description: "Workers are crashing or the network is flapping — watch the reason label."
+        # Commit failures are the only critical: the catalog is rejecting
+        # commits, a data-loss risk if it persists.
+        - alert: UrutauCommitFailures
+          expr: increase(urutau_worker_commit_failures_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Commit failures on table {{ $labels.table }} — data-loss risk if it persists"
+            description: "The catalog is rejecting commits for {{ $labels.table }}."
+        - alert: UrutauEnrichEvictionsRising
+          expr: increase(urutau_enrich_evicted_total[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Cold-start buffer evictions rising (table {{ $labels.table }}, reference {{ $labels.reference }})"
+            description: "The cold-start buffer is too small or the reference refresh is too slow."
