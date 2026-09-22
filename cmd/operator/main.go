@@ -22,6 +22,11 @@ import (
 
 var scheme = runtime.NewScheme()
 
+// leaderElectionID names the coordination.k8s.io Lease the manager elects
+// through. Stable across releases: changing it makes every replica fight for
+// a fresh lease.
+const leaderElectionID = "urutau-operator-lock"
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(urutauv1alpha1.AddToScheme(scheme))
@@ -71,7 +76,12 @@ func run() error {
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
-		Cache:                  cache.Options{DefaultNamespaces: namespaceConfig(watchNamespaces)},
+		// Only the elected leader reconciles; the other replicas stay ready
+		// as hot standbys. Without this, two replicas would both reconcile —
+		// a second leader also needs the coordination.k8s.io/leases RBAC.
+		LeaderElection:   true,
+		LeaderElectionID: leaderElectionID,
+		Cache:            cache.Options{DefaultNamespaces: namespaceConfig(watchNamespaces)},
 	})
 	if err != nil {
 		return fmt.Errorf("unable to start manager: %w", err)

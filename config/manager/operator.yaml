@@ -1,5 +1,9 @@
-# The urutau-operator Deployment: a single controller-runtime process that
+# The urutau-operator Deployment: a controller-runtime process that
 # reconciles CDCPipeline CRs into per-pipeline coordinator StatefulSets.
+#
+# Two replicas run behind leader election: only the elected leader reconciles,
+# the other stays a hot standby and takes over if the leader dies. Leader
+# election needs the coordination.k8s.io/leases rule in config/rbac.
 #
 # One image carries every binary (build/Dockerfile); this Pod overrides the
 # container command to run the operator. The SAME image is passed to the
@@ -24,7 +28,7 @@ metadata:
     app.kubernetes.io/part-of: urutau
     control-plane: controller-manager
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: urutau-operator
