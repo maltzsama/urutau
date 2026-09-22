@@ -22,7 +22,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker e2e-fixtures e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-deploy k8s-undeploy k8s-status
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-fixtures e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-deploy k8s-deploy-multi-tenant k8s-undeploy k8s-status
 
 all: lint test build
 
@@ -95,6 +95,11 @@ k8s-load: ## Build the image into minikube's docker daemon (no registry)
 
 k8s-deploy:
 	$(KUBECTL) apply -k config/default
+
+# Shared-cluster install: the operator is scoped to the namespaces listed in
+# config/multi-tenant (per-tenant RoleBindings, no cluster-wide binding).
+k8s-deploy-multi-tenant:
+	$(KUBECTL) apply -k config/multi-tenant
 
 k8s-undeploy:
 	$(KUBECTL) delete -k config/default --ignore-not-found

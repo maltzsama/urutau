@@ -4,11 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -34,17 +36,19 @@ func main() {
 
 func run() error {
 	var (
-		metricsAddr   string
-		probeAddr     string
-		image         string
-		fieldManager  string
-		enableWebhook bool
+		metricsAddr     string
+		probeAddr       string
+		image           string
+		fieldManager    string
+		enableWebhook   bool
+		watchNamespaces string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe endpoint")
 	flag.StringVar(&image, "coordinator-image", "", "coordinator container image (required)")
 	flag.StringVar(&fieldManager, "field-manager", operator.DefaultFieldManager, "Server-Side Apply field manager name (must be unique per controller managing the same objects)")
 	flag.BoolVar(&enableWebhook, "enable-webhook", true, "enable the admission webhook")
+	flag.StringVar(&watchNamespaces, "watch-namespaces", "", "comma-separated namespaces to watch (empty = all namespaces; each watched namespace needs its own RoleBinding, see config/multi-tenant)")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -67,6 +71,7 @@ func run() error {
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
+		Cache:                  cache.Options{DefaultNamespaces: namespaceConfig(watchNamespaces)},
 	})
 	if err != nil {
 		return fmt.Errorf("unable to start manager: %w", err)
@@ -100,9 +105,31 @@ func run() error {
 		"webhookEnabled", enableWebhook,
 		"metricsAddr", metricsAddr,
 		"probeAddr", probeAddr,
+		"watchNamespaces", watchNamespaces,
 	)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		return fmt.Errorf("problem running manager: %w", err)
 	}
 	return nil
+}
+
+// namespaceConfig turns a comma-separated namespace list into the manager
+// cache's DefaultNamespaces map, scoping every watch to the managed
+// namespaces so the operator needs RBAC only there (the per-tenant
+// RoleBinding model, config/multi-tenant) instead of cluster-wide. An empty
+// list returns nil, which leaves the cache watching all namespaces — the
+// cluster-wide single-tenant default.
+func namespaceConfig(csv string) map[string]cache.Config {
+	var out map[string]cache.Config
+	for _, ns := range strings.Split(csv, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns == "" {
+			continue
+		}
+		if out == nil {
+			out = map[string]cache.Config{}
+		}
+		out[ns] = cache.Config{}
+	}
+	return out
 }
