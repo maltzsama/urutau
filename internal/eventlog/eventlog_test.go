@@ -92,6 +92,26 @@ func (f *fakePutter) Calls() int {
 	return f.calls
 }
 
+// The key convention: the pipeline segment sits between the root prefix and
+// the run, so listing alone discovers pipelines then runs.
+func TestRunBaseKey(t *testing.T) {
+	tests := []struct {
+		prefix, pipeline, want string
+	}{
+		{"p", "", "p/run-abc/"},
+		{"/p/", "", "p/run-abc/"},
+		{"p", "shop", "p/shop/run-abc/"},
+		{"p/", "/shop/", "p/shop/run-abc/"},
+		{"", "shop", "shop/run-abc/"},
+		{"", "", "run-abc/"},
+	}
+	for _, tt := range tests {
+		if got := runBaseKey(tt.prefix, tt.pipeline, "abc"); got != tt.want {
+			t.Errorf("runBaseKey(%q, %q) = %q, want %q", tt.prefix, tt.pipeline, got, tt.want)
+		}
+	}
+}
+
 func TestEmitAccumulatesAndUploads(t *testing.T) {
 	p := &fakePutter{}
 	r := NewWithPutter("bucket", "prefix", 0, p)

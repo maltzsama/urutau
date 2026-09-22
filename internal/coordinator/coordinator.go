@@ -396,7 +396,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 
 	if cfg := c.cfg.Eventlog; cfg != nil {
-		ev, err := eventlog.New(ctx, *cfg)
+		ec := *cfg
+		// Apply the shared key convention: the trail lives under the
+		// pipeline name so it stays discoverable after the CR is deleted.
+		if ec.Pipeline == "" && c.cfg.Spec != nil {
+			ec.Pipeline = c.cfg.Spec.Pipeline
+		}
+		ev, err := eventlog.New(ctx, ec)
 		if err != nil {
 			return fmt.Errorf("coordinator: eventlog: %w", err)
 		}

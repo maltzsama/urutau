@@ -589,7 +589,13 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	// still seals the trail with job_stopped.
 	var ev *eventlog.Run
 	if cfg.Eventlog != nil {
-		e, eerr := eventlog.New(ctx, *cfg.Eventlog)
+		ec := *cfg.Eventlog
+		// Apply the shared key convention: the trail lives under the
+		// pipeline name so a reader can discover it by listing.
+		if ec.Pipeline == "" {
+			ec.Pipeline = s.Pipeline
+		}
+		e, eerr := eventlog.New(ctx, ec)
 		if eerr != nil {
 			return nil, eerr
 		}

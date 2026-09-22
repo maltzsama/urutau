@@ -48,6 +48,19 @@ object per line. It is append-only and independent of the sink, so it
 survives a sink failure. Credentials and endpoint come from the standard
 `AWS_*` environment.
 
+The trail is laid out under a shared root so it is discoverable with plain
+S3 listing — no database, no index:
+
+```
+s3://<bucket>/<prefix>/<pipeline>/run-<id>/events-NNNNNN.jsonl
+```
+
+Listing `<prefix>/` yields the pipeline names; listing
+`<prefix>/<pipeline>/` yields the run ids. A pipeline's trail stays
+discoverable after its `CDCPipeline` is deleted, because the pipeline name
+is in the key. (A direct `urutau run --eventlog` with no named pipeline
+omits the `<pipeline>/` segment.)
+
 Use it for post-incident forensics: "why did this row land late?" is
 usually answerable from the event log even after the metrics have rolled
 over.
