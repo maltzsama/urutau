@@ -47,6 +47,7 @@ build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/urutau-coordinator ./cmd/coordinator
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/urutau-worker ./cmd/worker
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/urutau-operator ./cmd/operator
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/urutau-history-server ./cmd/history-server
 
 test:
 	$(GO) test -race ./...

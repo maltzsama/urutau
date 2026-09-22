@@ -129,6 +129,24 @@ The Kubernetes operator. Plain flags (no subcommands); see
 | `--health-probe-bind-address` | `:8081` | `/healthz` + `/readyz` endpoint |
 | `--enable-webhook` | `true` | Serve the validating admission webhook |
 | `--field-manager` | `urutau-operator` | Server-Side Apply field manager — the name the operator applies objects as. Must be unique per controller managing the same objects. |
+| `--watch-namespaces` | _(all)_ | Comma-separated namespaces to watch; scopes the cache (see [multi-tenant install](../guides/deploy-kubernetes.md#multi-tenant-install-namespace-per-team)) |
 
 The operator also accepts the controller-runtime zap flags
 (`--zap-log-level`, `--zap-encoder`, `--zap-devel`, …).
+
+## `urutau-history-server`
+
+A standalone read-only API over **terminated** runs, backed by the eventlog
+trail in S3. It needs no Kubernetes RBAC — only read-only object-storage
+credentials. See [History server](../guides/history-server.md).
+
+### `urutau-history-server serve`
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--root` | _(required)_ | Eventlog root: `s3://<bucket>/<prefix>` |
+| `--listen` | `:8080` | HTTP listen address |
+| `--region` | `us-east-1` | S3 region |
+| `--endpoint` | _(AWS default)_ | S3 endpoint override (MinIO-style path addressing) |
+| `--access-key` / `--secret-key` | _(AWS chain)_ | Static S3 credentials |
+| `--page-limit` | `1000` | Max events per page |
