@@ -52,7 +52,7 @@ come from the source table's own schema (introspected for SQL sources),
 not a `columns:` list on `tables[]`.
 
 **Single reference:**
-```yaml
+```yaml title="Single enrichment reference"
 pipeline: orders-enriched
 source:
   kind: mysql
@@ -87,7 +87,7 @@ A `customer_id` with no matching row lands with `customers.name` and
 `customers.tier` both NULL (left join, not dropped).
 
 **Multiple references** (no collision — each gets its own prefix):
-```yaml
+```yaml title="Multiple enrichment references"
 enrich:
   - table: customers
     source: {uri: "mysql://repl:replpass@127.0.0.1:3306/shop", query: "SELECT id, name FROM customers"}
@@ -103,7 +103,7 @@ enrich:
 → `{..., customers.name: "Ana", products.name: "Laptop", products.category: "electronics"}`
 
 **Renaming with `as`:**
-```yaml
+```yaml title="Renaming enriched columns"
 enrich:
   - table: customers
     source: {uri: "mysql://repl:replpass@127.0.0.1:3306/shop", query: "SELECT id, name, tier FROM customers"}

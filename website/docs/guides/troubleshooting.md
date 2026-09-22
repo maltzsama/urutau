@@ -98,7 +98,7 @@ it.
 
 **Fix** — build into the daemon instead, which retags regardless:
 
-```sh
+```sh command="make k8s-load"
 make k8s-load      # eval $(minikube docker-env) && docker build -t urutau:dev .
 ```
 

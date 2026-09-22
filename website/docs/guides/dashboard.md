@@ -15,7 +15,7 @@ No CDN, no external dependencies, no build step: the HTML, JavaScript
 Pass `--metrics-addr` to the coordinator (or the collapsed `urutau run`
 CLI). The dashboard is served on the same address:
 
-```sh
+```sh command="urutau run -f pipeline.yaml --metrics-addr :9090"
 # Single-process mode
 urutau run -f pipeline.yaml --metrics-addr :9090
 
@@ -25,7 +25,7 @@ urutau-coordinator run -f pipeline.yaml --metrics-addr :9090
 
 On Kubernetes, set `spec.coordinator.metricsAddr` in the `CDCPipeline` CR:
 
-```yaml
+```yaml title="CDCPipeline CR with metrics"
 apiVersion: urutau.maltzsama.github.io/v1alpha1
 kind: CDCPipeline
 spec:
@@ -160,7 +160,7 @@ coordinator state through the `State` interface — the same dependency
 direction the rest of the orchestration keeps. The coordinator implements
 `State`; the dashboard never imports the coordinator.
 
-```
+```text title="Dashboard architecture"
 coordinator.go
   └── dashboard.Handler
         ├── /api/v1/*  (JSON API)

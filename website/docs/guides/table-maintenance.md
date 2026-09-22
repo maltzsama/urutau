@@ -22,7 +22,7 @@ Urutau automates all three so you don't have to schedule external jobs.
 
 Add a `sink.maintenance` block to your pipeline spec:
 
-```yaml
+```yaml title="Maintenance configuration"
 sink:
   type: iceberg+rest
   uri: http://catalog:8181
@@ -161,7 +161,7 @@ Each maintenance run emits events visible in the dashboard and via the
 
 Example event:
 
-```json
+```json title="Maintenance event example"
 {
   "ts": "2026-09-17T11:05:32.123456789Z",
   "type": "compaction",
@@ -202,7 +202,7 @@ not block writing to partition B.
 
 ## Example: full maintenance spec
 
-```yaml
+```yaml title="Full maintenance spec"
 sink:
   type: iceberg+rest
   uri: http://catalog:8181
@@ -234,7 +234,7 @@ sink:
 
 ## Example: full-dump append-only table
 
-```yaml
+```yaml title="Append-only table with maintenance"
 sink:
   type: iceberg+rest
   uri: http://catalog:8181

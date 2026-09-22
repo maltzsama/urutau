@@ -13,7 +13,7 @@ second, looser path.
 
 ## Shape
 
-```yaml
+```yaml title="Pipeline shape"
 pipeline: orders            # required; names the run and its worker groups
 source: { … }               # required; where rows come from
 sink: { … }                 # required; where rows go
@@ -127,7 +127,7 @@ See [Sinks](sinks.md) for each sink's semantics and limits.
 A structured predicate tree, not a raw SQL string. Each node is exactly one of
 `all`, `any`, `not`, or `where`:
 
-```yaml
+```yaml title="Filter example"
 filter:
   all:
     - where: { col: status, op: eq, value: active }
@@ -204,7 +204,7 @@ The same rules run in three places, all server-side:
 A spec that fails validation is rejected with a list of problems, each
 naming the exact field path:
 
-```
+```text title="Validation error example"
 spec: tables[0].primaryKey: required when writeMode is upsert
 ```
 

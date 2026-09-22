@@ -15,7 +15,7 @@ process. No Kubernetes, no broker.
 
 ## 2. Build the binary
 
-```sh
+```sh title="Build and install"
 git clone https://github.com/maltzsama/urutau
 cd urutau
 make build
@@ -31,7 +31,7 @@ The repo's e2e stack gives you a real MySQL (binlog enabled) and a real
 Iceberg catalog (Polaris REST catalog + Trino to read the result back) with
 one command:
 
-```sh
+```sh title="Start infrastructure"
 docker compose -f test/e2e/docker-compose.yml up -d --wait mysql polaris trino rustfs bucket-init polaris-setup
 ```
 
@@ -46,7 +46,7 @@ created (see `test/e2e/mysql/init/init.sql`), plus a replication user
 
 ## 4. Write a pipeline spec
 
-```yaml
+```yaml title="pipeline.yaml"
 # pipeline.yaml
 pipeline: orders-demo
 source:
@@ -83,7 +83,7 @@ check across pipelines, and a collision corrupts binlog state for both.
 
 ## 5. Run it
 
-```sh
+```sh command="./bin/urutau run -f pipeline.yaml"
 ./bin/urutau run -f pipeline.yaml
 ```
 
@@ -101,7 +101,7 @@ Leave it running — it's a long-lived process, like any replicator.
 
 Add `--metrics-addr :9090` to enable the embedded monitoring dashboard:
 
-```sh
+```sh command="./bin/urutau run -f pipeline.yaml --metrics-addr :9090"
 ./bin/urutau run -f pipeline.yaml --metrics-addr :9090
 ```
 
@@ -117,7 +117,7 @@ The dashboard also has a JSON API at `/api/v1/*`. See
 
 Don't trust the write; read it back through a real SQL engine:
 
-```sh
+```sh title="Query Iceberg via Trino"
 docker exec -it $(docker compose -f test/e2e/docker-compose.yml ps -q trino) \
   trino --execute "SELECT * FROM iceberg.bronze.orders"
 ```
@@ -131,7 +131,7 @@ want to check).
 
 In another terminal, connect to MySQL and mutate `shop.orders`:
 
-```sh
+```sh title="Insert test data"
 docker exec -it $(docker compose -f test/e2e/docker-compose.yml ps -q mysql) \
   mysql -uroot -prootpass shop \
   -e "INSERT INTO orders (id, v, amount) VALUES (101, 'hello', 9.99);"
@@ -143,7 +143,7 @@ worker batches changes on a commit interval (a few seconds, not instant) —
 but applies as an upsert / equality-delete in Iceberg, never a new
 appended row next to the old one:
 
-```sh
+```sh title="Update test data"
 docker exec -it $(docker compose -f test/e2e/docker-compose.yml ps -q mysql) \
   mysql -uroot -prootpass shop \
   -e "UPDATE orders SET v='updated' WHERE id=101;"
@@ -151,7 +151,7 @@ docker exec -it $(docker compose -f test/e2e/docker-compose.yml ps -q mysql) \
 
 ## 9. Stop and clean up
 
-```sh
+```sh title="Stop infrastructure"
 # Ctrl-C the running `urutau run` process, then:
 docker compose -f test/e2e/docker-compose.yml down
 ```

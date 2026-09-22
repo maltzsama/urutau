@@ -15,7 +15,7 @@ Two ways to configure the connection — **mutually exclusive**:
 
 ### URI (default)
 
-```yaml
+```yaml title="URI connection"
 source:
   kind: postgres
   uri: postgres://user:password@host:port/database?sslmode=disable
@@ -24,7 +24,7 @@ source:
 
 ### Structured fields
 
-```yaml
+```yaml title="Structured connection with TLS/SSH"
 source:
   kind: postgres
   slotName: my_slot
@@ -105,7 +105,7 @@ connected user may `SELECT`. The spec then omits `tables` entirely — discovery
 and an explicit `tables` list are **mutually exclusive** (declaring both is a
 validation error).
 
-```yaml
+```yaml title="Table discovery"
 pipeline: shop
 source:
   kind: postgres
@@ -191,7 +191,7 @@ A table can sync by **cursor column** instead of the replication log: it reads
 the last cursor value. No replication slot, no publication — useful for slowly
 changing tables or servers where logical replication is not available.
 
-```yaml
+```yaml title="Incremental mode"
 tables:
   - source: public.accounts
     target: raw.accounts
@@ -262,7 +262,7 @@ transaction between slot creation and the stream start is lost.
 
 ### URI-based
 
-```yaml
+```yaml title="URI-based pipeline"
 pipeline: shop
 source:
   kind: postgres
@@ -281,7 +281,7 @@ tables:
 
 ### Structured config with TLS and SSH
 
-```yaml
+```yaml title="Structured config with TLS and SSH"
 pipeline: shop
 source:
   kind: postgres

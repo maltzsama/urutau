@@ -82,7 +82,7 @@ than skipping the gap.
 
 ## Example
 
-```yaml
+```yaml title="MySQL pipeline"
 pipeline: shop
 source:
   kind: mysql

@@ -27,7 +27,7 @@ type is a validation error, not a silently-ignored setting, so a pipeline
 cannot look like it is compacting when nothing will run. It enables
 compaction, snapshot expiry, and orphan file cleanup, disabled by default:
 
-```yaml
+```yaml title="Maintenance configuration"
 sink:
   maintenance:
     enabled: true

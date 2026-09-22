@@ -20,7 +20,7 @@ You're replicating `shop.orders`. Every order carries a `customer_id`,
 but you want the customer's `name` and `tier` on the row too, without
 adding a join to every downstream query.
 
-```yaml
+```yaml title="Enrichment pipeline"
 pipeline: orders-enriched
 source:
   kind: mysql
@@ -92,7 +92,7 @@ default beyond `maxRows`, which defaults to 5,000,000 rows. If your query
 returns more than that, the pipeline fails loudly at load time rather
 than silently ballooning memory:
 
-```yaml
+```yaml title="maxRows guardrail"
 enrich:
   - table: customers
     source: {uri: "...", query: "SELECT id, name, tier FROM customers"}
@@ -108,7 +108,7 @@ tuning knob to raise casually.
 
 ## Keeping the reference fresh
 
-```yaml
+```yaml title="Refresh settings"
     refresh: 5m        # default
     onColdStart: buffer # default
 ```

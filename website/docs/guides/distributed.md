@@ -39,7 +39,7 @@ is a startup failure, not a silent degradation: the coordinator waits
 Use the same spec you would give `urutau run`, with `workers: {number: N}`
 on the tables you want to parallelize.
 
-```sh
+```sh title="Run coordinator and workers"
 # Terminal 1 — the coordinator
 ./bin/urutau-coordinator run -f pipeline.yaml --listen :50051
 
@@ -76,7 +76,7 @@ WARN coordinator: control plane is PLAINTEXT — the Assignment carries the sour
 A minimal CA plus a server certificate for the coordinator and a client
 certificate for each worker:
 
-```sh
+```sh title="Generate mTLS certificates"
 # CA
 openssl req -x509 -newkey rsa:4096 -days 365 -nodes \
   -keyout ca.key -out ca.crt -subj "/CN=urutau-ca"
@@ -95,7 +95,7 @@ openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -days 365 -out client.crt
 ```
 
-```sh
+```sh title="Run with mTLS"
 urutau-coordinator run -f pipeline.yaml \
   --tls-cert server.crt --tls-key server.key --tls-ca ca.crt
 

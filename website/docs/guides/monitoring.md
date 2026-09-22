@@ -79,7 +79,7 @@ coordinator logs, all updated in real time via Server-Sent Events.
 
 Enable it with `--metrics-addr`:
 
-```sh
+```sh command="urutau run -f pipeline.yaml --metrics-addr :9090"
 urutau run -f pipeline.yaml --metrics-addr :9090
 # Open http://localhost:9090
 ```
@@ -102,7 +102,7 @@ workers, their phases, the current position, per-table progress.
 Reach for it when you want to know *what it is doing right now*, as opposed
 to what the counters say:
 
-```sh
+```sh title="Check live state"
 curl -s http://coordinator:9090/statusz | jq
 ```
 

@@ -12,7 +12,7 @@ just makes it explicit before the [append-only](append-only.md) and
 
 ## MySQL → Iceberg
 
-```yaml
+```yaml title="MySQL → Iceberg" command="urutau run -f examples/mysql-iceberg.yaml"
 pipeline: e2e-mysql
 source:
   kind: mysql
@@ -40,7 +40,7 @@ after a stop/restart. Full file: [`examples/mysql-iceberg.yaml`](https://github.
 
 ## Postgres → Iceberg
 
-```yaml
+```yaml title="Postgres → Iceberg" command="urutau run -f examples/postgres-iceberg.yaml"
 pipeline: e2e-postgres
 source:
   kind: postgres
@@ -66,7 +66,7 @@ slot the source creates and reads from (`pgoutput`). Full file:
 
 ## MySQL → ClickHouse
 
-```yaml
+```yaml title="MySQL → ClickHouse" command="urutau run -f examples/mysql-clickhouse.yaml"
 pipeline: e2e-mysql-clickhouse
 source:
   kind: mysql
@@ -91,7 +91,7 @@ carry one. Full file: [`examples/mysql-clickhouse.yaml`](https://github.com/malt
 
 ## MySQL → Couchbase
 
-```yaml
+```yaml title="MySQL → Couchbase" command="urutau run -f examples/mysql-couchbase.yaml"
 pipeline: e2e-mysql-couchbase
 source:
   kind: mysql
