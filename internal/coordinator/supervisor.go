@@ -68,6 +68,18 @@ func (s *supervisor) noteAttach(worker string) {
 	s.mu.Unlock()
 }
 
+// forget drops every trace of a worker the coordinator no longer tracks — a
+// scale-out rolled back before commit. Its ack clock, pending-reset flag and
+// reset window must not linger, or a later re-registration would inherit
+// them.
+func (s *supervisor) forget(worker string) {
+	s.mu.Lock()
+	delete(s.lastAck, worker)
+	delete(s.pending, worker)
+	delete(s.resets, worker)
+	s.mu.Unlock()
+}
+
 // pendingSet marks a worker as reset-and-not-reattached.
 func (s *supervisor) pendingSet(worker string) {
 	s.mu.Lock()

@@ -50,6 +50,7 @@ func scaleHarness(t *testing.T) (*Coordinator, *scalingChunker) {
 	}}
 	ch := &scalingChunker{}
 	c.chunkers = map[string]source.ChunkSource{"raw.orders": ch}
+	c.snk = fakeStagedSink{} // a staging sink that supports concurrent writers
 	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}}})
 	c.workers[w.name] = w
 	c.byTicket = map[string]*workerState{}
@@ -354,4 +355,74 @@ func TestRoutingSnapshotIsConsistentUnderConcurrentScale(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// A table booted unpartitioned (workers: 1) may only be scaled to N>1 if its
+// sink can order concurrent writers — the same capability boot-time
+// validation requires.
+func TestScaleRejectsNonConcurrentSink(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.snk = fakeNonConcurrentSink{}
+
+	err := c.ScaleTable(context.Background(), "raw.orders", 2)
+	if err == nil || !strings.Contains(err.Error(), "concurrent") {
+		t.Fatalf("want a concurrent-writer error, got %v", err)
+	}
+	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+		t.Fatalf("owners = %d, want the pre-scale 1 (no flip)", len(got))
+	}
+}
+
+// A scale whose prepare phase fails (the drain never converges) must roll
+// back the owners it CREATED, or they linger as ghosts under the old layout:
+// accepting Hellos, supervised, and holding a retention position.
+func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.cfg.ScaleDrainTimeout = 200 * time.Millisecond
+	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	// One in-flight batch the drain can never clear.
+	c.index[owners[0].name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+
+	if err := c.ScaleTable(context.Background(), "raw.orders", 2); err == nil {
+		t.Fatal("the scale must fail when the drain never converges")
+	}
+
+	name := partitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)
+	c.mu.Lock()
+	_, inWorkers := c.workers[name]
+	_, inIndex := c.index[name]
+	c.mu.Unlock()
+	c.confirmedMu.Lock()
+	_, inConfirmed := c.confirmed[name]
+	c.confirmedMu.Unlock()
+	if inWorkers || inIndex || inConfirmed {
+		t.Fatalf("created owner %q lingered after a failed scale: workers=%v index=%v confirmed=%v",
+			name, inWorkers, inIndex, inConfirmed)
+	}
+	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+		t.Fatalf("owners = %d, want the pre-scale 1 (no flip)", len(got))
+	}
+}
+
+// After the flip commits, a scale-in must detach the removed owner even if
+// the caller context is cancelled mid-drain — otherwise the scale reports
+// success while the owner keeps its session and resources under the new
+// layout.
+func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
+	c, _ := scaleHarness(t)
+	w, _ := c.loadRouting().ownersOf("raw.orders")
+	owner := w[0]
+	// A batch that will never drain, so the loop would spin.
+	c.index[owner.name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.retireOwner(ctx, owner)
+
+	c.mu.Lock()
+	_, still := c.workers[owner.name]
+	c.mu.Unlock()
+	if still {
+		t.Fatal("a retired owner must be detached even when the context is cancelled")
+	}
 }

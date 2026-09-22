@@ -10,6 +10,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/source"
+	"github.com/maltzsama/urutau/spec"
 )
 
 // routing is the immutable snapshot of one table's partition layout: the
@@ -171,6 +172,13 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	if n > 1 && len(ref.PrimaryKey) == 0 {
 		return fmt.Errorf("coordinator: scale %s: partitioning requires a primary key", target)
 	}
+	// A partitioned table needs a sink that can order concurrent writers —
+	// the same capability boot-time validation requires. Re-checked here
+	// because the table may have booted unpartitioned (workers: 1) and is
+	// only now becoming partitioned.
+	if err := requireConcurrentSink(spec.Table{Target: target, Workers: &spec.WorkerSpec{Number: n}}, c.snk); err != nil {
+		return fmt.Errorf("coordinator: scale %s: %w", target, err)
+	}
 
 	ranges, err := c.rangesFor(ctx, target, n, ref)
 	if err != nil {
@@ -180,17 +188,28 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 		return fmt.Errorf("coordinator: scale %s: resolved %d ranges for %d partitions", target, len(ranges), n)
 	}
 
-	next, removed, err := c.reslicedOwners(target, owners, n, ref)
+	next, removed, created, err := c.reslicedOwners(target, owners, n, ref)
 	if err != nil {
 		return fmt.Errorf("coordinator: scale %s: %w", target, err)
 	}
 
+	// A pre-commit failure leaves the old layout active, so the owners this
+	// call CREATED must be rolled back: otherwise they linger as ghosts —
+	// accepting Hellos, supervised, and holding a retention position they
+	// will never advance.
+	committed := false
+	defer func() {
+		if !committed {
+			for _, w := range created {
+				c.unregisterOwner(w)
+			}
+		}
+	}()
+
 	// The new owners must be able to resume: an owner with no confirmed
 	// position pins confirmedPosition to nil and stalls source retention
-	// for the WHOLE pipeline, not just this table. A scale-in adds none.
-	if len(next) > len(owners) {
-		c.seedConfirmed(next[len(owners):])
-	}
+	// for the WHOLE pipeline, not just this table. A scale-in creates none.
+	c.seedConfirmed(created)
 
 	// PREPARE: pause the table's input. The drain below waits until the
 	// table owes nothing — every in-flight batch acked, every staged cycle
@@ -217,6 +236,7 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	c.publishRouting(snap)
 	c.resumeTable(target)
 	resumed = true
+	committed = true
 
 	c.emitScale(target, len(owners), n)
 
@@ -232,32 +252,37 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 
 // reslicedOwners returns the owner slice for n partitions, keeping the
 // existing owners in place (minimal remap: only the boundary moves) and
-// creating the ones a scale-out adds. It also returns the owners a
-// scale-in drops.
-func (c *Coordinator) reslicedOwners(target string, cur []*workerState, n int, ref source.TableRef) (next, removed []*workerState, err error) {
+// creating the ones a scale-out adds. It also returns the owners a scale-in
+// drops and the ones this call CREATED (not reused), so a pre-commit failure
+// can roll exactly those back.
+func (c *Coordinator) reslicedOwners(target string, cur []*workerState, n int, ref source.TableRef) (next, removed, created []*workerState, err error) {
 	if n <= len(cur) {
-		return cur[:n:n], cur[n:], nil
+		return cur[:n:n], cur[n:], nil, nil
 	}
 	next = make([]*workerState, len(cur), n)
 	copy(next, cur)
 	for p := len(cur); p < n; p++ {
-		w, err := c.registerOwner(partitionName(c.cfg.Spec.Pipeline, target, p), ref)
+		w, isNew, err := c.registerOwner(partitionName(c.cfg.Spec.Pipeline, target, p), ref)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		next = append(next, w)
+		if isNew {
+			created = append(created, w)
+		}
 	}
-	return next, nil, nil
+	return next, nil, created, nil
 }
 
 // registerOwner creates a worker group and publishes it in the registry, so
 // Session accepts the pod's Hello the moment it connects. A name that is
-// already registered is reused: a pod restart must not orphan its queue.
-func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerState, error) {
+// already registered is reused (created=false): a pod restart must not
+// orphan its queue.
+func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerState, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if w, ok := c.workers[name]; ok {
-		return w, nil
+		return w, false, nil
 	}
 	w := &workerState{
 		name:  name,
@@ -280,7 +305,23 @@ func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerSt
 	// Seed the ack clock before the pod can attach, or the supervisor's
 	// next tick sees an attached worker with no lastAck and resets it.
 	c.supervisor.noteRegistered(name, time.Now())
-	return w, nil
+	return w, true, nil
+}
+
+// unregisterOwner drops a worker the coordinator created for a scale that
+// never committed, so no ghost owner is left registered under the old
+// layout — accepting Hellos, supervised, and holding a retention position it
+// will never advance.
+func (c *Coordinator) unregisterOwner(w *workerState) {
+	c.mu.Lock()
+	delete(c.workers, w.name)
+	delete(c.byTicket, string(w.ticket))
+	delete(c.index, w.name)
+	c.mu.Unlock()
+	c.confirmedMu.Lock()
+	delete(c.confirmed, w.name)
+	c.confirmedMu.Unlock()
+	c.supervisor.forget(w.name)
 }
 
 // seedConfirmed gives each owner the pipeline's current confirmed position
@@ -354,7 +395,11 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	for c.inFlight(w.name) != 0 || len(w.queue) != 0 {
 		select {
 		case <-ctx.Done():
-			return
+			// The flip has already committed: the retire must finish, or the
+			// owner stays registered with a live session under the new
+			// layout. Force the detach rather than abort mid-way.
+			c.log.Warn("coordinator: owner drain context done; forcing removal",
+				"worker", w.name, "inflight", c.inFlight(w.name))
 		case <-deadline.C:
 			c.log.Warn("coordinator: owner drain timed out; forcing removal",
 				"worker", w.name, "inflight", c.inFlight(w.name), "timeout", c.drainTimeout())
