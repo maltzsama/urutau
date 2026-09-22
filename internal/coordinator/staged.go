@@ -179,3 +179,27 @@ func (s *stagedCycles) discardWorker(worker string) int {
 	}
 	return discarded
 }
+
+// openFor counts the cycles of table that are not yet committed: still
+// accumulating deliveries (open) or complete but waiting their turn in seq
+// order (done). A re-slice waits for this to reach zero, so no cycle spans
+// two partition layouts.
+func (s *stagedCycles) openFor(ref core.TableRef) int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k := range s.open {
+		if k.table == ref.Target {
+			n++
+		}
+	}
+	for k := range s.done {
+		if k.table == ref.Target {
+			n++
+		}
+	}
+	return n
+}

@@ -310,6 +310,13 @@ message BatchMeta {
   uint64    batch_id = 4;
   uint64    epoch    = 5;  // same guard as Ack
   WindowTag window   = 6;
+  // staged tells the worker to stage this batch (write files, ship the
+  // descriptor, let the coordinator commit the cycle) instead of committing
+  // it directly. The coordinator decides per batch, so a table that changes
+  // commit mode on a re-slice (1 owner → N) is consistent from the first
+  // batch after the flip: the surviving owner stages too, and its cycle is
+  // not left open blocking the new owners' cycles.
+  bool staged = 7;
 }
 
 message WindowTag {

@@ -469,7 +469,11 @@ type Table struct {
 // of Spark's spark.executor.cores/memory, scoped to one hot table instead
 // of the whole job.
 type WorkerSpec struct {
-	Number int    `json:"number,omitempty"`
+	Number int `json:"number,omitempty"`
+	// Max caps how many partitions this table may be scaled to at
+	// runtime (issue #312). Zero means the pipeline-wide default. A table
+	// that sets it ignores the global cap.
+	Max    int    `json:"max,omitempty"`
 	CPU    string `json:"cpu,omitempty"`
 	Memory string `json:"memory,omitempty"`
 }

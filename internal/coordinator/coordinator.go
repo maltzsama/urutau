@@ -112,6 +112,20 @@ type Config struct {
 	MaxResets   int
 	ResetWindow time.Duration
 
+	// ScaleDrainTimeout bounds how long a re-slice waits for a table's
+	// open staged cycles, and for a removed owner's in-flight batches, to
+	// drain. Past it the owner is forced out and its range is replayed by
+	// the inheriting owner — safe because the writes are idempotent
+	// upserts (issue #312). Default 60s.
+	ScaleDrainTimeout time.Duration
+	// MaxWorkers caps the partitions one table may be scaled to when the
+	// table declares no cap of its own. Default 32.
+	MaxWorkers int
+	// OnReady, when set, receives the running coordinator once its
+	// routing is published. It is how a scaler reaches ScaleTable
+	// in-process (issue #312); the operator wires the HTTP action to it.
+	OnReady func(*Coordinator)
+
 	// MetricsAddr serves /metrics (Prometheus), /statusz (live state), and the
 	// dashboard (issue #97). Empty disables the endpoint.
 	MetricsAddr string
@@ -159,16 +173,25 @@ type Coordinator struct {
 	// partitionRanges[target][i]) — a table with Workers<=1 has exactly
 	// one entry, an unbounded range, matching today's single-worker
 	// behavior byte for byte.
-	route           map[string][]*workerState
-	partitionRanges map[string][]source.Chunk
+	// routing is the live partition layout, swapped atomically by a
+	// re-slice (issue #312). A reader loads the snapshot ONCE and routes a
+	// whole batch by it, so a flip never splits one batch across two
+	// layouts. Boot publishes the first snapshot; ScaleTable replaces it.
+	routing atomic.Pointer[routing]
+	// repart serializes re-slices: two concurrent scale events would each
+	// read-modify-write the snapshot and one would be lost.
+	repart repartitioner
 	// chunkers is the per-table chunker built at boot: reused for the
 	// snapshot so a partitioned table's chunker (forced to key-based
 	// chunking by Partitions) is the one the snapshot bounds come from.
-	chunkers map[string]source.ChunkSource
-	workers  map[string]*workerState
-	byTicket map[string]*workerState
-	budget   *flowBudget
-	index    map[string]*positionIndex
+	// A re-slice builds one on demand for a table booted unpartitioned, so
+	// chunkersMu guards the map against the snapshot goroutine's read.
+	chunkers   map[string]source.ChunkSource
+	chunkersMu sync.Mutex
+	workers    map[string]*workerState
+	byTicket   map[string]*workerState
+	budget     *flowBudget
+	index      map[string]*positionIndex
 
 	// runCtx outlives the helper goroutines that need cancellation (the
 	// wireRelay) but are called outside run's select.
@@ -223,6 +246,14 @@ type Coordinator struct {
 	// a structural bound). One shared channel: any drain (of any window)
 	// wakes every waiter, which re-checks its own window's state.
 	gateDrain chan struct{}
+
+	// paused blocks the pump for a table whose re-slice is draining. The
+	// flip waits for the table to owe nothing, which a continuously loaded
+	// table never reaches on its own; pausing the input lets the queue
+	// drain, then the flip, then resume. Keyed by target; the pump checks it
+	// per batch, so only a paused table's batches block.
+	pausedMu sync.Mutex
+	paused   map[string]chan struct{}
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
@@ -336,7 +367,6 @@ func Run(ctx context.Context, cfg Config) error {
 	c := &Coordinator{
 		cfg:         cfg,
 		log:         cfg.Logger,
-		route:       map[string][]*workerState{},
 		workers:     map[string]*workerState{},
 		byTicket:    map[string]*workerState{},
 		index:       map[string]*positionIndex{},
@@ -346,6 +376,7 @@ func Run(ctx context.Context, cfg Config) error {
 		gateOn:      map[string]bool{},
 		gateWin:     map[string]gateWindow{},
 		gateBuf:     map[string][]*dataplane.Batch{},
+		paused:      map[string]chan struct{}{},
 		gateDrain:   make(chan struct{}),
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
@@ -534,7 +565,8 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// or not. Workers<=1 short-circuits to a single unbounded range with
 	// no chunker query at all, so this is a no-op for every unpartitioned
 	// table (the overwhelming common case today).
-	c.partitionRanges = make(map[string][]source.Chunk, len(c.cfg.Spec.Tables))
+	bootRanges := make(map[string][]source.Chunk, len(c.cfg.Spec.Tables))
+	bootOwners := make(map[string][]*workerState, len(c.cfg.Spec.Tables))
 	c.chunkers = make(map[string]source.ChunkSource, len(c.cfg.Spec.Tables))
 	// workerTarget maps every derived worker group name back to the table
 	// target it belongs to — provisionWorkers uses it to pick that
@@ -553,7 +585,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if len(ranges) != len(names) {
 			return fmt.Errorf("coordinator: %s: resolved %d partition ranges for %d worker groups", t.Source, len(ranges), len(names))
 		}
-		c.partitionRanges[t.Target] = ranges
+		bootRanges[t.Target] = ranges
 		c.chunkers[t.Target] = chunker
 
 		owners := make([]*workerState, len(names))
@@ -584,7 +616,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 			owners[p] = w
 			workerTarget[name] = t.Target
 		}
-		c.route[t.Target] = owners
+		bootOwners[t.Target] = owners
+	}
+	// Publish the boot layout once: every runtime reader loads this
+	// snapshot, and a re-slice swaps in a successor (issue #312).
+	c.publishRouting(&routing{owners: bootOwners, ranges: bootRanges})
+	if c.cfg.OnReady != nil {
+		c.cfg.OnReady(c)
 	}
 	if err := c.provisionWorkers(ctx, workerTarget); err != nil {
 		return fmt.Errorf("coordinator: %w", err)
@@ -801,8 +839,8 @@ func (c *Coordinator) run(ctx context.Context) error {
 			if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 				c.log.Warn("coordinator: eventlog emit", "err", err)
 			}
-			chunker, ok := c.chunkers[ref.Target]
-			if !ok || chunker == nil {
+			chunker := c.lookupChunker(ref.Target)
+			if chunker == nil {
 				var cerr error
 				chunker, cerr = c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 				if cerr != nil {
@@ -1086,6 +1124,11 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 			if c.metrics != nil {
 				c.metrics.EventsDecoded.Inc()
 			}
+			// A re-slice pauses this table so its drain can converge. The
+			// batch is held here (not routed, not counted by the drain) until
+			// the flip, then enqueued under the new layout — so no batch
+			// spans the flip and ordering is preserved.
+			c.waitUnpaused(ctx, b.Table)
 			if c.gateHold(ctx, b) {
 				continue
 			}
@@ -1373,11 +1416,12 @@ func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID 
 // Closes marker. The worker holds the chunk rows in its window; the window
 // is what InWindow events drain and the Closes marker flushes.
 func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
-	owners, ok := c.route[ref.Target]
+	rt := c.loadRouting()
+	owners, ok := rt.ownersOf(ref.Target)
 	if !ok {
 		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
 	}
-	ranges := c.partitionRanges[ref.Target]
+	ranges := rt.rangesOf(ref.Target)
 	if len(ranges) != len(owners) {
 		return fmt.Errorf("coordinator: snapshot: table %s: %d partition ranges for %d owners", ref.Target, len(ranges), len(owners))
 	}
@@ -1582,12 +1626,16 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if meta == nil {
 		meta = &pb.BatchMeta{}
 	}
-	owners, ok := c.route[meta.Table]
+	// ONE snapshot load for this whole batch: a concurrent re-slice may
+	// publish a new layout mid-batch, and routing half the rows by each
+	// would split a key range across two owners (issue #312).
+	rt := c.loadRouting()
+	owners, ok := rt.ownersOf(meta.Table)
 	if !ok {
 		if b != nil {
 			meta.Table = b.Table
 		}
-		owners, ok = c.route[meta.Table]
+		owners, ok = rt.ownersOf(meta.Table)
 		if !ok {
 			return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
 		}
@@ -1620,7 +1668,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if len(pk) == 0 {
 		return fmt.Errorf("coordinator: table %s has %d partition owners but no primary key to route by", meta.Table, len(owners))
 	}
-	ranges := c.partitionRanges[meta.Table]
+	ranges := rt.rangesOf(meta.Table)
 	if len(ranges) != len(owners) {
 		return fmt.Errorf("coordinator: table %s: %d partition ranges for %d owners", meta.Table, len(ranges), len(owners))
 	}
@@ -1696,6 +1744,12 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if meta.BatchId == 0 {
 		meta.BatchId = c.batchSeq.Add(1)
 	}
+	// The coordinator owns the table's commit mode and states it per batch:
+	// a staging sink with >1 owner stages (the coordinator commits the
+	// cycle), everything else commits directly. Setting it here, at send
+	// time, keeps every owner on the same mode even when the table changes
+	// mode under it (1 owner → N on a re-slice, issue #312).
+	meta.Staged = c.isStagedTable(meta.Table)
 
 	var body []byte
 	var metaBytes []byte
@@ -2097,7 +2151,11 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			SchemaArrow:       schemaB,
 			// A partitioned table on a staging sink: the worker stages its
 			// data files and the coordinator commits the cycle (WK-001 C5).
-			Staged: c.stagesCycles() && len(c.route[ref.Target]) > 1,
+			// This is the mode at ATTACH time; live batches carry the current
+			// mode per batch (BatchMeta.staged), so a table that becomes
+			// partitioned under this worker (issue #312) is staged from the
+			// next batch even though this flag is stale.
+			Staged: c.isStagedTable(ref.Target),
 		}
 		// The table's write shape travels with the assignment so the worker's
 		// collapse and the coordinator's DDL agree: the per-table write mode
@@ -2255,7 +2313,7 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 		// The expected partition count travels to the sink: a per-partition
 		// Position() must not return a MinSafe over an incomplete owner set,
 		// or an owner with no committed position yet is resumed past (§2.6).
-		ref.OwnerCount = len(c.route[ref.Target])
+		ref.OwnerCount = len(c.loadRouting().owners[ref.Target])
 		pos, err := c.snk.Position(ctx, ref)
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
@@ -2454,7 +2512,12 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
 	}
 	c.pushDashState() // the worker is no longer attached
-	if !errors.Is(retErr, errSessionReset) && !c.supervisor.isPending(worker) {
+	// A session cancelled by the coordinator — a supervisor reset or a
+	// re-slice retiring an owner — surfaces as errSessionReset OR, when the
+	// recv goroutine wins the race, as context.Canceled. Neither is a worker
+	// failure; only a real stream error is. Treating the cancel as a failure
+	// ended the whole run the moment a scale-in retired an owner.
+	if !errors.Is(retErr, errSessionReset) && !errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)

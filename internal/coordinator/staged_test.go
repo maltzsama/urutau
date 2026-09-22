@@ -135,17 +135,28 @@ func (fakeStagedSink) CommitStaged(context.Context, core.TableRef, [][]byte, str
 	return nil
 }
 
+// SupportsConcurrentWriters lets the re-slice capability check pass; these
+// tests exercise routing and cycle bookkeeping, not the sink.
+func (fakeStagedSink) SupportsConcurrentWriters() bool { return true }
+
+// fakeNonConcurrentSink is a sink.Sink that declares it cannot order
+// concurrent writers, for the re-slice capability check.
+type fakeNonConcurrentSink struct{ sink.Sink }
+
+func (fakeNonConcurrentSink) SupportsConcurrentWriters() bool { return false }
+
 // WK-001 §2.2/F2: only a partitioned table on a staging sink is "staged" —
 // its commits are owned by the coordinator's cycle, so its worker's ack must
 // not advance the confirmed position.
 func TestIsStagedTable(t *testing.T) {
-	c := &Coordinator{
-		snk: fakeStagedSink{},
-		route: map[string][]*workerState{
+	c := &Coordinator{snk: fakeStagedSink{}}
+	c.publishRouting(&routing{
+		owners: map[string][]*workerState{
 			"orders": {{name: "w0"}, {name: "w1"}},
 			"items":  {{name: "w2"}},
 		},
-	}
+		ranges: map[string][]source.Chunk{},
+	})
 	if !c.isStagedTable("orders") {
 		t.Fatal("partitioned table on a staging sink must be staged")
 	}

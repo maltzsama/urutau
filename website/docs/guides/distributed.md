@@ -153,6 +153,52 @@ A sink that does not support concurrent writers rejects
 [Operator](../architecture/operator.md#concurrent-writers-two-different-fixes-for-the-same-problem)
 has the details.
 
+## Runtime scaling
+
+A running coordinator can re-slice a table across a different number of
+workers — adding or removing owners and swapping the routing snapshot
+atomically, with no coordinator restart. A scaler (KEDA, or an operator by
+hand) drives it via `Coordinator.ScaleTable`.
+
+The sequence is **prepare → commit**, and every wait is bounded: a step that
+cannot complete fails the scale and leaves the old layout in place, so a
+scale is a retryable no-op rather than an incident — never an unbounded
+pause, never data loss.
+
+1. **Prepare** — register any new owner (so its Hello is accepted the moment
+   its pod starts), then **pause the table's input** at the coordinator's
+   pump. The flip requires the table to owe nothing (no in-flight batch, no
+   open staged cycle), and a continuously loaded table never reaches that on
+   its own; pausing the input lets the queue drain, which is what makes the
+   barrier converge under load.
+2. **Commit** — swap the routing snapshot atomically, then resume the input.
+   A reader that loaded the old snapshot keeps routing a whole batch by it,
+   so a batch is never split across two layouts; the pump's held batch, and
+   every batch after it, is routed by the new layout.
+3. **Retire** (scale-in only) — each removed owner drains, then is detached.
+
+A prepare step that times out — the table never drains, a commit never lands
+— resumes the input and returns with the old layout intact. The scaler
+retries, and worker recovery stays the supervisor's job: a worker that
+stalls owing work is terminated for a clean replay from the committed
+position, not reset mid-flight (which would replay its batches).
+
+The pause briefly holds the whole pipeline's reader — the pump is shared, so
+other tables stall for the duration of the drain. That is the price of not
+losing the events that arrive during the flip, and the drain is bounded, so
+the stall is too.
+
+The commit mode travels **per batch** (`BatchMeta.staged`), decided by the
+coordinator at send time, not frozen in the worker's assignment. That is what
+makes a table that *becomes* partitioned under a running worker safe: the
+surviving owner, which attached when the table was unpartitioned, stages the
+batches the coordinator now marks staged instead of committing them directly —
+a direct commit would leave its staged cycle open and block every cycle
+behind it in the table's send order (issue #312).
+
+A table's `workers.max` caps how far it may scale **up**; it never blocks a
+scale-down. A table that sets it ignores the coordinator's default (32).
+
 ## Next steps
 
 - **Automate the lifecycle**: [Deploy on Kubernetes](deploy-kubernetes.md).

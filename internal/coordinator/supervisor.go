@@ -39,6 +39,20 @@ func newSupervisor(c *Coordinator) *supervisor {
 	}
 }
 
+// noteRegistered seeds a newly created worker group's ack clock. tick treats
+// an attached worker with no lastAck entry as stale, and Session sets
+// w.attached under c.mu BEFORE calling noteAttach, so a tick landing in that
+// window would reset a worker that had just connected — a scale-out
+// crashloop. Boot never hit it: every worker attaches before the supervisor
+// starts ticking.
+func (s *supervisor) noteRegistered(worker string, at time.Time) {
+	s.mu.Lock()
+	if _, ok := s.lastAck[worker]; !ok {
+		s.lastAck[worker] = at
+	}
+	s.mu.Unlock()
+}
+
 // noteAck records a worker's ack time.
 func (s *supervisor) noteAck(worker string, at time.Time) {
 	s.mu.Lock()
@@ -51,6 +65,18 @@ func (s *supervisor) noteAttach(worker string) {
 	s.mu.Lock()
 	delete(s.pending, worker)
 	s.lastAck[worker] = time.Now()
+	s.mu.Unlock()
+}
+
+// forget drops every trace of a worker the coordinator no longer tracks — a
+// scale-out rolled back before commit. Its ack clock, pending-reset flag and
+// reset window must not linger, or a later re-registration would inherit
+// them.
+func (s *supervisor) forget(worker string) {
+	s.mu.Lock()
+	delete(s.lastAck, worker)
+	delete(s.pending, worker)
+	delete(s.resets, worker)
 	s.mu.Unlock()
 }
 
@@ -116,19 +142,30 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	type attachProbe struct {
 		name     string
 		attached bool
+		owes     bool
 	}
 	probes := make([]attachProbe, 0, len(s.c.workers))
 	for name, w := range s.c.workers {
-		probes = append(probes, attachProbe{name: name, attached: w.attached})
+		probes = append(probes, attachProbe{name: name, attached: w.attached, owes: len(w.queue) > 0})
 	}
 	s.c.mu.Unlock()
+	// A worker owes work when it holds a delivered-but-unacked batch or has
+	// one queued. inFlight takes the index's own lock, so it is read outside
+	// c.mu.
+	for i := range probes {
+		probes[i].owes = probes[i].owes || s.c.inFlight(probes[i].name) > 0
+	}
 
 	s.mu.Lock()
 	for _, p := range probes {
 		at, ok := s.lastAck[p.name]
 		// A reset worker that never reattached keeps the job in crashloop;
 		// an attached worker that never acked is just as stale.
-		if s.pending[p.name] || (p.attached && (!ok || now.Sub(at) > ack)) {
+		// An ack timeout means a worker owes work and is not delivering it.
+		// An ATTACHED worker that owes nothing is merely idle — a quiet
+		// table, or one that just went through a re-slice — and resetting it
+		// destroys its open staged cycles for no reason (issue #312).
+		if s.pending[p.name] || (p.attached && p.owes && (!ok || now.Sub(at) > ack)) {
 			stale = append(stale, p.name)
 		}
 	}

@@ -387,3 +387,8 @@ tmp/
 # e2e generated fixtures (self-signed TLS cert, ephemeral SSH keys)
 test/e2e/postgres/tls/
 test/e2e/postgres/ssh/
+
+.agents/
+agent/
+skills-lock.json
+

@@ -113,12 +113,35 @@ func TestStagedFlushesPerCycleSeq(t *testing.T) {
 	}
 }
 
+// TestStageSelectsPerBatchMode: a live batch's commit mode is the
+// coordinator's per-batch decision (BatchMeta.staged), which can flip under a
+// re-slice; a worker-generated snapshot/window batch (Seq 0) has no BatchMeta
+// and keeps the attach-time mode. The surviving owner of a 1→N scale attached
+// when the table was unpartitioned (staged=false) yet must stage the live
+// batches the coordinator now marks staged — otherwise its cycle stays open
+// and blocks every cycle behind it (issue #312).
+func TestStageSelectsPerBatchMode(t *testing.T) {
+	unpartitioned := &tablePipeline{staged: false}
+	if !unpartitioned.stage(&dataplane.Batch{Seq: 7, Staged: true}) {
+		t.Error("a live batch the coordinator marked staged must stage even when the attach-time mode is non-staged")
+	}
+	if unpartitioned.stage(&dataplane.Batch{Seq: 7, Staged: false}) {
+		t.Error("a live batch the coordinator did not mark staged must commit directly")
+	}
+	partitioned := &tablePipeline{staged: true}
+	if !partitioned.stage(&dataplane.Batch{Seq: 0}) {
+		t.Error("a worker-generated snapshot batch keeps the attach-time mode")
+	}
+}
+
 // seqIngest wraps one change into an Ingest whose batch carries the given
-// coordinator cycle sequence.
+// coordinator cycle sequence. A batch with a cycle seq is a staged batch: the
+// coordinator sets BatchMeta.staged for exactly those (issue #312).
 func seqIngest(t *testing.T, table string, seq uint64, c rowchange.Change) Ingest {
 	t.Helper()
 	b := wireBatch(t, table, dataplane.UpsertMode, []rowchange.Change{c})
 	b.Seq = seq
+	b.Staged = true
 	return Ingest{Table: table, Batch: b}
 }
 

@@ -112,6 +112,7 @@ See [Sinks](sinks.md) for each sink's semantics and limits.
 | `partitionBy` | no | Iceberg partition transform |
 | `createIfNotExists` | no | Create the target table |
 | `workers.number` | no | Partition the table across N workers by key range |
+| `workers.max` | no | Cap for runtime scaling: a re-slice may not exceed this. Zero uses the coordinator's default (32); a table that sets it ignores the global cap |
 | `workers.cpu` / `workers.memory` | no | Per-table Kubernetes resources |
 | `identity` | append-idempotent | Transport-metadata columns making the table idempotent |
 | `metadata` | no | Pipeline metadata columns (`op`, `commit_ts`, …) |
@@ -180,6 +181,11 @@ contiguous ranges and derives the group names
 `<pipeline>-<target>-<index>`. `N <= 1` or absent means one worker, no
 partitioning. A sink that cannot handle concurrent writers rejects
 `N > 1` at boot. See [Distributed mode](../guides/distributed.md).
+
+`workers.max` caps runtime scaling (issue #312): the coordinator may
+re-slice the table up to that many workers, never beyond. Zero uses the
+coordinator's default (32); a table that sets `max` ignores the global. A
+scale-in ignores it (it is an upper bound, not a target).
 
 ### `enrich[]`
 

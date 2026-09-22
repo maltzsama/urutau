@@ -178,6 +178,23 @@ func (w *Worker) OnCommit(f OnCommit) { w.onCommit = f }
 // descriptor is dropped and the cycle never commits.
 func (w *Worker) OnStaged(f OnStaged) { w.onStaged = f }
 
+// stage reports whether batch b is committed by the coordinator's staged
+// cycle rather than directly. A live batch carries the coordinator's per-batch
+// decision (BatchMeta.staged), which can flip under a re-slice: the surviving
+// owner of a 1→N scale attached when the table was unpartitioned, so its
+// p.staged is false, yet the coordinator now expects a staged delivery from
+// it — and if it committed directly, the cycle it owes would stay open and
+// block every cycle behind it in the table's send order (issue #312). A
+// worker-generated snapshot/window batch (Seq 0) has no BatchMeta and keeps
+// the attach-time mode, which never changes after boot because a re-slice
+// does not re-snapshot.
+func (p *tablePipeline) stage(b *dataplane.Batch) bool {
+	if b.Seq == 0 {
+		return p.staged
+	}
+	return b.Staged
+}
+
 // SetStaged marks a table's pipeline as staged (WK-001 C5). It refuses when
 // the writer cannot stage, so a misconfigured assignment fails loudly instead
 // of committing data the coordinator will never see.
@@ -486,7 +503,7 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 			rb.batch.Release()
 			return fmt.Errorf("worker: table %s: batch has no write mode set", p.target)
 		}
-		if p.staged {
+		if p.stage(rb.batch) {
 			if err := w.stageBatch(ctx, p, rb.batch); err != nil {
 				rb.batch.Release()
 				if w.metrics != nil {
@@ -587,7 +604,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	// produced no data; Seq 0 is a worker-generated snapshot batch, not a
 	// cycle, and needs no delivery.
 	deliverEmpty := func(b *dataplane.Batch) error {
-		if !p.staged || b.Seq == 0 {
+		if !p.stage(b) || b.Seq == 0 {
 			return nil
 		}
 		return ready(emptyBatch(b, p.mode), 0, 0, 0)
@@ -696,9 +713,9 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	// and merge freely; each live binlog batch's sub-batch is its own cycle.
 	// Ownership of b transfers to pending.
 	addPending := func(b *dataplane.Batch, rows int) error {
-		// Only a staged table's sub-batches are coordinator cycles: for
-		// every other table the flush stays on MaxRows/MaxInterval.
-		if p.staged && len(pending) > 0 && b.Seq != pendingSeq {
+		// Only a staged batch is a coordinator cycle: for every other batch
+		// the flush stays on MaxRows/MaxInterval.
+		if p.stage(b) && len(pending) > 0 && b.Seq != pendingSeq {
 			if err := flush(); err != nil {
 				return err
 			}
@@ -833,7 +850,7 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	if combined == nil {
 		// Nothing survived the collapse: the cycle still needs its delivery
 		// so the coordinator does not leave it open (WK-001 C5.4).
-		if p.staged && b.Seq != 0 {
+		if p.stage(b) && b.Seq != 0 {
 			return 0, 0, ready(emptyBatch(b, p.mode), 0, 0, 0)
 		}
 		return 0, 0, nil
@@ -932,7 +949,7 @@ func adoptWindowPos(b *dataplane.Batch, pos string) (*dataplane.Batch, error) {
 	for _, c := range cols {
 		c.Release()
 	}
-	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: []byte(pos), Mode: dataplane.AppendMode, Seq: b.Seq}, nil
+	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: []byte(pos), Mode: dataplane.AppendMode, Seq: b.Seq, Staged: b.Staged}, nil
 }
 
 // markBatchSideEffects applies the per-row, side-effect-only decisions for a
@@ -1256,6 +1273,9 @@ func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.Writ
 		// Seq is the coordinator cycle key (WK-001 C5): a reconstruction
 		// that dropped it sent live batches back as seq-0 snapshot cycles.
 		Seq: b.Seq,
+		// Staged travels with the cycle key: the reconstruction must not
+		// silently downgrade a staged cycle to a direct commit.
+		Staged: b.Staged,
 	}, nil
 }
 
@@ -1279,6 +1299,7 @@ func emptyBatch(b *dataplane.Batch, mode dataplane.WriteMode) *dataplane.Batch {
 		SnapshotState:   b.SnapshotState,
 		SnapshotPending: b.SnapshotPending,
 		Seq:             b.Seq,
+		Staged:          b.Staged,
 	}
 }
 
@@ -1327,12 +1348,12 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		}
 		b.Record.Retain()
 		return &dataplane.Batch{Table: b.Table, Record: b.Record, Watermark: b.Watermark,
-			Mode: b.Mode, SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq}, nil
+			Mode: b.Mode, SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq, Staged: b.Staged}, nil
 	}
 	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
 		a.Record.Retain()
 		return &dataplane.Batch{Table: a.Table, Record: a.Record, Watermark: a.Watermark,
-			Mode: a.Mode, SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending, Seq: a.Seq}, nil
+			Mode: a.Mode, SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending, Seq: a.Seq, Staged: a.Staged}, nil
 	}
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
@@ -1363,5 +1384,6 @@ func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Bat
 		SnapshotState:   a.SnapshotState,
 		SnapshotPending: a.SnapshotPending,
 		Seq:             a.Seq,
+		Staged:          a.Staged || b.Staged,
 	}, nil
 }
