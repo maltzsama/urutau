@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,6 +52,27 @@ func getJSON(t *testing.T, url string, into any) *http.Response {
 		}
 	}
 	return resp
+}
+
+// The SPA is embedded and served at /, and it drives the same API.
+func TestServesSPA(t *testing.T) {
+	srv := testServer(fakeStore{}, 0)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("content-type = %q, want text/html", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "/api/v1") {
+		t.Fatal("the SPA must call the API")
+	}
 }
 
 func TestListPipelines(t *testing.T) {
