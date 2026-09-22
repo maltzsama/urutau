@@ -1,0 +1,67 @@
+# Permissions for the urutau-operator service account. Mirrors
+# config/rbac/operator.yaml in the repo; the subject namespace follows the
+# release namespace.
+#
+# The coordinator gets its OWN identity dynamically: for every pipeline the
+# reconciler creates a ServiceAccount, a Role (cdcpipelines + status in the
+# pipeline's namespace) and a RoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: urutau-operator-role
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["urutau.io"]
+    resources: ["cdcpipelines"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["urutau.io"]
+    resources: ["cdcpipelines/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["urutau.io"]
+    resources: ["cdcpipelines/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # Held only to be delegated to the coordinator's own Role: RBAC forbids
+  # granting what you do not hold. Bound cluster-wide here; for a shared
+  # cluster, scope the operator per namespace instead (see the repo's
+  # config/multi-tenant).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Leader election: a coordination.k8s.io Lease in the operator's namespace.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: urutau-operator-rolebinding
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: urutau-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: urutau-operator
+    namespace: {{ .Release.Namespace }}

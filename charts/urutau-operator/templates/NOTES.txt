@@ -1,0 +1,23 @@
+urutau-operator is installed in namespace {{ .Release.Namespace }}.
+
+Check it:
+
+  kubectl -n {{ .Release.Namespace }} get deploy,pod
+
+{{- if .Values.webhook.enabled }}
+
+The validating webhook is enabled. It needs its serving certificate before
+the apiserver will call it — wait for it:
+
+  kubectl -n {{ .Release.Namespace }} get certificate urutau-operator-webhook-cert
+
+{{- else }}
+
+The admission webhook is DISABLED. The reconciler still validates specs; you
+only lose the admission-time check.
+
+{{- end }}
+
+Submit a pipeline:
+
+  kubectl apply -f config/samples/cdcpipeline.yaml

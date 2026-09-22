@@ -1,0 +1,40 @@
+# Default values for urutau-operator.
+#
+# This chart is an ALTERNATIVE to the kustomize install (config/ +
+# `make k8s-deploy`), not a replacement: it ships the same resources with the
+# namespace, image, replicas and resources driven by values instead of
+# kustomize edits.
+
+image:
+  repository: ghcr.io/maltzsama/urutau
+  # tag defaults to the chart's appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+operator:
+  # Leader election makes more than one replica safe: only the leader
+  # reconciles, the rest are hot standbys.
+  replicaCount: 2
+  # Server-Side Apply field manager name.
+  fieldManager: urutau-operator
+  # Comma-separated namespaces to watch (empty = all). Scoping the operator to
+  # specific namespaces needs a RoleBinding in each; see the repo's
+  # config/multi-tenant for the model.
+  watchNamespaces: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+webhook:
+  # Disable to run without the admission webhook. The reconciler still
+  # validates, so this loses the admission-time check, not correctness.
+  enabled: true
+  # cert-manager issues the webhook serving certificate. If disabled, provide
+  # the `urutau-operator-webhook-cert` Secret and the ValidatingWebhookConfiguration's
+  # caBundle yourself.
+  certManager:
+    enabled: true

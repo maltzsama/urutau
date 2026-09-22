@@ -1,0 +1,18 @@
+{{- if .Values.webhook.enabled }}
+# The webhook Service the ValidatingWebhookConfiguration points at. The
+# operator's webhook server listens on 9443; the Service fronts it on 443.
+apiVersion: v1
+kind: Service
+metadata:
+  name: urutau-operator-webhook
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: urutau-operator
+    control-plane: controller-manager
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+{{- end }}

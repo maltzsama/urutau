@@ -64,6 +64,28 @@ jobs:
       - name: Lint
         run: make lint
 
+  helm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Lint the chart
+        run: helm lint charts/urutau-operator
+
+      # Render the defaults, a different release namespace (the webhook
+      # namespace must follow it), and the webhook-off path.
+      - name: Template the chart
+        run: |
+          helm template urutau charts/urutau-operator --namespace urutau-system > /dev/null
+          helm template urutau charts/urutau-operator --namespace team-a > /dev/null
+          helm template urutau charts/urutau-operator --namespace urutau-system \
+            --set webhook.enabled=false --set operator.replicaCount=1 > /dev/null
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25

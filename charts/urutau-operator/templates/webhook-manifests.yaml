@@ -1,0 +1,32 @@
+{{- if .Values.webhook.enabled }}
+# The validating webhook. The namespace appears three times and is driven by
+# .Release.Namespace in all of them, so a Helm install into any namespace is
+# correct (the kustomize base requires editing them by hand).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: urutau-operator-validating-webhook
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/urutau-operator-webhook-cert
+  {{- end }}
+webhooks:
+  - name: vcdcpipeline.urutau.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    clientConfig:
+      service:
+        name: urutau-operator-webhook
+        namespace: {{ .Release.Namespace }}
+        path: /validate-urutau-io-v1alpha1-cdcpipeline
+        port: 443
+    rules:
+      - apiGroups: ["urutau.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["cdcpipelines"]
+        scope: Namespaced
+{{- end }}
