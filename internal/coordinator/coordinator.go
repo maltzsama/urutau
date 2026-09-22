@@ -247,6 +247,14 @@ type Coordinator struct {
 	// wakes every waiter, which re-checks its own window's state.
 	gateDrain chan struct{}
 
+	// paused blocks the pump for a table whose re-slice is draining. The
+	// flip waits for the table to owe nothing, which a continuously loaded
+	// table never reaches on its own; pausing the input lets the queue
+	// drain, then the flip, then resume. Keyed by target; the pump checks it
+	// per batch, so only a paused table's batches block.
+	pausedMu sync.Mutex
+	paused   map[string]chan struct{}
+
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
 
@@ -368,6 +376,7 @@ func Run(ctx context.Context, cfg Config) error {
 		gateOn:      map[string]bool{},
 		gateWin:     map[string]gateWindow{},
 		gateBuf:     map[string][]*dataplane.Batch{},
+		paused:      map[string]chan struct{}{},
 		gateDrain:   make(chan struct{}),
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
@@ -1115,6 +1124,11 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 			if c.metrics != nil {
 				c.metrics.EventsDecoded.Inc()
 			}
+			// A re-slice pauses this table so its drain can converge. The
+			// batch is held here (not routed, not counted by the drain) until
+			// the flip, then enqueued under the new layout — so no batch
+			// spans the flip and ordering is preserved.
+			c.waitUnpaused(ctx, b.Table)
 			if c.gateHold(ctx, b) {
 				continue
 			}

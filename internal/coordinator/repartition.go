@@ -69,6 +69,49 @@ func (c *Coordinator) publishRouting(r *routing) {
 	c.routing.Store(r)
 }
 
+// pauseTable stops the pump from routing a table's batches, so a re-slice's
+// drain can converge: a continuously loaded table never owes nothing on its
+// own. The pump blocks on its next batch for the table (holding that batch,
+// which the drain does not count), the queue drains, the flip happens, and
+// resumeTable releases it — routed by the new layout. Idempotent: pausing an
+// already-paused table keeps the same resume channel.
+func (c *Coordinator) pauseTable(target string) {
+	c.pausedMu.Lock()
+	defer c.pausedMu.Unlock()
+	if c.paused == nil {
+		c.paused = map[string]chan struct{}{}
+	}
+	if _, ok := c.paused[target]; !ok {
+		c.paused[target] = make(chan struct{})
+	}
+}
+
+// resumeTable releases a table paused by pauseTable.
+func (c *Coordinator) resumeTable(target string) {
+	c.pausedMu.Lock()
+	defer c.pausedMu.Unlock()
+	if ch, ok := c.paused[target]; ok {
+		close(ch)
+		delete(c.paused, target)
+	}
+}
+
+// waitUnpaused blocks while target is paused. The pump calls it before
+// routing a batch, so a paused table's events stay upstream (the reader's
+// queue) rather than being lost or reordered.
+func (c *Coordinator) waitUnpaused(ctx context.Context, target string) {
+	c.pausedMu.Lock()
+	ch, ok := c.paused[target]
+	c.pausedMu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
 // repartitioner serializes re-slices: two concurrent scale events on the
 // same table would each read-modify-write the routing snapshot and one
 // would be lost.
@@ -80,17 +123,28 @@ type repartitioner struct {
 // owners so the table ends up with exactly n of them. It is the entry
 // point a scaler (KEDA today, an operator by hand) drives.
 //
-// The sequence is ordered so no key is ever routed to an owner that cannot
-// commit it, and no cycle is split across two layouts:
+// The sequence is prepare → commit, and every wait is bounded: a step that
+// cannot complete fails the scale and leaves the OLD layout intact, so a
+// scale is a retryable no-op rather than an incident (never an unbounded
+// pause, never data loss):
 //
 //  1. Resolve the new ranges from the source's chunker.
 //  2. Register any new owner (queue, ticket, index) so its Hello is
 //     accepted the moment its pod starts.
 //  3. Seed the new owner's confirmed position, so confirmedPosition does
 //     not stall the whole pipeline on an owner that has committed nothing.
-//  4. Drain the affected table's open staged cycles — only that table.
-//  5. Swap the routing snapshot atomically.
-//  6. Drain and drop any owner the new layout removed.
+//  4. PREPARE: pause the table's input so its drain can converge — a
+//     continuously loaded table never reaches zero in-flight on its own.
+//  5. Drain the table's in-flight batches and open staged cycles. With the
+//     input paused, no new batch arrives and this converges.
+//  6. COMMIT: swap the routing snapshot atomically, then resume the input.
+//     The pump's held batch is routed by the new layout, so no batch spans
+//     the flip.
+//  7. Drain and drop any owner the new layout removed.
+//
+// A timeout in the prepare phase (4-5) resumes the input and returns,
+// leaving the old layout in place: the scaler retries, and worker recovery
+// stays the supervisor's job.
 func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) error {
 	if n < 1 {
 		return fmt.Errorf("coordinator: scale %s: worker count must be >= 1, got %d", target, n)
@@ -138,27 +192,31 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 		c.seedConfirmed(next[len(owners):])
 	}
 
-	// Per-table barrier: quiesce this table before the flip. Nothing is
-	// torn down here — every owner keeps its session, epoch and queue. The
-	// flip just waits until the table owes nothing: every in-flight batch
-	// acked, every staged cycle committed. Replication must not lose a row
-	// and a pause costs only latency, so waiting is the right trade. Other
-	// tables keep streaming through the shared reader.
-	//
-	// NOTE: this requires the table to go quiet. Under sustained load it
-	// never does, so a re-slice driven while the source is continuously busy
-	// times out the drain. Gating the table's input (the DBLog window's
-	// whole-table gate) fixes the convergence but the release must then wait
-	// for the new owners to attach and must not overlap the next re-slice —
-	// a follow-up, not this change.
+	// PREPARE: pause the table's input. The drain below waits until the
+	// table owes nothing — every in-flight batch acked, every staged cycle
+	// committed — and a continuously loaded table never reaches that on its
+	// own. Pausing makes it converge; on any failure the input resumes and
+	// the old layout stands.
+	c.pauseTable(target)
+	resumed := false
+	defer func() {
+		if !resumed {
+			c.resumeTable(target)
+		}
+	}()
 	if err := c.drainForFlip(ctx, target, owners); err != nil {
 		return fmt.Errorf("coordinator: scale %s: drain: %w", target, err)
 	}
 
+	// COMMIT: the flip is atomic and instant, and happens only now that the
+	// table owes nothing. Resuming routes the pump's held batch — and every
+	// batch after it — by the new layout.
 	snap := cur.clone()
 	snap.owners[target] = next
 	snap.ranges[target] = ranges
 	c.publishRouting(snap)
+	c.resumeTable(target)
+	resumed = true
 
 	c.emitScale(target, len(owners), n)
 

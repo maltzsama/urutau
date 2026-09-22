@@ -367,11 +367,9 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 
 	stop := make(chan struct{})
 	writeDone := make(chan struct{})
-	// writeMu serializes the writer with a re-slice. The coordinator's flip
-	// waits for the table to owe nothing, which a continuously busy source
-	// never reaches, so the test quiesces the writer for the duration of each
-	// ScaleTable — a brief lull, the shape the current barrier supports.
-	var writeMu sync.Mutex
+	// No pause: the source stays continuously busy across every re-slice.
+	// The coordinator's barrier must converge on its own by pausing the
+	// table's input during the drain.
 	go func() {
 		defer close(writeDone)
 		for i := 0; ; i++ {
@@ -392,20 +390,18 @@ func TestLiveRepartitionChaosScale(t *testing.T) {
 				id := 100 + (i/3)%50
 				q = fmt.Sprintf("DELETE FROM orders WHERE id = %d", id)
 			}
-			writeMu.Lock()
-			_, err := db.Exec(q)
-			writeMu.Unlock()
-			if err != nil {
+			if _, err := db.Exec(q); err != nil {
 				t.Logf("chaos writer: %q: %v", q, err)
 			}
-			time.Sleep(15 * time.Millisecond)
+			// 40ms keeps the source continuously busy without overwhelming
+			// the e2e's RustFS, which returns 500s (commit retries exhausted)
+			// above roughly this commit rate.
+			time.Sleep(40 * time.Millisecond)
 		}
 	}()
 
 	for _, n := range []int{3, 2, 4, 1, 3, 2} {
-		writeMu.Lock()
 		err := p.coord.ScaleTable(ctx, target, n)
-		writeMu.Unlock()
 		if err != nil {
 			t.Fatalf("ScaleTable(%s, %d): %v", target, n, err)
 		}
