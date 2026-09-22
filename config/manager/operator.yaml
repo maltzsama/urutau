@@ -64,11 +64,16 @@ spec:
             # below via Kubernetes' $(VAR) argument expansion.
             - name: COORDINATOR_IMAGE
               value: urutau:dev
+            # Prometheus address for KEDA ScaledObjects. Empty (the default)
+            # disables worker autoscaling: no ScaledObject is rendered.
+            - name: KEDA_PROMETHEUS_ADDRESS
+              value: ""
           args:
             - --coordinator-image=$(COORDINATOR_IMAGE)
             - --metrics-bind-address=:8080
             - --health-probe-bind-address=:8081
             - --enable-webhook=true
+            - --keda-prometheus-address=$(KEDA_PROMETHEUS_ADDRESS)
           ports:
             - name: metrics
               containerPort: 8080

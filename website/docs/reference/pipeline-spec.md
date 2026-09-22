@@ -178,7 +178,8 @@ snapshot.
 
 `workers: {number: N}` splits the table's primary-key range into `N`
 contiguous ranges and derives the group names
-`<pipeline>-<target>-<index>`. `N <= 1` or absent means one worker, no
+`<pipeline>-<target>-<index>` (DNS-sanitized: `.` and other invalid
+characters become `-`). `N <= 1` or absent means one worker, no
 partitioning. A sink that cannot handle concurrent writers rejects
 `N > 1` at boot. See [Distributed mode](../guides/distributed.md).
 

@@ -33,8 +33,8 @@ func TestScaledObjectTargetsWorkerStatefulSet(t *testing.T) {
 
 	obj := scaledObject(cr, "shop", tbl, "http://prom:9090", "30")
 
-	if obj.GetName() != "shop-raw.orders" || obj.GetNamespace() != "ns" {
-		t.Fatalf("identity = %s/%s, want ns/shop-raw.orders", obj.GetNamespace(), obj.GetName())
+	if obj.GetName() != "shop-raw-orders" || obj.GetNamespace() != "ns" {
+		t.Fatalf("identity = %s/%s, want ns/shop-raw-orders", obj.GetNamespace(), obj.GetName())
 	}
 	if obj.GroupVersionKind() != kedaGroupVersion {
 		t.Fatalf("gvk = %v, want %v", obj.GroupVersionKind(), kedaGroupVersion)
@@ -42,7 +42,7 @@ func TestScaledObjectTargetsWorkerStatefulSet(t *testing.T) {
 
 	spec, _ := obj.Object["spec"].(map[string]any)
 	target, _ := spec["scaleTargetRef"].(map[string]any)
-	if target["kind"] != "StatefulSet" || target["name"] != "shop-raw.orders" || target["apiVersion"] != "apps/v1" {
+	if target["kind"] != "StatefulSet" || target["name"] != "shop-raw-orders" || target["apiVersion"] != "apps/v1" {
 		t.Fatalf("scaleTargetRef = %v", target)
 	}
 	if spec["minReplicaCount"] != int64(2) || spec["maxReplicaCount"] != int64(8) {
@@ -95,7 +95,7 @@ func TestEnsureScaledObjectsDisabledWithoutPrometheus(t *testing.T) {
 
 	stale := &unstructured.Unstructured{}
 	stale.SetGroupVersionKind(kedaGroupVersion)
-	stale.SetName("shop-raw.orders")
+	stale.SetName("shop-raw-orders")
 	stale.SetNamespace("ns")
 	stale.SetLabels(selectorLabels(cr))
 
@@ -105,7 +105,7 @@ func TestEnsureScaledObjectsDisabledWithoutPrometheus(t *testing.T) {
 	}
 	got := &unstructured.Unstructured{}
 	got.SetGroupVersionKind(kedaGroupVersion)
-	err := r.Get(context.Background(), types.NamespacedName{Name: "shop-raw.orders", Namespace: "ns"}, got)
+	err := r.Get(context.Background(), types.NamespacedName{Name: "shop-raw-orders", Namespace: "ns"}, got)
 	if err == nil {
 		t.Fatal("stale ScaledObject survived with autoscaling off")
 	}
@@ -133,10 +133,10 @@ func TestEnsureScaledObjectsCreatesForCappedTables(t *testing.T) {
 
 	got := &unstructured.Unstructured{}
 	got.SetGroupVersionKind(kedaGroupVersion)
-	if err := r.Get(context.Background(), types.NamespacedName{Name: "e2e-raw.orders", Namespace: "ns"}, got); err != nil {
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "e2e-raw-orders", Namespace: "ns"}, got); err != nil {
 		t.Fatalf("ScaledObject for the capped table: %v", err)
 	}
-	err := r.Get(context.Background(), types.NamespacedName{Name: "e2e-raw.items", Namespace: "ns"}, &unstructured.Unstructured{})
+	err := r.Get(context.Background(), types.NamespacedName{Name: "e2e-raw-items", Namespace: "ns"}, &unstructured.Unstructured{})
 	if err == nil {
 		t.Fatal("a table without workers.max must not get a ScaledObject")
 	}

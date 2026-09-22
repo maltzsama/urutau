@@ -203,9 +203,11 @@ scale-down. A table that sets it ignores the coordinator's default (32).
 ### Autoscaling with KEDA
 
 In Kubernetes, a table's workers run as **one StatefulSet** named
-`<pipeline>-<target>`, with `replicas = workers.number` at boot. A StatefulSet
-pod's hostname is `<statefulset>-<ordinal>` — exactly the derived worker group
-name — so a replica *is* its partition, with no identity plumbing.
+`<pipeline>-<target>`, with `replicas = workers.number` at boot. The name is
+DNS-sanitized (a `.` in the target becomes `-`), because a StatefulSet pod's
+hostname is `<statefulset>-<ordinal>` — a single DNS label — and that string is
+exactly the derived worker group name. So a replica *is* its partition, with no
+identity plumbing.
 
 That single replica count is what KEDA scales. Start the operator with
 `--keda-prometheus-address <url>` and it renders one `ScaledObject` per table

@@ -158,6 +158,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 
 	seenSource := map[string]bool{}
 	seenTarget := map[string]bool{}
+	seenGroup := map[string]bool{}
 	for i, tbl := range s.Tables {
 		p := fmt.Sprintf("tables[%d]", i)
 		if tbl.Source == "" {
@@ -179,6 +180,14 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 				problems = append(problems, fmt.Sprintf("%s.target: duplicated %q", p, tbl.Target))
 			}
 			seenTarget[tbl.Target] = true
+			// Worker group names are DNS-sanitized, so two targets that
+			// differ only by punctuation ("raw.orders" and "raw-orders")
+			// would collide on one worker group name.
+			g := WorkerGroupPrefix(s.Pipeline, tbl.Target)
+			if seenGroup[g] {
+				problems = append(problems, fmt.Sprintf("%s.target: %q maps to the same worker group name %q as another table — targets must differ beyond punctuation", p, tbl.Target, g))
+			}
+			seenGroup[g] = true
 		}
 		if tbl.Workers != nil {
 			if tbl.Workers.Number < 0 {

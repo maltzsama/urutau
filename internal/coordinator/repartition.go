@@ -476,7 +476,7 @@ func (c *Coordinator) tableRef(target string) (source.TableRef, bool) {
 // partitionName derives partition p's worker group name, the same shape
 // spec.Table.WorkerGroupNames produces at boot.
 func partitionName(pipeline, target string, p int) string {
-	return fmt.Sprintf("%s-%s-%d", pipeline, target, p)
+	return fmt.Sprintf("%s-%d", spec.WorkerGroupPrefix(pipeline, target), p)
 }
 
 // emitScale records the scale event on the durable trail.

@@ -8,6 +8,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/maltzsama/urutau/spec"
 )
 
 func sampleTemplate() corev1.PodTemplateSpec {
@@ -216,7 +218,7 @@ func TestReconcileReplicasFollowsStatefulSet(t *testing.T) {
 	c.workerK8s = true
 	c.k8sNS = "ns"
 	owner := metav1.OwnerReference{Kind: "Pod", Name: "c", UID: types.UID("x")}
-	name := "p-raw.orders" // spec.WorkerGroupPrefix("p", "raw.orders")
+	name := spec.WorkerGroupPrefix("p", "raw.orders")
 	sts := workerStatefulSet(name, "ns", owner, sampleTemplate(), 3)
 	c.k8sClient = fake.NewSimpleClientset(sts)
 
