@@ -64,6 +64,13 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Leader election: controller-runtime coordinates the manager through a
+  # coordination.k8s.io Lease in the operator's own namespace. Without this
+  # rule the manager fails at startup the first time it tries to acquire the
+  # lease — it does not silently skip election.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

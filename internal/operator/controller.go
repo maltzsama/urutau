@@ -82,6 +82,7 @@ func (r *CoordinatorReconciler) fieldManager() string {
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
 
 // SetupWithManager wires the reconciler into the manager.
 func (r *CoordinatorReconciler) SetupWithManager(mgr ctrl.Manager) error {

@@ -203,6 +203,21 @@ Two details are easy to get wrong when writing this RBAC by hand:
   `core/pods` get — even though the operator never touches a Deployment or
   a Pod. The coordinator does, through the per-pipeline Role.
 
+## Leader election and high availability
+
+The operator Deployment ships with `replicas: 2`. Only the elected leader runs
+the reconciler; the other replica is a hot standby that takes over if the
+leader dies. Election coordinates through a `coordination.k8s.io` `Lease`
+named `urutau-operator-lock` in the operator's namespace — which is why the
+ClusterRole carries a `leases` rule. Without it the manager fails at startup
+on lease acquisition rather than silently skipping election.
+
+The standby is not load-balanced: the operator's work is small and
+order-sensitive (one reconciler per `CDCPipeline`), so extra replicas buy
+failover availability, not throughput. The webhook server, by contrast, runs
+on every replica — the apiserver load-balances admission requests across them
+through the Service.
+
 ## How the operator applies objects
 
 The reconciler writes every managed object (the coordinator StatefulSet,
