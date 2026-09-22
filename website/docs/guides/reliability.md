@@ -52,6 +52,21 @@ Use it for post-incident forensics: "why did this row land late?" is
 usually answerable from the event log even after the metrics have rolled
 over.
 
+On Kubernetes, set it in the `CDCPipeline` — the operator renders the same
+flag. Without it, an operator-managed pipeline writes **no** trail:
+
+```yaml
+spec:
+  coordinator:
+    eventlog:
+      bucket: my-trails
+      rootPrefix: urutau     # → --eventlog s3://my-trails/urutau
+```
+
+S3 credentials still come from the standard `AWS_*` environment (or the
+Pod's workload identity); the trail is best-effort, so a missing credential
+warns rather than failing the pipeline.
+
 ## Checkpoints (`--checkpoint`)
 
 `--checkpoint s3://bucket/prefix` additionally writes **async position

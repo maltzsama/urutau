@@ -307,6 +307,25 @@ func TestCoordinatorStatefulSetProbesAndPorts(t *testing.T) {
 	}
 }
 
+// The coordinator gets --eventlog only when the CR declares it, rendered as
+// s3://<bucket>/<rootPrefix>.
+func TestCoordinatorCommandEventlog(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	if cmd := strings.Join(coordinatorCommand(cr), " "); strings.Contains(cmd, "--eventlog") {
+		t.Fatalf("command = %q, must not carry --eventlog when unset", cmd)
+	}
+
+	cr.Spec.Coordinator.Eventlog = &urutauv1alpha1.EventlogSpec{Bucket: "trails", RootPrefix: "/urutau/"}
+	if cmd := strings.Join(coordinatorCommand(cr), " "); !strings.Contains(cmd, "--eventlog s3://trails/urutau") {
+		t.Fatalf("command = %q, want --eventlog s3://trails/urutau", cmd)
+	}
+
+	cr.Spec.Coordinator.Eventlog = &urutauv1alpha1.EventlogSpec{Bucket: "trails"}
+	if cmd := strings.Join(coordinatorCommand(cr), " "); !strings.Contains(cmd, "--eventlog s3://trails") {
+		t.Fatalf("command = %q, want --eventlog s3://trails (empty prefix)", cmd)
+	}
+}
+
 // withMaintenance turns sink.maintenance on in a CR's inline spec.
 func withMaintenance(cr *urutauv1alpha1.CDCPipeline) *urutauv1alpha1.CDCPipeline {
 	sink := cr.Spec.Definition.Inline["sink"].(map[string]any)

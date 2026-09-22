@@ -56,6 +56,12 @@ spec:
                     metricsAddr: {type: string}
                     cpu: {type: string}
                     memory: {type: string}
+                    eventlog:
+                      type: object
+                      required: [bucket]
+                      properties:
+                        bucket: {type: string}
+                        rootPrefix: {type: string}
                 worker:
                   type: object
                   properties:

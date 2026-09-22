@@ -10,6 +10,10 @@ func (in *CDCPipelineSpec) DeepCopyInto(out *CDCPipelineSpec) {
 	if in.Definition.Inline != nil {
 		out.Definition.Inline = deepCopyAny(in.Definition.Inline).(map[string]any)
 	}
+	if in.Coordinator.Eventlog != nil {
+		e := *in.Coordinator.Eventlog
+		out.Coordinator.Eventlog = &e
+	}
 }
 
 // DeepCopy copies the spec.
