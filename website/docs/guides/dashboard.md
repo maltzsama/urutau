@@ -12,14 +12,11 @@ No CDN, no external dependencies, no build step: the HTML, JavaScript
 
 ## Enabling the dashboard
 
-Pass `--metrics-addr` to the coordinator (or the collapsed `urutau run`
-CLI). The dashboard is served on the same address:
+The dashboard is a **coordinator** feature: the collapsed `urutau run` CLI has
+no Prometheus registry, so it does not serve one. Pass `--metrics-addr` to the
+coordinator. The dashboard is served on the same address:
 
-```sh command="urutau run -f pipeline.yaml --metrics-addr :9090"
-# Single-process mode
-urutau run -f pipeline.yaml --metrics-addr :9090
-
-# Distributed mode (coordinator)
+```sh command="urutau-coordinator run -f pipeline.yaml --metrics-addr :9090"
 urutau-coordinator run -f pipeline.yaml --metrics-addr :9090
 ```
 

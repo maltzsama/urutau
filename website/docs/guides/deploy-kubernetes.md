@@ -256,6 +256,42 @@ coordinator.
 kubectl apply -f config/samples/cdcpipeline.yaml
 ```
 
+### Autoscaling workers with KEDA
+
+A table's worker count is fixed at `workers.number` by default. Set
+`workers.max` to let it scale at runtime, and point the operator at
+Prometheus so it renders one KEDA `ScaledObject` per such table — set the
+operator's `KEDA_PROMETHEUS_ADDRESS` env (in `config/manager/operator.yaml`,
+or the equivalent in your install):
+
+```yaml title="Enable autoscaling in the operator"
+- name: KEDA_PROMETHEUS_ADDRESS
+  value: "http://prometheus.monitoring.svc:9090"
+```
+
+```yaml title="A table that may scale out"
+tables:
+  - source: shop.orders
+    target: raw.orders
+    primaryKey: [id]
+    workers:
+      number: 1      # minReplicaCount
+      max: 8         # maxReplicaCount — also enables the ScaledObject
+```
+
+Each table's workers run as one StatefulSet named `<pipeline>-<target>` (its
+pod ordinals are the derived worker names), and the `ScaledObject` drives its
+`spec.replicas` from `urutau_coordinator_pending_batches{table="<target>"}` —
+the table's outstanding batches — with `--keda-threshold` (default `30`) as
+the per-replica backlog target. The operator never scales the table itself:
+the coordinator follows `spec.replicas` and re-slices to match, so KEDA (or a
+manual `kubectl scale`) is the only writer.
+
+The Helm chart does not expose `--keda-prometheus-address` yet; use the
+kustomize install for autoscaling. See
+[Distributed mode → Autoscaling with KEDA](distributed.md#autoscaling-with-keda)
+for the metric choice and the current barrier limit under a large backlog.
+
 ## 5. Watch it come up
 
 ```sh title="Watch pods come up"

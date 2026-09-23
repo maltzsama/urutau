@@ -97,21 +97,14 @@ process, one binary, no Kubernetes. It:
 
 Leave it running — it's a long-lived process, like any replicator.
 
-## 6. Watch it on the dashboard
+## 6. Watch it live (optional)
 
-Add `--metrics-addr :9090` to enable the embedded monitoring dashboard:
-
-```sh command="./bin/urutau run -f pipeline.yaml --metrics-addr :9090"
-./bin/urutau run -f pipeline.yaml --metrics-addr :9090
-```
-
-Open **http://localhost:9090** in your browser. You'll see the pipeline
-status, the table stream with live throughput charts, and the connected
-worker — all updated in real time via Server-Sent Events.
-
-The dashboard also has a JSON API at `/api/v1/*`. See
-[Dashboard](guides/dashboard.md) and
-[Dashboard API](reference/dashboard-api.md) for details.
+The collapsed `urutau run` process has no metrics endpoint — the embedded
+**dashboard is a coordinator feature**. To watch a pipeline live (status,
+throughput charts, workers, events), run it in
+[distributed mode](guides/distributed.md) and start the coordinator with
+`--metrics-addr :9090`. See [Dashboard](guides/dashboard.md) and
+[Dashboard API](reference/dashboard-api.md) for the views and the JSON API.
 
 ## 7. Prove it worked — read it back
 
@@ -137,7 +130,7 @@ docker exec -it $(docker compose -f test/e2e/docker-compose.yml ps -q mysql) \
   -e "INSERT INTO orders (id, v, amount) VALUES (101, 'hello', 9.99);"
 ```
 
-Query Trino again (step 6). The insert shows up in a couple seconds. An
+Query Trino again (step 7). The insert shows up in a couple seconds. An
 `UPDATE`/`DELETE` on the same `id` takes a little longer to show up — the
 worker batches changes on a commit interval (a few seconds, not instant) —
 but applies as an upsert / equality-delete in Iceberg, never a new

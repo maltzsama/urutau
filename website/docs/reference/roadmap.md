@@ -36,9 +36,9 @@ silently — they're tracked, not forgotten.
 parent-child shard lineage is a position-contract problem Kafka doesn't
 have, and it isn't modeled yet.
 
-**Incremental and backfill-only sync modes** (`incremental`,
-`backfill-only`) — declared as a future part of the contract, not
-implemented.
+**Backfill-only sync mode** (`backfill-only`) — declared as a future part of
+the contract, not implemented. (`incremental` shipped for Postgres; see
+[Sources: Postgres](../sources/postgres.md#incremental-mode).)
 
 Nested canonical types (`Struct`/`List`/`Map`), `KindFixedBinary`, the
 Kafka `raw`/Confluent-Avro decoders, transport-native metadata columns,
