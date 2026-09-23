@@ -51,15 +51,24 @@ func (h *Hub) Publish(event string, data func() any) {
 		return
 	}
 	h.mu.Unlock()
-	// Marshal outside the lock: data() can be expensive (it reads coordinator
-	// state), and Subscribe must not wait on it.
-	b, err := json.Marshal(data())
+	// Build outside the lock: data() reads coordinator state under its own
+	// locks, and holding h.mu across it would both block Subscribe behind the
+	// build and add a hub→coordinator lock order to reason about.
+	payload := data()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// The last subscriber may have left while the payload was built; skip the
+	// marshal and the fan-out then. One wasted build on that rare race is the
+	// price of not holding h.mu across data() above.
+	if len(h.subs) == 0 {
+		return
+	}
+	b, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
 	msg := streamMsg{event: event, data: b}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	for ch := range h.subs {
 		select {
 		case ch <- msg:
