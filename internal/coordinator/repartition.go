@@ -516,6 +516,22 @@ func partitionName(pipeline, target string, p int) string {
 	return fmt.Sprintf("%s-%d", spec.WorkerGroupPrefix(pipeline, target), p)
 }
 
+// OwnerNames returns target's partition owner names in partition order — the
+// live routing layout. It is the read-only companion to ScaleTable: a scaler
+// (or a test) uses it to observe a re-slice's effect, including DURING a
+// scale-in/out, without reaching into the coordinator's internals.
+func (c *Coordinator) OwnerNames(target string) []string {
+	owners, ok := c.loadRouting().ownersOf(target)
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(owners))
+	for i, w := range owners {
+		out[i] = w.name
+	}
+	return out
+}
+
 // emitScale records the scale event on the durable trail.
 func (c *Coordinator) emitScale(target string, from, to int) {
 	if err := c.emit(eventlog.KindTableRepartitioned, map[string]any{
