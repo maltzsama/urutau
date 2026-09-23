@@ -356,7 +356,7 @@ func (c *Coordinator) tablePending(target string) int {
 	c.mu.Lock()
 	for _, w := range owners {
 		pending += len(w.queue)
-		if idx := c.index[w.name]; idx != nil {
+		if idx := c.indexOf(w.name); idx != nil {
 			pending += idx.InFlight()
 		}
 	}

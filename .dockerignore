@@ -8,6 +8,16 @@
 bin/
 out/
 
+# Stray compiled binaries at the repo root (test binaries and ad-hoc builds);
+# without this the build context is gigabytes sent over the daemon socket.
+*.test
+/operator
+/urutau
+/urutau-coordinator
+/urutau-worker
+/urutau-operator
+/urutau-history-server
+
 # E2E artifacts and docs the image does not need.
 test/e2e/
 *.md

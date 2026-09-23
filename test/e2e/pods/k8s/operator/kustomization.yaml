@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The operator, deployed from the race-instrumented image, so the coordinator
+# StatefulSet and every worker StatefulSet it provisions also run under the
+# race detector (the CRs the pod e2e creates pin spec.image to the same tag;
+# the operator's --coordinator-image default is carried through the base's
+# replacement). It is also pointed at the in-cluster Prometheus so it renders
+# a KEDA ScaledObject for every table that sets workers.max (issue #298).
+# This is an overlay on the real install — it changes the image tag and one
+# env value, never the resources.
+resources:
+  - ../../../../../config/default
+
+images:
+  - name: urutau
+    newTag: dev-race
+
+patches:
+  - target:
+      kind: Deployment
+      name: urutau-operator
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: urutau-operator
+      spec:
+        template:
+          spec:
+            containers:
+              - name: operator
+                env:
+                  - name: KEDA_PROMETHEUS_ADDRESS
+                    value: http://prometheus.monitoring.svc.cluster.local:9090
+  # A low per-replica backlog target so a modest, deterministic backlog
+  # triggers a scale-up in the test (the shipped default is 30).
+  - target:
+      kind: Deployment
+      name: urutau-operator
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --keda-threshold=2

@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+
+# Race-instrumented variant of build/Dockerfile: the same five binaries, built
+# with the Go race detector. Used ONLY by the Kubernetes pod e2e suite
+# (test/e2e/pods), so the engine's concurrency is checked across the real
+# multi-process, pod-to-pod topology — not a single address space.
+#
+# The race detector needs CGO and a glibc runtime, so unlike the shipped image
+# (CGO_ENABLED=0, distroless/static) this one builds on a Debian toolchain and
+# ships on debian-slim with libgcc. It is a test artifact, not the release
+# image. The binaries are deliberately NOT stripped (-s -w omitted): a race
+# report needs symbols to name the frames.
+ARG GO_VERSION=1.26.5
+FROM golang:${GO_VERSION}-bookworm AS build
+WORKDIR /src
+# Version metadata for urutau version (defaults keep ad-hoc builds honest).
+ARG VERSION=dev
+ARG COMMIT=unknown
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    set -e; \
+    ldflags=" \
+      -X github.com/maltzsama/urutau/internal/version.Version=${VERSION} \
+      -X github.com/maltzsama/urutau/internal/version.Commit=${COMMIT}"; \
+    for pair in urutau:urutau urutau-coordinator:coordinator urutau-worker:worker urutau-operator:operator urutau-history-server:history-server; do \
+      name="${pair%%:*}"; dir="${pair##*:}"; \
+      CGO_ENABLED=1 go build -race -trimpath -ldflags="$ldflags" -o "/out/$name" "./cmd/$dir"; \
+    done
+
+# The race runtime links only against libc (verified with ldd: libc.so.6 +
+# the dynamic loader; modern Go's race runtime carries its own unwinder, so
+# libgcc is NOT needed). debian-slim has libc and a shell for `kubectl exec`
+# debugging; no apt-get, so the build never depends on the network at this
+# stage. USER is numeric because the slim base has no nonroot passwd entry.
+FROM debian:bookworm-slim
+COPY --from=build /out/ /usr/local/bin/
+# A detected race halts the process (exit 66) instead of logging and carrying
+# on, so a race is a hard failure the pod restart surfaces. The pod e2e also
+# scans every pod's logs for "WARNING: DATA RACE" as the authoritative signal.
+ENV GORACE="halt_on_error=1"
+# Match the shipped image's nonroot uid/gid (distroless nonroot is 65532).
+USER 65532:65532
+ENTRYPOINT ["urutau"]

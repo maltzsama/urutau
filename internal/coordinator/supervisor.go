@@ -196,11 +196,45 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	return nil
 }
 
+// indexOf returns a worker's position index under indexMu, or nil.
+func (c *Coordinator) indexOf(worker string) *positionIndex {
+	c.indexMu.RLock()
+	defer c.indexMu.RUnlock()
+	return c.index[worker]
+}
+
+// setIndex installs a worker's position index under indexMu.
+func (c *Coordinator) setIndex(worker string, idx *positionIndex) {
+	c.indexMu.Lock()
+	defer c.indexMu.Unlock()
+	c.index[worker] = idx
+}
+
+// deleteIndex removes a worker's position index under indexMu.
+func (c *Coordinator) deleteIndex(worker string) {
+	c.indexMu.Lock()
+	defer c.indexMu.Unlock()
+	delete(c.index, worker)
+}
+
+// indexSnapshot copies the index map under indexMu, for a reader that iterates
+// it (the checkpoint runner) while registerOwner may be writing.
+func (c *Coordinator) indexSnapshot() map[string]*positionIndex {
+	c.indexMu.RLock()
+	defer c.indexMu.RUnlock()
+	out := make(map[string]*positionIndex, len(c.index))
+	for k, v := range c.index {
+		out[k] = v
+	}
+	return out
+}
+
 // inFlight reports how many batches the worker has been delivered but has not
-// acked. c.index is populated at boot and only read afterwards, so the map
-// lookup needs no lock; InFlight takes the index's own lock.
+// acked. The map lookup is guarded by indexMu because registerOwner writes the
+// map at runtime during a scale-out (issue #312); InFlight takes the index's
+// own lock.
 func (c *Coordinator) inFlight(worker string) int {
-	if idx := c.index[worker]; idx != nil {
+	if idx := c.indexOf(worker); idx != nil {
 		return idx.InFlight()
 	}
 	return 0

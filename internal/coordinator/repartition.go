@@ -338,7 +338,7 @@ func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerSt
 		break
 	}
 	c.workers[name] = w
-	c.index[name] = newPositionIndex(c.runID)
+	c.setIndex(name, newPositionIndex(c.runID))
 	// Seed the ack clock before the pod can attach, or the supervisor's
 	// next tick sees an attached worker with no lastAck and resets it.
 	c.supervisor.noteRegistered(name, time.Now())
@@ -353,7 +353,7 @@ func (c *Coordinator) unregisterOwner(w *workerState) {
 	c.mu.Lock()
 	delete(c.workers, w.name)
 	delete(c.byTicket, string(w.ticket))
-	delete(c.index, w.name)
+	c.deleteIndex(w.name)
 	c.mu.Unlock()
 	c.confirmedMu.Lock()
 	delete(c.confirmed, w.name)
