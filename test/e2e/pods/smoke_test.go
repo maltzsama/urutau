@@ -15,21 +15,7 @@ func TestPodSmoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
-	ensureNamespace(t, testNS)
-	ensureSecret(t, testNS, "pod-e2e-source", map[string]string{
-		"uri": "mysql://repl:replpass@mysql.e2e.svc.cluster.local:3306/shop",
-	})
-	ensureSecret(t, testNS, "pod-e2e-catalog", map[string]string{
-		"uri":          "http://polaris.e2e.svc.cluster.local:8181/api/catalog",
-		"clientId":     "root",
-		"clientSecret": "s3cr3t",
-		"scope":        "PRINCIPAL_ROLE:ALL",
-	})
-
-	portForward(t, dataNS, "svc/mysql", localMySQLPort, 3306)
-	portForward(t, dataNS, "svc/trino", localTrinoPort, 8080)
-	mysql := openMySQL(t, localMySQLPort)
-	trino := openTrino(t, localTrinoPort)
+	mysql, trino := setupPodEnv(t)
 
 	// A distinct target keeps every run a fresh snapshot: no committed
 	// position to resume from, and no dependence on a prior test's table.

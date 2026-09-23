@@ -402,7 +402,17 @@ func readOrdersFrom(t *testing.T, db *sql.DB, query string) map[int64]rowState {
 // one duplicated.
 func assertSinkEqualsSource(t *testing.T, source, sink map[int64]rowState) {
 	t.Helper()
-	var missing, extra, wrong []int64
+	missing, extra, wrong := diffSinkSource(source, sink)
+	if len(missing) == 0 && len(extra) == 0 && len(wrong) == 0 {
+		return
+	}
+	t.Fatalf("sink != source: source=%d sink=%d missing=%v extra=%v wrongValue=%v",
+		len(source), len(sink), cap10(missing), cap10(extra), cap10(wrong))
+}
+
+// diffSinkSource returns the ids the sink is missing, has extra (a resurrected
+// delete), or holds with a stale value, relative to the source.
+func diffSinkSource(source, sink map[int64]rowState) (missing, extra, wrong []int64) {
 	for id, want := range source {
 		got, ok := sink[id]
 		switch {
@@ -417,11 +427,27 @@ func assertSinkEqualsSource(t *testing.T, source, sink map[int64]rowState) {
 			extra = append(extra, id)
 		}
 	}
-	if len(missing) == 0 && len(extra) == 0 && len(wrong) == 0 {
-		return
+	return missing, extra, wrong
+}
+
+// waitSettled polls until the sink's exact state equals the source's, or fails
+// with the residual diff. It is the convergence wait for a live writer.
+func waitSettled(t *testing.T, mysql, trino *sql.DB, table string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		src := readOrders(t, mysql)
+		sink := readOrdersSink(t, trino, table)
+		missing, extra, wrong := diffSinkSource(src, sink)
+		if len(missing) == 0 && len(extra) == 0 && len(wrong) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink never settled to source: source=%d sink=%d missing=%v extra=%v wrongValue=%v",
+				len(src), len(sink), cap10(missing), cap10(extra), cap10(wrong))
+		}
+		time.Sleep(time.Second)
 	}
-	t.Fatalf("sink != source: source=%d sink=%d missing=%v extra=%v wrongValue=%v",
-		len(source), len(sink), cap10(missing), cap10(extra), cap10(wrong))
 }
 
 func cap10(ids []int64) []int64 {
@@ -444,5 +470,65 @@ func seedOrders(t *testing.T, db *sql.DB, count int) {
 		if _, err := db.Exec("INSERT INTO orders (id, v, amount) VALUES (?, ?, ?)", i, fmt.Sprintf("seed%d", i), float64(i)); err != nil {
 			t.Fatalf("seed orders %d: %v", i, err)
 		}
+	}
+}
+
+// setupPodEnv is the shared fixture: the test namespace, the source/catalog
+// Secrets, port-forwards to the in-cluster data services, and open drivers.
+func setupPodEnv(t *testing.T) (mysql, trino *sql.DB) {
+	t.Helper()
+	ensureNamespace(t, testNS)
+	ensureSecret(t, testNS, "pod-e2e-source", map[string]string{
+		"uri": "mysql://repl:replpass@mysql.e2e.svc.cluster.local:3306/shop",
+	})
+	ensureSecret(t, testNS, "pod-e2e-catalog", map[string]string{
+		"uri":          "http://polaris.e2e.svc.cluster.local:8181/api/catalog",
+		"clientId":     "root",
+		"clientSecret": "s3cr3t",
+		"scope":        "PRINCIPAL_ROLE:ALL",
+	})
+	portForward(t, dataNS, "svc/mysql", localMySQLPort, 3306)
+	portForward(t, dataNS, "svc/trino", localTrinoPort, 8080)
+	return openMySQL(t, localMySQLPort), openTrino(t, localTrinoPort)
+}
+
+// startWriter runs a mixed INSERT/UPDATE/DELETE load against the source until
+// the returned stop function is called. The source is the oracle, so the exact
+// operations do not need to be tracked — a row the engine loses shows up as a
+// key missing from the sink, and a resurrected delete as an extra key.
+func startWriter(t *testing.T, db *sql.DB) (stop func()) {
+	t.Helper()
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			var q string
+			var args []any
+			switch i % 3 {
+			case 0: // monotonic insert: extends the key range
+				id := int64(1000 + i/3)
+				q, args = "INSERT INTO orders (id, v, amount) VALUES (?, ?, ?)", []any{id, fmt.Sprintf("ins%d", i), float64(id)}
+			case 1: // update an existing key
+				id := int64((i / 3) % 200)
+				q, args = "UPDATE orders SET v = ? WHERE id = ?", []any{fmt.Sprintf("upd%d", i), id}
+			case 2: // delete a key, which must not be resurrected
+				id := int64(100 + (i/3)%50)
+				q, args = "DELETE FROM orders WHERE id = ?", []any{id}
+			}
+			if _, err := db.Exec(q, args...); err != nil {
+				t.Logf("writer %q: %v", q, err)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	return func() {
+		close(stopCh)
+		<-done
 	}
 }
