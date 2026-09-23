@@ -24,7 +24,7 @@ func TestPodSmoke(t *testing.T) {
 
 	cr := buildCR("pod-smoke", testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2301",
 		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
-	applyCR(t, cr)
+	applyPipeline(t, testNS, "pod-smoke", cr)
 	t.Log("CDCPipeline applied; waiting for the coordinator and worker Pods")
 
 	waitPodsByPrefix(t, testNS, "pod-smoke-", 2, 4*time.Minute)

@@ -25,7 +25,7 @@ func TestPodMaintenance(t *testing.T) {
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2304",
 		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}},
 		crOptions{Maintenance: true})
-	applyCR(t, cr)
+	applyPipeline(t, testNS, pipeline, cr)
 	t.Log("applied with maintenance enabled")
 
 	coord := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 4*time.Minute)[0]

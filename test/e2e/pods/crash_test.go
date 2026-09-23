@@ -26,7 +26,7 @@ func TestPodCrashRecovery(t *testing.T) {
 
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2303",
 		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
-	applyCR(t, cr)
+	applyPipeline(t, testNS, pipeline, cr)
 	t.Log("applied; waiting for the coordinator and one worker")
 
 	coord := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 4*time.Minute)[0]

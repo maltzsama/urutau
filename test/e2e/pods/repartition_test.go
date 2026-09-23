@@ -25,7 +25,7 @@ func TestPodScaleOutIn(t *testing.T) {
 
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2302",
 		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
-	applyCR(t, cr)
+	applyPipeline(t, testNS, pipeline, cr)
 	t.Log("applied; waiting for the coordinator and one worker")
 
 	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 4*time.Minute)

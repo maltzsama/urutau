@@ -91,6 +91,18 @@ func applyCR(t *testing.T, manifest string) {
 	kubectlStdin(t, manifest, "apply", "-f", "-")
 }
 
+// applyPipeline applies a CR and registers a cleanup that deletes it. Without
+// the cleanup a finished test leaves a pipeline streaming the shared source,
+// cross-talking into the next test's load.
+func applyPipeline(t *testing.T, ns, name, manifest string) {
+	t.Helper()
+	applyCR(t, manifest)
+	t.Cleanup(func() {
+		_ = exec.Command("kubectl", "-n", ns, "delete", "cdcpipelines", name,
+			"--ignore-not-found", "--wait=false").Run()
+	})
+}
+
 // ensureNamespace creates the namespace if it is absent (idempotent).
 func ensureNamespace(t *testing.T, ns string) {
 	t.Helper()
