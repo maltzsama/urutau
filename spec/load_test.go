@@ -249,8 +249,9 @@ func TestDNSLabel(t *testing.T) {
 		}
 	}
 	// Long names are truncated but stay under the 63-char label limit once
-	// the "-<ordinal>" suffix is appended.
-	if got := dnsLabel(strings.Repeat("a", 100)); len(got) > 54 {
-		t.Errorf("dnsLabel(long) = %d chars, want <= 54", len(got))
+	// the "-<ordinal>" and the StatefulSet's "controller-revision-hash"
+	// suffixes are appended.
+	if got := dnsLabel(strings.Repeat("a", 100)); len(got) > 52 {
+		t.Errorf("dnsLabel(long) = %d chars, want <= 52", len(got))
 	}
 }
