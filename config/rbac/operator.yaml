@@ -69,6 +69,13 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Events: the operator records reconciliation and leader-election Events.
+  # Without this rule the API server rejects every Event
+  # ("events is forbidden: cannot create resource events"), so kubectl
+  # describe shows none — a silent observability gap (issue #364).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   # KEDA ScaledObjects: the operator renders one per autoscalable table
   # (spec.workers.max > 0) when started with --keda-prometheus-address. The
   # CRD may not be installed; the operator then skips them (issue #298).

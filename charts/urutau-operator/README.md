@@ -36,14 +36,18 @@ every place the kustomize base hardcodes `urutau-system` — the webhook
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `nameOverride` | `urutau-operator` | Resource name base |
-| `fullnameOverride` | _(empty)_ | Overrides every resource name; set it to run a second release without colliding on the cluster-scoped resources |
+| `fullnameOverride` | _(empty)_ | Overrides every cluster-scoped resource name except the CRD (fixed at `cdcpipelines.urutau.io`); a second release also needs `crds.install=false` |
+| `crds.install` | `true` | Whether this release owns the CDCPipeline CRD; set `false` for a second release in the same cluster |
+| `rbac.clusterWide` | `true` | Bind the operator's ClusterRole cluster-wide; `false` binds it into each `operator.watchNamespaces` namespace |
 | `image.repository` | `ghcr.io/maltzsama/urutau` | Image for the operator (and `--coordinator-image`) |
 | `image.tag` | chart `appVersion` | Image tag |
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy |
 | `imagePullSecrets` | `[]` | Pull secrets for the image (private mirrors) |
 | `operator.replicaCount` | `2` | Operator replicas (leader election makes >1 safe) |
 | `operator.fieldManager` | `urutau-operator` | Server-Side Apply field manager |
-| `operator.watchNamespaces` | _(all)_ | Comma-separated namespaces to watch; each needs a RoleBinding |
+| `operator.watchNamespaces` | _(all)_ | Comma-separated namespaces to watch — scopes the CACHE; pair with `rbac.clusterWide=false` for the permissions boundary |
+| `operator.keda.prometheusAddress` | `""` | Prometheus address for KEDA ScaledObjects; empty disables worker autoscaling |
+| `operator.keda.threshold` | `""` | Per-replica backlog target for KEDA; empty uses the operator default (30) |
 | `operator.resources` | `100m/128Mi` → `500m/256Mi` | Operator container resources |
 | `podAnnotations` | `{}` | Extra annotations on the operator Pod |
 | `nodeSelector` / `tolerations` / `affinity` / `topologySpreadConstraints` | `{}`/`[]` | Pod placement |
@@ -54,6 +58,63 @@ every place the kustomize base hardcodes `urutau-system` — the webhook
 | `webhook.enabled` | `true` | Run the admission webhook |
 | `webhook.certManager.enabled` | `true` | cert-manager issues the webhook cert |
 | `webhook.caBundle` | `""` | Base64 PEM for the webhook's caBundle; required when `webhook.certManager.enabled=false` |
+
+## Worker autoscaling (KEDA)
+
+Set `operator.keda.prometheusAddress` to turn on KEDA worker autoscaling
+(issue #298). The operator then renders one KEDA `ScaledObject` per table that
+sets `spec.workers.max`, driven by the coordinator's per-table backlog metric.
+
+Prerequisite: **KEDA** installed in the cluster, and a **Prometheus** that
+scrapes the coordinator Pods' `/metrics` — KEDA's prometheus scaler queries
+Prometheus, not the Pods directly.
+
+```sh
+helm install urutau charts/urutau-operator \
+  --namespace urutau-system --create-namespace \
+  --set operator.keda.prometheusAddress=http://prometheus.monitoring.svc:9090
+```
+
+`operator.keda.threshold` sets the per-replica backlog target; leave it empty
+to use the operator default (30). An empty `prometheusAddress` keeps the
+feature off — no `ScaledObject` is rendered.
+
+## Multiple releases in one cluster
+
+`fullnameOverride` renames every cluster-scoped resource the chart creates
+**except the CRD**: its name (`cdcpipelines.urutau.io`) is the API identity
+and cannot be renamed. So a second release must also set `crds.install=false`
+and share the first release's CRD:
+
+```sh
+# second release, sharing the CRD and the cluster-wide RBAC of the first
+helm install urutau-b charts/urutau-operator \
+  --namespace urutau-b-system --create-namespace \
+  --set fullnameOverride=urutau-operator-b \
+  --set crds.install=false
+```
+
+Only the release that owns the CRD (the one that created it) should leave
+`crds.install=true`.
+
+## Namespace-scoped RBAC
+
+`operator.watchNamespaces` scopes the operator's **cache** only; by default
+the operator is still bound cluster-wide. To make it a real permissions
+boundary — the repo's `config/multi-tenant` model — set
+`rbac.clusterWide=false`; the chart then binds the operator's ClusterRole into
+each watched namespace with a `RoleBinding` and drops the
+`ClusterRoleBinding`:
+
+```sh
+helm install urutau charts/urutau-operator \
+  --namespace urutau-system --create-namespace \
+  --set rbac.clusterWide=false \
+  --set 'operator.watchNamespaces=team-a\,team-b'
+```
+
+`rbac.clusterWide=false` with an empty `operator.watchNamespaces` fails the
+render: the operator would have no permissions anywhere.
 
 ## The CDCPipeline CRD survives `helm uninstall`
 

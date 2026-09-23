@@ -83,6 +83,12 @@ spec:
             {{- if .Values.operator.watchNamespaces }}
             - --watch-namespaces={{ .Values.operator.watchNamespaces }}
             {{- end }}
+            {{- if .Values.operator.keda.prometheusAddress }}
+            - --keda-prometheus-address={{ .Values.operator.keda.prometheusAddress }}
+            {{- end }}
+            {{- if .Values.operator.keda.threshold }}
+            - --keda-threshold={{ .Values.operator.keda.threshold }}
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080

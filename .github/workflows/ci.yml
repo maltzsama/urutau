@@ -117,6 +117,37 @@ jobs:
           helm template urutau $C -n urutau-system --set fullnameOverride=myop \
             | grep -q 'name: myop-validating-webhook'
 
+          # KEDA flags render only when configured (#359).
+          if helm template urutau $C -n urutau-system | grep -q -- '--keda-prometheus-address='; then
+            echo "keda address rendered with no value set"; exit 1
+          fi
+          helm template urutau $C -n urutau-system \
+            --set operator.keda.prometheusAddress=http://p:9090 --set operator.keda.threshold=10 \
+            | grep -q -- '--keda-threshold=10'
+
+          # The operator can record Events (#364).
+          helm template urutau $C -n urutau-system | grep -q 'resources: \["events"\]'
+
+          # Namespace-scoped RBAC: no cluster-wide binding, one RoleBinding per
+          # watched namespace (#361).
+          helm template urutau $C -n urutau-system \
+            --set rbac.clusterWide=false --set 'operator.watchNamespaces=team-a\,team-b' \
+            > /tmp/urutau-ns-rbac.yaml
+          if grep -q 'kind: ClusterRoleBinding' /tmp/urutau-ns-rbac.yaml; then
+            echo "namespace-scoped mode still renders a ClusterRoleBinding"; exit 1
+          fi
+          [ "$(grep -c 'kind: RoleBinding' /tmp/urutau-ns-rbac.yaml)" = "2" ]
+          # ...and it is unsatisfiable with no watched namespaces.
+          if helm template urutau $C -n urutau-system --set rbac.clusterWide=false >/dev/null 2>&1; then
+            echo "rbac.clusterWide=false with no watchNamespaces rendered instead of failing"; exit 1
+          fi
+
+          # A second release can share the CRD (#360).
+          if helm template urutau $C -n urutau-system --set crds.install=false \
+            | grep -q 'kind: CustomResourceDefinition'; then
+            echo "crds.install=false still rendered the CRD"; exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25

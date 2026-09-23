@@ -1,5 +1,10 @@
 # The CDCPipeline CRD. Mirrors config/crd/cdcpipelines.urutau.io.yaml in the
 # repo; keep the two in sync when the API changes.
+#
+# crds.install=false skips it, so a second release in the same cluster shares
+# the first release's CRD instead of colliding on its fixed name — the CRD
+# name is the API identity and cannot be renamed (issue #360).
+{{- if .Values.crds.install }}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -99,3 +104,4 @@ spec:
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
+{{- end }}
