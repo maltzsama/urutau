@@ -1,7 +1,10 @@
 package coordinator
 
 import (
+	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/maltzsama/urutau/dataplane"
 )
@@ -35,5 +38,31 @@ func TestPauseHoldPassesThroughUnpausedTable(t *testing.T) {
 	c, _ := scaleHarness(t)
 	if c.pauseHold(&dataplane.Batch{Table: "raw.orders"}) {
 		t.Fatal("an unpaused table's batch must not be held")
+	}
+}
+
+// #343, end to end at the pump: a batch for a paused table must not PARK the
+// pump. The pump is fed a paused table's batch and then a second table's batch
+// that enqueueBatch rejects (no owner), which terminates the pump. With the
+// old behaviour the pump parked on the first batch and never reached the
+// second, so this would hang; with the buffering fix it reaches the second and
+// terminates with the pump error.
+func TestPumpDoesNotParkOnPausedTable(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.terminate = make(chan error, 1)
+	c.pauseTable("raw.orders")
+
+	out := make(chan *dataplane.Batch, 2)
+	go c.pump(context.Background(), out)
+	out <- &dataplane.Batch{Table: "raw.orders"}  // paused: buffered
+	out <- &dataplane.Batch{Table: "raw.unknown"} // no owner: enqueueBatch fails
+
+	select {
+	case err := <-c.terminate:
+		if err == nil || !strings.Contains(err.Error(), "pump") {
+			t.Fatalf("want a pump error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pump parked on the paused table; it never processed the next table's batch")
 	}
 }
