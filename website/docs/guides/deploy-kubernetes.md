@@ -279,8 +279,10 @@ tables:
       max: 8         # maxReplicaCount — also enables the ScaledObject
 ```
 
-Each table's workers run as one StatefulSet named `<pipeline>-<target>` (its
-pod ordinals are the derived worker names), and the `ScaledObject` drives its
+Each table's workers run as one StatefulSet named `<pipeline>-<target>` with
+the name **DNS-sanitized** (a target like `raw.orders` becomes
+`raw-orders`, since `.` is not valid in a Kubernetes name), and its pod
+ordinals are the derived worker names. The `ScaledObject` drives its
 `spec.replicas` from `urutau_coordinator_pending_batches{table="<target>"}` —
 the table's outstanding batches — with `--keda-threshold` (default `30`) as
 the per-replica backlog target. The operator never scales the table itself:
