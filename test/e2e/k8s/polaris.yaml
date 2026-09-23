@@ -1,0 +1,72 @@
+# Apache Polaris: the Iceberg REST catalog — the in-cluster twin of the
+# compose `polaris` service. The `quickstart_catalog` (with in-cluster S3
+# endpoints, so pods reach RustFS directly) is created by the polaris-setup
+# Job.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polaris
+  labels:
+    app: polaris
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: polaris
+  template:
+    metadata:
+      labels:
+        app: polaris
+    spec:
+      containers:
+        - name: polaris
+          image: apache/polaris:latest
+          env:
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_ACCESS_KEY_ID
+              value: urutau
+            - name: AWS_SECRET_ACCESS_KEY
+              value: urutau_dev_secret
+            - name: POLARIS_BOOTSTRAP_CREDENTIALS
+              value: "POLARIS,root,s3cr3t"
+            - name: polaris.realm-context.realms
+              value: POLARIS
+            - name: quarkus.otel.sdk.disabled
+              value: "true"
+            # The container sizes its heap from the limit; cap it so the
+            # whole e2e stack fits a modest minikube.
+            - name: JAVA_OPTS_APPEND
+              value: "-Xmx1024m"
+          ports:
+            - containerPort: 8181
+            - containerPort: 8182
+          readinessProbe:
+            httpGet:
+              path: /q/health
+              port: 8182
+            initialDelaySeconds: 10
+            periodSeconds: 3
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: polaris
+spec:
+  selector:
+    app: polaris
+  ports:
+    - name: api
+      port: 8181
+      targetPort: 8181
+    - name: health
+      port: 8182
+      targetPort: 8182

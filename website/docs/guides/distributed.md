@@ -157,8 +157,9 @@ has the details.
 
 A running coordinator can re-slice a table across a different number of
 workers — adding or removing owners and swapping the routing snapshot
-atomically, with no coordinator restart. A scaler (KEDA, or an operator by
-hand) drives it via `Coordinator.ScaleTable`.
+atomically, with no coordinator restart. The coordinator's `ScaleTable` does
+the re-slice; under Kubernetes, KEDA drives it from the per-table lag metric
+(see [Autoscaling with KEDA](#autoscaling-with-keda)).
 
 The sequence is **prepare → commit**, and every wait is bounded: a step that
 cannot complete fails the scale and leaves the old layout in place, so a
@@ -198,6 +199,47 @@ behind it in the table's send order (issue #312).
 
 A table's `workers.max` caps how far it may scale **up**; it never blocks a
 scale-down. A table that sets it ignores the coordinator's default (32).
+
+### Autoscaling with KEDA
+
+In Kubernetes, a table's workers run as **one StatefulSet** named
+`<pipeline>-<target>` (DNS-sanitized), with `replicas = workers.number` at
+boot. A StatefulSet pod's hostname is `<statefulset>-<ordinal>` — exactly the
+derived worker group name — so a replica *is* its partition, with no identity
+plumbing.
+
+That single replica count is what KEDA scales. Start the operator with
+`--keda-prometheus-address <url>` and it renders one `ScaledObject` per table
+that sets `workers.max`:
+
+- `minReplicaCount` = `workers.number`, `maxReplicaCount` = `workers.max`;
+- a Prometheus trigger on `urutau_coordinator_pending_batches{table="<target>"}`
+  (the table's outstanding batches — queued, in-flight, and staged), with
+  `--keda-threshold` (default 30) as the per-replica backlog target.
+
+**Why the backlog, not the lag.** `urutau_coordinator_lag_seconds` is the time
+since the table's last commit. Measured under a 50k-row burst it stayed ~0.1s
+while the table owed ~50k rows — commits kept flowing, so the gauge never moved
+— and it *grew* while the table sat idle. It is a "commits have stalled"
+detector, not a load signal. `urutau_coordinator_pending_batches` is the direct
+backlog, and is what the ScaledObject uses. (The lag gauge is still set, and
+reads zero for a caught-up table.)
+
+The coordinator never writes the replica count — it **follows** it. A reconcile
+loop reads each worker StatefulSet's `spec.replicas` and calls `ScaleTable` when
+the routing owner count diverges, so KEDA (or a manual `kubectl scale`) is the
+only writer. A failed scale is retried after a cooldown, so it cannot hold the
+table's input paused on every tick.
+
+**Known limit.** A re-slice flips only once the table owes nothing (the barrier
+above). Under a large backlog the drain cannot converge inside
+`ScaleDrainTimeout`, so a scale-out can fail: KEDA raises `replicas`, the new
+pods connect, but the coordinator keeps the old routing and the new owners idle
+until the backlog drains. The mechanism is sound for a moderate backlog (the
+drain converges) and for scale-in; making a scale-out effective *while*
+backlogged needs a cheaper barrier.
+
+Omit `workers.max` and the count is fixed — no ScaledObject, no autoscaling.
 
 ## Next steps
 

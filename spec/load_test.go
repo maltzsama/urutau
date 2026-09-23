@@ -65,7 +65,7 @@ func TestLoadYAML(t *testing.T) {
 		orders.WriteMode != WriteModeAppend || !orders.FilterImmutable {
 		t.Fatalf("orders = %+v", orders)
 	}
-	wantGroups := []string{"shop-mysql-raw.orders-0", "shop-mysql-raw.orders-1", "shop-mysql-raw.orders-2"}
+	wantGroups := []string{"shop-mysql-raw-orders-0", "shop-mysql-raw-orders-1", "shop-mysql-raw-orders-2"}
 	gotGroups := orders.WorkerGroupNames(s.Pipeline)
 	if len(gotGroups) != len(wantGroups) {
 		t.Fatalf("WorkerGroupNames = %v, want %v", gotGroups, wantGroups)
@@ -212,13 +212,45 @@ func TestValidateAcceptsNumericServerID(t *testing.T) {
 // tables' positions into the same minimum.
 func TestWorkerGroupNamesEmbedTarget(t *testing.T) {
 	tbl := Table{Target: "raw.orders"}
-	names := tbl.WorkerGroupNames("shop-mysql")
+	const pipeline = "shop-mysql"
+	prefix := WorkerGroupPrefix(pipeline, tbl.Target)
+	names := tbl.WorkerGroupNames(pipeline)
 	if len(names) == 0 {
 		t.Fatal("no worker group names")
 	}
+	// The prefix must be a single DNS label: it names the worker StatefulSet
+	// and its headless Service, and each pod's hostname is "<prefix>-<index>".
+	if strings.ContainsAny(prefix, "._") || prefix != dnsLabel(prefix) {
+		t.Fatalf("worker group prefix %q is not a DNS label", prefix)
+	}
 	for _, name := range names {
-		if !strings.Contains(name, tbl.Target) {
-			t.Fatalf("worker group %q does not embed the target %q — the coordinator's per-worker confirmed key would fold two tables", name, tbl.Target)
+		if !strings.HasPrefix(name, prefix+"-") {
+			t.Fatalf("worker group %q does not embed the prefix %q", name, prefix)
 		}
+		if !strings.Contains(name, dnsLabel(tbl.Target)) {
+			t.Fatalf("worker group %q does not embed the (sanitized) target — the coordinator's per-worker confirmed key could fold two tables", name)
+		}
+	}
+}
+
+func TestDNSLabel(t *testing.T) {
+	cases := map[string]string{
+		"raw.orders":      "raw-orders",
+		"Shop.Orders":     "shop-orders",
+		"a--b":            "a-b",
+		"-lead-trail-":    "lead-trail",
+		"1digit":          "w-1digit",
+		"":                "w",
+		"weird!!chars..x": "weird-chars-x",
+	}
+	for in, want := range cases {
+		if got := dnsLabel(in); got != want {
+			t.Errorf("dnsLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// Long names are truncated but stay under the 63-char label limit once
+	// the "-<ordinal>" suffix is appended.
+	if got := dnsLabel(strings.Repeat("a", 100)); len(got) > 54 {
+		t.Errorf("dnsLabel(long) = %d chars, want <= 54", len(got))
 	}
 }

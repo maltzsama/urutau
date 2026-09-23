@@ -26,11 +26,12 @@ rules:
     verbs: ["get", "list", "watch"]
   # The per-pipeline coordinator Role grants these to the coordinator's own
   # ServiceAccount. RBAC forbids granting what you do not hold, so the
-  # operator must hold them too — it never uses deployments/pods itself (the
-  # coordinator creates the worker Deployments, and creates/deletes the
-  # ephemeral maintenance worker Pods — issue #105).
+  # operator must hold them too — it never uses pods itself (the coordinator
+  # creates/deletes the ephemeral maintenance worker Pods — issue #105). The
+  # worker StatefulSets and headless Services the coordinator also creates
+  # are covered by the statefulsets/services rules above.
   #
-  # These are held only to be delegated, but this ClusterRole is bound
+  # The pods rule is held only to be delegated, but this ClusterRole is bound
   # cluster-wide (see the ClusterRoleBinding below), so pods/delete reaches
   # every namespace. The coordinator's own Role scopes delete down to the
   # maintenance Pod names it provisions (coordinatorRole in
@@ -44,9 +45,6 @@ rules:
   # each managed namespace with a RoleBinding (same permission set, scoped),
   # and runs the operator with --watch-namespaces so its cache stays within
   # those namespaces too.
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "create", "update"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "create", "delete"]
@@ -71,6 +69,12 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # KEDA ScaledObjects: the operator renders one per autoscalable table
+  # (spec.workers.max > 0) when started with --keda-prometheus-address. The
+  # CRD may not be installed; the operator then skips them (issue #298).
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

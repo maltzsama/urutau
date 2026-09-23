@@ -178,14 +178,20 @@ snapshot.
 
 `workers: {number: N}` splits the table's primary-key range into `N`
 contiguous ranges and derives the group names
-`<pipeline>-<target>-<index>`. `N <= 1` or absent means one worker, no
+`<pipeline>-<target>-<index>` (DNS-sanitized: `.` and other invalid
+characters become `-`). `N <= 1` or absent means one worker, no
 partitioning. A sink that cannot handle concurrent writers rejects
 `N > 1` at boot. See [Distributed mode](../guides/distributed.md).
 
-`workers.max` caps runtime scaling (issue #312): the coordinator may
+`workers.max` caps runtime scaling (issues #312, #298): the coordinator may
 re-slice the table up to that many workers, never beyond. Zero uses the
 coordinator's default (32); a table that sets `max` ignores the global. A
-scale-in ignores it (it is an upper bound, not a target).
+scale-in ignores it (it is an upper bound, not a target). Under Kubernetes it
+is also the KEDA autoscaling ceiling: with the operator started with
+`--keda-prometheus-address`, a table that sets `max` gets a `ScaledObject`
+that scales its worker StatefulSet between `number` and `max` on
+`urutau_coordinator_pending_batches` (the table's outstanding batches).
+`max` must not be below `number`.
 
 ### `enrich[]`
 

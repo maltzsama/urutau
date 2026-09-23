@@ -15,11 +15,12 @@ type Metrics struct {
 	reg *prometheus.Registry
 
 	// Coordinator.
-	LagSeconds    *prometheus.GaugeVec
-	InflightBytes *prometheus.GaugeVec
-	WorkerResets  *prometheus.CounterVec
-	CommitsTotal  *prometheus.CounterVec
-	EventsDecoded prometheus.Counter
+	LagSeconds     *prometheus.GaugeVec
+	PendingBatches *prometheus.GaugeVec
+	InflightBytes  *prometheus.GaugeVec
+	WorkerResets   *prometheus.CounterVec
+	CommitsTotal   *prometheus.CounterVec
+	EventsDecoded  prometheus.Counter
 
 	// Worker.
 	RowsWritten      *prometheus.CounterVec
@@ -58,6 +59,13 @@ func New() *Metrics {
 
 	m.LagSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "urutau_coordinator_lag_seconds", Help: "reader-to-worker lag in seconds, per table."},
+		[]string{"table"})
+	// PendingBatches is the table's outstanding work (queued + in-flight +
+	// open staged cycles): the direct backlog signal a load-based scaler
+	// wants. LagSeconds alone only rises when commits STALL, so a backlog
+	// the workers are still draining never moves it (issue #298).
+	m.PendingBatches = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "urutau_coordinator_pending_batches", Help: "uncommitted batches the table owes, per table."},
 		[]string{"table"})
 	m.InflightBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "urutau_coordinator_inflight_bytes", Help: "unacked batch bytes per worker."},
@@ -136,7 +144,7 @@ func New() *Metrics {
 		Name: "urutau_iceberg_orphan_cleanup_bytes_freed_total", Help: "storage bytes freed by orphan cleanup, per table."},
 		[]string{"table"})
 
-	reg.MustRegister(m.LagSeconds, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
+	reg.MustRegister(m.LagSeconds, m.PendingBatches, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
 	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitLatencyMs, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	reg.MustRegister(m.EnrichDropped, m.EnrichEvicted)
 	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,

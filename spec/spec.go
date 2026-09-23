@@ -5,6 +5,8 @@
 package spec
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -487,17 +489,64 @@ func (t Table) WorkerCount() int {
 	return t.Workers.Number
 }
 
+// WorkerGroupPrefix is the shared prefix of a table's worker group names,
+// coerced to a DNS-1035 label: "<pipeline>-<target>" with every character
+// outside [a-z0-9-] replaced by '-'. It is also the name of the StatefulSet
+// (and its governing headless Service) whose ordinals are the partition
+// indices, and a pod's hostname is "<prefix>-<index>" — a single DNS label.
+// A target like "raw.orders" contains a dot, legal in a Deployment name but
+// NOT in a pod hostname or a Service name, so the derived name is sanitized
+// here, once, for every consumer (issue #298).
+func WorkerGroupPrefix(pipeline, target string) string {
+	return dnsLabel(pipeline + "-" + target)
+}
+
+// dnsLabel coerces s into a DNS-1035 label (RFC 1123): lowercase
+// alphanumerics and '-', starting and ending with an alphanumeric, at most 63
+// characters. It leaves room for the "-<ordinal>" a worker pod appends.
+func dnsLabel(s string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			dash = false
+		case b.Len() > 0 && !dash:
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "w"
+	}
+	// A DNS-1035 label must start with a letter.
+	if out[0] < 'a' || out[0] > 'z' {
+		out = "w-" + out
+	}
+	// Reserve room for "-<ordinal>" under the 63-char label limit; the short
+	// hash keeps two long, distinct names from collapsing to one prefix.
+	const maxPrefix = 54
+	if len(out) > maxPrefix {
+		sum := sha256.Sum256([]byte(out))
+		out = out[:maxPrefix-9] + "-" + hex.EncodeToString(sum[:4])
+	}
+	return out
+}
+
 // WorkerGroupNames returns this table's derived worker group names — one
 // per partition, "<pipeline>-<target>-<index>" for index in
-// [0, WorkerCount()). This is the ONLY way a worker group is named: there
-// is no operator-chosen name (Workers.Number is a count, not a list of
-// names), so the coordinator's routing and its Kubernetes worker
+// [0, WorkerCount()), DNS-sanitized. This is the ONLY way a worker group is
+// named: there is no operator-chosen name (Workers.Number is a count, not a
+// list of names), so the coordinator's routing and its Kubernetes worker
 // provisioning always derive the same names from the same inputs.
 func (t Table) WorkerGroupNames(pipeline string) []string {
 	n := t.WorkerCount()
+	prefix := WorkerGroupPrefix(pipeline, t.Target)
 	names := make([]string, n)
 	for i := 0; i < n; i++ {
-		names[i] = fmt.Sprintf("%s-%s-%d", pipeline, t.Target, i)
+		names[i] = fmt.Sprintf("%s-%d", prefix, i)
 	}
 	return names
 }

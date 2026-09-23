@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/dashboard"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/spec"
@@ -109,6 +110,12 @@ func (s dashState) Tables() []dashboard.TableStatus {
 		return nil
 	}
 	positions := c.tablePositions()
+	// Pending before statsMu, for the same reason publishLag does it: it
+	// takes other locks, and statsMu must not be held across them.
+	pending := make(map[string]int, len(c.cfg.Spec.Tables))
+	for _, t := range c.cfg.Spec.Tables {
+		pending[t.Target] = c.tablePending(t.Target)
+	}
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	out := make([]dashboard.TableStatus, 0, len(c.cfg.Spec.Tables))
@@ -128,7 +135,7 @@ func (s dashState) Tables() []dashboard.TableStatus {
 			st.CommitLatencyMs = ts.commitLatencyMs
 			st.DeletesDropped = ts.deletesDropped
 			st.SnapshotProgress = ts.snapshotProgress
-			if !ts.lastCommit.IsZero() {
+			if !ts.lastCommit.IsZero() && pending[t.Target] > 0 {
 				st.LagS = time.Since(ts.lastCommit).Seconds()
 			}
 		}
@@ -299,19 +306,65 @@ func (c *Coordinator) lagLoop(ctx context.Context) {
 	}
 }
 
-// publishLag sets the per-table lag gauge to the time since that table's last
-// commit. A table that has never committed has no series — a permanent 0 would
-// alert on a pipeline that simply has not started.
+// publishLag sets the per-table lag gauge. Lag is the time since that table's
+// last commit WHILE it still owes work; a table that has caught up reports
+// zero. Reporting time-since-last-commit unconditionally would make an idle
+// pipeline look infinitely behind and scale it to its ceiling (issue #298). A
+// table that has never committed has no series — a permanent 0 would alert on
+// a pipeline that simply has not started.
 func (c *Coordinator) publishLag() {
+	if c.cfg.Spec == nil {
+		return
+	}
 	now := time.Now()
+	// Pending is computed before statsMu: it reads routing and staged state
+	// under their own locks, and statsMu must not be held across them.
+	pending := make(map[string]int, len(c.cfg.Spec.Tables))
+	for _, t := range c.cfg.Spec.Tables {
+		pending[t.Target] = c.tablePending(t.Target)
+	}
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	for table, ts := range c.tableStats {
 		if ts == nil || ts.lastCommit.IsZero() {
 			continue
 		}
-		c.metrics.LagSeconds.WithLabelValues(table).Set(now.Sub(ts.lastCommit).Seconds())
+		lag := 0.0
+		if pending[table] > 0 {
+			lag = now.Sub(ts.lastCommit).Seconds()
+		}
+		c.metrics.LagSeconds.WithLabelValues(table).Set(lag)
 	}
+	// The backlog gauge is set for every table — a table can owe work before
+	// its first commit — so a load-based scaler sees it from the start.
+	for table, n := range pending {
+		c.metrics.PendingBatches.WithLabelValues(table).Set(float64(n))
+	}
+}
+
+// tablePending reports the table's outstanding work: batches queued for or
+// in flight to its owners, plus any open staged cycle. Zero means caught up.
+// It takes c.mu for the in-flight index read (a scale mutates that map), and
+// the staged lock separately, never nested — so a caller can use it without
+// holding c.mu or c.statsMu.
+func (c *Coordinator) tablePending(target string) int {
+	owners, ok := c.loadRouting().ownersOf(target)
+	if !ok {
+		return 0
+	}
+	pending := 0
+	c.mu.Lock()
+	for _, w := range owners {
+		pending += len(w.queue)
+		if idx := c.index[w.name]; idx != nil {
+			pending += idx.InFlight()
+		}
+	}
+	c.mu.Unlock()
+	if c.stagesCycles() {
+		pending += c.staged.openFor(core.TableRef{Target: target})
+	}
+	return pending
 }
 
 // recordMaintStats folds one maintenance operation result into the per-table,

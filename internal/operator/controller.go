@@ -75,6 +75,14 @@ type CoordinatorReconciler struct {
 	// controller also manages these objects, so their field ownership does not
 	// collide.
 	FieldManager string
+	// KEDAPrometheusAddress is the Prometheus server the KEDA ScaledObjects
+	// query for the coordinator's per-table backlog gauge. Empty disables KEDA
+	// autoscaling entirely: no ScaledObject is rendered, and worker replicas
+	// stay at spec.workers.number (issue #298).
+	KEDAPrometheusAddress string
+	// KEDAThreshold is the per-replica backlog target (outstanding batches)
+	// handed to the ScaledObject trigger. Empty means defaultKEDAThreshold.
+	KEDAThreshold string
 }
 
 // fieldManager returns the configured Server-Side Apply field owner, or the
@@ -96,6 +104,7 @@ func (r *CoordinatorReconciler) fieldManager() string {
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 
 // SetupWithManager wires the reconciler into the manager.
 func (r *CoordinatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -229,6 +238,13 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	log.Info("coordinator ensured", "statefulset", sts.Name)
+
+	// Autoscaling (issue #298): one KEDA ScaledObject per autoscalable table,
+	// targeting the worker StatefulSet the coordinator creates. A no-op
+	// unless the operator was started with a Prometheus address.
+	if err := r.ensureScaledObjects(ctx, cr); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// Observe the reconciled generation so the operator's view of the spec
 	// is distinguishable from the coordinator's running one.
@@ -395,8 +411,18 @@ func coordinatorRole(cr *urutauv1alpha1.CDCPipeline) *rbacv1.Role {
 			Verbs:     []string{"get", "update", "patch"},
 		},
 		{
+			// The coordinator provisions one worker StatefulSet per table
+			// (issue #298); the replica count itself is owned by KEDA, so the
+			// coordinator only ever reads it.
 			APIGroups: []string{"apps"},
-			Resources: []string{"deployments"},
+			Resources: []string{"statefulsets"},
+			Verbs:     []string{"get", "create", "update"},
+		},
+		{
+			// The governing headless Service each worker StatefulSet requires
+			// for its pods' stable network identity.
+			APIGroups: []string{""},
+			Resources: []string{"services"},
 			Verbs:     []string{"get", "create", "update"},
 		},
 		{

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -35,14 +36,17 @@ const workerConfigDir = "/etc/urutau"
 // for this.
 const serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
-// provisionWorkers ensures one single-replica Deployment exists for
-// every worker group name in workerTarget (name -> table target), using
-// that table's own Pod template rendered by the operator into this
-// coordinator's ConfigMap ("worker-pod-template.<target>.yaml", next to
-// pipeline.yaml). If no such template file exists for ANY of the given
-// names, Kubernetes worker provisioning is off entirely — this is the
-// normal case for every pipeline that doesn't set spec.image, and the
-// coordinator makes zero Kubernetes API calls.
+// provisionWorkers ensures one StatefulSet exists per table, with replicas
+// equal to that table's partition count, using that table's own Pod template
+// rendered by the operator into this coordinator's ConfigMap
+// ("worker-pod-template.<target>.yaml", next to pipeline.yaml). The
+// StatefulSet is named "<pipeline>-<target>", so its pods are named
+// "<pipeline>-<target>-<index>" — exactly spec.Table.WorkerGroupNames — and
+// KEDA has a single replica count to scale for the whole table (issue #298).
+// If no such template file exists for ANY of the given names, Kubernetes
+// worker provisioning is off entirely — this is the normal case for every
+// pipeline that doesn't set spec.image, and the coordinator makes zero
+// Kubernetes API calls.
 func (c *Coordinator) provisionWorkers(ctx context.Context, workerTarget map[string]string) error {
 	if len(workerTarget) == 0 {
 		return nil
@@ -51,13 +55,25 @@ func (c *Coordinator) provisionWorkers(ctx context.Context, workerTarget map[str
 		return nil
 	}
 
-	clientset, ns, owner, err := inClusterClient(ctx)
+	clientset, ns, owner, err := c.workerClientset(ctx)
 	if err != nil {
 		return fmt.Errorf("k8s worker provisioning: %w", err)
 	}
 
+	// One StatefulSet per table: its replica count is the number of worker
+	// group names the boot path derived for that target.
+	replicas := map[string]int{}
+	for _, target := range workerTarget {
+		replicas[target]++
+	}
+	targets := make([]string, 0, len(replicas))
+	for target := range replicas {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets) // stable order, so boot provisioning is deterministic
+
 	templates := map[string]corev1.PodTemplateSpec{}
-	for name, target := range workerTarget {
+	for _, target := range targets {
 		tmpl, ok := templates[target]
 		if !ok {
 			tmpl, err = loadWorkerPodTemplate(target)
@@ -66,13 +82,37 @@ func (c *Coordinator) provisionWorkers(ctx context.Context, workerTarget map[str
 			}
 			templates[target] = tmpl
 		}
-		dep := workerDeployment(name, ns, owner, tmpl)
-		if err := ensureDeployment(ctx, clientset, ns, dep); err != nil {
+		name := spec.WorkerGroupPrefix(c.cfg.Spec.Pipeline, target)
+		if err := ensureService(ctx, clientset, ns, workerHeadlessService(name, ns, owner)); err != nil {
 			return fmt.Errorf("k8s worker provisioning: %s: %w", name, err)
 		}
-		c.log.Info("coordinator: worker deployment ensured", "worker", name, "table", target)
+		sts := workerStatefulSet(name, ns, owner, tmpl, int32(replicas[target]))
+		if err := ensureStatefulSet(ctx, clientset, ns, sts); err != nil {
+			return fmt.Errorf("k8s worker provisioning: %s: %w", name, err)
+		}
+		c.log.Info("coordinator: worker statefulset ensured", "table", target, "replicas", replicas[target])
 	}
 	return nil
+}
+
+// workerClientset returns the coordinator's cached in-cluster Kubernetes
+// client, its namespace, and the ownerReference new worker workloads carry.
+// It is built once and reused: the scale reconcile loop calls it on every
+// tick, and rebuilding the client each time would re-read the service
+// account files and re-GET the coordinator Pod. A failure is not cached, so
+// a transient boot error does not permanently disable provisioning.
+func (c *Coordinator) workerClientset(ctx context.Context) (kubernetes.Interface, string, metav1.OwnerReference, error) {
+	c.k8sMu.Lock()
+	defer c.k8sMu.Unlock()
+	if c.k8sClient != nil {
+		return c.k8sClient, c.k8sNS, c.k8sOwner, nil
+	}
+	cs, ns, owner, err := inClusterClient(ctx)
+	if err != nil {
+		return nil, "", metav1.OwnerReference{}, err
+	}
+	c.k8sClient, c.k8sNS, c.k8sOwner = cs, ns, owner
+	return cs, ns, owner, nil
 }
 
 // workerPodTemplateAvailable reports whether the operator rendered worker pod
@@ -176,53 +216,104 @@ func coordinatorPodOwner(ctx context.Context, cs kubernetes.Interface, namespace
 	}, nil
 }
 
-// workerDeployment clones the table's own Pod template, stamping only
-// the two things the operator cannot know: this worker's derived name
-// (spec.Table.WorkerGroupNames) and the ownerReference back to the
-// coordinator.
-func workerDeployment(name, namespace string, owner metav1.OwnerReference, tmpl corev1.PodTemplateSpec) *appsv1.Deployment {
+// workerStatefulSet clones the table's own Pod template into the workload
+// that runs that table's worker pool. It is named "<pipeline>-<target>", so
+// a pod's hostname is "<pipeline>-<target>-<ordinal>" — exactly
+// spec.Table.WorkerGroupNames[ordinal]. The pod template carries NO --name:
+// the worker's --name defaults to $HOSTNAME, which Kubernetes sets to the
+// pod name, so the derived name needs no stamping. The replica count is the
+// table's partition count at boot; KEDA owns it from then on (issue #298).
+func workerStatefulSet(name, namespace string, owner metav1.OwnerReference, tmpl corev1.PodTemplateSpec, replicas int32) *appsv1.StatefulSet {
 	tmpl = *tmpl.DeepCopy()
 	if tmpl.Labels == nil {
 		tmpl.Labels = map[string]string{}
 	}
 	tmpl.Labels["urutau.io/worker"] = name
-	for i := range tmpl.Spec.Containers {
-		tmpl.Spec.Containers[i].Args = append(tmpl.Spec.Containers[i].Args, "--name", name)
-	}
 
-	return &appsv1.Deployment{
+	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       namespace,
 			Labels:          tmpl.Labels,
 			OwnerReferences: []metav1.OwnerReference{owner},
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: int32Ptr(1),
-			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"urutau.io/worker": name}},
-			Template: tmpl,
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: name,
+			Replicas:    int32Ptr(replicas),
+			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{"urutau.io/worker": name}},
+			Template:    tmpl,
 		},
 	}
 }
 
-// ensureDeployment creates the Deployment if absent, or updates it in
+// workerHeadlessService is the governing Service a StatefulSet requires for
+// its pods' stable network identity. The workers dial the coordinator, not
+// each other, so it is otherwise unused — it exists so the StatefulSet spec
+// is valid and its pods resolve.
+func workerHeadlessService(name, namespace string, owner metav1.OwnerReference) *corev1.Service {
+	labels := map[string]string{"urutau.io/worker": name}
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{owner},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "None",
+			Selector:  labels,
+			Ports:     []corev1.ServicePort{{Name: "grpc", Port: 50051}},
+		},
+	}
+}
+
+// ensureStatefulSet creates the StatefulSet if absent, or updates it in
 // place when the desired spec differs from the live one — the same
 // declarative reconcile shape internal/operator's ensure() uses for the
-// coordinator itself.
-func ensureDeployment(ctx context.Context, cs kubernetes.Interface, namespace string, desired *appsv1.Deployment) error {
-	deployments := cs.AppsV1().Deployments(namespace)
-	existing, err := deployments.Get(ctx, desired.Name, metav1.GetOptions{})
+// coordinator itself. The replica count is NOT the coordinator's to set:
+// KEDA owns it, so the live count is carried forward, or the coordinator
+// would fight the autoscaler on every reconcile (issue #298).
+func ensureStatefulSet(ctx context.Context, cs kubernetes.Interface, namespace string, desired *appsv1.StatefulSet) error {
+	statefulsets := cs.AppsV1().StatefulSets(namespace)
+	existing, err := statefulsets.Get(ctx, desired.Name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		_, err := deployments.Create(ctx, desired, metav1.CreateOptions{})
+		_, err := statefulsets.Create(ctx, desired, metav1.CreateOptions{})
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if existing.Spec.Replicas != nil {
+		desired.Spec.Replicas = existing.Spec.Replicas
+	}
+	desired.ResourceVersion = existing.ResourceVersion
+	// Selector and ServiceName are immutable once set; carry the live
+	// values forward.
+	desired.Spec.Selector = existing.Spec.Selector
+	desired.Spec.ServiceName = existing.Spec.ServiceName
+	_, err = statefulsets.Update(ctx, desired, metav1.UpdateOptions{})
+	return err
+}
+
+// ensureService creates the Service if absent, or updates it in place when
+// the desired spec differs from the live one. ClusterIP and its family
+// fields are immutable once assigned; the live values are carried forward.
+func ensureService(ctx context.Context, cs kubernetes.Interface, namespace string, desired *corev1.Service) error {
+	services := cs.CoreV1().Services(namespace)
+	existing, err := services.Get(ctx, desired.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err := services.Create(ctx, desired, metav1.CreateOptions{})
 		return err
 	}
 	if err != nil {
 		return err
 	}
 	desired.ResourceVersion = existing.ResourceVersion
-	// The selector is immutable once set; carry the live value forward.
-	desired.Spec.Selector = existing.Spec.Selector
-	_, err = deployments.Update(ctx, desired, metav1.UpdateOptions{})
+	desired.Spec.ClusterIP = existing.Spec.ClusterIP
+	desired.Spec.ClusterIPs = existing.Spec.ClusterIPs
+	desired.Spec.IPFamilies = existing.Spec.IPFamilies
+	desired.Spec.IPFamilyPolicy = existing.Spec.IPFamilyPolicy
+	_, err = services.Update(ctx, desired, metav1.UpdateOptions{})
 	return err
 }
 
