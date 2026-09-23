@@ -525,9 +525,14 @@ func dnsLabel(s string) string {
 	if out[0] < 'a' || out[0] > 'z' {
 		out = "w-" + out
 	}
-	// Reserve room for "-<ordinal>" under the 63-char label limit; the short
-	// hash keeps two long, distinct names from collapsing to one prefix.
-	const maxPrefix = 54
+	// Reserve room under the 63-char label limit for the two suffixes a
+	// derived name collects: the "-<ordinal>" a worker Pod hostname appends,
+	// and — tighter — the StatefulSet's "controller-revision-hash" label,
+	// "<statefulset-name>-<~10-char hash>". A longer prefix makes the
+	// StatefulSet unable to create its Pods ("metadata.labels: must be no
+	// more than 63 bytes"). The short hash keeps two long, distinct names
+	// from collapsing to one prefix.
+	const maxPrefix = 52
 	if len(out) > maxPrefix {
 		sum := sha256.Sum256([]byte(out))
 		out = out[:maxPrefix-9] + "-" + hex.EncodeToString(sum[:4])

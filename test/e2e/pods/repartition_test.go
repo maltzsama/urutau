@@ -64,3 +64,56 @@ func TestPodScaleOutIn(t *testing.T) {
 	assertNoRaces(t, testNS, pipeline+"-")
 	t.Log("scale-out/in ok: sink equals source exactly, no data races")
 }
+
+// TestPodScaleInUnderLoad is issue #363: scaling in while the workers still owe
+// batches deletes their Pods mid-flight, stranding the queued batches in the
+// coordinator. The drain for the re-slice then waits on them forever and the
+// flip never commits. The coordinator must recover — fail the run for a clean
+// replay and resume from the committed position — not stall.
+func TestPodScaleInUnderLoad(t *testing.T) {
+	requirePods(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Minute)
+	defer cancel()
+
+	mysql, trino := setupPodEnv(t)
+	const pipeline = "pod-scalein"
+	target := uniqueTarget("pod_scalein_orders")
+	seedOrders(t, mysql, 200)
+
+	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2306",
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
+	applyPipeline(t, testNS, pipeline, cr)
+
+	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 4*time.Minute)
+	sts := workerSTSs(t, testNS, pipeline)
+	if len(sts) != 1 {
+		t.Fatalf("want exactly one worker StatefulSet, got %v", sts)
+	}
+	worker := sts[0]
+	waitPodsByPrefix(t, testNS, worker+"-", 1, 4*time.Minute)
+	waitConverged(t, ctx, trino, "SELECT count(*) FROM "+target, 200, 4*time.Minute)
+
+	// Scale out, then in, all under continuous load: the scaled-away workers
+	// are mid-flight when their Pods are deleted, which is the #363 trigger.
+	stop := startWriter(t, mysql, 150*time.Millisecond)
+	scaleWorker(t, testNS, worker, 3)
+	waitPodsByPrefix(t, testNS, worker+"-", 3, 4*time.Minute)
+	time.Sleep(15 * time.Second)
+	t.Log("scaled out to 3 under load; scaling in")
+	scaleWorker(t, testNS, worker, 1)
+	waitPodsByPrefix(t, testNS, worker+"-", 1, 4*time.Minute)
+
+	// The coordinator may have failed the run for a clean replay (issue #363);
+	// its StatefulSet restarts it. Wait for the coordinator and its worker to be
+	// Ready again before draining the writer.
+	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 8*time.Minute)
+	waitPodsByPrefix(t, testNS, worker+"-", 1, 8*time.Minute)
+	t.Log("coordinator + worker Ready after the scale-in")
+
+	stop()
+
+	waitSettled(t, mysql, trino, target, 10*time.Minute)
+	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, target))
+	assertNoRaces(t, testNS, pipeline+"-")
+	t.Log("scale-in under load ok: recovered from a lost worker, sink equals source, no races")
+}
