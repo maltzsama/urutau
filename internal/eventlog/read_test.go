@@ -2,6 +2,7 @@ package eventlog
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -109,5 +110,65 @@ func TestParseRoot(t *testing.T) {
 	}
 	if _, err := ParseRoot("http://nope"); err == nil {
 		t.Fatal("a non-s3 URI must fail")
+	}
+}
+
+// #333: the reader reports a seq gap and a seal marker through Trail, so a
+// truncated trail is not indistinguishable from a complete one.
+func TestReadRunTrailReportsCompleteness(t *testing.T) {
+	l := &fakeLister{objects: map[string]string{
+		"urutau/shop/run-20260101T000000-aa/events-000000.jsonl": `{"ts":"2026-01-01T00:00:00Z","run_id":"r","kind":"job_started","seq":1}` + "\n" +
+			`{"ts":"2026-01-01T00:00:01Z","run_id":"r","kind":"commit","seq":3}` + "\n" +
+			`{"ts":"2026-01-01T00:00:02Z","run_id":"r","kind":"run_sealed","emitted":4}` + "\n",
+	}}
+	tr, err := readRunTrail(context.Background(), l, RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "20260101T000000-aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tr.Sealed || tr.Emitted != 4 {
+		t.Fatalf("seal = %v emitted = %d, want sealed with 4", tr.Sealed, tr.Emitted)
+	}
+	if tr.Missing != 2 {
+		t.Fatalf("missing = %d, want 2 (seq 2 and 4 absent)", tr.Missing)
+	}
+}
+
+// #333: an unsealed run is reported as such — the trail may be missing its
+// tail.
+func TestReadRunTrailUnsealed(t *testing.T) {
+	tr, err := readRunTrail(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "20260101T000000-aa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Sealed {
+		t.Fatal("a trail with no run_sealed marker must report Sealed=false")
+	}
+}
+
+// #329: a nonexistent run is ErrNotFound, not an empty success.
+func TestReadRunNotFound(t *testing.T) {
+	_, err := readRun(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// #329: an unknown pipeline is ErrNotFound, not an empty run list.
+func TestListRunsUnknownPipelineNotFound(t *testing.T) {
+	_, err := listRuns(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// #335: an unsafe path segment is rejected before it reaches a key prefix.
+func TestReadRejectsUnsafeSegment(t *testing.T) {
+	for _, id := range []string{"", ".", "..", "../../etc", "a/b", `a\b`} {
+		if _, err := readRunTrail(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", id); !errors.Is(err, ErrInvalidID) {
+			t.Errorf("runID %q: err = %v, want ErrInvalidID", id, err)
+		}
+		if _, err := listRuns(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, id); !errors.Is(err, ErrInvalidID) {
+			t.Errorf("pipeline %q: err = %v, want ErrInvalidID", id, err)
+		}
 	}
 }

@@ -115,6 +115,15 @@ const (
 	// KindTableRepartitioned records a live re-slice of one table's
 	// partition ranges (issue #312).
 	KindTableRepartitioned = "table_repartitioned"
+	// KindEventsDropped is a synthetic marker the writer inserts where
+	// dropOldestLocked discarded buffered lines under an S3 backlog: without
+	// it the trail reads as if the pipeline simply did nothing during the gap
+	// (issue #333).
+	KindEventsDropped = "events_dropped"
+	// KindRunSealed is the terminal marker Close appends: it records the final
+	// emitted count, so a reader can verify it read every event and can tell a
+	// sealed run from an abandoned one (issue #333).
+	KindRunSealed = "run_sealed"
 )
 
 // Run accumulates one run's events and uploads the trail object as it
@@ -259,22 +268,9 @@ func (r *Run) Emitted() int {
 const putTimeout = 10 * time.Second
 
 // Emit appends one event and uploads the trail. Fields are free-form; ts,
-// run_id, and kind are added automatically. Best-effort by contract:
+// run_id, kind and seq are added automatically. Best-effort by contract:
 // callers log failures and carry on.
 func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) error {
-	ev := make(map[string]any, len(fields)+3)
-	for k, v := range fields {
-		ev[k] = v
-	}
-	ev["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
-	ev["run_id"] = r.id
-	ev["kind"] = kind
-
-	line, err := json.Marshal(ev)
-	if err != nil {
-		return fmt.Errorf("eventlog: marshal %s: %w", kind, err)
-	}
-
 	r.mu.Lock()
 	if r.closed || r.closing {
 		r.mu.Unlock()
@@ -285,11 +281,29 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	// snapshot and be lost (issue #229).
 	r.inflight.Add(1)
 	defer r.inflight.Done()
+
+	// seq is assigned (and the event marshaled) under mu so the trail's line
+	// order matches the sequence order: a reader then reads a gap in the seqs
+	// as lost events (issue #333).
+	seq := r.emitted + 1
+	ev := make(map[string]any, len(fields)+4)
+	for k, v := range fields {
+		ev[k] = v
+	}
+	ev["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
+	ev["run_id"] = r.id
+	ev["kind"] = kind
+	ev["seq"] = seq
+	line, err := json.Marshal(ev)
+	if err != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("eventlog: marshal %s: %w", kind, err)
+	}
+	r.emitted = seq
 	pending := r.pending
 	r.pending = nil
 	r.buf = append(r.buf, line...)
 	r.buf = append(r.buf, '\n')
-	r.emitted++
 	// Bound the buffer ONLY while rotation is deferred (backlog non-empty): an
 	// S3 outage then grows buf without limit until OOM (issue #230). With no
 	// backlog, rotation resets buf, so the cap must not run — it would empty
@@ -382,7 +396,21 @@ func (r *Run) Close() error {
 	r.pending = nil
 	body := slices.Clone(r.buf)
 	key := r.key
+	emitted := r.emitted
 	r.mu.Unlock()
+
+	// The terminal marker records the final emitted count, so a reader can
+	// verify it read every event and can tell a sealed run from an abandoned
+	// one (issue #333). It is written even for a run that emitted nothing.
+	if marker, err := json.Marshal(map[string]any{
+		"ts":      time.Now().UTC().Format(time.RFC3339Nano),
+		"run_id":  r.id,
+		"kind":    KindRunSealed,
+		"emitted": emitted,
+	}); err == nil {
+		body = append(body, marker...)
+		body = append(body, '\n')
+	}
 
 	r.putMu.Lock()
 	defer r.putMu.Unlock()
@@ -407,7 +435,10 @@ func (r *Run) Close() error {
 }
 
 // dropOldestLocked trims r.buf to its last maxObjectBytes bytes, aligned to a
-// line boundary, and returns the number of bytes dropped. Callers must hold mu.
+// line boundary, and returns the number of bytes dropped. The lines it
+// replaces are gone, so it leaves an events_dropped marker in their place:
+// without it the trail reads as if the pipeline simply did nothing during the
+// gap (issue #333). Callers must hold mu.
 func (r *Run) dropOldestLocked() int {
 	target := len(r.buf) - int(r.maxObjectBytes)
 	if target <= 0 {
@@ -419,7 +450,19 @@ func (r *Run) dropOldestLocked() int {
 		target = len(r.buf)
 	}
 	dropped := target
-	r.buf = append(r.buf[:0], r.buf[target:]...)
+	rest := r.buf[target:]
+	next := make([]byte, 0, len(rest)+128)
+	if marker, err := json.Marshal(map[string]any{
+		"ts":     time.Now().UTC().Format(time.RFC3339Nano),
+		"run_id": r.id,
+		"kind":   KindEventsDropped,
+		"bytes":  dropped,
+	}); err == nil {
+		next = append(next, marker...)
+		next = append(next, '\n')
+	}
+	next = append(next, rest...)
+	r.buf = next
 	return dropped
 }
 

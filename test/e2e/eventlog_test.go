@@ -22,8 +22,9 @@ import (
 // TestEventlogTrail runs the MySQL pipeline with an audit trail pointed at
 // the stack's S3 store, then reads the trail back and checks the lifecycle:
 // job_started first, resume/snapshot/commit in the middle, job_stopped last,
-// one run_id across every line. The trail is the post-mortem record — this
-// test proves it survives a real run and is readable back through plain S3.
+// the run_sealed terminal marker after it, one run_id across every line. The
+// trail is the post-mortem record — this test proves it survives a real run
+// and is readable back through plain S3.
 func TestEventlogTrail(t *testing.T) {
 	requireE2E(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -72,6 +73,7 @@ func TestEventlogTrail(t *testing.T) {
 	kinds := make([]string, 0, len(lines))
 	runIDs := map[string]bool{}
 	commits, snapshots := 0, 0
+	var stopped map[string]any
 	for _, line := range lines {
 		var ev map[string]any
 		if err := json.Unmarshal(line, &ev); err != nil {
@@ -89,6 +91,8 @@ func TestEventlogTrail(t *testing.T) {
 			commits++
 		case eventlog.KindSnapshotStarted, eventlog.KindSnapshotDone:
 			snapshots++
+		case eventlog.KindJobStopped:
+			stopped = ev
 		}
 	}
 	if len(runIDs) != 1 {
@@ -97,8 +101,13 @@ func TestEventlogTrail(t *testing.T) {
 	if kinds[0] != eventlog.KindJobStarted {
 		t.Errorf("first kind = %s, want %s", kinds[0], eventlog.KindJobStarted)
 	}
-	if last := kinds[len(kinds)-1]; last != eventlog.KindJobStopped {
-		t.Errorf("last kind = %s, want %s", last, eventlog.KindJobStopped)
+	// The trail ends with the writer's run_sealed terminal marker (issue
+	// #333); the last lifecycle event before it is the stop.
+	if last := kinds[len(kinds)-1]; last != eventlog.KindRunSealed {
+		t.Errorf("last kind = %s, want %s", last, eventlog.KindRunSealed)
+	}
+	if len(kinds) < 2 || kinds[len(kinds)-2] != eventlog.KindJobStopped {
+		t.Errorf("kind before the seal = %q, want %q", kinds[len(kinds)-1], eventlog.KindJobStopped)
 	}
 	if commits == 0 {
 		t.Error("trail carries no commit events")
@@ -108,9 +117,8 @@ func TestEventlogTrail(t *testing.T) {
 	}
 
 	// The stop is a deliberate cancel; the trail must say so, not "error".
-	var stopped map[string]any
-	if err := json.Unmarshal(lines[len(lines)-1], &stopped); err != nil {
-		t.Fatalf("last line: %v", err)
+	if stopped == nil {
+		t.Fatal("no job_stopped event in the trail")
 	}
 	if stopped["reason"] != "cancelled" {
 		t.Errorf("job_stopped reason = %v, want cancelled", stopped["reason"])
