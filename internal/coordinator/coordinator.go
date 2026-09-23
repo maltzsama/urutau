@@ -194,7 +194,15 @@ type Coordinator struct {
 	workers    map[string]*workerState
 	byTicket   map[string]*workerState
 	budget     *flowBudget
-	index      map[string]*positionIndex
+	// index is the per-worker position index. It was written only at boot
+	// until live re-slicing (issue #312) made registerOwner write it at
+	// runtime, so it now needs its own lock: the readers (inFlight, enqueueTo,
+	// onAck, the dashboard) deliberately run outside c.mu to avoid the
+	// c.mu/supervisor lock-order deadlock (audit #3). indexMu is taken alone
+	// by readers and as c.mu -> indexMu by registerOwner/unregisterOwner, so
+	// the order is consistent and never cycles.
+	indexMu sync.RWMutex
+	index   map[string]*positionIndex
 
 	// Kubernetes worker provisioning (issue #298): the in-cluster client is
 	// built lazily and cached (workerClientset). workerK8s is set at boot
@@ -640,7 +648,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 					break
 				}
 				c.workers[name] = w
-				c.index[name] = newPositionIndex(c.runID)
+				c.setIndex(name, newPositionIndex(c.runID))
 			}
 			w.refs = append(w.refs, refs[i])
 			owners[p] = w
@@ -673,7 +681,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return fmt.Errorf("coordinator: checkpoint: %w", err)
 		}
 		c.cp = cp
-		go cp.run(ctx, c.runID, c.index, c.log)
+		go cp.run(ctx, c.runID, c.indexSnapshot(), c.log)
 		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
 	}
 
@@ -1868,7 +1876,9 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	}
 	select {
 	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes}:
-		c.index[w.name].add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
+		if idx := c.indexOf(w.name); idx != nil {
+			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
+		}
 		return nil
 	case <-ctx.Done():
 		c.budget.release(w.name, n)
@@ -2095,7 +2105,13 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.fail(fmt.Errorf("coordinator: worker %s: unparsable ack position %q: %w", worker, ack.Position, err))
 		return
 	}
-	freed, freedOversized, popped := c.index[worker].truncate(ack.Table, pos)
+	idx := c.indexOf(worker)
+	if idx == nil {
+		// The worker's index is gone (unregistered on a rolled-back scale):
+		// nothing to truncate, and it holds no budget this ack would free.
+		return
+	}
+	freed, freedOversized, popped := idx.truncate(ack.Table, pos)
 	if freed > 0 {
 		c.budget.release(worker, freed)
 	}
