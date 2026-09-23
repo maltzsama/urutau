@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -54,7 +55,12 @@ func bootScalable(t *testing.T, ctx context.Context, addr string, s *spec.Spec, 
 			WindowTimeout: 2 * time.Minute,
 			CaughtUpPoll:  300 * time.Millisecond,
 			WaitWorker:    2 * time.Minute,
-			OnReady:       func(c *coordinator.Coordinator) { ready <- c },
+			// The stall detector's default (30s) is tight for the e2e
+			// stack (minikube + port-forward); give a slow snapshot room,
+			// and a slow commit room to drain before a re-slice flips.
+			AckTimeout:        2 * time.Minute,
+			ScaleDrainTimeout: 3 * time.Minute,
+			OnReady:           func(c *coordinator.Coordinator) { ready <- c },
 		})
 	}()
 
@@ -63,6 +69,24 @@ func bootScalable(t *testing.T, ctx context.Context, addr string, s *spec.Spec, 
 		p.coord = c
 	case <-time.After(2 * time.Minute):
 		t.Fatal("coordinator never became ready")
+	}
+
+	// OnReady fires when routing is published, but the gRPC listener only
+	// binds after the sink is opened, every table is ensured, and the resume
+	// position is read — seconds on a warm catalog, minutes on the
+	// port-forwarded e2e stack. Wait for the port so the workers do not burn
+	// through their handshake backoff, and give that boot phase room.
+	dialDeadline := time.Now().Add(3 * time.Minute)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		if time.Now().After(dialDeadline) {
+			t.Fatalf("coordinator listener never came up at %s: %v", addr, err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	for _, name := range workers {
@@ -679,5 +703,245 @@ func e2eIcebergCatalog() icebergsink.Config {
 		ClientID:     "root",
 		ClientSecret: "s3cr3t",
 		Scope:        "PRINCIPAL_ROLE:ALL",
+	}
+}
+
+// TestLiveRepartitionMultiTable proves issue #343 end to end with THREE
+// tables streaming together: re-slicing one — OUT and IN — must not stall or
+// lose any of them. Real pipelines carry several tables, and the pump is
+// shared, so the regression was that pausing ONE table parked the pump and
+// every OTHER table's batches queued behind it for the whole drain.
+//
+// orders is re-sliced (1→3→1); order_items and order_audit are bystanders.
+// ALL THREE write continuously, so orders' drain runs against live load: its
+// input is paused, its batches buffered and re-routed after the flip, and
+// nothing may be lost or duplicated. While each re-slice is in flight the
+// test waits for BOTH bystanders' sink counts to advance — the direct
+// integration check that the pump kept serving them mid-drain.
+//
+// The deterministic proof that a pause does not PARK the pump is
+// TestPumpDoesNotParkOnPausedTable — a unit test that fails with the old
+// behaviour. The live layout (OwnerNames) is observed at each scale so a flip
+// that silently keeps the old owner set fails here, not on a later
+// convergence.
+func TestLiveRepartitionMultiTable(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+
+	addr := reserveAddr(t)
+	s := loadPipeline(t)
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
+	s.Tables = append(s.Tables,
+		spec.Table{
+			Source:            "shop.order_items",
+			Target:            "raw.order_items",
+			PrimaryKey:        []string{"order_id", "line_no"},
+			CreateIfNotExists: true,
+		},
+		spec.Table{
+			Source:            "shop.order_audit",
+			Target:            "raw.order_audit",
+			PrimaryKey:        []string{"id"},
+			CreateIfNotExists: true,
+		},
+	)
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	ordersTarget := s.Tables[0].Target
+
+	var boot []string
+	for _, tbl := range s.Tables {
+		boot = append(boot, tbl.WorkerGroupNames(s.Pipeline)...)
+	}
+
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS order_items (
+		order_id BIGINT NOT NULL,
+		line_no  INT    NOT NULL,
+		sku      VARCHAR(64) NOT NULL,
+		qty      INT    NOT NULL,
+		PRIMARY KEY (order_id, line_no))`); err != nil {
+		t.Fatalf("create order_items: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS order_audit (
+		id   BIGINT      NOT NULL PRIMARY KEY,
+		note VARCHAR(64) NOT NULL)`); err != nil {
+		t.Fatalf("create order_audit: %v", err)
+	}
+	for _, tbl := range []string{"order_items", "order_audit"} {
+		if _, err := db.Exec("DELETE FROM " + tbl); err != nil {
+			t.Fatalf("clear %s: %v", tbl, err)
+		}
+	}
+	dropIcebergTable(t, ctx)
+	dropIcebergNamed(t, ctx, "raw.order_items")
+	dropIcebergNamed(t, ctx, "raw.order_audit")
+	dropAll(t, db)
+	seedOrders(t, db, 0, 300)
+	for i := 0; i < 100; i++ {
+		dml(t, db, fmt.Sprintf("INSERT INTO order_items (order_id, line_no, sku, qty) VALUES (%d, 1, 'sku%d', %d)", i, i, i%7+1))
+	}
+	for i := 0; i < 50; i++ {
+		dml(t, db, fmt.Sprintf("INSERT INTO order_audit (id, note) VALUES (%d, 'seed%d')", i, i))
+	}
+
+	p := bootScalable(t, ctx, addr, s, boot...)
+	defer p.stop()
+	// The port-forwarded stack is slow; give the initial snapshot room.
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM orders`, int64(300), 3*time.Minute)
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM order_items`, int64(100), 3*time.Minute)
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM order_audit`, int64(50), 3*time.Minute)
+	t.Log("all three tables converged with 1 partition each")
+
+	// The live layout starts at one owner for the re-sliced table.
+	if got := p.coord.OwnerNames(ordersTarget); len(got) != 1 {
+		t.Fatalf("boot owners = %v, want 1", got)
+	}
+
+	// All three tables write CONTINUOUSLY across the whole scale-in/out
+	// sequence. orders is re-sliced: its input is paused for the drain, its
+	// batches buffered and re-routed after the flip. order_items and
+	// order_audit are bystanders: they must keep flowing on the same pump.
+	var mu sync.Mutex
+	ordersWritten, itemsWritten, auditWritten := 0, 0, 0
+	stop := make(chan struct{})
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'live%d', %d.0)", 1000+i, i, i))
+			dml(t, db, fmt.Sprintf("INSERT INTO order_items (order_id, line_no, sku, qty) VALUES (%d, 1, 'chaos%d', %d)", 1000+i, i, i%7+1))
+			dml(t, db, fmt.Sprintf("INSERT INTO order_audit (id, note) VALUES (%d, 'note%d')", 1000+i, i))
+			mu.Lock()
+			ordersWritten++
+			itemsWritten++
+			auditWritten++
+			mu.Unlock()
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	// Scale OUT then IN. The scale runs in the background while the test
+	// watches BOTH bystanders advance in the sink: if the pump parked on the
+	// paused table, their commits would stall for the whole drain and this
+	// wait would fail. Then the live layout must show exactly n owners, and a
+	// fresh key must be routed by the new layout.
+	extra := 0
+	for _, n := range []int{3, 1} {
+		before := map[string]int64{
+			"order_items": trinoCount(t, ctx, "order_items"),
+			"order_audit": trinoCount(t, ctx, "order_audit"),
+		}
+		errCh := make(chan error, 1)
+		go func() { errCh <- p.coord.ScaleTable(ctx, ordersTarget, n) }()
+		for _, bt := range []string{"order_items", "order_audit"} {
+			waitTrinoAbove(t, ctx, "SELECT count(*) FROM "+bt, before[bt], 2*time.Minute)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("ScaleTable(%s, %d): %v", ordersTarget, n, err)
+		}
+		if got := p.coord.OwnerNames(ordersTarget); len(got) != n {
+			t.Fatalf("after scale to %d: owners = %v, want %d", n, got, n)
+		}
+
+		// Bring up the owners the new layout needs, then write a key the flip
+		// moved: it must land under the new layout.
+		scaled := s.Tables[0]
+		scaled.Workers = &spec.WorkerSpec{Number: n}
+		for _, name := range scaled.WorkerGroupNames(s.Pipeline) {
+			p.startWorker(name)
+		}
+		id := 9000 + extra
+		dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'post-scale-%d', 1.0)", id, n))
+		extra++
+		waitTrinoWithin(t, ctx, fmt.Sprintf("SELECT v FROM orders WHERE id = %d", id), fmt.Sprintf("post-scale-%d", n), 2*time.Minute)
+		t.Logf("re-sliced orders to %d under live load; owners=%v", n, p.coord.OwnerNames(ordersTarget))
+	}
+	close(stop)
+	<-writeDone
+	mu.Lock()
+	ow, iw, aw := ordersWritten, itemsWritten, auditWritten
+	mu.Unlock()
+
+	// Every table converges exactly across both flips: no loss, no duplicate.
+	totalOrders := int64(300 + ow + extra)
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM orders`, totalOrders, 5*time.Minute)
+	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, totalOrders)
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM order_items`, int64(100+iw), 5*time.Minute)
+	assertCount(t, ctx, `SELECT count(DISTINCT order_id) FROM order_items`, int64(100+iw))
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM order_audit`, int64(50+aw), 5*time.Minute)
+	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM order_audit`, int64(50+aw))
+	t.Log("all three tables converged after scale-out and scale-in: no loss, no duplicate")
+}
+
+// waitTrinoWithin polls until query returns want, failing after within. The
+// shared waitTrino's 60s deadline is too tight for a re-sliced table draining
+// under load on the port-forwarded e2e stack.
+func waitTrinoWithin(t *testing.T, ctx context.Context, query string, want any, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		rows, err := trinoQuery(ctx, query)
+		if err == nil && len(rows) == 1 && len(rows[0]) == 1 && rows[0][0] == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("trino wait %q: rows=%v err=%v want %v within %s", query, rows, err, want, within)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// trinoCount returns a table's row count from the sink, retrying a transient
+// Trino/catalog error (the port-forwarded stack is not always warm).
+func trinoCount(t *testing.T, ctx context.Context, table string) int64 {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for {
+		rows, err := trinoQuery(ctx, "SELECT count(*) FROM "+table)
+		switch {
+		case err != nil:
+			lastErr = err
+		case len(rows) != 1 || len(rows[0]) != 1:
+			lastErr = fmt.Errorf("count %s: rows=%v", table, rows)
+		default:
+			if n, ok := rows[0][0].(int64); ok {
+				return n
+			}
+			lastErr = fmt.Errorf("count %s: %T", table, rows[0][0])
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("count %s: %v", table, lastErr)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// waitTrinoAbove polls until a scalar query exceeds base, failing after
+// within. It is how the test observes a bystander table still landing rows in
+// the sink WHILE another table's re-slice drains.
+func waitTrinoAbove(t *testing.T, ctx context.Context, query string, base int64, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		rows, err := trinoQuery(ctx, query)
+		if err == nil && len(rows) == 1 && len(rows[0]) == 1 {
+			if n, ok := rows[0][0].(int64); ok && n > base {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("trino wait above %d: %q: rows=%v err=%v within %s", base, query, rows, err, within)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
