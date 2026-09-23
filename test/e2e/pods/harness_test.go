@@ -675,9 +675,11 @@ func cap10(ids []int64) []int64 {
 // would resume from a previous run's committed position and replay all the
 // binlog since — including other tests' writes — instead of snapshotting the
 // reseeded source, so the sink would diverge. A unique name forces a fresh
-// snapshot every run. The spec target is "raw." + this.
+// snapshot every run. The spec target is "raw." + this. The suffix is short
+// so the derived worker StatefulSet name stays well under the 63-byte label
+// limit once its controller-revision-hash suffix is appended.
 func uniqueTarget(base string) string {
-	return fmt.Sprintf("%s_%d", base, time.Now().UnixNano())
+	return fmt.Sprintf("%s_%s", base, strconv.FormatInt(time.Now().UnixNano()%2176782336, 36))
 }
 
 // seedOrders clears the source and inserts `count` rows 0..count-1 with a
