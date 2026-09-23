@@ -18,14 +18,12 @@ func TestPodKEDAScaling(t *testing.T) {
 	defer cancel()
 
 	mysql, trino := setupPodEnv(t)
-	const (
-		pipeline = "pod-keda"
-		target   = "raw.pod_keda_orders"
-	)
+	const pipeline = "pod-keda"
+	target := uniqueTarget("pod_keda_orders")
 	seedOrders(t, mysql, 200)
 
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2305",
-		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1, Max: 4}},
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: 1, Max: 4}},
 		crOptions{})
 	applyPipeline(t, testNS, pipeline, cr)
 	t.Log("applied with workers.max=4")
@@ -37,7 +35,7 @@ func TestPodKEDAScaling(t *testing.T) {
 	}
 	worker := sts[0]
 	waitPodsByPrefix(t, testNS, worker+"-", 1, 4*time.Minute)
-	waitConverged(t, ctx, trino, "SELECT count(*) FROM pod_keda_orders", 200, 4*time.Minute)
+	waitConverged(t, ctx, trino, "SELECT count(*) FROM "+target, 200, 4*time.Minute)
 
 	// The operator renders a ScaledObject; KEDA turns it into an HPA.
 	waitResource(t, testNS, "scaledobject", worker, time.Minute)
@@ -51,8 +49,8 @@ func TestPodKEDAScaling(t *testing.T) {
 	t.Log("KEDA scaled the worker StatefulSet above 1")
 	stop()
 
-	waitSettled(t, mysql, trino, "pod_keda_orders", 10*time.Minute)
-	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, "pod_keda_orders"))
+	waitSettled(t, mysql, trino, target, 10*time.Minute)
+	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, target))
 	assertNoRaces(t, testNS, pipeline+"-")
 	t.Log("keda ok: ScaledObject -> HPA -> scale-up, sink equals source")
 }

@@ -17,21 +17,21 @@ func TestPodSmoke(t *testing.T) {
 
 	mysql, trino := setupPodEnv(t)
 
-	// A distinct target keeps every run a fresh snapshot: no committed
-	// position to resume from, and no dependence on a prior test's table.
-	const target = "raw.pod_smoke_orders"
+	// A unique target keeps every run a fresh snapshot: no committed position
+	// to resume from, so a rerun never replays an earlier run's binlog.
+	target := uniqueTarget("pod_smoke_orders")
 	seedOrders(t, mysql, 50)
 
 	cr := buildCR("pod-smoke", testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2301",
-		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
 	applyPipeline(t, testNS, "pod-smoke", cr)
 	t.Log("CDCPipeline applied; waiting for the coordinator and worker Pods")
 
 	waitPodsByPrefix(t, testNS, "pod-smoke-", 2, 4*time.Minute)
 	t.Log("coordinator + worker Pods Ready")
 
-	waitConverged(t, ctx, trino, "SELECT count(*) FROM pod_smoke_orders", 50, 4*time.Minute)
-	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, "pod_smoke_orders"))
+	waitConverged(t, ctx, trino, "SELECT count(*) FROM "+target, 50, 4*time.Minute)
+	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, target))
 	assertNoRaces(t, testNS, "pod-smoke-")
 
 	t.Log("smoke ok: engine ran as Pods over the pod network, converged exactly, no data races")

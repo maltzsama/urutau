@@ -16,14 +16,12 @@ func TestPodMaintenance(t *testing.T) {
 	defer cancel()
 
 	mysql, trino := setupPodEnv(t)
-	const (
-		pipeline = "pod-maint"
-		target   = "raw.pod_maint_orders"
-	)
+	const pipeline = "pod-maint"
+	target := uniqueTarget("pod_maint_orders")
 	seedOrders(t, mysql, 150)
 
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2304",
-		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}},
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: 1}},
 		crOptions{Maintenance: true})
 	applyPipeline(t, testNS, pipeline, cr)
 	t.Log("applied with maintenance enabled")
@@ -34,10 +32,10 @@ func TestPodMaintenance(t *testing.T) {
 		t.Fatalf("want exactly one worker StatefulSet, got %v", sts)
 	}
 	waitPodsByPrefix(t, testNS, sts[0]+"-", 1, 4*time.Minute)
-	waitConverged(t, ctx, trino, "SELECT count(*) FROM pod_maint_orders", 150, 4*time.Minute)
+	waitConverged(t, ctx, trino, "SELECT count(*) FROM "+target, 150, 4*time.Minute)
 	t.Log("converged; generating small files so compaction is due")
 
-	stop := startWriter(t, mysql)
+	stop := startWriter(t, mysql, 250*time.Millisecond)
 
 	// The coordinator records maintenance metrics even though the maintenance
 	// worker is a separate, ephemeral Pod — a compaction run proves the whole
@@ -48,8 +46,8 @@ func TestPodMaintenance(t *testing.T) {
 
 	stop()
 
-	waitSettled(t, mysql, trino, "pod_maint_orders", 8*time.Minute)
-	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, "pod_maint_orders"))
+	waitSettled(t, mysql, trino, target, 8*time.Minute)
+	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, target))
 	assertNoRaces(t, testNS, pipeline+"-")
 	t.Log("maintenance ok: compaction ran as a Pod, position survived, sink equals source")
 }

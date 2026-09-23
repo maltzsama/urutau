@@ -369,15 +369,32 @@ func startHeavyWriter(t *testing.T, db *sql.DB) (stop func()) {
 
 // ── logs and races ──────────────────────────────────────────────────────
 
-// podLogs returns a Pod's logs (best effort — a terminating Pod may be gone).
+// podLogs returns a Pod's logs, best effort: a Pod still creating, or already
+// gone, has none — that is not a test failure.
 func podLogs(t *testing.T, ns, pod string) string {
 	t.Helper()
-	return kubectl(t, "-n", ns, "logs", pod, "--tail=-1")
+	return kubectlLogsBestEffort(ns, pod, false)
+}
+
+func kubectlLogsBestEffort(ns, pod string, previous bool) string {
+	args := []string{"-n", ns, "logs", pod, "--tail=-1"}
+	if previous {
+		args = append(args, "--previous")
+	}
+	cmd := exec.Command("kubectl", args...)
+	var out strings.Builder
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return ""
+	}
+	return out.String()
 }
 
 // assertNoRaces scans the logs of every Pod with the prefix for the race
 // detector's report and fails if one is present. This is the authoritative
 // race signal: the engine logs it, and GORACE=halt_on_error makes it fatal.
+// Both the current and the previous container logs are scanned, so a race that
+// killed (and restarted) a container is still caught.
 func assertNoRaces(t *testing.T, ns, prefix string) {
 	t.Helper()
 	out := kubectl(t, "-n", ns, "get", "pods", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
@@ -386,7 +403,7 @@ func assertNoRaces(t *testing.T, ns, prefix string) {
 		if pod == "" || !strings.HasPrefix(pod, prefix) {
 			continue
 		}
-		logs := podLogs(t, ns, pod)
+		logs := kubectlLogsBestEffort(ns, pod, false) + "\n" + kubectlLogsBestEffort(ns, pod, true)
 		if i := strings.Index(logs, "WARNING: DATA RACE"); i >= 0 {
 			end := i + 2000
 			if end > len(logs) {
@@ -615,6 +632,15 @@ func cap10(ids []int64) []int64 {
 
 // ── seeding ─────────────────────────────────────────────────────────────
 
+// uniqueTarget returns a fresh sink table name for one test run. A fixed name
+// would resume from a previous run's committed position and replay all the
+// binlog since — including other tests' writes — instead of snapshotting the
+// reseeded source, so the sink would diverge. A unique name forces a fresh
+// snapshot every run. The spec target is "raw." + this.
+func uniqueTarget(base string) string {
+	return fmt.Sprintf("%s_%d", base, time.Now().UnixNano())
+}
+
 // seedOrders clears the source and inserts `count` rows 0..count-1 with a
 // deterministic v/amount, so the oracle is fully known before the engine runs.
 func seedOrders(t *testing.T, db *sql.DB, count int) {
@@ -651,8 +677,10 @@ func setupPodEnv(t *testing.T) (mysql, trino *sql.DB) {
 // startWriter runs a mixed INSERT/UPDATE/DELETE load against the source until
 // the returned stop function is called. The source is the oracle, so the exact
 // operations do not need to be tracked — a row the engine loses shows up as a
-// key missing from the sink, and a resurrected delete as an extra key.
-func startWriter(t *testing.T, db *sql.DB) (stop func()) {
+// key missing from the sink, and a resurrected delete as an extra key. The
+// interval must keep the writer slower than the race-instrumented worker
+// commits (roughly one row per commit here), or the sink lags past the settle.
+func startWriter(t *testing.T, db *sql.DB, interval time.Duration) (stop func()) {
 	t.Helper()
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
@@ -680,7 +708,7 @@ func startWriter(t *testing.T, db *sql.DB) (stop func()) {
 			if _, err := db.Exec(q, args...); err != nil {
 				t.Logf("writer %q: %v", q, err)
 			}
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(interval)
 		}
 	}()
 	return func() {

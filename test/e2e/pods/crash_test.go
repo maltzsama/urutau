@@ -18,14 +18,12 @@ func TestPodCrashRecovery(t *testing.T) {
 	defer cancel()
 
 	mysql, trino := setupPodEnv(t)
-	const (
-		pipeline = "pod-crash"
-		target   = "raw.pod_crash_orders"
-	)
+	const pipeline = "pod-crash"
+	target := uniqueTarget("pod_crash_orders")
 	seedOrders(t, mysql, 200)
 
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2303",
-		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
 	applyPipeline(t, testNS, pipeline, cr)
 	t.Log("applied; waiting for the coordinator and one worker")
 
@@ -36,10 +34,10 @@ func TestPodCrashRecovery(t *testing.T) {
 	}
 	worker := sts[0]
 	workerPods := waitPodsByPrefix(t, testNS, worker+"-", 1, 4*time.Minute)
-	waitConverged(t, ctx, trino, "SELECT count(*) FROM pod_crash_orders", 200, 4*time.Minute)
+	waitConverged(t, ctx, trino, "SELECT count(*) FROM "+target, 200, 4*time.Minute)
 	t.Log("converged; starting the load")
 
-	stop := startWriter(t, mysql)
+	stop := startWriter(t, mysql, 250*time.Millisecond)
 
 	// 1. SIGKILL the worker Pod mid-load. The StatefulSet recreates it, and
 	//    the coordinator's supervisor resets the partition it owned.
@@ -58,8 +56,8 @@ func TestPodCrashRecovery(t *testing.T) {
 	stop()
 
 	// The sink must converge to the source across both crashes.
-	waitSettled(t, mysql, trino, "pod_crash_orders", 8*time.Minute)
-	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, "pod_crash_orders"))
+	waitSettled(t, mysql, trino, target, 8*time.Minute)
+	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, target))
 	assertNoRaces(t, testNS, pipeline+"-")
 	t.Log("crash recovery ok: worker + coordinator SIGKILL, sink equals source exactly, no races")
 }
