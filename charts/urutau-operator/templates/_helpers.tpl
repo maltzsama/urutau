@@ -11,9 +11,12 @@ resources (ClusterRole, ClusterRoleBinding, ValidatingWebhookConfiguration). */}
 {{- default "urutau-operator" .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/* The full name: fullnameOverride when set, else name. */}}
+{{/* The full name: fullnameOverride when set, else name. Truncated with room
+for the longest suffix appended to it ("-validating-webhook", 19 chars), so
+every generated name — including the "<fullname>-webhook" Service, a 63-char
+DNS-1035 label — stays valid. */}}
 {{- define "urutau-operator.fullname" -}}
-{{- default (include "urutau-operator.name" .) .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- default (include "urutau-operator.name" .) .Values.fullnameOverride | trunc 44 | trimSuffix "-" -}}
 {{- end -}}
 
 {{/* Standard labels. */}}
