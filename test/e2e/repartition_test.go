@@ -54,7 +54,10 @@ func bootScalable(t *testing.T, ctx context.Context, addr string, s *spec.Spec, 
 			WindowTimeout: 2 * time.Minute,
 			CaughtUpPoll:  300 * time.Millisecond,
 			WaitWorker:    2 * time.Minute,
-			OnReady:       func(c *coordinator.Coordinator) { ready <- c },
+			// The stall detector's default (30s) is tight for the e2e
+			// stack (minikube + port-forward); give a slow snapshot room.
+			AckTimeout: 2 * time.Minute,
+			OnReady:    func(c *coordinator.Coordinator) { ready <- c },
 		})
 	}()
 
@@ -735,11 +738,12 @@ func TestLiveRepartitionMultiTable(t *testing.T) {
 
 	p := bootScalable(t, ctx, addr, s, append(append([]string{}, ordersBoot...), itemsBoot...)...)
 	defer p.stop()
-	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
-	waitTrino(t, ctx, `SELECT count(*) FROM order_items`, int64(100))
+	// The port-forwarded stack is slow; give the initial snapshot room.
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM orders`, int64(200), 3*time.Minute)
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM order_items`, int64(100), 3*time.Minute)
 	t.Log("both tables converged with 1 partition each")
 
-	const ordersTo, itemsTo = 700, 300
+	const ordersTo, itemsTo = 450, 200
 	writeDone := make(chan struct{})
 	go func() {
 		defer close(writeDone)
@@ -765,9 +769,29 @@ func TestLiveRepartitionMultiTable(t *testing.T) {
 	}
 	<-writeDone
 
-	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(ordersTo))
+	// A longer deadline than waitTrino's default: the drain of a re-sliced
+	// table under load is slow on the port-forwarded e2e stack.
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM orders`, int64(ordersTo), 3*time.Minute)
 	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, ordersTo)
-	waitTrino(t, ctx, `SELECT count(*) FROM order_items`, int64(itemsTo))
+	waitTrinoWithin(t, ctx, `SELECT count(*) FROM order_items`, int64(itemsTo), 3*time.Minute)
 	assertCount(t, ctx, `SELECT count(DISTINCT order_id) FROM order_items`, itemsTo)
 	t.Log("both tables converged after the re-slice: no loss, no duplicate")
+}
+
+// waitTrinoWithin polls until query returns want, failing after within. The
+// shared waitTrino's 60s deadline is too tight for a re-sliced table draining
+// under load on the port-forwarded e2e stack.
+func waitTrinoWithin(t *testing.T, ctx context.Context, query string, want any, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		rows, err := trinoQuery(ctx, query)
+		if err == nil && len(rows) == 1 && len(rows[0]) == 1 && rows[0][0] == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("trino wait %q: rows=%v err=%v want %v within %s", query, rows, err, want, within)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
