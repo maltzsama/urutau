@@ -22,7 +22,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker e2e-fixtures e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-deploy k8s-deploy-multi-tenant k8s-undeploy k8s-status
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-fixtures e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-load-race k8s-deploy k8s-deploy-multi-tenant k8s-undeploy k8s-status e2e-pods-up e2e-pods-down e2e-pods-test
 
 all: lint test build
 
@@ -108,6 +108,28 @@ k8s-undeploy:
 k8s-status:
 	$(KUBECTL) -n urutau-system get deploy,sts,pod
 	$(KUBECTL) get cdcpipelines -A
+
+# ── Pod e2e (engine as real Pods, over the pod network) ─────────────────
+# The scenarios in test/e2e/pods run the engine the way it is deployed: the
+# operator provisions the coordinator and worker Pods, and the tests drive
+# them over kubectl and the cluster network — never as in-process goroutines.
+# The image is race-instrumented (build/Dockerfile.race), so concurrency is
+# checked across the real multi-process topology.
+RACE_IMAGE ?= urutau:dev-race
+POD_E2E_DIR := test/e2e/pods
+
+k8s-load-race: ## Build the race-instrumented image on the host and load it into minikube
+	docker build -f build/Dockerfile.race -t $(RACE_IMAGE) .
+	minikube image load $(RACE_IMAGE)
+
+e2e-pods-up: ## Bring up cert-manager, the in-cluster stack, and the operator (race image)
+	./$(POD_E2E_DIR)/up.sh
+
+e2e-pods-down: ## Tear down the pod e2e: CRs, operator, and the in-cluster stack
+	./$(POD_E2E_DIR)/down.sh
+
+e2e-pods-test: ## Run the pod e2e scenarios (needs e2e-pods-up + k8s-load-race)
+	URUTAU_E2E_PODS=1 $(GO) test -count=1 -v ./$(POD_E2E_DIR)
 
 E2E_COMPOSE := test/e2e/docker-compose.yml
 
