@@ -158,8 +158,8 @@ has the details.
 A running coordinator can re-slice a table across a different number of
 workers — adding or removing owners and swapping the routing snapshot
 atomically, with no coordinator restart. The coordinator's `ScaleTable` does
-the re-slice; under Kubernetes, KEDA drives it from the per-table lag metric
-(see [Autoscaling with KEDA](#autoscaling-with-keda)).
+the re-slice; under Kubernetes, KEDA drives it from the per-table backlog
+metric (see [Autoscaling with KEDA](#autoscaling-with-keda)).
 
 The sequence is **prepare → commit**, and every wait is bounded: a step that
 cannot complete fails the scale and leaves the old layout in place, so a
@@ -171,11 +171,13 @@ pause, never data loss.
    pump. The flip requires the table to owe nothing (no in-flight batch, no
    open staged cycle), and a continuously loaded table never reaches that on
    its own; pausing the input lets the queue drain, which is what makes the
-   barrier converge under load.
+   barrier converge under load. The paused table's new batches are **buffered**,
+   not routed and not counted by the drain.
 2. **Commit** — swap the routing snapshot atomically, then resume the input.
    A reader that loaded the old snapshot keeps routing a whole batch by it,
-   so a batch is never split across two layouts; the pump's held batch, and
-   every batch after it, is routed by the new layout.
+   so a batch is never split across two layouts. The batches buffered during
+   the pause are flushed, in order, under the new layout, so a batch still
+   never spans the flip.
 3. **Retire** (scale-in only) — each removed owner drains, then is detached.
 
 A prepare step that times out — the table never drains, a commit never lands
@@ -184,10 +186,10 @@ retries, and worker recovery stays the supervisor's job: a worker that
 stalls owing work is terminated for a clean replay from the committed
 position, not reset mid-flight (which would replay its batches).
 
-The pause briefly holds the whole pipeline's reader — the pump is shared, so
-other tables stall for the duration of the drain. That is the price of not
-losing the events that arrive during the flip, and the drain is bounded, so
-the stall is too.
+Pausing one table does **not** stall the others. The pump buffers the paused
+table's batches instead of parking on them, and keeps routing every other
+table's batches through the shared reader channel (issue #343). The drain is
+bounded either way, so the held backlog is too.
 
 The commit mode travels **per batch** (`BatchMeta.staged`), decided by the
 coordinator at send time, not frozen in the worker's assignment. That is what

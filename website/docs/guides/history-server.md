@@ -6,7 +6,7 @@ sidebar_position: 11
 
 The live dashboard shows a **running** pipeline. The history server answers a
 different question: what did a **terminated** run actually do? It serves a
-read-only API over the durable [audit trail](reliability.md#audit-trail-eventlog)
+read-only API over the durable [audit trail](reliability.md#audit-trail---eventlog)
 — the JSONL trail in S3 — with no live state and nothing to push, so it is
 plain request/response, not Server-Sent Events.
 

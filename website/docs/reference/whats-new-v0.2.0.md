@@ -54,7 +54,7 @@ An embedded monitoring UI served from the coordinator's HTTP server —
 external dependencies: Alpine.js + Chart.js compiled into the binary.
 
 ```sh
-urutau run -f pipeline.yaml --metrics-addr :9090
+urutau-coordinator run -f pipeline.yaml --metrics-addr :9090
 # Open http://localhost:9090
 ```
 

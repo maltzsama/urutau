@@ -30,6 +30,7 @@ Set `spec.coordinator.metricsAddr` to move it; the probes follow.
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `urutau_coordinator_lag_seconds` | gauge (table) | Seconds since the table's last commit — grows between commits |
+| `urutau_coordinator_pending_batches` | gauge (table) | Batches the table still owes (queued, in-flight, and staged) — the KEDA backlog signal |
 | `urutau_coordinator_inflight_bytes` | gauge (worker) | Unacked batch bytes per worker |
 | `urutau_coordinator_worker_resets_total` | counter (reason) | Worker resets by reason |
 | `urutau_coordinator_commits_total` | counter (table) | Commits acked by the worker |
@@ -77,10 +78,11 @@ the coordinator's HTTP server. It shows pipeline status, per-table
 throughput and lag charts, worker health, operational events, and
 coordinator logs, all updated in real time via Server-Sent Events.
 
-Enable it with `--metrics-addr`:
+It is a **coordinator** feature: the collapsed `urutau run` process has no
+metrics endpoint, so enable it on the coordinator with `--metrics-addr`:
 
-```sh command="urutau run -f pipeline.yaml --metrics-addr :9090"
-urutau run -f pipeline.yaml --metrics-addr :9090
+```sh command="urutau-coordinator run -f pipeline.yaml --metrics-addr :9090"
+urutau-coordinator run -f pipeline.yaml --metrics-addr :9090
 # Open http://localhost:9090
 ```
 

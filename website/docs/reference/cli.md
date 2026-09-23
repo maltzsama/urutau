@@ -69,6 +69,8 @@ server, not a one-shot.
 | `--chunk-size` | `10000` | Snapshot chunk size |
 | `--max-parallel-chunks` | `0` | Concurrent chunk `SELECT`s (`0` = serial) |
 | `--window-timeout` | `5m` | DBLog window timeout |
+| `--flow-total-bytes` | `536870912` (512 MiB) | Process-wide ceiling on unacked batch bytes in flight |
+| `--flow-per-worker-min-mi` | `16` | Per-worker minimum share of the flow budget (MiB) |
 | `--wait-worker` | `2m` | How long to wait for every expected worker session |
 | `--ack-timeout` | `30s` | A worker is stale without an ack for this long |
 | `--max-resets` | `5` | Resets within the window before the job terminates |
@@ -109,6 +111,7 @@ the sink for its partition.
 | `--metrics-addr` | _(off)_ | Serve `/metrics` on this address |
 | `--plugin` | _(none)_ | Go plugin path; repeatable |
 | `--tls-cert` / `--tls-key` / `--tls-ca` | _(off)_ | Client cert for the control plane (mTLS) |
+| `--maintenance` | `false` | Run as an ephemeral maintenance worker: connect, run the coordinator's maintenance assignment once, then exit |
 
 The catalog settings fall back to the `URUTAU_SINK_*` environment, which
 is how the Kubernetes operator passes Secret-backed credentials to a
@@ -130,6 +133,8 @@ The Kubernetes operator. Plain flags (no subcommands); see
 | `--enable-webhook` | `true` | Serve the validating admission webhook |
 | `--field-manager` | `urutau-operator` | Server-Side Apply field manager — the name the operator applies objects as. Must be unique per controller managing the same objects. |
 | `--watch-namespaces` | _(all)_ | Comma-separated namespaces to watch; scopes the cache (see [multi-tenant install](../guides/deploy-kubernetes.md#multi-tenant-install-namespace-per-team)) |
+| `--keda-prometheus-address` | _(off)_ | Prometheus server address for KEDA `ScaledObject`s; empty disables worker autoscaling |
+| `--keda-threshold` | `30` | Per-replica backlog target (outstanding batches) for KEDA `ScaledObject`s |
 
 The operator also accepts the controller-runtime zap flags
 (`--zap-log-level`, `--zap-encoder`, `--zap-devel`, …).
