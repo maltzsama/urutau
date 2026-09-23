@@ -5,6 +5,15 @@
 # The coordinator gets its OWN identity dynamically: for every pipeline the
 # reconciler creates a ServiceAccount, a Role (cdcpipelines + status in the
 # pipeline's namespace) and a RoleBinding.
+#
+# Scope: by default (rbac.clusterWide=true) the ClusterRole is bound
+# cluster-wide. Set rbac.clusterWide=false to bind it into each
+# operator.watchNamespaces namespace instead — the repo's config/multi-tenant
+# model. watchNamespaces alone scopes the operator's CACHE, not its RBAC; this
+# switch is the permissions boundary (issue #361).
+{{- if and (not .Values.rbac.clusterWide) (eq (trim .Values.operator.watchNamespaces) "") }}
+{{- fail "rbac.clusterWide=false requires operator.watchNamespaces (a comma-separated list of namespaces to bind into)" }}
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -47,12 +56,19 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Events: the operator records reconciliation and leader-election Events.
+  # Without this rule the API server rejects every Event, so kubectl describe
+  # shows none (issue #364).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   # KEDA ScaledObjects (worker autoscaling, issue #298). Rendered only when
   # the operator runs with --keda-prometheus-address; the rule is harmless on
   # a cluster without the KEDA CRD.
   - apiGroups: ["keda.sh"]
     resources: ["scaledobjects"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+{{- if .Values.rbac.clusterWide }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -68,3 +84,29 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "urutau-operator.fullname" . }}
     namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- range $ns := splitList "," .Values.operator.watchNamespaces }}
+{{- $n := $ns | trim }}
+{{- if $n }}
+---
+# Scope the operator's permissions to one managed namespace. The ClusterRole
+# is referenced, not copied, so the permission set cannot drift from the
+# cluster-wide install.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "urutau-operator.fullname" $ }}
+  namespace: {{ $n }}
+  labels:
+    {{- include "urutau-operator.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "urutau-operator.fullname" $ }}-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "urutau-operator.fullname" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

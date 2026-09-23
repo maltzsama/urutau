@@ -8,7 +8,9 @@
 # Override the resource name base. The default ("urutau-operator") keeps an
 # existing install's names; set fullnameOverride to run a second release in
 # the same cluster without colliding on the cluster-scoped resources
-# (ClusterRole, ClusterRoleBinding, ValidatingWebhookConfiguration).
+# (ClusterRole, ClusterRoleBinding, ValidatingWebhookConfiguration). It does
+# NOT rename the CRD — its name is the API identity — so a second release must
+# also set crds.install=false (issue #360).
 nameOverride: ""
 fullnameOverride: ""
 
@@ -29,8 +31,19 @@ operator:
   fieldManager: urutau-operator
   # Comma-separated namespaces to watch (empty = all). Scoping the operator to
   # specific namespaces needs a RoleBinding in each; see the repo's
-  # config/multi-tenant for the model.
+  # config/multi-tenant for the model. This scopes the CACHE only — pair it
+  # with rbac.clusterWide=false for the permissions boundary.
   watchNamespaces: ""
+  # Worker autoscaling (issue #298). A non-empty prometheusAddress turns the
+  # feature on: the operator renders one KEDA ScaledObject per table that sets
+  # spec.workers.max, driven by the coordinator's per-table backlog metric.
+  # Requires KEDA and a Prometheus scraping the coordinator's /metrics.
+  # Empty (the default) disables it — no ScaledObject is rendered.
+  keda:
+    prometheusAddress: ""
+    # Per-replica backlog target (outstanding batches). The operator default
+    # is 30 when empty.
+    threshold: ""
   resources:
     requests:
       cpu: 100m
@@ -38,6 +51,20 @@ operator:
     limits:
       cpu: 500m
       memory: 256Mi
+
+# Whether this release owns the CDCPipeline CRD. The CRD's name is the API
+# identity (cdcpipelines.urutau.io) and cannot be renamed, so a second release
+# in the same cluster must set install=false and share the first release's CRD
+# (issue #360). fullnameOverride renames every OTHER cluster-scoped resource.
+crds:
+  install: true
+
+# RBAC scope. clusterWide (default) binds the operator's ClusterRole across the
+# cluster. Set clusterWide=false to bind it only into each
+# operator.watchNamespaces namespace (the repo's config/multi-tenant model) —
+# then watchNamespaces must be non-empty (issue #361).
+rbac:
+  clusterWide: true
 
 # Extra annotations on the operator Pod.
 podAnnotations: {}
