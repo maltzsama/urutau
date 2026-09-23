@@ -114,7 +114,9 @@ The namespace comes from `--namespace` in all three places the kustomize base
 hardcodes `urutau-system` (the `Certificate` dnsNames, the `inject-ca-from`
 annotation, and the webhook `clientConfig.service.namespace`), so installing
 into a different namespace needs no edits. cert-manager is a hard prerequisite
-unless you set `webhook.enabled=false`. See the chart's
+unless you disable the webhook (`webhook.enabled=false`) or supply the
+certificate and caBundle yourself (`webhook.certManager.enabled=false` with
+`webhook.caBundle`). See the chart's
 [README](https://github.com/maltzsama/urutau/tree/main/charts/urutau-operator)
 for the values.
 

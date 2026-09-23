@@ -6,6 +6,12 @@ metadata:
   name: cdcpipelines.urutau.io
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
+  annotations:
+    # helm uninstall must NOT delete the CRD: deleting it cascades to every
+    # CDCPipeline in the cluster — across all namespaces, including ones this
+    # chart never created. Removing the CRD (and the pipelines it holds) is a
+    # deliberate, manual step: kubectl delete crd cdcpipelines.urutau.io.
+    helm.sh/resource-policy: keep
 spec:
   group: urutau.io
   names:

@@ -1,16 +1,19 @@
 {{- if .Values.webhook.enabled }}
+{{- if and (not .Values.webhook.certManager.enabled) (not .Values.webhook.caBundle) }}
+{{- fail "webhook.enabled=true with webhook.certManager.enabled=false requires webhook.caBundle (base64-encoded PEM). Without it the ValidatingWebhookConfiguration has failurePolicy: Fail and no trust anchor, so every CDCPipeline write is rejected. See the chart README." }}
+{{- end }}
 # The validating webhook. The namespace appears three times and is driven by
 # .Release.Namespace in all of them, so a Helm install into any namespace is
 # correct (the kustomize base requires editing them by hand).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
-  name: urutau-operator-validating-webhook
+  name: {{ include "urutau-operator.fullname" . }}-validating-webhook
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
   {{- if .Values.webhook.certManager.enabled }}
   annotations:
-    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/urutau-operator-webhook-cert
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ include "urutau-operator.fullname" . }}-webhook-cert
   {{- end }}
 webhooks:
   - name: vcdcpipeline.urutau.io
@@ -18,8 +21,12 @@ webhooks:
     sideEffects: None
     failurePolicy: Fail
     clientConfig:
+      {{- if and (not .Values.webhook.certManager.enabled) .Values.webhook.caBundle }}
+      # cert-manager is off: the CA bundle is the operator's, supplied here.
+      caBundle: {{ .Values.webhook.caBundle }}
+      {{- end }}
       service:
-        name: urutau-operator-webhook
+        name: {{ include "urutau-operator.fullname" . }}-webhook
         namespace: {{ .Release.Namespace }}
         path: /validate-urutau-io-v1alpha1-cdcpipeline
         port: 443
