@@ -24,13 +24,16 @@ import (
 // must still run every other pipeline (issue #298).
 var kedaGroupVersion = schema.GroupVersionKind{Group: "keda.sh", Version: "v1alpha1", Kind: "ScaledObject"}
 
-// kedaMetricName is the coordinator's per-table lag gauge (issue #299), the
-// signal KEDA scales on.
-const kedaMetricName = "urutau_coordinator_lag_seconds"
+// kedaMetricName is the coordinator's per-table backlog gauge: the number of
+// batches the table still owes. It is the signal KEDA scales on. The lag
+// gauge only rises when commits STALL, so a backlog the workers are still
+// draining never moves it — measured under a 50k-row burst, lag stayed ~0.1s
+// while the table owed ~50k rows (issue #298).
+const kedaMetricName = "urutau_coordinator_pending_batches"
 
-// defaultKEDALagThreshold is the per-replica lag target when the operator
-// flag is unset: roughly one worker per 30s of lag.
-const defaultKEDALagThreshold = "30"
+// defaultKEDAThreshold is the per-replica backlog target when the operator
+// flag is unset: roughly one worker per 30 outstanding batches.
+const defaultKEDAThreshold = "30"
 
 // ensureScaledObjects renders one ScaledObject per autoscalable table — a
 // table that declares a partition cap (spec.workers.max), which becomes
@@ -53,7 +56,7 @@ func (r *CoordinatorReconciler) ensureScaledObjects(ctx context.Context, cr *uru
 			if t.Workers == nil || t.Workers.Max <= 0 {
 				continue
 			}
-			obj := scaledObject(cr, s.Pipeline, t, r.KEDAPrometheusAddress, r.kedaLagThreshold())
+			obj := scaledObject(cr, s.Pipeline, t, r.KEDAPrometheusAddress, r.kedaThreshold())
 			desired[obj.GetName()] = obj
 		}
 	}
@@ -152,10 +155,10 @@ func (r *CoordinatorReconciler) applyScaledObject(ctx context.Context, obj *unst
 	return nil
 }
 
-// kedaLagThreshold is the configured per-replica lag target, or the default.
-func (r *CoordinatorReconciler) kedaLagThreshold() string {
-	if r.KEDALagThreshold == "" {
-		return defaultKEDALagThreshold
+// kedaThreshold is the configured per-replica backlog target, or the default.
+func (r *CoordinatorReconciler) kedaThreshold() string {
+	if r.KEDAThreshold == "" {
+		return defaultKEDAThreshold
 	}
-	return r.KEDALagThreshold
+	return r.KEDAThreshold
 }

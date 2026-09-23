@@ -48,7 +48,7 @@ func run() error {
 		enableWebhook   bool
 		watchNamespaces string
 		kedaPromAddr    string
-		kedaLagThresh   string
+		kedaThreshold   string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe endpoint")
@@ -57,7 +57,7 @@ func run() error {
 	flag.BoolVar(&enableWebhook, "enable-webhook", true, "enable the admission webhook")
 	flag.StringVar(&watchNamespaces, "watch-namespaces", "", "comma-separated namespaces to watch (empty = all namespaces; each watched namespace needs its own RoleBinding, see config/multi-tenant)")
 	flag.StringVar(&kedaPromAddr, "keda-prometheus-address", "", "Prometheus server address for KEDA ScaledObjects (empty disables worker autoscaling)")
-	flag.StringVar(&kedaLagThresh, "keda-lag-threshold", "30", "per-replica lag target in seconds for KEDA ScaledObjects")
+	flag.StringVar(&kedaThreshold, "keda-threshold", "30", "per-replica backlog target (outstanding batches) for KEDA ScaledObjects")
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -98,7 +98,7 @@ func run() error {
 		Image:                 image,
 		FieldManager:          fieldManager,
 		KEDAPrometheusAddress: kedaPromAddr,
-		KEDALagThreshold:      kedaLagThresh,
+		KEDAThreshold:         kedaThreshold,
 	}
 	if err := r.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("unable to create controller: %w", err)

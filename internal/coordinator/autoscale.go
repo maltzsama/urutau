@@ -15,6 +15,12 @@ import (
 // it (issue #298).
 const scaleReconcileInterval = 5 * time.Second
 
+// scaleFailureCooldown is how long the reconcile loop waits after a failed
+// scale before trying again. A scale pauses the table's input for the whole
+// drain, so retrying every tick would hold the input paused far more than it
+// runs and the backlog the drain waits on would never clear.
+const scaleFailureCooldown = time.Minute
+
 // scaleReconcileLoop keeps the coordinator's routing in step with the worker
 // StatefulSets' replica counts. It runs only when the operator rendered
 // worker pod templates (the same switch that turns provisioning on); a
@@ -49,6 +55,9 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 	if c.cfg.Spec == nil {
 		return
 	}
+	if c.scaleRetryAfter.After(time.Now()) {
+		return // a recent scale failed; let the table drain before retrying
+	}
 	cs, ns, _, err := c.workerClientset(ctx)
 	if err != nil {
 		c.log.Debug("coordinator: scale reconcile skipped", "err", err)
@@ -76,6 +85,8 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 		}
 		if err := c.ScaleTable(ctx, t.Target, want); err != nil {
 			c.log.Warn("coordinator: scale reconcile", "table", t.Target, "replicas", want, "err", err)
+			c.scaleRetryAfter = time.Now().Add(scaleFailureCooldown)
+			return
 		}
 	}
 }

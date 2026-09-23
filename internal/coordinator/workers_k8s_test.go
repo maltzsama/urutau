@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -227,5 +228,23 @@ func TestReconcileReplicasFollowsStatefulSet(t *testing.T) {
 	got, _ := c.loadRouting().ownersOf("raw.orders")
 	if len(got) != 3 {
 		t.Fatalf("owners = %d, want 3 (routing follows the StatefulSet)", len(got))
+	}
+}
+
+// A failed scale suppresses the reconcile until the cooldown elapses, so the
+// table's input is not held paused on every tick (issue #298).
+func TestReconcileReplicasBacksOffAfterFailure(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.workerK8s = true
+	c.k8sNS = "ns"
+	owner := metav1.OwnerReference{Kind: "Pod", Name: "c", UID: types.UID("x")}
+	sts := workerStatefulSet(spec.WorkerGroupPrefix("p", "raw.orders"), "ns", owner, sampleTemplate(), 3)
+	c.k8sClient = fake.NewSimpleClientset(sts)
+	c.scaleRetryAfter = time.Now().Add(time.Minute)
+
+	c.reconcileReplicas(context.Background())
+
+	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+		t.Fatalf("owners = %d, want the untouched 1 (reconcile suppressed)", len(got))
 	}
 }

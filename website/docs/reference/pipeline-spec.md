@@ -190,7 +190,8 @@ scale-in ignores it (it is an upper bound, not a target). Under Kubernetes it
 is also the KEDA autoscaling ceiling: with the operator started with
 `--keda-prometheus-address`, a table that sets `max` gets a `ScaledObject`
 that scales its worker StatefulSet between `number` and `max` on
-`urutau_coordinator_lag_seconds`. `max` must not be below `number`.
+`urutau_coordinator_pending_batches` (the table's outstanding batches).
+`max` must not be below `number`.
 
 ### `enrich[]`
 

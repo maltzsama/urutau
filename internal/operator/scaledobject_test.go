@@ -64,7 +64,7 @@ func TestScaledObjectTargetsWorkerStatefulSet(t *testing.T) {
 	if md["metricName"] != kedaMetricName {
 		t.Fatalf("metricName = %v, want %v", md["metricName"], kedaMetricName)
 	}
-	if md["query"] != `urutau_coordinator_lag_seconds{table="raw.orders"}` {
+	if md["query"] != `urutau_coordinator_pending_batches{table="raw.orders"}` {
 		t.Fatalf("query = %v", md["query"])
 	}
 	if len(obj.GetOwnerReferences()) != 1 || obj.GetOwnerReferences()[0].Name != "orders" {

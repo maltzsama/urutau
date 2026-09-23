@@ -76,13 +76,13 @@ type CoordinatorReconciler struct {
 	// collide.
 	FieldManager string
 	// KEDAPrometheusAddress is the Prometheus server the KEDA ScaledObjects
-	// query for the coordinator's per-table lag gauge. Empty disables KEDA
+	// query for the coordinator's per-table backlog gauge. Empty disables KEDA
 	// autoscaling entirely: no ScaledObject is rendered, and worker replicas
 	// stay at spec.workers.number (issue #298).
 	KEDAPrometheusAddress string
-	// KEDALagThreshold is the per-replica lag target (seconds) handed to the
-	// ScaledObject trigger. Empty means defaultKEDALagThreshold.
-	KEDALagThreshold string
+	// KEDAThreshold is the per-replica backlog target (outstanding batches)
+	// handed to the ScaledObject trigger. Empty means defaultKEDAThreshold.
+	KEDAThreshold string
 }
 
 // fieldManager returns the configured Server-Side Apply field owner, or the
