@@ -294,6 +294,79 @@ func deletePod(t *testing.T, ns, pod string) {
 	kubectl(t, "-n", ns, "delete", "pod", pod, "--wait=true")
 }
 
+// waitResource polls until `kubectl get <kind> <name> -n ns` succeeds — used
+// for the operator-rendered ScaledObject and the HPA KEDA derives from it.
+func waitResource(t *testing.T, ns, kind, name string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := exec.Command("kubectl", "-n", ns, "get", kind, name, "-o", "name").Run(); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s/%s never appeared in %s within %s", kind, name, ns, timeout)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// stsReplicas returns a StatefulSet's desired replicas, or -1 on error.
+func stsReplicas(t *testing.T, ns, sts string) int {
+	t.Helper()
+	out := kubectl(t, "-n", ns, "get", "sts", sts, "-o", "jsonpath={.spec.replicas}")
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// waitSTSReplicasAbove polls until a StatefulSet's replicas exceed want — the
+// observable effect of KEDA scaling it.
+func waitSTSReplicasAbove(t *testing.T, ns, sts string, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	last := -1
+	for {
+		last = stsReplicas(t, ns, sts)
+		if last > want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("StatefulSet %s replicas never exceeded %d within %s (last=%d)", sts, want, timeout, last)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// startHeavyWriter sustains a fast insert load so the per-table backlog stays
+// above KEDA's threshold long enough for a scale-up. Stop with the returned
+// function; the source remains the oracle for the final comparison.
+func startHeavyWriter(t *testing.T, db *sql.DB) (stop func()) {
+	t.Helper()
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+			id := int64(100000 + i)
+			if _, err := db.Exec("INSERT INTO orders (id, v, amount) VALUES (?, ?, ?)", id, fmt.Sprintf("burst%d", i), float64(i)); err != nil {
+				t.Logf("heavy writer: %v", err)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	return func() {
+		close(stopCh)
+		<-done
+	}
+}
+
 // ── logs and races ──────────────────────────────────────────────────────
 
 // podLogs returns a Pod's logs (best effort — a terminating Pod may be gone).

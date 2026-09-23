@@ -18,6 +18,7 @@ cd "$ROOT"
 
 KUBECTL="${KUBECTL:-kubectl}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
+KEDA_VERSION="${KEDA_VERSION:-v2.16.1}"
 RACE_IMAGE="${RACE_IMAGE:-urutau:dev-race}"
 
 say() { printf '\n==> %s\n' "$*"; }
@@ -51,5 +52,17 @@ say "fresh in-cluster data services (namespace e2e)"
 say "operator ($RACE_IMAGE)"
 "$KUBECTL" apply -k test/e2e/pods/k8s/operator
 "$KUBECTL" -n urutau-system rollout status deployment/urutau-operator --timeout=300s
+
+say "KEDA ($KEDA_VERSION)"
+if ! "$KUBECTL" get namespace keda >/dev/null 2>&1; then
+  # --server-side: KEDA's CRDs are too large for the client-side
+  # last-applied-configuration annotation ("metadata.annotations: Too long").
+  "$KUBECTL" apply --server-side --force-conflicts -f "https://github.com/kedacore/keda/releases/download/${KEDA_VERSION}/keda-${KEDA_VERSION#v}.yaml"
+fi
+"$KUBECTL" -n keda wait --for=condition=Available --timeout=300s deployment --all
+
+say "prometheus (namespace monitoring)"
+"$KUBECTL" apply -f test/e2e/pods/k8s/monitoring/prometheus.yaml
+"$KUBECTL" -n monitoring rollout status deployment/prometheus --timeout=300s
 
 say "pod e2e environment ready"
