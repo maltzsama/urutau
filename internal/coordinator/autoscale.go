@@ -55,8 +55,8 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 	if c.cfg.Spec == nil {
 		return
 	}
-	if c.scaleRetryAfter.After(time.Now()) {
-		return // a recent scale failed; let the table drain before retrying
+	if c.scaleRetryAfter == nil {
+		c.scaleRetryAfter = map[string]time.Time{}
 	}
 	cs, ns, _, err := c.workerClientset(ctx)
 	if err != nil {
@@ -64,6 +64,9 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 		return
 	}
 	for _, t := range c.cfg.Spec.Tables {
+		if c.scaleRetryAfter[t.Target].After(time.Now()) {
+			continue // this table's recent scale failed; let it drain first
+		}
 		name := spec.WorkerGroupPrefix(c.cfg.Spec.Pipeline, t.Target)
 		sts, err := cs.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
@@ -85,8 +88,7 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 		}
 		if err := c.ScaleTable(ctx, t.Target, want); err != nil {
 			c.log.Warn("coordinator: scale reconcile", "table", t.Target, "replicas", want, "err", err)
-			c.scaleRetryAfter = time.Now().Add(scaleFailureCooldown)
-			return
+			c.scaleRetryAfter[t.Target] = time.Now().Add(scaleFailureCooldown)
 		}
 	}
 }

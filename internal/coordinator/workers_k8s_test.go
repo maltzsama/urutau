@@ -240,7 +240,7 @@ func TestReconcileReplicasBacksOffAfterFailure(t *testing.T) {
 	owner := metav1.OwnerReference{Kind: "Pod", Name: "c", UID: types.UID("x")}
 	sts := workerStatefulSet(spec.WorkerGroupPrefix("p", "raw.orders"), "ns", owner, sampleTemplate(), 3)
 	c.k8sClient = fake.NewSimpleClientset(sts)
-	c.scaleRetryAfter = time.Now().Add(time.Minute)
+	c.scaleRetryAfter = map[string]time.Time{"raw.orders": time.Now().Add(time.Minute)}
 
 	c.reconcileReplicas(context.Background())
 

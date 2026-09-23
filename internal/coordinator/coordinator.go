@@ -207,11 +207,13 @@ type Coordinator struct {
 	k8sNS     string
 	k8sOwner  metav1.OwnerReference
 	workerK8s bool
-	// scaleRetryAfter suppresses the replica reconcile until this time after a
-	// failed scale: each attempt pauses the table's input for the whole drain
-	// timeout, so retrying every tick would starve the backlog the drain is
-	// waiting on (issue #298). Read and written only by the reconcile loop.
-	scaleRetryAfter time.Time
+	// scaleRetryAfter suppresses one table's replica reconcile until the
+	// mapped time after a failed scale: each attempt pauses the table's input
+	// for the whole drain timeout, so retrying every tick would starve the
+	// backlog the drain is waiting on (issue #298). Keyed by table target so
+	// one table's failure does not stall another's. Read and written only by
+	// the reconcile loop.
+	scaleRetryAfter map[string]time.Time
 
 	// runCtx outlives the helper goroutines that need cancellation (the
 	// wireRelay) but are called outside run's select.

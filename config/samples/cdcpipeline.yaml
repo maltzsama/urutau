@@ -76,5 +76,6 @@ spec:
             # KEDA autoscaling cap (issue #298): with the operator started
             # with --keda-prometheus-address, it renders a ScaledObject that
             # scales this table's worker StatefulSet between number and max
-            # on urutau_coordinator_lag_seconds. Omit max for a fixed count.
+            # on urutau_coordinator_pending_batches. Omit max for a fixed
+            # count.
             max: 6
