@@ -96,6 +96,58 @@ func (s *sessionSender) send(msg *pb.WorkerMessage) error {
 	return s.s.Send(msg)
 }
 
+// workerHandshake opens the Session, sends the Hello and waits for the
+// Assignment, retrying the whole sequence with backoff. A worker whose name
+// the coordinator does not know yet is rejected as unknown — and under KEDA
+// a scale-out starts the pod before the coordinator's reconcile loop has
+// registered the new owner, so that rejection is expected, not fatal.
+// Retrying lets the worker connect once the owner exists instead of
+// crash-looping. sessionWithRetry still handles a coordinator that is only
+// starting its listener.
+func workerHandshake(ctx context.Context, conn *grpc.ClientConn, name string, log *slog.Logger) (pb.UrutauControl_SessionClient, *pb.Assignment, error) {
+	const maxTries = 20
+	const base = 250 * time.Millisecond
+	const cap = 10 * time.Second
+	var last error
+	for attempt := 0; attempt < maxTries; attempt++ {
+		if attempt > 0 {
+			d := base << (attempt - 1)
+			if d > cap {
+				d = cap
+			}
+			d += time.Duration(rand.Int64N(int64(d)/2 + 1))
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(d):
+			}
+		}
+		session, err := sessionWithRetry(ctx, conn, log)
+		if err != nil {
+			last = err
+			continue
+		}
+		sender := &sessionSender{s: session}
+		err = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Hello{Hello: &pb.Hello{
+			WorkerName: name,
+			Phase:      pb.WorkerPhase_WORKER_PHASE_STARTING,
+			Epoch:      1,
+		}}})
+		if err == nil {
+			var msg *pb.CoordinatorMessage
+			if msg, err = session.Recv(); err == nil {
+				if assign := msg.GetAssign(); assign != nil {
+					return session, assign, nil
+				}
+				err = errors.New("worker: expected Assignment, got none")
+			}
+		}
+		last = err
+		log.Warn("worker: handshake retry", "attempt", attempt+1, "err", err)
+	}
+	return nil, nil, fmt.Errorf("worker: handshake: %w", last)
+}
+
 // sessionWithRetry opens the Session stream, tolerating a coordinator that
 // is still booting its listener.
 func sessionWithRetry(ctx context.Context, conn *grpc.ClientConn, log *slog.Logger) (pb.UrutauControl_SessionClient, error) {
@@ -159,31 +211,11 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	sessCtx, cancelAll := context.WithCancelCause(ctx)
 	defer cancelAll(nil)
 
-	session, err := sessionWithRetry(sessCtx, conn, cfg.Logger)
+	session, assign, err := workerHandshake(sessCtx, conn, cfg.Name, cfg.Logger)
 	if err != nil {
-		return fmt.Errorf("worker: session: %w", err)
+		return err
 	}
 	sender := &sessionSender{s: session}
-
-	// Handshake.
-	if err := sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Hello{
-		Hello: &pb.Hello{
-			WorkerName: cfg.Name,
-			Phase:      pb.WorkerPhase_WORKER_PHASE_STARTING,
-			Epoch:      1,
-		},
-	}}); err != nil {
-		return fmt.Errorf("worker: hello: %w", err)
-	}
-
-	msg, err := session.Recv()
-	if err != nil {
-		return fmt.Errorf("worker: await assignment: %w", err)
-	}
-	assign := msg.GetAssign()
-	if assign == nil {
-		return errors.New("worker: expected Assignment, got none")
-	}
 	cfg.Logger.Info("assignment", "tables", len(assign.Tables), "run", assign.RunId)
 
 	// Catalog + writers from the assignment: the coordinator owns DDL and
