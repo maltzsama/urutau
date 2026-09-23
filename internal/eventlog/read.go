@@ -90,6 +90,9 @@ type Trail struct {
 	// contain: Emitted minus the events read when sealed, otherwise the gaps
 	// in the event seq numbers.
 	Missing int
+	// Outcome classifies how the run ended, from the last terminal event
+	// (issue #350). Independent of Sealed.
+	Outcome Outcome
 }
 
 // lister abstracts the S3 list + get calls (unit tests use a fake). List
@@ -241,7 +244,7 @@ func readRunTrail(ctx context.Context, l lister, cfg RootConfig, pipeline, runID
 		return Trail{}, fmt.Errorf("%w: run %q of pipeline %q", ErrNotFound, runID, pipeline)
 	}
 	dropped, missing, emitted, sealed := summarize(out)
-	return Trail{Events: out, Sealed: sealed, Emitted: emitted, Dropped: dropped, Missing: missing}, nil
+	return Trail{Events: out, Sealed: sealed, Emitted: emitted, Dropped: dropped, Missing: missing, Outcome: outcomeOf(out)}, nil
 }
 
 // summarize folds the writer's completeness signals out of a decoded trail:

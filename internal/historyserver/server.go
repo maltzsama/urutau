@@ -114,6 +114,10 @@ type pipelineJSON struct {
 type runJSON struct {
 	ID      string `json:"id"`
 	Started string `json:"started,omitempty"`
+	// Outcome classifies how the run ended (issue #350): succeeded | failed |
+	// cancelled | unknown. Read per run so the list shows it without opening
+	// each run.
+	Outcome string `json:"outcome"`
 }
 
 type eventJSON struct {
@@ -151,9 +155,15 @@ func (s *server) listRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]runJSON, 0, len(runs))
 	for _, run := range runs {
-		rj := runJSON{ID: run.ID}
+		rj := runJSON{ID: run.ID, Outcome: string(eventlog.OutcomeUnknown)}
 		if !run.Started.IsZero() {
 			rj.Started = run.Started.UTC().Format(time.RFC3339)
+		}
+		// Classify the run's outcome from its terminal event (issue #350). A
+		// read failure — a run that vanished mid-list — leaves it unknown
+		// rather than failing the whole list.
+		if trail, err := s.store.ReadRunTrail(r.Context(), name, run.ID); err == nil && trail.Outcome != "" {
+			rj.Outcome = string(trail.Outcome)
 		}
 		out = append(out, rj)
 	}
@@ -181,13 +191,16 @@ func (s *server) readRun(w http.ResponseWriter, r *http.Request) {
 		out = append(out, eventJSON{Timestamp: e.Timestamp, RunID: e.RunID, Kind: e.Kind, Fields: e.Fields})
 	}
 	// The completeness signals travel with every page: a truncated or
-	// abandoned run must not render as a clean one (issues #329, #333).
+	// abandoned run must not render as a clean one (issues #329, #333). The
+	// outcome is independent of them: a sealed run can still have failed
+	// (issue #350).
 	resp := map[string]any{
 		"events":  out,
 		"sealed":  trail.Sealed,
 		"emitted": trail.Emitted,
 		"dropped": trail.Dropped,
 		"missing": trail.Missing,
+		"outcome": string(trail.Outcome),
 	}
 	if next != "" {
 		resp["nextCursor"] = next

@@ -77,7 +77,13 @@ async function pickPipeline(name) {
   $('events').replaceChildren();
   $('events-title').textContent = 'Events';
   const {runs = []} = await api(`/pipelines/${encodeURIComponent(name)}/runs`);
-  renderList($('runs'), runs, (r) => r.started ? `${r.id}  ${r.started}` : r.id,
+  renderList($('runs'), runs,
+    (r) => {
+      // The outcome (issue #350) is independent of trail completeness; show it
+      // as a prefix so the list reads without opening each run.
+      const badge = r.outcome && r.outcome !== 'unknown' ? `[${r.outcome}] ` : '';
+      return r.started ? `${badge}${r.id}  ${r.started}` : `${badge}${r.id}`;
+    },
     (run) => pickRun(name, run.id));
 }
 
@@ -90,7 +96,7 @@ async function pickRun(pipeline, runID) {
   $('events').append(table);
 
   let cursor = '';
-  let warned = false;
+  let headed = false;
   const more = document.createElement('button');
   more.textContent = 'Load more';
   more.hidden = true;
@@ -111,11 +117,14 @@ async function pickRun(pipeline, runID) {
 
   async function page() {
     const q = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
-    const {events = [], nextCursor = '', sealed = true, emitted = 0, dropped = false, missing = 0} =
+    const {events = [], nextCursor = '', sealed = true, emitted = 0, dropped = false, missing = 0, outcome = 'unknown'} =
       await api(`/pipelines/${encodeURIComponent(pipeline)}/runs/${encodeURIComponent(runID)}/events${q}`);
-    if (!warned) {
+    if (!headed) {
+      headed = true;
+      // The outcome is independent of the completeness signals (issue #350).
+      $('events-title').textContent = `Events — ${runID}  ·  outcome: ${outcome}`;
       const warning = trailWarning(sealed, emitted, dropped, missing);
-      if (warning) { warned = true; $('events').prepend(warning); }
+      if (warning) $('events').prepend(warning);
     }
     // Every cell is set with textContent: a trail's kind/timestamp is
     // free-form and must never be interpreted as markup (issue #334).

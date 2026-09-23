@@ -25,6 +25,8 @@ type fakeStore struct {
 	emitted int
 	dropped bool
 	missing int
+	// The terminal outcome the fake reports (issue #350).
+	outcome eventlog.Outcome
 	// listErr/readErr, when set, are returned by the corresponding method.
 	listErr error
 	readErr error
@@ -45,6 +47,7 @@ func (f fakeStore) ReadRunTrail(context.Context, string, string) (eventlog.Trail
 	}
 	return eventlog.Trail{
 		Events: f.events, Sealed: f.sealed, Emitted: f.emitted, Dropped: f.dropped, Missing: f.missing,
+		Outcome: f.outcome,
 	}, nil
 }
 
@@ -227,6 +230,45 @@ func TestReadRunReportsCompleteness(t *testing.T) {
 	getJSON(t, srv.URL+"/api/v1/pipelines/shop/runs/r1/events", &got)
 	if !got.Sealed || got.Emitted != 5 || got.Missing != 2 || got.Dropped {
 		t.Fatalf("completeness = %+v, want sealed=true emitted=5 missing=2 dropped=false", got)
+	}
+}
+
+// #350: the run's terminal outcome travels with the events, independent of
+// the completeness signals (a sealed run can still have failed).
+func TestReadRunReportsOutcome(t *testing.T) {
+	srv := testServer(fakeStore{
+		events:  []eventlog.Event{{Kind: "job_terminated", RunID: "r1", Fields: map[string]any{"reason": "crashloop"}}},
+		sealed:  true,
+		outcome: eventlog.OutcomeFailed,
+	}, 0)
+	defer srv.Close()
+	var got struct {
+		Sealed  bool   `json:"sealed"`
+		Outcome string `json:"outcome"`
+	}
+	getJSON(t, srv.URL+"/api/v1/pipelines/shop/runs/r1/events", &got)
+	if !got.Sealed || got.Outcome != "failed" {
+		t.Fatalf("outcome = %q sealed=%v, want failed/sealed (sealed != succeeded)", got.Outcome, got.Sealed)
+	}
+}
+
+// #350: the runs list carries each run's outcome so it reads without opening
+// each run.
+func TestListRunsReportsOutcome(t *testing.T) {
+	srv := testServer(fakeStore{
+		runs:    []eventlog.RunSummary{{ID: "r1"}},
+		outcome: eventlog.OutcomeSucceeded,
+	}, 0)
+	defer srv.Close()
+	var got struct {
+		Runs []struct {
+			ID      string `json:"id"`
+			Outcome string `json:"outcome"`
+		} `json:"runs"`
+	}
+	getJSON(t, srv.URL+"/api/v1/pipelines/shop/runs", &got)
+	if len(got.Runs) != 1 || got.Runs[0].Outcome != "succeeded" {
+		t.Fatalf("runs = %+v, want outcome succeeded", got.Runs)
 	}
 }
 
