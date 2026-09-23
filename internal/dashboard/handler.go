@@ -66,18 +66,20 @@ func (h *Handler) Register(mux *http.ServeMux) {
 // PublishState pushes the current pipeline/tables/workers snapshot to every
 // connected SSE subscriber. The coordinator calls it when that state changes
 // (an ack, a worker-metrics report, a maintenance result, a session change).
+// The payload is built lazily, so an ack on a pipeline nobody is watching
+// costs a lock and a length check, not a full state materialization (#338).
 func (h *Handler) PublishState() {
-	h.hub.Publish("state", h.statePayload())
+	h.hub.Publish("state", func() any { return h.statePayload() })
 }
 
 // PublishEvent pushes one new event.
 func (h *Handler) PublishEvent(e Event) {
-	h.hub.Publish("event", e)
+	h.hub.Publish("event", func() any { return e })
 }
 
 // PublishLog pushes one new coordinator log line.
 func (h *Handler) PublishLog(r logging.Record) {
-	h.hub.Publish("log", logEntryOf(r))
+	h.hub.Publish("log", func() any { return logEntryOf(r) })
 }
 
 // statePayload is the pipeline/tables/workers snapshot shared by the SSE
@@ -122,7 +124,7 @@ func (h *Handler) workers(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) worker(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("worker")
+	name := r.PathValue("name")
 	for _, ws := range h.state.Workers() {
 		if ws.Name == name {
 			writeJSON(w, ws)
