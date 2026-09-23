@@ -23,7 +23,7 @@ func TestPodSmoke(t *testing.T) {
 	seedOrders(t, mysql, 50)
 
 	cr := buildCR("pod-smoke", testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2301",
-		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}})
+		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
 	applyCR(t, cr)
 	t.Log("CDCPipeline applied; waiting for the coordinator and worker Pods")
 

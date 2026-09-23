@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,9 +122,16 @@ type tableSpec struct {
 	Max int
 }
 
+// crOptions are the optional knobs the scenarios toggle.
+type crOptions struct {
+	// Maintenance enables background Iceberg maintenance (compaction) in the
+	// inline sink spec, so an ephemeral maintenance worker Pod is scheduled.
+	Maintenance bool
+}
+
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
 // Secrets; everything else lives in definition.inline, exactly as the sample.
-func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tables []tableSpec) string {
+func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tables []tableSpec, opts crOptions) string {
 	rendered := make([]map[string]any, 0, len(tables))
 	for _, tbl := range tables {
 		t := map[string]any{
@@ -142,6 +151,17 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			t["workers"] = w
 		}
 		rendered = append(rendered, t)
+	}
+	sink := map[string]any{
+		"type": "iceberg+rest", "namespace": "raw", "warehouse": "quickstart_catalog",
+	}
+	if opts.Maintenance {
+		// A 1s interval makes compaction due for every pass, so the
+		// ephemeral maintenance worker Pod is scheduled promptly.
+		sink["maintenance"] = map[string]any{
+			"enabled":    true,
+			"compaction": map[string]any{"minInputFiles": 2, "interval": "1s"},
+		}
 	}
 	cr := map[string]any{
 		"apiVersion": "urutau.io/v1alpha1",
@@ -164,10 +184,8 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 				"inline": map[string]any{
 					"pipeline": name,
 					"source":   map[string]any{"kind": "mysql", "serverId": serverID},
-					"sink": map[string]any{
-						"type": "iceberg+rest", "namespace": "raw", "warehouse": "quickstart_catalog",
-					},
-					"tables": rendered,
+					"sink":     sink,
+					"tables":   rendered,
 				},
 			},
 		},
@@ -324,6 +342,59 @@ func portForward(t *testing.T, ns, resource string, local, remote int) {
 			t.Fatalf("port-forward %s: %s never came up: %v", resource, addr, err)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// coordinatorMetricsBase port-forwards the coordinator Pod's metrics port and
+// returns the base URL. Call once per test (the local port is fixed).
+func coordinatorMetricsBase(t *testing.T, ns, coordPod string) string {
+	t.Helper()
+	portForward(t, ns, "pod/"+coordPod, 19091, 8080)
+	return "http://127.0.0.1:19091"
+}
+
+// metricValue fetches /metrics and returns the value of the first sample whose
+// metric name matches, or -1 when absent.
+func metricValue(t *testing.T, base, metric string) float64 {
+	t.Helper()
+	resp, err := http.Get(base + "/metrics")
+	if err != nil {
+		return -1
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.HasPrefix(line, metric) {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) >= 2 {
+			if v, err := strconv.ParseFloat(f[len(f)-1], 64); err == nil {
+				return v
+			}
+		}
+	}
+	return -1
+}
+
+// waitMetricAbove polls the coordinator's metrics until the named metric
+// exceeds want, or fails after timeout.
+func waitMetricAbove(t *testing.T, base, metric string, want float64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	last := -1.0
+	for {
+		last = metricValue(t, base, metric)
+		if last > want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metric %s never exceeded %v within %s (last=%v)", metric, want, timeout, last)
+		}
+		time.Sleep(time.Second)
 	}
 }
 

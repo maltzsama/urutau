@@ -24,7 +24,7 @@ func TestPodScaleOutIn(t *testing.T) {
 	seedOrders(t, mysql, 200)
 
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2302",
-		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}})
+		[]tableSpec{{Source: "shop.orders", Target: target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
 	applyCR(t, cr)
 	t.Log("applied; waiting for the coordinator and one worker")
 
