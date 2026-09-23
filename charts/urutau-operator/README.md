@@ -114,7 +114,8 @@ helm install urutau charts/urutau-operator \
 ```
 
 `rbac.clusterWide=false` with an empty `operator.watchNamespaces` fails the
-render: the operator would have no permissions anywhere.
+render: the operator would have no permissions anywhere. A namespace repeated
+in the list is bound once.
 
 ## The CDCPipeline CRD survives `helm uninstall`
 

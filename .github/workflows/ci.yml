@@ -137,6 +137,12 @@ jobs:
             echo "namespace-scoped mode still renders a ClusterRoleBinding"; exit 1
           fi
           [ "$(grep -c 'kind: RoleBinding' /tmp/urutau-ns-rbac.yaml)" = "2" ]
+          # A namespace repeated in watchNamespaces renders once (a duplicate
+          # RoleBinding object would fail the install).
+          helm template urutau $C -n urutau-system \
+            --set rbac.clusterWide=false --set 'operator.watchNamespaces=team-a\,team-a\,team-b' \
+            > /tmp/urutau-ns-dup.yaml
+          [ "$(grep -c 'kind: RoleBinding' /tmp/urutau-ns-dup.yaml)" = "2" ]
           # ...and it is unsatisfiable with no watched namespaces.
           if helm template urutau $C -n urutau-system --set rbac.clusterWide=false >/dev/null 2>&1; then
             echo "rbac.clusterWide=false with no watchNamespaces rendered instead of failing"; exit 1
