@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: urutau-operator
+  name: {{ include "urutau-operator.fullname" . }}
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: urutau-operator
+  name: {{ include "urutau-operator.fullname" . }}
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
     control-plane: controller-manager
@@ -17,16 +17,22 @@ spec:
   replicas: {{ .Values.operator.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: urutau-operator
-      control-plane: controller-manager
+      {{- include "urutau-operator.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: urutau-operator
+        {{- include "urutau-operator.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/part-of: urutau
-        control-plane: controller-manager
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
-      serviceAccountName: urutau-operator
+      serviceAccountName: {{ include "urutau-operator.fullname" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         # The distroless image's USER is the non-numeric `nonroot`, which
@@ -35,6 +41,25 @@ spec:
         runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: operator
           image: {{ include "urutau-operator.image" . }}
@@ -63,8 +88,10 @@ spec:
               containerPort: 8080
             - name: health
               containerPort: 8081
+            {{- if .Values.webhook.enabled }}
             - name: webhook
               containerPort: 9443
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -90,5 +117,5 @@ spec:
       volumes:
         - name: webhook-cert
           secret:
-            secretName: urutau-operator-webhook-cert
+            secretName: {{ include "urutau-operator.fullname" . }}-webhook-cert
       {{- end }}

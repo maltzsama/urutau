@@ -1,0 +1,37 @@
+{{- if .Values.serviceMonitor.enabled }}
+# The metrics Service and ServiceMonitor the operator's /metrics is scraped
+# through. The Service carries a `component: metrics` label the ServiceMonitor
+# selects on, so it does not match the webhook Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "urutau-operator.fullname" . }}-metrics
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  selector:
+    {{- include "urutau-operator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "urutau-operator.fullname" . }}
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "urutau-operator.name" . }}
+      app.kubernetes.io/component: metrics
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

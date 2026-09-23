@@ -6,18 +6,33 @@ Check it:
 
 {{- if .Values.webhook.enabled }}
 
-The validating webhook is enabled. It needs its serving certificate before
-the apiserver will call it — wait for it:
+The validating webhook is enabled.
+{{- if .Values.webhook.certManager.enabled }}
 
-  kubectl -n {{ .Release.Namespace }} get certificate urutau-operator-webhook-cert
+cert-manager issues its serving certificate — wait for it:
 
+  kubectl -n {{ .Release.Namespace }} get certificate {{ include "urutau-operator.fullname" . }}-webhook-cert
+{{- else }}
+
+cert-manager is disabled: the webhook needs the
+{{ include "urutau-operator.fullname" . }}-webhook-cert Secret (keys
+tls.crt/tls.key) and the ValidatingWebhookConfiguration's caBundle
+(webhook.caBundle) to exist, or the apiserver rejects every CDCPipeline
+write. Both are supplied by you.
+{{- end }}
 {{- else }}
 
 The admission webhook is DISABLED. The reconciler still validates specs; you
 only lose the admission-time check.
-
 {{- end }}
 
 Submit a pipeline:
 
   kubectl apply -f config/samples/cdcpipeline.yaml
+
+NOTE: helm uninstall does NOT delete the CDCPipeline CRD — it carries
+helm.sh/resource-policy: keep, because deleting it cascades to every
+CDCPipeline in the cluster, across all namespaces. To remove the CRD and its
+pipelines deliberately:
+
+  kubectl delete crd cdcpipelines.urutau.io

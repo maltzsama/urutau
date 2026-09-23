@@ -78,13 +78,44 @@ jobs:
         run: helm lint charts/urutau-operator
 
       # Render the defaults, a different release namespace (the webhook
-      # namespace must follow it), and the webhook-off path.
+      # namespace must follow it), the webhook-off path, and the cert-manager
+      # off paths — asserting the failure and the caBundle render, so the
+      # chart cannot silently ship a webhook with no trust anchor (#339), a
+      # disabled webhook's stray port (#341), or broken optional extras.
       - name: Template the chart
         run: |
-          helm template urutau charts/urutau-operator --namespace urutau-system > /dev/null
-          helm template urutau charts/urutau-operator --namespace team-a > /dev/null
-          helm template urutau charts/urutau-operator --namespace urutau-system \
+          set -euo pipefail
+          C=charts/urutau-operator
+
+          helm template urutau $C --namespace urutau-system > /dev/null
+          helm template urutau $C --namespace team-a > /dev/null
+          helm template urutau $C --namespace urutau-system \
             --set webhook.enabled=false --set operator.replicaCount=1 > /dev/null
+
+          # webhook.enabled=false must not declare the 9443 webhook port.
+          if helm template urutau $C -n urutau-system --set webhook.enabled=false | grep -q 9443; then
+            echo "webhook disabled but the 9443 port still renders"; exit 1
+          fi
+
+          # cert-manager off with no caBundle is unsatisfiable: the render must
+          # fail rather than ship failurePolicy: Fail with no trust anchor.
+          if helm template urutau $C -n urutau-system --set webhook.certManager.enabled=false > /dev/null 2>&1; then
+            echo "cert-manager off with no caBundle rendered instead of failing"; exit 1
+          fi
+
+          # cert-manager off with a caBundle renders it.
+          helm template urutau $C -n urutau-system \
+            --set webhook.certManager.enabled=false --set webhook.caBundle=Zm9v \
+            | grep -q 'caBundle: Zm9v'
+
+          # The optional PDB and ServiceMonitor render when enabled.
+          helm template urutau $C -n urutau-system \
+            --set podDisruptionBudget.enabled=true --set serviceMonitor.enabled=true > /dev/null
+
+          # fullnameOverride renames the cluster-scoped resources, so a second
+          # release does not collide (#341).
+          helm template urutau $C -n urutau-system --set fullnameOverride=myop \
+            | grep -q 'name: myop-validating-webhook'
 
   test:
     runs-on: ubuntu-latest

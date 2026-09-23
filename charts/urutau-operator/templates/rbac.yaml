@@ -8,7 +8,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: urutau-operator-role
+  name: {{ include "urutau-operator.fullname" . }}-role
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
 rules:
@@ -31,9 +31,6 @@ rules:
   # granting what you do not hold. Bound cluster-wide here; for a shared
   # cluster, scope the operator per namespace instead (see the repo's
   # config/multi-tenant).
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "create", "update"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "create", "delete"]
@@ -50,18 +47,24 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # KEDA ScaledObjects (worker autoscaling, issue #298). Rendered only when
+  # the operator runs with --keda-prometheus-address; the rule is harmless on
+  # a cluster without the KEDA CRD.
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: urutau-operator-rolebinding
+  name: {{ include "urutau-operator.fullname" . }}-rolebinding
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: urutau-operator-role
+  name: {{ include "urutau-operator.fullname" . }}-role
 subjects:
   - kind: ServiceAccount
-    name: urutau-operator
+    name: {{ include "urutau-operator.fullname" . }}
     namespace: {{ .Release.Namespace }}

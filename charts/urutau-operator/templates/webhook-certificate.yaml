@@ -6,7 +6,7 @@
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
-  name: urutau-operator-selfsigned
+  name: {{ include "urutau-operator.fullname" . }}-selfsigned
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
 spec:
@@ -15,17 +15,17 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: urutau-operator-webhook-cert
+  name: {{ include "urutau-operator.fullname" . }}-webhook-cert
   labels:
     {{- include "urutau-operator.labels" . | nindent 4 }}
 spec:
-  secretName: urutau-operator-webhook-cert
+  secretName: {{ include "urutau-operator.fullname" . }}-webhook-cert
   duration: 8760h # 1 year
   renewBefore: 720h # 30 days
   dnsNames:
-    - urutau-operator-webhook.{{ .Release.Namespace }}.svc
-    - urutau-operator-webhook.{{ .Release.Namespace }}.svc.cluster.local
+    - {{ include "urutau-operator.fullname" . }}-webhook.{{ .Release.Namespace }}.svc
+    - {{ include "urutau-operator.fullname" . }}-webhook.{{ .Release.Namespace }}.svc.cluster.local
   issuerRef:
-    name: urutau-operator-selfsigned
+    name: {{ include "urutau-operator.fullname" . }}-selfsigned
     kind: Issuer
 {{- end }}

@@ -5,11 +5,21 @@
 # namespace, image, replicas and resources driven by values instead of
 # kustomize edits.
 
+# Override the resource name base. The default ("urutau-operator") keeps an
+# existing install's names; set fullnameOverride to run a second release in
+# the same cluster without colliding on the cluster-scoped resources
+# (ClusterRole, ClusterRoleBinding, ValidatingWebhookConfiguration).
+nameOverride: ""
+fullnameOverride: ""
+
 image:
   repository: ghcr.io/maltzsama/urutau
   # tag defaults to the chart's appVersion when empty.
   tag: ""
   pullPolicy: IfNotPresent
+
+# Pull secrets for the operator image (e.g. a private-registry mirror).
+imagePullSecrets: []
 
 operator:
   # Leader election makes more than one replica safe: only the leader
@@ -29,12 +39,42 @@ operator:
       cpu: 500m
       memory: 256Mi
 
+# Extra annotations on the operator Pod.
+podAnnotations: {}
+# Standard pod placement knobs.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# A PodDisruptionBudget for the operator. replicaCount defaults to 2 so leader
+# election gives HA; without a PDB a node drain can evict both replicas at
+# once, which defeats that. Off by default so the default render is unchanged.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# A metrics Service + ServiceMonitor for a Prometheus Operator install. Off by
+# default: the ServiceMonitor needs the monitoring.coreos.com CRDs.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  # Extra labels on the ServiceMonitor (e.g. for a Prometheus selector).
+  labels: {}
+
 webhook:
   # Disable to run without the admission webhook. The reconciler still
   # validates, so this loses the admission-time check, not correctness.
   enabled: true
-  # cert-manager issues the webhook serving certificate. If disabled, provide
-  # the `urutau-operator-webhook-cert` Secret and the ValidatingWebhookConfiguration's
-  # caBundle yourself.
+  # cert-manager issues the webhook serving certificate. Disable it only if
+  # you also supply webhook.caBundle AND pre-create the
+  # `<fullname>-webhook-cert` Secret (keys tls.crt/tls.key): the render fails
+  # when cert-manager is off and no caBundle is given, because the webhook
+  # declares failurePolicy: Fail and would otherwise reject every CDCPipeline
+  # write.
   certManager:
     enabled: true
+  # The ValidatingWebhookConfiguration's caBundle, base64-encoded PEM. Used
+  # only when certManager.enabled=false.
+  caBundle: ""

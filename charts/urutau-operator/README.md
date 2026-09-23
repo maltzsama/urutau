@@ -35,19 +35,41 @@ every place the kustomize base hardcodes `urutau-system` — the webhook
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `nameOverride` | `urutau-operator` | Resource name base |
+| `fullnameOverride` | _(empty)_ | Overrides every resource name; set it to run a second release without colliding on the cluster-scoped resources |
 | `image.repository` | `ghcr.io/maltzsama/urutau` | Image for the operator (and `--coordinator-image`) |
 | `image.tag` | chart `appVersion` | Image tag |
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy |
+| `imagePullSecrets` | `[]` | Pull secrets for the image (private mirrors) |
 | `operator.replicaCount` | `2` | Operator replicas (leader election makes >1 safe) |
 | `operator.fieldManager` | `urutau-operator` | Server-Side Apply field manager |
 | `operator.watchNamespaces` | _(all)_ | Comma-separated namespaces to watch; each needs a RoleBinding |
 | `operator.resources` | `100m/128Mi` → `500m/256Mi` | Operator container resources |
+| `podAnnotations` | `{}` | Extra annotations on the operator Pod |
+| `nodeSelector` / `tolerations` / `affinity` / `topologySpreadConstraints` | `{}`/`[]` | Pod placement |
+| `priorityClassName` | `""` | Pod priority class |
+| `podDisruptionBudget.enabled` | `false` | Render a PDB (`minAvailable: 1`) |
+| `serviceMonitor.enabled` | `false` | Render a metrics Service + ServiceMonitor |
+| `serviceMonitor.interval` | `30s` | Scrape interval |
 | `webhook.enabled` | `true` | Run the admission webhook |
 | `webhook.certManager.enabled` | `true` | cert-manager issues the webhook cert |
+| `webhook.caBundle` | `""` | Base64 PEM for the webhook's caBundle; required when `webhook.certManager.enabled=false` |
+
+## The CDCPipeline CRD survives `helm uninstall`
+
+The CRD carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves it
+— and every `CDCPipeline` in the cluster — in place. Deleting the CRD cascades
+to all pipelines across all namespaces, including ones this chart never
+created, so it is deliberately a manual step:
+
+```sh
+kubectl delete crd cdcpipelines.urutau.io
+```
 
 ## Install without cert-manager
 
-If cert-manager is not available, disable the webhook entirely:
+If cert-manager is not available, the simplest path is to disable the webhook
+entirely:
 
 ```sh
 helm install urutau charts/urutau-operator \
@@ -58,7 +80,20 @@ helm install urutau charts/urutau-operator \
 The reconciler still validates every spec, so this loses only the
 admission-time check, not correctness.
 
-To keep the webhook but manage the certificate yourself, set
-`webhook.certManager.enabled=false` and provide the
-`urutau-operator-webhook-cert` Secret (keys `tls.crt`/`tls.key`) plus the
-`ValidatingWebhookConfiguration`'s `caBundle`.
+### Keep the webhook, manage the certificate yourself
+
+Set `webhook.certManager.enabled=false` and supply both halves of the trust
+chain, or the install fails fast (the webhook declares `failurePolicy: Fail`,
+so a missing caBundle would reject every `CDCPipeline` write):
+
+1. **The caBundle** — `--set webhook.caBundle=$(base64 -w0 ca.crt)`.
+2. **The serving Secret** — pre-create `urutau-operator-webhook-cert` (keys
+   `tls.crt`/`tls.key`) in the release namespace. The operator Pod mounts it,
+   so it must exist before the Pod starts.
+
+```sh
+helm install urutau charts/urutau-operator \
+  --namespace urutau-system --create-namespace \
+  --set webhook.certManager.enabled=false \
+  --set webhook.caBundle="$(base64 -w0 ca.crt)"
+```
