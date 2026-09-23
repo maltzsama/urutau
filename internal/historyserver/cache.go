@@ -5,6 +5,8 @@ import (
 	"context"
 	"sync"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/maltzsama/urutau/internal/eventlog"
 )
 
@@ -79,6 +81,10 @@ func (c *trailCache) put(key string, t eventlog.Trail) {
 type cachedStore struct {
 	inner Store
 	cache *trailCache
+	// sf dedupes concurrent misses for the same run: one caller reads S3 and
+	// the rest share its result, so a burst of requests cannot stampede the
+	// store (issue #330).
+	sf singleflight.Group
 }
 
 func newCachedStore(inner Store, retained int) *cachedStore {
@@ -98,12 +104,23 @@ func (s *cachedStore) ReadRunTrail(ctx context.Context, pipeline, runID string) 
 	if t, ok := s.cache.get(key); ok {
 		return t, nil
 	}
-	t, err := s.inner.ReadRunTrail(ctx, pipeline, runID)
+	v, err, _ := s.sf.Do(key, func() (any, error) {
+		// Another caller may have populated the cache while this one waited
+		// for the in-flight read.
+		if t, ok := s.cache.get(key); ok {
+			return t, nil
+		}
+		t, err := s.inner.ReadRunTrail(ctx, pipeline, runID)
+		if err != nil {
+			return eventlog.Trail{}, err
+		}
+		if t.Sealed {
+			s.cache.put(key, t)
+		}
+		return t, nil
+	})
 	if err != nil {
 		return eventlog.Trail{}, err
 	}
-	if t.Sealed {
-		s.cache.put(key, t)
-	}
-	return t, nil
+	return v.(eventlog.Trail), nil
 }

@@ -2,6 +2,8 @@ package historyserver
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/maltzsama/urutau/internal/eventlog"
@@ -11,11 +13,11 @@ import (
 // store is read.
 type countingStore struct {
 	fakeStore
-	reads int
+	reads atomic.Int64
 }
 
 func (s *countingStore) ReadRunTrail(ctx context.Context, pipeline, runID string) (eventlog.Trail, error) {
-	s.reads++
+	s.reads.Add(1)
 	return s.fakeStore.ReadRunTrail(ctx, pipeline, runID)
 }
 
@@ -32,8 +34,8 @@ func TestCachedStoreCachesSealedRuns(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if inner.reads != 1 {
-		t.Fatalf("store reads = %d, want 1 (a sealed run is cached)", inner.reads)
+	if got := inner.reads.Load(); got != 1 {
+		t.Fatalf("store reads = %d, want 1 (a sealed run is cached)", got)
 	}
 }
 
@@ -47,8 +49,8 @@ func TestCachedStoreDoesNotCacheUnsealedRuns(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if inner.reads != 3 {
-		t.Fatalf("store reads = %d, want 3 (an unsealed run is never cached)", inner.reads)
+	if got := inner.reads.Load(); got != 3 {
+		t.Fatalf("store reads = %d, want 3 (an unsealed run is never cached)", got)
 	}
 }
 
@@ -61,7 +63,27 @@ func TestCachedStoreEvictsLRU(t *testing.T) {
 	_, _ = cs.ReadRunTrail(context.Background(), "shop", "r2")
 	_, _ = cs.ReadRunTrail(context.Background(), "shop", "r3") // evicts r1
 	_, _ = cs.ReadRunTrail(context.Background(), "shop", "r1") // must re-read
-	if inner.reads != 4 {
-		t.Fatalf("store reads = %d, want 4 (r1 was evicted)", inner.reads)
+	if got := inner.reads.Load(); got != 4 {
+		t.Fatalf("store reads = %d, want 4 (r1 was evicted)", got)
+	}
+}
+
+// Concurrent misses for the same run are deduped: one S3 read, not one per
+// request.
+func TestCachedStoreDedupesConcurrentReads(t *testing.T) {
+	inner := &countingStore{fakeStore: fakeStore{sealed: true}}
+	cs := newCachedStore(inner, 4)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = cs.ReadRunTrail(context.Background(), "shop", "r1")
+		}()
+	}
+	wg.Wait()
+	if got := inner.reads.Load(); got != 1 {
+		t.Fatalf("store reads = %d, want 1 (concurrent misses deduped)", got)
 	}
 }
