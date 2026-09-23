@@ -85,13 +85,17 @@ subjects:
     name: {{ include "urutau-operator.fullname" . }}
     namespace: {{ .Release.Namespace }}
 {{- else }}
+{{- $seen := dict }}
 {{- range $ns := splitList "," .Values.operator.watchNamespaces }}
 {{- $n := $ns | trim }}
-{{- if $n }}
+{{- if and $n (not (hasKey $seen $n)) }}
+{{- $_ := set $seen $n true }}
 ---
 # Scope the operator's permissions to one managed namespace. The ClusterRole
 # is referenced, not copied, so the permission set cannot drift from the
-# cluster-wide install.
+# cluster-wide install. A namespace repeated in watchNamespaces is rendered
+# once — duplicates would be duplicate RoleBinding objects and fail the
+# install.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
