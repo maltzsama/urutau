@@ -34,7 +34,12 @@ type Config struct {
 	Listen string
 	// PageLimit caps the events returned per request (default 1000).
 	PageLimit int
-	Logger    *slog.Logger
+	// RetainedRuns caps how many terminated runs' decoded trails stay cached
+	// in memory (default 32). A sealed run is immutable, so caching it turns a
+	// repeat read — and every page after the first — into a map lookup
+	// (issues #330, #331).
+	RetainedRuns int
+	Logger       *slog.Logger
 }
 
 // Store is the read side the server needs. The eventlog package satisfies it
@@ -55,7 +60,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.PageLimit <= 0 {
 		cfg.PageLimit = defaultPageLimit
 	}
-	s := &server{store: &eventlogStore{root: cfg.Root}, log: cfg.Logger, pageLimit: cfg.PageLimit}
+	s := &server{
+		store:     newCachedStore(&eventlogStore{root: cfg.Root}, cfg.RetainedRuns),
+		log:       cfg.Logger,
+		pageLimit: cfg.PageLimit,
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
