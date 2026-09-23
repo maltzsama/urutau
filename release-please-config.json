@@ -15,6 +15,10 @@
         {
           "type": "generic",
           "path": "README.md"
+        },
+        {
+          "type": "generic",
+          "path": "charts/urutau-operator/Chart.yaml"
         }
       ]
     }
