@@ -122,6 +122,12 @@ func TestHandlerEndpoints(t *testing.T) {
 		t.Errorf("restart = %q, want w-0", st.restarted)
 	}
 
+	// A known worker must resolve through the registered route — the handler
+	// read PathValue("worker") against a {name} pattern, so every request
+	// 404'd (issue #336). The route, not a synthetic request, is the point.
+	if rec := do("GET", "/api/v1/workers/w-0"); rec.Code != http.StatusOK {
+		t.Errorf("known worker = %d, want 200", rec.Code)
+	}
 	if rec := do("GET", "/api/v1/workers/nope"); rec.Code != http.StatusNotFound {
 		t.Errorf("unknown worker = %d, want 404", rec.Code)
 	}

@@ -39,10 +39,21 @@ func (h *Hub) Subscribe() (<-chan streamMsg, func()) {
 	}
 }
 
-// Publish marshals data once and fans it out to every subscriber under the
-// named event. A marshal failure or a full subscriber buffer drops the message.
-func (h *Hub) Publish(event string, data any) {
-	b, err := json.Marshal(data)
+// Publish fans data out to every subscriber under the named event. data is a
+// thunk, called only when at least one subscriber is connected: a high-rate
+// caller (the per-ack state snapshot) must not build a payload nobody will
+// read (issue #338). A marshal failure or a full subscriber buffer drops the
+// message.
+func (h *Hub) Publish(event string, data func() any) {
+	h.mu.Lock()
+	if len(h.subs) == 0 {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	// Marshal outside the lock: data() can be expensive (it reads coordinator
+	// state), and Subscribe must not wait on it.
+	b, err := json.Marshal(data())
 	if err != nil {
 		return
 	}
