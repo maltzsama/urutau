@@ -150,3 +150,4 @@ credentials. See [History server](../guides/history-server.md).
 | `--endpoint` | _(AWS default)_ | S3 endpoint override (MinIO-style path addressing) |
 | `--access-key` / `--secret-key` | _(AWS chain)_ | Static S3 credentials |
 | `--page-limit` | `1000` | Max events per page |
+| `--retained-runs` | `32` | How many terminated runs' trails stay cached in memory |

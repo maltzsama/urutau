@@ -38,15 +38,16 @@ func run() error {
 }
 
 type serveFlags struct {
-	rootURI   string
-	listen    string
-	region    string
-	endpoint  string
-	accessKey string
-	secretKey string
-	pageLimit int
-	logLevel  string
-	logFormat string
+	rootURI      string
+	listen       string
+	region       string
+	endpoint     string
+	accessKey    string
+	secretKey    string
+	pageLimit    int
+	retainedRuns int
+	logLevel     string
+	logFormat    string
 }
 
 func serveCmd() *cobra.Command {
@@ -75,10 +76,11 @@ func serveCmd() *cobra.Command {
 			root.AccessKey = f.accessKey
 			root.SecretKey = f.secretKey
 			return historyserver.Run(cmd.Context(), historyserver.Config{
-				Root:      root,
-				Listen:    f.listen,
-				PageLimit: f.pageLimit,
-				Logger:    logger,
+				Root:         root,
+				Listen:       f.listen,
+				PageLimit:    f.pageLimit,
+				RetainedRuns: f.retainedRuns,
+				Logger:       logger,
 			})
 		},
 	}
@@ -90,6 +92,7 @@ func serveCmd() *cobra.Command {
 	fl.StringVar(&f.accessKey, "access-key", "", "S3 access key (else the standard AWS chain)")
 	fl.StringVar(&f.secretKey, "secret-key", "", "S3 secret key")
 	fl.IntVar(&f.pageLimit, "page-limit", 1000, "max events per page")
+	fl.IntVar(&f.retainedRuns, "retained-runs", 32, "how many terminated runs' trails stay cached in memory")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	fl.StringVar(&f.logFormat, "log-format", "text", "log format: text|json")
 	return cmd

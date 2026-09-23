@@ -60,7 +60,14 @@ Events are paginated: pass the returned `nextCursor` to fetch the next page
 (`--page-limit` sets the page size, default 1000). Each event is
 `{"timestamp","runId","kind","fields"}` — `fields` carries the event's
 free-form payload (a `commit` event's table, a `worker_reset` event's reason,
-and so on).
+and so on). The response also carries the trail's completeness signals
+(`sealed`, `emitted`, `dropped`, `missing`); the SPA flags a run whose trail is
+incomplete rather than rendering it as clean.
+
+A sealed run is immutable, so its decoded trail is cached in memory
+(`--retained-runs`, default 32, least-recently-used): the first request reads
+and parses S3, and later requests — including every page after the first — are
+a lookup, not a re-download.
 
 ```sh title="Query the API"
 curl -s localhost:8080/api/v1/pipelines | jq
