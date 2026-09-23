@@ -21,6 +21,7 @@
   th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #8883; vertical-align: top; }
   td.fields { white-space: pre-wrap; word-break: break-word; }
   .muted { opacity: .6; }
+  .warn { color: #b91c1c; background: #ef444422; border: 1px solid #ef444466; border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; }
   button { font: inherit; margin-top: 8px; padding: 4px 10px; cursor: pointer; }
 </style>
 </head>
@@ -89,18 +90,46 @@ async function pickRun(pipeline, runID) {
   $('events').append(table);
 
   let cursor = '';
+  let warned = false;
   const more = document.createElement('button');
   more.textContent = 'Load more';
   more.hidden = true;
 
+  // A truncated or abandoned run must not render as a clean one: the server
+  // sends the completeness signals with every page (issues #329, #333).
+  function trailWarning(sealed, emitted, dropped, missing) {
+    const bits = [];
+    if (!sealed) bits.push('the run did not finish cleanly, so the trail may be missing its tail');
+    if (missing > 0) bits.push(`${missing} event(s) the writer accepted are missing`);
+    if (dropped) bits.push('the writer dropped buffered events under an S3 backlog');
+    if (!bits.length) return null;
+    const div = document.createElement('div');
+    div.className = 'warn';
+    div.textContent = 'Incomplete trail: ' + bits.join('; ') + '.';
+    return div;
+  }
+
   async function page() {
     const q = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
-    const {events = [], nextCursor = ''} =
+    const {events = [], nextCursor = '', sealed = true, emitted = 0, dropped = false, missing = 0} =
       await api(`/pipelines/${encodeURIComponent(pipeline)}/runs/${encodeURIComponent(runID)}/events${q}`);
+    if (!warned) {
+      const warning = trailWarning(sealed, emitted, dropped, missing);
+      if (warning) { warned = true; $('events').prepend(warning); }
+    }
+    // Every cell is set with textContent: a trail's kind/timestamp is
+    // free-form and must never be interpreted as markup (issue #334).
     for (const e of events) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td class="muted">${e.timestamp ?? ''}</td><td>${e.kind ?? ''}</td><td class="fields"></td>`;
-      tr.querySelector('.fields').textContent = JSON.stringify(e.fields ?? {});
+      const tdTime = document.createElement('td');
+      tdTime.className = 'muted';
+      tdTime.textContent = e.timestamp ?? '';
+      const tdKind = document.createElement('td');
+      tdKind.textContent = e.kind ?? '';
+      const tdFields = document.createElement('td');
+      tdFields.className = 'fields';
+      tdFields.textContent = JSON.stringify(e.fields ?? {});
+      tr.append(tdTime, tdKind, tdFields);
       tbody.append(tr);
     }
     cursor = nextCursor;
@@ -117,7 +146,10 @@ async function pickRun(pipeline, runID) {
     const {pipelines = []} = await api('/pipelines');
     renderList($('pipelines'), pipelines, (p) => p.name, (p) => pickPipeline(p.name));
   } catch (err) {
-    $('pipelines').innerHTML = `<li class="muted">failed: ${err.message}</li>`;
+    const li = document.createElement('li');
+    li.className = 'muted';
+    li.textContent = `failed: ${err.message}`;
+    $('pipelines').replaceChildren(li);
   }
 })();
 </script>

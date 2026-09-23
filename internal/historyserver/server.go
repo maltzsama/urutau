@@ -42,7 +42,7 @@ type Config struct {
 type Store interface {
 	ListPipelines(ctx context.Context) ([]eventlog.PipelineSummary, error)
 	ListRuns(ctx context.Context, pipeline string) ([]eventlog.RunSummary, error)
-	ReadRun(ctx context.Context, pipeline, runID string) ([]eventlog.Event, error)
+	ReadRunTrail(ctx context.Context, pipeline, runID string) (eventlog.Trail, error)
 }
 
 const defaultPageLimit = 1000
@@ -128,7 +128,14 @@ func (s *server) listPipelines(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.store.ListRuns(r.Context(), r.PathValue("name"))
+	name := r.PathValue("name")
+	// Reject an unsafe segment at the boundary: it is embedded in an S3 key
+	// prefix, and confinement must not rest on S3's key semantics (#335).
+	if !eventlog.ValidSegment(name) {
+		http.Error(w, "invalid pipeline id", http.StatusBadRequest)
+		return
+	}
+	runs, err := s.store.ListRuns(r.Context(), name)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -145,12 +152,17 @@ func (s *server) listRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) readRun(w http.ResponseWriter, r *http.Request) {
-	events, err := s.store.ReadRun(r.Context(), r.PathValue("name"), r.PathValue("runId"))
+	name, runID := r.PathValue("name"), r.PathValue("runId")
+	if !eventlog.ValidSegment(name) || !eventlog.ValidSegment(runID) {
+		http.Error(w, "invalid pipeline or run id", http.StatusBadRequest)
+		return
+	}
+	trail, err := s.store.ReadRunTrail(r.Context(), name, runID)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	page, next, err := paginate(events, r.URL.Query().Get("cursor"), s.pageLimit)
+	page, next, err := paginate(trail.Events, r.URL.Query().Get("cursor"), s.pageLimit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -159,7 +171,15 @@ func (s *server) readRun(w http.ResponseWriter, r *http.Request) {
 	for _, e := range page {
 		out = append(out, eventJSON{Timestamp: e.Timestamp, RunID: e.RunID, Kind: e.Kind, Fields: e.Fields})
 	}
-	resp := map[string]any{"events": out}
+	// The completeness signals travel with every page: a truncated or
+	// abandoned run must not render as a clean one (issues #329, #333).
+	resp := map[string]any{
+		"events":  out,
+		"sealed":  trail.Sealed,
+		"emitted": trail.Emitted,
+		"dropped": trail.Dropped,
+		"missing": trail.Missing,
+	}
 	if next != "" {
 		resp["nextCursor"] = next
 	}
@@ -199,6 +219,16 @@ func (s *server) writeJSON(w http.ResponseWriter, v any) {
 }
 
 func (s *server) fail(w http.ResponseWriter, err error) {
+	// A missing pipeline/run is a 404 and a bad identifier a 400, so a typo
+	// and a genuine S3 outage do not look alike to monitoring (#329, #335).
+	switch {
+	case errors.Is(err, eventlog.ErrNotFound):
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	case errors.Is(err, eventlog.ErrInvalidID):
+		http.Error(w, "invalid identifier", http.StatusBadRequest)
+		return
+	}
 	s.log.Warn("history-server: request failed", "err", err)
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
@@ -216,6 +246,6 @@ func (s *eventlogStore) ListRuns(ctx context.Context, pipeline string) ([]eventl
 	return eventlog.ListRuns(ctx, s.root, pipeline)
 }
 
-func (s *eventlogStore) ReadRun(ctx context.Context, pipeline, runID string) ([]eventlog.Event, error) {
-	return eventlog.ReadRun(ctx, s.root, pipeline, runID)
+func (s *eventlogStore) ReadRunTrail(ctx context.Context, pipeline, runID string) (eventlog.Trail, error) {
+	return eventlog.ReadRunTrail(ctx, s.root, pipeline, runID)
 }

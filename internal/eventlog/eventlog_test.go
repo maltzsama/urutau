@@ -148,11 +148,12 @@ func TestEmitClosedReturnsError(t *testing.T) {
 	r := NewWithPutter("bucket", "prefix", 0, p)
 
 	_ = r.Close()
+	before := p.Calls()
 	if err := r.Emit(context.Background(), "job_stopped", nil); err == nil {
 		t.Fatal("expected error on closed run")
 	}
-	if p.Calls() != 0 {
-		t.Fatalf("calls = %d, want 0 (no upload after close)", p.Calls())
+	if p.Calls() != before {
+		t.Fatalf("calls = %d, want %d (no upload after close)", p.Calls(), before)
 	}
 }
 
@@ -373,7 +374,8 @@ func TestCloseSerializesWithInFlightEmits(t *testing.T) {
 		t.Fatalf("PUTs = %d, want %d (accepted emits + one close)", len(bodies), accepted+1)
 	}
 	// Every PUT body is a prefix of the final buffer (appends only grow it),
-	// so the largest body must carry exactly the accepted events.
+	// so the largest body must carry exactly the accepted events plus the
+	// run_sealed terminal marker Close appends (issue #333).
 	bodies := p.snapshot()
 	maxLines := 0
 	for _, b := range bodies {
@@ -381,8 +383,8 @@ func TestCloseSerializesWithInFlightEmits(t *testing.T) {
 			maxLines = c
 		}
 	}
-	if maxLines != accepted {
-		t.Fatalf("largest PUT body has %d lines, want %d (accepted)", maxLines, accepted)
+	if maxLines != accepted+1 {
+		t.Fatalf("largest PUT body has %d lines, want %d (accepted + seal marker)", maxLines, accepted+1)
 	}
 }
 
@@ -761,9 +763,72 @@ func TestEmitBoundsBufferUnderBacklog(t *testing.T) {
 	r.mu.Lock()
 	buf := len(r.buf)
 	max := r.maxBufferBytes
+	body := string(r.buf)
 	r.mu.Unlock()
 	if int64(buf) > max+200 {
 		t.Fatalf("buffer grew to %d, want <= %d", buf, max)
+	}
+	// #333: the drop leaves a marker in the trail, so a reader sees the loss
+	// instead of reading the gap as a quiet period.
+	if !strings.Contains(body, `"kind":"events_dropped"`) {
+		t.Fatalf("a drop left no events_dropped marker")
+	}
+}
+
+// #333: every event carries a contiguous, monotonic seq, and seq is lifted out
+// of Fields like the other reserved keys.
+func TestEmitAssignsContiguousSeq(t *testing.T) {
+	p := &fakePutter{}
+	r := NewWithPutter("b", "p", 1<<20, p)
+	for i := 0; i < 5; i++ {
+		if err := r.Emit(context.Background(), "commit", map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.mu.Lock()
+	body := p.lastBody
+	p.mu.Unlock()
+	events, err := parseEvents(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 5 {
+		t.Fatalf("events = %d, want 5", len(events))
+	}
+	for i, e := range events {
+		if e.Seq != i+1 {
+			t.Fatalf("event %d seq = %d, want %d", i, e.Seq, i+1)
+		}
+		if _, ok := e.Fields["seq"]; ok {
+			t.Fatalf("seq leaked into Fields: %+v", e.Fields)
+		}
+	}
+}
+
+// #333: Close writes a run_sealed terminal marker recording the emitted count,
+// so a reader can verify completeness and tell a sealed run from an abandoned
+// one.
+func TestCloseWritesSealMarker(t *testing.T) {
+	p := &fakePutter{}
+	r := NewWithPutter("b", "p", 1<<20, p)
+	_ = r.Emit(context.Background(), "job_started", nil)
+	_ = r.Emit(context.Background(), "commit", nil)
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	body := p.lastBody
+	p.mu.Unlock()
+	events, err := parseEvents(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Kind != KindRunSealed {
+		t.Fatalf("last event = %q, want %q", last.Kind, KindRunSealed)
+	}
+	if got := last.Fields["emitted"]; got != float64(2) {
+		t.Fatalf("seal emitted = %v, want 2", got)
 	}
 }
 

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -18,16 +20,32 @@ type fakeStore struct {
 	pipelines []eventlog.PipelineSummary
 	runs      []eventlog.RunSummary
 	events    []eventlog.Event
+	// Completeness signals the fake reports (issue #333).
+	sealed  bool
+	emitted int
+	dropped bool
+	missing int
+	// listErr/readErr, when set, are returned by the corresponding method.
+	listErr error
+	readErr error
 }
 
 func (f fakeStore) ListPipelines(context.Context) ([]eventlog.PipelineSummary, error) {
 	return f.pipelines, nil
 }
 func (f fakeStore) ListRuns(context.Context, string) ([]eventlog.RunSummary, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.runs, nil
 }
-func (f fakeStore) ReadRun(context.Context, string, string) ([]eventlog.Event, error) {
-	return f.events, nil
+func (f fakeStore) ReadRunTrail(context.Context, string, string) (eventlog.Trail, error) {
+	if f.readErr != nil {
+		return eventlog.Trail{}, f.readErr
+	}
+	return eventlog.Trail{
+		Events: f.events, Sealed: f.sealed, Emitted: f.emitted, Dropped: f.dropped, Missing: f.missing,
+	}, nil
 }
 
 func testServer(store Store, limit int) *httptest.Server {
@@ -142,3 +160,91 @@ func TestReadRunPaginates(t *testing.T) {
 		t.Fatalf("bad cursor status = %d, want 400", resp.StatusCode)
 	}
 }
+
+// #329: a missing run is 404, not a 200 with an empty list.
+func TestReadRunNotFound(t *testing.T) {
+	srv := testServer(fakeStore{readErr: eventlog.ErrNotFound}, 0)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/pipelines/shop/runs/nope/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// #329: an unknown pipeline is 404 on the runs list.
+func TestListRunsNotFound(t *testing.T) {
+	srv := testServer(fakeStore{listErr: eventlog.ErrNotFound}, 0)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/v1/pipelines/nope/runs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// #335: an unsafe path segment is rejected with 400 before the store is hit.
+func TestReadRunRejectsUnsafeID(t *testing.T) {
+	srv := testServer(fakeStore{}, 0)
+	defer srv.Close()
+	for _, path := range []string{
+		"/api/v1/pipelines/..%2F..%2Fetc/runs",
+		"/api/v1/pipelines/shop/runs/..%2F..%2Fother%2Frun-x/events",
+	} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s status = %d, want 400", path, resp.StatusCode)
+		}
+	}
+}
+
+// #333: the completeness signals travel with the events, so the SPA can flag a
+// truncated or abandoned run.
+func TestReadRunReportsCompleteness(t *testing.T) {
+	srv := testServer(fakeStore{
+		events:  []eventlog.Event{{Kind: "job_started", RunID: "r1"}},
+		sealed:  true,
+		emitted: 5,
+		missing: 2,
+	}, 0)
+	defer srv.Close()
+	var got struct {
+		Sealed  bool `json:"sealed"`
+		Emitted int  `json:"emitted"`
+		Dropped bool `json:"dropped"`
+		Missing int  `json:"missing"`
+	}
+	getJSON(t, srv.URL+"/api/v1/pipelines/shop/runs/r1/events", &got)
+	if !got.Sealed || got.Emitted != 5 || got.Missing != 2 || got.Dropped {
+		t.Fatalf("completeness = %+v, want sealed=true emitted=5 missing=2 dropped=false", got)
+	}
+}
+
+// #334: the SPA must never interpolate trail contents into innerHTML — a
+// malicious kind would execute in the viewer's browser. Regression guard: no
+// `innerHTML = `…${…}“ (a plain-string innerHTML is fine).
+func TestSPANoInnerHTMLInterpolation(t *testing.T) {
+	sub, err := fs.Sub(staticFS, "static")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := fs.ReadFile(sub, "index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if innerHTMLInterp.Match(b) {
+		t.Fatal("index.html interpolates into innerHTML; build the cell with textContent (issue #334)")
+	}
+}
+
+var innerHTMLInterp = regexp.MustCompile("innerHTML\\s*=\\s*`[^`]*\\$\\{")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -13,6 +14,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
+
+// ErrNotFound reports that a pipeline or run does not exist under the root,
+// so an HTTP caller can answer 404 instead of an empty 200 (issue #329).
+var ErrNotFound = errors.New("eventlog: not found")
+
+// ErrInvalidID reports a pipeline or run identifier that is not a safe single
+// path segment. It is embedded in an S3 key prefix, so this is the
+// confinement boundary (issue #335).
+var ErrInvalidID = errors.New("eventlog: invalid identifier")
 
 // RootConfig points a reader at the shared eventlog root
 // (s3://<bucket>/<prefix>). It carries the same connection knobs as Config;
@@ -49,12 +59,37 @@ type RunSummary struct {
 }
 
 // Event is one decoded JSONL line. Fields carries every key besides the
-// reserved ts/run_id/kind, mirroring the free-form map Emit accepts.
+// reserved ts/run_id/kind/seq, mirroring the free-form map Emit accepts.
 type Event struct {
 	Timestamp time.Time
 	RunID     string
 	Kind      string
-	Fields    map[string]any
+	// Seq is the writer's monotonic per-event sequence number (1-based),
+	// added by Emit. Zero on a synthetic marker (events_dropped, run_sealed)
+	// and on lines written before seq existed. A gap in the seqs is lost
+	// events (issue #333).
+	Seq    int
+	Fields map[string]any
+}
+
+// Trail is a run's decoded events plus the completeness signals the writer
+// leaves in the trail (issue #333).
+type Trail struct {
+	Events []Event
+	// Sealed reports whether the run wrote its run_sealed terminal marker.
+	// False means the run was abandoned (a crash, a kill) and the trail may
+	// be missing its tail.
+	Sealed bool
+	// Emitted is the writer's final event count, from the terminal marker.
+	// Zero when the run is not sealed.
+	Emitted int
+	// Dropped reports an events_dropped marker: the writer overflowed its
+	// buffer under an S3 backlog and lost lines.
+	Dropped bool
+	// Missing is how many events the writer accepted that the trail does not
+	// contain: Emitted minus the events read when sealed, otherwise the gaps
+	// in the event seq numbers.
+	Missing int
 }
 
 // lister abstracts the S3 list + get calls (unit tests use a fake). List
@@ -88,11 +123,22 @@ func ListRuns(ctx context.Context, cfg RootConfig, pipeline string) ([]RunSummar
 // run's prefix, concatenated. Each object is a full re-upload of the events
 // since the previous rotation, so the objects never overlap.
 func ReadRun(ctx context.Context, cfg RootConfig, pipeline, runID string) ([]Event, error) {
-	l, err := newLister(ctx, cfg)
+	t, err := ReadRunTrail(ctx, cfg, pipeline, runID)
 	if err != nil {
 		return nil, err
 	}
-	return readRun(ctx, l, cfg, pipeline, runID)
+	return t.Events, nil
+}
+
+// ReadRunTrail returns a run's events plus the completeness signals the writer
+// left in the trail (issue #333). A missing run yields ErrNotFound, so an HTTP
+// caller can answer 404 (issue #329).
+func ReadRunTrail(ctx context.Context, cfg RootConfig, pipeline, runID string) (Trail, error) {
+	l, err := newLister(ctx, cfg)
+	if err != nil {
+		return Trail{}, err
+	}
+	return readRunTrail(ctx, l, cfg, pipeline, runID)
 }
 
 func listPipelines(ctx context.Context, l lister, cfg RootConfig) ([]PipelineSummary, error) {
@@ -114,6 +160,9 @@ func listPipelines(ctx context.Context, l lister, cfg RootConfig) ([]PipelineSum
 }
 
 func listRuns(ctx context.Context, l lister, cfg RootConfig, pipeline string) ([]RunSummary, error) {
+	if !ValidSegment(pipeline) {
+		return nil, fmt.Errorf("%w: pipeline %q", ErrInvalidID, pipeline)
+	}
 	prefix := pipelinePrefix(cfg.Prefix, pipeline)
 	_, prefixes, err := l.List(ctx, cfg.Bucket, prefix, "/")
 	if err != nil {
@@ -128,15 +177,47 @@ func listRuns(ctx context.Context, l lister, cfg RootConfig, pipeline string) ([
 		}
 		out = append(out, RunSummary{ID: id, Started: runStarted(id)})
 	}
+	// No runs under the prefix is either an unknown pipeline or a genuinely
+	// empty one; only the first is an error (issue #329).
+	if len(out) == 0 {
+		known, err := listPipelines(ctx, l, cfg)
+		if err != nil {
+			return nil, err
+		}
+		found := false
+		for _, p := range known {
+			if p.Name == pipeline {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: pipeline %q", ErrNotFound, pipeline)
+		}
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
 
 func readRun(ctx context.Context, l lister, cfg RootConfig, pipeline, runID string) ([]Event, error) {
-	prefix := pipelinePrefix(cfg.Prefix, pipeline) + "run-" + strings.Trim(runID, "/") + "/"
-	objects, _, err := l.List(ctx, cfg.Bucket, prefix, "")
+	t, err := readRunTrail(ctx, l, cfg, pipeline, runID)
 	if err != nil {
 		return nil, err
+	}
+	return t.Events, nil
+}
+
+func readRunTrail(ctx context.Context, l lister, cfg RootConfig, pipeline, runID string) (Trail, error) {
+	if !ValidSegment(pipeline) {
+		return Trail{}, fmt.Errorf("%w: pipeline %q", ErrInvalidID, pipeline)
+	}
+	if !ValidSegment(runID) {
+		return Trail{}, fmt.Errorf("%w: run %q", ErrInvalidID, runID)
+	}
+	prefix := pipelinePrefix(cfg.Prefix, pipeline) + "run-" + runID + "/"
+	objects, _, err := l.List(ctx, cfg.Bucket, prefix, "")
+	if err != nil {
+		return Trail{}, err
 	}
 	// Fixed-width names (events-000000.jsonl, …) sort in creation order as
 	// plain strings, so the events concatenate in the order they were emitted.
@@ -148,21 +229,83 @@ func readRun(ctx context.Context, l lister, cfg RootConfig, pipeline, runID stri
 		}
 		body, err := l.Get(ctx, cfg.Bucket, key)
 		if err != nil {
-			return nil, fmt.Errorf("eventlog: get %s: %w", key, err)
+			return Trail{}, fmt.Errorf("eventlog: get %s: %w", key, err)
 		}
 		events, err := parseEvents(body)
 		if err != nil {
-			return nil, fmt.Errorf("eventlog: parse %s: %w", key, err)
+			return Trail{}, fmt.Errorf("eventlog: parse %s: %w", key, err)
 		}
 		out = append(out, events...)
 	}
-	return out, nil
+	if len(out) == 0 {
+		return Trail{}, fmt.Errorf("%w: run %q of pipeline %q", ErrNotFound, runID, pipeline)
+	}
+	dropped, missing, emitted, sealed := summarize(out)
+	return Trail{Events: out, Sealed: sealed, Emitted: emitted, Dropped: dropped, Missing: missing}, nil
+}
+
+// summarize folds the writer's completeness signals out of a decoded trail:
+// whether it was dropped or sealed, the final emitted count, and how many
+// accepted events are missing (issue #333).
+func summarize(events []Event) (dropped bool, missing, emitted int, sealed bool) {
+	minSeq, maxSeq, count := 0, 0, 0
+	for _, e := range events {
+		switch e.Kind {
+		case KindEventsDropped:
+			dropped = true
+			continue
+		case KindRunSealed:
+			sealed = true
+			if n, ok := e.Fields["emitted"].(float64); ok {
+				emitted = int(n)
+			}
+			continue
+		}
+		if e.Seq <= 0 {
+			continue
+		}
+		count++
+		if minSeq == 0 || e.Seq < minSeq {
+			minSeq = e.Seq
+		}
+		if e.Seq > maxSeq {
+			maxSeq = e.Seq
+		}
+	}
+	switch {
+	case sealed && emitted > count:
+		missing = emitted - count
+	case minSeq > 0:
+		missing = (maxSeq - minSeq + 1) - count
+	}
+	return dropped, missing, emitted, sealed
+}
+
+// ValidSegment reports whether s is a safe single path segment to embed in an
+// S3 key prefix: non-empty, no separators, no "." or "..", no control
+// characters (issue #335). Exported so the HTTP layer can reject a bad
+// identifier before it reaches the store.
+func ValidSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	if strings.ContainsAny(s, `/\`) {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // parseEvents decodes a JSONL object. A malformed line fails the read rather
 // than being skipped: a torn trail is a bug the reader should surface.
 func parseEvents(body []byte) ([]Event, error) {
-	var out []Event
+	// One line per newline (the last may lack one) is a good capacity hint;
+	// otherwise the slice grows repeatedly (issue #332).
+	out := make([]Event, 0, bytes.Count(body, []byte("\n"))+1)
 	for _, line := range bytes.Split(body, []byte("\n")) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
@@ -171,7 +314,7 @@ func parseEvents(body []byte) ([]Event, error) {
 		if err := json.Unmarshal(line, &raw); err != nil {
 			return nil, err
 		}
-		ev := Event{Fields: map[string]any{}}
+		ev := Event{}
 		if v, ok := raw["ts"].(string); ok {
 			if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
 				ev.Timestamp = t
@@ -179,12 +322,18 @@ func parseEvents(body []byte) ([]Event, error) {
 		}
 		ev.RunID, _ = raw["run_id"].(string)
 		ev.Kind, _ = raw["kind"].(string)
-		for k, v := range raw {
-			switch k {
-			case "ts", "run_id", "kind":
-			default:
-				ev.Fields[k] = v
-			}
+		if n, ok := raw["seq"].(float64); ok {
+			ev.Seq = int(n)
+		}
+		// Reuse the decoded map for Fields instead of copying into a second
+		// one: delete the reserved keys in place (issue #332).
+		delete(raw, "ts")
+		delete(raw, "run_id")
+		delete(raw, "kind")
+		delete(raw, "seq")
+		ev.Fields = raw
+		if len(raw) == 0 {
+			ev.Fields = map[string]any{}
 		}
 		out = append(out, ev)
 	}
