@@ -118,9 +118,11 @@ k8s-status:
 RACE_IMAGE ?= urutau:dev-race
 POD_E2E_DIR := test/e2e/pods
 
-k8s-load-race: ## Build the race-instrumented image on the host and load it into minikube
-	docker build -f build/Dockerfile.race -t $(RACE_IMAGE) .
-	minikube image load $(RACE_IMAGE)
+k8s-load-race: ## Build the race-instrumented image into minikube's docker daemon
+	# Built straight into the daemon (like k8s-load): `minikube image load`
+	# refuses to retag an image a Pod still holds, so a load after a code
+	# change would silently keep the old image while the operator keeps running.
+	eval $$(minikube docker-env) && docker build -f build/Dockerfile.race -t $(RACE_IMAGE) .
 
 e2e-pods-up: ## Bring up cert-manager, the in-cluster stack, and the operator (race image)
 	./$(POD_E2E_DIR)/up.sh
@@ -129,7 +131,7 @@ e2e-pods-down: ## Tear down the pod e2e: CRs, operator, and the in-cluster stack
 	./$(POD_E2E_DIR)/down.sh
 
 e2e-pods-test: ## Run the pod e2e scenarios (needs e2e-pods-up + k8s-load-race)
-	URUTAU_E2E_PODS=1 $(GO) test -count=1 -v ./$(POD_E2E_DIR)
+	URUTAU_E2E_PODS=1 $(GO) test -count=1 -timeout=90m -v ./$(POD_E2E_DIR)
 
 E2E_COMPOSE := test/e2e/docker-compose.yml
 

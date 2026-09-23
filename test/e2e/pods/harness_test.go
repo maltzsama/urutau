@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,16 +92,43 @@ func applyCR(t *testing.T, manifest string) {
 	kubectlStdin(t, manifest, "apply", "-f", "-")
 }
 
-// applyPipeline applies a CR and registers a cleanup that deletes it. Without
-// the cleanup a finished test leaves a pipeline streaming the shared source,
-// cross-talking into the next test's load.
+// applyPipeline applies a CR and registers a cleanup that deletes it. The
+// cleanup waits for the CR and its Pods to be gone: the scenarios share the
+// shop.orders source, so a lingering pipeline would consume the next test's
+// writes and contaminate its sink.
 func applyPipeline(t *testing.T, ns, name, manifest string) {
 	t.Helper()
 	applyCR(t, manifest)
 	t.Cleanup(func() {
 		_ = exec.Command("kubectl", "-n", ns, "delete", "cdcpipelines", name,
-			"--ignore-not-found", "--wait=false").Run()
+			"--ignore-not-found", "--wait=true").Run()
+		waitPodsGone(t, ns, name+"-", 2*time.Minute)
 	})
+}
+
+// waitPodsGone polls until no Pod with the prefix remains, best effort — a
+// cleanup must not fail an already-finished test.
+func waitPodsGone(t *testing.T, ns, prefix string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		out, _ := exec.Command("kubectl", "-n", ns, "get", "pods", "-o",
+			`jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`).Output()
+		remaining := 0
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+				remaining++
+			}
+		}
+		if remaining == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Logf("pods with prefix %q still present after %s", prefix, timeout)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // ensureNamespace creates the namespace if it is absent (idempotent).
@@ -284,14 +312,20 @@ func waitConverged(t *testing.T, ctx context.Context, trino *sql.DB, query strin
 // coordinator follows (issue #298). The coordinator re-slices to match.
 func scaleWorker(t *testing.T, ns, sts string, replicas int) {
 	t.Helper()
+	// A race in a Pod about to be scaled away must be caught before its logs
+	// vanish with it.
+	assertNoRaces(t, ns, sts+"-")
 	kubectl(t, "-n", ns, "scale", "statefulset", sts, fmt.Sprintf("--replicas=%d", replicas))
 }
 
 // deletePod SIGKILLs a Pod by deleting it; the owning StatefulSet recreates it.
-// This is the real crash the in-process suite could only fake with a cancel.
+// --grace-period=0 --force sends SIGKILL, so no deferred cleanup runs — the
+// real crash the in-process suite could only fake with a cancel.
 func deletePod(t *testing.T, ns, pod string) {
 	t.Helper()
-	kubectl(t, "-n", ns, "delete", "pod", pod, "--wait=true")
+	// A race in the Pod being killed must be caught before its logs vanish.
+	assertNoRacesForPod(t, ns, pod)
+	kubectl(t, "-n", ns, "delete", "pod", pod, "--grace-period=0", "--force", "--wait=true")
 }
 
 // waitResource polls until `kubectl get <kind> <name> -n ns` succeeds — used
@@ -326,7 +360,7 @@ func stsReplicas(t *testing.T, ns, sts string) int {
 func waitSTSReplicasAbove(t *testing.T, ns, sts string, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	last := -1
+	var last int
 	for {
 		last = stsReplicas(t, ns, sts)
 		if last > want {
@@ -361,23 +395,23 @@ func startHeavyWriter(t *testing.T, db *sql.DB) (stop func()) {
 			time.Sleep(2 * time.Millisecond)
 		}
 	}()
-	return func() {
-		close(stopCh)
-		<-done
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			close(stopCh)
+			<-done
+		})
 	}
+	t.Cleanup(stop)
+	return stop
 }
 
 // ── logs and races ──────────────────────────────────────────────────────
 
-// podLogs returns a Pod's logs, best effort: a Pod still creating, or already
-// gone, has none — that is not a test failure.
-func podLogs(t *testing.T, ns, pod string) string {
-	t.Helper()
-	return kubectlLogsBestEffort(ns, pod, false)
-}
-
+// kubectlLogsBestEffort returns a Pod's logs across all its containers, best
+// effort: a Pod still creating, or already gone, has none — not a test failure.
 func kubectlLogsBestEffort(ns, pod string, previous bool) string {
-	args := []string{"-n", ns, "logs", pod, "--tail=-1"}
+	args := []string{"-n", ns, "logs", pod, "--all-containers", "--tail=-1"}
 	if previous {
 		args = append(args, "--previous")
 	}
@@ -390,11 +424,23 @@ func kubectlLogsBestEffort(ns, pod string, previous bool) string {
 	return out.String()
 }
 
-// assertNoRaces scans the logs of every Pod with the prefix for the race
-// detector's report and fails if one is present. This is the authoritative
-// race signal: the engine logs it, and GORACE=halt_on_error makes it fatal.
-// Both the current and the previous container logs are scanned, so a race that
-// killed (and restarted) a container is still caught.
+// assertNoRacesForPod scans one Pod's current and previous container logs for
+// the race detector's report and fails if one is present.
+func assertNoRacesForPod(t *testing.T, ns, pod string) {
+	t.Helper()
+	logs := kubectlLogsBestEffort(ns, pod, false) + "\n" + kubectlLogsBestEffort(ns, pod, true)
+	if i := strings.Index(logs, "WARNING: DATA RACE"); i >= 0 {
+		end := i + 2000
+		if end > len(logs) {
+			end = len(logs)
+		}
+		t.Fatalf("data race in %s/%s:\n%s", ns, pod, logs[i:end])
+	}
+}
+
+// assertNoRaces scans every surviving Pod with the prefix for a race. Pods
+// deliberately deleted or scaled away are scanned at their deletion sites
+// (deletePod, scaleWorker) before their logs vanish.
 func assertNoRaces(t *testing.T, ns, prefix string) {
 	t.Helper()
 	out := kubectl(t, "-n", ns, "get", "pods", "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
@@ -403,14 +449,7 @@ func assertNoRaces(t *testing.T, ns, prefix string) {
 		if pod == "" || !strings.HasPrefix(pod, prefix) {
 			continue
 		}
-		logs := kubectlLogsBestEffort(ns, pod, false) + "\n" + kubectlLogsBestEffort(ns, pod, true)
-		if i := strings.Index(logs, "WARNING: DATA RACE"); i >= 0 {
-			end := i + 2000
-			if end > len(logs) {
-				end = len(logs)
-			}
-			t.Fatalf("data race in %s/%s:\n%s", ns, pod, logs[i:end])
-		}
+		assertNoRacesForPod(t, ns, pod)
 	}
 }
 
@@ -487,7 +526,7 @@ func metricValue(t *testing.T, base, metric string) float64 {
 func waitMetricAbove(t *testing.T, base, metric string, want float64, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
-	last := -1.0
+	var last float64
 	for {
 		last = metricValue(t, base, metric)
 		if last > want {
@@ -711,8 +750,14 @@ func startWriter(t *testing.T, db *sql.DB, interval time.Duration) (stop func())
 			time.Sleep(interval)
 		}
 	}()
-	return func() {
-		close(stopCh)
-		<-done
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			close(stopCh)
+			<-done
+		})
 	}
+	// Stop the writer before the test's DB cleanup closes the connection.
+	t.Cleanup(stop)
+	return stop
 }

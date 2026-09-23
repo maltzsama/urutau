@@ -9,6 +9,10 @@ cd "$ROOT"
 
 KUBECTL="${KUBECTL:-kubectl}"
 
-"$KUBECTL" delete cdcpipelines --all -A --ignore-not-found --wait=true
+# Under `set -e`, deleting a CRD-backed resource that does not exist fails the
+# whole teardown; skip it when the CRD was never installed.
+if "$KUBECTL" get crd cdcpipelines.urutau.io >/dev/null 2>&1; then
+  "$KUBECTL" delete cdcpipelines --all -A --ignore-not-found --wait=true
+fi
 "$KUBECTL" delete -k test/e2e/pods/k8s/operator --ignore-not-found
 "$KUBECTL" delete -k test/e2e --ignore-not-found

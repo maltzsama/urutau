@@ -51,6 +51,9 @@ say "fresh in-cluster data services (namespace e2e)"
 
 say "operator ($RACE_IMAGE)"
 "$KUBECTL" apply -k test/e2e/pods/k8s/operator
+# The race image may have been rebuilt since the operator last started; restart
+# so it runs the new one (a plain apply sees no spec change and does not roll).
+"$KUBECTL" -n urutau-system rollout restart deployment/urutau-operator
 "$KUBECTL" -n urutau-system rollout status deployment/urutau-operator --timeout=300s
 
 say "KEDA ($KEDA_VERSION)"
