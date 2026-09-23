@@ -269,13 +269,19 @@ type Coordinator struct {
 	// wakes every waiter, which re-checks its own window's state.
 	gateDrain chan struct{}
 
-	// paused blocks the pump for a table whose re-slice is draining. The
-	// flip waits for the table to owe nothing, which a continuously loaded
-	// table never reaches on its own; pausing the input lets the queue
-	// drain, then the flip, then resume. Keyed by target; the pump checks it
-	// per batch, so only a paused table's batches block.
-	pausedMu sync.Mutex
-	paused   map[string]chan struct{}
+	// paused holds a table whose re-slice is draining. The flip waits for the
+	// table to owe nothing, which a continuously loaded table never reaches on
+	// its own; pausing the input lets the queue drain, then the flip, then
+	// resume. Keyed by target.
+	//
+	// A paused table's batches are BUFFERED (pauseBuf), not left to park the
+	// pump: parking it would stall every other table's batches behind the
+	// paused one in the reader channel (issue #343). resumeTable wakes the
+	// pump to flush them under the new layout, in order.
+	pausedMu  sync.Mutex
+	paused    map[string]chan struct{}
+	pauseBuf  map[string][]*dataplane.Batch
+	pauseWake chan struct{}
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
@@ -399,6 +405,8 @@ func Run(ctx context.Context, cfg Config) error {
 		gateWin:     map[string]gateWindow{},
 		gateBuf:     map[string][]*dataplane.Batch{},
 		paused:      map[string]chan struct{}{},
+		pauseBuf:    map[string][]*dataplane.Batch{},
+		pauseWake:   make(chan struct{}, 1),
 		gateDrain:   make(chan struct{}),
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
@@ -1154,30 +1162,44 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 				c.metrics.EventsDecoded.Inc()
 			}
 			// A re-slice pauses this table so its drain can converge. The
-			// batch is held here (not routed, not counted by the drain) until
+			// batch is BUFFERED (not routed, not counted by the drain) until
 			// the flip, then enqueued under the new layout — so no batch
-			// spans the flip and ordering is preserved.
-			c.waitUnpaused(ctx, b.Table)
+			// spans the flip and ordering is preserved, and the pump keeps
+			// draining the reader for every other table (issue #343).
+			if c.pauseHold(b) {
+				continue
+			}
 			if c.gateHold(ctx, b) {
 				continue
 			}
 			// enqueueBatch takes ownership of b (serializes + releases).
 			if err := c.enqueueBatch(ctx, b, nil); err != nil {
-				c.log.Warn("coordinator: enqueue failed", "err", err)
-				// A pump death is a real failure: the reader stalls behind the
-				// closed out channel and the coordinator stays "alive" doing
-				// nothing (audit #9). Surface it on the terminal plane; on a
-				// cancelled pipeline run's select already owns the exit.
-				if ctx.Err() == nil {
-					select {
-					case c.terminate <- fmt.Errorf("coordinator: pump: %w", err):
-					default:
-					}
-				}
+				c.pumpFail(ctx, err)
+				return
+			}
+		case <-c.pauseWake:
+			// A table resumed: route the batches held during its pause, in
+			// order, under the new layout.
+			if err := c.flushPaused(ctx); err != nil {
+				c.pumpFail(ctx, err)
 				return
 			}
 		case <-ctx.Done():
 			return
+		}
+	}
+}
+
+// pumpFail surfaces a pump failure on the terminal plane: a pump death is a
+// real failure — the reader stalls behind the closed out channel and the
+// coordinator stays "alive" doing nothing (audit #9). On a cancelled pipeline
+// run's select already owns the exit.
+func (c *Coordinator) pumpFail(ctx context.Context, err error) {
+	c.log.Warn("coordinator: enqueue failed", "err", err)
+	if ctx.Err() == nil {
+		select {
+		case c.terminate <- fmt.Errorf("coordinator: pump: %w", err):
+		default:
 		}
 	}
 }

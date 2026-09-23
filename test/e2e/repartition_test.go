@@ -681,3 +681,93 @@ func e2eIcebergCatalog() icebergsink.Config {
 		Scope:        "PRINCIPAL_ROLE:ALL",
 	}
 }
+
+// TestLiveRepartitionMultiTable proves issue #343 end to end: re-slicing one
+// table must not stall the others. A two-table pipeline keeps writing to both
+// while orders is scaled 1→3 — orders is paused for its drain (its batches are
+// buffered, then routed by the new layout on resume), and order_items keeps
+// streaming through the same pump. Both tables must converge to the source
+// exactly: nothing lost or duplicated on either side of the re-slice.
+//
+// Before the fix the pump parked on the paused table's batch, so every other
+// table's batches waited behind it for the whole drain.
+func TestLiveRepartitionMultiTable(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+
+	addr := reserveAddr(t)
+	s := loadPipeline(t)
+	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
+	s.Tables = append(s.Tables, spec.Table{
+		Source:            "shop.order_items",
+		Target:            "raw.order_items",
+		PrimaryKey:        []string{"order_id", "line_no"},
+		CreateIfNotExists: true,
+	})
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	ordersTarget := s.Tables[0].Target
+	ordersBoot := s.Tables[0].WorkerGroupNames(s.Pipeline)
+	itemsBoot := s.Tables[1].WorkerGroupNames(s.Pipeline)
+
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS order_items (
+		order_id BIGINT NOT NULL,
+		line_no  INT    NOT NULL,
+		sku      VARCHAR(64) NOT NULL,
+		qty      INT    NOT NULL,
+		PRIMARY KEY (order_id, line_no))`); err != nil {
+		t.Fatalf("create order_items: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM order_items`); err != nil {
+		t.Fatalf("clear order_items: %v", err)
+	}
+	dropIcebergTable(t, ctx)
+	dropIcebergNamed(t, ctx, "raw.order_items")
+	dropAll(t, db)
+	seedOrders(t, db, 0, 200)
+	for i := 0; i < 100; i++ {
+		dml(t, db, fmt.Sprintf("INSERT INTO order_items (order_id, line_no, sku, qty) VALUES (%d, 1, 'sku%d', %d)", i, i, i%7+1))
+	}
+
+	p := bootScalable(t, ctx, addr, s, append(append([]string{}, ordersBoot...), itemsBoot...)...)
+	defer p.stop()
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(200))
+	waitTrino(t, ctx, `SELECT count(*) FROM order_items`, int64(100))
+	t.Log("both tables converged with 1 partition each")
+
+	const ordersTo, itemsTo = 700, 300
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		for i := 200; i < ordersTo; i++ {
+			dml(t, db, fmt.Sprintf("INSERT INTO orders (id, v, amount) VALUES (%d, 'live%d', %d.0)", i, i, i))
+			if i < itemsTo+100 {
+				dml(t, db, fmt.Sprintf("INSERT INTO order_items (order_id, line_no, sku, qty) VALUES (%d, 1, 'live%d', %d)", i, i, i%7+1))
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	if err := p.coord.ScaleTable(ctx, ordersTarget, 3); err != nil {
+		t.Fatalf("ScaleTable(%s, 3): %v", ordersTarget, err)
+	}
+	t.Log("orders re-sliced to 3 while both tables keep writing")
+
+	scaled := s.Tables[0]
+	scaled.Workers = &spec.WorkerSpec{Number: 3}
+	for _, name := range scaled.WorkerGroupNames(s.Pipeline)[1:] {
+		p.startWorker(name)
+	}
+	<-writeDone
+
+	waitTrino(t, ctx, `SELECT count(*) FROM orders`, int64(ordersTo))
+	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM orders`, ordersTo)
+	waitTrino(t, ctx, `SELECT count(*) FROM order_items`, int64(itemsTo))
+	assertCount(t, ctx, `SELECT count(DISTINCT order_id) FROM order_items`, itemsTo)
+	t.Log("both tables converged after the re-slice: no loss, no duplicate")
+}

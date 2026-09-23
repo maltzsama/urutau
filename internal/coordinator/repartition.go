@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
@@ -70,11 +71,11 @@ func (c *Coordinator) publishRouting(r *routing) {
 	c.routing.Store(r)
 }
 
-// pauseTable stops the pump from routing a table's batches, so a re-slice's
-// drain can converge: a continuously loaded table never owes nothing on its
-// own. The pump blocks on its next batch for the table (holding that batch,
-// which the drain does not count), the queue drains, the flip happens, and
-// resumeTable releases it — routed by the new layout. Idempotent: pausing an
+// pauseTable marks a table whose re-slice is draining, so a re-slice's drain
+// can converge: a continuously loaded table never owes nothing on its own.
+// The pump buffers the table's next batches (pauseHold) instead of parking on
+// them, so the queue drains, the flip happens, and resumeTable flushes the
+// held batches — routed by the new layout. Idempotent: pausing an
 // already-paused table keeps the same resume channel.
 func (c *Coordinator) pauseTable(target string) {
 	c.pausedMu.Lock()
@@ -87,30 +88,66 @@ func (c *Coordinator) pauseTable(target string) {
 	}
 }
 
-// resumeTable releases a table paused by pauseTable.
+// resumeTable releases a table paused by pauseTable and wakes the pump to
+// flush the batches held during the pause.
 func (c *Coordinator) resumeTable(target string) {
 	c.pausedMu.Lock()
-	defer c.pausedMu.Unlock()
 	if ch, ok := c.paused[target]; ok {
 		close(ch)
 		delete(c.paused, target)
 	}
+	c.pausedMu.Unlock()
+	select {
+	case c.pauseWake <- struct{}{}:
+	default: // a wake is already pending; flushPaused drains every resumed table
+	}
 }
 
-// waitUnpaused blocks while target is paused. The pump calls it before
-// routing a batch, so a paused table's events stay upstream (the reader's
-// queue) rather than being lost or reordered.
-func (c *Coordinator) waitUnpaused(ctx context.Context, target string) {
+// pauseHold reports whether b was buffered for a paused table rather than left
+// for the pump to route. A table that is paused, OR that still has held
+// batches awaiting their post-flip flush, buffers: the second condition keeps
+// ordering when a batch for the resumed table arrives before the pump
+// processes the resume wake. Callers must be the pump goroutine — it is the
+// only router, so nothing can be routed between a held batch and the batches
+// that follow it.
+func (c *Coordinator) pauseHold(b *dataplane.Batch) bool {
 	c.pausedMu.Lock()
-	ch, ok := c.paused[target]
+	defer c.pausedMu.Unlock()
+	if c.pauseBuf == nil {
+		c.pauseBuf = map[string][]*dataplane.Batch{}
+	}
+	if _, paused := c.paused[b.Table]; !paused && len(c.pauseBuf[b.Table]) == 0 {
+		return false
+	}
+	c.pauseBuf[b.Table] = append(c.pauseBuf[b.Table], b)
+	return true
+}
+
+// flushPaused routes the batches held for every resumed table, in order, and
+// clears their buffers. A table still paused keeps buffering. It runs on the
+// pump goroutine, so the held batches are routed before any later batch.
+func (c *Coordinator) flushPaused(ctx context.Context) error {
+	c.pausedMu.Lock()
+	held := make(map[string][]*dataplane.Batch)
+	for table, buf := range c.pauseBuf {
+		if len(buf) == 0 {
+			continue
+		}
+		if _, paused := c.paused[table]; paused {
+			continue // still paused: keep buffering
+		}
+		held[table] = buf
+		delete(c.pauseBuf, table)
+	}
 	c.pausedMu.Unlock()
-	if !ok {
-		return
+	for table, batches := range held {
+		for _, b := range batches {
+			if err := c.enqueueBatch(ctx, b, nil); err != nil {
+				return fmt.Errorf("flush held batches for %s: %w", table, err)
+			}
+		}
 	}
-	select {
-	case <-ch:
-	case <-ctx.Done():
-	}
+	return nil
 }
 
 // repartitioner serializes re-slices: two concurrent scale events on the
