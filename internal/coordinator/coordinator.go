@@ -2579,6 +2579,19 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
 	}
 	c.pushDashState() // the worker is no longer attached
+	// A session that ends with context.Canceled — the Pod was deleted, or the
+	// client's stream closed — while the worker still owes batches strands
+	// them: the pump keeps routing to the detached owner until a re-slice
+	// removes it, and no session will ever deliver them, so a re-slice's drain
+	// waits on them forever and the flip never commits (issue #363). The other
+	// terminal paths below already fail the run; this one does not, so fail it
+	// here for a clean replay — the restart replays every partition from the
+	// committed position, recovering the stranded batches. A supervisor reset
+	// (pending) is excluded: that worker reconnects and redelivers.
+	if errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) && c.workerOwes(worker) {
+		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost owing work: %w", worker, retErr)
+		return
+	}
 	// A session cancelled by the coordinator — a supervisor reset or a
 	// re-slice retiring an owner — surfaces as errSessionReset OR, when the
 	// recv goroutine wins the race, as context.Canceled. Neither is a worker
@@ -2589,6 +2602,19 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	} else if c.snapshotActive.Load() {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)
 	}
+}
+
+// workerOwes reports whether a worker still holds undelivered queued batches
+// or delivered-but-unacked in-flight batches — work a re-slice's drain would
+// wait on, and that no detached session can drain.
+func (c *Coordinator) workerOwes(worker string) bool {
+	c.mu.Lock()
+	w := c.workers[worker]
+	c.mu.Unlock()
+	if w == nil {
+		return false
+	}
+	return len(w.queue) > 0 || c.inFlight(worker) > 0
 }
 
 // workerSession is one connected worker's session-local surface; the group's

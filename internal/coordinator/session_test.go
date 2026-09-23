@@ -144,6 +144,48 @@ func TestSignalSessionEndDeathSurfaces(t *testing.T) {
 	}
 }
 
+// Issue #363: a session that ends while the worker still owes batches strands
+// them — the pump keeps routing to the detached owner and nothing drains the
+// queue, so a re-slice's drain waits on them forever and the flip never
+// commits. The run must terminate for a clean replay instead.
+func TestSignalSessionEndOwingWorkTerminates(t *testing.T) {
+	s, workers := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	// supervisorHarness seeds w1 with one undelivered queued batch.
+	if len(workers["w1"].queue) == 0 {
+		t.Fatal("precondition: w1 must owe a queued batch")
+	}
+
+	c.signalSessionEnd("w1", context.Canceled)
+
+	select {
+	case err := <-c.sessionErrs:
+		if err == nil || !strings.Contains(err.Error(), "owing work") {
+			t.Fatalf("err = %v, want a session-lost-owing-work error", err)
+		}
+	default:
+		t.Fatal("a session lost while owing work must fail the run for a clean replay")
+	}
+}
+
+// The control: a session that ends with nothing owed (a clean scale-in retire,
+// or a drained worker) must not fail the run.
+func TestSignalSessionEndNothingOwedIsSilent(t *testing.T) {
+	s, workers := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	<-workers["w1"].queue // drain the seeded batch: nothing owed
+
+	c.signalSessionEnd("w1", context.Canceled)
+
+	select {
+	case err := <-c.sessionErrs:
+		t.Fatalf("a session ending with nothing owed must not fail the run, got %v", err)
+	default:
+	}
+}
+
 var errWorkerDead = errors.New("stream died")
 
 // opaquePos is an identity-only position (plugin offset cookie): different
