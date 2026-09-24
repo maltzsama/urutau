@@ -484,20 +484,31 @@ var (
 // again for the same local port replaces the previous forward.
 func portForward(t *testing.T, ns, resource string, local, remote int) {
 	t.Helper()
+	if err := startPortForward(t, ns, resource, local, remote, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// startPortForward is portForward returning its failure instead of failing the
+// test, so a caller that polls through a Pod restart can retry within its own
+// deadline. The forward must accept a connection within wait; on failure the
+// kubectl process is stopped.
+func startPortForward(t *testing.T, ns, resource string, local, remote int, wait time.Duration) error {
+	t.Helper()
 	releasePort(local)
 	ctx, cancel := context.WithCancel(context.Background())
 	st := &forwardState{cancel: cancel}
-	forwardMu.Lock()
-	forwardStates[local] = st
-	forwardMu.Unlock()
 	cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "port-forward", resource,
 		fmt.Sprintf("%d:%d", local, remote))
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Start(); err != nil {
 		cancel()
-		t.Fatalf("port-forward %s %d:%d: %v", resource, local, remote, err)
+		return fmt.Errorf("port-forward %s %d:%d: %w", resource, local, remote, err)
 	}
-	t.Cleanup(func() {
+	forwardMu.Lock()
+	forwardStates[local] = st
+	forwardMu.Unlock()
+	stop := func() {
 		forwardMu.Lock()
 		if forwardStates[local] == st {
 			delete(forwardStates, local)
@@ -505,17 +516,19 @@ func portForward(t *testing.T, ns, resource string, local, remote int) {
 		forwardMu.Unlock()
 		cancel()
 		_ = cmd.Wait()
-	})
-	deadline := time.Now().Add(30 * time.Second)
+	}
+	deadline := time.Now().Add(wait)
 	addr := fmt.Sprintf("127.0.0.1:%d", local)
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
-			return
+			t.Cleanup(stop)
+			return nil
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("port-forward %s: %s never came up: %v", resource, addr, err)
+			stop()
+			return fmt.Errorf("port-forward %s: %s never came up within %s: %w", resource, addr, wait, err)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -547,9 +560,14 @@ func releasePort(local int) {
 // returns the base URL. Call once per test (the local port is fixed).
 func coordinatorMetricsBase(t *testing.T, ns, coordPod string) string {
 	t.Helper()
-	portForward(t, ns, "pod/"+coordPod, 19091, 8080)
-	return "http://127.0.0.1:19091"
+	portForward(t, ns, "pod/"+coordPod, coordinatorMetricsPort, 8080)
+	return coordinatorMetricsURL
 }
+
+const (
+	coordinatorMetricsPort = 19091
+	coordinatorMetricsURL  = "http://127.0.0.1:19091"
+)
 
 // statuszWorkerNames fetches /statusz and returns the coordinator's registered
 // worker names — the owner layout the re-slice mutates, which the source/sink
@@ -585,31 +603,40 @@ func statuszWorkerNames(base string) ([]string, error) {
 // re-slice drops the metrics port-forward, so it re-forwards on read errors.
 func waitOwnerCount(t *testing.T, ns, coordPod, sts string, want int, timeout time.Duration) {
 	t.Helper()
-	base := coordinatorMetricsBase(t, ns, coordPod)
 	deadline := time.Now().Add(timeout)
-	var got int
+	forwarded := false
+	got := -1
+	var lastErr error
 	for {
-		names, err := statuszWorkerNames(base)
-		if err != nil {
-			t.Logf("statusz read failed (re-forwarding): %v", err)
-			base = coordinatorMetricsBase(t, ns, coordPod)
-			if time.Now().After(deadline) {
-				t.Fatalf("coordinator /statusz unreachable for %s within %s: %v", sts, timeout, err)
-			}
-			time.Sleep(time.Second)
-			continue
-		}
-		got = 0
-		for _, n := range names {
-			if strings.HasPrefix(n, sts+"-") {
-				got++
+		if !forwarded {
+			wait := min(time.Until(deadline), 30*time.Second)
+			if err := startPortForward(t, ns, "pod/"+coordPod, coordinatorMetricsPort, 8080, wait); err != nil {
+				lastErr = err
+				t.Logf("coordinator metrics forward failed (retrying): %v", err)
+			} else {
+				forwarded = true
 			}
 		}
-		if got == want {
-			return
+		if forwarded {
+			names, err := statuszWorkerNames(coordinatorMetricsURL)
+			if err != nil {
+				lastErr = err
+				forwarded = false // the coordinator restarted under the fault: re-forward
+				t.Logf("statusz read failed (re-forwarding): %v", err)
+			} else {
+				got = 0
+				for _, n := range names {
+					if strings.HasPrefix(n, sts+"-") {
+						got++
+					}
+				}
+				if got == want {
+					return
+				}
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("coordinator owner count for %s = %d, want %d within %s", sts, got, want, timeout)
+			t.Fatalf("coordinator owner count for %s = %d, want %d within %s (last error: %v)", sts, got, want, timeout, lastErr)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
