@@ -391,7 +391,7 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		pending := 0
+		inflight, queued := 0, 0
 		// In-flight batches first. positionIndex frees a worker's queue
 		// strictly from the head, in send order, and a batch leaves only
 		// when the table's acked position covers it. After a flip the owner
@@ -400,13 +400,18 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 		// acking, the supervisor calls it stale, and the reset discards its
 		// open staged cycles — silently losing the rows they carried.
 		for _, w := range owners {
-			pending += c.inFlight(w.name) + len(w.queue)
+			inflight += c.inFlight(w.name)
+			queued += len(w.queue)
 		}
 		// Then the staged cycles, which must commit as one unit and so must
 		// not span two layouts.
+		cycles := 0
+		cyclesOpen, cyclesDone := 0, 0
 		if c.stagesCycles() {
-			pending += c.staged.openFor(core.TableRef{Target: target})
+			cyclesOpen, cyclesDone = c.staged.openForBreakdown(core.TableRef{Target: target})
+			cycles = cyclesOpen + cyclesDone
 		}
+		pending := inflight + queued + cycles
 		if pending == 0 {
 			return nil
 		}
@@ -414,7 +419,8 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s", pending, c.drainTimeout())
+			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s (in-flight=%d queued=%d staged-cycles=%d open=%d done=%d)",
+				pending, c.drainTimeout(), inflight, queued, cycles, cyclesOpen, cyclesDone)
 		case <-tick.C:
 		}
 	}

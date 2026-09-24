@@ -185,21 +185,29 @@ func (s *stagedCycles) discardWorker(worker string) int {
 // order (done). A re-slice waits for this to reach zero, so no cycle spans
 // two partition layouts.
 func (s *stagedCycles) openFor(ref core.TableRef) int {
+	open, done := s.openForBreakdown(ref)
+	return open + done
+}
+
+// openForBreakdown splits openFor's count: cycles still accumulating a
+// delivery, and cycles complete but blocked behind an earlier open cycle in
+// send order. The split names the stall — an open head cycle wedges every
+// complete cycle behind it.
+func (s *stagedCycles) openForBreakdown(ref core.TableRef) (open, done int) {
 	if s == nil {
-		return 0
+		return 0, 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n := 0
 	for k := range s.open {
 		if k.table == ref.Target {
-			n++
+			open++
 		}
 	}
 	for k := range s.done {
 		if k.table == ref.Target {
-			n++
+			done++
 		}
 	}
-	return n
+	return open, done
 }
