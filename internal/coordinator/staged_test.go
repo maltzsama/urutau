@@ -109,21 +109,25 @@ func TestStagedCyclesDiscardWorkerDropsAffectedTable(t *testing.T) {
 	s := newStagedCycles()
 	r := ref(t, "orders")
 	// Cycle 1 needs worker "a"; cycle 2 needs "b". Cycle 2 arrives first and
-	// waits. Worker "a" dies owing cycle 1: cycle 1 is discarded, and cycle 2
-	// — though complete and owned only by "b" — sits BEHIND cycle 1 in send
-	// order, so committing it would advance the position over cycle 1's gap
-	// and cycle 1's data would never be replayed. Both are discarded.
+	// waits. Worker "a" dies owing cycle 1: only cycle 1 is discarded. Cycle 2
+	// — owned only by "b", which is still alive — can still complete and must
+	// not be discarded (issue #372: the old code dropped it, losing rows a live
+	// owner had staged). The table is marked gapped so nothing commits over
+	// cycle 1's gap until a clean replay.
 	s.expect(r, 1, []string{"a"})
 	s.expect(r, 2, []string{"b"})
 
 	if got := s.deliver(r, 2, []byte("2"), "200", "", nil); got != nil {
 		t.Fatalf("cycle 2 committed before cycle 1: %v", got)
 	}
-	if n := s.discardWorker("a"); n != 2 {
-		t.Fatalf("discarded %d cycles, want 2 (the owed cycle and the one behind it)", n)
+	if n := s.discardWorker("a"); n != 1 {
+		t.Fatalf("discarded %d cycles, want 1 (only the cycle owed to the dead worker)", n)
 	}
-	if s.len() != 0 {
-		t.Fatalf("%d cycles tracked after the discard, want 0", s.len())
+	if !s.isGapped("orders") {
+		t.Fatal("the affected table must be marked gapped")
+	}
+	if s.len() != 1 {
+		t.Fatalf("%d cycles tracked after the discard, want 1 (cycle 2 survives)", s.len())
 	}
 }
 

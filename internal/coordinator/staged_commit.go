@@ -97,6 +97,7 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {
 		return fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err)
 	}
+	c.log.Info("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos, "owners", len(cy.owners), "descriptors", len(cy.descriptors))
 	// The cycle is durable: only now may source retention advance. Record the
 	// cycle's position for every owner it covered, so confirmedPosition (the
 	// min) reflects the whole cycle — the worker's per-batch ack does not

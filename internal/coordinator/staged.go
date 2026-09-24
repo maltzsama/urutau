@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/maltzsama/urutau/core"
@@ -75,6 +76,34 @@ func (s *stagedCycles) isGapped(target string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gapped[target]
+}
+
+// debugOpen renders a table's open and done cycles in send order, with their
+// delivery positions and expected owners — a wedge diagnostic (issue #372).
+func (s *stagedCycles) debugOpen(target string) []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.order[target]))
+	for _, seq := range s.order[target] {
+		k := cycleKey{target, seq}
+		if cy, ok := s.open[k]; ok {
+			out = append(out, fmt.Sprintf("%d:open@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
+		} else if cy, ok := s.done[k]; ok {
+			out = append(out, fmt.Sprintf("%d:done@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
+		}
+	}
+	return out
+}
+
+func ownerNames(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for name := range m {
+		out = append(out, name)
+	}
+	return out
 }
 
 // expect records that a delivery is expected from each of owners for
@@ -159,16 +188,17 @@ func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
 	return out
 }
 
-// discardWorker drops every cycle that needed a delivery from worker — on
-// session loss those cycles can never complete, and an incomplete cycle must
-// never be committed — and then every remaining cycle of each affected table.
-// A cycle still queued for that table sits BEHIND the discarded one in send
-// order: committing it would advance the durable position over the discarded
-// cycle's gap, and that gap's data would never be replayed. Returns the
-// number discarded, for logging.
+// discardWorker drops every cycle that still needed a delivery from worker —
+// on session loss those cycles can never complete, and an incomplete cycle must
+// never be committed. Cycles owned only by other workers are LEFT ALONE: they
+// can still complete (issue #372 — the old code discarded every cycle of the
+// affected table, losing rows a live owner had already staged). The table is
+// marked gapped instead, so onStagedBatch refuses to commit a cycle over the
+// discarded gap and the run terminates for a clean replay. Returns the number
+// discarded, for logging.
 //
-// A worker that owed nothing (the safe-reset case) leaves no open cycle
-// here, so an affected table never arises and nothing is discarded.
+// A worker that owed nothing (the safe-reset case) leaves no open cycle here,
+// so an affected table never arises and nothing is discarded.
 func (s *stagedCycles) discardWorker(worker string) int {
 	if s == nil {
 		return 0
@@ -191,20 +221,7 @@ func (s *stagedCycles) discardWorker(worker string) int {
 			discarded++
 		}
 	}
-	for k := range s.open {
-		if tables[k.table] {
-			delete(s.open, k)
-			discarded++
-		}
-	}
-	for k := range s.done {
-		if tables[k.table] {
-			delete(s.done, k)
-			discarded++
-		}
-	}
 	for table := range tables {
-		delete(s.order, table)
 		s.gapped[table] = true
 	}
 	return discarded
