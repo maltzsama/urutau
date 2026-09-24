@@ -2,10 +2,13 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow/flight"
 
 	"github.com/maltzsama/urutau/core"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -425,4 +428,37 @@ func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
 	if still {
 		t.Fatal("a retired owner must be detached even when the context is cancelled")
 	}
+}
+
+// A re-slice registers owners (writing byTicket) while a worker opens or
+// reopens its Flight DoGet (reading byTicket): the lookup must hold c.mu, or
+// the concurrent map access races and, without -race, can panic.
+func TestDoGetTicketLookupDoesNotRaceRegisterOwner(t *testing.T) {
+	c, _ := scaleHarness(t)
+	ref, ok := c.tableRef("raw.orders")
+	if !ok {
+		ref = source.TableRef{Source: "shop.orders", Target: "raw.orders"}
+	}
+	srv := &flightServer{c: c}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		stream := &fakeDoGetStream{ctx: context.Background()}
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = srv.DoGet(&flight.Ticket{Ticket: []byte("no-such-ticket")}, stream)
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		if _, _, err := c.registerOwner(fmt.Sprintf("owner-%d", i), ref); err != nil {
+			t.Fatalf("registerOwner: %v", err)
+		}
+	}
+	close(stop)
+	<-done
 }

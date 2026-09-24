@@ -2676,6 +2676,16 @@ func (c *Coordinator) ownerDetached(w *workerState) bool {
 	return w.hadSession && !w.attached
 }
 
+// workerByTicket looks up a worker by its Flight ticket under c.mu: a
+// re-slice's registerOwner writes byTicket while a worker opens or reopens
+// its DoGet, and an unlocked read races that write (issue #372).
+func (c *Coordinator) workerByTicket(ticket string) (*workerState, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w, ok := c.byTicket[ticket]
+	return w, ok
+}
+
 // workerRefs returns the table refs a worker owns, or nil if it is unknown.
 func (c *Coordinator) workerRefs(worker string) []source.TableRef {
 	c.mu.Lock()
@@ -2771,7 +2781,7 @@ type flightServer struct {
 // sent list is in send order, ahead of the queue's head, and the budget charge
 // is released only by the Ack that truncates past the batch.
 func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoGetServer) error {
-	w, ok := s.c.byTicket[string(req.Ticket)]
+	w, ok := s.c.workerByTicket(string(req.Ticket))
 	if !ok {
 		return fmt.Errorf("coordinator: unknown flight ticket %q", string(req.Ticket))
 	}
