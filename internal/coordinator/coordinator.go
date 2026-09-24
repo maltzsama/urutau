@@ -905,24 +905,24 @@ func (c *Coordinator) run(ctx context.Context) error {
 	select {
 	case err := <-snapDone:
 		if err != nil {
-			c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "snapshot"})
+			c.emitLog(eventlog.KindJobStopped, terminalFields("snapshot", err))
 			return err
 		}
 	case <-ctx.Done():
 		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "shutdown"})
+		c.emitLog(eventlog.KindJobStopped, terminalFields("shutdown", ctx.Err()))
 		return ctx.Err()
 	case err := <-c.sessionErrs:
 		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "session"})
+		c.emitLog(eventlog.KindJobStopped, terminalFields("session", err))
 		return fmt.Errorf("coordinator: worker session: %w", err)
 	case err := <-streamErr:
 		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "stream"})
+		c.emitLog(eventlog.KindJobStopped, terminalFields("stream", err))
 		return fmt.Errorf("coordinator: stream: %w", err)
 	case err := <-c.terminate:
 		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": terminateReason(err)})
+		c.emitLog(eventlog.KindJobTerminated, terminalFields(terminateReason(err), err))
 		return err
 	}
 
@@ -945,25 +945,25 @@ func (c *Coordinator) run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "shutdown"})
+			c.emitLog(eventlog.KindJobStopped, terminalFields("shutdown", ctx.Err()))
 			return ctx.Err()
 		case err := <-c.terminate:
 			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobTerminated, map[string]any{"reason": terminateReason(err)})
+			c.emitLog(eventlog.KindJobTerminated, terminalFields(terminateReason(err), err))
 			return err
 		case err := <-streamErr:
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "stream"})
+			c.emitLog(eventlog.KindJobStopped, terminalFields("stream", err))
 			return fmt.Errorf("coordinator: stream: %w", err)
 		case err := <-c.sessionErrs:
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobStopped, map[string]any{"reason": "session"})
+			c.emitLog(eventlog.KindJobStopped, terminalFields("session", err))
 			return fmt.Errorf("coordinator: worker session: %w", err)
 		}
 	}
@@ -1045,6 +1045,17 @@ func (c *Coordinator) emitLog(kind string, fields map[string]any) {
 	if err := c.emit(kind, fields); err != nil {
 		c.log.Warn("coordinator: eventlog emit", "kind", kind, "err", err)
 	}
+}
+
+// terminalFields builds a job_stopped / job_terminated event's fields: the
+// coarse reason code plus the underlying error text, so a postmortem has more
+// than "reason": "crashloop" to go on (issue #351). err may be nil.
+func terminalFields(reason string, err error) map[string]any {
+	f := map[string]any{"reason": reason}
+	if err != nil {
+		f["error"] = err.Error()
+	}
+	return f
 }
 
 // statusz renders the live coordinator state for /statusz (design §13.4).

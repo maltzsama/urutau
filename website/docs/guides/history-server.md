@@ -53,8 +53,8 @@ API below (no streaming — a terminated run has nothing to push).
 | Route | Returns |
 | --- | --- |
 | `GET /api/v1/pipelines` | `{"pipelines":[{"name":"shop"}]}` |
-| `GET /api/v1/pipelines/{name}/runs` | `{"runs":[{"id":"…","started":"…"}]}` |
-| `GET /api/v1/pipelines/{name}/runs/{runId}/events?cursor=…` | `{"events":[…],"nextCursor":"…"}` |
+| `GET /api/v1/pipelines/{name}/runs` | `{"runs":[{"id":"…","started":"…","outcome":"succeeded"}]}` |
+| `GET /api/v1/pipelines/{name}/runs/{runId}/events?cursor=…` | `{"events":[…],"nextCursor":"…","outcome":"succeeded"}` |
 
 Events are paginated: pass the returned `nextCursor` to fetch the next page
 (`--page-limit` sets the page size, default 1000). Each event is
@@ -63,6 +63,14 @@ free-form payload (a `commit` event's table, a `worker_reset` event's reason,
 and so on). The response also carries the trail's completeness signals
 (`sealed`, `emitted`, `dropped`, `missing`); the SPA flags a run whose trail is
 incomplete rather than rendering it as clean.
+
+The **outcome** (`succeeded` | `failed` | `cancelled` | `unknown`) classifies
+how the run ended, from the last terminal `job_stopped`/`job_terminated` event
+in its trail. It is independent of the completeness signals — a sealed run can
+still have `failed`, and an unsealed run's outcome is `unknown` (the trail was
+truncated before a terminal marker). The terminal event carries the underlying
+error text in its `error` field, so a postmortem has more than the coarse
+`reason` code.
 
 A sealed run is immutable, so its decoded trail is cached in memory
 (`--retained-runs`, default 32, least-recently-used): the first request reads

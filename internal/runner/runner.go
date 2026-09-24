@@ -1059,8 +1059,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		if errors.Is(err, context.Canceled) {
 			reason = "cancelled"
 		}
-		_ = r.ev.Emit(context.Background(), eventlog.KindJobStopped,
-			map[string]any{"reason": reason})
+		fields := map[string]any{"reason": reason}
+		if err != nil {
+			fields["error"] = err.Error() // the underlying error text (issue #351)
+		}
+		_ = r.ev.Emit(context.Background(), eventlog.KindJobStopped, fields)
 		_ = r.ev.Close()
 	}
 	if r.rdr != nil {
