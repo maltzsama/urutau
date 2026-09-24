@@ -27,7 +27,18 @@ func TestPodSmoke(t *testing.T) {
 	applyPipeline(t, testNS, "pod-smoke", cr)
 	t.Log("CDCPipeline applied; waiting for the coordinator and worker Pods")
 
-	waitPodsByPrefix(t, testNS, "pod-smoke-", 2, 4*time.Minute)
+	// waitPodsByPrefix matches an ordinal Pod name (prefix + integer), which
+	// the bare pipeline prefix "pod-smoke-" never is for either the
+	// coordinator (…-coordinator-0) or the worker (…-raw-…-0): trimming it
+	// leaves "coordinator-0"/"raw-…-0", neither a valid integer, so this
+	// always waited out its own timeout even with both Pods Ready. Wait per
+	// StatefulSet instead, the pattern every other pod e2e test uses.
+	waitPodsByPrefix(t, testNS, "pod-smoke-coordinator-", 1, 4*time.Minute)
+	stss := workerSTSs(t, testNS, "pod-smoke")
+	if len(stss) != 1 {
+		t.Fatalf("want 1 worker StatefulSet, got %v", stss)
+	}
+	waitPodsByPrefix(t, testNS, stss[0]+"-", 1, 4*time.Minute)
 	t.Log("coordinator + worker Pods Ready")
 
 	waitConverged(t, ctx, trino, "SELECT count(*) FROM "+target, 50, 4*time.Minute)
