@@ -342,7 +342,7 @@ type workerState struct {
 	// a worker that simply never attached yet (issue #372).
 	hadSession bool
 	epoch      uint64 // last accepted epoch (guards stale Hellos)
-	cancel   context.CancelFunc
+	cancel     context.CancelFunc
 
 	// sent holds the batches popped from the queue and delivered (or whose
 	// Send was attempted) but not yet acked, in send order. On session loss
@@ -1730,9 +1730,11 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// and has not been retired by a re-slice yet can never drain a batch
 	// routed to it: the batch strands, and other partitions' cycles advance
 	// the durable position over the gap. Fail for a clean replay instead of
-	// routing into the void (issue #372).
+	// routing into the void (issue #372). A supervisor reset is excluded: it
+	// is detached only between the reset and the reconnect, and its queue
+	// survives, so the batch is delivered on reconnect rather than stranded.
 	for _, w := range owners {
-		if c.ownerDetached(w) {
+		if c.ownerDetached(w) && !c.supervisor.isPending(w.name) {
 			return fmt.Errorf("coordinator: owner %s of %s is detached; terminating for a clean replay", w.name, meta.Table)
 		}
 	}
@@ -2625,18 +2627,18 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 		}
 	}
 	c.pushDashState() // the worker is no longer attached
+	// A worker whose open staged cycles were just discarded (discarded > 0)
+	// lost rows — they were delivered to a cycle that can never complete — and
+	// discardWorker leaves a hole in the table's send order that drainLocked
+	// cannot pass, so a re-slice's drain waits until it times out (issue #372).
 	// A session that ends with context.Canceled — the Pod was deleted, or the
-	// client's stream closed — while the worker still owes batches strands
-	// them: the pump keeps routing to the detached owner until a re-slice
-	// removes it, and no session will ever deliver them, so a re-slice's drain
-	// waits on them forever and the flip never commits (issue #363). A worker
-	// whose open staged cycles were just discarded (discarded > 0) lost rows
-	// the same way — they were delivered to a cycle that can never complete —
-	// so a run that merely re-slices on would advance the durable position over
-	// that gap and drop them for good (issue #372). Both strand work that only
-	// a clean replay recovers, so fail the run for one. A supervisor reset
-	// (pending) is excluded: that worker reconnects and redelivers.
-	if errors.Is(retErr, context.Canceled) && !pending && (c.workerOwes(worker) || discarded > 0) {
+	// client's stream closed — while the worker still owes batches strands them
+	// the same way: the pump keeps routing to the detached owner, no session
+	// will ever deliver them, and the flip never commits (issue #363). Both
+	// strand work that only a clean replay recovers, so fail the run for either
+	// — a discarded cycle regardless of the reset error type. A supervisor
+	// reset (pending) is excluded: that worker reconnects and redelivers.
+	if !pending && (discarded > 0 || (errors.Is(retErr, context.Canceled) && c.workerOwes(worker))) {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost owing work: %w", worker, retErr)
 		return
 	}

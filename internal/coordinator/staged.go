@@ -55,19 +55,6 @@ func newStagedCycles() *stagedCycles {
 	}
 }
 
-// markGapped marks each table as having a gap: its staged cycles were dropped
-// when an owner was lost, so the durable position must not advance over them.
-func (s *stagedCycles) markGapped(targets []string) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, t := range targets {
-		s.gapped[t] = true
-	}
-}
-
 // isGapped reports whether the table has a gap from a lost owner.
 func (s *stagedCycles) isGapped(target string) bool {
 	if s == nil {
