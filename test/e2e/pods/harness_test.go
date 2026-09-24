@@ -465,6 +465,26 @@ func assertNoRaces(t *testing.T, ns, prefix string) {
 	}
 }
 
+// dumpLogsOnFailure dumps the logs of every Pod with the prefix when the test
+// fails, so a stalled scenario is diagnosable from the test output alone.
+func dumpLogsOnFailure(t *testing.T, ns, prefix string) {
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		out := kubectlStdin(t, "", "-n", ns, "get", "pods", "-o",
+			`jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`)
+		for _, line := range strings.Split(out, "\n") {
+			pod := strings.TrimSpace(line)
+			if pod == "" || !strings.HasPrefix(pod, prefix) {
+				continue
+			}
+			t.Logf("=== %s/%s (current) ===\n%s", ns, pod, kubectlLogsBestEffort(ns, pod, false))
+			t.Logf("=== %s/%s (previous) ===\n%s", ns, pod, kubectlLogsBestEffort(ns, pod, true))
+		}
+	})
+}
+
 // ── data services (port-forward + drivers) ──────────────────────────────
 
 // portForward starts a kubectl port-forward and waits until the local port

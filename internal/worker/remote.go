@@ -461,6 +461,13 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		parsePos:  parsePos,
 		pkByTable: pkByTable,
 		log:       cfg.Logger,
+		ack: func(table, pos string) {
+			_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
+				Table:    table,
+				Epoch:    assign.Epoch,
+				Position: pos,
+			}}})
+		},
 	}
 
 	// Chunk work is serialized: the coordinator sends one ChunkRequest at a
@@ -637,6 +644,12 @@ type batchReceiver struct {
 	parsePos  func(string) (position.Position, error)
 	pkByTable map[string][]string // target table → primary key columns
 	log       *slog.Logger
+	// ack reports a batch as durably applied when the worker skips it as
+	// already covered by its committed position. The coordinator still counts
+	// such a batch as in-flight until it is acked; skipping without acking
+	// leaks the in-flight forever and the supervisor terminates the run for a
+	// "stalled" worker (issue #372).
+	ack func(table, pos string)
 }
 
 // sendIngest delivers one change into the pipeline, aborting when the
@@ -670,6 +683,24 @@ func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
 	return c != position.Incomparable && c <= 0
 }
 
+// skipCovered reports whether meta is at or before the table's committed
+// position, and, when so, acks it so the coordinator clears the batch from its
+// in-flight window. The coordinator counts a delivered batch as in-flight until
+// acked; skipping without acking leaks that in-flight forever, the supervisor
+// sees a "stalled" worker and terminates the run for a clean replay, which
+// redelivers the same batch and crashloops (issue #372). Acking a covered batch
+// is safe: it is at or before the position the worker has durably committed.
+func (r *batchReceiver) skipCovered(meta *pb.BatchMeta) bool {
+	if !r.covered(meta) {
+		return false
+	}
+	r.log.Info("worker skip covered batch", "table", meta.Table, "high", meta.HighPos)
+	if r.ack != nil {
+		r.ack(meta.Table, meta.HighPos)
+	}
+	return true
+}
+
 // apply routes one Flight batch: the demux. It builds a *dataplane.Batch
 // from the IPC record and routes by BatchMeta (four-readers rule: routing
 // tags live in app_metadata, consumed here, never on the record). Snapshot
@@ -696,9 +727,8 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		return fmt.Errorf("worker: unmarshal batch meta: %w", err)
 	}
 
-	if r.covered(meta) {
+	if r.skipCovered(meta) {
 		rec.Release()
-		r.log.Info("worker skip covered batch", "table", meta.Table, "high", meta.HighPos)
 		return nil
 	}
 
