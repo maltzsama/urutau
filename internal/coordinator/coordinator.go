@@ -505,12 +505,16 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	c.src = src
-	qsrc, ok := src.(source.QuerySource)
-	if !ok {
-		return fmt.Errorf("coordinator: source %q has no SQL query surface", c.cfg.Spec.Source.Kind)
+	// QuerySource is optional: it backs NewChunker, the snapshot/re-slice
+	// chunking surface, which only a relational, snapshot-capable source
+	// (Capabilities.Snapshot or ChunkQuery) ever calls. A source with
+	// neither, like Kafka, has no SQL query connection at all (kafka.Source's
+	// own doc comment) and must boot with c.qsrc == nil; every call site
+	// gates on the source's capabilities before touching it (issue #394).
+	if qsrc, ok := src.(source.QuerySource); ok {
+		c.qsrc = qsrc
+		defer func() { _ = qsrc.CloseQuery() }()
 	}
-	c.qsrc = qsrc
-	defer func() { _ = qsrc.CloseQuery() }()
 	// The parallel-chunk setting may not exceed the ceiling the source
 	// driver declares — fail fast at boot, not mid-snapshot.
 	if err := driver.ValidateParallelism(c.cfg.Spec.Source.Kind, c.cfg.MaxParallelChunks); err != nil {
@@ -2405,8 +2409,19 @@ func coreCastOf(tbl spec.Table) (core.CastPolicy, error) {
 }
 
 // resumeFrom reads cdc.position per target table; the minimum across tables
-// is the resume point, tables without one need the snapshot.
+// is the resume point, tables without one need the snapshot — unless the
+// source cannot snapshot at all (Kafka: Capabilities.Snapshot is false),
+// in which case a table with no committed position simply starts streaming
+// from the source's default, matching the collapsed runner's "skip when the
+// source does not support snapshot" guard (internal/runner/runner.go). The
+// coordinator has no equivalent guard otherwise: a fresh Kafka table would be
+// routed into the snapshot phase and dereference the nil c.qsrc a
+// non-snapshotting source boots without (issue #394).
 func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (position.Position, []source.TableRef, error) {
+	caps, err := driver.CapsForKind(c.cfg.Spec.Source.Kind)
+	if err != nil {
+		return nil, nil, fmt.Errorf("coordinator: %w", err)
+	}
 	var positions []position.Position
 	var needsSnapshot []source.TableRef
 	byTarget := make(map[string]position.Position, len(refs))
@@ -2426,7 +2441,7 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 			}
 			positions = append(positions, p)
 			byTarget[ref.Target] = p
-		} else {
+		} else if caps.Snapshot {
 			needsSnapshot = append(needsSnapshot, ref)
 		}
 	}
