@@ -1,0 +1,88 @@
+# Redpanda: a Kafka-API broker — the in-cluster twin of
+# docker-compose.kafka.yml's `redpanda` service, minus its schema registry.
+# Single node, no persistent volume (the e2e data services are all
+# stateless), auto-create-topics on so the source's ConsumeTopics needs no
+# pre-provisioning step.
+#
+# The schema registry is deliberately NOT enabled here: on a fresh
+# single-node cluster its internal bootstrap client dials a hardcoded
+# 0.0.0.0:9092 rather than this broker's own listener and never comes up
+# (observed: "Schema registry failed to initialize: broker_error
+# broker_not_available", looping forever, readinessProbe never green). It is
+# only needed for format: avro, which no in-cluster e2e uses yet — #391-#394's
+# baseline shape is format: raw (no envelope, no registry). Re-add
+# --schema-registry-addr (and its probe) if an avro e2e is added later, and
+# fix the bootstrap ordering then rather than carry a broken health check now.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redpanda
+  labels:
+    app: redpanda
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v24.2.18
+          args:
+            - redpanda
+            - start
+            - --smp=1
+            - --memory=512M
+            - --overprovisioned
+            - --node-id=0
+            - --kafka-addr=PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+            # The FQDN, not the bare Service name: a Kafka client resolves the
+            # ADVERTISED address after its initial bootstrap, and the pipeline
+            # (secrets.source uri) runs in a DIFFERENT namespace (pod-e2e) —
+            # a bare "redpanda" only resolves inside this Pod's own namespace
+            # search path (mirrors mysql.yaml's cross-namespace access, which
+            # needs no advertise address because MySQL is not a two-hop
+            # bootstrap-then-reconnect protocol).
+            - --advertise-kafka-addr=PLAINTEXT://redpanda.e2e.svc.cluster.local:9092,OUTSIDE://127.0.0.1:19092
+            - --check=false
+            - --set
+            - redpanda.auto_create_topics_enabled=true
+          ports:
+            - containerPort: 9092
+            - containerPort: 19092
+          readinessProbe:
+            exec:
+              # rpk speaks the Kafka API itself (no HTTP endpoint without the
+              # schema registry): a successful topic list means the broker is
+              # actually serving metadata, not just that the process started.
+              command: ["rpk", "topic", "list", "--brokers=127.0.0.1:9092"]
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+spec:
+  selector:
+    app: redpanda
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: 9092
+    - name: kafka-outside
+      port: 19092
+      targetPort: 19092
