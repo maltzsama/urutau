@@ -468,11 +468,28 @@ func assertNoRaces(t *testing.T, ns, prefix string) {
 
 // ── data services (port-forward + drivers) ──────────────────────────────
 
+// forwardStates tracks the running port-forward per local port, so a re-forward
+// after the target Pod restarted mid-test (a coordinator run restart drops the
+// old connection) releases the port before rebinding instead of colliding with
+// its dead predecessor.
+type forwardState struct{ cancel context.CancelFunc }
+
+var (
+	forwardMu     sync.Mutex
+	forwardStates = map[int]*forwardState{}
+)
+
 // portForward starts a kubectl port-forward and waits until the local port
-// accepts a connection. The process is killed when the test ends.
+// accepts a connection. The process is killed when the test ends. Calling it
+// again for the same local port replaces the previous forward.
 func portForward(t *testing.T, ns, resource string, local, remote int) {
 	t.Helper()
+	releasePort(local)
 	ctx, cancel := context.WithCancel(context.Background())
+	st := &forwardState{cancel: cancel}
+	forwardMu.Lock()
+	forwardStates[local] = st
+	forwardMu.Unlock()
 	cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "port-forward", resource,
 		fmt.Sprintf("%d:%d", local, remote))
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
@@ -481,6 +498,11 @@ func portForward(t *testing.T, ns, resource string, local, remote int) {
 		t.Fatalf("port-forward %s %d:%d: %v", resource, local, remote, err)
 	}
 	t.Cleanup(func() {
+		forwardMu.Lock()
+		if forwardStates[local] == st {
+			delete(forwardStates, local)
+		}
+		forwardMu.Unlock()
 		cancel()
 		_ = cmd.Wait()
 	})
@@ -499,6 +521,28 @@ func portForward(t *testing.T, ns, resource string, local, remote int) {
 	}
 }
 
+// releasePort cancels any forward on local and waits for the port to free, so a
+// replacement forward can bind it.
+func releasePort(local int) {
+	forwardMu.Lock()
+	st := forwardStates[local]
+	delete(forwardStates, local)
+	forwardMu.Unlock()
+	if st == nil {
+		return
+	}
+	st.cancel()
+	addr := fmt.Sprintf("127.0.0.1:%d", local)
+	for i := 0; i < 50; i++ {
+		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // coordinatorMetricsBase port-forwards the coordinator Pod's metrics port and
 // returns the base URL. Call once per test (the local port is fixed).
 func coordinatorMetricsBase(t *testing.T, ns, coordPod string) string {
@@ -509,42 +553,54 @@ func coordinatorMetricsBase(t *testing.T, ns, coordPod string) string {
 
 // statuszWorkerNames fetches /statusz and returns the coordinator's registered
 // worker names — the owner layout the re-slice mutates, which the source/sink
-// convergence check alone does not prove.
-func statuszWorkerNames(t *testing.T, base string) []string {
-	t.Helper()
+// convergence check alone does not prove. An error means the forward dropped
+// (the coordinator restarted under the fault); the caller re-forwards.
+func statuszWorkerNames(base string) ([]string, error) {
 	resp, err := http.Get(base + "/statusz")
 	if err != nil {
-		t.Fatalf("statusz: %v", err)
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("statusz read: %v", err)
+		return nil, err
 	}
 	var st struct {
 		Workers map[string]json.RawMessage `json:"workers"`
 	}
 	if err := json.Unmarshal(body, &st); err != nil {
-		t.Fatalf("statusz decode: %v", err)
+		return nil, err
 	}
 	names := make([]string, 0, len(st.Workers))
 	for n := range st.Workers {
 		names = append(names, n)
 	}
-	return names
+	return names, nil
 }
 
 // waitOwnerCount polls /statusz until the coordinator holds exactly want
 // registered workers whose name carries the worker StatefulSet prefix
 // (sts+"-"), proving the coordinator re-sliced to match the replica count
-// rather than merely the Pods becoming Ready.
-func waitOwnerCount(t *testing.T, base, sts string, want int, timeout time.Duration) {
+// rather than merely the Pods becoming Ready. A coordinator restart under the
+// re-slice drops the metrics port-forward, so it re-forwards on read errors.
+func waitOwnerCount(t *testing.T, ns, coordPod, sts string, want int, timeout time.Duration) {
 	t.Helper()
+	base := coordinatorMetricsBase(t, ns, coordPod)
 	deadline := time.Now().Add(timeout)
 	var got int
 	for {
+		names, err := statuszWorkerNames(base)
+		if err != nil {
+			t.Logf("statusz read failed (re-forwarding): %v", err)
+			base = coordinatorMetricsBase(t, ns, coordPod)
+			if time.Now().After(deadline) {
+				t.Fatalf("coordinator /statusz unreachable for %s within %s: %v", sts, timeout, err)
+			}
+			time.Sleep(time.Second)
+			continue
+		}
 		got = 0
-		for _, n := range statuszWorkerNames(t, base) {
+		for _, n := range names {
 			if strings.HasPrefix(n, sts+"-") {
 				got++
 			}

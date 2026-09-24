@@ -30,7 +30,6 @@ func TestMultiTableResliceConvergence(t *testing.T) {
 	t.Logf("targets: %v", targets)
 
 	coordPods := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)
-	base := coordinatorMetricsBase(t, testNS, coordPods[0])
 	stss := workerSTSs(t, testNS, pipeline)
 	for _, sts := range stss {
 		waitPodsByPrefix(t, testNS, sts+"-", 1, 5*time.Minute)
@@ -46,7 +45,7 @@ func TestMultiTableResliceConvergence(t *testing.T) {
 	for _, n := range []int{3, 1, 2, 1} {
 		scaleWorker(t, testNS, chaosSTS, n)
 		waitPodsByPrefix(t, testNS, chaosSTS+"-", n, 5*time.Minute)
-		waitOwnerCount(t, base, chaosSTS, n, 5*time.Minute)
+		waitOwnerCount(t, testNS, coordPods[0], chaosSTS, n, 5*time.Minute)
 		t.Logf("re-sliced to %d", n)
 	}
 	for _, s := range stops {
