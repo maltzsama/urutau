@@ -731,6 +731,7 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		rec.Release()
 		return nil
 	}
+	r.log.Debug("worker apply batch", "table", meta.Table, "high", meta.HighPos, "rows", rec.NumRows(), "staged", meta.Staged)
 
 	b := &dataplane.Batch{
 		Table:     meta.Table,

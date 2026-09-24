@@ -52,7 +52,23 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		return
 	}
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
-	for _, cy := range c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending) {
+	committable, known := c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
+	if sb.Seq != 0 && !known {
+		// The seq named no cycle this tracker holds: a too-late delivery for
+		// a discarded cycle — the telltale of a wedged cycle (issue #372). A
+		// still-accumulating multi-owner cycle also returns no committable
+		// cycles but IS known, so healthy partitioned traffic does not warn.
+		c.log.Warn("coordinator: staged delivery not committable", "worker", worker, "table", sb.Table, "seq", sb.Seq)
+	}
+	for _, cy := range committable {
+		// A table whose cycles were discarded after an owner was lost is
+		// gapped: committing this later cycle would advance the durable
+		// position past the discarded rows, and a replay would never recover
+		// them. Terminate instead (issue #372).
+		if c.staged.isGapped(cy.ref.Target) {
+			c.fail(fmt.Errorf("coordinator: table %s has a staged gap from a lost owner; terminating for a clean replay", cy.ref.Target))
+			return
+		}
 		// Cycles commit in send order; the first failure must stop the run
 		// here — committing a later cycle would advance the durable position
 		// past the gap the failed cycle left, and its data would never be
@@ -83,6 +99,7 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {
 		return fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err)
 	}
+	c.log.Debug("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos, "owners", len(cy.owners), "descriptors", len(cy.descriptors))
 	// The cycle is durable: only now may source retention advance. Record the
 	// cycle's position for every owner it covered, so confirmedPosition (the
 	// min) reflects the whole cycle — the worker's per-batch ack does not

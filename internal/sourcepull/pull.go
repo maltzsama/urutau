@@ -67,8 +67,9 @@ func (p *Puller) Next(ctx context.Context) (*dataplane.Batch, error) {
 			return nil, ctx.Err()
 		}
 	}
-	// Drain a few more non-blockingly to batch.
-	for len(p.buf) < batchTarget {
+	// Drain a few more non-blockingly to batch. A change of another table
+	// ends the batch: it stays buffered and heads the next one.
+	for len(p.buf) < batchTarget && p.buf[len(p.buf)-1].Table == p.buf[0].Table {
 		select {
 		case c, ok := <-p.ch:
 			if !ok {
@@ -134,6 +135,20 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	if len(p.buf) == 0 {
 		return nil, nil
 	}
+	// A batch carries ONE table: encode only the leading run of buffered
+	// changes of the same table and keep the rest for the next batch. A
+	// backlog interleaves tables, and labelling the whole buffer with the
+	// first change's table routed every other table's rows into it — silently
+	// when the schemas match (issue #372).
+	table := p.buf[0].Table
+	n := 1
+	for n < len(p.buf) && p.buf[n].Table == table {
+		n++
+	}
+	run, rest := p.buf[:n], append([]rowchange.Change(nil), p.buf[n:]...)
+	p.buf = run
+	defer func() { p.buf = rest }()
+
 	// Drift check at the SOURCE boundary, where the native row shape
 	// exists: encode against the canonical schema would silently DROP a
 	// field the schema does not know (top-level OR nested inside a struct),
@@ -152,7 +167,6 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 			}
 		}
 	}
-	table := p.buf[0].Table
 	// Known schema plus any column a change carries that the schema lacks
 	// (schema-less producers, sparse rows). Empty cs → full inference.
 	cs := transport.MergeSchema(p.buf, p.schemas[table])
@@ -162,14 +176,12 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	if len(cs.PrimaryKey) == 0 {
 		for _, c := range p.buf {
 			if c.Op == rowchange.OpDelete {
-				p.buf = nil
 				return nil, fmt.Errorf("sourcepull: batch %q carries a delete but the schema has no primary key — declare it and resume", table)
 			}
 		}
 	}
 
 	rec, err := transport.RecordFromChanges(p.buf, cs, nil)
-	p.buf = nil
 	if err != nil {
 		return nil, fmt.Errorf("sourcepull: encode batch: %w", err)
 	}

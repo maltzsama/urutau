@@ -419,8 +419,8 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s (in-flight=%d queued=%d staged-cycles=%d open=%d done=%d)",
-				pending, c.drainTimeout(), inflight, queued, cycles, cyclesOpen, cyclesDone)
+			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s (in-flight=%d queued=%d staged-cycles=%d open=%d done=%d open-seqs=%v)",
+				pending, c.drainTimeout(), inflight, queued, cycles, cyclesOpen, cyclesDone, c.staged.openSeqs(core.TableRef{Target: target}))
 		case <-tick.C:
 		}
 	}

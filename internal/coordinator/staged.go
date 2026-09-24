@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/maltzsama/urutau/core"
@@ -33,6 +34,11 @@ type stagedCycles struct {
 	open  map[cycleKey]*stagedCycle // still accumulating
 	done  map[cycleKey]*stagedCycle // complete, waiting for its turn
 	order map[string][]uint64       // per table, seqs in send order
+	// gapped marks a table whose cycles were discarded after an owner was
+	// lost: a later cycle must not commit over the gap, or the durable
+	// position would advance past the discarded rows and a replay would
+	// never recover them (issue #372).
+	gapped map[string]bool
 }
 
 type cycleKey struct {
@@ -42,10 +48,49 @@ type cycleKey struct {
 
 func newStagedCycles() *stagedCycles {
 	return &stagedCycles{
-		open:  map[cycleKey]*stagedCycle{},
-		done:  map[cycleKey]*stagedCycle{},
-		order: map[string][]uint64{},
+		open:   map[cycleKey]*stagedCycle{},
+		done:   map[cycleKey]*stagedCycle{},
+		order:  map[string][]uint64{},
+		gapped: map[string]bool{},
 	}
+}
+
+// isGapped reports whether the table has a gap from a lost owner.
+func (s *stagedCycles) isGapped(target string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gapped[target]
+}
+
+// debugOpen renders a table's open and done cycles in send order, with their
+// delivery positions and expected owners — a wedge diagnostic (issue #372).
+func (s *stagedCycles) debugOpen(target string) []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.order[target]))
+	for _, seq := range s.order[target] {
+		k := cycleKey{target, seq}
+		if cy, ok := s.open[k]; ok {
+			out = append(out, fmt.Sprintf("%d:open@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
+		} else if cy, ok := s.done[k]; ok {
+			out = append(out, fmt.Sprintf("%d:done@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
+		}
+	}
+	return out
+}
+
+func ownerNames(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for name := range m {
+		out = append(out, name)
+	}
+	return out
 }
 
 // expect records that a delivery is expected from each of owners for
@@ -71,11 +116,14 @@ func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
 }
 
 // deliver records one staged delivery and returns the run of cycles of that
-// table now committable, head-first. A Seq==0 delivery is its own cycle of
-// one, returned immediately.
-func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, state string, pending []uint32) []*stagedCycle {
+// table now committable, head-first. The second return reports whether the
+// delivery named a cycle this tracker knows: false means a too-late delivery
+// for a discarded cycle (dropped), true covers both a still-accumulating cycle
+// and a completed one. A Seq==0 delivery is its own cycle of one, returned
+// immediately.
+func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, state string, pending []uint32) (committable []*stagedCycle, known bool) {
 	if s == nil {
-		return nil
+		return nil, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -87,13 +135,13 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 		// a too-late delivery for a discarded cycle — dropping it is the
 		// only safe choice, since committing it would be a partial cycle.
 		if seq != 0 {
-			return nil
+			return nil, false
 		}
 		return []*stagedCycle{{
 			ref: ref, seq: 0, expected: 1,
 			descriptors: [][]byte{desc}, positions: []string{pos},
 			state: state, pending: pending,
-		}}
+		}}, true
 	}
 	cy.descriptors = append(cy.descriptors, desc)
 	cy.positions = append(cy.positions, pos)
@@ -104,11 +152,11 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 		cy.pending = pending
 	}
 	if len(cy.descriptors) < cy.expected {
-		return nil
+		return nil, true
 	}
 	delete(s.open, k)
 	s.done[k] = cy
-	return s.drainLocked(ref.Target)
+	return s.drainLocked(ref.Target), true
 }
 
 // drainLocked pops the head of table's send order while it is complete,
@@ -130,16 +178,17 @@ func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
 	return out
 }
 
-// discardWorker drops every cycle that needed a delivery from worker — on
-// session loss those cycles can never complete, and an incomplete cycle must
-// never be committed — and then every remaining cycle of each affected table.
-// A cycle still queued for that table sits BEHIND the discarded one in send
-// order: committing it would advance the durable position over the discarded
-// cycle's gap, and that gap's data would never be replayed. Returns the
-// number discarded, for logging.
+// discardWorker drops every cycle that still needed a delivery from worker —
+// on session loss those cycles can never complete, and an incomplete cycle must
+// never be committed. Cycles owned only by other workers are LEFT ALONE: they
+// can still complete (issue #372 — the old code discarded every cycle of the
+// affected table, losing rows a live owner had already staged). The table is
+// marked gapped instead, so onStagedBatch refuses to commit a cycle over the
+// discarded gap and the run terminates for a clean replay. Returns the number
+// discarded, for logging.
 //
-// A worker that owed nothing (the safe-reset case) leaves no open cycle
-// here, so an affected table never arises and nothing is discarded.
+// A worker that owed nothing (the safe-reset case) leaves no open cycle here,
+// so an affected table never arises and nothing is discarded.
 func (s *stagedCycles) discardWorker(worker string) int {
 	if s == nil {
 		return 0
@@ -162,20 +211,8 @@ func (s *stagedCycles) discardWorker(worker string) int {
 			discarded++
 		}
 	}
-	for k := range s.open {
-		if tables[k.table] {
-			delete(s.open, k)
-			discarded++
-		}
-	}
-	for k := range s.done {
-		if tables[k.table] {
-			delete(s.done, k)
-			discarded++
-		}
-	}
 	for table := range tables {
-		delete(s.order, table)
+		s.gapped[table] = true
 	}
 	return discarded
 }
@@ -210,4 +247,25 @@ func (s *stagedCycles) openForBreakdown(ref core.TableRef) (open, done int) {
 		}
 	}
 	return open, done
+}
+
+// openSeqs returns the seqs of a table's not-yet-committed cycles, for
+// diagnostics: the head of send order names which cycle is blocking.
+func (s *stagedCycles) openSeqs(ref core.TableRef) []uint64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := s.order[ref.Target]
+	out := make([]uint64, 0, len(q))
+	for _, seq := range q {
+		k := cycleKey{ref.Target, seq}
+		if _, open := s.open[k]; open {
+			out = append(out, seq)
+		} else if _, done := s.done[k]; done {
+			out = append(out, seq)
+		}
+	}
+	return out
 }

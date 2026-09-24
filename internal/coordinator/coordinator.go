@@ -336,8 +336,13 @@ type workerState struct {
 	out      chan *pb.CoordinatorMessage // attached by Session
 	control  pb.UrutauControl_ControlServer
 	attached bool
-	epoch    uint64 // last accepted epoch (guards stale Hellos)
-	cancel   context.CancelFunc
+	// hadSession records that the worker's session has attached at least once.
+	// A worker that was attached and is now detached (its Pod deleted) can
+	// never drain its queue; the supervisor uses this to distinguish that from
+	// a worker that simply never attached yet (issue #372).
+	hadSession bool
+	epoch      uint64 // last accepted epoch (guards stale Hellos)
+	cancel     context.CancelFunc
 
 	// sent holds the batches popped from the queue and delivered (or whose
 	// Send was attempted) but not yet acked, in send order. On session loss
@@ -1177,6 +1182,9 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 			if !ok {
 				return
 			}
+			if b.Record != nil {
+				c.log.Debug("coordinator: reader batch", "table", b.Table, "rows", b.Record.NumRows(), "mode", b.Mode)
+			}
 			if c.metrics != nil {
 				c.metrics.EventsDecoded.Inc()
 			}
@@ -1718,6 +1726,19 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		return fmt.Errorf("coordinator: enqueueBatch requires a batch; window markers go through enqueueTo")
 	}
 
+	// A partition owner whose Pod died (its session attached, then detached)
+	// and has not been retired by a re-slice yet can never drain a batch
+	// routed to it: the batch strands, and other partitions' cycles advance
+	// the durable position over the gap. Fail for a clean replay instead of
+	// routing into the void (issue #372). A supervisor reset is excluded: it
+	// is detached only between the reset and the reconnect, and its queue
+	// survives, so the batch is delivered on reconnect rather than stranded.
+	for _, w := range owners {
+		if c.ownerDetached(w) && !c.supervisor.isPending(w.name) {
+			return fmt.Errorf("coordinator: owner %s of %s is detached; terminating for a clean replay", w.name, meta.Table)
+		}
+	}
+
 	if len(owners) == 1 {
 		return c.enqueueTo(ctx, owners[0], b, meta)
 	}
@@ -1776,6 +1797,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// no cycle is tracked and none can leak.
 	if c.stagesCycles() {
 		c.staged.expect(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners)
+		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
 	for p, sub := range subBatches {
 		if sub == nil {
@@ -1872,6 +1894,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if err := c.budget.acquire(ctx, w.name, n); err != nil {
 		return err
 	}
+	c.log.Debug("coordinator: enqueue sub-batch", "owner", w.name, "table", meta.Table, "seq", meta.BatchId, "highPos", meta.HighPos, "staged", meta.Staged)
 	// Marker batches (window closes) carry their position in LowPos.
 	posStr := meta.HighPos
 	if posStr == "" {
@@ -2470,7 +2493,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	// happens-before run's receive, so run may use w.out the moment it
 	// wakes — attaching after the signal is a data race.
 	if known {
-		w.out, w.attached = sess.out, true
+		w.out, w.attached, w.hadSession = sess.out, true, true
 		w.cancel = sessCancel
 	}
 	c.mu.Unlock()
@@ -2582,24 +2605,40 @@ var errSessionReset = errors.New("session reset")
 // silently incomplete snapshot). Fail the run instead, so it restarts and
 // re-snapshots cleanly (CD-5).
 func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
-	// A lost worker leaves the staged cycles it owed permanently incomplete:
-	// discard them (never commit a partial cycle). The run terminates below
-	// and replays every partition from the committed position, so no later
-	// cycle may be committed over the gap.
-	if n := c.staged.discardWorker(worker); n > 0 {
-		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
+	// A supervisor reset (pending) reconnects and redelivers its batches, so
+	// its open staged cycles must NOT be discarded: the reconnecting session's
+	// nonzero sequences are unknown to stagedCycles.deliver and would be
+	// dropped, losing the staged rows. Only a genuinely lost worker's cycles
+	// are discarded below.
+	pending := c.supervisor.isPending(worker)
+	discarded := 0
+	if !pending {
+		// A lost worker leaves the staged cycles it owed permanently
+		// incomplete: discard them (never commit a partial cycle). The run
+		// terminates below and replays every partition from the committed
+		// position, so no later cycle may be committed over the gap.
+		var open []string
+		for _, ref := range c.workerRefs(worker) {
+			open = append(open, c.staged.debugOpen(ref.Target)...)
+		}
+		discarded = c.staged.discardWorker(worker)
+		if discarded > 0 {
+			c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", discarded, "open-before", open)
+		}
 	}
 	c.pushDashState() // the worker is no longer attached
+	// A worker whose open staged cycles were just discarded (discarded > 0)
+	// lost rows — they were delivered to a cycle that can never complete — and
+	// discardWorker leaves a hole in the table's send order that drainLocked
+	// cannot pass, so a re-slice's drain waits until it times out (issue #372).
 	// A session that ends with context.Canceled — the Pod was deleted, or the
-	// client's stream closed — while the worker still owes batches strands
-	// them: the pump keeps routing to the detached owner until a re-slice
-	// removes it, and no session will ever deliver them, so a re-slice's drain
-	// waits on them forever and the flip never commits (issue #363). The other
-	// terminal paths below already fail the run; this one does not, so fail it
-	// here for a clean replay — the restart replays every partition from the
-	// committed position, recovering the stranded batches. A supervisor reset
-	// (pending) is excluded: that worker reconnects and redelivers.
-	if errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) && c.workerOwes(worker) {
+	// client's stream closed — while the worker still owes batches strands them
+	// the same way: the pump keeps routing to the detached owner, no session
+	// will ever deliver them, and the flip never commits (issue #363). Both
+	// strand work that only a clean replay recovers, so fail the run for either
+	// — a discarded cycle regardless of the reset error type. A supervisor
+	// reset (pending) is excluded: that worker reconnects and redelivers.
+	if !pending && (discarded > 0 || (errors.Is(retErr, context.Canceled) && c.workerOwes(worker))) {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost owing work: %w", worker, retErr)
 		return
 	}
@@ -2608,7 +2647,7 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	// recv goroutine wins the race, as context.Canceled. Neither is a worker
 	// failure; only a real stream error is. Treating the cancel as a failure
 	// ended the whole run the moment a scale-in retired an owner.
-	if !errors.Is(retErr, errSessionReset) && !errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) {
+	if !errors.Is(retErr, errSessionReset) && !errors.Is(retErr, context.Canceled) && !pending {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)
@@ -2626,6 +2665,25 @@ func (c *Coordinator) workerOwes(worker string) bool {
 		return false
 	}
 	return len(w.queue) > 0 || c.inFlight(worker) > 0
+}
+
+// ownerDetached reports whether an owner's Pod died — its session attached and
+// then detached — but no re-slice has retired it yet. Such an owner can never
+// drain a batch routed to it (issue #372).
+func (c *Coordinator) ownerDetached(w *workerState) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return w.hadSession && !w.attached
+}
+
+// workerRefs returns the table refs a worker owns, or nil if it is unknown.
+func (c *Coordinator) workerRefs(worker string) []source.TableRef {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w := c.workers[worker]; w != nil {
+		return w.refs
+	}
+	return nil
 }
 
 // workerSession is one connected worker's session-local surface; the group's
