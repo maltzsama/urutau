@@ -52,7 +52,13 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		return
 	}
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
-	for _, cy := range c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending) {
+	committable := c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
+	if sb.Seq != 0 && len(committable) == 0 {
+		// A delivery that commits nothing is a dropped/incomplete cycle — the
+		// telltale of a wedged cycle (issue #372).
+		c.log.Warn("coordinator: staged delivery not committable", "worker", worker, "table", sb.Table, "seq", sb.Seq)
+	}
+	for _, cy := range committable {
 		// Cycles commit in send order; the first failure must stop the run
 		// here — committing a later cycle would advance the durable position
 		// past the gap the failed cycle left, and its data would never be

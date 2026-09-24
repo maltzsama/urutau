@@ -336,7 +336,12 @@ type workerState struct {
 	out      chan *pb.CoordinatorMessage // attached by Session
 	control  pb.UrutauControl_ControlServer
 	attached bool
-	epoch    uint64 // last accepted epoch (guards stale Hellos)
+	// hadSession records that the worker's session has attached at least once.
+	// A worker that was attached and is now detached (its Pod deleted) can
+	// never drain its queue; the supervisor uses this to distinguish that from
+	// a worker that simply never attached yet (issue #372).
+	hadSession bool
+	epoch      uint64 // last accepted epoch (guards stale Hellos)
 	cancel   context.CancelFunc
 
 	// sent holds the batches popped from the queue and delivered (or whose
@@ -2470,7 +2475,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	// happens-before run's receive, so run may use w.out the moment it
 	// wakes — attaching after the signal is a data race.
 	if known {
-		w.out, w.attached = sess.out, true
+		w.out, w.attached, w.hadSession = sess.out, true, true
 		w.cancel = sessCancel
 	}
 	c.mu.Unlock()
@@ -2586,20 +2591,23 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	// discard them (never commit a partial cycle). The run terminates below
 	// and replays every partition from the committed position, so no later
 	// cycle may be committed over the gap.
-	if n := c.staged.discardWorker(worker); n > 0 {
-		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", n)
+	discarded := c.staged.discardWorker(worker)
+	if discarded > 0 {
+		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", discarded)
 	}
 	c.pushDashState() // the worker is no longer attached
 	// A session that ends with context.Canceled — the Pod was deleted, or the
 	// client's stream closed — while the worker still owes batches strands
 	// them: the pump keeps routing to the detached owner until a re-slice
 	// removes it, and no session will ever deliver them, so a re-slice's drain
-	// waits on them forever and the flip never commits (issue #363). The other
-	// terminal paths below already fail the run; this one does not, so fail it
-	// here for a clean replay — the restart replays every partition from the
-	// committed position, recovering the stranded batches. A supervisor reset
+	// waits on them forever and the flip never commits (issue #363). A worker
+	// whose open staged cycles were just discarded (discarded > 0) lost rows
+	// the same way — they were delivered to a cycle that can never complete —
+	// so a run that merely re-slices on would advance the durable position over
+	// that gap and drop them for good (issue #372). Both strand work that only
+	// a clean replay recovers, so fail the run for one. A supervisor reset
 	// (pending) is excluded: that worker reconnects and redelivers.
-	if errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) && c.workerOwes(worker) {
+	if errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) && (c.workerOwes(worker) || discarded > 0) {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost owing work: %w", worker, retErr)
 		return
 	}

@@ -211,3 +211,24 @@ func (s *stagedCycles) openForBreakdown(ref core.TableRef) (open, done int) {
 	}
 	return open, done
 }
+
+// openSeqs returns the seqs of a table's not-yet-committed cycles, for
+// diagnostics: the head of send order names which cycle is blocking.
+func (s *stagedCycles) openSeqs(ref core.TableRef) []uint64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := s.order[ref.Target]
+	out := make([]uint64, 0, len(q))
+	for _, seq := range q {
+		k := cycleKey{ref.Target, seq}
+		if _, open := s.open[k]; open {
+			out = append(out, seq)
+		} else if _, done := s.done[k]; done {
+			out = append(out, seq)
+		}
+	}
+	return out
+}

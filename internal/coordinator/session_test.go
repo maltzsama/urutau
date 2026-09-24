@@ -186,6 +186,32 @@ func TestSignalSessionEndNothingOwedIsSilent(t *testing.T) {
 	}
 }
 
+// A worker whose open staged cycles are discarded on session loss also loses
+// rows: the cycle can never complete, and committing past it would drop the
+// gap. The run must terminate for a clean replay even when nothing is queued
+// or in-flight (issue #372).
+func TestSignalSessionEndDiscardedCyclesTerminates(t *testing.T) {
+	s, workers := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	<-workers["w1"].queue // nothing owed: the loss is purely open cycles
+
+	// w1 was an expected deliverer of a cycle that never completed.
+	c.staged = newStagedCycles()
+	c.staged.expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1"})
+
+	c.signalSessionEnd("w1", context.Canceled)
+
+	select {
+	case err := <-c.sessionErrs:
+		if err == nil || !strings.Contains(err.Error(), "owing work") {
+			t.Fatalf("err = %v, want a session-lost-owing-work error", err)
+		}
+	default:
+		t.Fatal("discarding a worker's open cycles must fail the run for a clean replay")
+	}
+}
+
 var errWorkerDead = errors.New("stream died")
 
 // opaquePos is an identity-only position (plugin offset cookie): different

@@ -140,13 +140,14 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	// taking c.mu — the two orders would deadlock (audit #3).
 	s.c.mu.Lock()
 	type attachProbe struct {
-		name     string
-		attached bool
-		owes     bool
+		name       string
+		attached   bool
+		hadSession bool
+		owes       bool
 	}
 	probes := make([]attachProbe, 0, len(s.c.workers))
 	for name, w := range s.c.workers {
-		probes = append(probes, attachProbe{name: name, attached: w.attached, owes: len(w.queue) > 0})
+		probes = append(probes, attachProbe{name: name, attached: w.attached, hadSession: w.hadSession, owes: len(w.queue) > 0})
 	}
 	s.c.mu.Unlock()
 	// A worker owes work when it holds a delivered-but-unacked batch or has
@@ -165,7 +166,13 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// An ATTACHED worker that owes nothing is merely idle — a quiet
 		// table, or one that just went through a re-slice — and resetting it
 		// destroys its open staged cycles for no reason (issue #312).
-		if s.pending[p.name] || (p.attached && p.owes && (!ok || now.Sub(at) > ack)) {
+		// A worker that was attached and is now detached with work owed has
+		// lost its Pod (a re-slice scale-in deletes the StatefulSet Pods, and
+		// no reset or pending flag marks that). It can never drain its queue,
+		// so a reset is useless: flag it to terminate for a clean replay
+		// (issue #372).
+		detachedOwing := !p.attached && p.hadSession && p.owes && ok && now.Sub(at) > ack
+		if s.pending[p.name] || (p.attached && p.owes && (!ok || now.Sub(at) > ack)) || detachedOwing {
 			stale = append(stale, p.name)
 		}
 	}
