@@ -112,32 +112,17 @@ func (s Source) Introspect(_ context.Context, t spec.Table) (core.TableRef, core
 	return core.TableRef{Source: t.Source, Target: t.Target, PrimaryKey: pk}, cs, nil, nil
 }
 
-// NewReader builds the Kafka consumer. It subscribes to the topics
-// derived from the spec tables and produces changes to the output
-// channel. No consumer group is used — the consumer manages its own
-// offsets.
-func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader, error) {
+// Open prepares the Kafka consumer's decoder and topic list. The
+// kgo.Client itself is NOT connected here: Start receives the resume
+// position (Open's caller never does), and the client must be built there so
+// its per-partition offsets (ConsumePartitions) can be seeded from it —
+// nothing reads from the returned Reader between Open and Start (issue #394).
+func (s Source) Open(_ context.Context, refs []source.TableRef) (source.Reader, error) {
 	refBySource := make(map[string]source.TableRef, len(refs))
 	topics := make([]string, 0, len(refs))
 	for _, ref := range refs {
 		topics = append(topics, ref.Source)
 		refBySource[ref.Source] = ref
-	}
-
-	// No ConsumeGroup: this is direct/manual partition consuming, so there
-	// is no group-coordinated autocommit to disable — kgo.DisableAutoCommit
-	// is only valid alongside a group, and errors client construction
-	// otherwise (issue #17 e2e round trip surfaced this: no Kafka pipeline
-	// had ever actually connected).
-	opts := []kgo.Opt{
-		kgo.SeedBrokers(s.Spec.Source.URI),
-		kgo.ConsumeTopics(topics...),
-		kgo.WithLogger(newKgoLogger(s.Rt.Logger)),
-	}
-
-	client, err := kgo.NewClient(opts...)
-	if err != nil {
-		return nil, fmt.Errorf("kafka: new client: %w", err)
 	}
 
 	dec := decoder.Decoder(&decoder.DebeziumJSON{
@@ -151,7 +136,6 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		}
 	case "avro":
 		if s.Spec.Source.SchemaRegistry == "" {
-			client.Close()
 			return nil, fmt.Errorf("kafka: source.schemaRegistry required when format is avro")
 		}
 		avroDec := decoder.NewAvroDecoder(decoder.NewHTTPRegistry(s.Spec.Source.SchemaRegistry))
@@ -161,7 +145,8 @@ func (s Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	}
 
 	r := &Reader{
-		client:      client,
+		src:         s,
+		topics:      topics,
 		dec:         dec,
 		out:         make(chan rowchange.Change, 1024),
 		logger:      s.Rt.Logger,
@@ -251,6 +236,10 @@ func (s Source) ParsePosition(pos string) (position.Position, error) {
 // Reader implements source.Reader for Kafka: it consumes records,
 // decodes them, and feeds changes to the output channel.
 type Reader struct {
+	// src and topics carry what Open resolved; client is built in Start,
+	// once the resume position is known (see Open's doc comment).
+	src    Source
+	topics []string
 	client *kgo.Client
 	dec    decoder.Decoder
 	out    chan rowchange.Change
@@ -289,13 +278,92 @@ func (r *Reader) OpenWindow(_ context.Context, _ uint32) {}
 // ClearWindow is a no-op for Kafka.
 func (r *Reader) ClearWindow() {}
 
-// Start begins consuming from Kafka (the offset is carried in the reader's
-// construction; Kafka has no single resume position like GTID/LSN).
-func (r *Reader) Start(ctx context.Context, _ position.Position) error {
+// Start connects the Kafka consumer, seeded from the resume position:
+// resume's per-partition offsets (position.Offsets — a partial order over
+// possibly-multiple topics) are read starting exactly there via
+// kgo.ConsumePartitions; any partition resume does not name (a fresh
+// pipeline, or a partition added since the last commit) still uses
+// kgo.ConsumeTopics, which discovers it and starts from the client's default
+// reset policy (the beginning of the log). Without this, every restart
+// re-read every partition from the beginning regardless of what was already
+// committed — harmless under exactly-once/idempotent sinks, but on an
+// append-only table (Kafka's only mode with no PK to collapse duplicates on)
+// every restart re-appended everything already durable, unbounded and
+// silent (issue #394).
+func (r *Reader) Start(ctx context.Context, resume position.Position) error {
+	opts := []kgo.Opt{
+		kgo.SeedBrokers(r.src.Spec.Source.URI),
+		kgo.WithLogger(newKgoLogger(r.logger)),
+	}
+	parts, wholeTopics := splitConsumeOpts(r.topics, resume)
+	if len(wholeTopics) > 0 {
+		opts = append(opts, kgo.ConsumeTopics(wholeTopics...))
+	}
+	if len(parts) > 0 {
+		opts = append(opts, kgo.ConsumePartitions(parts))
+	}
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		return fmt.Errorf("kafka: new client: %w", err)
+	}
+	r.client = client
+
 	errCh := make(chan error, 1)
 	r.puller.SetErr(errCh)
 	go func() { errCh <- r.consume(ctx) }()
 	return nil
+}
+
+// splitConsumeOpts partitions topics into kgo's two consume shapes.
+// ConsumePartitions and ConsumeTopics are a UNION, not overlapping options:
+// kgo refuses a client where the same topic appears in both ("these options
+// are a union, it is invalid to specify specific partitions for a topic
+// while also consuming the entire topic"). A topic with a resume offset goes
+// through ConsumePartitions only (parts); every other topic (no committed
+// position yet, or a resume of a different position type) goes through
+// ConsumeTopics (wholeTopics), whole-topic discovery from the default reset
+// policy — this is also where a topic's newly added partition lands, since
+// consumePartitionsFrom only names the partitions the resume position knew
+// about.
+func splitConsumeOpts(topics []string, resume position.Position) (parts map[string]map[int32]kgo.Offset, wholeTopics []string) {
+	parts = consumePartitionsFrom(resume)
+	for _, topic := range topics {
+		if _, ok := parts[topic]; !ok {
+			wholeTopics = append(wholeTopics, topic)
+		}
+	}
+	return parts, wholeTopics
+}
+
+// consumePartitionsFrom translates a resume position's per-partition offsets
+// into kgo's ConsumePartitions shape: read starting at the NEXT record after
+// what was already committed. A nil or non-Offsets resume (a fresh pipeline,
+// or a mismatched position type — defensive, should not happen for a kafka
+// source) yields no entries, so every topic falls back to ConsumeTopics'
+// default reset policy.
+func consumePartitionsFrom(resume position.Position) map[string]map[int32]kgo.Offset {
+	off, ok := resume.(*position.Offsets)
+	if !ok || off == nil {
+		return nil
+	}
+	out := make(map[string]map[int32]kgo.Offset, len(off.Topics))
+	for topic, parts := range off.Topics {
+		if len(parts) == 0 {
+			continue
+		}
+		p := make(map[int32]kgo.Offset, len(parts))
+		for partition, committed := range parts {
+			// committed is the record's OWN offset (the reader's decode loop
+			// sets c.Position from rec.Offset directly, not rec.Offset+1 —
+			// that +1 only appears in r.synced, the separate caught-up/Master
+			// tracker, and never reaches cdc.position). The next fetch must
+			// start one past it, or the already-committed record would be
+			// redelivered on every resume.
+			p[partition] = kgo.NewOffset().At(committed + 1)
+		}
+		out[topic] = p
+	}
+	return out
 }
 
 // Next returns the next columnar batch. The source boundary owns the
