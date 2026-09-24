@@ -230,6 +230,20 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 		return fmt.Errorf("coordinator: scale %s: %w", target, err)
 	}
 
+	// A scale-in removes owners whose Pods the StatefulSet has already
+	// deleted. One that is not attached yet owes work can never drain it:
+	// the drain below would time out on every retry and the table would
+	// wedge. The case the supervisor cannot see is an owner that never
+	// attached at all — its Pod died while still connecting — so it is never
+	// "detached". Its work is uncommitted, so a clean replay recovers it.
+	for _, w := range removed {
+		if c.strandedOwner(w) {
+			err := fmt.Errorf("coordinator: scale %s: removed owner %s is not attached and owes work; terminating for a clean replay", target, w.name)
+			c.fail(err)
+			return err
+		}
+	}
+
 	// A pre-commit failure leaves the old layout active, so the owners this
 	// call CREATED must be rolled back: otherwise they linger as ghosts —
 	// accepting Hellos, supervised, and holding a retention position they
@@ -285,6 +299,16 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	}
 	c.pushDashState()
 	return nil
+}
+
+// strandedOwner reports whether w has no attached session yet holds queued or
+// in-flight batches — work nothing will deliver once its Pod is gone.
+func (c *Coordinator) strandedOwner(w *workerState) bool {
+	c.mu.Lock()
+	attached := w.attached
+	queued := len(w.queue)
+	c.mu.Unlock()
+	return !attached && (queued > 0 || c.inFlight(w.name) > 0)
 }
 
 // reslicedOwners returns the owner slice for n partitions, keeping the

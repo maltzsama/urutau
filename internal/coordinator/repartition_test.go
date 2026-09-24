@@ -462,3 +462,37 @@ func TestDoGetTicketLookupDoesNotRaceRegisterOwner(t *testing.T) {
 	close(stop)
 	<-done
 }
+
+// A scale-in that removes an owner whose Pod died before it ever attached —
+// the StatefulSet scaled back down while the new Pod was still connecting —
+// can never drain the work routed to it: no session will deliver it, the
+// supervisor ignores a never-attached owner, and every drain times out, so
+// the table wedges forever. The scale must terminate the run for a clean
+// replay instead of retrying the drain.
+func TestScaleInTerminatesOnNeverAttachedOwnerOwingWork(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.cfg.ScaleDrainTimeout = 500 * time.Millisecond
+	c.terminate = make(chan error, 1)
+	ctx := context.Background()
+	if err := c.ScaleTable(ctx, "raw.orders", 2); err != nil {
+		t.Fatalf("scale out: %v", err)
+	}
+	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	lost := owners[1]
+	if lost.attached || lost.hadSession {
+		t.Fatal("precondition: the new owner must never have attached")
+	}
+	lost.queue <- queuedBatch{id: 1, body: []byte("b")}
+
+	if err := c.ScaleTable(ctx, "raw.orders", 1); err == nil {
+		t.Fatal("scale-in must not flip over a never-attached owner's stranded work")
+	}
+	select {
+	case err := <-c.terminate:
+		if !strings.Contains(err.Error(), lost.name) {
+			t.Fatalf("terminate error must name the stranded owner, got %v", err)
+		}
+	default:
+		t.Fatal("scale-in must terminate the run for a clean replay, not retry the drain")
+	}
+}
