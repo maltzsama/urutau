@@ -2603,17 +2603,26 @@ var errSessionReset = errors.New("session reset")
 // silently incomplete snapshot). Fail the run instead, so it restarts and
 // re-snapshots cleanly (CD-5).
 func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
-	// A lost worker leaves the staged cycles it owed permanently incomplete:
-	// discard them (never commit a partial cycle). The run terminates below
-	// and replays every partition from the committed position, so no later
-	// cycle may be committed over the gap.
-	var open []string
-	for _, ref := range c.workerRefs(worker) {
-		open = append(open, c.staged.debugOpen(ref.Target)...)
-	}
-	discarded := c.staged.discardWorker(worker)
-	if discarded > 0 {
-		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", discarded, "open-before", open)
+	// A supervisor reset (pending) reconnects and redelivers its batches, so
+	// its open staged cycles must NOT be discarded: the reconnecting session's
+	// nonzero sequences are unknown to stagedCycles.deliver and would be
+	// dropped, losing the staged rows. Only a genuinely lost worker's cycles
+	// are discarded below.
+	pending := c.supervisor.isPending(worker)
+	discarded := 0
+	if !pending {
+		// A lost worker leaves the staged cycles it owed permanently
+		// incomplete: discard them (never commit a partial cycle). The run
+		// terminates below and replays every partition from the committed
+		// position, so no later cycle may be committed over the gap.
+		var open []string
+		for _, ref := range c.workerRefs(worker) {
+			open = append(open, c.staged.debugOpen(ref.Target)...)
+		}
+		discarded = c.staged.discardWorker(worker)
+		if discarded > 0 {
+			c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", discarded, "open-before", open)
+		}
 	}
 	c.pushDashState() // the worker is no longer attached
 	// A session that ends with context.Canceled — the Pod was deleted, or the
@@ -2627,7 +2636,7 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	// that gap and drop them for good (issue #372). Both strand work that only
 	// a clean replay recovers, so fail the run for one. A supervisor reset
 	// (pending) is excluded: that worker reconnects and redelivers.
-	if errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) && (c.workerOwes(worker) || discarded > 0) {
+	if errors.Is(retErr, context.Canceled) && !pending && (c.workerOwes(worker) || discarded > 0) {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost owing work: %w", worker, retErr)
 		return
 	}
@@ -2636,7 +2645,7 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	// recv goroutine wins the race, as context.Canceled. Neither is a worker
 	// failure; only a real stream error is. Treating the cancel as a failure
 	// ended the whole run the moment a scale-in retired an owner.
-	if !errors.Is(retErr, errSessionReset) && !errors.Is(retErr, context.Canceled) && !c.supervisor.isPending(worker) {
+	if !errors.Is(retErr, errSessionReset) && !errors.Is(retErr, context.Canceled) && !pending {
 		c.sessionErrs <- retErr
 	} else if c.snapshotActive.Load() {
 		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)

@@ -52,10 +52,12 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		return
 	}
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
-	committable := c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
-	if sb.Seq != 0 && len(committable) == 0 {
-		// A delivery that commits nothing is a dropped/incomplete cycle — the
-		// telltale of a wedged cycle (issue #372).
+	committable, known := c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
+	if sb.Seq != 0 && !known {
+		// The seq named no cycle this tracker holds: a too-late delivery for
+		// a discarded cycle — the telltale of a wedged cycle (issue #372). A
+		// still-accumulating multi-owner cycle also returns no committable
+		// cycles but IS known, so healthy partitioned traffic does not warn.
 		c.log.Warn("coordinator: staged delivery not committable", "worker", worker, "table", sb.Table, "seq", sb.Seq)
 	}
 	for _, cy := range committable {

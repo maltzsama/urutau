@@ -22,13 +22,13 @@ func TestStagedCycleWaitsForEveryDelivery(t *testing.T) {
 	r := ref(t, "orders")
 	s.expect(r, 7, []string{"a", "b", "c"})
 
-	if got := s.deliver(r, 7, []byte("a"), "100", "", nil); got != nil {
+	if got, _ := s.deliver(r, 7, []byte("a"), "100", "", nil); got != nil {
 		t.Fatalf("cycle committed after 1/3 deliveries: %v", got)
 	}
-	if got := s.deliver(r, 7, []byte("b"), "101", "", nil); got != nil {
+	if got, _ := s.deliver(r, 7, []byte("b"), "101", "", nil); got != nil {
 		t.Fatalf("cycle committed after 2/3 deliveries: %v", got)
 	}
-	got := s.deliver(r, 7, []byte("c"), "102", "", nil)
+	got, _ := s.deliver(r, 7, []byte("c"), "102", "", nil)
 	if len(got) != 1 {
 		t.Fatalf("cycle not committed after 3/3 deliveries: %v", got)
 	}
@@ -49,18 +49,18 @@ func TestStagedCyclesCommitInSendOrder(t *testing.T) {
 
 	// Cycle 2 completes first — it must wait for cycle 1, or committing it
 	// would advance the checkpoint past cycle 1 and regress it later.
-	if got := s.deliver(r, 2, []byte("2a"), "200", "", nil); got != nil {
+	if got, _ := s.deliver(r, 2, []byte("2a"), "200", "", nil); got != nil {
 		t.Fatalf("cycle 2 committed out of order: %v", got)
 	}
-	if got := s.deliver(r, 2, []byte("2b"), "201", "", nil); got != nil {
+	if got, _ := s.deliver(r, 2, []byte("2b"), "201", "", nil); got != nil {
 		t.Fatalf("cycle 2 committed before cycle 1: %v", got)
 	}
 
-	got := s.deliver(r, 1, []byte("1a"), "100", "", nil)
+	got, _ := s.deliver(r, 1, []byte("1a"), "100", "", nil)
 	if got != nil {
 		t.Fatalf("cycle 1 committed before its second delivery: %v", got)
 	}
-	got = s.deliver(r, 1, []byte("1b"), "101", "", nil)
+	got, _ = s.deliver(r, 1, []byte("1b"), "101", "", nil)
 	if len(got) != 2 {
 		t.Fatalf("expected cycle 1 then cycle 2 to commit, got %d", len(got))
 	}
@@ -74,7 +74,7 @@ func TestStagedCycleSeqZeroCommitsOnArrival(t *testing.T) {
 	r := ref(t, "orders")
 	// A worker-generated snapshot batch never saw a BatchMeta: seq 0, its
 	// own cycle of one.
-	got := s.deliver(r, 0, []byte("snap"), "10", "state-1", []uint32{3, 4})
+	got, _ := s.deliver(r, 0, []byte("snap"), "10", "state-1", []uint32{3, 4})
 	if len(got) != 1 {
 		t.Fatalf("seq-0 delivery did not commit on arrival: %v", got)
 	}
@@ -83,6 +83,23 @@ func TestStagedCycleSeqZeroCommitsOnArrival(t *testing.T) {
 	}
 	if s.len() != 0 {
 		t.Fatalf("seq-0 cycle leaked: %d tracked", s.len())
+	}
+}
+
+// A partial delivery of a known cycle reports known=true (it is still
+// accumulating, not dropped); a delivery for an unknown seq reports false.
+// This is what lets onStagedBatch warn only on a real wedge instead of every
+// multi-owner partial delivery (issue #372).
+func TestDeliverReportsKnownCycle(t *testing.T) {
+	s := newStagedCycles()
+	r := ref(t, "orders")
+	s.expect(r, 7, []string{"a", "b"})
+
+	if got, known := s.deliver(r, 7, []byte("a"), "100", "", nil); got != nil || !known {
+		t.Fatalf("partial delivery: got=%v known=%v, want nil,true", got, known)
+	}
+	if got, known := s.deliver(r, 99, []byte("x"), "900", "", nil); got != nil || known {
+		t.Fatalf("unknown seq: got=%v known=%v, want nil,false", got, known)
 	}
 }
 
@@ -100,7 +117,7 @@ func TestStagedCyclesDiscardTable(t *testing.T) {
 	}
 	// A discarded cycle's late delivery must be dropped, never committed as
 	// a cycle of one — that would commit a partial cycle.
-	if got := s.deliver(ref(t, "orders"), 1, []byte("late"), "100", "", nil); got != nil {
+	if got, _ := s.deliver(ref(t, "orders"), 1, []byte("late"), "100", "", nil); got != nil {
 		t.Fatalf("late delivery for a discarded cycle committed: %v", got)
 	}
 }
@@ -117,7 +134,7 @@ func TestStagedCyclesDiscardWorkerDropsAffectedTable(t *testing.T) {
 	s.expect(r, 1, []string{"a"})
 	s.expect(r, 2, []string{"b"})
 
-	if got := s.deliver(r, 2, []byte("2"), "200", "", nil); got != nil {
+	if got, _ := s.deliver(r, 2, []byte("2"), "200", "", nil); got != nil {
 		t.Fatalf("cycle 2 committed before cycle 1: %v", got)
 	}
 	if n := s.discardWorker("a"); n != 1 {
@@ -143,7 +160,7 @@ func TestStagedCyclesDiscardWorkerMarksTableGapped(t *testing.T) {
 	}
 	// A table the worker never touched is not gapped.
 	s.expect(ref(t, "items"), 3, []string{"b"})
-	s.deliver(ref(t, "items"), 3, []byte("3"), "300", "", nil)
+	_, _ = s.deliver(ref(t, "items"), 3, []byte("3"), "300", "", nil)
 	if s.isGapped("items") {
 		t.Fatal("a table unaffected by the discard must not be gapped")
 	}

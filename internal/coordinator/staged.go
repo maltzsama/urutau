@@ -129,11 +129,14 @@ func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
 }
 
 // deliver records one staged delivery and returns the run of cycles of that
-// table now committable, head-first. A Seq==0 delivery is its own cycle of
-// one, returned immediately.
-func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, state string, pending []uint32) []*stagedCycle {
+// table now committable, head-first. The second return reports whether the
+// delivery named a cycle this tracker knows: false means a too-late delivery
+// for a discarded cycle (dropped), true covers both a still-accumulating cycle
+// and a completed one. A Seq==0 delivery is its own cycle of one, returned
+// immediately.
+func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, state string, pending []uint32) (committable []*stagedCycle, known bool) {
 	if s == nil {
-		return nil
+		return nil, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,13 +148,13 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 		// a too-late delivery for a discarded cycle — dropping it is the
 		// only safe choice, since committing it would be a partial cycle.
 		if seq != 0 {
-			return nil
+			return nil, false
 		}
 		return []*stagedCycle{{
 			ref: ref, seq: 0, expected: 1,
 			descriptors: [][]byte{desc}, positions: []string{pos},
 			state: state, pending: pending,
-		}}
+		}}, true
 	}
 	cy.descriptors = append(cy.descriptors, desc)
 	cy.positions = append(cy.positions, pos)
@@ -162,11 +165,11 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 		cy.pending = pending
 	}
 	if len(cy.descriptors) < cy.expected {
-		return nil
+		return nil, true
 	}
 	delete(s.open, k)
 	s.done[k] = cy
-	return s.drainLocked(ref.Target)
+	return s.drainLocked(ref.Target), true
 }
 
 // drainLocked pops the head of table's send order while it is complete,

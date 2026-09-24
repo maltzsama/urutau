@@ -126,6 +126,31 @@ func TestSignalSessionEndResetWithoutSnapshotIsSilent(t *testing.T) {
 	}
 }
 
+// A supervisor reset (pending) must NOT discard the worker's open staged
+// cycles: the reconnecting session redelivers them, and a discarded cycle
+// would drop those redeliveries (its new-epoch sequences are unknown to
+// deliver). The run stays up so the reconnect can complete them (issue #372).
+func TestSignalSessionEndPendingDoesNotDiscard(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	c.snapshotActive.Store(false)
+	s.pendingSet("w1")
+	c.staged = newStagedCycles()
+	c.staged.expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1", "w2"})
+
+	c.signalSessionEnd("w1", context.Canceled)
+
+	select {
+	case err := <-c.sessionErrs:
+		t.Fatalf("a pending reset must not fail the run, got %v", err)
+	default:
+	}
+	if c.staged.isGapped("raw.t") {
+		t.Fatal("a pending reset must not discard the worker's cycles")
+	}
+}
+
 // A genuine worker death always surfaces, snapshot or not.
 func TestSignalSessionEndDeathSurfaces(t *testing.T) {
 	s, _ := supervisorHarness()
