@@ -167,6 +167,8 @@ type crOptions struct {
 	// Maintenance enables background Iceberg maintenance (compaction) in the
 	// inline sink spec, so an ephemeral maintenance worker Pod is scheduled.
 	Maintenance bool
+	// MaintenanceInterval is the compaction interval; empty means "1s".
+	MaintenanceInterval string
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
@@ -198,9 +200,13 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 	if opts.Maintenance {
 		// A 1s interval makes compaction due for every pass, so the
 		// ephemeral maintenance worker Pod is scheduled promptly.
+		interval := opts.MaintenanceInterval
+		if interval == "" {
+			interval = "1s"
+		}
 		sink["maintenance"] = map[string]any{
 			"enabled":    true,
-			"compaction": map[string]any{"minInputFiles": 2, "interval": "1s"},
+			"compaction": map[string]any{"minInputFiles": 2, "interval": interval},
 		}
 	}
 	cr := map[string]any{
@@ -239,9 +245,12 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 
 // ── waiting ─────────────────────────────────────────────────────────────
 
-// waitPodsByPrefix polls until exactly want Pods whose name starts with prefix
-// exist and every one is Ready, or fails after timeout. It returns their names.
-// Prefix matching avoids coupling the harness to the operator's label scheme.
+// waitPodsByPrefix polls until exactly want StatefulSet ordinal Pods whose
+// name starts with prefix (i.e. "<prefix><n>") exist and every one is Ready, or
+// fails after timeout. It returns their names. Prefix matching avoids coupling
+// the harness to the operator's label scheme; the numeric-suffix check excludes
+// a sibling that shares the prefix, like the ephemeral "<prefix>maint"
+// maintenance Pod.
 func waitPodsByPrefix(t *testing.T, ns, prefix string, want int, timeout time.Duration) []string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -254,6 +263,9 @@ func waitPodsByPrefix(t *testing.T, ns, prefix string, want int, timeout time.Du
 			f := strings.Fields(line)
 			if len(f) != 3 || !strings.HasPrefix(f[0], prefix) {
 				continue
+			}
+			if _, err := strconv.Atoi(strings.TrimPrefix(f[0], prefix)); err != nil {
+				continue // not an ordinal Pod (e.g. the "-maint" maintenance Pod)
 			}
 			if f[1] == "Running" && f[2] == "true" {
 				ready = append(ready, f[0])
@@ -575,16 +587,28 @@ type rowState struct {
 	Amount sql.NullFloat64
 }
 
+// readTable reads (id → state) from any source table.
+func readTable(t *testing.T, db *sql.DB, table string) map[int64]rowState {
+	t.Helper()
+	return readOrdersFrom(t, db, "SELECT id, v, amount FROM "+table)
+}
+
+// readTableSink reads (id → state) from any sink table (Trino, schema raw).
+func readTableSink(t *testing.T, db *sql.DB, table string) map[int64]rowState {
+	t.Helper()
+	return readOrdersFrom(t, db, "SELECT id, v, amount FROM "+table)
+}
+
 // readOrders reads (id → state) from the source (MySQL shop.orders).
 func readOrders(t *testing.T, db *sql.DB) map[int64]rowState {
 	t.Helper()
-	return readOrdersFrom(t, db, "SELECT id, v, amount FROM orders")
+	return readTable(t, db, "orders")
 }
 
 // readOrdersSink reads (id → state) from a sink table (Trino, schema raw).
 func readOrdersSink(t *testing.T, db *sql.DB, table string) map[int64]rowState {
 	t.Helper()
-	return readOrdersFrom(t, db, "SELECT id, v, amount FROM "+table)
+	return readTableSink(t, db, table)
 }
 
 func readOrdersFrom(t *testing.T, db *sql.DB, query string) map[int64]rowState {
@@ -646,17 +670,23 @@ func diffSinkSource(source, sink map[int64]rowState) (missing, extra, wrong []in
 // with the residual diff. It is the convergence wait for a live writer.
 func waitSettled(t *testing.T, mysql, trino *sql.DB, table string, timeout time.Duration) {
 	t.Helper()
+	waitSettledTables(t, mysql, trino, "orders", table, timeout)
+}
+
+// waitSettledTables is waitSettled for an arbitrary source→sink table pair.
+func waitSettledTables(t *testing.T, mysql, trino *sql.DB, srcTable, sinkTable string, timeout time.Duration) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		src := readOrders(t, mysql)
-		sink := readOrdersSink(t, trino, table)
+		src := readTable(t, mysql, srcTable)
+		sink := readTableSink(t, trino, sinkTable)
 		missing, extra, wrong := diffSinkSource(src, sink)
 		if len(missing) == 0 && len(extra) == 0 && len(wrong) == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("sink never settled to source: source=%d sink=%d missing=%v extra=%v wrongValue=%v",
-				len(src), len(sink), cap10(missing), cap10(extra), cap10(wrong))
+			t.Fatalf("sink %s never settled to source %s: source=%d sink=%d missing=%v extra=%v wrongValue=%v",
+				sinkTable, srcTable, len(src), len(sink), cap10(missing), cap10(extra), cap10(wrong))
 		}
 		time.Sleep(time.Second)
 	}
@@ -682,18 +712,24 @@ func uniqueTarget(base string) string {
 	return fmt.Sprintf("%s_%s", base, strconv.FormatInt(time.Now().UnixNano()%2176782336, 36))
 }
 
-// seedOrders clears the source and inserts `count` rows 0..count-1 with a
+// seedTable clears a source table and inserts `count` rows 0..count-1 with a
 // deterministic v/amount, so the oracle is fully known before the engine runs.
-func seedOrders(t *testing.T, db *sql.DB, count int) {
+func seedTable(t *testing.T, db *sql.DB, table string, count int) {
 	t.Helper()
-	if _, err := db.Exec("DELETE FROM orders"); err != nil {
-		t.Fatalf("clear orders: %v", err)
+	if _, err := db.Exec("DELETE FROM " + table); err != nil {
+		t.Fatalf("clear %s: %v", table, err)
 	}
 	for i := 0; i < count; i++ {
-		if _, err := db.Exec("INSERT INTO orders (id, v, amount) VALUES (?, ?, ?)", i, fmt.Sprintf("seed%d", i), float64(i)); err != nil {
-			t.Fatalf("seed orders %d: %v", i, err)
+		if _, err := db.Exec("INSERT INTO "+table+" (id, v, amount) VALUES (?, ?, ?)", i, fmt.Sprintf("seed%d", i), float64(i)); err != nil {
+			t.Fatalf("seed %s %d: %v", table, i, err)
 		}
 	}
+}
+
+// seedOrders clears the source and inserts `count` rows 0..count-1.
+func seedOrders(t *testing.T, db *sql.DB, count int) {
+	t.Helper()
+	seedTable(t, db, "orders", count)
 }
 
 // setupPodEnv is the shared fixture: the test namespace, the source/catalog
@@ -715,13 +751,19 @@ func setupPodEnv(t *testing.T) (mysql, trino *sql.DB) {
 	return openMySQL(t, localMySQLPort), openTrino(t, localTrinoPort)
 }
 
-// startWriter runs a mixed INSERT/UPDATE/DELETE load against the source until
-// the returned stop function is called. The source is the oracle, so the exact
-// operations do not need to be tracked — a row the engine loses shows up as a
-// key missing from the sink, and a resurrected delete as an extra key. The
+// startWriter runs a mixed INSERT/UPDATE/DELETE load against shop.orders.
+func startWriter(t *testing.T, db *sql.DB, interval time.Duration) (stop func()) {
+	t.Helper()
+	return startWriterOn(t, db, "orders", interval)
+}
+
+// startWriterOn runs a mixed INSERT/UPDATE/DELETE load against any source table
+// until the returned stop function is called. The source is the oracle, so the
+// exact operations do not need to be tracked — a row the engine loses shows up
+// as a key missing from the sink, and a resurrected delete as an extra key. The
 // interval must keep the writer slower than the race-instrumented worker
 // commits (roughly one row per commit here), or the sink lags past the settle.
-func startWriter(t *testing.T, db *sql.DB, interval time.Duration) (stop func()) {
+func startWriterOn(t *testing.T, db *sql.DB, table string, interval time.Duration) (stop func()) {
 	t.Helper()
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
@@ -738,13 +780,13 @@ func startWriter(t *testing.T, db *sql.DB, interval time.Duration) (stop func())
 			switch i % 3 {
 			case 0: // monotonic insert: extends the key range
 				id := int64(1000 + i/3)
-				q, args = "INSERT INTO orders (id, v, amount) VALUES (?, ?, ?)", []any{id, fmt.Sprintf("ins%d", i), float64(id)}
+				q, args = "INSERT INTO "+table+" (id, v, amount) VALUES (?, ?, ?)", []any{id, fmt.Sprintf("ins%d", i), float64(id)}
 			case 1: // update an existing key
 				id := int64((i / 3) % 200)
-				q, args = "UPDATE orders SET v = ? WHERE id = ?", []any{fmt.Sprintf("upd%d", i), id}
+				q, args = "UPDATE "+table+" SET v = ? WHERE id = ?", []any{fmt.Sprintf("upd%d", i), id}
 			case 2: // delete a key, which must not be resurrected
 				id := int64(100 + (i/3)%50)
-				q, args = "DELETE FROM orders WHERE id = ?", []any{id}
+				q, args = "DELETE FROM "+table+" WHERE id = ?", []any{id}
 			}
 			if _, err := db.Exec(q, args...); err != nil {
 				t.Logf("writer %q: %v", q, err)
