@@ -24,7 +24,6 @@ func TestScaleOutConvergence(t *testing.T) {
 	applyPipeline(t, testNS, pipeline, cr)
 
 	coordPods := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)
-	base := coordinatorMetricsBase(t, testNS, coordPods[0])
 	stss := workerSTSs(t, testNS, pipeline)
 	for _, sts := range stss {
 		waitPodsByPrefix(t, testNS, sts+"-", 1, 5*time.Minute)
@@ -34,7 +33,7 @@ func TestScaleOutConvergence(t *testing.T) {
 	stop := startWriterOn(t, mysql, src, 300*time.Millisecond)
 	scaleWorker(t, testNS, stss[0], 3)
 	waitPodsByPrefix(t, testNS, stss[0]+"-", 3, 5*time.Minute)
-	waitOwnerCount(t, base, stss[0], 3, 5*time.Minute)
+	waitOwnerCount(t, testNS, coordPods[0], stss[0], 3, 5*time.Minute)
 	t.Logf("scaled out to 3")
 	time.Sleep(15 * time.Second)
 	stop()

@@ -2,10 +2,13 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/apache/arrow-go/v18/arrow/flight"
 
 	"github.com/maltzsama/urutau/core"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -424,5 +427,72 @@ func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
 	c.mu.Unlock()
 	if still {
 		t.Fatal("a retired owner must be detached even when the context is cancelled")
+	}
+}
+
+// A re-slice registers owners (writing byTicket) while a worker opens or
+// reopens its Flight DoGet (reading byTicket): the lookup must hold c.mu, or
+// the concurrent map access races and, without -race, can panic.
+func TestDoGetTicketLookupDoesNotRaceRegisterOwner(t *testing.T) {
+	c, _ := scaleHarness(t)
+	ref, ok := c.tableRef("raw.orders")
+	if !ok {
+		ref = source.TableRef{Source: "shop.orders", Target: "raw.orders"}
+	}
+	srv := &flightServer{c: c}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		stream := &fakeDoGetStream{ctx: context.Background()}
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = srv.DoGet(&flight.Ticket{Ticket: []byte("no-such-ticket")}, stream)
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		if _, _, err := c.registerOwner(fmt.Sprintf("owner-%d", i), ref); err != nil {
+			t.Fatalf("registerOwner: %v", err)
+		}
+	}
+	close(stop)
+	<-done
+}
+
+// A scale-in that removes an owner whose Pod died before it ever attached —
+// the StatefulSet scaled back down while the new Pod was still connecting —
+// can never drain the work routed to it: no session will deliver it, the
+// supervisor ignores a never-attached owner, and every drain times out, so
+// the table wedges forever. The scale must terminate the run for a clean
+// replay instead of retrying the drain.
+func TestScaleInTerminatesOnNeverAttachedOwnerOwingWork(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.cfg.ScaleDrainTimeout = 500 * time.Millisecond
+	c.terminate = make(chan error, 1)
+	ctx := context.Background()
+	if err := c.ScaleTable(ctx, "raw.orders", 2); err != nil {
+		t.Fatalf("scale out: %v", err)
+	}
+	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	lost := owners[1]
+	if lost.attached || lost.hadSession {
+		t.Fatal("precondition: the new owner must never have attached")
+	}
+	lost.queue <- queuedBatch{id: 1, body: []byte("b")}
+
+	if err := c.ScaleTable(ctx, "raw.orders", 1); err == nil {
+		t.Fatal("scale-in must not flip over a never-attached owner's stranded work")
+	}
+	select {
+	case err := <-c.terminate:
+		if !strings.Contains(err.Error(), lost.name) {
+			t.Fatalf("terminate error must name the stranded owner, got %v", err)
+		}
+	default:
+		t.Fatal("scale-in must terminate the run for a clean replay, not retry the drain")
 	}
 }

@@ -12,14 +12,8 @@ import (
 // isolated scenarios, the faults overlap — a worker is SIGKILLed and the
 // coordinator is restarted while a table is being re-sliced and maintenance
 // runs. Every table must converge to its source exactly, with no data races.
-//
-// SKIPPED pending #372: the composition (and, narrowed, even the multi-table
-// re-slice alone) leaves a table's sink short of its source — a block of rows
-// is never applied while the committed position advances past them, so the
-// sink never converges. Remove this Skip once #372 is fixed.
 func TestPodChaosComposition(t *testing.T) {
 	requirePods(t)
-	t.Skip("blocked by #372: the composed chaos stalls a table's sink short of its source")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
