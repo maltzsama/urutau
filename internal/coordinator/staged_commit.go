@@ -59,6 +59,14 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		c.log.Warn("coordinator: staged delivery not committable", "worker", worker, "table", sb.Table, "seq", sb.Seq)
 	}
 	for _, cy := range committable {
+		// A table whose cycles were discarded after an owner was lost is
+		// gapped: committing this later cycle would advance the durable
+		// position past the discarded rows, and a replay would never recover
+		// them. Terminate instead (issue #372).
+		if c.staged.isGapped(cy.ref.Target) {
+			c.fail(fmt.Errorf("coordinator: table %s has a staged gap from a lost owner; terminating for a clean replay", cy.ref.Target))
+			return
+		}
 		// Cycles commit in send order; the first failure must stop the run
 		// here — committing a later cycle would advance the durable position
 		// past the gap the failed cycle left, and its data would never be

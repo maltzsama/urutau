@@ -127,6 +127,24 @@ func TestStagedCyclesDiscardWorkerDropsAffectedTable(t *testing.T) {
 	}
 }
 
+// A worker's death discards its cycles and marks the table gapped, so a later
+// cycle cannot commit over the discarded rows (issue #372).
+func TestStagedCyclesDiscardWorkerMarksTableGapped(t *testing.T) {
+	s := newStagedCycles()
+	r := ref(t, "orders")
+	s.expect(r, 1, []string{"a", "b"})
+	s.discardWorker("a")
+	if !s.isGapped("orders") {
+		t.Fatal("discarding a worker's cycle must mark the table gapped")
+	}
+	// A table the worker never touched is not gapped.
+	s.expect(ref(t, "items"), 3, []string{"b"})
+	s.deliver(ref(t, "items"), 3, []byte("3"), "300", "", nil)
+	if s.isGapped("items") {
+		t.Fatal("a table unaffected by the discard must not be gapped")
+	}
+}
+
 // fakeStagedSink satisfies sink.StagedCommitter (and sink.Sink via the
 // embedded interface) so isStagedTable's capability probe is exercised.
 type fakeStagedSink struct{ sink.Sink }

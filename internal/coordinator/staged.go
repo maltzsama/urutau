@@ -33,6 +33,11 @@ type stagedCycles struct {
 	open  map[cycleKey]*stagedCycle // still accumulating
 	done  map[cycleKey]*stagedCycle // complete, waiting for its turn
 	order map[string][]uint64       // per table, seqs in send order
+	// gapped marks a table whose cycles were discarded after an owner was
+	// lost: a later cycle must not commit over the gap, or the durable
+	// position would advance past the discarded rows and a replay would
+	// never recover them (issue #372).
+	gapped map[string]bool
 }
 
 type cycleKey struct {
@@ -42,10 +47,34 @@ type cycleKey struct {
 
 func newStagedCycles() *stagedCycles {
 	return &stagedCycles{
-		open:  map[cycleKey]*stagedCycle{},
-		done:  map[cycleKey]*stagedCycle{},
-		order: map[string][]uint64{},
+		open:   map[cycleKey]*stagedCycle{},
+		done:   map[cycleKey]*stagedCycle{},
+		order:  map[string][]uint64{},
+		gapped: map[string]bool{},
 	}
+}
+
+// markGapped marks each table as having a gap: its staged cycles were dropped
+// when an owner was lost, so the durable position must not advance over them.
+func (s *stagedCycles) markGapped(targets []string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range targets {
+		s.gapped[t] = true
+	}
+}
+
+// isGapped reports whether the table has a gap from a lost owner.
+func (s *stagedCycles) isGapped(target string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gapped[target]
 }
 
 // expect records that a delivery is expected from each of owners for
@@ -176,6 +205,7 @@ func (s *stagedCycles) discardWorker(worker string) int {
 	}
 	for table := range tables {
 		delete(s.order, table)
+		s.gapped[table] = true
 	}
 	return discarded
 }

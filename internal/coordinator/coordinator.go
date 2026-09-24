@@ -1723,6 +1723,17 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		return fmt.Errorf("coordinator: enqueueBatch requires a batch; window markers go through enqueueTo")
 	}
 
+	// A partition owner whose Pod died (its session attached, then detached)
+	// and has not been retired by a re-slice yet can never drain a batch
+	// routed to it: the batch strands, and other partitions' cycles advance
+	// the durable position over the gap. Fail for a clean replay instead of
+	// routing into the void (issue #372).
+	for _, w := range owners {
+		if c.ownerDetached(w) {
+			return fmt.Errorf("coordinator: owner %s of %s is detached; terminating for a clean replay", w.name, meta.Table)
+		}
+	}
+
 	if len(owners) == 1 {
 		return c.enqueueTo(ctx, owners[0], b, meta)
 	}
@@ -2634,6 +2645,15 @@ func (c *Coordinator) workerOwes(worker string) bool {
 		return false
 	}
 	return len(w.queue) > 0 || c.inFlight(worker) > 0
+}
+
+// ownerDetached reports whether an owner's Pod died — its session attached and
+// then detached — but no re-slice has retired it yet. Such an owner can never
+// drain a batch routed to it (issue #372).
+func (c *Coordinator) ownerDetached(w *workerState) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return w.hadSession && !w.attached
 }
 
 // workerSession is one connected worker's session-local surface; the group's
