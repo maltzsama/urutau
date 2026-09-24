@@ -224,3 +224,50 @@ func TestDrainNothingPending(t *testing.T) {
 		t.Fatalf("Drain(empty) = %v", err)
 	}
 }
+
+// A backlog interleaving several tables must never be encoded as one batch:
+// the batch carries a single Table, so rows of any other table would be
+// routed to — and written into — the wrong table.
+func TestNextNeverMixesTables(t *testing.T) {
+	in := []rowchange.Change{
+		sampleChange("a", 1),
+		sampleChange("a", 2),
+		sampleChange("b", 3),
+		sampleChange("a", 4),
+		sampleChange("c", 5),
+		sampleChange("c", 6),
+	}
+	ch := make(chan rowchange.Change, len(in))
+	for _, c := range in {
+		ch <- c
+	}
+	close(ch)
+	p := New(ch)
+	p.SetSchemas(schemaFor("a", "b", "c"))
+
+	type batch struct {
+		table string
+		rows  int64
+	}
+	var got []batch
+	for {
+		b, err := p.Next(context.Background())
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if b == nil {
+			break
+		}
+		got = append(got, batch{b.Table, b.Record.NumRows()})
+		b.Release()
+	}
+	want := []batch{{"a", 2}, {"b", 1}, {"a", 1}, {"c", 2}}
+	if len(got) != len(want) {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("batches = %v, want %v", got, want)
+		}
+	}
+}
