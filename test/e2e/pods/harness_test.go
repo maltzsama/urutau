@@ -28,6 +28,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/trinodb/trino-go-client/trino"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"gopkg.in/yaml.v3"
 )
 
@@ -43,8 +44,9 @@ const (
 
 	// Fixed local ports for the data-service port-forwards. Tests run
 	// serially, so a fixed pair is simpler than dynamic allocation.
-	localMySQLPort = 13306
-	localTrinoPort = 18080
+	localMySQLPort    = 13306
+	localTrinoPort    = 18080
+	localRedpandaPort = 19092
 )
 
 func requirePods(t *testing.T) {
@@ -240,6 +242,72 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 	b, err := yaml.Marshal(cr)
 	if err != nil {
 		panic(fmt.Sprintf("marshal CR: %v", err))
+	}
+	return string(b)
+}
+
+// kafkaTableSpec is one append-only Kafka→Iceberg table: a topic (the
+// "source") landing into a target with no primary key. Kafka carries no
+// before-image on deletes, so append tables must set onDelete: skip
+// (spec/validate.go); there is no update/delete concept in this shape at all
+// — a raw-format record is always an insert (internal/source/kafka/decoder
+// Raw.Decode).
+type kafkaTableSpec struct {
+	Topic  string
+	Target string
+}
+
+// buildKafkaCR renders a CDCPipeline whose source is Kafka (format: raw —
+// see kafkaTableSpec's doc comment for why raw, not debezium, is the
+// baseline shape for the resume/offset matrix). Kafka has no SQL
+// introspection, so every table must declare columns: regardless of format
+// or extraction (kafka.Source.Introspect fails boot otherwise) — here just
+// "payload: string", the one column an undeclared-extraction raw topic
+// decodes into (Raw.Decode), so this stays a schemaless, envelope-free
+// append log, the shape unique to Kafka among Urutau's sources.
+func buildKafkaCR(name, ns, image, sourceSecret, catalogSecret string, tables []kafkaTableSpec) string {
+	rendered := make([]map[string]any, 0, len(tables))
+	for _, tbl := range tables {
+		rendered = append(rendered, map[string]any{
+			"source":            tbl.Topic,
+			"target":            tbl.Target,
+			"writeMode":         "append",
+			"onDelete":          "skip",
+			"createIfNotExists": true,
+			"columns":           map[string]any{"payload": "string"},
+		})
+	}
+	sink := map[string]any{
+		"type": "iceberg+rest", "namespace": "raw", "warehouse": "quickstart_catalog",
+	}
+	cr := map[string]any{
+		"apiVersion": "urutau.io/v1alpha1",
+		"kind":       "CDCPipeline",
+		"metadata":   map[string]any{"name": name, "namespace": ns},
+		"spec": map[string]any{
+			"image": image,
+			"secrets": map[string]any{
+				"source":  sourceSecret,
+				"catalog": catalogSecret,
+			},
+			"coordinator": map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080"},
+			"worker": map[string]any{
+				"cpu": "500m", "cpu_overhead": "500m",
+				"memory": "2Gi", "memory_overhead": "1Gi",
+			},
+			"definition": map[string]any{
+				"inline": map[string]any{
+					"pipeline": name,
+					"source":   map[string]any{"kind": "kafka", "format": "raw"},
+					"sink":     sink,
+					"tables":   rendered,
+				},
+			},
+		},
+	}
+	b, err := yaml.Marshal(cr)
+	if err != nil {
+		panic(fmt.Sprintf("marshal kafka CR: %v", err))
 	}
 	return string(b)
 }
@@ -885,6 +953,165 @@ func setupPodEnv(t *testing.T) (mysql, trino *sql.DB) {
 	portForward(t, dataNS, "svc/mysql", localMySQLPort, 3306)
 	portForward(t, dataNS, "svc/trino", localTrinoPort, 8080)
 	return openMySQL(t, localMySQLPort), openTrino(t, localTrinoPort)
+}
+
+// setupPodEnvKafka is setupPodEnv for a Kafka-sourced pipeline: the Kafka
+// source Secret (a broker address, same "uri" shape the operator already
+// validates — see internal/operator/controller.go validateSecrets), the
+// catalog Secret, a port-forward to the in-cluster Redpanda, and an open
+// producer client. The Redpanda broker's OUTSIDE listener is what the
+// port-forward reaches (test/e2e/k8s/redpanda.yaml), matching the
+// docker-compose overlay's 19092 mapping.
+func setupPodEnvKafka(t *testing.T) (produce *kgo.Client, trino *sql.DB) {
+	t.Helper()
+	ensureNamespace(t, testNS)
+	ensureSecret(t, testNS, "pod-e2e-source-kafka", map[string]string{
+		"uri": "redpanda.e2e.svc.cluster.local:9092",
+	})
+	ensureSecret(t, testNS, "pod-e2e-catalog", map[string]string{
+		"uri":          "http://polaris.e2e.svc.cluster.local:8181/api/catalog",
+		"clientId":     "root",
+		"clientSecret": "s3cr3t",
+		"scope":        "PRINCIPAL_ROLE:ALL",
+	})
+	portForward(t, dataNS, "svc/redpanda", localRedpandaPort, 19092)
+	portForward(t, dataNS, "svc/trino", localTrinoPort, 8080)
+	return openKafkaProducer(t, localRedpandaPort), openTrino(t, localTrinoPort)
+}
+
+// openKafkaProducer dials the in-cluster Redpanda's OUTSIDE listener through
+// a port-forward, for the test to produce records the pipeline consumes.
+func openKafkaProducer(t *testing.T, port int) *kgo.Client {
+	t.Helper()
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(fmt.Sprintf("127.0.0.1:%d", port)),
+		// Redpanda's auto_create_topics_enabled only fires for a metadata
+		// request that explicitly asks for it — the client library does not
+		// set that flag by default, so producing to a topic this test just
+		// invented (uniqueTarget's per-run suffix) failed every record with
+		// UNKNOWN_TOPIC_OR_PARTITION until this was added (issue #394).
+		kgo.AllowAutoTopicCreation(),
+	)
+	if err != nil {
+		t.Fatalf("kafka producer: %v", err)
+	}
+	t.Cleanup(client.Close)
+	if err := client.Ping(context.Background()); err != nil {
+		t.Fatalf("ping redpanda: %v", err)
+	}
+	return client
+}
+
+// produceRawRecords synchronously produces n records of {"seq": N} JSON
+// payloads (N from start, start+1, ...) to topic, returning the seqs
+// actually acknowledged by the broker. Using JSON keeps the payload
+// self-describing for the oracle comparison without requiring a columns:
+// declaration on the pipeline side (format: raw with no per-topic
+// extraction lands the whole payload string verbatim in one column).
+func produceRawRecords(t *testing.T, client *kgo.Client, topic string, start, n int) []int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	seqs := make([]int, 0, n)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var failed []error
+	for i := 0; i < n; i++ {
+		seq := start + i
+		body, err := json.Marshal(map[string]int{"seq": seq})
+		if err != nil {
+			t.Fatalf("marshal seq %d: %v", seq, err)
+		}
+		wg.Add(1)
+		client.Produce(ctx, &kgo.Record{Topic: topic, Value: body}, func(_ *kgo.Record, err error) {
+			defer wg.Done()
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				// t.Fatal cannot be called from this callback — it does not
+				// run on the test goroutine — so a produce failure is
+				// collected here and fails the test AFTER wg.Wait() returns
+				// below. Returning only the acknowledged seqs (silently
+				// dropping the failed ones) would make an all-failed batch
+				// pass the oracle vacuously: an empty "produced" set has
+				// nothing missing from the sink (issue #394 caught this the
+				// hard way — a topic-not-yet-created race looked like a
+				// clean pass).
+				failed = append(failed, fmt.Errorf("seq %d: %w", seq, err))
+				return
+			}
+			seqs = append(seqs, seq)
+		})
+	}
+	wg.Wait()
+	if len(failed) > 0 {
+		t.Fatalf("produce %s: %d/%d records failed, first: %v", topic, len(failed), n, failed[0])
+	}
+	return seqs
+}
+
+// readKafkaRawSink reads every produced seq present in the sink table (one
+// row per delivered record, column "payload" holding the JSON string) and
+// returns how many times each seq appears — at-least-once means a seq can
+// repeat, but every produced seq must be present at least once.
+func readKafkaRawSink(t *testing.T, db *sql.DB, table string) map[int]int {
+	t.Helper()
+	rows, err := db.Query("SELECT payload FROM " + table)
+	if err != nil {
+		t.Fatalf("read %s: %v", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[int]int{}
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatalf("scan %s: %v", table, err)
+		}
+		var v struct {
+			Seq int `json:"seq"`
+		}
+		if err := json.Unmarshal([]byte(payload), &v); err != nil {
+			t.Fatalf("unmarshal payload %q: %v", payload, err)
+		}
+		out[v.Seq]++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows %s: %v", table, err)
+	}
+	return out
+}
+
+// waitKafkaSettled polls until every produced seq is present at least once in
+// the sink, or fails with the residual diff. Duplicate delivery (a seq
+// present more than once) is not a failure — the produced set must merely be
+// a subset of what actually landed.
+func waitKafkaSettled(t *testing.T, trino *sql.DB, table string, produced []int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		sink := readKafkaRawSink(t, trino, table)
+		var missing []int
+		for _, seq := range produced {
+			if sink[seq] == 0 {
+				missing = append(missing, seq)
+			}
+		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink %s never settled: produced=%d sink=%d missing=%v",
+				table, len(produced), len(sink), cap10Int(missing))
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func cap10Int(ids []int) []int {
+	if len(ids) > 10 {
+		return ids[:10]
+	}
+	return ids
 }
 
 // startWriter runs a mixed INSERT/UPDATE/DELETE load against shop.orders.
