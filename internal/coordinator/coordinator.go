@@ -1183,7 +1183,7 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 				return
 			}
 			if b.Record != nil {
-				c.log.Info("coordinator: reader batch", "table", b.Table, "rows", b.Record.NumRows(), "mode", b.Mode)
+				c.log.Debug("coordinator: reader batch", "table", b.Table, "rows", b.Record.NumRows(), "mode", b.Mode)
 			}
 			if c.metrics != nil {
 				c.metrics.EventsDecoded.Inc()
@@ -1795,7 +1795,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// no cycle is tracked and none can leak.
 	if c.stagesCycles() {
 		c.staged.expect(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners)
-		c.log.Info("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
+		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
 	for p, sub := range subBatches {
 		if sub == nil {
@@ -1892,7 +1892,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if err := c.budget.acquire(ctx, w.name, n); err != nil {
 		return err
 	}
-	c.log.Info("coordinator: enqueue sub-batch", "owner", w.name, "table", meta.Table, "seq", meta.BatchId, "highPos", meta.HighPos, "staged", meta.Staged)
+	c.log.Debug("coordinator: enqueue sub-batch", "owner", w.name, "table", meta.Table, "seq", meta.BatchId, "highPos", meta.HighPos, "staged", meta.Staged)
 	// Marker batches (window closes) carry their position in LowPos.
 	posStr := meta.HighPos
 	if posStr == "" {
@@ -2607,12 +2607,13 @@ func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	// discard them (never commit a partial cycle). The run terminates below
 	// and replays every partition from the committed position, so no later
 	// cycle may be committed over the gap.
+	var open []string
 	for _, ref := range c.workerRefs(worker) {
-		c.log.Info("coordinator: staged open before discard", "worker", worker, "table", ref.Target, "cycles", c.staged.debugOpen(ref.Target))
+		open = append(open, c.staged.debugOpen(ref.Target)...)
 	}
 	discarded := c.staged.discardWorker(worker)
 	if discarded > 0 {
-		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", discarded)
+		c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", discarded, "open-before", open)
 	}
 	c.pushDashState() // the worker is no longer attached
 	// A session that ends with context.Canceled — the Pod was deleted, or the
