@@ -13,6 +13,7 @@ package pods
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -504,6 +505,58 @@ func coordinatorMetricsBase(t *testing.T, ns, coordPod string) string {
 	t.Helper()
 	portForward(t, ns, "pod/"+coordPod, 19091, 8080)
 	return "http://127.0.0.1:19091"
+}
+
+// statuszWorkerNames fetches /statusz and returns the coordinator's registered
+// worker names — the owner layout the re-slice mutates, which the source/sink
+// convergence check alone does not prove.
+func statuszWorkerNames(t *testing.T, base string) []string {
+	t.Helper()
+	resp, err := http.Get(base + "/statusz")
+	if err != nil {
+		t.Fatalf("statusz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("statusz read: %v", err)
+	}
+	var st struct {
+		Workers map[string]json.RawMessage `json:"workers"`
+	}
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("statusz decode: %v", err)
+	}
+	names := make([]string, 0, len(st.Workers))
+	for n := range st.Workers {
+		names = append(names, n)
+	}
+	return names
+}
+
+// waitOwnerCount polls /statusz until the coordinator holds exactly want
+// registered workers whose name carries the worker StatefulSet prefix
+// (sts+"-"), proving the coordinator re-sliced to match the replica count
+// rather than merely the Pods becoming Ready.
+func waitOwnerCount(t *testing.T, base, sts string, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var got int
+	for {
+		got = 0
+		for _, n := range statuszWorkerNames(t, base) {
+			if strings.HasPrefix(n, sts+"-") {
+				got++
+			}
+		}
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("coordinator owner count for %s = %d, want %d within %s", sts, got, want, timeout)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // metricValue fetches /metrics and returns the value of the first sample whose

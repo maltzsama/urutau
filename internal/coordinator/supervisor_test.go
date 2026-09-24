@@ -165,8 +165,28 @@ func TestSupervisorTickDetachedOwingTerminates(t *testing.T) {
 	err := s.tick(time.Now(), SupervisorConfig{
 		AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute,
 	})
-	if err == nil || !strings.Contains(err.Error(), "in-flight") {
-		t.Fatalf("err = %v, want a terminate citing in-flight batches", err)
+	if err == nil || !strings.Contains(err.Error(), "detached") {
+		t.Fatalf("err = %v, want a terminate for the detached, owing worker", err)
+	}
+}
+
+// A detached worker that owes only QUEUED work (no in-flight batch) must also
+// terminate: no session will ever drain its queue, so a reset strands it
+// (issue #372).
+func TestSupervisorTickDetachedQueuedTerminates(t *testing.T) {
+	s, workers := supervisorHarness()
+	w := workers["w1"]
+	w.attached = false
+	w.hadSession = true
+	// supervisorHarness seeds one queued batch; the index stays empty, so the
+	// worker owes via the queue alone, not an in-flight batch.
+	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+
+	err := s.tick(time.Now(), SupervisorConfig{
+		AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute,
+	})
+	if err == nil || !strings.Contains(err.Error(), "detached") {
+		t.Fatalf("err = %v, want a terminate for the detached, queued-owing worker", err)
 	}
 }
 

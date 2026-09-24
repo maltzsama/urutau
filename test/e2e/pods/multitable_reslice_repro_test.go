@@ -6,8 +6,9 @@ import (
 	"time"
 )
 
-// TEMP repro for the multi-table re-slice stall (not committed): three tables
-// under continuous load, re-slicing one repeatedly, then converge.
+// Multi-table re-slice convergence: three tables under continuous load,
+// re-slicing one repeatedly, then converge — with the coordinator's owner
+// layout asserted per scale, not just the Pods (issue #372).
 func TestMultiTableResliceConvergence(t *testing.T) {
 	requirePods(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -28,7 +29,8 @@ func TestMultiTableResliceConvergence(t *testing.T) {
 	applyPipeline(t, testNS, pipeline, cr)
 	t.Logf("targets: %v", targets)
 
-	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)
+	coordPods := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)
+	base := coordinatorMetricsBase(t, testNS, coordPods[0])
 	stss := workerSTSs(t, testNS, pipeline)
 	for _, sts := range stss {
 		waitPodsByPrefix(t, testNS, sts+"-", 1, 5*time.Minute)
@@ -44,6 +46,7 @@ func TestMultiTableResliceConvergence(t *testing.T) {
 	for _, n := range []int{3, 1, 2, 1} {
 		scaleWorker(t, testNS, chaosSTS, n)
 		waitPodsByPrefix(t, testNS, chaosSTS+"-", n, 5*time.Minute)
+		waitOwnerCount(t, base, chaosSTS, n, 5*time.Minute)
 		t.Logf("re-sliced to %d", n)
 	}
 	for _, s := range stops {

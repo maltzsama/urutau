@@ -134,7 +134,11 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		window = 15 * time.Minute
 	}
 
-	var stale []string
+	type staleWorker struct {
+		name          string
+		detachedOwing bool
+	}
+	var stale []staleWorker
 	// Lock order: c.mu first, then s.mu. Session takes c.mu and calls
 	// noteAttach (s.mu) afterwards, so tick must never hold s.mu while
 	// taking c.mu — the two orders would deadlock (audit #3).
@@ -173,15 +177,22 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// (issue #372).
 		detachedOwing := !p.attached && p.hadSession && p.owes && ok && now.Sub(at) > ack
 		if s.pending[p.name] || (p.attached && p.owes && (!ok || now.Sub(at) > ack)) || detachedOwing {
-			stale = append(stale, p.name)
+			stale = append(stale, staleWorker{name: p.name, detachedOwing: detachedOwing})
 		}
 	}
 	s.mu.Unlock()
 
-	for _, worker := range stale {
-		w, ok := s.c.workers[worker]
+	for _, sw := range stale {
+		w, ok := s.c.workers[sw.name]
 		if !ok {
 			continue
+		}
+		// A detached worker that owes work can never drain it — no session
+		// will ever deliver its queue — so a reset (which assumes a reconnect
+		// and redelivery) is useless: terminate for a clean replay whether the
+		// work is queued or in flight (issue #372).
+		if sw.detachedOwing {
+			return fmt.Errorf("coordinator: worker %s is detached owing work — terminating for a clean replay", sw.name)
 		}
 		// CD-2: a reset cancels the session but is NOT a failure — the
 		// worker reconnects and drains the queue. The in-flight (unacked)
@@ -190,13 +201,13 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// plain appends). With batches owed, terminate instead for a clean
 		// replay from the committed position. A reset is safe only when the
 		// worker owes nothing.
-		if n := s.c.inFlight(worker); n > 0 {
+		if n := s.c.inFlight(sw.name); n > 0 {
 			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) — a reset would replay them; terminating for a clean replay",
-				worker, n)
+				sw.name, n)
 		}
-		if n := s.recordReset(worker, now, window); n >= maxResets {
+		if n := s.recordReset(sw.name, now, window); n >= maxResets {
 			return fmt.Errorf("coordinator: crashloop: worker %s: %d resets in %s",
-				worker, maxResets, window)
+				sw.name, maxResets, window)
 		}
 		s.c.resetWorker(w)
 	}

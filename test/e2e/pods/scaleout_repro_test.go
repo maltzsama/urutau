@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// TEMP repro: pure scale-out (1→3) under load, then converge — isolates the
-// scale-out data loss from the scale-in.
+// Pure scale-out (1→3) under load, then converge — isolates the scale-out
+// path from the scale-in, asserting the coordinator's owner count (issue #372).
 func TestScaleOutConvergence(t *testing.T) {
 	requirePods(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
@@ -23,7 +23,8 @@ func TestScaleOutConvergence(t *testing.T) {
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2308", tables, crOptions{})
 	applyPipeline(t, testNS, pipeline, cr)
 
-	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)
+	coordPods := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)
+	base := coordinatorMetricsBase(t, testNS, coordPods[0])
 	stss := workerSTSs(t, testNS, pipeline)
 	for _, sts := range stss {
 		waitPodsByPrefix(t, testNS, sts+"-", 1, 5*time.Minute)
@@ -33,6 +34,7 @@ func TestScaleOutConvergence(t *testing.T) {
 	stop := startWriterOn(t, mysql, src, 300*time.Millisecond)
 	scaleWorker(t, testNS, stss[0], 3)
 	waitPodsByPrefix(t, testNS, stss[0]+"-", 3, 5*time.Minute)
+	waitOwnerCount(t, base, stss[0], 3, 5*time.Minute)
 	t.Logf("scaled out to 3")
 	time.Sleep(15 * time.Second)
 	stop()
