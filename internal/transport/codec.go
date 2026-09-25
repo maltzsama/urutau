@@ -368,6 +368,15 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Float64Builder).Append(float64(t))
 		case int32:
 			bld.(*array.Float64Builder).Append(float64(t))
+		case uint8, uint16, uint32, uint, uint64:
+			// An unsigned source column cast to float64. Above 2^53 a
+			// float64 no longer holds every integer; reject a value it
+			// would round (2^64 itself is out of uint64 range).
+			u := unsignedOf(t)
+			if f := float64(u); f >= 1<<64 || uint64(f) != u {
+				return fmt.Errorf("value %d loses precision in float64", u)
+			}
+			bld.(*array.Float64Builder).Append(float64(u))
 		default:
 			return fmt.Errorf("want float64-compatible, got %T", v)
 		}
@@ -377,7 +386,7 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			if err := bld.(*array.Decimal128Builder).AppendValueFromString(t); err != nil {
 				return fmt.Errorf("decimal parse: %w", err)
 			}
-		case int, int32, int64, float32, float64:
+		case int, int32, int64, float32, float64, uint8, uint16, uint32, uint, uint64:
 			// A numeric source column cast to decimal renders its decimal
 			// text through the shared kernel, then appends that. The decimal
 			// kernel is Kind-agnostic (the value type is enough), so the
