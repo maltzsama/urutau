@@ -165,6 +165,9 @@ type tableSpec struct {
 	Workers int
 	// Max, when > 0, sets workers.max so the operator renders a ScaledObject.
 	Max int
+	// Cast is the table's cast map (source column → cast target), e.g. the
+	// uint64 cast an unsigned MySQL key needs.
+	Cast map[string]string
 }
 
 // crOptions are the optional knobs the scenarios toggle.
@@ -196,6 +199,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 				w["max"] = tbl.Max
 			}
 			t["workers"] = w
+		}
+		if len(tbl.Cast) > 0 {
+			t["cast"] = tbl.Cast
 		}
 		rendered = append(rendered, t)
 	}
