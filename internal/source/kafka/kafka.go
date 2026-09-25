@@ -325,6 +325,27 @@ func (r *Reader) Start(ctx context.Context, resume position.Position) error {
 	}
 	if len(parts) > 0 {
 		opts = append(opts, kgo.ConsumePartitions(parts))
+		// ConsumeResetOffset/NoResetOffset (see consumePartitionsFrom's
+		// comment on why: plain committed+1 offsets silently reset to the
+		// log start on OFFSET_OUT_OF_RANGE by default) is a CLIENT-WIDE
+		// option, not a per-partition one — it also governs the starting
+		// offset any topic under ConsumeTopics (wholeTopics) uses for a
+		// partition it is seeing for the first time, UNLESS ConsumeStartOffset
+		// is set separately (its own doc comment: "If you do not set
+		// ConsumeStartOffset, this is also the offset to start consuming
+		// from"). kgo.NoResetOffset()'s own struct literal is {at: -1} — the
+		// SAME raw value as a bare kgo.NewOffset()'s default, which is
+		// end-of-log, NOT start-of-log despite its doc comment's "similar to
+		// NewOffset().AtStart()" claim. Without ConsumeStartOffset pinned to
+		// AtStart explicitly here, a brand-new wholeTopics pipeline would
+		// silently start reading from the END of the log instead of the
+		// beginning on its very first boot — skipping its entire existing
+		// backlog, the opposite of correct and unrelated to what
+		// NoResetOffset is meant to change.
+		opts = append(opts,
+			kgo.ConsumeResetOffset(kgo.NoResetOffset()),
+			kgo.ConsumeStartOffset(kgo.NewOffset().AtStart()),
+		)
 	}
 	client, err := kgo.NewClient(opts...)
 	if err != nil {
@@ -445,18 +466,12 @@ func consumePartitionsFrom(resume position.Position) map[string]map[int32]kgo.Of
 			// start one past it, or the already-committed record would be
 			// redelivered on every resume.
 			//
-			// NoResetOffset: kgo's plain NewOffset().At(n) silently falls
-			// back to AtStart (its default resetOffset) on
-			// OFFSET_OUT_OF_RANGE — if retention has trimmed past committed,
-			// that fallback would re-read the ENTIRE retained log on this
-			// one partition, appending everything already durable a second
-			// time (exactly the bug this whole fix closes, now triggered by
-			// retention instead of by ignoring resume). NoResetOffset instead
-			// surfaces it as ErrPositionLost through classifyFetch
-			// (errors.go/kafka.go's existing fetchPositionLost handling,
-			// already written for this and otherwise unreachable — the
-			// default resetOffset absorbed it before it ever got there).
-			p[partition] = kgo.NoResetOffset().At(committed + 1)
+			// Start (below) pairs this with kgo.ConsumeResetOffset(NoResetOffset())
+			// when parts is non-empty: NoResetOffset here on the per-partition
+			// Offset value would do nothing — the OFFSET_OUT_OF_RANGE check
+			// (source.go) reads the CLIENT's cfg.resetOffset.noReset, never a
+			// per-partition Offset's own noReset field, however it was built.
+			p[partition] = kgo.NewOffset().At(committed + 1)
 		}
 		out[topic] = p
 	}
