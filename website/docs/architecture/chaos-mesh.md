@@ -47,8 +47,8 @@ harness (no client-go/controller-runtime dependency):
 | `applyPodChaos` | Creates a `PodChaos` (`pod-kill` or `pod-failure`) targeting pods by label selector. |
 | `applyNetworkChaos` | Creates a `NetworkChaos` between a selector and a target selector (e.g. worker ↔ coordinator). |
 | `applyStressChaos` | Creates a `StressChaos` (`cpu` or `memory`) targeting pods by label selector. |
-| `waitChaosExperimentInjected` | Polls the `AllInjected` condition. |
-| `waitChaosExperimentFinished` | Polls `.status.experiment.desiredPhase` for `Finished`. |
+| `waitChaosExperimentInjected` | Polls the `AllInjected` condition — the fault took effect. Works for every chaos kind. |
+| `waitChaosExperimentStopped` | Polls `.status.experiment.desiredPhase` for `Stop` — Chaos Mesh's own terminal value once a duration-bound experiment's duration elapses. |
 | `deleteChaosExperiment` | Removes the experiment CR, best-effort — safe from `t.Cleanup`. |
 
 Targets are the same coordinator/worker label selectors the rest of the
@@ -63,13 +63,20 @@ harness already uses (`deletePod`, `workerSTSs`):
 Namespace: `pod-e2e` (the harness's `testNS`), alongside the CDCPipeline the
 experiment targets.
 
-## `pod-kill` is continuous, not one-shot
+## `desiredPhase` only has two values: `Run` and `Stop`
 
-`PodChaos` with `action: pod-kill` never reaches `desiredPhase: Finished` —
-Chaos Mesh reapplies the kill to any new pod matching the selector until the
-CR is deleted. `waitChaosExperimentFinished` hangs on it forever; use
-`waitChaosExperimentInjected` (the `AllInjected` condition) instead, then
-delete the experiment once the kill has been observed.
+There is no `Finished` value anywhere in Chaos Mesh's status — the CRD's
+`desiredPhase` enum is exactly `Run` and `Stop`. A duration-bound experiment
+(`pod-failure`, `NetworkChaos`, `StressChaos`) moves from `Run` to `Stop`
+once its `duration` elapses; `waitChaosExperimentStopped` polls for that.
+
+`PodChaos` with `action: pod-kill` is different: it is continuous, not
+duration-bound, so it never leaves `Run` — Chaos Mesh reapplies the kill to
+any new pod matching the selector until the CR is deleted.
+`waitChaosExperimentStopped` hangs on it forever. Use
+`waitChaosExperimentInjected` (the `AllInjected` condition) instead, which
+works for every chaos kind, then delete the experiment once the kill has
+been observed.
 
 `pod-kill` also deletes the Pod object outright, the same as the harness's
 own `deletePod` — the owning StatefulSet recreates it as a **new Pod with the
@@ -79,6 +86,15 @@ kill happened. Compare `metadata.uid` before and after instead — that is how
 `TestChaosMeshPodKillAffectsRealPipeline` (`chaos_mesh_smoke_test.go`) proves
 Chaos Mesh, not the test process, did the killing.
 
-Duration-bound actions (`pod-failure`, `NetworkChaos`, `StressChaos`) behave
-as expected and do reach `Finished` on their own once their `duration`
-elapses.
+## `chaosDaemon.runtime` must match the cluster's actual runtime
+
+The vendored manifest leaves `chaosDaemon.runtime` at the chart's default
+(`docker`, `/var/run/docker.sock`). An earlier revision pinned it to
+`containerd`, on the assumption that's minikube's default — it silently
+broke `NetworkChaos`: the daemon could apply `PodChaos` pod-kill fine (it
+only needs the Kubernetes API), but every `NetworkChaos`/`StressChaos`
+injection failed with `unable to flush ip sets ... expected containerd://
+but got docker://...`, because minikube's default driver here runs
+Kubernetes under `dockerd`. Verify `NetworkChaos`/`StressChaos` specifically
+after touching this setting — `PodChaos` pod-kill passing is not enough
+signal that the runtime is configured correctly.
