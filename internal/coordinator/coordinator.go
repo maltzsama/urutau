@@ -10,6 +10,8 @@
 package coordinator
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -630,6 +632,9 @@ func (c *Coordinator) run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("coordinator: %s: %w", t.Source, err)
 		}
+		if err := requireOrderableRanges(t, canonical[t.Source], refs[i].PrimaryKey, ranges); err != nil {
+			return err
+		}
 		if len(ranges) != len(names) {
 			return fmt.Errorf("coordinator: %s: resolved %d partition ranges for %d worker groups", t.Source, len(ranges), len(names))
 		}
@@ -999,6 +1004,64 @@ func requirePartitionKey(t spec.Table, ref core.TableRef) error {
 			"way to divide it", t.Target)
 	}
 	return nil
+}
+
+// requireOrderableRanges rejects a partitioned table whose key, as the wire
+// carries it, cannot be ordered against the partition bounds the chunker
+// built from the source column. It happens when a cast gives an unsigned
+// MySQL key (KindUnknown at the source) a kind the bounds do not share, e.g.
+// cast: {id: string}: the snapshot splits by SQL numeric order, and live
+// routing has no order to match it (issue #406). Failing here beats failing
+// on the first live batch.
+func requireOrderableRanges(t spec.Table, wire core.Schema, pk []string, ranges []source.Chunk) error {
+	for j, name := range pk {
+		col, ok := wire.Column(name)
+		if !ok {
+			return fmt.Errorf("coordinator: %s: partition key %q is not in the table schema", t.Target, name)
+		}
+		sample, ok := keySample(col.Type.Kind)
+		if !ok {
+			if len(ranges) <= 1 {
+				continue // unpartitioned: the key is never compared
+			}
+			return fmt.Errorf("coordinator: %s: partition key %q has type %s, which cannot be range-partitioned; set workers.number to 1", t.Target, name, col.Type.Kind)
+		}
+		for _, r := range ranges {
+			for _, bound := range [][]any{r.Low, r.High} {
+				if j >= len(bound) {
+					continue
+				}
+				if _, err := compareScalar(sample, bound[j]); err != nil {
+					return fmt.Errorf("coordinator: %s: partition key %q is %s on the wire but the partition bounds are %T: "+
+						"a cast on a partition key must keep its ordering (e.g. cast an unsigned integer key to int64 or uint64, not string or decimal), "+
+						"or set workers.number to 1", t.Target, name, col.Type.Kind, bound[j])
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// keySample returns a value of the Go type transport.BatchReader.Key yields
+// for kind, or false for a kind partition routing has no order for (a
+// decimal travels as its text form, which does not order numerically).
+func keySample(kind core.Kind) (any, bool) {
+	switch kind {
+	case core.KindInt32:
+		return int32(0), true
+	case core.KindInt64:
+		return int64(0), true
+	case core.KindUInt64:
+		return uint64(0), true
+	case core.KindFloat32, core.KindFloat64:
+		return float64(0), true
+	case core.KindString:
+		return "", true
+	case core.KindBinary, core.KindUUID, core.KindFixedBinary:
+		return []byte{}, true
+	default:
+		return nil, false
+	}
 }
 
 // requireConcurrentSink rejects workers>1 when the sink does not declare the
@@ -1540,7 +1603,11 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	allChunks := snapshot.Chunks(bounds)
 	var emptyOwners []string
 	for p, w := range owners {
-		if len(clipChunksToRange(allChunks, ranges[p])) == 0 {
+		clipped, err := clipChunksToRange(allChunks, ranges[p])
+		if err != nil {
+			return fmt.Errorf("partition %d: %w", p, err)
+		}
+		if len(clipped) == 0 {
 			emptyOwners = append(emptyOwners, w.name)
 		}
 		if err := c.snapshotPartition(ctx, rdr, allChunks, ref, ranges[p], p, w, cfg); err != nil {
@@ -1565,7 +1632,10 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 // allChunks is computed once by snapshotTable (one Bounds query per table,
 // not per partition — issue #216).
 func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, allChunks []source.Chunk, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
-	chunks := clipChunksToRange(allChunks, partitionRange)
+	chunks, err := clipChunksToRange(allChunks, partitionRange)
+	if err != nil {
+		return err
+	}
 	if len(chunks) == 0 {
 		return nil // this partition's range contains no rows right now
 	}
@@ -1669,28 +1739,58 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 // chunk straddling the partition boundary never sends rows outside it.
 // An empty partitionRange (the unpartitioned {} zero value) matches
 // everything unchanged.
-func clipChunksToRange(chunks []source.Chunk, partitionRange source.Chunk) []source.Chunk {
+func clipChunksToRange(chunks []source.Chunk, partitionRange source.Chunk) ([]source.Chunk, error) {
 	if partitionRange.Low == nil && partitionRange.High == nil {
-		return chunks
+		return chunks, nil
 	}
 	var out []source.Chunk
 	for _, ch := range chunks {
-		if partitionRange.High != nil && ch.Low != nil && comparePK(ch.Low, partitionRange.High) >= 0 {
-			continue // chunk starts at/after the range ends
+		if partitionRange.High != nil && ch.Low != nil {
+			c, err := comparePK(ch.Low, partitionRange.High)
+			if err != nil {
+				return nil, err
+			}
+			if c >= 0 {
+				continue // chunk starts at/after the range ends
+			}
 		}
-		if partitionRange.Low != nil && ch.High != nil && comparePK(ch.High, partitionRange.Low) <= 0 {
-			continue // chunk ends at/before the range starts — both are half-open [Low,High)
+		if partitionRange.Low != nil && ch.High != nil {
+			c, err := comparePK(ch.High, partitionRange.Low)
+			if err != nil {
+				return nil, err
+			}
+			if c <= 0 {
+				continue // chunk ends at/before the range starts — both are half-open [Low,High)
+			}
 		}
 		clipped := ch
-		if partitionRange.Low != nil && (ch.Low == nil || comparePK(ch.Low, partitionRange.Low) < 0) {
-			clipped.Low = partitionRange.Low
+		if partitionRange.Low != nil {
+			c := -1
+			if ch.Low != nil {
+				var err error
+				if c, err = comparePK(ch.Low, partitionRange.Low); err != nil {
+					return nil, err
+				}
+			}
+			if c < 0 {
+				clipped.Low = partitionRange.Low
+			}
 		}
-		if partitionRange.High != nil && (ch.High == nil || comparePK(ch.High, partitionRange.High) > 0) {
-			clipped.High = partitionRange.High
+		if partitionRange.High != nil {
+			c := 1
+			if ch.High != nil {
+				var err error
+				if c, err = comparePK(ch.High, partitionRange.High); err != nil {
+					return nil, err
+				}
+			}
+			if c > 0 {
+				clipped.High = partitionRange.High
+			}
 		}
 		out = append(out, clipped)
 	}
-	return out
+	return out, nil
 }
 
 // enqueueBatch queues ONE source batch on a worker's Flight stream and
@@ -1782,7 +1882,10 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	nrows := reader.NumRows()
 	owner := make([]int, nrows)
 	for i := 0; i < nrows; i++ {
-		p := partitionOwner(ranges, reader.Key(i))
+		p, err := partitionOwner(ranges, reader.Key(i))
+		if err != nil {
+			return fmt.Errorf("coordinator: table %s: row %d: %w", meta.Table, i, err)
+		}
 		if p < 0 {
 			return fmt.Errorf("coordinator: table %s: row %d's key %v matches no partition range", meta.Table, i, reader.Key(i))
 		}
@@ -1955,102 +2058,170 @@ func cloneBatchMeta(meta *pb.BatchMeta) *pb.BatchMeta {
 // — the range r such that r.Low <= key < r.High (nil bounds are open).
 // Ranges must be contiguous and ordered (as Partitions/the single-range
 // default always produce); returns -1 only if no range matches, which
-// never happens for a correctly resolved table.
-func partitionOwner(ranges []source.Chunk, key []any) int {
+// never happens for a correctly resolved table. A key that cannot be
+// ordered against the bounds is an error, never a guess.
+func partitionOwner(ranges []source.Chunk, key []any) (int, error) {
 	if len(ranges) == 1 {
-		return 0 // the common, unpartitioned case — skip the comparison
+		return 0, nil // the common, unpartitioned case — skip the comparison
 	}
 	for i, r := range ranges {
-		if r.Low != nil && comparePK(key, r.Low) < 0 {
-			continue
+		if r.Low != nil {
+			c, err := comparePK(key, r.Low)
+			if err != nil {
+				return -1, err
+			}
+			if c < 0 {
+				continue
+			}
 		}
-		if r.High != nil && comparePK(key, r.High) >= 0 {
-			continue
+		if r.High != nil {
+			c, err := comparePK(key, r.High)
+			if err != nil {
+				return -1, err
+			}
+			if c >= 0 {
+				continue
+			}
 		}
-		return i
+		return i, nil
 	}
-	return -1
+	return -1, nil
 }
 
 // comparePK compares two same-shaped primary-key tuples column by
 // column, the same row-constructor semantics the chunkers' own bounds
 // comparisons use (lexicographic over the tuple). Supports the ordered
-// scalar types a partition key can be: int64-family, float64, and
-// string/[]byte (partitioning today only supports a single-column key —
-// see source.PartitionSource — so in practice these tuples always have
-// exactly one element, but the comparison is written for the general
-// tuple shape to match Chunk's own []any convention).
-func comparePK(a, b []any) int {
+// scalar types a partition key can be: signed and unsigned integers,
+// floats, and string/[]byte (partitioning today only supports a
+// single-column key — see source.PartitionSource — so in practice these
+// tuples always have exactly one element, but the comparison is written
+// for the general tuple shape to match Chunk's own []any convention).
+func comparePK(a, b []any) (int, error) {
 	for i := 0; i < len(a) && i < len(b); i++ {
-		if c := compareScalar(a[i], b[i]); c != 0 {
-			return c
+		c, err := compareScalar(a[i], b[i])
+		if err != nil {
+			return 0, err
+		}
+		if c != 0 {
+			return c, nil
 		}
 	}
-	return len(a) - len(b)
+	return len(a) - len(b), nil
 }
 
-func compareScalar(a, b any) int {
-	// Exact integer comparison first: float64 cannot represent adjacent
-	// int64 values above 2^53, so a float round-trip would collapse distinct
-	// keys and boundaries and route a key to the wrong worker.
-	if ai, aok := toInt64(a); aok {
-		if bi, bok := toInt64(b); bok {
-			switch {
-			case ai < bi:
-				return -1
-			case ai > bi:
-				return 1
-			default:
-				return 0
-			}
+// compareScalar orders two key values the way the source's SQL orders
+// them. Integers compare exactly, signed against unsigned included: float64
+// cannot represent adjacent int64 values above 2^53, so a float round-trip
+// would collapse distinct keys and boundaries and route a key to the wrong
+// worker. A pair with no common ordering (a number against a string, say)
+// is an error: a lexical fallback would order "100" before "50" and route
+// silently to the wrong partition (issue #406).
+func compareScalar(a, b any) (int, error) {
+	if ai, aok := asInteger(a); aok {
+		if bi, bok := asInteger(b); bok {
+			return ai.compare(bi), nil
 		}
 	}
-	af, aok := toFloat(a)
-	bf, bok := toFloat(b)
-	if aok && bok {
-		switch {
-		case af < bf:
-			return -1
-		case af > bf:
-			return 1
-		default:
-			return 0
+	if af, aok := asFloat(a); aok {
+		if bf, bok := asFloat(b); bok {
+			return cmp.Compare(af, bf), nil
 		}
 	}
-	as, bs := fmt.Sprint(a), fmt.Sprint(b)
-	return strings.Compare(as, bs)
+	if as, aok := asBytes(a); aok {
+		if bs, bok := asBytes(b); bok {
+			return bytes.Compare(as, bs), nil
+		}
+	}
+	return 0, fmt.Errorf("coordinator: cannot order partition key value %v (%T) against %v (%T)", a, a, b, b)
 }
 
-// toInt64 extracts an exact integer when v is an integer type. A float is not
-// coerced here: a float64 that is integral may still be an approximation of a
-// larger int64.
-func toInt64(v any) (int64, bool) {
-	switch t := v.(type) {
-	case int64:
-		return t, true
-	case int32:
-		return int64(t), true
-	case int:
-		return int64(t), true
+// integer is an exact integer of either signedness: a negative value is
+// always signed, so neg plus the magnitude orders every int64 and uint64.
+type integer struct {
+	neg bool
+	mag uint64 // |value|; for neg, the two's-complement magnitude
+}
+
+func (x integer) compare(y integer) int {
+	switch {
+	case x.neg && !y.neg:
+		return -1
+	case !x.neg && y.neg:
+		return 1
+	case x.neg: // both negative: the larger magnitude is the smaller value
+		return cmp.Compare(y.mag, x.mag)
 	default:
-		return 0, false
+		return cmp.Compare(x.mag, y.mag)
 	}
 }
 
-func toFloat(v any) (float64, bool) {
+func signed(v int64) integer {
+	if v < 0 {
+		return integer{neg: true, mag: uint64(-(v + 1)) + 1} // -MinInt64 overflows int64
+	}
+	return integer{mag: uint64(v)}
+}
+
+// asInteger extracts an exact integer when v is an integer type. A float is
+// not coerced here: a float64 that is integral may still be an
+// approximation of a larger int64.
+func asInteger(v any) (integer, bool) {
 	switch t := v.(type) {
 	case int64:
-		return float64(t), true
+		return signed(t), true
 	case int32:
-		return float64(t), true
+		return signed(int64(t)), true
+	case int16:
+		return signed(int64(t)), true
+	case int8:
+		return signed(int64(t)), true
 	case int:
-		return float64(t), true
+		return signed(int64(t)), true
+	case uint64:
+		return integer{mag: t}, true
+	case uint32:
+		return integer{mag: uint64(t)}, true
+	case uint16:
+		return integer{mag: uint64(t)}, true
+	case uint8:
+		return integer{mag: uint64(t)}, true
+	case uint:
+		return integer{mag: uint64(t)}, true
+	default:
+		return integer{}, false
+	}
+}
+
+// asFloat widens any numeric value to float64, for a float key or a float
+// against an integer bound (the Postgres chunker builds integer bounds for a
+// float key).
+func asFloat(v any) (float64, bool) {
+	switch t := v.(type) {
 	case float64:
 		return t, true
 	case float32:
 		return float64(t), true
+	}
+	if i, ok := asInteger(v); ok {
+		f := float64(i.mag)
+		if i.neg {
+			f = -f
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+// asBytes returns the bytes of a string or []byte key. Go orders strings
+// bytewise, so both compare the same way.
+func asBytes(v any) ([]byte, bool) {
+	switch t := v.(type) {
+	case string:
+		return []byte(t), true
+	case []byte:
+		return t, true
 	default:
-		return 0, false
+		return nil, false
 	}
 }
 

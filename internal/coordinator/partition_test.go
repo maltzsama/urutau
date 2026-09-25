@@ -21,16 +21,43 @@ func TestComparePKOrdersInt64(t *testing.T) {
 		{[]any{int64(9)}, []any{int64(2)}, 1},
 	}
 	for _, c := range cases {
-		if got := sign(comparePK(c.a, c.b)); got != c.want {
+		if got := sign(mustComparePK(t, c.a, c.b)); got != c.want {
 			t.Errorf("comparePK(%v, %v) sign = %d, want %d", c.a, c.b, got, c.want)
 		}
 	}
 }
 
 func TestComparePKOrdersStrings(t *testing.T) {
-	if comparePK([]any{"aaa"}, []any{"aab"}) >= 0 {
+	if mustComparePK(t, []any{"aaa"}, []any{"aab"}) >= 0 {
 		t.Fatal(`comparePK("aaa", "aab") should be < 0`)
 	}
+}
+
+func mustComparePK(t *testing.T, a, b []any) int {
+	t.Helper()
+	c, err := comparePK(a, b)
+	if err != nil {
+		t.Fatalf("comparePK(%v, %v): %v", a, b, err)
+	}
+	return c
+}
+
+func mustPartitionOwner(t *testing.T, ranges []source.Chunk, key []any) int {
+	t.Helper()
+	p, err := partitionOwner(ranges, key)
+	if err != nil {
+		t.Fatalf("partitionOwner(%v): %v", key, err)
+	}
+	return p
+}
+
+func mustClip(t *testing.T, chunks []source.Chunk, r source.Chunk) []source.Chunk {
+	t.Helper()
+	out, err := clipChunksToRange(chunks, r)
+	if err != nil {
+		t.Fatalf("clipChunksToRange: %v", err)
+	}
+	return out
 }
 
 func sign(n int) int {
@@ -46,7 +73,7 @@ func sign(n int) int {
 
 func TestPartitionOwnerSingleRangeAlwaysZero(t *testing.T) {
 	ranges := []source.Chunk{{}}
-	if got := partitionOwner(ranges, []any{int64(12345)}); got != 0 {
+	if got := mustPartitionOwner(t, ranges, []any{int64(12345)}); got != 0 {
 		t.Fatalf("partitionOwner with one range = %d, want 0", got)
 	}
 }
@@ -65,7 +92,7 @@ func TestPartitionOwnerThreeWayContiguous(t *testing.T) {
 		{0, 0}, {99, 0}, {100, 1}, {150, 1}, {199, 1}, {200, 2}, {1000, 2},
 	}
 	for _, c := range cases {
-		got := partitionOwner(ranges, []any{c.key})
+		got := mustPartitionOwner(t, ranges, []any{c.key})
 		if got != c.want {
 			t.Errorf("partitionOwner(key=%d) = %d, want %d", c.key, got, c.want)
 		}
@@ -79,14 +106,14 @@ func TestPartitionOwnerNoMatchReturnsNegativeOne(t *testing.T) {
 		{Low: nil, High: []any{int64(10)}},
 		{Low: []any{int64(20)}, High: nil},
 	}
-	if got := partitionOwner(ranges, []any{int64(15)}); got != -1 {
+	if got := mustPartitionOwner(t, ranges, []any{int64(15)}); got != -1 {
 		t.Fatalf("partitionOwner(key=15) = %d, want -1 (gap between ranges)", got)
 	}
 }
 
 func TestClipChunksToRangeUnpartitionedPassesThrough(t *testing.T) {
 	chunks := []source.Chunk{{Low: []any{int64(0)}, High: []any{int64(10)}}}
-	got := clipChunksToRange(chunks, source.Chunk{})
+	got := mustClip(t, chunks, source.Chunk{})
 	if len(got) != 1 || got[0].Low[0] != int64(0) {
 		t.Fatalf("clipChunksToRange with an empty range should pass chunks through unchanged: %+v", got)
 	}
@@ -99,11 +126,11 @@ func TestClipChunksToRangeDropsOutsideChunks(t *testing.T) {
 		{Low: []any{int64(100)}, High: nil},
 	}
 	// Partition range [50, 100) should keep only the middle chunk.
-	got := clipChunksToRange(chunks, source.Chunk{Low: []any{int64(50)}, High: []any{int64(100)}})
+	got := mustClip(t, chunks, source.Chunk{Low: []any{int64(50)}, High: []any{int64(100)}})
 	if len(got) != 1 {
 		t.Fatalf("clipChunksToRange = %+v, want exactly 1 chunk", got)
 	}
-	if comparePK(got[0].Low, []any{int64(50)}) != 0 || comparePK(got[0].High, []any{int64(100)}) != 0 {
+	if mustComparePK(t, got[0].Low, []any{int64(50)}) != 0 || mustComparePK(t, got[0].High, []any{int64(100)}) != 0 {
 		t.Fatalf("clipped chunk = %+v, want [50,100)", got[0])
 	}
 }
@@ -112,12 +139,19 @@ func TestClipChunksToRangeClampsStraddlingChunk(t *testing.T) {
 	// One big chunk [0, 1000) straddles a [200, 400) partition range —
 	// the clipped chunk must not leak rows outside [200,400).
 	chunks := []source.Chunk{{Low: []any{int64(0)}, High: []any{int64(1000)}}}
-	got := clipChunksToRange(chunks, source.Chunk{Low: []any{int64(200)}, High: []any{int64(400)}})
+	got := mustClip(t, chunks, source.Chunk{Low: []any{int64(200)}, High: []any{int64(400)}})
 	if len(got) != 1 {
 		t.Fatalf("clipChunksToRange = %+v, want 1 clamped chunk", got)
 	}
-	if comparePK(got[0].Low, []any{int64(200)}) != 0 || comparePK(got[0].High, []any{int64(400)}) != 0 {
+	if mustComparePK(t, got[0].Low, []any{int64(200)}) != 0 || mustComparePK(t, got[0].High, []any{int64(400)}) != 0 {
 		t.Fatalf("clamped chunk = %+v, want [200,400)", got[0])
+	}
+}
+
+func TestClipChunksToRangeRejectsUnorderedBounds(t *testing.T) {
+	chunks := []source.Chunk{{Low: []any{"a"}, High: []any{"z"}}}
+	if _, err := clipChunksToRange(chunks, source.Chunk{Low: []any{int64(50)}}); err == nil {
+		t.Fatal("clipChunksToRange: want an error for string chunk bounds against an int64 partition range")
 	}
 }
 
@@ -155,7 +189,7 @@ func TestSplitByOwnerRoutesRowsToTheirOwningPartition(t *testing.T) {
 	}
 	owner := make([]int, reader.NumRows())
 	for i := 0; i < reader.NumRows(); i++ {
-		owner[i] = partitionOwner(ranges, reader.Key(i))
+		owner[i] = mustPartitionOwner(t, ranges, reader.Key(i))
 	}
 
 	subs, err := splitByOwner(context.Background(), rec, owner, len(ranges))
