@@ -6,9 +6,8 @@ sidebar_position: 6
 
 This page traces one batch from the source reader to a durable `cdc.position`
 and names every point where a process can die in between. It is the map the
-crash-recovery matrix (issue #354) tests against: each boundary has a
-deterministic fault point (`internal/faultinject`) that kills the process at
-exactly that step.
+crash-recovery matrix tests against: each boundary has a deterministic fault
+point (`internal/faultinject`) that kills the process at exactly that step.
 
 The contract being tested does not change here: **a crash may cause replay,
 never loss**. Duplicate delivery is acceptable; a lost, stale or resurrected
@@ -91,17 +90,17 @@ Orphan files left by S2–S4 are unreferenced, so readers never see them. They
 stay in storage until orphan-file maintenance removes them, which only
 happens when the sink's `maintenance.orphanCleanup` is configured.
 
-## How #354's failure windows map here
+## How the crash-recovery matrix's failure windows map here
 
-| #354 window | Boundaries |
-|-------------|------------|
+| Failure window | Boundaries |
+|-----------------|------------|
 | Batch delivered to worker, before commit | D1, D2, S1 |
 | Sink write staged, before commit | S2, S4 |
 | Sink commit completed, worker has not acked | D4, S3, S5 |
 | Ack sent, coordinator has not recorded the next state | D5 |
 | Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss) |
 | Coordinator killed during an active commit cycle | S4, S5 |
-| (not in #354) Upsert split across two snapshots | D3 |
+| Upsert split across two snapshots (not in the base matrix) | D3 |
 
 ## Using the fault points
 
