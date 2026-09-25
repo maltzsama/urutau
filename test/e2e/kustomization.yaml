@@ -18,6 +18,7 @@ namespace: e2e
 resources:
   - k8s/namespace.yaml
   - k8s/mysql.yaml
+  - k8s/redpanda.yaml
   - k8s/rustfs.yaml
   - k8s/polaris.yaml
   - k8s/trino.yaml

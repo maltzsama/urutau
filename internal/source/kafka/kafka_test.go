@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/maltzsama/urutau/position"
 )
 
 func TestTransportOf(t *testing.T) {
@@ -32,5 +34,109 @@ func TestTransportOfNoHeaders(t *testing.T) {
 	tp := transportOf(&kgo.Record{Topic: "t", Partition: 0, Offset: 1})
 	if tp.Headers != "" {
 		t.Fatalf("headers = %q, want empty when none", tp.Headers)
+	}
+}
+
+func TestConsumePartitionsFromResumesAfterCommitted(t *testing.T) {
+	resume := position.NewOffsets("orders", map[int32]int64{0: 5, 1: 12})
+	got := consumePartitionsFrom(resume)
+	want := map[int32]kgo.Offset{0: kgo.NewOffset().At(6), 1: kgo.NewOffset().At(13)}
+	if len(got["orders"]) != len(want) {
+		t.Fatalf("partitions = %d, want %d", len(got["orders"]), len(want))
+	}
+	for p, w := range want {
+		g, ok := got["orders"][p]
+		if !ok {
+			t.Fatalf("partition %d missing from result", p)
+		}
+		// kgo.Offset has no exported comparison; compare through EpochOffset,
+		// which At() sets deterministically (relative=false, epoch=-1).
+		if g.EpochOffset() != w.EpochOffset() {
+			t.Fatalf("partition %d offset = %+v, want %+v", p, g.EpochOffset(), w.EpochOffset())
+		}
+	}
+}
+
+func TestConsumePartitionsFromNilOrWrongType(t *testing.T) {
+	if got := consumePartitionsFrom(nil); got != nil {
+		t.Fatalf("nil resume: got %v, want nil", got)
+	}
+	if got := consumePartitionsFrom(&position.GTID{}); got != nil {
+		t.Fatalf("wrong position type: got %v, want nil", got)
+	}
+}
+
+func TestConsumePartitionsFromEmptyTopicSkipped(t *testing.T) {
+	resume := &position.Offsets{Topics: map[string]map[int32]int64{"orders": {}}}
+	if got := consumePartitionsFrom(resume); len(got) != 0 {
+		t.Fatalf("empty-partition topic: got %v, want no entries", got)
+	}
+}
+
+// TestSplitConsumeOptsNeverOverlaps guards the exact regression this fix
+// caught in the pod e2e: kgo.NewClient refuses a topic present in BOTH
+// ConsumePartitions and ConsumeTopics, so a coordinator restart resuming one
+// topic while a second, fresh topic has no committed position yet must split
+// them into disjoint sets, never leave the resumed topic in wholeTopics too.
+func TestSplitConsumeOptsNeverOverlaps(t *testing.T) {
+	resume := position.NewOffsets("resumed", map[int32]int64{0: 9})
+	parts, wholeTopics := splitConsumeOpts([]string{"resumed", "fresh"}, resume)
+
+	if _, ok := parts["resumed"]; !ok {
+		t.Fatalf("parts = %v, want \"resumed\" present", parts)
+	}
+	for _, topic := range wholeTopics {
+		if _, ok := parts[topic]; ok {
+			t.Fatalf("topic %q in both parts and wholeTopics: %v / %v", topic, parts, wholeTopics)
+		}
+	}
+	if len(wholeTopics) != 1 || wholeTopics[0] != "fresh" {
+		t.Fatalf("wholeTopics = %v, want [fresh]", wholeTopics)
+	}
+}
+
+func TestSplitConsumeOptsNoResumeGoesWholeTopic(t *testing.T) {
+	parts, wholeTopics := splitConsumeOpts([]string{"a", "b"}, nil)
+	if len(parts) != 0 {
+		t.Fatalf("parts = %v, want none (no resume position)", parts)
+	}
+	if len(wholeTopics) != 2 {
+		t.Fatalf("wholeTopics = %v, want [a b]", wholeTopics)
+	}
+}
+
+// TestAddMissingPartitionsAddsNewOnly guards Sourcery's finding on this PR: a
+// resumed topic (already in ConsumePartitions) that gains a partition since
+// the last commit must have that new partition added at the default reset
+// offset — kgo never discovers it on its own once a topic is under
+// ConsumePartitions (AddConsumeTopics' own doc comment). Known partitions
+// must keep their resumed offset untouched.
+func TestAddMissingPartitionsAddsNewOnly(t *testing.T) {
+	known := kgo.NewOffset().At(6)
+	parts := map[string]map[int32]kgo.Offset{
+		"orders": {0: known},
+	}
+	discovered := map[string][]int32{
+		"orders": {0, 1}, // partition 1 is new since the last commit
+	}
+	addMissingPartitions(parts, discovered)
+
+	if got := parts["orders"][0]; got.EpochOffset() != known.EpochOffset() {
+		t.Fatalf("known partition 0 = %+v, want unchanged %+v", got.EpochOffset(), known.EpochOffset())
+	}
+	newOffset, ok := parts["orders"][1]
+	if !ok {
+		t.Fatal("new partition 1 was not added")
+	}
+	if want := kgo.NewOffset().AtStart(); newOffset.EpochOffset() != want.EpochOffset() {
+		t.Fatalf("new partition 1 = %+v, want AtStart %+v", newOffset.EpochOffset(), want.EpochOffset())
+	}
+}
+
+func TestAddMissingPartitionsNoNewPartitions(t *testing.T) {
+	parts := map[string]map[int32]kgo.Offset{"orders": {0: kgo.NewOffset().At(3)}}
+	addMissingPartitions(parts, map[string][]int32{"orders": {0}})
+	if len(parts["orders"]) != 1 {
+		t.Fatalf("parts = %v, want unchanged (1 partition)", parts["orders"])
 	}
 }
