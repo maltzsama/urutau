@@ -29,6 +29,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/trinodb/trino-go-client/trino"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 	"gopkg.in/yaml.v3"
 )
 
@@ -991,6 +992,11 @@ func openKafkaProducer(t *testing.T, port int) *kgo.Client {
 		// invented (uniqueTarget's per-run suffix) failed every record with
 		// UNKNOWN_TOPIC_OR_PARTITION until this was added (issue #394).
 		kgo.AllowAutoTopicCreation(),
+		// ManualPartitioner: produceRawRecords never sets Record.Partition
+		// (defaults to 0, matching every single-partition test unchanged);
+		// produceRawRecordsToPartition uses this to land records on a chosen
+		// partition deterministically, for the new-partition-discovery test.
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 	)
 	if err != nil {
 		t.Fatalf("kafka producer: %v", err)
@@ -1000,6 +1006,67 @@ func openKafkaProducer(t *testing.T, port int) *kgo.Client {
 		t.Fatalf("ping redpanda: %v", err)
 	}
 	return client
+}
+
+// createKafkaTopic explicitly creates topic with the given partition count,
+// rather than relying on auto-create (which gives the broker's default
+// partition count — 1 on this stack's Redpanda). Needed for the
+// new-partition-discovery scenario: a resume position that only knows about
+// partition 0 of a topic that already has more.
+func createKafkaTopic(t *testing.T, client *kgo.Client, topic string, partitions int32) {
+	t.Helper()
+	req := kmsg.NewCreateTopicsRequest()
+	req.Topics = []kmsg.CreateTopicsRequestTopic{{
+		Topic:             topic,
+		NumPartitions:     partitions,
+		ReplicationFactor: 1,
+	}}
+	resp, err := req.RequestWith(context.Background(), client)
+	if err != nil {
+		t.Fatalf("create topic %s: %v", topic, err)
+	}
+	for _, rt := range resp.Topics {
+		if rt.ErrorCode != 0 {
+			t.Fatalf("create topic %s: error code %d", topic, rt.ErrorCode)
+		}
+	}
+}
+
+// produceRawRecordsToPartition is produceRawRecords pinned to one partition
+// (kgo.ManualPartitioner reads Record.Partition directly), for tests that
+// need to control exactly which partition a batch lands on.
+func produceRawRecordsToPartition(t *testing.T, client *kgo.Client, topic string, partition int32, start, n int) []int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	seqs := make([]int, 0, n)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var failed []error
+	for i := 0; i < n; i++ {
+		seq := start + i
+		body, err := json.Marshal(map[string]int{"seq": seq})
+		if err != nil {
+			t.Fatalf("marshal seq %d: %v", seq, err)
+		}
+		wg.Add(1)
+		rec := &kgo.Record{Topic: topic, Partition: partition, Value: body}
+		client.Produce(ctx, rec, func(_ *kgo.Record, err error) {
+			defer wg.Done()
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failed = append(failed, fmt.Errorf("seq %d: %w", seq, err))
+				return
+			}
+			seqs = append(seqs, seq)
+		})
+	}
+	wg.Wait()
+	if len(failed) > 0 {
+		t.Fatalf("produce %s/%d: %d/%d records failed, first: %v", topic, partition, len(failed), n, failed[0])
+	}
+	return seqs
 }
 
 // produceRawRecords synchronously produces n records of {"seq": N} JSON
