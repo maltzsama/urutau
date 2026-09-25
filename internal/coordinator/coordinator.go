@@ -497,6 +497,16 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 	}
 
+	// Reject a bootstrap block this mode ignores before touching the source:
+	// the error must not hide behind a connection or introspection failure.
+	// Discovered tables (source.ExpandTables) never carry one, so checking
+	// the declared list is enough.
+	for _, t := range c.cfg.Spec.Tables {
+		if err := requireSnapshotBootstrap(t); err != nil {
+			return err
+		}
+	}
+
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
 	src, err := driver.OpenSource(c.cfg.Spec, source.Runtime{
@@ -1002,6 +1012,31 @@ func requirePartitionKey(t spec.Table, ref core.TableRef) error {
 		return fmt.Errorf("coordinator: %s: workers>1 requires a primary key: "+
 			"partitioning splits the key range, and a table without one has no "+
 			"way to divide it", t.Target)
+	}
+	return nil
+}
+
+// requireSnapshotBootstrap rejects a bootstrap block the coordinator does not
+// implement. tables[].bootstrap is honored only by the collapsed runner: the
+// coordinator snapshots every table without a committed position and starts
+// the stream at the resume or current position (issue #405). Accepting
+// adopt would silently run a full snapshot instead, and accepting an
+// explicit start would skip the changes between that position and the
+// current one. mode: snapshot with startAt: current is what the
+// coordinator already does, so it stays valid.
+func requireSnapshotBootstrap(t spec.Table) error {
+	b := t.Bootstrap
+	if b == nil {
+		return nil
+	}
+	if b.Mode != "" && b.Mode != spec.BootstrapSnapshot {
+		return fmt.Errorf("coordinator: %s: bootstrap.mode %q is not supported in distributed mode yet — "+
+			"remove the bootstrap block to snapshot the table, or run this table in the collapsed runner", t.Target, b.Mode)
+	}
+	if b.StartAt == spec.StartAtExplicit {
+		return fmt.Errorf("coordinator: %s: bootstrap.startAt %q is not supported in distributed mode yet — "+
+			"the stream would start at the current source position and skip the changes since %q; "+
+			"run this table in the collapsed runner", t.Target, b.StartAt, b.Position)
 	}
 	return nil
 }
