@@ -154,7 +154,19 @@ func CheckCast(from ColumnType, to CastTarget) error {
 			}
 			return fmt.Errorf("core: unmappable column%s → string(%s) is not supported; declare a plain string cast", prov, to.Encoding)
 		}
-		return nil
+		// The bypass skips the matrix, so it must still be a target
+		// Convert produces, or the cast passes boot and fails on the
+		// first row.
+		switch to.Type.Kind {
+		case KindString, KindBinary, KindInt64, KindUInt64, KindFloat64, KindDecimal,
+			KindUUID, KindJSON, KindTimestamp, KindTimestampTZ:
+			return nil
+		}
+		prov := ""
+		if from.Opaque != nil {
+			prov = " (" + from.Opaque.String() + ")"
+		}
+		return fmt.Errorf("core: unmappable column%s → %s is not supported; cast it to string, int64, uint64, float64, decimal, binary, uuid, json, timestamp or timestamptz", prov, to.Type)
 	}
 	switch to.Type.Kind {
 	case KindString:
@@ -285,6 +297,8 @@ func (t CastTarget) Convert(from Kind, v any) (any, error) {
 		return castToBinary(v)
 	case KindInt64:
 		return castToInt64(v)
+	case KindUInt64:
+		return castToUInt64(v)
 	case KindFloat64:
 		return castToFloat64(v)
 	case KindDecimal:
@@ -321,6 +335,9 @@ func StringifyScalar(v any) (string, error) {
 		return strconv.FormatInt(t, 10), nil
 	case uint64:
 		return strconv.FormatUint(t, 10), nil
+	case uint8, uint16, uint32, uint:
+		u, _ := unsignedValue(t)
+		return strconv.FormatUint(u, 10), nil
 	case float32:
 		return strconv.FormatFloat(float64(t), 'f', -1, 32), nil
 	case float64:
@@ -500,8 +517,59 @@ func castToInt64(v any) (any, error) {
 		return int64(t), nil
 	case int64:
 		return t, nil
+	}
+	if u, ok := unsignedValue(v); ok {
+		if u > math.MaxInt64 {
+			return nil, fmt.Errorf("core: %d overflows int64", u)
+		}
+		return int64(u), nil
+	}
+	return nil, fmt.Errorf("core: cannot cast %T to int64", v)
+}
+
+// castToUInt64 lands an integer as uint64: the cast an unsigned source
+// column (KindUnknown at the source) takes to keep values above MaxInt64.
+func castToUInt64(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if u, ok := unsignedValue(v); ok {
+		return u, nil
+	}
+	var n int64
+	switch t := v.(type) {
+	case int:
+		n = int64(t)
+	case int32:
+		n = int64(t)
+	case int64:
+		n = t
 	default:
-		return nil, fmt.Errorf("core: cannot cast %T to int64", v)
+		return nil, fmt.Errorf("core: cannot cast %T to uint64", v)
+	}
+	if n < 0 {
+		return nil, fmt.Errorf("core: negative value %d cannot be cast to uint64", n)
+	}
+	return uint64(n), nil
+}
+
+// unsignedValue widens the unsigned integer types a source decoder hands
+// over (go-mysql's canal delivers an unsigned column as uint8, uint16,
+// uint32 or uint64) to uint64.
+func unsignedValue(v any) (uint64, bool) {
+	switch t := v.(type) {
+	case uint8:
+		return uint64(t), true
+	case uint16:
+		return uint64(t), true
+	case uint32:
+		return uint64(t), true
+	case uint:
+		return uint64(t), true
+	case uint64:
+		return t, true
+	default:
+		return 0, false
 	}
 }
 
@@ -513,9 +581,11 @@ func castToFloat64(v any) (any, error) {
 		return float64(t), nil
 	case float64:
 		return t, nil
-	default:
-		return nil, fmt.Errorf("core: cannot cast %T to float64", v)
 	}
+	if u, ok := unsignedValue(v); ok {
+		return float64(u), nil
+	}
+	return nil, fmt.Errorf("core: cannot cast %T to float64", v)
 }
 
 // castToDecimal renders an integral or float value as decimal text with the
@@ -549,9 +619,11 @@ func castToDecimal(v any, precision, scale int) (any, error) {
 			return nil, err
 		}
 		return t, nil
-	default:
-		return nil, fmt.Errorf("core: cannot cast %T to decimal", v)
 	}
+	if u, ok := unsignedValue(v); ok {
+		return decimalChecked(new(big.Int).SetUint64(u), precision, scale)
+	}
+	return nil, fmt.Errorf("core: cannot cast %T to decimal", v)
 }
 
 // checkFinite rejects NaN and ±Inf, which have no decimal text.

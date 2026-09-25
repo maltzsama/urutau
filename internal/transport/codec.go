@@ -293,6 +293,14 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Int64Builder).Append(int64(t))
 		case int32:
 			bld.(*array.Int64Builder).Append(int64(t))
+		case uint8, uint16, uint32, uint, uint64:
+			// An unsigned source column cast to int64: go-mysql delivers
+			// it as a Go unsigned type. Above MaxInt64 it cannot land.
+			u := unsignedOf(t)
+			if u > math.MaxInt64 {
+				return fmt.Errorf("value %d out of int64 range", u)
+			}
+			bld.(*array.Int64Builder).Append(int64(u))
 		case float64:
 			// RV-04: math.MaxInt64 as an untyped constant converts to
 			// float64 as exactly 2^63 (float64 cannot represent 2^63-1
@@ -309,6 +317,8 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		switch t := v.(type) {
 		case uint64:
 			bld.(*array.Uint64Builder).Append(t)
+		case uint8, uint16, uint32, uint:
+			bld.(*array.Uint64Builder).Append(unsignedOf(t))
 		case int:
 			if t < 0 {
 				return fmt.Errorf("negative value %d is not representable in uint64", t)
@@ -775,4 +785,21 @@ func hexDigit(c byte) int {
 // isIntegralFloat reports whether f is an integer representable without loss.
 func isIntegralFloat(f float64) bool {
 	return f == math.Trunc(f) && !math.IsInf(f, 0) && !math.IsNaN(f)
+}
+
+// unsignedOf widens a Go unsigned integer to uint64 (0 for any other type).
+func unsignedOf(v any) uint64 {
+	switch t := v.(type) {
+	case uint8:
+		return uint64(t)
+	case uint16:
+		return uint64(t)
+	case uint32:
+		return uint64(t)
+	case uint:
+		return uint64(t)
+	case uint64:
+		return t
+	}
+	return 0
 }
