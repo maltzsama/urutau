@@ -44,3 +44,7 @@ store hold a position, the rule is:
 This rule is the design constraint any future store must honor: importing a
 second source of truth *without* it would create exactly the divergence the
 position-in-sink model exists to prevent.
+
+For the exact steps between reading a change and its position becoming
+durable, and what a crash at each step leaves behind, see
+[Commit boundaries and crash windows](./commit-boundaries.md).
