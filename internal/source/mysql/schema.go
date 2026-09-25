@@ -14,13 +14,18 @@ import (
 // declared cast can land them explicitly — never silent coercion. The source
 // knows nothing about any sink: this is the source side of the canonical
 // type system.
-func CanonicalSchema(tbl *schema.Table) (core.Schema, error) {
+//
+// Nullability comes from the introspection (tbl.Nullable). Without it every
+// column would be declared NOT NULL, the sink would create every column
+// required, and a NULL would have no representation there.
+func CanonicalSchema(tbl *Table) (core.Schema, error) {
 	cols := make([]core.Column, 0, len(tbl.Columns))
 	for _, col := range tbl.Columns {
 		ct, err := mapColumnType(col)
 		if err != nil {
 			return core.Schema{}, fmt.Errorf("mysql: column %q: %w", col.Name, err)
 		}
+		ct.Nullable = tbl.Nullable[col.Name]
 		cols = append(cols, core.Column{Name: col.Name, Type: ct})
 	}
 	var pk []string

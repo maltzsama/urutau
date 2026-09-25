@@ -13,7 +13,7 @@ import (
 const (
 	columnsSQL = `
 		SELECT column_name, data_type, column_type, collation_name,
-		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0)
+		       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0), is_nullable
 		FROM information_schema.columns
 		WHERE table_schema = ? AND table_name = ?
 		ORDER BY ordinal_position`
@@ -24,11 +24,19 @@ const (
 		ORDER BY ordinal_position`
 )
 
+// Table is an introspected table: the schema.Table the canal decoder would
+// fetch, plus the column nullability schema.Table has no field for.
+type Table struct {
+	*schema.Table
+	// Nullable holds the columns information_schema reports as nullable.
+	Nullable map[string]bool
+}
+
 // QueryTable introspects one table via information_schema, producing the
 // same schema.Table the canal decoder would fetch — so row decoding and
-// Iceberg schema derivation share one path.
-func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (*schema.Table, error) {
-	cols, err := queryColumns(ctx, db, schemaName, tableName)
+// Iceberg schema derivation share one path — and each column's nullability.
+func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (*Table, error) {
+	cols, nullable, err := queryColumns(ctx, db, schemaName, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -45,29 +53,33 @@ func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (
 			}
 		}
 	}
-	return t, nil
+	return &Table{Table: t, Nullable: nullable}, nil
 }
 
-func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableColumn, error) {
+func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]schema.TableColumn, map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, columnsSQL, s, t)
 	if err != nil {
-		return nil, fmt.Errorf("mysql: columns: %w", err)
+		return nil, nil, fmt.Errorf("mysql: columns: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var out []schema.TableColumn
+	nullable := map[string]bool{}
 	for rows.Next() {
 		var (
-			name, dataType, colType string
-			collation               sql.NullString
-			precision, scale        int
+			name, dataType, colType, isNullable string
+			collation                           sql.NullString
+			precision, scale                    int
 		)
-		if err := rows.Scan(&name, &dataType, &colType, &collation, &precision, &scale); err != nil {
-			return nil, err
+		if err := rows.Scan(&name, &dataType, &colType, &collation, &precision, &scale, &isNullable); err != nil {
+			return nil, nil, err
 		}
 		out = append(out, buildColumn(name, dataType, colType, collation.String, precision, scale))
+		if isNullable == "YES" {
+			nullable[name] = true
+		}
 	}
-	return out, rows.Err()
+	return out, nullable, rows.Err()
 }
 
 // buildColumn assembles one schema.TableColumn from an information_schema

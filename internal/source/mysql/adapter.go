@@ -86,7 +86,7 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	// A column projection must name real columns and keep every key column:
 	// the sink resolves the key and the snapshot SELECT uses the projection
 	// verbatim (#183).
-	if err := checkColumnFilterExists(st, t.ColumnFilter); err != nil {
+	if err := checkColumnFilterExists(st.Table, t.ColumnFilter); err != nil {
 		return core.TableRef{}, core.Schema{}, nil, fmt.Errorf("mysql: %s: %w", t.Source, err)
 	}
 	if err := checkColumnFilterCoversPK(t.ColumnFilter, pk); err != nil {
@@ -201,7 +201,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 				return nil, fmt.Errorf("mysql: schema %s: %w", ref.Source, serr)
 			}
 			t, _ := a.tableFor(ref.Source)
-			proj, perr := newProjection(t.ColumnFilter, t.Filter, st)
+			proj, perr := newProjection(t.ColumnFilter, t.Filter, st.Table)
 			if perr != nil {
 				return nil, fmt.Errorf("mysql: %s: %w", ref.Source, perr)
 			}

@@ -22,7 +22,7 @@ func testWriter() *TableWriter {
 	return &TableWriter{
 		dataSchema: arrow.NewSchema([]arrow.Field{
 			{Name: "id", Type: arrow.PrimitiveTypes.Int64},
-			{Name: "v", Type: arrow.BinaryTypes.String},
+			{Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
 			{Name: "_op", Type: arrow.BinaryTypes.String},
 		}, nil),
 		delSchema: arrow.NewSchema([]arrow.Field{
