@@ -136,10 +136,13 @@ spec:
 
 // waitChaosExperimentInjected polls a Chaos Mesh experiment until its
 // AllInjected condition is True — the fault has actually been applied to
-// every selected pod. Needed for continuous actions like pod-kill, whose
-// .status.experiment.desiredPhase stays "Run" forever (Chaos Mesh reapplies
-// the kill to any new pod matching the selector until the CR is deleted) and
-// so never reports Finished.
+// every selected pod. This is the only reliable "the fault took effect"
+// signal for every chaos kind: .status.experiment.desiredPhase is not it —
+// its CRD schema allows exactly two values, "Run" and "Stop", never
+// "Finished" — and for a continuous action like pod-kill it never leaves
+// "Run" at all (Chaos Mesh reapplies the kill to any new pod matching the
+// selector until the CR is deleted), so it cannot signal completion for
+// every kind the way AllInjected does.
 func waitChaosExperimentInjected(t *testing.T, ns, kind, name string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -156,22 +159,23 @@ func waitChaosExperimentInjected(t *testing.T, ns, kind, name string, timeout ti
 	}
 }
 
-// waitChaosExperimentFinished polls a Chaos Mesh experiment until its
-// .status.experiment.desiredPhase reports Finished. Only duration-bound
-// actions (pod-failure, NetworkChaos, StressChaos) reach this phase on their
-// own; a continuous action like pod-kill never does — use
-// waitChaosExperimentInjected for that instead.
-func waitChaosExperimentFinished(t *testing.T, ns, kind, name string, timeout time.Duration) {
+// waitChaosExperimentStopped polls a Chaos Mesh experiment until its
+// .status.experiment.desiredPhase reports Stop — Chaos Mesh's own terminal
+// value once a duration-bound experiment's duration elapses. Only
+// duration-bound actions (pod-failure, NetworkChaos, StressChaos) reach this
+// on their own; a continuous action like pod-kill stays at "Run" forever —
+// use waitChaosExperimentInjected for that instead.
+func waitChaosExperimentStopped(t *testing.T, ns, kind, name string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		out := kubectl(t, "-n", ns, "get", kind, name, "-o",
 			"jsonpath={.status.experiment.desiredPhase}")
-		if strings.TrimSpace(out) == "Finished" {
+		if strings.TrimSpace(out) == "Stop" {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s/%s did not reach Finished within %s (last phase: %q)", kind, name, timeout, out)
+			t.Fatalf("%s/%s did not reach Stop within %s (last phase: %q)", kind, name, timeout, out)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
