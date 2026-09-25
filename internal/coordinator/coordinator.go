@@ -497,6 +497,16 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 	}
 
+	// Reject a bootstrap block this mode ignores before touching the source:
+	// the error must not hide behind a connection or introspection failure.
+	// Discovered tables (source.ExpandTables) never carry one, so checking
+	// the declared list is enough.
+	for _, t := range c.cfg.Spec.Tables {
+		if err := requireSnapshotBootstrap(t); err != nil {
+			return err
+		}
+	}
+
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
 	src, err := driver.OpenSource(c.cfg.Spec, source.Runtime{
@@ -591,9 +601,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 	for _, t := range c.cfg.Spec.Tables {
 		if t.Mode == spec.ModeIncremental {
 			return fmt.Errorf("coordinator: %s: incremental mode is not supported in distributed mode yet — run this table in the collapsed runner", t.Target)
-		}
-		if err := requireSnapshotBootstrap(t); err != nil {
-			return err
 		}
 	}
 
