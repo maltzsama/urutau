@@ -19,8 +19,11 @@ import (
 // coordinator, produces a second batch, and checks that every record from
 // both batches is present in the sink — proving neither "skip nothing (a
 // duplicate-that-matters)" nor "resume past uncommitted data (a loss)"
-// happened. format: raw is the baseline shape (see kafkaTableSpec's doc
-// comment): this is not a Debezium/CDC question, it is an offset/resume
+// happened, AND that no pre-restart record — durably committed strictly
+// before the kill — was re-delivered, which is what actually distinguishes a
+// correct resume from a silent full re-read of the topic that happens not to
+// have lost anything. format: raw is the baseline shape (see kafkaTableSpec's
+// doc comment): this is not a Debezium/CDC question, it is an offset/resume
 // question that lives below the decoder.
 func TestKafkaResumeAcrossCoordinatorRestart(t *testing.T) {
 	requirePods(t)
@@ -67,6 +70,28 @@ func TestKafkaResumeAcrossCoordinatorRestart(t *testing.T) {
 	waitKafkaSettled(t, trino, target, all, 5*time.Minute)
 	t.Logf("second batch committed: %d records (total %d)", len(second), len(all))
 
+	// waitKafkaSettled only proves "present at least once" — a resume that
+	// silently re-read the WHOLE topic from the beginning (this issue's
+	// original bug) would also satisfy it, since nothing is missing, only
+	// duplicated. The first batch was durably committed (worker acked,
+	// cdc.position advanced) strictly BEFORE the coordinator was killed, so
+	// no at-least-once redelivery window applies to it: every one of its
+	// seqs must appear in the sink EXACTLY once, never re-appended by the
+	// restart. This is the assertion that actually distinguishes "resumed
+	// correctly" from "resumed by re-reading everything and got lucky that
+	// nothing was missing."
+	sink := readKafkaRawSink(t, trino, target)
+	var duplicated []int
+	for _, seq := range first {
+		if sink[seq] > 1 {
+			duplicated = append(duplicated, seq)
+		}
+	}
+	if len(duplicated) > 0 {
+		t.Fatalf("resume re-delivered %d pre-restart record(s) that were already committed (the original bug: a full topic re-read from the beginning): %v",
+			len(duplicated), cap10Int(duplicated))
+	}
+
 	assertNoRaces(t, testNS, pipeline+"-")
-	t.Log("kafka resume across coordinator restart: no record lost, no data race")
+	t.Log("kafka resume across coordinator restart: no record lost, no unbounded re-delivery, no data race")
 }
