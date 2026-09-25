@@ -4,16 +4,17 @@ sidebar_position: 7
 
 # Chaos Mesh in the pod e2e cluster
 
-Issue #383 provisions real [Chaos Mesh](https://chaos-mesh.org) in the pod e2e
-minikube cluster and gives the harness (`test/e2e/pods`) primitives to create,
-observe and remove experiments against the real Urutau coordinator/worker
-Pods. It is deliberately scoped to that foundation: the *randomized*
-scheduling of overlapping faults belongs to issue #385's nondeterministic
-chaos controller, built on top of these primitives, not to this page.
+Real [Chaos Mesh](https://chaos-mesh.org) runs in the pod e2e minikube
+cluster, and the harness (`test/e2e/pods`) has primitives to create, observe
+and remove experiments against the real Urutau coordinator/worker Pods. This
+page covers that foundation only: install, the harness API, and its one sharp
+edge. Randomized scheduling of overlapping faults — which chaos type, which
+target, when, how long — is a separate concern built on top of these
+primitives, not covered here.
 
-The acceptance bar this exists to satisfy: fault injection here must be a
-real Chaos Mesh resource acting on the real MySQL → Iceberg pipeline, never
-`deletePod` or in-process goroutine control standing in for it.
+Fault injection through this path must be a real Chaos Mesh resource acting
+on the real MySQL → Iceberg pipeline, never `deletePod` or in-process
+goroutine control standing in for it.
 
 ## Install
 
