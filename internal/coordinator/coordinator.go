@@ -472,13 +472,6 @@ func Run(ctx context.Context, cfg Config) error {
 func (c *Coordinator) run(ctx context.Context) error {
 	c.runCtx = ctx
 
-	// Lag grows between commits, so the gauge needs its own clock: setting it
-	// on the ack path would pin it near zero after every commit and never let
-	// it rise. Mirrors the dashboard's on-demand Tables().
-	if c.metrics != nil {
-		go c.lagLoop(ctx)
-	}
-
 	if cfg := c.cfg.Eventlog; cfg != nil {
 		ec := *cfg
 		// Apply the shared key convention: the trail lives under the
@@ -880,6 +873,15 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// per-change one-row Flight batch. The FIFO queue preserves the wire
 	// ordering the window protocol needs.
 	out, streamErr := sourceBatches(ctx, rdr)
+	// Lag grows between commits, so the gauge needs its own clock: setting it
+	// on the ack path would pin it near zero after every commit and never let
+	// it rise. Mirrors the dashboard's on-demand Tables(). Started only now:
+	// it reads c.snk and c.cfg.Spec.Tables, which boot writes above, and a
+	// loop started earlier raced them (the race image aborted a restarting
+	// coordinator on it). Before the pump runs there is no lag to report.
+	if c.metrics != nil {
+		go c.lagLoop(ctx)
+	}
 	go c.pump(ctx, out)
 
 	// The snapshot runs in its own goroutine: run's terminal select must
