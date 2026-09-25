@@ -57,17 +57,18 @@ func (fakeISConn) QueryContext(_ context.Context, query string, args []driver.Na
 		}, nil
 	case strings.Contains(query, "information_schema.columns"):
 		// column_name, data_type, column_type, collation_name,
-		// numeric_precision, numeric_scale — in the order the SELECT lists.
+		// numeric_precision, numeric_scale, is_nullable — in the order the
+		// SELECT lists.
 		return &fakeRows{
-			cols: []string{"column_name", "data_type", "column_type", "collation_name", "numeric_precision", "numeric_scale"},
+			cols: []string{"column_name", "data_type", "column_type", "collation_name", "numeric_precision", "numeric_scale", "is_nullable"},
 			data: [][]driver.Value{
-				{"id", "bigint", "bigint unsigned", nil, int64(20), int64(0)},
-				{"tenant", "int", "int(11)", nil, int64(10), int64(0)},
-				{"digest", "binary", "binary(16)", nil, int64(0), int64(0)},
-				{"name", "varchar", "varchar(64)", "latin1_swedish_ci", int64(0), int64(0)},
-				{"status", "enum", "enum('new','paid')", "utf8mb4_general_ci", int64(0), int64(0)},
-				{"flags", "set", "set('a','b','c')", "utf8mb4_general_ci", int64(0), int64(0)},
-				{"amount", "decimal", "decimal(20,4)", nil, int64(20), int64(4)},
+				{"id", "bigint", "bigint unsigned", nil, int64(20), int64(0), "NO"},
+				{"tenant", "int", "int(11)", nil, int64(10), int64(0), "NO"},
+				{"digest", "binary", "binary(16)", nil, int64(0), int64(0), "YES"},
+				{"name", "varchar", "varchar(64)", "latin1_swedish_ci", int64(0), int64(0), "YES"},
+				{"status", "enum", "enum('new','paid')", "utf8mb4_general_ci", int64(0), int64(0), "NO"},
+				{"flags", "set", "set('a','b','c')", "utf8mb4_general_ci", int64(0), int64(0), "YES"},
+				{"amount", "decimal", "decimal(20,4)", nil, int64(20), int64(4), "YES"},
 			},
 		}, nil
 	}
@@ -220,6 +221,18 @@ func TestQueryTableToCanonicalSchema(t *testing.T) {
 	}
 	if got, want := cs.PrimaryKey, []string{"id", "tenant"}; !equalStrings(got, want) {
 		t.Errorf("PrimaryKey = %v, want %v", got, want)
+	}
+	// information_schema.is_nullable must reach the canonical schema: a
+	// nullable column declared NOT NULL made the sink create a required
+	// column and write NULL as the zero value ("" / 0).
+	for name, want := range map[string]bool{
+		"id": false, "tenant": false, "digest": true, "name": true,
+		"status": false, "flags": true, "amount": true,
+	} {
+		c, ok := cs.Column(name)
+		if !ok || c.Type.Nullable != want {
+			t.Errorf("%s Nullable = %v, want %v", name, c.Type.Nullable, want)
+		}
 	}
 }
 

@@ -53,7 +53,7 @@ func TestCanonicalSchemaFixedBinary(t *testing.T) {
 			{Name: "digest", Type: schema.TYPE_BINARY, RawType: "binary(16)", FixedSize: 16},
 		},
 	}
-	cs, err := CanonicalSchema(tbl)
+	cs, err := CanonicalSchema(&Table{Table: tbl})
 	if err != nil {
 		t.Fatalf("canonical: %v", err)
 	}
