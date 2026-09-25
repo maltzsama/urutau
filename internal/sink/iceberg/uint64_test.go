@@ -101,3 +101,47 @@ func TestDeleteRecordUint64PK(t *testing.T) {
 		t.Fatalf("delete key = %q, want the canonical decimal form of the uint64 PK", d.ValueStr(0))
 	}
 }
+
+// A column CAST to uint64 (an unsigned MySQL key, KindUnknown at the source)
+// goes through the value-level cast path, not the columnar one: Convert
+// returns uint64, and it must land in the decimal(20,0) column in the same
+// canonical decimal text the delete path uses, above MaxInt64 included.
+func TestProjectRecordUint64Cast(t *testing.T) {
+	cp, err := core.ParseCastPolicy(map[string]string{"big": "uint64"})
+	if err != nil {
+		t.Fatalf("cast: %v", err)
+	}
+	cs := core.Schema{Columns: []core.Column{
+		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		{Name: "big", Type: core.ColumnType{Kind: core.KindUInt64}},
+	}, PrimaryKey: []string{"id"}}
+	wire, err := transport.CoreSchemaToArrow(cs)
+	if err != nil {
+		t.Fatalf("wire schema: %v", err)
+	}
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, wire)
+	defer bld.Release()
+	bld.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2}, nil)
+	bld.Field(1).(*array.Uint64Builder).AppendValues([]uint64{18446744073709551615, 7}, nil)
+	for j := 2; j < int(wire.NumFields()); j++ {
+		bld.Field(j).AppendNulls(2)
+	}
+	rec := bld.NewRecordBatch()
+	defer rec.Release()
+
+	target := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "big", Type: &arrow.Decimal128Type{Precision: 20, Scale: 0}},
+	}, nil)
+	w := &TableWriter{dataSchema: target, metaByName: map[string]core.MetadataColumn{}, cast: cp}
+	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p"), Mode: dataplane.UpsertMode}
+	out, err := w.projectRecord(context.Background(), b)
+	if err != nil {
+		t.Fatalf("projectRecord: %v", err)
+	}
+	defer out.Release()
+	d := out.Column(1).(*array.Decimal128)
+	if d.ValueStr(0) != "18446744073709551615" || d.ValueStr(1) != "7" {
+		t.Fatalf("big = %q, %q; want the full uint64 values", d.ValueStr(0), d.ValueStr(1))
+	}
+}

@@ -45,6 +45,35 @@ func (p *Puller) SetSchemas(schemas map[string]core.Schema) {
 	p.schemas = schemas
 }
 
+// SetSourceSchemas implements source.SchemaSetter for every stream that
+// embeds a Puller: the engine hands over the resolved wire schema, and each
+// column the source introspected as KindUnknown (an unsigned MySQL integer,
+// say) takes its resolved kind, which only the declared cast knows. Without
+// it such a column cannot be encoded ("unsupported canonical kind unknown").
+// Every other column keeps the source's own type, and no column is added:
+// the wire carries the source type, and the sink applies the cast.
+func (p *Puller) SetSourceSchemas(resolved map[string]core.Schema) {
+	for table, cs := range p.schemas {
+		rs, ok := resolved[table]
+		if !ok {
+			continue
+		}
+		cols := make([]core.Column, len(cs.Columns))
+		for i, c := range cs.Columns {
+			if c.Type.Kind == core.KindUnknown {
+				if rc, ok := rs.Column(c.Name); ok && rc.Type.Kind != core.KindUnknown {
+					nullable := c.Type.Nullable
+					c.Type = rc.Type
+					c.Type.Nullable = nullable
+				}
+			}
+			cols[i] = c
+		}
+		cs.Columns = cols
+		p.schemas[table] = cs
+	}
+}
+
 // SetErr installs the decoder's terminal-error channel.
 func (p *Puller) SetErr(errCh <-chan error) { p.errCh = errCh }
 

@@ -113,6 +113,12 @@ func (w *TableWriter) projectDataColumn(ctx context.Context, reader *transport.B
 			if err != nil {
 				return nil, fmt.Errorf("value %d: %w", i, err)
 			}
+			// Iceberg has no unsigned integer: a uint64 cast lands in a
+			// decimal(20,0) column, as canonical decimal text, the same
+			// form scalarValue gives the delete path.
+			if u, ok := cv.(uint64); ok {
+				cv = strconv.FormatUint(u, 10)
+			}
 			values[i] = cv
 		}
 		if err := appendColumn(bld, field, values); err != nil {

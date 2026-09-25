@@ -293,6 +293,14 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Int64Builder).Append(int64(t))
 		case int32:
 			bld.(*array.Int64Builder).Append(int64(t))
+		case uint8, uint16, uint32, uint, uint64:
+			// An unsigned source column cast to int64: go-mysql delivers
+			// it as a Go unsigned type. Above MaxInt64 it cannot land.
+			u := unsignedOf(t)
+			if u > math.MaxInt64 {
+				return fmt.Errorf("value %d out of int64 range", u)
+			}
+			bld.(*array.Int64Builder).Append(int64(u))
 		case float64:
 			// RV-04: math.MaxInt64 as an untyped constant converts to
 			// float64 as exactly 2^63 (float64 cannot represent 2^63-1
@@ -309,6 +317,8 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		switch t := v.(type) {
 		case uint64:
 			bld.(*array.Uint64Builder).Append(t)
+		case uint8, uint16, uint32, uint:
+			bld.(*array.Uint64Builder).Append(unsignedOf(t))
 		case int:
 			if t < 0 {
 				return fmt.Errorf("negative value %d is not representable in uint64", t)
@@ -358,6 +368,15 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.Float64Builder).Append(float64(t))
 		case int32:
 			bld.(*array.Float64Builder).Append(float64(t))
+		case uint8, uint16, uint32, uint, uint64:
+			// An unsigned source column cast to float64. Above 2^53 a
+			// float64 no longer holds every integer; reject a value it
+			// would round (2^64 itself is out of uint64 range).
+			u := unsignedOf(t)
+			if f := float64(u); f >= 1<<64 || uint64(f) != u {
+				return fmt.Errorf("value %d loses precision in float64", u)
+			}
+			bld.(*array.Float64Builder).Append(float64(u))
 		default:
 			return fmt.Errorf("want float64-compatible, got %T", v)
 		}
@@ -367,7 +386,7 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			if err := bld.(*array.Decimal128Builder).AppendValueFromString(t); err != nil {
 				return fmt.Errorf("decimal parse: %w", err)
 			}
-		case int, int32, int64, float32, float64:
+		case int, int32, int64, float32, float64, uint8, uint16, uint32, uint, uint64:
 			// A numeric source column cast to decimal renders its decimal
 			// text through the shared kernel, then appends that. The decimal
 			// kernel is Kind-agnostic (the value type is enough), so the
@@ -775,4 +794,21 @@ func hexDigit(c byte) int {
 // isIntegralFloat reports whether f is an integer representable without loss.
 func isIntegralFloat(f float64) bool {
 	return f == math.Trunc(f) && !math.IsInf(f, 0) && !math.IsNaN(f)
+}
+
+// unsignedOf widens a Go unsigned integer to uint64 (0 for any other type).
+func unsignedOf(v any) uint64 {
+	switch t := v.(type) {
+	case uint8:
+		return uint64(t)
+	case uint16:
+		return uint64(t)
+	case uint32:
+		return uint64(t)
+	case uint:
+		return uint64(t)
+	case uint64:
+		return t
+	}
+	return 0
 }
