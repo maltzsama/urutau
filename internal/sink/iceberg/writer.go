@@ -22,6 +22,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/faultinject"
 )
 
 // ErrCommitExhausted marks a terminal commit failure: retries against the
@@ -200,6 +201,12 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		}
 		if err := w.commitDeletes(ctx, keys, delPos, b.SnapshotState, b.SnapshotPending); err != nil {
 			return err
+		}
+		if delPos == "" {
+			// The deletes are durable, the appends and the position are not:
+			// the batch's keys are absent from the table until a replay.
+			faultinject.At(faultinject.IcebergUpsertBetweenDeleteAndAppend,
+				"table", identString(w.ident), "seq", b.Seq, "position", pos)
 		}
 	}
 	if upsertBatch != nil && upsertBatch.Record.NumRows() > 0 {
