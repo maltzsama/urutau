@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -185,6 +186,9 @@ func dbTypeName(cols []*sql.ColumnType, i int) string {
 // midnight, TIMESTAMP keeps its instant. The query connection parses in UTC,
 // so these arrive UTC-tagged. Non-temporal values fall back to normalize.
 func normalizeSnapshot(v any, dbType string, loc *time.Location) any {
+	if dbType == "UNSIGNED BIGINT" {
+		return normalizeUnsigned(v)
+	}
 	t, ok := v.(time.Time)
 	if !ok {
 		return normalize(v)
@@ -201,9 +205,40 @@ func normalizeSnapshot(v any, dbType string, loc *time.Location) any {
 	}
 }
 
+// normalizeUnsigned returns an UNSIGNED BIGINT cell as uint64. go-sql-driver
+// returns one three ways: uint64 over the text protocol (a query without
+// args), and over the binary protocol (a query with args, as every bounded
+// chunk is) int64 when it fits in 63 bits and its decimal text above that.
+// Bounds and rows must carry one type whichever protocol served them: chunk
+// bounds that mix int64 and uint64 cannot be encoded, and the uint64 codec
+// rejects the text form. A value that is none of these is returned as is, so
+// the codec reports it.
+func normalizeUnsigned(v any) any {
+	switch t := v.(type) {
+	case int64:
+		if t >= 0 {
+			return uint64(t)
+		}
+	case []byte:
+		if u, err := strconv.ParseUint(string(t), 10, 64); err == nil {
+			return u
+		}
+		return string(t)
+	case string:
+		if u, err := strconv.ParseUint(t, 10, 64); err == nil {
+			return u
+		}
+	}
+	return v
+}
+
 // scanRow scans one row into a normalized []any (used for chunk bounds).
 func scanRow(rows *sql.Rows) ([]any, error) {
 	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	colTypes, err := rows.ColumnTypes()
 	if err != nil {
 		return nil, err
 	}
@@ -222,6 +257,10 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	// []byte cell here would otherwise flow raw into the persisted bounds
 	// and be bound back into SQL as the wrong type.
 	for i := range vals {
+		if dbTypeName(colTypes, i) == "UNSIGNED BIGINT" {
+			vals[i] = normalizeUnsigned(vals[i])
+			continue
+		}
 		vals[i] = normalize(vals[i])
 	}
 	return vals, nil
