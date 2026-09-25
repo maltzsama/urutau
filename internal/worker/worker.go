@@ -17,6 +17,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
@@ -511,12 +512,20 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 				}
 				return err
 			}
-		} else if err := p.committer.Commit(ctx, rb.batch); err != nil {
-			rb.batch.Release()
-			if w.metrics != nil {
-				w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
+			faultinject.At(faultinject.WorkerStagedShippedBeforeAck,
+				"table", p.target, "seq", rb.batch.Seq, "position", string(rb.batch.Watermark))
+		} else {
+			faultinject.At(faultinject.WorkerCommitBefore,
+				"table", p.target, "seq", rb.batch.Seq, "position", string(rb.batch.Watermark))
+			if err := p.committer.Commit(ctx, rb.batch); err != nil {
+				rb.batch.Release()
+				if w.metrics != nil {
+					w.metrics.CommitFailures.WithLabelValues(p.target).Inc()
+				}
+				return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
 			}
-			return fmt.Errorf("worker: table %s: commit: %w", p.target, err)
+			faultinject.At(faultinject.WorkerCommittedBeforeAck,
+				"table", p.target, "seq", rb.batch.Seq, "position", string(rb.batch.Watermark))
 		}
 		// Ack only AFTER the batch is durable (non-staged) or staged for the
 		// coordinator's commit (staged). Acking first advanced the
@@ -554,6 +563,8 @@ func (w *Worker) stageBatch(ctx context.Context, p *tablePipeline, b *dataplane.
 	if w.onStaged == nil {
 		return fmt.Errorf("worker: table %s: staged assignment without a delivery callback", p.target)
 	}
+	faultinject.At(faultinject.WorkerStagedBeforeShip,
+		"table", p.target, "seq", b.Seq, "position", string(b.Watermark))
 	if err := w.onStaged(p.target, b.Seq, desc, string(b.Watermark), b.SnapshotState, b.SnapshotPending); err != nil {
 		return fmt.Errorf("worker: table %s: ship staged descriptor: %w", p.target, err)
 	}

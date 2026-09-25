@@ -10,6 +10,12 @@
 # ships on debian-slim with libgcc. It is a test artifact, not the release
 # image. The binaries are deliberately NOT stripped (-s -w omitted): a race
 # report needs symbols to name the frames.
+#
+# -tags faultinject compiles in the commit-boundary fault points
+# (internal/faultinject): armed by a file inside the Pod, they SIGKILL the
+# process at an exact step of the commit path for the crash-recovery matrix.
+# The shipped image (build/Dockerfile) never sets the tag, so there they are
+# empty functions.
 ARG GO_VERSION=1.26.5
 FROM golang:${GO_VERSION}-bookworm AS build
 WORKDIR /src
@@ -26,7 +32,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       -X github.com/maltzsama/urutau/internal/version.Commit=${COMMIT}"; \
     for pair in urutau:urutau urutau-coordinator:coordinator urutau-worker:worker urutau-operator:operator urutau-history-server:history-server; do \
       name="${pair%%:*}"; dir="${pair##*:}"; \
-      CGO_ENABLED=1 go build -race -trimpath -ldflags="$ldflags" -o "/out/$name" "./cmd/$dir"; \
+      CGO_ENABLED=1 go build -race -tags faultinject -trimpath -ldflags="$ldflags" -o "/out/$name" "./cmd/$dir"; \
     done
 
 # The race runtime links only against libc (verified with ldd: libc.so.6 +

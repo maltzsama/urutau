@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1187,6 +1188,9 @@ func startWriter(t *testing.T, db *sql.DB, interval time.Duration) (stop func())
 	return startWriterOn(t, db, "orders", interval)
 }
 
+// writerRuns numbers startWriterOn calls within this test binary.
+var writerRuns atomic.Int64
+
 // startWriterOn runs a mixed INSERT/UPDATE/DELETE load against any source table
 // until the returned stop function is called. The source is the oracle, so the
 // exact operations do not need to be tracked — a row the engine loses shows up
@@ -1195,6 +1199,13 @@ func startWriter(t *testing.T, db *sql.DB, interval time.Duration) (stop func())
 // commits (roughly one row per commit here), or the sink lags past the settle.
 func startWriterOn(t *testing.T, db *sql.DB, table string, interval time.Duration) (stop func()) {
 	t.Helper()
+	// Every call writes its own key range and its own values. A test that
+	// starts the writer more than once against the same table (one run per
+	// fault point) would otherwise re-INSERT keys the previous run created
+	// (duplicate-key errors) and re-UPDATE rows to values they already hold —
+	// and MySQL writes no binlog event for an UPDATE that changes nothing, so
+	// the later runs silently produced almost no CDC traffic.
+	run := writerRuns.Add(1) - 1
 	stopCh := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -1209,11 +1220,11 @@ func startWriterOn(t *testing.T, db *sql.DB, table string, interval time.Duratio
 			var args []any
 			switch i % 3 {
 			case 0: // monotonic insert: extends the key range
-				id := int64(1000 + i/3)
-				q, args = "INSERT INTO "+table+" (id, v, amount) VALUES (?, ?, ?)", []any{id, fmt.Sprintf("ins%d", i), float64(id)}
+				id := 1000 + run*100000 + int64(i/3)
+				q, args = "INSERT INTO "+table+" (id, v, amount) VALUES (?, ?, ?)", []any{id, fmt.Sprintf("ins%d-%d", run, i), float64(id)}
 			case 1: // update an existing key
 				id := int64((i / 3) % 200)
-				q, args = "UPDATE "+table+" SET v = ? WHERE id = ?", []any{fmt.Sprintf("upd%d", i), id}
+				q, args = "UPDATE "+table+" SET v = ? WHERE id = ?", []any{fmt.Sprintf("upd%d-%d", run, i), id}
 			case 2: // delete a key, which must not be resurrected
 				id := int64(100 + (i/3)%50)
 				q, args = "DELETE FROM "+table+" WHERE id = ?", []any{id}

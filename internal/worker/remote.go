@@ -24,6 +24,7 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/enrich"
+	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -731,6 +732,8 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		rec.Release()
 		return nil
 	}
+	faultinject.At(faultinject.WorkerBatchReceived,
+		"table", meta.Table, "seq", meta.BatchId, "position", meta.HighPos, "staged", meta.Staged)
 	r.log.Debug("worker apply batch", "table", meta.Table, "high", meta.HighPos, "rows", rec.NumRows(), "staged", meta.Staged)
 
 	b := &dataplane.Batch{

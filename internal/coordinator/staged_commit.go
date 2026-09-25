@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/faultinject"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -96,9 +97,13 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	mu := c.stagedLock(cy.ref.Target)
 	mu.Lock()
 	defer mu.Unlock()
+	faultinject.At(faultinject.CoordinatorCycleBeforeCommit,
+		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
 	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {
 		return fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err)
 	}
+	faultinject.At(faultinject.CoordinatorCycleCommittedBeforeRecord,
+		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
 	c.log.Debug("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos, "owners", len(cy.owners), "descriptors", len(cy.descriptors))
 	// The cycle is durable: only now may source retention advance. Record the
 	// cycle's position for every owner it covered, so confirmedPosition (the

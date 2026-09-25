@@ -44,6 +44,7 @@ import (
 	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
@@ -2150,6 +2151,8 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.fail(fmt.Errorf("coordinator: worker %s: unparsable ack position %q: %w", worker, ack.Position, err))
 		return
 	}
+	faultinject.At(faultinject.CoordinatorAckBeforeRecord,
+		"table", ack.Table, "worker", worker, "position", ack.Position)
 	idx := c.indexOf(worker)
 	if idx == nil {
 		// The worker's index is gone (unregistered on a rolled-back scale):
