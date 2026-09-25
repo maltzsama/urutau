@@ -15,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
@@ -281,21 +283,43 @@ func (r *Reader) ClearWindow() {}
 // Start connects the Kafka consumer, seeded from the resume position:
 // resume's per-partition offsets (position.Offsets — a partial order over
 // possibly-multiple topics) are read starting exactly there via
-// kgo.ConsumePartitions; any partition resume does not name (a fresh
-// pipeline, or a partition added since the last commit) still uses
-// kgo.ConsumeTopics, which discovers it and starts from the client's default
-// reset policy (the beginning of the log). Without this, every restart
-// re-read every partition from the beginning regardless of what was already
-// committed — harmless under exactly-once/idempotent sinks, but on an
-// append-only table (Kafka's only mode with no PK to collapse duplicates on)
-// every restart re-appended everything already durable, unbounded and
-// silent (issue #394).
+// kgo.ConsumePartitions; a topic resume does not mention at all (a fresh
+// pipeline) uses kgo.ConsumeTopics, which discovers it and starts from the
+// client's default reset policy (the beginning of the log). Without this,
+// every restart re-read every partition from the beginning regardless of
+// what was already committed — harmless under exactly-once/idempotent sinks,
+// but on an append-only table (Kafka's only mode with no PK to collapse
+// duplicates on) every restart re-appended everything already durable,
+// unbounded and silent (issue #394).
+//
+// A topic WITH a resume position still needs its CURRENT partition count: a
+// partition added since the last commit has no entry in resume and, once a
+// topic is under ConsumePartitions, kgo never discovers new partitions for it
+// on its own (AddConsumeTopics' own doc comment: "if you specified
+// ConsumePartitions, this will not add the rest of the partitions for a
+// topic ... until the entire topic is purged") — records written to that
+// partition would be silently skipped forever, the same loss this whole fix
+// exists to close. A short-lived metadata-only client resolves each resumed
+// topic's partitions before the real consuming client is built, so
+// discoveredPartitions below can add any partition resume does not name at
+// the default reset offset, keeping the FINAL ConsumePartitions map complete
+// for every resumed topic in one shot (kgo refuses a client where the same
+// topic appears in both ConsumePartitions and ConsumeTopics, so this cannot
+// be patched up after construction either).
 func (r *Reader) Start(ctx context.Context, resume position.Position) error {
+	parts, wholeTopics := splitConsumeOpts(r.topics, resume)
+	if len(parts) > 0 {
+		discovered, err := discoverPartitions(ctx, r.src.Spec.Source.URI, r.logger, mapKeys(parts))
+		if err != nil {
+			return fmt.Errorf("kafka: discover partitions: %w", err)
+		}
+		addMissingPartitions(parts, discovered)
+	}
+
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(r.src.Spec.Source.URI),
 		kgo.WithLogger(newKgoLogger(r.logger)),
 	}
-	parts, wholeTopics := splitConsumeOpts(r.topics, resume)
 	if len(wholeTopics) > 0 {
 		opts = append(opts, kgo.ConsumeTopics(wholeTopics...))
 	}
@@ -319,12 +343,10 @@ func (r *Reader) Start(ctx context.Context, resume position.Position) error {
 // kgo refuses a client where the same topic appears in both ("these options
 // are a union, it is invalid to specify specific partitions for a topic
 // while also consuming the entire topic"). A topic with a resume offset goes
-// through ConsumePartitions only (parts); every other topic (no committed
-// position yet, or a resume of a different position type) goes through
-// ConsumeTopics (wholeTopics), whole-topic discovery from the default reset
-// policy — this is also where a topic's newly added partition lands, since
-// consumePartitionsFrom only names the partitions the resume position knew
-// about.
+// through ConsumePartitions only (parts, completed by discoverPartitions
+// below); every other topic (no committed position yet, or a resume of a
+// different position type) goes through ConsumeTopics (wholeTopics),
+// whole-topic discovery from the default reset policy.
 func splitConsumeOpts(topics []string, resume position.Position) (parts map[string]map[int32]kgo.Offset, wholeTopics []string) {
 	parts = consumePartitionsFrom(resume)
 	for _, topic := range topics {
@@ -333,6 +355,69 @@ func splitConsumeOpts(topics []string, resume position.Position) (parts map[stri
 		}
 	}
 	return parts, wholeTopics
+}
+
+// mapKeys returns a map's keys, for discoverPartitions' topic list.
+func mapKeys[K comparable, V any](m map[K]V) []K {
+	out := make([]K, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// discoverPartitions returns every partition Kafka currently reports for
+// each of topics, via a short-lived metadata-only client (no consume options
+// — Request works without them) closed before this returns.
+func discoverPartitions(ctx context.Context, uri string, logger *slog.Logger, topics []string) (map[string][]int32, error) {
+	client, err := kgo.NewClient(kgo.SeedBrokers(uri), kgo.WithLogger(newKgoLogger(logger)))
+	if err != nil {
+		return nil, fmt.Errorf("new client: %w", err)
+	}
+	defer client.Close()
+
+	req := kmsg.NewMetadataRequest()
+	req.Topics = make([]kmsg.MetadataRequestTopic, len(topics))
+	for i, topic := range topics {
+		t := topic
+		req.Topics[i] = kmsg.MetadataRequestTopic{Topic: &t}
+	}
+	resp, err := req.RequestWith(ctx, client)
+	if err != nil {
+		return nil, fmt.Errorf("metadata request: %w", err)
+	}
+	out := make(map[string][]int32, len(resp.Topics))
+	for _, t := range resp.Topics {
+		if t.Topic == nil {
+			continue
+		}
+		if t.ErrorCode != 0 {
+			return nil, fmt.Errorf("topic %q: %w", *t.Topic, kerr.ErrorForCode(t.ErrorCode))
+		}
+		partitions := make([]int32, len(t.Partitions))
+		for i, p := range t.Partitions {
+			partitions[i] = p.Partition
+		}
+		out[*t.Topic] = partitions
+	}
+	return out, nil
+}
+
+// addMissingPartitions adds, to parts (in place), every partition
+// discoverPartitions reports for a topic that parts does not already name —
+// a partition added to the topic since the last commit — at the default
+// reset offset (AtStart, matching what a wholly-fresh topic under
+// ConsumeTopics would use). parts is keyed by exactly the topics
+// discoverPartitions was asked about, so every topic here is already present.
+func addMissingPartitions(parts map[string]map[int32]kgo.Offset, discovered map[string][]int32) {
+	for topic, partitions := range discovered {
+		known := parts[topic]
+		for _, p := range partitions {
+			if _, ok := known[p]; !ok {
+				known[p] = kgo.NewOffset().AtStart()
+			}
+		}
+	}
 }
 
 // consumePartitionsFrom translates a resume position's per-partition offsets
@@ -359,7 +444,19 @@ func consumePartitionsFrom(resume position.Position) map[string]map[int32]kgo.Of
 			// tracker, and never reaches cdc.position). The next fetch must
 			// start one past it, or the already-committed record would be
 			// redelivered on every resume.
-			p[partition] = kgo.NewOffset().At(committed + 1)
+			//
+			// NoResetOffset: kgo's plain NewOffset().At(n) silently falls
+			// back to AtStart (its default resetOffset) on
+			// OFFSET_OUT_OF_RANGE — if retention has trimmed past committed,
+			// that fallback would re-read the ENTIRE retained log on this
+			// one partition, appending everything already durable a second
+			// time (exactly the bug this whole fix closes, now triggered by
+			// retention instead of by ignoring resume). NoResetOffset instead
+			// surfaces it as ErrPositionLost through classifyFetch
+			// (errors.go/kafka.go's existing fetchPositionLost handling,
+			// already written for this and otherwise unreachable — the
+			// default resetOffset absorbed it before it ever got there).
+			p[partition] = kgo.NoResetOffset().At(committed + 1)
 		}
 		out[topic] = p
 	}

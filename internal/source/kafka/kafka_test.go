@@ -104,3 +104,39 @@ func TestSplitConsumeOptsNoResumeGoesWholeTopic(t *testing.T) {
 		t.Fatalf("wholeTopics = %v, want [a b]", wholeTopics)
 	}
 }
+
+// TestAddMissingPartitionsAddsNewOnly guards Sourcery's finding on this PR: a
+// resumed topic (already in ConsumePartitions) that gains a partition since
+// the last commit must have that new partition added at the default reset
+// offset — kgo never discovers it on its own once a topic is under
+// ConsumePartitions (AddConsumeTopics' own doc comment). Known partitions
+// must keep their resumed offset untouched.
+func TestAddMissingPartitionsAddsNewOnly(t *testing.T) {
+	known := kgo.NewOffset().At(6)
+	parts := map[string]map[int32]kgo.Offset{
+		"orders": {0: known},
+	}
+	discovered := map[string][]int32{
+		"orders": {0, 1}, // partition 1 is new since the last commit
+	}
+	addMissingPartitions(parts, discovered)
+
+	if got := parts["orders"][0]; got.EpochOffset() != known.EpochOffset() {
+		t.Fatalf("known partition 0 = %+v, want unchanged %+v", got.EpochOffset(), known.EpochOffset())
+	}
+	newOffset, ok := parts["orders"][1]
+	if !ok {
+		t.Fatal("new partition 1 was not added")
+	}
+	if want := kgo.NewOffset().AtStart(); newOffset.EpochOffset() != want.EpochOffset() {
+		t.Fatalf("new partition 1 = %+v, want AtStart %+v", newOffset.EpochOffset(), want.EpochOffset())
+	}
+}
+
+func TestAddMissingPartitionsNoNewPartitions(t *testing.T) {
+	parts := map[string]map[int32]kgo.Offset{"orders": {0: kgo.NewOffset().At(3)}}
+	addMissingPartitions(parts, map[string][]int32{"orders": {0}})
+	if len(parts["orders"]) != 1 {
+		t.Fatalf("parts = %v, want unchanged (1 partition)", parts["orders"])
+	}
+}
