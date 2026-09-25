@@ -311,6 +311,13 @@ type Coordinator struct {
 	confirmedMu sync.Mutex
 	confirmed   map[string]position.Position
 
+	// bootCommitted is each table's committed cdc.position read at boot
+	// (resumeFrom). A crash recovery replays every table from the minimum
+	// across tables, so a table ahead of it sees batches it already holds;
+	// its workers skip those as covered (worker.batchReceiver.covered) and
+	// never stage them. Written once before the pump starts, read-only after.
+	bootCommitted map[string]position.Position
+
 	cp         *checkpoint
 	supervisor *supervisor
 	terminate  chan error
@@ -1936,16 +1943,33 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 			total++
 		}
 	}
+	// Each sub-batch's high position (its last row's __pos) is computed
+	// here, once, and sent as its HighPos: the worker decides "covered" on
+	// exactly this value, and the cycle must not expect a delivery the
+	// worker will skip.
+	highs := make([]string, len(subBatches))
 	cycleOwners := make([]string, 0, total)
 	for p, sub := range subBatches {
-		if sub != nil {
-			cycleOwners = append(cycleOwners, owners[p].name)
+		if sub == nil {
+			continue
 		}
+		reader, rerr := transport.NewBatchReader(sub, nil)
+		if rerr != nil {
+			releaseRecords(subBatches)
+			return fmt.Errorf("coordinator: table %s: partition %d: %w", meta.Table, p, rerr)
+		}
+		if reader.NumRows() > 0 {
+			highs[p] = reader.Position(reader.NumRows() - 1)
+		}
+		if c.coveredAtBoot(meta.Table, highs[p]) {
+			continue
+		}
+		cycleOwners = append(cycleOwners, owners[p].name)
 	}
 	// Only a staging sink commits per cycle; for any other concurrent sink
 	// (ClickHouse, Couchbase) the workers commit their own sub-batches, so
 	// no cycle is tracked and none can leak.
-	if c.stagesCycles() {
+	if c.stagesCycles() && len(cycleOwners) > 0 {
 		c.staged.expect(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners)
 		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
@@ -1954,7 +1978,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 			continue // no rows for this partition in this batch
 		}
 		subMeta := cloneBatchMeta(meta)
-		subMeta.HighPos = "" // recomputed per sub-batch below
+		subMeta.HighPos = highs[p]
 		subBatch := &dataplane.Batch{Table: b.Table, Record: sub, Watermark: b.Watermark, Mode: b.Mode}
 		if err := c.enqueueTo(ctx, owners[p], subBatch, subMeta); err != nil {
 			// enqueueTo already released subBatch (and its Record — the same
@@ -1965,6 +1989,23 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		}
 	}
 	return nil
+}
+
+// coveredAtBoot mirrors the worker's covered check (batchReceiver.covered):
+// a sub-batch whose high position is at or before the table's committed
+// position at boot is skipped by its worker, acked but never staged. An
+// Incomparable pair is never covered, matching the worker.
+func (c *Coordinator) coveredAtBoot(table, high string) bool {
+	cp, ok := c.bootCommitted[table]
+	if !ok || high == "" {
+		return false
+	}
+	p, err := c.src.ParsePosition(high)
+	if err != nil {
+		return false
+	}
+	cmp := p.Compare(cp)
+	return cmp != position.Incomparable && cmp <= 0
 }
 
 // enqueueTo serializes and queues ONE batch (or a nil-record marker) on
@@ -2664,6 +2705,7 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	if len(positions) == 0 {
 		return nil, needsSnapshot, nil
 	}
+	c.bootCommitted = byTarget
 	// MinSafe: an incomparable pair (should not happen for one source) is an
 	// error — guessing a minimum could resume past uncommitted data (P1).
 	best, err := position.MinSafe(positions)
