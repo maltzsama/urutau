@@ -72,6 +72,19 @@ than skipping the gap.
   path did not read a column's unsignedness, so an unsigned column was
   declared `int64` and wrapped negative above 2^63 instead of asking for the
   cast; `BINARY(n)` similarly kept its declared length only on the CDC path.
+  A cast to `uint64` lands as `decimal(20,0)` in Iceberg, which has no
+  unsigned integer.
+- **Nullability** — a column's `NULL`/`NOT NULL` comes from
+  `information_schema.columns.is_nullable`, so a nullable column is an
+  optional column in the target. Earlier versions did not read it: every
+  column was declared `NOT NULL`, Iceberg tables were created with every
+  column required, and a `NULL` was written as the column's zero value (`""`,
+  `0`). A table created that way now stops the pipeline at the first `NULL`
+  for a required column, naming the column, instead of writing the zero
+  value. Make the column optional (in Trino:
+  `ALTER TABLE t ALTER COLUMN c DROP NOT NULL`) and resume. Rows already
+  written with a zero value in place of `NULL` are not corrected; re-snapshot
+  the table to repair them.
 - **`FLOAT` keeps MySQL's stored precision** — a 4-byte `FLOAT` is read as
   `float32` by both the snapshot and the CDC path and widened to `float64`
   once, so the two agree on the value MySQL actually stores: `0.1` lands as

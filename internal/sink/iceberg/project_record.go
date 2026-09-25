@@ -54,6 +54,17 @@ func (w *TableWriter) projectRecord(ctx context.Context, b *dataplane.Batch) (ar
 			releaseCols(cols, i)
 			return nil, fmt.Errorf("iceberg: column %q: %w", f.Name, err)
 		}
+		// A NULL has no representation in a required column: Parquet
+		// would write the value slot, landing it as "" or 0. A table
+		// created before its source reported nullability (the MySQL
+		// source did not) has every column required.
+		if !f.Nullable && col.NullN() > 0 {
+			col.Release()
+			releaseCols(cols, i)
+			return nil, fmt.Errorf("iceberg: column %q is required in %v but %d row(s) carry NULL — "+
+				"make the column optional (e.g. Trino: ALTER TABLE ... ALTER COLUMN %s DROP NOT NULL) and resume",
+				f.Name, w.ident, col.NullN(), f.Name)
+		}
 		cols[i] = col
 	}
 

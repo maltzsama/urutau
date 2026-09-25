@@ -148,12 +148,12 @@ func TestProjectRecordComposite(t *testing.T) {
 func TestProjectRecordCompositeNulls(t *testing.T) {
 	w := &TableWriter{dataSchema: arrow.NewSchema([]arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
-		{Name: "cust", Type: arrow.StructOf(arrow.Field{Name: "name", Type: arrow.BinaryTypes.String})},
-		{Name: "tags", Type: arrow.ListOfNonNullable(arrow.BinaryTypes.String)},
+		{Name: "cust", Type: arrow.StructOf(arrow.Field{Name: "name", Type: arrow.BinaryTypes.String}), Nullable: true},
+		{Name: "tags", Type: arrow.ListOfNonNullable(arrow.BinaryTypes.String), Nullable: true},
 		{Name: "attrs", Type: arrow.MapOfFields(
 			arrow.Field{Name: "key", Type: arrow.BinaryTypes.String, Nullable: false},
 			arrow.Field{Name: "value", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-		)},
+		), Nullable: true},
 	}, nil), metaByName: map[string]core.MetadataColumn{}, cast: core.CastPolicy{}}
 	data, err := transport.CoreSchemaToArrow(core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
