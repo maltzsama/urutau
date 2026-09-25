@@ -478,18 +478,34 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 	// prepared batches from readyCh and commits them one at a time.
 	// While batch N commits (catalog round-trips, S3 writes), batch
 	// N+1 collapses concurrently in the batcher goroutine below.
+	//
+	// A committer failure cancels the pipeline: the committer stops
+	// reading readyCh, so without the cancel the batcher would block on
+	// its next send forever, and the worker would go silent (no ack, no
+	// error) until the coordinator declared it stalled.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- w.runCommitter(ctx, p)
+		err := w.runCommitter(ctx, p)
+		if err != nil {
+			cancel(err)
+		}
+		errCh <- err
 	}()
 
 	// Batcher goroutine: collects changes, collapses, sends to readyCh.
 	err := w.runBatcher(ctx, p)
 	close(p.readyCh) // signal committer to drain and exit
-	if err != nil {
-		return err
+	if cerr := <-errCh; cerr != nil {
+		// The committer's error is the cause; the batcher's is its echo
+		// (context canceled). Release what the committer never took.
+		for rb := range p.readyCh {
+			rb.batch.Release()
+		}
+		return cerr
 	}
-	return <-errCh
+	return err
 }
 
 // runCommitter reads prepared batches and commits them serially.
