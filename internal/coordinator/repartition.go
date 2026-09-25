@@ -514,6 +514,13 @@ func (c *Coordinator) rangesFor(ctx context.Context, target string, n int, ref s
 	// way boot does, and keep it for the next re-slice.
 	chunker := c.lookupChunker(target)
 	if chunker == nil {
+		if c.qsrc == nil {
+			// A source with no SQL query surface (Kafka: coordinator.go's
+			// boot makes QuerySource optional, issue #394) has no chunker at
+			// all — scaling it out to n>1 is a config error, not a nil-qsrc
+			// panic on the line below.
+			return nil, fmt.Errorf("coordinator: scale %s: source %q has no SQL query surface to partition by", target, c.cfg.Spec.Source.Kind)
+		}
 		built, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 		if err != nil {
 			return nil, fmt.Errorf("chunker: %w", err)

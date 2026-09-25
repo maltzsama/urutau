@@ -1025,6 +1025,13 @@ func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, 
 		// lazily (the common case pays no chunker construction here).
 		return []source.Chunk{{}}, nil, nil
 	}
+	if c.qsrc == nil {
+		// A source with no SQL query surface (Kafka: coordinator.go's boot
+		// makes QuerySource optional, issue #394) has no chunker at all —
+		// range-partitioning it is a config error the operator must fix, not
+		// a nil-qsrc panic on the line below.
+		return nil, nil, fmt.Errorf("workers: %d: source %q has no SQL query surface to partition by; set workers.number to 1", n, c.cfg.Spec.Source.Kind)
+	}
 	chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 	if err != nil {
 		return nil, nil, fmt.Errorf("workers: %d: chunker: %w", n, err)
