@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Bring up the pod e2e environment — the engine's real deployment topology:
 # cert-manager (the operator webhook needs it), the in-cluster data services
-# with a FRESH Polaris catalog whose S3 endpoint is in-cluster, and the
-# operator built from the race-instrumented image so the coordinator and every
-# worker Pod it provisions run under the race detector.
+# with a FRESH Polaris catalog whose S3 endpoint is in-cluster, the operator
+# built from the race-instrumented image so the coordinator and every worker
+# Pod it provisions run under the race detector, and Chaos Mesh so scenarios
+# can inject real pod/network/resource faults against those Pods.
 #
 #   make e2e-pods-up
 #
@@ -19,6 +20,7 @@ cd "$ROOT"
 KUBECTL="${KUBECTL:-kubectl}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
 KEDA_VERSION="${KEDA_VERSION:-v2.16.1}"
+CHAOS_MESH_VERSION="${CHAOS_MESH_VERSION:-2.8.4}"
 RACE_IMAGE="${RACE_IMAGE:-urutau:dev-race}"
 
 say() { printf '\n==> %s\n' "$*"; }
@@ -67,5 +69,15 @@ fi
 say "prometheus (namespace monitoring)"
 "$KUBECTL" apply -f test/e2e/pods/k8s/monitoring/prometheus.yaml
 "$KUBECTL" -n monitoring rollout status deployment/prometheus --timeout=300s
+
+say "Chaos Mesh (${CHAOS_MESH_VERSION})"
+if ! "$KUBECTL" get namespace chaos-mesh >/dev/null 2>&1; then
+  # --server-side: like KEDA's CRDs, several of Chaos Mesh's (schedules,
+  # workflows, workflownodes) are too large for the client-side
+  # last-applied-configuration annotation ("metadata.annotations: Too long").
+  "$KUBECTL" apply --server-side --force-conflicts -f test/e2e/pods/k8s/chaos-mesh/manifest.yaml
+fi
+"$KUBECTL" -n chaos-mesh wait --for=condition=Available --timeout=300s deployment --all
+"$KUBECTL" -n chaos-mesh rollout status daemonset/chaos-daemon --timeout=300s
 
 say "pod e2e environment ready"

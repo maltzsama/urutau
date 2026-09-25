@@ -64,6 +64,8 @@ const sidebars: SidebarsConfig = {
         'architecture/encode-key',
         'architecture/state-position',
         'architecture/enrich-internals',
+        'architecture/commit-boundaries',
+        'architecture/chaos-mesh',
       ],
     },
   ],
