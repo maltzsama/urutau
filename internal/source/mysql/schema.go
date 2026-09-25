@@ -15,9 +15,9 @@ import (
 // knows nothing about any sink: this is the source side of the canonical
 // type system.
 //
-// Nullability comes from the introspection (tbl.Nullable): a nullable column
-// declared NOT NULL makes the sink create a required column, and a NULL then
-// has no representation there.
+// Nullability comes from the introspection (tbl.Nullable). Without it every
+// column would be declared NOT NULL, the sink would create every column
+// required, and a NULL would have no representation there.
 func CanonicalSchema(tbl *Table) (core.Schema, error) {
 	cols := make([]core.Column, 0, len(tbl.Columns))
 	for _, col := range tbl.Columns {
