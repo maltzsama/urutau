@@ -1900,8 +1900,9 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// Partitioned table: one cycle id for the whole binlog batch. Every
 	// sub-batch sent below shares it, so the staged deliveries group back
 	// into the one cycle that must commit atomically (WK-001 C5). The
-	// expected count is the number of partitions that actually have rows
-	// — a nil sub-batch is never sent, so it is never expected.
+	// cycle expects the partitions that actually have rows and are not
+	// covered at boot — a nil sub-batch is never sent, and a covered one
+	// is skipped by its worker, so neither is expected (see cycleOwners).
 	if meta.BatchId == 0 {
 		meta.BatchId = c.batchSeq.Add(1)
 	}
