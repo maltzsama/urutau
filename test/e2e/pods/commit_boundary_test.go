@@ -1,9 +1,13 @@
 package pods
 
 import (
+	"context"
 	"database/sql"
+	"io"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,26 +45,88 @@ func podRestarts(t *testing.T, ns, pod string) int {
 	return n
 }
 
-// waitFaultFired waits until pod's container restarted past before and its
-// previous container logged the FAULT INJECTED line for point, and returns
-// that line — the diagnostic naming the table, batch and positions. The Pod
-// must also come back Ready, since the recovery runs on the restarted
-// container.
-func waitFaultFired(t *testing.T, ns, pod string, point faultinject.Point, before int, timeout time.Duration) string {
+// logFollower streams one Pod's container logs from the moment it starts, so
+// a line survives the container restarting — possibly more than once — after
+// it was written. kubectl logs --previous only keeps the LAST terminated
+// container: a worker fault ends the coordinator's run, which can restart the
+// worker a second time and replace the log that held the FAULT line. The
+// stream ends when that container exits; the process writes the FAULT line
+// before it exits, so the stream has it.
+type logFollower struct {
+	mu   sync.Mutex
+	buf  strings.Builder
+	done chan struct{}
+}
+
+// followLogs starts streaming pod's current container logs (new lines only)
+// until the container exits or the test ends.
+func followLogs(t *testing.T, ns, pod string) *logFollower {
+	t.Helper()
+	f := &logFollower{done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "logs", "-f", "--tail=0", pod)
+	cmd.Stdout = f
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("follow logs of %s: %v", pod, err)
+	}
+	go func() {
+		_ = cmd.Wait()
+		close(f.done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-f.done
+	})
+	return f
+}
+
+func (f *logFollower) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buf.Write(p)
+}
+
+// line returns the first streamed line containing want, or "".
+func (f *logFollower) line(want string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, l := range strings.Split(f.buf.String(), "\n") {
+		if strings.Contains(l, want) {
+			return l
+		}
+	}
+	return ""
+}
+
+// waitFaultFired waits until the followed container logged the FAULT INJECTED
+// line for point and the Pod's container restarted past before (the process
+// really died), and returns the line — the diagnostic naming the table, batch
+// and positions.
+func waitFaultFired(t *testing.T, ns, pod string, logs *logFollower, point faultinject.Point, before int, timeout time.Duration) string {
 	t.Helper()
 	want := "FAULT INJECTED point=" + string(point)
 	deadline := time.Now().Add(timeout)
 	for {
-		if podRestarts(t, ns, pod) > before {
-			for _, line := range strings.Split(kubectlLogsBestEffort(ns, pod, true), "\n") {
-				if strings.Contains(line, want) {
-					return line
-				}
+		restarts := podRestarts(t, ns, pod)
+		if l := logs.line(want); l != "" && restarts > before {
+			return l
+		}
+		select {
+		case <-logs.done:
+			// The followed container is gone. If it logged the line, the
+			// restart count catches up on the next poll; if it did not, it
+			// died for another reason and the arm file died with it.
+			if logs.line(want) == "" {
+				t.Fatalf("fault %s: the armed container in %s exited without firing it (restarts %d, before %d) — it died for another reason first",
+					point, pod, restarts, before)
 			}
+		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("fault %s never fired in %s within %s (restarts %d, before %d)",
-				point, pod, timeout, podRestarts(t, ns, pod), before)
+				point, pod, timeout, restarts, before)
 		}
 		time.Sleep(time.Second)
 	}
@@ -91,9 +157,12 @@ func runBoundaryCases(t *testing.T, mysql, trino *sql.DB, pipeline, target strin
 			}
 
 			before := podRestarts(t, testNS, pod)
+			// Follow before arming, so the FAULT line cannot be written
+			// before the stream is attached.
+			logs := followLogs(t, testNS, pod)
 			armFault(t, testNS, pod, bc.point, "raw."+target)
 			stop := startWriter(t, mysql, 250*time.Millisecond)
-			line := waitFaultFired(t, testNS, pod, bc.point, before, 4*time.Minute)
+			line := waitFaultFired(t, testNS, pod, logs, bc.point, before, 4*time.Minute)
 			stop()
 			t.Logf("fired: %s", strings.TrimSpace(line))
 			if !strings.Contains(line, "table=raw."+target) {
