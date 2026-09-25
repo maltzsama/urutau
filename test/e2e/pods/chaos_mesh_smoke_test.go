@@ -6,13 +6,12 @@ import (
 	"time"
 )
 
-// TestChaosMeshPodKillAffectsRealPipeline is issue #383's smoke test: it
-// proves a real Chaos Mesh PodChaos experiment — not deletePod, not process
-// control — kills a real Urutau worker Pod while MySQL -> Iceberg CDC is
-// active, and that the pipeline recovers and still converges to the source
-// exactly. TestPodCrashRecovery covers the same recovery path via deletePod;
-// this test exists to prove the Chaos Mesh path specifically works end to
-// end, since #385/#386/#388 build their fault scheduling on top of it.
+// TestChaosMeshPodKillAffectsRealPipeline proves a real Chaos Mesh PodChaos
+// experiment — not deletePod, not process control — kills a real Urutau
+// worker Pod while MySQL -> Iceberg CDC is active, and that the pipeline
+// recovers and still converges to the source exactly.
+// TestPodCrashRecovery covers the same recovery path via deletePod; this
+// test exists to prove the Chaos Mesh path specifically works end to end.
 func TestChaosMeshPodKillAffectsRealPipeline(t *testing.T) {
 	requirePods(t)
 	verifyChaosMeshReady(t)
@@ -69,4 +68,49 @@ func TestChaosMeshPodKillAffectsRealPipeline(t *testing.T) {
 	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, target))
 	assertNoRaces(t, testNS, pipeline+"-")
 	t.Log("chaos mesh smoke ok: real PodChaos pod-kill, sink equals source exactly, no races")
+}
+
+// TestChaosMeshNetworkAndStressRoundTrip proves the NetworkChaos and
+// StressChaos primitives create, get observed, and get removed as real
+// Chaos Mesh resources — the duration-bound counterpart to the pod-kill
+// smoke test above, which only covers the continuous PodChaos path. It does
+// not assert a pipeline-level effect; that composition belongs to whatever
+// exercises these primitives under a live CDC workload.
+func TestChaosMeshNetworkAndStressRoundTrip(t *testing.T) {
+	requirePods(t)
+	verifyChaosMeshReady(t)
+
+	mysql, _ := setupPodEnv(t)
+	const pipeline = "pod-chaos-mesh-roundtrip"
+	target := uniqueTarget("pod_chaos_mesh_rt_orders")
+	seedOrders(t, mysql, 50)
+
+	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2309",
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
+	applyPipeline(t, testNS, pipeline, cr)
+	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 4*time.Minute)
+	sts := workerSTSs(t, testNS, pipeline)
+	if len(sts) != 1 {
+		t.Fatalf("want exactly one worker StatefulSet, got %v", sts)
+	}
+	worker := sts[0]
+	waitPodsByPrefix(t, testNS, worker+"-", 1, 4*time.Minute)
+
+	const netExperiment = "smoke-network-partition"
+	applyNetworkChaos(t, testNS, netExperiment,
+		map[string]string{"urutau.io/worker": worker},
+		map[string]string{"app": "urutau-coordinator", "urutau.io/pipeline": pipeline},
+		"partition", "5s")
+	t.Cleanup(func() { deleteChaosExperiment(t, testNS, "networkchaos", netExperiment) })
+	waitChaosExperimentStopped(t, testNS, "networkchaos", netExperiment, 2*time.Minute)
+	deleteChaosExperiment(t, testNS, "networkchaos", netExperiment)
+	t.Log("NetworkChaos partition: created, observed Stopped, removed")
+
+	const stressExperiment = "smoke-cpu-stress"
+	applyStressChaos(t, testNS, stressExperiment,
+		map[string]string{"urutau.io/worker": worker}, "cpu", 1, "", "5s")
+	t.Cleanup(func() { deleteChaosExperiment(t, testNS, "stresschaos", stressExperiment) })
+	waitChaosExperimentStopped(t, testNS, "stresschaos", stressExperiment, 2*time.Minute)
+	deleteChaosExperiment(t, testNS, "stresschaos", stressExperiment)
+	t.Log("StressChaos cpu: created, observed Stopped, removed")
 }
