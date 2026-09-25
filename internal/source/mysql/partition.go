@@ -100,45 +100,74 @@ func (c *Chunker) minMax(ctx context.Context, col string) (minVal, maxVal any, e
 // (drivers/mysql/internal/backfill.go) — same idea (an arithmetic
 // progression across the key domain), rebuilt against source.Chunk
 // instead of Olake's own types.Chunk.
+//
+// go-sql-driver returns an unsigned BIGINT as uint64, which may exceed
+// int64, so the split runs over the offset from min in uint64 and each
+// boundary goes back to the key's own type: uint64 bounds for an unsigned
+// key, int64 otherwise.
 func (c *Chunker) partitionNumeric(minVal, maxVal any, n int) ([]source.Chunk, error) {
-	minI, err := toInt64(minVal)
-	if err != nil {
-		return nil, fmt.Errorf("min value: %w", err)
-	}
-	maxI, err := toInt64(maxVal)
-	if err != nil {
-		return nil, fmt.Errorf("max value: %w", err)
-	}
-	if maxI < minI {
-		return nil, fmt.Errorf("max %d < min %d", maxI, minI)
+	var width uint64
+	var at func(off uint64) any
+	if minU, ok := minVal.(uint64); ok {
+		maxU, ok := maxVal.(uint64)
+		if !ok {
+			return nil, fmt.Errorf("max value: %T with a uint64 min", maxVal)
+		}
+		if maxU < minU {
+			return nil, fmt.Errorf("max %d < min %d", maxU, minU)
+		}
+		width = maxU - minU
+		at = func(off uint64) any { return minU + off }
+	} else {
+		minI, err := toInt64(minVal)
+		if err != nil {
+			return nil, fmt.Errorf("min value: %w", err)
+		}
+		maxI, err := toInt64(maxVal)
+		if err != nil {
+			return nil, fmt.Errorf("max value: %w", err)
+		}
+		if maxI < minI {
+			return nil, fmt.Errorf("max %d < min %d", maxI, minI)
+		}
+		width = uint64(maxI) - uint64(minI) // exact even when max-min overflows int64
+		at = func(off uint64) any { return int64(uint64(minI) + off) }
 	}
 
-	span := maxI - minI + 1
-	step := span / int64(n)
-	if step < 1 {
-		step = 1
-	}
-
-	var out []source.Chunk
-	low := minI
-	for i := 0; i < n; i++ {
-		var lowVal, highVal any
-		if i > 0 {
-			lowVal = low
-		}
-		high := low + step
-		if i == n-1 || high > maxI {
-			highVal = nil // last partition is open-ended, covers any late-arriving max
-		} else {
-			highVal = high
-		}
-		out = append(out, source.Chunk{
-			Low:  boundTuple(lowVal),
-			High: boundTuple(highVal),
-		})
+	// Only the first Low and last High are open: they cover a key that
+	// arrives below the observed min or above the observed max.
+	out := make([]source.Chunk, 0, n)
+	var low []any
+	for _, off := range evenBoundaries(width, n) {
+		high := boundTuple(at(off))
+		out = append(out, source.Chunk{Low: low, High: high})
 		low = high
 	}
-	return out, nil
+	return append(out, source.Chunk{Low: low}), nil
+}
+
+// evenBoundaries returns the n-1 interior boundaries, as offsets from min,
+// of an even split of the key domain [0, width]. When the domain is too
+// small to give every partition a full step, the range that reaches max
+// ends there and the extra partitions are empty [max,max) ranges (as the
+// Postgres chunker does): the ranges never overlap, so no row is owned by
+// two workers.
+func evenBoundaries(width uint64, n int) []uint64 {
+	if n < 2 {
+		return nil
+	}
+	step := width/uint64(n) + 1 // width+1 wraps to 0 over the full uint64 domain
+	out := make([]uint64, 0, n-1)
+	var low uint64
+	for i := 0; i < n-1; i++ {
+		if step > width-low {
+			low = width
+		} else {
+			low += step
+		}
+		out = append(out, low)
+	}
+	return out
 }
 
 func boundTuple(v any) []any {
