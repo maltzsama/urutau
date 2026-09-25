@@ -497,12 +497,24 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 	// Batcher goroutine: collects changes, collapses, sends to readyCh.
 	err := w.runBatcher(ctx, p)
 	close(p.readyCh) // signal committer to drain and exit
-	if cerr := <-errCh; cerr != nil {
-		// The committer's error is the cause; the batcher's is its echo
-		// (context canceled). Release what the committer never took.
+	if err != nil {
+		// A batcher failure cancels too: a commit in flight that only
+		// returns on cancellation must not keep the pipeline from ending.
+		cancel(err)
+	}
+	cerr := <-errCh
+	if cerr != nil {
+		// Release what the committer never took.
 		for rb := range p.readyCh {
 			rb.batch.Release()
 		}
+	}
+	if err != nil && cerr != nil {
+		// Both sides failed; one is the other's context-canceled echo.
+		// The cancel cause is whichever failed first.
+		return context.Cause(ctx)
+	}
+	if cerr != nil {
 		return cerr
 	}
 	return err
