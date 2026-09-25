@@ -1469,7 +1469,9 @@ func (c *Coordinator) flushWindow(ctx context.Context, target string, partition 
 		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
 	}
 	for i, b := range buf {
-		if err := c.enqueueBatch(ctx, b, meta); err != nil {
+		// A fresh meta per batch: enqueueBatch assigns the cycle id into
+		// it, and a shared one would put every held batch in one cycle.
+		if err := c.enqueueBatch(ctx, b, cloneBatchMeta(meta)); err != nil {
 			for _, rest := range buf[i+1:] {
 				rest.Release()
 			}
@@ -1496,7 +1498,8 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 
 	meta := &pb.BatchMeta{Table: target}
 	for i, b := range buf {
-		if err := c.enqueueBatch(ctx, b, meta); err != nil {
+		// A fresh meta per batch, as in flushWindow.
+		if err := c.enqueueBatch(ctx, b, cloneBatchMeta(meta)); err != nil {
 			for _, rest := range buf[i+1:] {
 				rest.Release()
 			}
@@ -1895,6 +1898,10 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// into the one cycle that must commit atomically (WK-001 C5). The
 	// expected count is the number of partitions that actually have rows
 	// — a nil sub-batch is never sent, so it is never expected.
+	//
+	// The id is assigned INTO meta: a caller must pass a fresh meta per
+	// batch, or two batches share one cycle and the second one's
+	// deliveries are dropped as not committable.
 	if meta.BatchId == 0 {
 		meta.BatchId = c.batchSeq.Add(1)
 	}
