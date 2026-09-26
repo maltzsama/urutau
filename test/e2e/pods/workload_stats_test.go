@@ -182,6 +182,7 @@ type runReport struct {
 	ExpectedPosition string          `json:"expectedPosition"` // gtid_executed after the last generated mutation
 	Tables           []tableReport   `json:"tables"`
 	Failure          string          `json:"failure,omitempty"`
+	Chaos            *chaosReport    `json:"chaos,omitempty"`
 }
 
 // writeReport persists the report under URUTAU_E2E_ARTIFACTS (or the system
