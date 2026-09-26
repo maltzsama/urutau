@@ -253,6 +253,12 @@ type Coordinator struct {
 	stagedLocks map[string]*sync.Mutex
 	stagedMu    sync.Mutex
 
+	// The latest position sent per table and the worker its latest snapshot
+	// window went to: where a table's snapshot-done marker goes (#428).
+	sentMu     sync.Mutex
+	lastSent   map[string]string
+	lastWindow map[string]*workerState
+
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
 	// on the worker, live events of that table are held here instead of
 	// being shipped — a live event racing ahead of the chunk's rows would
@@ -770,6 +776,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	c.log.Info("coordinator resume", "from", position.StringOrNone(resume), "snapshot_tables", len(needsSnapshot))
+	// Before any worker can commit: a crash from here on must find these
+	// tables unfinished, whatever positions the stream commits to them.
+	if err := c.markSnapshotsPending(ctx, needsSnapshot); err != nil {
+		return err
+	}
 
 	// Baseline every worker's confirmed position to the run's resume point.
 	// confirmedPosition() takes the min over the map, so a worker that has
@@ -909,6 +920,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		for _, ref := range needsSnapshot {
 			c.log.Info("coordinator snapshot", "table", ref.Source)
+			faultinject.At(faultinject.CoordinatorSnapshotTableStart, "table", ref.Target)
 			if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 				c.log.Warn("coordinator: eventlog emit", "err", err)
 			}
@@ -922,6 +934,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 				}
 			}
 			if err := c.snapshotTable(snapCtx, rdr, chunker, ref, snapCfg); err != nil {
+				snapDone <- fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
+				return
+			}
+			if err := c.finishSnapshot(snapCtx, ref); err != nil {
 				snapDone <- fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
 				return
 			}
@@ -1794,7 +1810,11 @@ func (c *Coordinator) sendCloses(ctx context.Context, w *workerState, target str
 		meta.BatchId = c.batchSeq.Add(1)
 		c.staged.expect(core.TableRef{Target: target}, meta.BatchId, []string{w.name})
 	}
-	return c.enqueueTo(ctx, w, nil, meta)
+	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
+		return err
+	}
+	c.noteWindow(target, w)
+	return nil
 }
 
 // clipChunksToRange keeps only the chunks that intersect partitionRange,
@@ -2130,6 +2150,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 		if idx := c.indexOf(w.name); idx != nil {
 			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
 		}
+		c.noteSent(meta.Table, posStr)
 		return nil
 	case <-ctx.Done():
 		c.budget.release(w.name, n)
@@ -2711,6 +2732,18 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 			byTarget[ref.Target] = p
 			if own, err := c.src.ParsePosition(pos); err == nil {
 				boot[ref.Target] = own
+			}
+			// A position does not prove the snapshot finished: the stream
+			// commits to a table before and during its snapshot (#428).
+			if caps.Snapshot {
+				interrupted, err := c.snapshotInterrupted(ctx, core.TableRef{Source: ref.Source, Target: ref.Target})
+				if err != nil {
+					return nil, nil, err
+				}
+				if interrupted {
+					c.log.Warn("coordinator: snapshot interrupted by an earlier run; snapshotting again", "table", ref.Target, "position", pos)
+					needsSnapshot = append(needsSnapshot, ref)
+				}
 			}
 		} else if caps.Snapshot {
 			needsSnapshot = append(needsSnapshot, ref)

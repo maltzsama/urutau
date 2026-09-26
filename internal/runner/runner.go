@@ -311,6 +311,15 @@ func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []co
 			}
 			positions = append(positions, p)
 			byTarget[ref.Target] = p
+			// A position does not prove the snapshot finished: the stream
+			// commits to a table before and during its snapshot (#428).
+			props, err := snk.Properties(ctx, ref)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("runner: %s: snapshot state: %w", ref.Target, err)
+			}
+			if snapshot.Unfinished(props) {
+				needsSnapshot = append(needsSnapshot, ref)
+			}
 		} else {
 			needsSnapshot = append(needsSnapshot, ref)
 		}
@@ -449,6 +458,34 @@ func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger 
 }
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
+
+// markSnapshotsPending marks each table about to be snapshotted not_started,
+// unless an earlier run already left it unfinished (its in_progress carries
+// resumable bounds). It returns the tables that already hold committed rows:
+// the bloom guard of this run never saw the keys an earlier run wrote, so
+// their snapshot rows must take the upsert path.
+func markSnapshotsPending(ctx context.Context, snk sink.Sink, refs []core.TableRef) (map[string]bool, error) {
+	held := map[string]bool{}
+	for _, ref := range refs {
+		pos, err := snk.Position(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("runner: %s: %w", ref.Target, err)
+		}
+		held[ref.Target] = pos != ""
+		props, err := snk.Properties(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("runner: %s: snapshot state: %w", ref.Target, err)
+		}
+		if snapshot.Unfinished(props) {
+			continue
+		}
+		mark := map[string]string{snapshot.PropSnapshotState: string(snapshot.StateNotStarted)}
+		if err := snk.SetProperties(ctx, ref, mark); err != nil {
+			return nil, fmt.Errorf("runner: %s: mark snapshot pending: %w", ref.Target, err)
+		}
+	}
+	return held, nil
+}
 
 // Runner wraps the collapsed pipeline and exposes metrics like
 // dropped rows by window (proof of caught-up state).
@@ -849,6 +886,21 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		"from": position.StringOrNone(resume), "snapshot_tables": len(needsSnapshot),
 	})
 
+	// Before the stream can commit anything: a crash from here on must find
+	// these tables unfinished, whatever positions the stream commits to them
+	// (#428). Skipped when the source does not snapshot (e.g. Kafka).
+	caps, _ := driver.CapsForKind(s.Source.Kind)
+	var heldRows map[string]bool
+	if caps.Snapshot {
+		heldRows, err = markSnapshotsPending(ctx, snk, needsSnapshot)
+		if err != nil {
+			closeQuery()
+			closeStages()
+			closeStages()
+			return nil, err
+		}
+	}
+
 	// Per-table bootstrap config, resolved once: the stream start below and
 	// the snapshot loop both consult it.
 	bootstrapByTarget := make(map[string]spec.Bootstrap, len(s.Tables))
@@ -927,9 +979,9 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		go func() { routerDone <- router.run(ctx, rdr) }()
 	}
 
-	// Snapshot phase: DBLog for tables with no committed position. Skip
-	// when the source does not support snapshot (e.g. Kafka).
-	caps, _ := driver.CapsForKind(s.Source.Kind)
+	// Snapshot phase: DBLog for tables with no committed position, or whose
+	// snapshot an earlier run left unfinished. Skip when the source does not
+	// support snapshot (e.g. Kafka).
 	if caps.Snapshot {
 		for _, ref := range needsSnapshot {
 			bootstrapMode := spec.BootstrapSnapshot
@@ -990,11 +1042,13 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 				}
 				// Set initial snapshot state on the worker so batches carry it.
 				w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), progress.Pending)
-				if progress.State == snapshot.StateInProgress {
+				if progress.State == snapshot.StateInProgress || heldRows[ref.Target] {
 					// The bloom guard was recreated empty: keys live events
 					// touched before the crash are unknown, so pure appends
 					// could duplicate committed rows. Every snapshot row goes
-					// through the upsert path on a resumed snapshot.
+					// through the upsert path on a resumed snapshot — and on
+					// one an earlier run left not_started after committing
+					// stream rows to the table (#428).
 					w.MarkSnapshotResumed(ref.Target)
 				}
 				if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{

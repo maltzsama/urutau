@@ -143,6 +143,10 @@ type readyBatch struct {
 	rows    int // rows fed into the batcher for this flush
 	upserts int // surviving upsert rows
 	deletes int // equality-delete rows
+	// ackPos, when set, is the position acked once the batch is committed,
+	// in place of its watermark: a snapshot-done batch commits no position
+	// but acks the marker's (#428).
+	ackPos []byte
 }
 
 // Ingest is one unit the worker consumes: a columnar batch plus optional
@@ -159,6 +163,10 @@ type Ingest struct {
 	// cycle (zero for a marker that carries none).
 	Seq    uint64
 	Staged bool
+	// SnapshotDone marks the end of the table's snapshot: every window was
+	// sent ahead of it. The worker commits cdc.snapshot.state=complete after
+	// them, at Position, as the marker's cycle on a staged table (#428).
+	SnapshotDone bool
 }
 
 // New builds a worker; register tables before Run.
@@ -567,6 +575,9 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 		// (issue #260). In staged mode the durable point is the coordinator's
 		// CommitStaged, so this ack is a delivery receipt, but it must still
 		// follow a successful stage.
+		if rb.ackPos != nil {
+			rb.batch.Watermark = rb.ackPos
+		}
 		if w.onCommit != nil {
 			w.onCommit(rb.batch, rb.rows)
 		}
@@ -811,6 +822,26 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					if err := addPending(cb, int(cb.Record.NumRows())); err != nil {
 						return err
 					}
+				}
+				continue
+			}
+			// Snapshot done: commit what came before it (the table's last
+			// windows among it), then the completion, in that order. A
+			// completion committed ahead of a window would let a crash skip
+			// the re-snapshot that window's rows need (issue #428).
+			if ing.SnapshotDone {
+				if err := flush(); err != nil {
+					return err
+				}
+				db, err := snapshotDoneBatch(p, ing)
+				if err != nil {
+					return err
+				}
+				select {
+				case p.readyCh <- readyBatch{batch: db, ackPos: []byte(ing.Position)}:
+				case <-ctx.Done():
+					db.Release()
+					return ctx.Err()
 				}
 				continue
 			}
@@ -1349,12 +1380,27 @@ func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.Writ
 func markerBatch(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
 	schema, err := transport.CoreSchemaToArrow(p.knownSchema)
 	if err != nil {
-		return nil, fmt.Errorf("worker: table %s: window %d marker: %w", p.target, ing.Win.ChunkID, err)
+		return nil, fmt.Errorf("worker: table %s: marker batch: %w", p.target, err)
 	}
 	bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	rec := bld.NewRecordBatch()
 	bld.Release()
 	return &dataplane.Batch{Table: p.target, Record: rec, Watermark: []byte(ing.Position), Mode: p.mode, Seq: ing.Seq, Staged: ing.Staged}, nil
+}
+
+// snapshotDoneBatch is the 0-row batch that commits a table's snapshot
+// completion: cdc.snapshot.state=complete and no position. The marker's
+// position is the coordinator's latest sent when it queued the marker; the
+// stream may have committed past it since, and the completion must not move
+// the table's position back. The committer acks the marker's position.
+func snapshotDoneBatch(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
+	b, err := markerBatch(p, ing)
+	if err != nil {
+		return nil, err
+	}
+	b.Watermark = nil
+	b.SnapshotState = string(snapshot.StateComplete)
+	return b, nil
 }
 
 // emptyBatch returns a 0-row batch with b's schema, carrying b's Seq and

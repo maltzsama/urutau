@@ -24,7 +24,8 @@ row is not.
 - On every boot the coordinator resumes from the **minimum `cdc.position`
   across tables** (`resumeFrom`). A table without one is snapshotted, unless
   its source cannot snapshot (Kafka), in which case it streams from the
-  source's start.
+  source's start. So is a table whose `cdc.snapshot.state` is `not_started` or
+  `in_progress`, position or not (see [The snapshot phase](#the-snapshot-phase)).
 - A worker skips any batch at or before its table's committed position
   (`skipCovered`) and acks it, so a replay re-applies only what is not
   durable.
@@ -90,6 +91,31 @@ Orphan files left by S2–S4 are unreferenced, so readers never see them. They
 stay in storage until orphan-file maintenance removes them, which only
 happens when the sink's `maintenance.orphanCleanup` is configured.
 
+## The snapshot phase
+
+The live stream runs while the snapshot copies tables one at a time, so the
+stream commits to a table, and gives it a `cdc.position`, before that table's
+snapshot has run. A position therefore does not prove the snapshot finished;
+`cdc.snapshot.state` does (issue #428):
+
+- at boot, before the stream starts, every table about to be snapshotted is
+  marked `not_started`;
+- after a table's last window, the coordinator sends a snapshot-done marker
+  behind it (on a staged table, its own cycle of the send order). The table's
+  writer commits `complete` after everything sent ahead of it, with no
+  position of its own;
+- a table found `not_started` or `in_progress` at boot is snapshotted again.
+  A table with a position and no state predates the marking and is taken as
+  done.
+
+| # | Step | Process | Durable after this step | Fault point |
+|---|------|---------|-------------------------|-------------|
+| P1 | About to snapshot a table the stream may already have committed to | coordinator | stream commits (a `cdc.position`), state `not_started` | `coordinator.snapshot-table-start` |
+
+Expected recovery: **P1 (coordinator dies).** The restarted coordinator finds
+the table `not_started` and snapshots it, so its pre-existing rows are copied
+even though it holds a position. Re-copied rows are upserts.
+
 ## How the crash-recovery matrix's failure windows map here
 
 | Failure window | Boundaries |
@@ -101,6 +127,7 @@ happens when the sink's `maintenance.orphanCleanup` is configured.
 | Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss) |
 | Coordinator killed during an active commit cycle | S4, S5 |
 | Upsert split across two snapshots (not in the base matrix) | D3 |
+| Coordinator killed before a table's snapshot, after the stream committed to it | P1 |
 
 ## Using the fault points
 

@@ -176,3 +176,19 @@ func TestRemoveFromPending(t *testing.T) {
 		})
 	}
 }
+
+// Only not_started and in_progress are unfinished: no state at all is a table
+// that predates the marking (#428), taken as finished.
+func TestUnfinished(t *testing.T) {
+	for state, want := range map[string]bool{
+		"": false, string(StateComplete): false, string(StateNotStarted): true, string(StateInProgress): true,
+	} {
+		props := map[string]string{}
+		if state != "" {
+			props[PropSnapshotState] = state
+		}
+		if got := Unfinished(props); got != want {
+			t.Errorf("Unfinished(%q) = %v, want %v", state, got, want)
+		}
+	}
+}
