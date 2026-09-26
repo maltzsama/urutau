@@ -26,7 +26,13 @@ import (
 func TestSnapshotInterruptedAfterStreamCommits(t *testing.T) {
 	requirePods(t)
 	mysql, trino := setupPodEnv(t)
-	const pipeline = "pod-snap-interrupted"
+	runSnapshotInterrupted(t, mysql, trino, "pod-snap-interrupted", "2330")
+}
+
+// runSnapshotInterrupted is the P1 case on its own pipeline, shared with the
+// randomized boundary matrix.
+func runSnapshotInterrupted(t *testing.T, mysql, trino *sql.DB, pipeline, serverID string) {
+	t.Helper()
 	sfx := uniqueTarget("")[1:]
 	srcA, srcB := "snapint_a_"+sfx, "snapint_b_"+sfx
 	createOrdersLike(t, mysql, srcA, 20000)
@@ -53,7 +59,7 @@ func TestSnapshotInterruptedAfterStreamCommits(t *testing.T) {
 	stopWrites := sync.OnceFunc(func() { stop(); wg.Wait() })
 	t.Cleanup(stopWrites)
 
-	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2330", []tableSpec{
+	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, []tableSpec{
 		{Source: "shop." + srcA, Target: "raw." + srcA, PrimaryKey: []string{"id"}, Workers: 1},
 		{Source: "shop." + srcB, Target: "raw." + srcB, PrimaryKey: []string{"id"}, Workers: 1},
 	}, crOptions{SnapshotChunkSize: 100})
@@ -64,6 +70,7 @@ func TestSnapshotInterruptedAfterStreamCommits(t *testing.T) {
 	armFault(t, testNS, coord, faultinject.CoordinatorSnapshotTableStart, "raw."+srcB)
 	line := waitFaultFired(t, testNS, coord, logs, faultinject.CoordinatorSnapshotTableStart, before, 10*time.Minute)
 	t.Logf("fault fired: %s", line)
+	reportBoundaryOnFailure(t, mysql, trino, pipeline, faultinject.CoordinatorSnapshotTableStart, srcA, srcB)
 
 	// The scenario needs B to hold a position when the coordinator died:
 	// without one, even the old code snapshots it.

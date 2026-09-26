@@ -866,24 +866,38 @@ func readOrdersSink(t *testing.T, db *sql.DB, table string) map[int64]rowState {
 
 func readOrdersFrom(t *testing.T, db *sql.DB, query string) map[int64]rowState {
 	t.Helper()
+	out, _ := readOrdersDup(t, db, query)
+	return out
+}
+
+// readOrdersDup reads (id → state) and the ids seen more than once. An
+// upsert table keeps one row per key: a duplicate is a replay the sink applied
+// twice, which a map keyed by id would silently collapse into one row (issue
+// #381: duplicate replay is reported apart from loss).
+func readOrdersDup(t *testing.T, db *sql.DB, query string) (map[int64]rowState, []int64) {
+	t.Helper()
 	rows, err := db.Query(query)
 	if err != nil {
 		t.Fatalf("read %q: %v", query, err)
 	}
 	defer func() { _ = rows.Close() }()
 	out := map[int64]rowState{}
+	var dups []int64
 	for rows.Next() {
 		var id int64
 		var st rowState
 		if err := rows.Scan(&id, &st.V, &st.Amount); err != nil {
 			t.Fatalf("scan %q: %v", query, err)
 		}
+		if _, seen := out[id]; seen {
+			dups = append(dups, id)
+		}
 		out[id] = st
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows %q: %v", query, err)
 	}
-	return out
+	return out, dups
 }
 
 // assertSinkEqualsSource is the pass condition: the sink's exact key→state map
@@ -932,14 +946,16 @@ func waitSettledTables(t *testing.T, mysql, trino *sql.DB, srcTable, sinkTable s
 	deadline := time.Now().Add(timeout)
 	for {
 		src := readTable(t, mysql, srcTable)
-		sink := readTableSink(t, trino, sinkTable)
+		sink, dups := readOrdersDup(t, trino, "SELECT id, v, amount FROM "+sinkTable)
 		missing, extra, wrong := diffSinkSource(src, sink)
-		if len(missing) == 0 && len(extra) == 0 && len(wrong) == 0 {
+		if len(missing) == 0 && len(extra) == 0 && len(wrong) == 0 && len(dups) == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("sink %s never settled to source %s: source=%d sink=%d missing=%v extra=%v wrongValue=%v",
-				sinkTable, srcTable, len(src), len(sink), cap10(missing), cap10(extra), cap10(wrong))
+			// missing is loss; duplicated is a replay applied twice; extra is
+			// a resurrected delete; wrongValue a stale image.
+			t.Fatalf("sink %s never settled to source %s: source=%d sink=%d missing=%v duplicated=%v extra=%v wrongValue=%v",
+				sinkTable, srcTable, len(src), len(sink), cap10(missing), cap10(dups), cap10(extra), cap10(wrong))
 		}
 		time.Sleep(time.Second)
 	}
