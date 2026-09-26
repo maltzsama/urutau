@@ -2,6 +2,7 @@ package pods
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"strconv"
 	"strings"
@@ -20,7 +21,7 @@ import (
 // varies). The diagnostics file (seed, observed distributions, final diffs)
 // is written under URUTAU_E2E_ARTIFACTS, or the system temp dir, pass or fail.
 func TestProductionReadinessWorkload(t *testing.T) {
-	runProductionReadiness(t, false)
+	runProductionReadiness(t, prOptions{pipeline: "pod-pr-workload", serverID: "2320"})
 }
 
 // TestProductionReadinessChaos is the workload with the nondeterministic
@@ -30,20 +31,52 @@ func TestProductionReadinessWorkload(t *testing.T) {
 // converges to MySQL exactly, and every experiment was injected and removed.
 // URUTAU_E2E_SEED seeds the fault stream too.
 func TestProductionReadinessChaos(t *testing.T) {
-	runProductionReadiness(t, true)
+	runProductionReadiness(t, prOptions{pipeline: "pod-pr-chaos", serverID: "2321", chaos: true})
+}
+
+// prOptions shapes one production-readiness run.
+type prOptions struct {
+	pipeline, serverID string
+	chaos              bool           // the chaos controller over the live window
+	kedaMax            int            // > 0: partitioned tables get workers.max for KEDA
+	maintenance        map[string]any // non-nil: the sink's maintenance block
+	live               time.Duration  // > 0: overrides the profile's live window
+	settle             time.Duration  // > 0: overrides the profile's settle timeout
+	// onLive runs once the coordinator is up, before the live window
+	// elapses; afterSettle runs after the final comparison. Both see the run.
+	onLive      func(ctx context.Context, r *prRun)
+	afterSettle func(ctx context.Context, r *prRun)
+}
+
+// prRun is what a hook sees of a run in progress.
+type prRun struct {
+	t            *testing.T
+	w            *workload
+	chaos        *chaosController
+	mysql, trino *sql.DB
+	pipeline     string
+	tables       []*prTable
+	profile      workloadProfile
 }
 
 // runProductionReadiness is the shared body: the workload, optionally with
-// the chaos controller over the live window.
-func runProductionReadiness(t *testing.T, withChaos bool) {
+// the chaos controller, KEDA and maintenance, and the hooks.
+func runProductionReadiness(t *testing.T, o prOptions) {
 	t.Helper()
 	requirePods(t)
+	withChaos := o.chaos
 	if withChaos {
 		verifyChaosMeshReady(t)
 	}
 	profile, err := selectedProfile()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if o.live > 0 {
+		profile.Duration = o.live
+	}
+	if o.settle > 0 {
+		profile.Settle = o.settle
 	}
 	seed, err := workloadSeed()
 	if err != nil {
@@ -53,17 +86,18 @@ func runProductionReadiness(t *testing.T, withChaos bool) {
 
 	// The live window and the settle, plus boot, seeding and teardown. The
 	// documented -timeout for each profile sits above this budget.
-	ctx, cancel := context.WithTimeout(context.Background(), profile.Duration+profile.Settle+15*time.Minute)
+	budget := profile.Duration + profile.Settle + 15*time.Minute
+	if o.afterSettle != nil {
+		budget += 15 * time.Minute // the hook's own checks (e.g. waiting for KEDA to scale in)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
 	mysql, trino := setupPodEnv(t)
 	suffix := strconv.FormatInt(time.Now().UnixNano()%2176782336, 36)
 	tables := selectTables(t, productionTables(suffix, profile))
 	w := newWorkload(seed, profile, tables, mysql)
-	pipeline, serverID := "pod-pr-workload", "2320"
-	if withChaos {
-		pipeline, serverID = "pod-pr-chaos", "2321"
-	}
+	pipeline, serverID := o.pipeline, o.serverID
 	var chaos *chaosController
 	t.Cleanup(func() {
 		rep := w.report()
@@ -100,8 +134,11 @@ func runProductionReadiness(t *testing.T, withChaos bool) {
 	specs := make([]tableSpec, len(tables))
 	for i, tb := range tables {
 		specs[i] = tableSpec{Source: "shop." + tb.Name, Target: "raw." + tb.Target, PrimaryKey: tb.PK, Workers: tb.Workers, Cast: tb.Cast}
+		if o.kedaMax > 0 && tb.Workers > 1 {
+			specs[i].Max = o.kedaMax
+		}
 	}
-	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, crOptions{})
+	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, crOptions{MaintenanceBlock: o.maintenance})
 	applyPipeline(t, testNS, pipeline, cr)
 
 	// Live mutations start before the coordinator is up, so they overlap
@@ -122,6 +159,10 @@ func runProductionReadiness(t *testing.T, withChaos bool) {
 			}
 		})
 		t.Log("chaos controller started")
+	}
+	run := &prRun{t: t, w: w, chaos: chaos, mysql: mysql, trino: trino, pipeline: pipeline, tables: tables, profile: profile}
+	if o.onLive != nil {
+		o.onLive(ctx, run)
 	}
 	select {
 	case <-ctx.Done():
@@ -166,6 +207,9 @@ func runProductionReadiness(t *testing.T, withChaos bool) {
 	}
 	for _, p := range w.coverageProblems() {
 		t.Errorf("coverage: %s", p)
+	}
+	if o.afterSettle != nil {
+		o.afterSettle(ctx, run)
 	}
 	if chaos != nil {
 		for _, p := range chaos.problems() {

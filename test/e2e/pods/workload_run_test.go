@@ -504,6 +504,18 @@ func (w *workload) compare(ctx context.Context, trino *sql.DB) ([]tableCheck, er
 func (w *workload) settle(ctx context.Context, trino *sql.DB, logf func(string, ...any), reconnect func() error) ([]tableCheck, error) {
 	deadline := time.Now().Add(w.profile.Settle)
 	for {
+		// Row counts first: a full read of every table (payload hashes,
+		// merge-on-read deletes) per poll is heavy enough to take Trino
+		// down while the sink is still catching up. Only equal counts earn
+		// the full comparison; the deadline always gets one.
+		if same, err := w.countsMatch(ctx, trino); err == nil && !same && time.Now().Before(deadline) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(20 * time.Second):
+			}
+			continue
+		}
 		checks, err := w.compare(ctx, trino)
 		if err != nil {
 			// Trino may briefly fail while a table is being created or
@@ -529,9 +541,27 @@ func (w *workload) settle(ctx context.Context, trino *sql.DB, logf func(string, 
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(10 * time.Second):
+		case <-time.After(20 * time.Second):
 		}
 	}
+}
+
+// countsMatch reports whether every table has as many rows in Iceberg as in
+// MySQL: a cheap necessary condition for convergence.
+func (w *workload) countsMatch(ctx context.Context, trino *sql.DB) (bool, error) {
+	for _, t := range w.tables {
+		var src, sink int64
+		if err := w.db.QueryRowContext(ctx, "SELECT count(*) FROM "+t.Name).Scan(&src); err != nil {
+			return false, err
+		}
+		if err := trino.QueryRowContext(ctx, "SELECT count(*) FROM "+t.Target).Scan(&sink); err != nil {
+			return false, err
+		}
+		if src != sink {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // sinkCommits reads the rows and bytes each Iceberg commit added, from the

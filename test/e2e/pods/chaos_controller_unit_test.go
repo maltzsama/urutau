@@ -144,6 +144,33 @@ func TestRenderChaosRefusesWithoutTarget(t *testing.T) {
 	}
 }
 
+// Maintenance Pods live for seconds, so no fault aims at them, and a
+// network fault names exactly the running Pods of its worker side.
+func TestRenderChaosSkipsMaintenanceAndListsRunningPods(t *testing.T) {
+	pods := append([]podInfo{
+		{name: "p-raw-a-maint", app: "urutau-worker", group: "p-raw-a-maint", phase: "Running"},
+	}, testPods...)
+	for i := range 40 {
+		for _, k := range []chaosKind{chaosWorkerKill, chaosNetworkPartition} {
+			d := newChaosPlanner(uint64(i), smokeChaos).next()
+			d.Kind, d.Scope = k, scopeOnePod
+			if k == chaosNetworkPartition {
+				d.Scope = scopeAllWorkers
+			}
+			m, _, target, _, err := renderChaos("pod-e2e", "p", d, "x", pods)
+			if err != nil {
+				t.Fatalf("%s: %v", k, err)
+			}
+			if strings.Contains(m, "maint") || strings.Contains(target, "maint") {
+				t.Fatalf("%s aimed at a maintenance Pod:\n%s", k, m)
+			}
+			if k == chaosNetworkPartition && (!strings.Contains(m, "- p-raw-a-0") || strings.Contains(m, "p-raw-b-0")) {
+				t.Fatalf("network fault must list the running workers only:\n%s", m)
+			}
+		}
+	}
+}
+
 // A reserved slot counts toward the concurrency limit before its resource
 // exists: once MaxConcurrent slots are taken, the loop's check refuses the
 // next draw.
