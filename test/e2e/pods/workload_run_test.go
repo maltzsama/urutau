@@ -231,6 +231,10 @@ func (w *workload) stop(ctx context.Context) error {
 	return w.db.QueryRowContext(ctx, "SELECT @@GLOBAL.gtid_executed").Scan(&w.finalPos)
 }
 
+// maxPaceLag is how far a stream may fall behind its schedule before it drops
+// the debt.
+const maxPaceLag = 5 * time.Second
+
 // runStream is one table's live stream: draw a regime, then transactions
 // until the regime ends, forever until stop. The events table also runs
 // backlog episodes: the first one inside the first third of the window, the
@@ -242,6 +246,11 @@ func (w *workload) runStream(ctx context.Context, i int) {
 	var open *episode
 	g.regime = newRegime(g.r, p, g.t, time.Now(), false)
 	burst := 0
+	// The stream paces against a schedule, not by pausing after each
+	// transaction: a pause on top of the transaction's own execution time
+	// kept every stream below its regime's rate (the full profile's 1,000/s
+	// per table came out at a fraction of it).
+	due := time.Now()
 	for {
 		select {
 		case <-w.stopCh:
@@ -316,9 +325,16 @@ func (w *workload) runStream(ctx context.Context, i int) {
 		if g.r.Float64() < g.regime.BurstProb {
 			burst = 1 + g.r.IntN(20)
 		}
+		due = due.Add(g.regime.delay(g.r, len(muts)))
+		// Behind by more than maxPaceLag (MySQL was slower than the regime):
+		// drop the debt instead of firing a catch-up burst the regimes never
+		// drew.
+		if time.Since(due) > maxPaceLag {
+			due = time.Now()
+		}
 		select {
 		case <-w.stopCh:
-		case <-time.After(g.regime.delay(g.r, len(muts))):
+		case <-time.After(time.Until(due)):
 		}
 	}
 }
