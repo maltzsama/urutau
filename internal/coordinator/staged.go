@@ -27,8 +27,11 @@ type stagedCycle struct {
 // commit in send order (seq order), even when they complete out of order:
 // committing a higher position first and a lower one after would regress the
 // durable checkpoint and re-deliver rows. A Seq==0 delivery — a
-// worker-generated snapshot/window batch, which never saw a BatchMeta — is
-// committed on arrival (the snapshot phase precedes every data cycle).
+// worker-generated batch that never saw a BatchMeta — is committed on
+// arrival. A DBLog window's rows are not one of those: live cycles flow
+// during a snapshot, so a window committed on arrival could move the table's
+// position past live cycles still open. They are delivered as their Closes
+// marker's cycle instead (sendCloses, #416).
 type stagedCycles struct {
 	mu    sync.Mutex
 	open  map[cycleKey]*stagedCycle // still accumulating

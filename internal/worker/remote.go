@@ -756,11 +756,17 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 		}
 	case meta.Window != nil && meta.Window.Closes:
 		b.Release()
-		return r.sendIngest(Ingest{
+		ing := Ingest{
 			Table:    meta.Table,
 			Win:      &rowchange.Window{Closes: true, ChunkID: meta.Window.ChunkId},
 			Position: meta.LowPos,
-		})
+		}
+		// On a staged table the marker is a cycle of the coordinator's send
+		// order, and the window's rows are delivered as that cycle.
+		if meta.Staged {
+			ing.Seq, ing.Staged = meta.BatchId, true
+		}
+		return r.sendIngest(ing)
 	default:
 		var win *rowchange.Window
 		if meta.Window != nil && meta.Window.InWindow {
