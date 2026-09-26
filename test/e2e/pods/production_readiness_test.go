@@ -31,7 +31,9 @@ func TestProductionReadinessWorkload(t *testing.T) {
 	}
 	t.Logf("production-readiness workload: profile=%s seed=%d (replay with URUTAU_E2E_SEED=%d)", profile.Name, seed, seed)
 
-	ctx, cancel := context.WithTimeout(context.Background(), profile.Duration+profile.Settle+30*time.Minute)
+	// The live window and the settle, plus boot, seeding and teardown. The
+	// documented -timeout for each profile sits above this budget.
+	ctx, cancel := context.WithTimeout(context.Background(), profile.Duration+profile.Settle+15*time.Minute)
 	defer cancel()
 
 	mysql, trino := setupPodEnv(t)

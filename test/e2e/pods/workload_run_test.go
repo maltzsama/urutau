@@ -229,11 +229,16 @@ func (w *workload) runStream(ctx context.Context, i int) {
 				open.End = time.Since(w.liveFrom)
 				s.Backlog = append(s.Backlog, *open)
 			}
+			// An upper bound on this stream's last position: other streams
+			// may commit between its last transaction and this read. The
+			// driver cannot report one transaction's own GTID (that needs
+			// session_track_gtids), so the authoritative expected position
+			// is the global one stop reads once every stream has ended.
 			var pos string
 			if err := w.db.QueryRowContext(ctx, "SELECT @@GLOBAL.gtid_executed").Scan(&pos); err != nil {
-				w.fail("%s: final gtid_executed: %v", g.t.Name, err)
+				w.fail("%s: gtid_executed at stop: %v", g.t.Name, err)
 			}
-			s.FinalGTID, s.LiveRows = pos, g.live.len()
+			s.GTIDAtStop, s.LiveRows = pos, g.live.len()
 			return
 		default:
 		}
@@ -572,6 +577,17 @@ func (w *workload) report() *runReport {
 // transactions, and small and large payloads.
 func (w *workload) coverageProblems() []string {
 	var out []string
+	// A run narrowed with URUTAU_E2E_TABLES does not cover the omitted
+	// tables, so it is never a pass of the matrix.
+	present := map[tableKind]bool{}
+	for _, g := range w.gens {
+		present[g.t.Kind] = true
+	}
+	for _, k := range []tableKind{accountsKind, itemsKind, eventsKind} {
+		if !present[k] {
+			out = append(out, fmt.Sprintf("table kind %s was not run (URUTAU_E2E_TABLES narrowed the run)", k))
+		}
+	}
 	ops := []string{opInsert.String(), opUpdate.String(), opDelete.String()}
 	txnMin, txnMax := -1.0, 0.0
 	for i, g := range w.gens {

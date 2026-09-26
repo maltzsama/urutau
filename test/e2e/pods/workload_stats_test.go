@@ -102,8 +102,10 @@ type tableStats struct {
 	AmbiguousCommits int64                       `json:"ambiguousCommits"`
 	SideOps          map[string]map[string]int64 `json:"sideOps,omitempty"` // accounts: side → op → count
 	Backlog          []episode                   `json:"backlogEpisodes,omitempty"`
-	FinalGTID        string                      `json:"finalGtidExecuted"`
-	LiveRows         int                         `json:"liveRows"`
+	// GTIDAtStop is gtid_executed read when this stream stopped: an upper
+	// bound on its last mutation's position, not that position itself.
+	GTIDAtStop string `json:"gtidExecutedAtStreamStop"`
+	LiveRows   int    `json:"liveRows"`
 
 	rowsPerTxn  *dist
 	bytesPerTxn *dist

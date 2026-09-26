@@ -25,6 +25,8 @@ The code lives in `test/e2e/pods`:
 ```bash
 make e2e-pods-up        # once; needs make k8s-load-race first
 URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 60m
+# full profile:
+URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
 ```
 
 | Variable | Effect |
@@ -32,7 +34,11 @@ URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkloa
 | `URUTAU_E2E_PROFILE` | `smoke` (default) or `full`. |
 | `URUTAU_E2E_SEED` | Replays a run's random choices. The seed is logged at the start of every run. |
 | `URUTAU_E2E_ARTIFACTS` | Directory for the diagnostics file (default: the system temp dir, under `urutau-e2e/`). |
-| `URUTAU_E2E_TABLES` | Comma-separated table kinds (`accounts`, `items`, `events`) to narrow a run while debugging one table. The coverage checks still expect all three, so a narrowed run is not a pass of the matrix. |
+| `URUTAU_E2E_TABLES` | Comma-separated table kinds (`accounts`, `items`, `events`) to narrow a run while debugging one table. The coverage checks still expect all three, so a narrowed run always fails coverage, naming the omitted tables: it is never a pass of the matrix. |
+
+The test's own budget is the live window plus the settle timeout plus 15
+minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full),
+so the `-timeout` values above leave it room to report its own failure.
 
 The seed reproduces every random draw, not the timing: regimes end on the
 wall clock, so a replay can cut them at different transactions.
@@ -149,10 +155,12 @@ single-row and a maximum-size transaction, and `events` payloads from under
 ## Position
 
 When the streams stop, the workload records `@@GLOBAL.gtid_executed`: the
-source position once the last generated mutation committed. Each stream also
-records it after its own last transaction. Comparing that expected position
-with the committed Iceberg `cdc.position` is the job of the validation layer
-(#387).
+source position once the last generated mutation committed. That is the
+expected position. Each stream also records `gtid_executed` when it stops,
+but that is only an upper bound on its own last position: other streams may
+commit in between, and the driver cannot report one transaction's own GTID.
+Comparing the expected position with the committed Iceberg `cdc.position` is
+the job of the validation layer (#387).
 
 ## Settling
 

@@ -5,6 +5,7 @@ package pods
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -215,5 +216,21 @@ func TestKeyFromIDRoundTrips(t *testing.T) {
 				t.Fatalf("%s: keyFromID(%s) = %v %v %v, want %v %v", tb.Kind, id, k2, t2, ok, key, texts)
 			}
 		}
+	}
+}
+
+// A run narrowed to some tables must never pass coverage: the omitted
+// tables are named as failures.
+func TestCoverageRejectsANarrowedRun(t *testing.T) {
+	all := productionTables("unit", smokeProfile)
+	w := newWorkload(1, smokeProfile, all[:1], nil)
+	var omitted []string
+	for _, p := range w.coverageProblems() {
+		if strings.Contains(p, "was not run") {
+			omitted = append(omitted, p)
+		}
+	}
+	if len(omitted) != 2 || !strings.Contains(strings.Join(omitted, " "), string(itemsKind)) || !strings.Contains(strings.Join(omitted, " "), string(eventsKind)) {
+		t.Fatalf("coverage problems for an accounts-only run = %v; want items and events named as not run", omitted)
 	}
 }
