@@ -200,3 +200,52 @@ func TestInjectNowAfterStopIsANoop(t *testing.T) {
 		t.Fatalf("%d experiment(s) started after stop", n)
 	}
 }
+
+// Chaos Mesh cannot stack two NetworkChaos on one Pod: the second fails with
+// "unable to flush ip sets" and is never injected. A network draw waits for
+// the active one to end; other kinds may still overlap it.
+func TestNetworkFaultsNeverOverlap(t *testing.T) {
+	c := newChaosController("pod-e2e", "p", 1, fullChaos, nil)
+	loss := chaosDecision{Kind: chaosNetworkLoss, Overlap: true}
+	c.mu.Lock()
+	seq, ok := c.admit(loss)
+	c.mu.Unlock()
+	if !ok {
+		t.Fatal("the first network fault must be admitted")
+	}
+	c.mu.Lock()
+	_, delayOK := c.admit(chaosDecision{Kind: chaosNetworkDelay, Overlap: true})
+	_, killOK := c.admit(chaosDecision{Kind: chaosWorkerKill, Overlap: true})
+	c.mu.Unlock()
+	if delayOK {
+		t.Fatal("a second network fault was admitted while one is active")
+	}
+	if !killOK {
+		t.Fatal("a pod kill must still overlap a network fault")
+	}
+	c.forget(c.name(seq))
+	c.mu.Lock()
+	_, ok = c.admit(chaosDecision{Kind: chaosNetworkDelay, Overlap: true})
+	c.mu.Unlock()
+	if !ok {
+		t.Fatal("a network fault must be admitted once the active one ended")
+	}
+}
+
+// A reactive network fault while another is active is recorded as skipped,
+// not attempted (it could only fail) and not counted as a failure.
+func TestReactiveNetworkFaultIsSkippedWhileOneIsActive(t *testing.T) {
+	c := newChaosController("pod-e2e", "p", 1, fullChaos, nil)
+	c.mu.Lock()
+	c.reserve(chaosNetworkLoss)
+	c.mu.Unlock()
+	c.injectNow(context.Background(), chaosNetworkPartition, "re-slice t 1->2")
+	c.wg.Wait()
+	evs := c.report().Events
+	if len(evs) != 1 || evs[0].Skipped == "" || evs[0].Injected || evs[0].Error != "" {
+		t.Fatalf("events %+v, want one skipped reactive partition", evs)
+	}
+	if n := len(c.active); n != 1 {
+		t.Fatalf("%d active, want only the network fault already there", n)
+	}
+}
