@@ -33,7 +33,10 @@ func TestFilterNegate(t *testing.T) {
 		"all→any":   {&Filter{All: []Filter{a, b}}, &Filter{Any: []Filter{notA, notB}}},
 		"any→all":   {&Filter{Any: []Filter{a, b}}, &Filter{All: []Filter{notA, notB}}},
 		"not(not)":  {&Filter{Not: &a}, &a},
-		"nested":    {&Filter{All: []Filter{a, {Any: []Filter{b}}}}, &Filter{Any: []Filter{notA, {All: []Filter{notB}}}}},
+		// The operand comes back as is: a nested not is the renderer's to
+		// negate when it reaches it.
+		"not(not(not))": {&Filter{Not: &Filter{Not: &a}}, &Filter{Not: &a}},
+		"nested":        {&Filter{All: []Filter{a, {Any: []Filter{b}}}}, &Filter{Any: []Filter{notA, {All: []Filter{notB}}}}},
 	} {
 		if got := c.in.Negate(); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s: negate = %+v, want %+v", name, got, c.want)

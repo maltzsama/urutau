@@ -57,10 +57,12 @@ type Predicate struct {
 	Value  any      `json:"value,omitempty"`
 }
 
-// Negate returns the logical negation of f with NOT pushed down to the leaves
-// (De Morgan): all↔any, not(not(x)) = x, and each predicate's operator
-// negated. It never leaves a `not` node, so an expression built from it has
-// no negation over a comparison. Shared by every SQL source (issue #403).
+// Negate returns the logical negation of f with NOT pushed down one level
+// (De Morgan): all↔any over negated children, each predicate's operator
+// negated, and a `not` node replaced by its operand as is (not(not(x)) = x).
+// That operand may itself hold `not` nodes: a renderer that meets one calls
+// Negate on it in turn, so the rendered expression never negates a
+// comparison. Shared by every SQL source (issue #403).
 func (f *Filter) Negate() *Filter {
 	switch {
 	case f == nil:
