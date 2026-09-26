@@ -6,13 +6,6 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
-func TestCountOpsNilBatch(t *testing.T) {
-	u, d := CountOps(nil)
-	if u != 0 || d != 0 {
-		t.Errorf("CountOps(nil) = %d, %d, want 0, 0", u, d)
-	}
-}
-
 func TestEnrichSpecsEmpty(t *testing.T) {
 	got := enrichSpecs(nil)
 	if len(got) != 0 {

@@ -15,6 +15,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/maintenance"
@@ -845,7 +846,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		})
 	})
 	w.OnCommit(func(b *dataplane.Batch, rows int) {
-		up, del := worker.CountOps(b)
+		up, del := dpint.CountOps(b)
 		log.Info("commit", "table", b.Table, "rows", rows,
 			"upserts", up, "deletes", del, "position", string(b.Watermark))
 		r.emit(eventlog.KindCommit, map[string]any{
