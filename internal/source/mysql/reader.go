@@ -180,9 +180,7 @@ func (r *Reader) stop() {
 // the stream ends or the context is cancelled. Call in a goroutine.
 func (r *Reader) StartFromGTID(ctx context.Context, start *position.GTID) error {
 	r.cfg.Logger.Info("reader start", "from", start.String())
-	r.mu.Lock()
-	r.curSet = start
-	r.mu.Unlock()
+	r.setStart(start)
 
 	// The position contract carries its own GTID set; convert it back to
 	// go-mysql's type at this boundary — the mysql source is the only place
@@ -304,6 +302,16 @@ func (r *Reader) OnGTID(header *replication.EventHeader, e gomysql.BinlogGTIDEve
 	r.mu.Unlock()
 	r.mergeGTID(g)
 	return nil
+}
+
+// setStart seeds the cumulative resume set from start, as the reader's own
+// copy: mergeGTID advances the set in place, and start belongs to the caller
+// (the coordinator keeps and reads it).
+func (r *Reader) setStart(start *position.GTID) {
+	own := position.MustGTID(start.String())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.curSet = own
 }
 
 // mergeGTID folds one transaction GTID into the cumulative resume set. A
