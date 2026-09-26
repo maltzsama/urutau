@@ -71,6 +71,9 @@ const (
 	// CoordinatorCycleCommittedBeforeRecord: CommitStaged is durable, the
 	// confirmed position was not recorded (S5).
 	CoordinatorCycleCommittedBeforeRecord Point = "coordinator.cycle-committed-before-record"
+	// CoordinatorSnapshotTableStart: the coordinator is about to snapshot a
+	// table; the live stream may already have committed to it (P1, #428).
+	CoordinatorSnapshotTableStart Point = "coordinator.snapshot-table-start"
 )
 
 // Points lists every boundary, for tests and for validating an armed name.
@@ -84,6 +87,7 @@ var Points = []Point{
 	WorkerStagedShippedBeforeAck,
 	CoordinatorCycleBeforeCommit,
 	CoordinatorCycleCommittedBeforeRecord,
+	CoordinatorSnapshotTableStart,
 }
 
 // DefaultFile is where an enabled binary looks for the arm file.

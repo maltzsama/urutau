@@ -920,6 +920,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		for _, ref := range needsSnapshot {
 			c.log.Info("coordinator snapshot", "table", ref.Source)
+			faultinject.At(faultinject.CoordinatorSnapshotTableStart, "table", ref.Target)
 			if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
 				c.log.Warn("coordinator: eventlog emit", "err", err)
 			}

@@ -181,6 +181,9 @@ type crOptions struct {
 	// is (all three operations and their windows); it overrides
 	// Maintenance.
 	MaintenanceBlock map[string]any
+	// SnapshotChunkSize, when > 0, is the coordinator's DBLog chunk size
+	// (rows per chunk): a small one stretches a table's snapshot.
+	SnapshotChunkSize int
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
@@ -226,6 +229,10 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			"compaction": map[string]any{"minInputFiles": 2, "interval": interval},
 		}
 	}
+	coordinator := map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080"}
+	if opts.SnapshotChunkSize > 0 {
+		coordinator["snapshot"] = map[string]any{"chunkSize": opts.SnapshotChunkSize}
+	}
 	cr := map[string]any{
 		"apiVersion": "urutau.io/v1alpha1",
 		"kind":       "CDCPipeline",
@@ -238,7 +245,7 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			},
 			// Race instrumentation roughly doubles the engine's footprint;
 			// the defaults are sized for the shipped (non-race) image.
-			"coordinator": map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080"},
+			"coordinator": coordinator,
 			"worker": map[string]any{
 				"cpu": "500m", "cpu_overhead": "500m",
 				"memory": "2Gi", "memory_overhead": "1Gi",
