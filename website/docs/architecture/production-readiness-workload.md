@@ -1,0 +1,195 @@
+---
+sidebar_position: 8
+---
+
+# Production-readiness workload
+
+The production-readiness matrix runs every fault, scaling and maintenance
+dimension against one live **MySQL → Iceberg CDC pipeline**. This page covers
+the pipeline's input and its truth: a stochastic workload over three MySQL
+tables, and the oracle that says what Iceberg must end up holding. Chaos
+scheduling, KEDA re-slicing and maintenance build on top of it.
+
+The code lives in `test/e2e/pods`:
+
+| File | Contents |
+|------|----------|
+| `workload_gen_test.go` | Profiles, the three tables, random regimes, the transaction builder and the oracle. Pure: no database. |
+| `workload_run_test.go` | Runs the streams against MySQL, reconciles the oracle, reads and compares MySQL and Iceberg state. |
+| `workload_stats_test.go` | Observed distributions and the diagnostics file. |
+| `workload_unit_test.go` | Cluster-free tests of the generator, run by plain `go test`. |
+| `production_readiness_test.go` | `TestProductionReadinessWorkload`, the workload end to end in the pod e2e cluster. |
+
+## Running it
+
+```bash
+make e2e-pods-up        # once; needs make k8s-load-race first
+URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 60m
+# full profile:
+URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
+```
+
+| Variable | Effect |
+|----------|--------|
+| `URUTAU_E2E_PROFILE` | `smoke` (default) or `full`. |
+| `URUTAU_E2E_SEED` | Replays a run's random choices. The seed is logged at the start of every run. |
+| `URUTAU_E2E_ARTIFACTS` | Directory for the diagnostics file (default: the system temp dir, under `urutau-e2e/`). |
+| `URUTAU_E2E_TABLES` | Comma-separated table kinds (`accounts`, `items`, `events`) to narrow a run while debugging one table. The coverage checks still expect all three, so a narrowed run always fails coverage, naming the omitted tables: it is never a pass of the matrix. |
+
+The test's own budget is the live window plus the settle timeout plus 15
+minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full),
+so the `-timeout` values above leave it room to report its own failure.
+
+The seed reproduces every random draw, not the timing: regimes end on the
+wall clock, so a replay can cut them at different transactions.
+
+## The three tables
+
+Each run creates fresh source tables and sink targets with a unique suffix,
+so no run resumes from another's position or replays its binlog.
+
+| Table | Primary key | Workers | What it exercises |
+|-------|-------------|---------|-------------------|
+| `pr_accounts_*` | `id BIGINT UNSIGNED`, cast to `uint64` | 2 | Unsigned keys above 2^63 end to end. Keys are drawn from `[2^63 − 2^40, 2^63 + 3·2^40)`, so a quarter sit below 2^63 and the two-worker partition boundary (the middle of the seeded range) lands above 2^63. |
+| `pr_items_*` | `sku VARCHAR(40)` | 2 | String-key range partitioning. Keys are `SKU-` plus ten characters from `[0-9A-Z]`, inside the MySQL chunker's charset and free of case-insensitive collisions. |
+| `pr_events_*` | `(tenant_id INT, event_id BIGINT)` | 1 | A composite key, `MEDIUMTEXT` payloads up to the profile's maximum, a nullable decimal, and backlog episodes. |
+
+Every table has a `rev BIGINT` column that takes a new, run-wide increasing
+value on every insert and update. It guarantees an UPDATE always changes the
+row (MySQL writes no binlog event for an UPDATE that changes nothing), and it
+lets the comparison tell a stale row from a wrong one.
+
+## Profiles
+
+Smoke and full share every line of the generator; only the sizes differ.
+
+| | smoke | full |
+|---|---|---|
+| Initial rows per table | 2,000 | 1,000,000 |
+| Mean mutations/s per table | 30 | 1,000 |
+| Live window | 3 min | 30 min |
+| Largest transaction | 150 rows | 2,000 rows |
+| Largest `events` payload | 64 KiB | 256 KiB |
+| Settle timeout | 30 min | 60 min |
+
+## How the workload stays random
+
+Each table has its own stream, seeded from the run seed and the table's
+position. A stream draws a **regime** every few seconds and runs
+transactions under it until it expires:
+
+- mutation rate: the profile mean times a log-normal factor (0.05× to 8×);
+- transaction size: exponential around a log-uniform mean, plus an
+  occasional jumbo transaction at the profile maximum (and one guaranteed
+  jumbo early in every stream);
+- insert/update/delete mix: log-normal weights around 45/35/20, pulled back
+  when the live row count drifts below half or above twice the seeded size;
+- payload size: log-uniform between 16 bytes and a regime cap;
+- bursts: some transactions start a run of back-to-back transactions with
+  no pause.
+
+Keys: inserts draw fresh keys, and about one in twenty reinserts a key the
+run deleted, so delete-then-reinsert is exercised. Updates and deletes pick a
+uniformly random live key.
+
+Consecutive inserts in a transaction go out as one multi-row INSERT (one
+binlog rows event with many rows), so the pipeline sees the batching a bulk
+writer produces. The workload never builds CDC batches itself.
+
+**Backlog episodes** (folded in from #355): the `events` stream overloads
+itself periodically, at 8× the mean rate with larger transactions and
+full-size payloads, for 10–40 s. The first episode starts in the first third
+of the live window, later ones at random intervals. The other two tables keep
+their own pace throughout.
+
+The live streams start right after the pipeline is applied, before the
+coordinator is up, so mutations overlap the snapshot as well as the stream.
+
+## The oracle
+
+The oracle is a primary key → row-image map per table, updated only from
+transactions that **committed**. A transaction is built against the live key
+set, executed in one MySQL transaction, and then:
+
+- **committed**: applied to the oracle;
+- **failed before COMMIT**: rolled back, and the key set is restored;
+- **failed at COMMIT** (ambiguous): every key it touched is read back from
+  MySQL, and the oracle takes MySQL's answer.
+
+An UPDATE or DELETE that touches anything but exactly one row fails the
+transaction: the oracle said the key was live, so MySQL and the oracle
+disagree.
+
+The row image is the canonical text of every value column, the same text
+both sides produce: `CAST(x AS CHAR)` in MySQL and `CAST(x AS VARCHAR)` in
+Trino, with payloads compared as MD5 (`MD5(x)` against
+`lower(to_hex(md5(to_utf8(x))))`). Decimals are generated as exact units and
+rendered with every fractional digit, as both engines print a `DECIMAL`.
+
+## The comparison
+
+After the live window, the test waits until every Iceberg table equals its
+MySQL table (or the settle timeout runs out) and then checks:
+
+1. **oracle vs MySQL**: must be empty. A difference is a workload bug, not a
+   pipeline bug.
+2. **MySQL vs Iceberg**: must be empty.
+
+Each difference is classified:
+
+| Category | Meaning |
+|----------|---------|
+| missing | a live key absent from the observed state |
+| extra | a key this run never wrote |
+| resurrected delete | a key this run deleted, present again |
+| stale | the right key with an older `rev` |
+| incorrect | the right key with the current (or a newer) `rev` and different content |
+| duplicated | one key, several rows |
+
+The test also fails if the run did not cover what the matrix needs: every
+operation on every table, every operation on each side of 2^63 and of the
+`pr_accounts` partition boundary, at least one backlog episode, a
+single-row and a maximum-size transaction, and `events` payloads from under
+1 KiB to at least half the profile maximum.
+
+## Position
+
+When the streams stop, the workload records `@@GLOBAL.gtid_executed`: the
+source position once the last generated mutation committed. That is the
+expected position. Each stream also records `gtid_executed` when it stops,
+but that is only an upper bound on its own last position: other streams may
+commit in between, and the driver cannot report one transaction's own GTID.
+Comparing the expected position with the committed Iceberg `cdc.position` is
+the job of the validation layer (#387).
+
+## Settling
+
+After the live window the test polls MySQL and Iceberg every 10 s until
+every table matches, up to the profile's settle timeout. A failed read (Trino
+restarting, a port-forward dropped over a long run) re-establishes the Trino
+port-forward before the next attempt, rather than failing the same way until
+the deadline.
+
+Partitioned tables are the slow ones to drain: with the race image a
+`workers: 2` table commits about one Iceberg snapshot per coordinator cycle,
+a median of 1–2 rows (#414), and took about 10 minutes to converge after a
+3-minute smoke window. The smoke settle is 30 minutes for that reason.
+
+A failed run keeps its MySQL source tables (and, like every pod e2e run, its
+Iceberg targets), so the keys the diff names can be read back.
+
+## Diagnostics
+
+Every run writes `production-readiness-<profile>-<seed>.json`, pass or fail:
+
+- the seed, the profile and the live window;
+- the expected source position;
+- per table: operation counts, per-side counts for `pr_accounts`, the
+  expected partition boundary, backlog episodes, failed and ambiguous
+  transactions;
+- distributions (min, max, mean, p50/p90/p99 and power-of-two buckets) of
+  mutations per second, rows and bytes per MySQL transaction, and payload
+  size;
+- rows and bytes per Iceberg commit, read from the target's `$snapshots`
+  summaries (one snapshot per worker commit);
+- both final diffs.
