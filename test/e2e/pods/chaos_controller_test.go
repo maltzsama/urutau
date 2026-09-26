@@ -222,10 +222,17 @@ func newChaosController(ns, pipeline string, seed uint64, p chaosProfile, worklo
 	}
 }
 
+// kubectlTimeout bounds one controller kubectl call.
+const kubectlTimeout = 2 * time.Minute
+
 // kubectlCmd runs kubectl without a *testing.T, for the controller's own
 // goroutines: a failure is an error to record, not a test abort.
 func kubectlCmd(stdin string, args ...string) (string, error) {
-	cmd := exec.Command("kubectl", args...)
+	// Bounded: a hung API server or deletion must not hang the experiment
+	// goroutine, and with it stop() and the test's cleanup.
+	ctx, cancel := context.WithTimeout(context.Background(), kubectlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -253,13 +260,18 @@ func (c *chaosController) start(ctx context.Context) {
 				return
 			case <-time.After(d.Delay):
 			}
+			// Check and reserve under one lock: an injection counts as
+			// active from here, before its resource exists, so two quick
+			// draws cannot both pass the limit.
 			c.mu.Lock()
 			n := len(c.active)
-			c.mu.Unlock()
 			if n >= c.profile.MaxConcurrent || (n > 0 && !d.Overlap) {
+				c.mu.Unlock()
 				continue // this draw would overlap more than allowed: skip it
 			}
 			seq++
+			c.active[c.name(seq)] = reserved
+			c.mu.Unlock()
 			c.wg.Add(1)
 			go func(seq int, d chaosDecision) {
 				defer c.wg.Done()
@@ -267,6 +279,14 @@ func (c *chaosController) start(ctx context.Context) {
 			}(seq, d)
 		}
 	}()
+}
+
+// reserved marks an active slot whose resource is not created yet.
+const reserved = "reserved"
+
+// name is the Chaos Mesh resource name of experiment seq.
+func (c *chaosController) name(seq int) string {
+	return fmt.Sprintf("pr-chaos-%d-%d", c.seed%100000, seq)
 }
 
 // stop ends the decision loop, waits for every experiment to end, and
@@ -281,7 +301,9 @@ func (c *chaosController) stop() {
 	}
 	c.mu.Unlock()
 	for name, kind := range left {
-		_, _ = kubectlCmd("", "-n", c.ns, "delete", kind, name, "--ignore-not-found", "--wait=true")
+		if kind != reserved {
+			_, _ = kubectlCmd("", "-n", c.ns, "delete", kind, name, "--ignore-not-found", "--wait=true")
+		}
 		c.forget(name)
 	}
 }
@@ -296,7 +318,7 @@ func (c *chaosController) forget(name string) {
 // report it injected, holds it for its duration and removes it.
 func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision) {
 	ev := &chaosEvent{Seq: seq, Kind: d.Kind, Scope: d.Scope, Planned: d.Duration, Requested: time.Now()}
-	ev.Name = fmt.Sprintf("pr-chaos-%d-%d", c.seed%100000, seq)
+	ev.Name = c.name(seq)
 	c.mu.Lock()
 	c.events = append(c.events, ev)
 	c.mu.Unlock()
@@ -310,6 +332,7 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision) 
 	manifest, resource, target, params, err := c.manifest(d, ev.Name)
 	if err != nil {
 		record(err)
+		c.forget(ev.Name) // release the reservation: nothing was created
 		return
 	}
 	c.mu.Lock()
@@ -317,6 +340,7 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision) 
 	c.mu.Unlock()
 	if _, err := kubectlCmd(manifest, "apply", "-f", "-"); err != nil {
 		record(err)
+		c.forget(ev.Name)
 		return
 	}
 	c.mu.Lock()

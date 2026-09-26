@@ -143,3 +143,19 @@ func TestRenderChaosRefusesWithoutTarget(t *testing.T) {
 		t.Fatal("a coordinator fault with no coordinator Pod must fail")
 	}
 }
+
+// A reserved slot counts toward the concurrency limit before its resource
+// exists: once MaxConcurrent slots are taken, the loop's check refuses the
+// next draw.
+func TestChaosReservationCountsTowardTheLimit(t *testing.T) {
+	c := newChaosController("pod-e2e", "p", 1, smokeChaos, nil)
+	for seq := 1; seq <= smokeChaos.MaxConcurrent; seq++ {
+		c.active[c.name(seq)] = reserved
+	}
+	if n := len(c.active); n < c.profile.MaxConcurrent {
+		t.Fatalf("%d reserved slots, want %d", n, c.profile.MaxConcurrent)
+	}
+	if c.name(1) == c.name(2) {
+		t.Fatal("experiment names must differ per seq")
+	}
+}
