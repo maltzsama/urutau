@@ -126,7 +126,14 @@ func (s *Sink) Writer(ctx context.Context, ref core.TableRef, cast core.CastPoli
 	if err != nil {
 		return nil, err
 	}
-	return openTableWriter(ctx, s.conn, ident, ref, cast, meta, ref.Source, nil)
+	w, err := openTableWriter(ctx, s.conn, ident, ref, cast, meta, ref.Source, nil)
+	if err != nil {
+		return nil, err
+	}
+	w.progress = func(ctx context.Context, props map[string]string) error {
+		return s.SetProperties(ctx, ref, props)
+	}
+	return w, nil
 }
 
 // Position reads the committed CDC position. When the per-partition control

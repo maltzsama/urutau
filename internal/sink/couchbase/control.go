@@ -46,6 +46,7 @@ type controlDoc struct {
 func controlWrite(prev *controlDoc, info batchInfo, now time.Time) *controlDoc {
 	ctrl := &controlDoc{Properties: map[string]string{}}
 	if prev != nil {
+		ctrl.Position = prev.Position
 		if prev.Properties != nil {
 			ctrl.Properties = prev.Properties
 		}
@@ -53,12 +54,16 @@ func controlWrite(prev *controlDoc, info batchInfo, now time.Time) *controlDoc {
 			ctrl.Positions = prev.Positions
 		}
 	}
-	ctrl.Position = info.Position
-	if info.Owner != "" {
-		if ctrl.Positions == nil {
-			ctrl.Positions = map[string]string{}
+	// A batch with no position (a state-only commit, #428) leaves the
+	// committed positions as they are.
+	if info.Position != "" {
+		ctrl.Position = info.Position
+		if info.Owner != "" {
+			if ctrl.Positions == nil {
+				ctrl.Positions = map[string]string{}
+			}
+			ctrl.Positions[info.Owner] = info.Position
 		}
-		ctrl.Positions[info.Owner] = info.Position
 	}
 	ctrl.UpdatedAt = now
 	if info.SnapshotState != "" {

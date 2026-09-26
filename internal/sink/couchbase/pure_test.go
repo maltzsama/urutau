@@ -283,6 +283,19 @@ func TestControlWriteSnapshotState(t *testing.T) {
 	}
 }
 
+// A state-only commit (the snapshot-done batch, #428) carries no position:
+// it must leave the committed positions as they are, not blank them.
+func TestControlWriteStateOnlyKeepsPosition(t *testing.T) {
+	prev := &controlDoc{Position: "g1:1-9", Positions: map[string]string{"w0": "g1:1-9"}}
+	got := controlWrite(prev, batchInfo{Owner: "w0", SnapshotState: "complete"}, time.Now())
+	if got.Position != "g1:1-9" || got.Positions["w0"] != "g1:1-9" {
+		t.Errorf("positions = %q %v, want g1:1-9 kept", got.Position, got.Positions)
+	}
+	if got.Properties["cdc.snapshot.state"] != "complete" {
+		t.Errorf("snapshot state = %q", got.Properties["cdc.snapshot.state"])
+	}
+}
+
 func TestPropertiesOfMissingDoc(t *testing.T) {
 	kv := newFakeKV()
 	props, err := propertiesOf(t.Context(), kv)

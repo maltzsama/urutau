@@ -9,6 +9,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
@@ -174,5 +176,21 @@ func TestMinSafePositionAcrossPartitions(t *testing.T) {
 	// The default kind is MySQL GTID (containment order).
 	if got, err := minSafePosition("", []string{"3e11fa47-71ca-11e1-9e33-c80aa9429562:1-90", "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50"}); err != nil || got != "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-50" {
 		t.Fatalf("gtid min = %q, %v", got, err)
+	}
+}
+
+// A batch's snapshot state reaches the progress table only when it carries
+// one (#428): the snapshot-done batch does, a plain stream batch does not.
+func TestSnapshotProps(t *testing.T) {
+	if got := snapshotProps(&dataplane.Batch{}); got != nil {
+		t.Fatalf("no state: %v, want nil", got)
+	}
+	got := snapshotProps(&dataplane.Batch{SnapshotState: "complete"})
+	if len(got) != 1 || got[snapshot.PropSnapshotState] != "complete" {
+		t.Fatalf("complete: %v", got)
+	}
+	got = snapshotProps(&dataplane.Batch{SnapshotState: "in_progress", SnapshotPending: []uint32{2, 5}})
+	if got[snapshot.PropSnapshotState] != "in_progress" || got[snapshot.PropSnapshotPending] == "" {
+		t.Fatalf("in progress: %v", got)
 	}
 }

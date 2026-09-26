@@ -43,6 +43,16 @@ type SnapshotProgress struct {
 	Started string   // ISO 8601 timestamp of snapshot start
 }
 
+// Unfinished reports whether a table's properties record a snapshot that has
+// not completed: not started yet, or in progress. A committed position does
+// not prove the opposite — the stream commits to a table before and during
+// its snapshot (#428). No state at all is a table that predates this
+// marking, and reads as finished.
+func Unfinished(props map[string]string) bool {
+	s := props[PropSnapshotState]
+	return s == string(StateNotStarted) || s == string(StateInProgress)
+}
+
 // ReadSnapshotProgress reads snapshot state from table properties. The
 // plain map type keeps this source-side package free of the sink library
 // (the architecture wall); iceberg.Properties is assignable to it.

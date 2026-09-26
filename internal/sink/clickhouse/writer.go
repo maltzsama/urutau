@@ -10,6 +10,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
@@ -50,6 +51,10 @@ type tableWriter struct {
 	// position in posQuoted (WK-001 C7).
 	owner     string
 	posQuoted string // per-partition position table, "" when unpartitioned
+	// progress records the batch-carried snapshot state after the batch's
+	// rows are durable (the Sink's SetProperties for this target), so a
+	// snapshot's completion is never recorded ahead of its rows (#428).
+	progress func(ctx context.Context, props map[string]string) error
 }
 
 // openTableWriter loads the target column list and seeds the seq floor from
@@ -182,6 +187,50 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// stays coherent if a mixed stream ever alternates.
 	seq := w.versionSeq(b.Seq)
 	batchPos := string(b.Watermark)
+	if reader.NumRows() > 0 {
+		if err := w.insertRows(ctx, reader, resolvers, batchPos, seq); err != nil {
+			return err
+		}
+	}
+	// Per-partition position (WK-001 C7): record this worker's committed
+	// coordinate so Position() can take the MinSafe across partitions. Only
+	// when the worker has an owner — the collapsed runner writes none and
+	// Position() falls back to the legacy argMax. A ReplacingMergeTree keyed
+	// by owner keeps the latest seq per partition. A batch with no position
+	// (a state-only commit) leaves it as it is.
+	if w.owner != "" && batchPos != "" {
+		if err := w.conn.Exec(ctx,
+			"INSERT INTO "+w.posQuoted+" (owner, position, seq) VALUES (?, ?, ?)",
+			w.owner, batchPos, seq); err != nil {
+			return fmt.Errorf("insert %s: %w", w.posQuoted, err)
+		}
+	}
+	if props := snapshotProps(b); props != nil && w.progress != nil {
+		if err := w.progress(ctx, props); err != nil {
+			return fmt.Errorf("snapshot state %s: %w", w.quoted, err)
+		}
+	}
+	return nil
+}
+
+// snapshotProps renders a batch's snapshot state as progress properties, nil
+// when the batch carries none.
+func snapshotProps(b *dataplane.Batch) map[string]string {
+	if b.SnapshotState == "" && b.SnapshotPending == nil {
+		return nil
+	}
+	props := map[string]string{}
+	if b.SnapshotState != "" {
+		props[snapshot.PropSnapshotState] = b.SnapshotState
+	}
+	if b.SnapshotPending != nil {
+		props[snapshot.PropSnapshotPending] = snapshot.EncodePending(b.SnapshotPending)
+	}
+	return props
+}
+
+// insertRows writes a batch's rows in one INSERT.
+func (w *tableWriter) insertRows(ctx context.Context, reader *transport.BatchReader, resolvers []colResolver, batchPos string, seq uint64) error {
 	batch, err := w.conn.PrepareBatch(ctx, "INSERT INTO "+w.quoted)
 	if err != nil {
 		return fmt.Errorf("prepare %s: %w", w.quoted, err)
@@ -212,18 +261,6 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	if err := batch.Send(); err != nil {
 		_ = batch.Abort()
 		return fmt.Errorf("insert %s: %w", w.quoted, err)
-	}
-	// Per-partition position (WK-001 C7): record this worker's committed
-	// coordinate so Position() can take the MinSafe across partitions. Only
-	// when the worker has an owner — the collapsed runner writes none and
-	// Position() falls back to the legacy argMax. A ReplacingMergeTree keyed
-	// by owner keeps the latest seq per partition.
-	if w.owner != "" {
-		if err := w.conn.Exec(ctx,
-			"INSERT INTO "+w.posQuoted+" (owner, position, seq) VALUES (?, ?, ?)",
-			w.owner, batchPos, seq); err != nil {
-			return fmt.Errorf("insert %s: %w", w.posQuoted, err)
-		}
 	}
 	return nil
 }

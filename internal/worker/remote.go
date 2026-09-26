@@ -767,6 +767,13 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 			ing.Seq, ing.Staged = meta.BatchId, true
 		}
 		return r.sendIngest(ing)
+	case meta.Window != nil && meta.Window.SnapshotDone:
+		b.Release()
+		ing := Ingest{Table: meta.Table, Position: meta.LowPos, SnapshotDone: true}
+		if meta.Staged {
+			ing.Seq, ing.Staged = meta.BatchId, true
+		}
+		return r.sendIngest(ing)
 	default:
 		var win *rowchange.Window
 		if meta.Window != nil && meta.Window.InWindow {

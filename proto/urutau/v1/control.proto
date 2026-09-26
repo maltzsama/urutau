@@ -324,4 +324,7 @@ message WindowTag {
   bool   closes    = 2;
   uint32 chunk_id  = 3;
   bool   snapshot  = 4;  // true → rows feed AddWindowRows, not the ingest path
+  // The table's snapshot is over: every window was sent ahead of this marker.
+  // The worker commits cdc.snapshot.state=complete after them (issue #428).
+  bool   snapshot_done = 5;
 }
