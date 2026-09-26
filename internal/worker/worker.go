@@ -154,6 +154,11 @@ type Ingest struct {
 	Batch    *dataplane.Batch
 	Win      *rowchange.Window
 	Position string
+	// Seq and Staged are a Closes marker's cycle in the coordinator's send
+	// order and its commit mode: the window's rows are delivered as that
+	// cycle (zero for a marker that carries none).
+	Seq    uint64
+	Staged bool
 }
 
 // New builds a worker; register tables before Run.
@@ -782,6 +787,26 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				if err != nil {
 					return err
 				}
+				// A marker with a seq is a cycle of the coordinator's send
+				// order: the window's rows go out as that cycle, so they
+				// commit after every live cycle released ahead of the
+				// marker (#416). A window that emits no rows still owes
+				// the cycle its delivery.
+				if ing.Seq != 0 {
+					if cb != nil {
+						cb.Seq, cb.Staged = ing.Seq, ing.Staged
+					} else {
+						eb, err := markerBatch(p, ing)
+						if err != nil {
+							return err
+						}
+						err = deliverEmpty(eb)
+						eb.Release()
+						if err != nil {
+							return err
+						}
+					}
+				}
 				if cb != nil {
 					if err := addPending(cb, int(cb.Record.NumRows())); err != nil {
 						return err
@@ -1316,6 +1341,20 @@ func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.Writ
 		// silently downgrade a staged cycle to a direct commit.
 		Staged: b.Staged,
 	}, nil
+}
+
+// markerBatch is a 0-row batch in the table's wire schema that carries a
+// Closes marker's cycle, for a window that emitted no rows: the cycle still
+// owes the coordinator a delivery.
+func markerBatch(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
+	schema, err := transport.CoreSchemaToArrow(p.knownSchema)
+	if err != nil {
+		return nil, fmt.Errorf("worker: table %s: window %d marker: %w", p.target, ing.Win.ChunkID, err)
+	}
+	bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	rec := bld.NewRecordBatch()
+	bld.Release()
+	return &dataplane.Batch{Table: p.target, Record: rec, Watermark: []byte(ing.Position), Mode: p.mode, Seq: ing.Seq, Staged: ing.Staged}, nil
 }
 
 // emptyBatch returns a 0-row batch with b's schema, carrying b's Seq and
