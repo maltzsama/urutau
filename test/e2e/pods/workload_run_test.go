@@ -43,6 +43,9 @@ type workload struct {
 	// backlog is set while the events stream runs a backlog episode, for
 	// the chaos record.
 	backlog atomic.Bool
+	// produced counts each table's committed row mutations, for the
+	// progress sampler, which reads it from another goroutine.
+	produced []atomic.Int64
 
 	// Filled after the run, for the diagnostics file.
 	checks    []tableCheck
@@ -53,7 +56,7 @@ type workload struct {
 // newWorkload builds a workload. Each table gets its own random stream,
 // derived from the run seed and the table's position.
 func newWorkload(seed uint64, p workloadProfile, tables []*prTable, db *sql.DB) *workload {
-	w := &workload{profile: p, seed: seed, db: db, tables: tables, started: time.Now()}
+	w := &workload{profile: p, seed: seed, db: db, tables: tables, started: time.Now(), produced: make([]atomic.Int64, len(tables))}
 	for i, t := range tables {
 		w.gens = append(w.gens, newTableGen(t, p, seed, uint64(i)+1))
 		w.stats = append(w.stats, newTableStats())
@@ -280,11 +283,18 @@ func (w *workload) runStream(ctx context.Context, i int) {
 			n = p.MaxTxnRows // one jumbo transaction per stream, whatever the regimes draw
 		}
 		muts, undo := g.buildTxn(n, false)
+		// What MySQL has executed before this transaction: once it commits,
+		// the table's committed position must end up strictly past it
+		// (positionProblems). One cheap query per transaction.
+		var before string
+		_ = w.db.QueryRowContext(ctx, "SELECT @@GLOBAL.gtid_executed").Scan(&before)
 		ambiguous, err := execTxn(ctx, w.db, g.t, muts)
 		switch {
 		case err == nil:
 			g.commit(muts)
 			s.recordTxn(g, muts, time.Now())
+			s.GTIDBeforeLast = before
+			w.produced[i].Add(int64(len(muts)))
 		case ambiguous:
 			s.AmbiguousCommits++
 			undo()

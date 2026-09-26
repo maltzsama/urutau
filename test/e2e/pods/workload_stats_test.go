@@ -105,7 +105,11 @@ type tableStats struct {
 	// GTIDAtStop is gtid_executed read when this stream stopped: an upper
 	// bound on its last mutation's position, not that position itself.
 	GTIDAtStop string `json:"gtidExecutedAtStreamStop"`
-	LiveRows   int    `json:"liveRows"`
+	// GTIDBeforeLast is gtid_executed read right before the stream's last
+	// committed transaction: the table's final committed position must be
+	// strictly past it.
+	GTIDBeforeLast string `json:"gtidExecutedBeforeLastTxn"`
+	LiveRows       int    `json:"liveRows"`
 
 	rowsPerTxn  *dist
 	bytesPerTxn *dist
@@ -183,6 +187,8 @@ type runReport struct {
 	Tables           []tableReport   `json:"tables"`
 	Failure          string          `json:"failure,omitempty"`
 	Chaos            *chaosReport    `json:"chaos,omitempty"`
+	// Progress is each table's sampled progress over time (#355).
+	Progress map[string][]progressSample `json:"progress,omitempty"`
 }
 
 // writeReport persists the report under URUTAU_E2E_ARTIFACTS (or the system
