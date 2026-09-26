@@ -626,8 +626,18 @@ func startPortForward(t *testing.T, ns, resource string, local, remote int, wait
 	}
 	deadline := time.Now().Add(wait)
 	addr := fmt.Sprintf("127.0.0.1:%d", local)
+	// In the cluster the local proxy accepts before its target does: probe
+	// the target itself, so "ready" means the Service or Pod is listening.
+	probe := func() (string, error) { return addr, nil }
+	if inCluster() {
+		probe = func() (string, error) { return clusterTarget(ns, resource, remote) }
+	}
 	for {
-		conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		target, err := probe()
+		var conn net.Conn
+		if err == nil {
+			conn, err = net.DialTimeout("tcp", target, 250*time.Millisecond)
+		}
 		if err == nil {
 			_ = conn.Close()
 			t.Cleanup(stop)

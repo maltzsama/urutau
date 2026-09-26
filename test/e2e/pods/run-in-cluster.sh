@@ -87,8 +87,12 @@ LOGS=$!
 trap 'kill $LOGS 2>/dev/null || true' EXIT
 
 until code="$("$KUBECTL" -n "$NS" exec "$POD" -- cat /artifacts/.exit 2>/dev/null)"; do
-  if ! "$KUBECTL" -n "$NS" get pod "$POD" >/dev/null 2>&1; then
-    echo "error: $POD is gone before the tests finished" >&2
+  # The container itself can die before writing .exit (OOM-killed, evicted):
+  # the Pod then stops Running and exec keeps failing, so report it.
+  phase="$("$KUBECTL" -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo Gone)"
+  if [ "$phase" != "Running" ] && [ "$phase" != "Pending" ]; then
+    reason="$("$KUBECTL" -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null)"
+    echo "error: $POD ended ($phase${reason:+, $reason}) before the tests recorded their exit" >&2
     exit 1
   fi
   sleep 10
