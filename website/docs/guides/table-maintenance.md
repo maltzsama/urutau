@@ -139,14 +139,31 @@ not referenced by any snapshot and deletes them after a configurable delay.
 | Field | Default | Description |
 | --- | --- | --- |
 | `interval` | `1h` | How often to scan for orphans |
-| `olderThan` | `72h` | Only delete files older than this |
+| `olderThan` | `72h` | Only delete files older than this. Minimum `1h` |
 
 ### Safety
 
-The `olderThan` delay ensures that files are not deleted while they might
-still be referenced by a concurrent writer or a long-running read. Three
-days is conservative; reduce it only if you're confident no concurrent
-access occurs.
+A file no snapshot references is not necessarily an orphan, and `olderThan`
+is what tells the two apart:
+
+- **Staged files.** On a partitioned table (`workers.number > 1`), workers
+  write their data files first and the coordinator commits them afterwards.
+  Until that commit, the files are referenced by nothing. `olderThan` must
+  outlast the longest wait for a commit, which is why it cannot be set below
+  **one hour**; a shorter value fails validation.
+- **Commits during the cleanup.** A cleanup computes the referenced files
+  from the table version it loaded, which can take minutes on a table with
+  many manifests. A commit that lands meanwhile is unreferenced in that view.
+  Its files are safe only while they are younger than `olderThan`, so a run
+  that outlasts **half** its `olderThan` stops deleting and logs
+  `orphan cleanup skipped`; the next run retries. Before this guard, a
+  cleanup with a short window could delete a concurrent commit's files,
+  the table's current metadata file among them, and leave the table
+  unloadable.
+
+Three days, the default, is conservative. Lower it only as far as your
+longest outage of the pipeline (with staged files outstanding) and your
+longest cleanup run allow.
 
 ## Maintenance events
 
@@ -266,7 +283,11 @@ sink:
 **Orphan files accumulating**
 
 - Increase `orphanCleanup.interval` if scans are too slow
-- Decrease `olderThan` if you're confident about no concurrent access
+- Decrease `olderThan` (never below `1h`, see [Safety](#safety)) to reclaim
+  space sooner
+- A log line `orphan cleanup skipped` means a run outlasted half its
+  `olderThan`: raise `olderThan`, or `interval` if runs overlap with heavy
+  commit traffic
 - Check Prometheus metrics for `urutau_maintenance_runs_total` to verify
   the operation is running
 

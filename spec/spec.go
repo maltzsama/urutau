@@ -361,6 +361,7 @@ type OrphanCleanupConfig struct {
 	Interval string `json:"interval,omitempty"`
 	// OlderThan: only files older than this are eligible for deletion. Go
 	// duration syntax. Default "72h" (3 days) — iceberg-go's own default.
+	// At least MinOrphanCleanupOlderThan (1h).
 	OlderThan string `json:"olderThan,omitempty"`
 }
 
@@ -373,6 +374,13 @@ type OrphanCleanupConfig struct {
 // the Iceberg sink, because the orchestration that schedules maintenance
 // consumes only the spec/sink contracts and cannot import a concrete sink
 // package.
+// MinOrphanCleanupOlderThan is the shortest orphan-cleanup window accepted.
+// A file no snapshot references yet is not necessarily an orphan: a worker's
+// staged data files wait for the coordinator's commit, and a commit can land
+// while a cleanup computes its references. The window must outlast both; an
+// hour covers a stalled staged cycle with room to spare.
+const MinOrphanCleanupOlderThan = time.Hour
+
 const (
 	DefaultCompactionInterval     = 5 * time.Minute
 	DefaultSnapshotExpiryInterval = 10 * time.Minute

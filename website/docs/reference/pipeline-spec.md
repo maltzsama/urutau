@@ -94,7 +94,7 @@ accepts `timezone` and TLS (`tls`, `ssl-ca`, `ssl-cert`, `ssl-key`,
 | `maintenance.enabled` | no | Background Iceberg table maintenance (Iceberg sink only — rejected on any other sink type). `false` by default — omitting the whole `maintenance` block, or leaving `enabled` unset, is the same as `false` |
 | `maintenance.compaction.interval` / `.targetFileSize` / `.minInputFiles` | no | Small-file compaction. Defaults `5m` / `512Mi` / `5` |
 | `maintenance.snapshotExpiry.interval` / `.retainLast` / `.maxAge` | no | Snapshot history pruning. Defaults `10m` / `1` / `168h`. `maxAge` is a safety window, not just a retention count — see [Sinks](sinks.md#table-maintenance) |
-| `maintenance.orphanCleanup.interval` / `.olderThan` | no | Unreferenced-file deletion. Defaults `1h` / `72h` |
+| `maintenance.orphanCleanup.interval` / `.olderThan` | no | Unreferenced-file deletion. Defaults `1h` / `72h`; `olderThan` at least `1h` |
 
 See [Sinks](sinks.md) for each sink's semantics and limits.
 
