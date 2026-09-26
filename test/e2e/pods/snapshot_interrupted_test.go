@@ -35,7 +35,9 @@ func runSnapshotInterrupted(t *testing.T, mysql, trino *sql.DB, pipeline, server
 	t.Helper()
 	sfx := uniqueTarget("")[1:]
 	srcA, srcB := "snapint_a_"+sfx, "snapint_b_"+sfx
-	createOrdersLike(t, mysql, srcA, 20000)
+	// A is large enough, with the small chunk size below, that its snapshot
+	// outlasts B's first stream commits.
+	createOrdersLike(t, mysql, srcA, 100000)
 	createOrdersLike(t, mysql, srcB, 500)
 	t.Cleanup(func() {
 		if !t.Failed() {
@@ -67,10 +69,14 @@ func runSnapshotInterrupted(t *testing.T, mysql, trino *sql.DB, pipeline, server
 	coord := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)[0]
 	logs := followLogs(t, testNS, coord)
 	before := podRestarts(t, testNS, coord)
+	// The scenario is a table the stream committed to before its snapshot:
+	// arm the fault only once B holds a position, so its snapshot start is
+	// reached with one.
+	waitCommittedPosition(t, trino, srcB, 5*time.Minute)
 	armFault(t, testNS, coord, faultinject.CoordinatorSnapshotTableStart, "raw."+srcB)
+	reportBoundaryOnFailure(t, mysql, trino, pipeline, faultinject.CoordinatorSnapshotTableStart, srcA, srcB)
 	line := waitFaultFired(t, testNS, coord, logs, faultinject.CoordinatorSnapshotTableStart, before, 10*time.Minute)
 	t.Logf("fault fired: %s", line)
-	reportBoundaryOnFailure(t, mysql, trino, pipeline, faultinject.CoordinatorSnapshotTableStart, srcA, srcB)
 
 	// The scenario needs B to hold a position when the coordinator died:
 	// without one, even the old code snapshots it.
@@ -109,5 +115,20 @@ func createOrdersLike(t *testing.T, db *sql.DB, table string, n int) {
 		if _, err := db.Exec(b.String(), args...); err != nil {
 			t.Fatalf("seed %s: %v", table, err)
 		}
+	}
+}
+
+// waitCommittedPosition waits until a sink table holds a cdc.position.
+func waitCommittedPosition(t *testing.T, trino *sql.DB, table string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if pos, err := committedPosition(context.Background(), trino, table); err == nil && pos != "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never committed a position within %s", table, timeout)
+		}
+		time.Sleep(time.Second)
 	}
 }

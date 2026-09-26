@@ -165,11 +165,12 @@ func runBoundaryCases(t *testing.T, mysql, trino *sql.DB, pipeline, target strin
 			// before the stream is attached.
 			logs := followLogs(t, testNS, pod)
 			armFault(t, testNS, pod, bc.point, "raw."+target)
+			// Before the wait: a fault that never fires is a failure too.
+			reportBoundaryOnFailure(t, mysql, trino, pipeline, bc.point, target)
 			stop := startWriter(t, mysql, 250*time.Millisecond)
 			line := waitFaultFired(t, testNS, pod, logs, bc.point, before, 4*time.Minute)
 			stop()
 			t.Logf("fired: %s", strings.TrimSpace(line))
-			reportBoundaryOnFailure(t, mysql, trino, pipeline, bc.point, target)
 			if !strings.Contains(line, "table=raw."+target) {
 				t.Fatalf("diagnostic line does not name the table: %q", line)
 			}
