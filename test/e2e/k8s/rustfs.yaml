@@ -47,13 +47,17 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 3
             failureThreshold: 40
+          # Sized for the production-readiness matrix (#386): four workers per
+          # table, compaction every 20 s and chaos-driven replays against one
+          # RustFS. At 512Mi/1 CPU it was OOMKilled repeatedly, every staged
+          # write in flight stalled, and the pipeline restart-stormed.
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 500m
+              memory: 1Gi
             limits:
-              cpu: "1"
-              memory: 512Mi
+              cpu: "2"
+              memory: 4Gi
       volumes:
         - name: data
           emptyDir: {}

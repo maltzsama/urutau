@@ -177,6 +177,10 @@ type crOptions struct {
 	Maintenance bool
 	// MaintenanceInterval is the compaction interval; empty means "1s".
 	MaintenanceInterval string
+	// MaintenanceBlock, when non-nil, is the sink's maintenance block as
+	// is (all three operations and their windows); it overrides
+	// Maintenance.
+	MaintenanceBlock map[string]any
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
@@ -208,7 +212,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 	sink := map[string]any{
 		"type": "iceberg+rest", "namespace": "raw", "warehouse": "quickstart_catalog",
 	}
-	if opts.Maintenance {
+	if opts.MaintenanceBlock != nil {
+		sink["maintenance"] = opts.MaintenanceBlock
+	} else if opts.Maintenance {
 		// A 1s interval makes compaction due for every pass, so the
 		// ephemeral maintenance worker Pod is scheduled promptly.
 		interval := opts.MaintenanceInterval

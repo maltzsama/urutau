@@ -20,7 +20,8 @@ The code lives in `test/e2e/pods`:
 | `workload_unit_test.go` | Cluster-free tests of the generator, run by plain `go test`. |
 | `chaos_controller_test.go` | The chaos controller: planner, executor and record (see [Chaos](#chaos)). |
 | `chaos_controller_unit_test.go` | Cluster-free tests of the planner and the rendered Chaos Mesh resources. |
-| `production_readiness_test.go` | `TestProductionReadinessWorkload` and `TestProductionReadinessChaos`, end to end in the pod e2e cluster. |
+| `production_readiness_test.go` | `TestProductionReadinessWorkload` and `TestProductionReadinessChaos`, end to end in the pod e2e cluster, and the shared runner. |
+| `production_readiness_matrix_test.go` | `TestProductionReadinessMatrix`: KEDA, re-slicing, maintenance and chaos (see [Matrix](#matrix-keda-re-slicing-maintenance-and-chaos)). |
 
 ## Running it
 
@@ -202,6 +203,49 @@ with phase and restarts, each worker StatefulSet's replicas, maintenance
 Pods, whether the workload was in a backlog episode, and the experiments
 already active). The seed replays the draws, never the recorded times: the
 record is for diagnosis, not a schedule.
+
+## Matrix: KEDA, re-slicing, maintenance and chaos
+
+`TestProductionReadinessMatrix` composes everything over the same workload:
+
+```bash
+URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessMatrix$' -v -timeout 130m
+```
+
+- **KEDA**: the two partitioned tables declare `workers.max: 4` over a
+  baseline of 2, so the operator renders a ScaledObject and KEDA scales the
+  worker StatefulSets on the coordinator's backlog. Scaling is never done by
+  the test.
+- **Re-slicing under CDC**: every replica change re-slices the table while
+  the workload keeps writing.
+- **Maintenance**: every operation runs through the coordinator's ephemeral
+  maintenance Pods on short intervals (compaction every 20 s, expiry every
+  30 s with `maxAge: 1m`, orphan cleanup every 30 s with the minimum
+  `olderThan: 1h`).
+- **Chaos**: the controller runs throughout; in addition, whenever a worker
+  StatefulSet's replica count changes (a re-slice starting), it injects a
+  worker pod-kill and a worker ↔ coordinator network partition at once, so
+  faults overlap partition transitions by construction.
+- A longer live window (8 minutes) and settle (60 minutes): with four workers
+  per table and staged tables committing one cycle at a time (#414), the
+  backlog of a run took about 36 minutes to drain before converging exactly.
+
+Besides the workload's exact convergence, the run proves each item from
+durable evidence, not from the coordinator's metrics (a restart resets them):
+
+| Criterion | Evidence |
+|-----------|----------|
+| KEDA scale-out during the live window | worker StatefulSet replicas, sampled every 5 s, above the baseline before the window ends |
+| KEDA scale-in | replicas back to the baseline after the backlog drains (up to 12 minutes, the HPA stabilization window) |
+| Faults during partition transitions | chaos events with a `re-slice …` trigger, injected |
+| Compaction, preserving `cdc.position` | a `replace` snapshot in every table, carrying `cdc.position` |
+| Snapshot expiry | every snapshot seen 90 s into the window is gone by the end |
+| Orphan cleanup never removes live files | the tables equal MySQL; a file planted in the accounts table's data directory, younger than `olderThan`, survives |
+
+That orphan cleanup removes a real orphan is proven where a file can be
+backdated, `TestOrphanCleanupRemovesAKnownOrphanOnly`
+(`internal/sink/iceberg`); an S3 object cannot be. The matrix found that a
+cleanup outlasting its window deleted concurrent commits (#423).
 
 ## Settling
 

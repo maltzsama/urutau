@@ -34,13 +34,16 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 5
             failureThreshold: 60
+          # The production-readiness settle reads whole merge-on-read tables
+          # (many equality-delete files) every poll; at 2Gi Trino was
+          # OOMKilled mid-settle (#386).
           resources:
             requests:
               cpu: 500m
-              memory: 1Gi
+              memory: 2Gi
             limits:
               cpu: "2"
-              memory: 2Gi
+              memory: 6Gi
       volumes:
         - name: catalog
           configMap:

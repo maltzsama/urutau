@@ -181,6 +181,7 @@ type chaosState struct {
 // chaosEvent is one injected experiment.
 type chaosEvent struct {
 	Seq        int           `json:"seq"`
+	Trigger    string        `json:"trigger"` // "planner", or what a reactive injection answered
 	Kind       chaosKind     `json:"kind"`
 	Resource   string        `json:"resource"` // podchaos / networkchaos / stresschaos
 	Name       string        `json:"name"`
@@ -204,11 +205,14 @@ type chaosController struct {
 	seed         uint64
 	profile      chaosProfile
 	planner      *chaosPlanner
+	reactive     *chaosPlanner // draws for injectNow, apart from the main stream
 	workload     func() string // the workload's phase, for the record
 
-	mu     sync.Mutex
-	events []*chaosEvent
-	active map[string]string // CR name → resource kind, still present
+	mu       sync.Mutex
+	stopping bool // set by stop under mu before it waits: injectNow then refuses
+	seq      int  // experiment counter, shared by the planner loop and injectNow
+	events   []*chaosEvent
+	active   map[string]string // CR name → resource kind, still present
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -217,7 +221,7 @@ type chaosController struct {
 func newChaosController(ns, pipeline string, seed uint64, p chaosProfile, workload func() string) *chaosController {
 	return &chaosController{
 		ns: ns, pipeline: pipeline, seed: seed, profile: p,
-		planner: newChaosPlanner(seed, p), workload: workload,
+		planner: newChaosPlanner(seed, p), reactive: newChaosPlanner(seed^0x5EAC7, p), workload: workload,
 		active: map[string]string{},
 	}
 }
@@ -250,7 +254,6 @@ func (c *chaosController) start(ctx context.Context) {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		seq := 0
 		for {
 			d := c.planner.next()
 			select {
@@ -269,15 +272,54 @@ func (c *chaosController) start(ctx context.Context) {
 				c.mu.Unlock()
 				continue // this draw would overlap more than allowed: skip it
 			}
-			seq++
+			c.seq++
+			seq := c.seq
 			c.active[c.name(seq)] = reserved
 			c.mu.Unlock()
 			c.wg.Add(1)
 			go func(seq int, d chaosDecision) {
 				defer c.wg.Done()
-				c.inject(ctx, seq, d)
+				c.inject(ctx, seq, d, "planner")
 			}(seq, d)
 		}
+	}()
+}
+
+// injectNow injects one fault of kind right away, outside the planner's
+// timing: a hook that sees a partition transition start uses it so a fault
+// overlaps the transition by construction. The target and parameters are
+// still drawn at random, and the experiment is recorded like any other,
+// with trigger naming what caused it. It is a no-op once stop has begun.
+func (c *chaosController) injectNow(ctx context.Context, kind chaosKind, trigger string) {
+	// Checked and counted under the lock stop takes before it waits, so a
+	// reactive injection either joins the wait group before stop waits on
+	// it, or does not start at all.
+	c.mu.Lock()
+	if c.stopping {
+		c.mu.Unlock()
+		return
+	}
+	d := c.reactive.next()
+	c.seq++
+	seq := c.seq
+	// Reserved like a planner draw: it counts as active from here. A
+	// reactive fault may exceed MaxConcurrent on purpose (it answers a
+	// transition), but the planner then sees it and holds back.
+	c.active[c.name(seq)] = reserved
+	c.wg.Add(1)
+	c.mu.Unlock()
+	d.Kind = kind
+	switch kind {
+	case chaosWorkerKill, chaosWorkerFailure, chaosCPUStress, chaosMemoryStress:
+		d.Scope = scopeOnePod
+	case chaosCoordinatorKill, chaosCoordFailure:
+		d.Scope = scopeCoordinator
+	default:
+		d.Scope = scopeTableGroup
+	}
+	go func() {
+		defer c.wg.Done()
+		c.inject(ctx, seq, d, trigger)
 	}()
 }
 
@@ -292,6 +334,9 @@ func (c *chaosController) name(seq int) string {
 // stop ends the decision loop, waits for every experiment to end, and
 // removes anything still present.
 func (c *chaosController) stop() {
+	c.mu.Lock()
+	c.stopping = true
+	c.mu.Unlock()
 	close(c.stopCh)
 	c.wg.Wait()
 	c.mu.Lock()
@@ -316,8 +361,8 @@ func (c *chaosController) forget(name string) {
 
 // inject resolves the target, applies the experiment, waits for Chaos Mesh to
 // report it injected, holds it for its duration and removes it.
-func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision) {
-	ev := &chaosEvent{Seq: seq, Kind: d.Kind, Scope: d.Scope, Planned: d.Duration, Requested: time.Now()}
+func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, trigger string) {
+	ev := &chaosEvent{Seq: seq, Kind: d.Kind, Scope: d.Scope, Planned: d.Duration, Requested: time.Now(), Trigger: trigger}
 	ev.Name = c.name(seq)
 	c.mu.Lock()
 	c.events = append(c.events, ev)
@@ -467,6 +512,11 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 		case "urutau-coordinator":
 			coordinators = append(coordinators, p)
 		case "urutau-worker":
+			// The coordinator's maintenance Pods live for seconds: a fault
+			// aimed at one would rarely land, so they are never targets.
+			if strings.HasSuffix(p.group, "-maint") {
+				continue
+			}
 			workers = append(workers, p)
 			if p.group != "" {
 				groups[p.group] = true
@@ -529,19 +579,32 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 		}
 		return header("StressChaos") + "  mode: all\n  duration: " + dur + "\n" + onePod(p) + "  stressors:\n" + stressor, "stresschaos", p.name, params, nil
 	case chaosNetworkPartition, chaosNetworkLoss, chaosNetworkDelay:
-		var sel map[string]string
-		if d.Scope == scopeAllWorkers || len(groups) == 0 {
-			sel = map[string]string{"app": "urutau-worker", "urutau.io/pipeline": c.pipeline}
-			target = "all workers"
-		} else {
+		// The worker side is the explicit list of running Pods — every
+		// worker, or one table's group — never a label selector, which
+		// would also match Pods that come and go during the experiment.
+		side := workers
+		target = "all workers"
+		if d.Scope != scopeAllWorkers && len(groups) > 0 {
 			names := make([]string, 0, len(groups))
 			for g := range groups {
 				names = append(names, g)
 			}
 			sort.Strings(names)
 			g := names[d.Pick%uint64(len(names))]
-			sel = map[string]string{"urutau.io/worker": g}
+			side = nil
+			for _, p := range workers {
+				if p.group == g {
+					side = append(side, p)
+				}
+			}
 			target = g
+		}
+		if len(side) == 0 {
+			return "", "", "", "", fmt.Errorf("no running worker pod to target")
+		}
+		var podList strings.Builder
+		for _, p := range side {
+			fmt.Fprintf(&podList, "        - %s\n", p.name)
 		}
 		target += " <-> coordinator"
 		action := "partition"
@@ -556,8 +619,8 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 			extra = fmt.Sprintf("  delay:\n    latency: \"%dms\"\n    jitter: \"%dms\"\n", d.Latency.Milliseconds(), d.Latency.Milliseconds()/4)
 			params = "latency=" + d.Latency.String()
 		}
-		body := fmt.Sprintf("  action: %s\n  mode: all\n  duration: %s\n  direction: both\n  selector:\n    namespaces:\n      - %s\n    labelSelectors:\n%s%s  target:\n    mode: all\n    selector:\n      namespaces:\n        - %s\n      labelSelectors:\n%s",
-			action, dur, c.ns, labelSelectorYAML(sel, "      "), extra, c.ns, labelSelectorYAML(coordSel, "        "))
+		body := fmt.Sprintf("  action: %s\n  mode: all\n  duration: %s\n  direction: both\n  selector:\n    pods:\n      %s:\n%s%s  target:\n    mode: all\n    selector:\n      namespaces:\n        - %s\n      labelSelectors:\n%s",
+			action, dur, c.ns, podList.String(), extra, c.ns, labelSelectorYAML(coordSel, "        "))
 		return header("NetworkChaos") + body, "networkchaos", target, params, nil
 	}
 	return "", "", "", "", fmt.Errorf("unknown chaos kind %q", d.Kind)

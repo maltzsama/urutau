@@ -3,6 +3,7 @@ package pods
 // Cluster-free tests of the chaos controller's planner and manifests.
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -144,6 +145,33 @@ func TestRenderChaosRefusesWithoutTarget(t *testing.T) {
 	}
 }
 
+// Maintenance Pods live for seconds, so no fault aims at them, and a
+// network fault names exactly the running Pods of its worker side.
+func TestRenderChaosSkipsMaintenanceAndListsRunningPods(t *testing.T) {
+	pods := append([]podInfo{
+		{name: "p-raw-a-maint", app: "urutau-worker", group: "p-raw-a-maint", phase: "Running"},
+	}, testPods...)
+	for i := range 40 {
+		for _, k := range []chaosKind{chaosWorkerKill, chaosNetworkPartition} {
+			d := newChaosPlanner(uint64(i), smokeChaos).next()
+			d.Kind, d.Scope = k, scopeOnePod
+			if k == chaosNetworkPartition {
+				d.Scope = scopeAllWorkers
+			}
+			m, _, target, _, err := renderChaos("pod-e2e", "p", d, "x", pods)
+			if err != nil {
+				t.Fatalf("%s: %v", k, err)
+			}
+			if strings.Contains(m, "maint") || strings.Contains(target, "maint") {
+				t.Fatalf("%s aimed at a maintenance Pod:\n%s", k, m)
+			}
+			if k == chaosNetworkPartition && (!strings.Contains(m, "- p-raw-a-0") || strings.Contains(m, "p-raw-b-0")) {
+				t.Fatalf("network fault must list the running workers only:\n%s", m)
+			}
+		}
+	}
+}
+
 // A reserved slot counts toward the concurrency limit before its resource
 // exists: once MaxConcurrent slots are taken, the loop's check refuses the
 // next draw.
@@ -157,5 +185,18 @@ func TestChaosReservationCountsTowardTheLimit(t *testing.T) {
 	}
 	if c.name(1) == c.name(2) {
 		t.Fatal("experiment names must differ per seq")
+	}
+}
+
+// A reactive injection that arrives once stop has begun must not start: it
+// would join the wait group while stop waits on it, and outlive cleanup.
+func TestInjectNowAfterStopIsANoop(t *testing.T) {
+	c := newChaosController("pod-e2e", "p", 1, smokeChaos, nil)
+	c.stopCh = make(chan struct{})
+	c.stop()
+	c.injectNow(context.Background(), chaosWorkerKill, "late")
+	c.wg.Wait()
+	if n := len(c.report().Events); n != 0 {
+		t.Fatalf("%d experiment(s) started after stop", n)
 	}
 }
