@@ -109,6 +109,12 @@ const (
 	KindJobTerminated   = "job_terminated"
 	KindSchemaDrift     = "schema_drift"
 	KindDeleteDropped   = "delete_dropped"
+	// KindLog is one structured process log record (a slog line) the
+	// coordinator's log trail appends. It carries level/msg/attrs — the
+	// run's operational log, distinct from the lifecycle events above, so a
+	// postmortem reads cause and context from the same trail (issue: logs
+	// belong in S3, not only in the live buffer).
+	KindLog = "log"
 	// KindWorkerRetired records an owner removed by a scale-in; its key
 	// range is inherited by the remaining owners.
 	KindWorkerRetired = "worker_retired"
@@ -267,10 +273,28 @@ func (r *Run) Emitted() int {
 // this event, not the entire pipeline.
 const putTimeout = 10 * time.Second
 
-// Emit appends one event and uploads the trail. Fields are free-form; ts,
+// Emit appends one event and uploads the trail. Fields are free-form; ts
+// (unless the caller supplies one — the log trail stamps its own records),
 // run_id, kind and seq are added automatically. Best-effort by contract:
 // callers log failures and carry on.
 func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) error {
+	return r.emitAll(ctx, kind, []map[string]any{fields})
+}
+
+// EmitBatch appends several events of one kind in a single append and upload.
+// It is what a log trail needs: one PUT per batch instead of one per line,
+// while keeping Emit's rotation, backlog and best-effort semantics. An empty
+// batch is a no-op.
+func (r *Run) EmitBatch(ctx context.Context, kind string, batch []map[string]any) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	return r.emitAll(ctx, kind, batch)
+}
+
+// emitAll is the shared body of Emit and EmitBatch: it appends every event of
+// the batch to the current object and uploads it.
+func (r *Run) emitAll(ctx context.Context, kind string, batch []map[string]any) error {
 	r.mu.Lock()
 	if r.closed || r.closing {
 		r.mu.Unlock()
@@ -282,28 +306,21 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 	r.inflight.Add(1)
 	defer r.inflight.Done()
 
-	// seq is assigned (and the event marshaled) under mu so the trail's line
+	// seq is assigned (and the events marshaled) under mu so the trail's line
 	// order matches the sequence order: a reader then reads a gap in the seqs
 	// as lost events (issue #333).
-	seq := r.emitted + 1
-	ev := make(map[string]any, len(fields)+4)
-	for k, v := range fields {
-		ev[k] = v
-	}
-	ev["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
-	ev["run_id"] = r.id
-	ev["kind"] = kind
-	ev["seq"] = seq
-	line, err := json.Marshal(ev)
+	lines, seq, err := r.marshalLocked(kind, batch)
 	if err != nil {
 		r.mu.Unlock()
-		return fmt.Errorf("eventlog: marshal %s: %w", kind, err)
+		return err
 	}
 	r.emitted = seq
 	pending := r.pending
 	r.pending = nil
-	r.buf = append(r.buf, line...)
-	r.buf = append(r.buf, '\n')
+	for _, line := range lines {
+		r.buf = append(r.buf, line...)
+		r.buf = append(r.buf, '\n')
+	}
 	// Bound the buffer ONLY while rotation is deferred (backlog non-empty): an
 	// S3 outage then grows buf without limit until OOM (issue #230). With no
 	// backlog, rotation resets buf, so the cap must not run — it would empty
@@ -366,6 +383,36 @@ func (r *Run) Emit(ctx context.Context, kind string, fields map[string]any) erro
 		return fmt.Errorf("eventlog: put %s/%s: %w", r.bucket, key, err)
 	}
 	return nil
+}
+
+// marshalLocked renders batch as JSONL lines carrying consecutive seqs after
+// the events already appended. It reads only r.emitted and r.id, so it runs
+// with mu held; on failure nothing has been mutated and the caller leaves the
+// trail untouched. ts defaults to now, but a caller-supplied one wins, so a
+// batched log record keeps its own timestamp instead of the flush time.
+func (r *Run) marshalLocked(kind string, batch []map[string]any) ([][]byte, int, error) {
+	lines := make([][]byte, 0, len(batch))
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	seq := r.emitted
+	for _, fields := range batch {
+		seq++
+		ev := make(map[string]any, len(fields)+4)
+		for k, v := range fields {
+			ev[k] = v
+		}
+		if _, ok := ev["ts"]; !ok {
+			ev["ts"] = now
+		}
+		ev["run_id"] = r.id
+		ev["kind"] = kind
+		ev["seq"] = seq
+		line, err := json.Marshal(ev)
+		if err != nil {
+			return nil, 0, fmt.Errorf("eventlog: marshal %s: %w", kind, err)
+		}
+		lines = append(lines, line)
+	}
+	return lines, seq, nil
 }
 
 // Close seals the run: further emits fail, and the final buffer — plus any

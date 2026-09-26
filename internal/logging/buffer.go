@@ -28,6 +28,7 @@ type Buffer struct {
 	next     int
 	full     bool
 	onAppend func(Record)
+	sink     func(Record)
 }
 
 // SetOnAppend installs a hook called after every record is appended (outside
@@ -36,6 +37,16 @@ type Buffer struct {
 func (b *Buffer) SetOnAppend(f func(Record)) {
 	b.mu.Lock()
 	b.onAppend = f
+	b.mu.Unlock()
+}
+
+// SetSink installs a second hook, called the same way, for durable storage:
+// the coordinator appends every record to the run's S3 trail through it, so
+// the process history outlives this ring. It must not block — it runs on the
+// logging path. Nil detaches it (shutdown, before the trail is sealed).
+func (b *Buffer) SetSink(f func(Record)) {
+	b.mu.Lock()
+	b.sink = f
 	b.mu.Unlock()
 }
 
@@ -49,8 +60,8 @@ func NewBuffer(capacity int) *Buffer {
 	return &Buffer{buf: make([]Record, capacity)}
 }
 
-// add appends one record, evicting the oldest once full, then fires the append
-// hook (if any) outside the lock.
+// add appends one record, evicting the oldest once full, then fires the
+// append and sink hooks (if any) outside the lock.
 func (b *Buffer) add(r Record) {
 	b.mu.Lock()
 	b.buf[b.next] = r
@@ -58,10 +69,13 @@ func (b *Buffer) add(r Record) {
 	if b.next == 0 {
 		b.full = true
 	}
-	f := b.onAppend
+	f, sink := b.onAppend, b.sink
 	b.mu.Unlock()
 	if f != nil {
 		f(r)
+	}
+	if sink != nil {
+		sink(r)
 	}
 }
 

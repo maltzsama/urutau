@@ -479,28 +479,14 @@ func (c *Coordinator) run(ctx context.Context) error {
 	c.runCtx = ctx
 
 	if cfg := c.cfg.Eventlog; cfg != nil {
-		ec := *cfg
-		// Apply the shared key convention: the trail lives under the
-		// pipeline name so it stays discoverable after the CR is deleted.
-		if ec.Pipeline == "" && c.cfg.Spec != nil {
-			ec.Pipeline = c.cfg.Spec.Pipeline
-		}
-		ev, err := eventlog.New(ctx, ec)
+		// startEventlog opens the trail and attaches the log trail, so the
+		// run's history (events AND logs) reaches S3; its stop func drains
+		// the log trail before sealing the run.
+		stop, err := c.startEventlog(ctx, *cfg)
 		if err != nil {
-			return fmt.Errorf("coordinator: eventlog: %w", err)
+			return err
 		}
-		c.ev = ev
-		defer func() {
-			if err := ev.Close(); err != nil {
-				c.log.Warn("coordinator: eventlog close", "err", err)
-			}
-		}()
-		if err := c.emit(eventlog.KindJobStarted, map[string]any{
-			"pipeline": c.cfg.Spec.Pipeline,
-			"source":   c.cfg.Spec.Source.Kind,
-		}); err != nil {
-			c.log.Warn("coordinator: eventlog emit", "err", err)
-		}
+		defer stop()
 	}
 
 	// Reject a bootstrap block this mode ignores before touching the source:
