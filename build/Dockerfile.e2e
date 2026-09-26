@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+
+# The pod e2e harness (test/e2e/pods) as an image, so it runs INSIDE the
+# cluster as a Job next to the pipeline it drives (test/e2e/pods/run-in-cluster.sh,
+# `make e2e-pods-test`). From there the load generator and the oracle reach
+# MySQL and Trino directly instead of through a `kubectl port-forward` tunnel,
+# which capped the full profile far below its rate.
+#
+# The test binary is built WITHOUT the race detector: it holds the oracle of
+# every row the workload wrote (3 x 1M rows with payloads in the full
+# profile), and the detector's memory overhead got the Job OOM-killed. The
+# pipeline under test still runs the race image, and the harness's own
+# concurrency is covered by `go test -race` in CI. The harness drives the cluster with kubectl
+# (apply/delete CRs, Chaos Mesh, exec, logs), copied from the upstream image
+# at the cluster's minor version.
+ARG GO_VERSION=1.26.5
+ARG KUBECTL_VERSION=v1.35.1
+FROM registry.k8s.io/kubectl:${KUBECTL_VERSION} AS kubectl
+
+FROM golang:${GO_VERSION}-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go test -c -o /out/pods.test ./test/e2e/pods
+
+FROM debian:bookworm-slim
+COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
+COPY --from=build /out/pods.test /usr/local/bin/pods.test
+ENV URUTAU_E2E_PODS=1 URUTAU_E2E_IN_CLUSTER=1 URUTAU_E2E_ARTIFACTS=/artifacts
+WORKDIR /artifacts
+ENTRYPOINT ["pods.test"]

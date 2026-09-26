@@ -1,0 +1,29 @@
+# VCS and editor state — never in the build context.
+.git
+.idea
+.vscode
+*.swp
+
+# Local build outputs.
+bin/
+out/
+
+# Stray compiled binaries at the repo root (test binaries and ad-hoc builds);
+# without this the build context is gigabytes sent over the daemon socket.
+*.test
+/operator
+/urutau
+/urutau-coordinator
+/urutau-worker
+/urutau-operator
+/urutau-history-server
+
+# Docs the harness image does not need (test/e2e is its source: kept).
+*.md
+website/
+tmp/
+
+# Local agent/editor scratch and unrelated sibling checkouts.
+.agents/
+agent/
+sabiql/

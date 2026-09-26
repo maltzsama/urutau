@@ -22,7 +22,7 @@ LDFLAGS := -s -w \
 	-X github.com/maltzsama/urutau/internal/version.Commit=$(COMMIT) \
 	-X github.com/maltzsama/urutau/internal/version.Date=$(DATE)
 
-.PHONY: all bootstrap build test lint proto tidy clean docker e2e-fixtures e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-load-race k8s-deploy k8s-deploy-multi-tenant k8s-undeploy k8s-status e2e-pods-up e2e-pods-down e2e-pods-test
+.PHONY: all bootstrap build test lint proto tidy clean docker e2e-fixtures e2e-up e2e-down e2e-test e2e-test-mysql e2e-test-postgres e2e-test-clickhouse e2e-test-couchbase e2e-test-distributed e2e-test-worker e2e-seed e2e-kafka-up e2e-kafka-down e2e-test-kafka envtest-setup docs docs-site docs-build k8s-load k8s-load-race k8s-deploy k8s-deploy-multi-tenant k8s-undeploy k8s-status e2e-pods-up e2e-pods-down e2e-pods-image e2e-pods-test
 
 all: lint test build
 
@@ -130,8 +130,11 @@ e2e-pods-up: ## Bring up cert-manager, the in-cluster stack, and the operator (r
 e2e-pods-down: ## Tear down the pod e2e: CRs, operator, and the in-cluster stack
 	./$(POD_E2E_DIR)/down.sh
 
-e2e-pods-test: ## Run the pod e2e scenarios (needs e2e-pods-up + k8s-load-race)
-	URUTAU_E2E_PODS=1 $(GO) test -count=1 -timeout=90m -v ./$(POD_E2E_DIR)
+e2e-pods-image: ## Build the pod e2e harness image (urutau-e2e:dev) into minikube
+	eval $$(minikube docker-env) && docker build -f build/Dockerfile.e2e -t urutau-e2e:dev .
+
+e2e-pods-test: ## Run the pod e2e scenarios as a Job inside minikube (needs e2e-pods-up, k8s-load-race, e2e-pods-image); RUN= selects tests
+	./$(POD_E2E_DIR)/run-in-cluster.sh
 
 E2E_COMPOSE := test/e2e/docker-compose.yml
 

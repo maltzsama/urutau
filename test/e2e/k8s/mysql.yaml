@@ -28,7 +28,13 @@ spec:
             - --binlog-row-image=FULL
             - --gtid-mode=ON
             - --enforce-gtid-consistency=ON
-            - --binlog-expire-logs-seconds=600
+            # Three hours: the full production-readiness profile runs a 30m
+            # live window and up to 60m of settle, and a pipeline that falls
+            # behind must still find its binlog to resume from.
+            - --binlog-expire-logs-seconds=10800
+            # The full profile seeds 1M rows per table and sustains ~1k
+            # mutations/s per table; the default 128M pool thrashes.
+            - --innodb-buffer-pool-size=4G
           env:
             - name: MYSQL_ROOT_PASSWORD
               value: rootpass
@@ -46,13 +52,15 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 30
+          # Sized for the full profile (3 tables x 1M rows, ~3k mutations/s):
+          # at 1 CPU / 1Gi the source itself capped the load generator.
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: "2"
+              memory: 5Gi
             limits:
-              cpu: "1"
-              memory: 1Gi
+              cpu: "4"
+              memory: 8Gi
       volumes:
         - name: init
           configMap:

@@ -1,0 +1,23 @@
+# The pod e2e harness runs as a Job inside minikube (test/e2e/pods/run-in-cluster.sh).
+# It drives the whole test cluster the way a developer's kubectl would:
+# CDCPipelines and Secrets in pod-e2e, Chaos Mesh experiments, worker
+# StatefulSets, pod exec (fault arming) and logs, across namespaces. This is
+# the throwaway minikube test cluster, so it is bound to cluster-admin.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-runner
+  namespace: e2e
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: urutau-e2e-runner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: e2e-runner
+    namespace: e2e

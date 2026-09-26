@@ -184,6 +184,8 @@ type crOptions struct {
 	// SnapshotChunkSize, when > 0, is the coordinator's DBLog chunk size
 	// (rows per chunk): a small one stretches a table's snapshot.
 	SnapshotChunkSize int
+	// CoordinatorMemory, when set, replaces the coordinator's 2Gi.
+	CoordinatorMemory string
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
@@ -230,6 +232,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		}
 	}
 	coordinator := map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080"}
+	if opts.CoordinatorMemory != "" {
+		coordinator["memory"] = opts.CoordinatorMemory
+	}
 	if opts.SnapshotChunkSize > 0 {
 		coordinator["snapshot"] = map[string]any{"chunkSize": opts.SnapshotChunkSize}
 	}
@@ -585,14 +590,27 @@ func portForward(t *testing.T, ns, resource string, local, remote int) {
 func startPortForward(t *testing.T, ns, resource string, local, remote int, wait time.Duration) error {
 	t.Helper()
 	releasePort(local)
-	ctx, cancel := context.WithCancel(context.Background())
-	st := &forwardState{cancel: cancel}
-	cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "port-forward", resource,
-		fmt.Sprintf("%d:%d", local, remote))
-	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return fmt.Errorf("port-forward %s %d:%d: %w", resource, local, remote, err)
+	var st *forwardState
+	var wait4 func()
+	if inCluster() {
+		// In the cluster: dial the target directly (incluster_test.go).
+		cancel, err := startProxy(ns, resource, local, remote)
+		if err != nil {
+			return err
+		}
+		st = &forwardState{cancel: cancel}
+		wait4 = func() {}
+	} else {
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "port-forward", resource,
+			fmt.Sprintf("%d:%d", local, remote))
+		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+		if err := cmd.Start(); err != nil {
+			cancel()
+			return fmt.Errorf("port-forward %s %d:%d: %w", resource, local, remote, err)
+		}
+		st = &forwardState{cancel: cancel}
+		wait4 = func() { _ = cmd.Wait() }
 	}
 	forwardMu.Lock()
 	forwardStates[local] = st
@@ -603,13 +621,23 @@ func startPortForward(t *testing.T, ns, resource string, local, remote int, wait
 			delete(forwardStates, local)
 		}
 		forwardMu.Unlock()
-		cancel()
-		_ = cmd.Wait()
+		st.cancel()
+		wait4()
 	}
 	deadline := time.Now().Add(wait)
 	addr := fmt.Sprintf("127.0.0.1:%d", local)
+	// In the cluster the local proxy accepts before its target does: probe
+	// the target itself, so "ready" means the Service or Pod is listening.
+	probe := func() (string, error) { return addr, nil }
+	if inCluster() {
+		probe = func() (string, error) { return clusterTarget(ns, resource, remote) }
+	}
 	for {
-		conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+		target, err := probe()
+		var conn net.Conn
+		if err == nil {
+			conn, err = net.DialTimeout("tcp", target, 250*time.Millisecond)
+		}
 		if err == nil {
 			_ = conn.Close()
 			t.Cleanup(stop)
