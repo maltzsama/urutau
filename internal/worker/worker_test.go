@@ -9,7 +9,6 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -317,37 +316,6 @@ type CommitterFunc func(context.Context, *dataplane.Batch) error
 func (f CommitterFunc) Close() error { return nil }
 
 func (f CommitterFunc) Commit(ctx context.Context, b *dataplane.Batch) error { return f(ctx, b) }
-
-// mergeBatches must propagate Mode on all three paths (a-only, b-only,
-// concat) — a lost mode silently defaulted to upsert before the ModeUnset
-// guard existed (audit #5). This is the exact trap the enum shift exposed.
-func TestMergeBatchesPropagatesMode(t *testing.T) {
-	mk := func(mode dataplane.WriteMode) *dataplane.Batch {
-		b := dpint.GenerateBatch(1, dpint.GeneratorOpts{NumRows: 1, Allocator: nil})
-		b.Mode = mode
-		return b
-	}
-	for _, mode := range []dataplane.WriteMode{dataplane.UpsertMode, dataplane.AppendMode} {
-		// a-only
-		got, err := mergeBatches(mk(mode), nil, nil)
-		if err != nil || got.Mode != mode {
-			t.Fatalf("a-only mode = %v, want %v (err %v)", got.Mode, mode, err)
-		}
-		got.Release()
-		// b-only
-		got, err = mergeBatches(nil, mk(mode), nil)
-		if err != nil || got.Mode != mode {
-			t.Fatalf("b-only mode = %v, want %v (err %v)", got.Mode, mode, err)
-		}
-		got.Release()
-		// concat
-		got, err = mergeBatches(mk(mode), mk(mode), nil)
-		if err != nil || got.Mode != mode {
-			t.Fatalf("concat mode = %v, want %v (err %v)", got.Mode, mode, err)
-		}
-		got.Release()
-	}
-}
 
 // batchUpserts/batchDeletes: byOp views for assertions.
 func batchUpserts(b rowchange.Batch) []rowchange.Change {

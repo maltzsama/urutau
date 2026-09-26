@@ -23,6 +23,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/grpctls"
@@ -424,7 +425,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		// Carry the equality-delete count so the coordinator's dashboard
 		// metrics (deletes, collapse ratio) are not always zero in distributed
 		// mode (issue #263).
-		_, deletes := CountOps(b)
+		_, deletes := dpint.CountOps(b)
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
 			Table:    b.Table,
 			Epoch:    assign.Epoch,
