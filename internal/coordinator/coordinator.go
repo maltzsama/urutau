@@ -285,6 +285,17 @@ type Coordinator struct {
 	// a structural bound). One shared channel: any drain (of any window)
 	// wakes every waiter, which re-checks its own window's state.
 	gateDrain chan struct{}
+	// gateReady is, per open window, the chunk whose ChunkReady arrived and
+	// whose catch-up is still under way: its rows are in the worker's
+	// window, so the gate's held batches may go out InWindow-tagged for it
+	// before the catch-up ends. A full gate then drains instead of blocking
+	// the pump — blocking it stalled the reader, and with it the very
+	// catch-up the window waited for.
+	gateReady map[string]uint32
+	// gateFlushMu serializes every drain of a gate, from taking its buffer
+	// to the last enqueue: the pump and the snapshot both drain, and the
+	// worker must receive the held batches in source order.
+	gateFlushMu sync.Mutex
 
 	// paused holds a table whose re-slice is draining. The flip waits for the
 	// table to owe nothing, which a continuously loaded table never reaches on
@@ -1408,30 +1419,42 @@ func gateKey(target string, partition int) string {
 // must not be relied on in any live path.
 func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
 	key, held := c.openKeyForTableLocked(b.Table)
 	if !held {
-		c.gateMu.Unlock()
 		return false
 	}
-	full := len(c.gateBuf[key]) >= gateMaxEvents
-	c.gateMu.Unlock()
-	if full {
-		select {
-		case <-c.gateDrain:
-		case <-ctx.Done():
+	for len(c.gateBuf[key]) >= gateMaxEvents {
+		_, ready := c.gateReady[key]
+		drain := c.gateDrain
+		c.gateMu.Unlock()
+		if ready {
+			// The chunk is in the worker's window: drain the held batches
+			// InWindow-tagged now, so the pump keeps pulling the reader.
+			if err := c.drainReadyWindow(ctx, key); err != nil {
+				c.pumpFail(ctx, err)
+				b.Release() // the run is terminating; the batch goes nowhere
+				c.gateMu.Lock()
+				return true
+			}
+		} else {
+			// Before ChunkReady: wait for the worker's chunk SELECT, which
+			// does not depend on the pump.
+			select {
+			case <-drain:
+			case <-ctx.Done():
+				c.gateMu.Lock()
+				return false
+			}
+		}
+		c.gateMu.Lock()
+		// Re-check after the wait or the drain: the gate may have closed, or
+		// the table's window changed, while the pump was away.
+		if key, held = c.openKeyForTableLocked(b.Table); !held {
 			return false
 		}
 	}
-	c.gateMu.Lock()
-	// Re-check after the wait: the gate may have drained, closed, or the
-	// table's window may have changed while the pump was asleep.
-	key, held = c.openKeyForTableLocked(b.Table)
-	if !held {
-		c.gateMu.Unlock()
-		return false
-	}
 	c.gateBuf[key] = append(c.gateBuf[key], b)
-	c.gateMu.Unlock()
 	return true
 }
 
@@ -1473,29 +1496,53 @@ func (c *Coordinator) openWindow(target string, partition int) {
 	c.gateMu.Unlock()
 }
 
-// flushWindow drains the gated batches collected since the last drain for
-// one partition's window, each InWindow-tagged for the given chunk, then
-// returns (that window stays open). Batch ownership transfers to
-// enqueueBatch per drain. enqueueBatch itself splits a batch across
-// partition owners by PK range when the table is partitioned, so a
-// drained batch reaches only the rows' actual owning worker(s) even
-// though the gate held it at whole-table granularity.
-func (c *Coordinator) flushWindow(ctx context.Context, target string, partition int, chunkID uint32) error {
+// markChunkReady records that chunkID's rows are in its worker's window (its
+// ChunkReady arrived), and wakes a pump blocked on the full gate so it drains.
+func (c *Coordinator) markChunkReady(target string, partition int, chunkID uint32) {
 	key := gateKey(target, partition)
 	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
+	if !c.gateOn[key] {
+		return
+	}
+	if c.gateReady == nil {
+		c.gateReady = map[string]uint32{}
+	}
+	c.gateReady[key] = chunkID
+	close(c.gateDrain)
+	c.gateDrain = make(chan struct{})
+}
+
+// drainReadyWindow is the pump's early flush of a full gate whose chunk is
+// ready: the held batches go out InWindow-tagged for that chunk, as
+// flushWindow would at the end of the catch-up.
+func (c *Coordinator) drainReadyWindow(ctx context.Context, key string) error {
+	c.gateFlushMu.Lock()
+	defer c.gateFlushMu.Unlock()
+	c.gateMu.Lock()
+	chunkID, ready := c.gateReady[key]
+	win, open := c.gateWin[key]
+	if !ready || !open {
+		c.gateMu.Unlock()
+		return nil
+	}
 	buf := c.gateBuf[key]
 	c.gateBuf[key] = nil
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
+	return c.enqueueWindowed(ctx, win.target, chunkID, buf)
+}
 
+// enqueueWindowed queues held batches InWindow-tagged for chunkID, in order.
+// A fresh meta per batch: enqueueBatch assigns the cycle id into it, and a
+// shared one would put every held batch in one cycle.
+func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, chunkID uint32, buf []*dataplane.Batch) error {
 	meta := &pb.BatchMeta{
 		Table:  target,
 		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
 	}
 	for i, b := range buf {
-		// A fresh meta per batch: enqueueBatch assigns the cycle id into
-		// it, and a shared one would put every held batch in one cycle.
 		if err := c.enqueueBatch(ctx, b, cloneBatchMeta(meta)); err != nil {
 			for _, rest := range buf[i+1:] {
 				rest.Release()
@@ -1506,17 +1553,43 @@ func (c *Coordinator) flushWindow(ctx context.Context, target string, partition 
 	return nil
 }
 
+// flushWindow drains the gated batches collected since the last drain for
+// one partition's window, each InWindow-tagged for the given chunk, then
+// returns (that window stays open). Batch ownership transfers to
+// enqueueBatch per drain. enqueueBatch itself splits a batch across
+// partition owners by PK range when the table is partitioned, so a
+// drained batch reaches only the rows' actual owning worker(s) even
+// though the gate held it at whole-table granularity.
+func (c *Coordinator) flushWindow(ctx context.Context, target string, partition int, chunkID uint32) error {
+	key := gateKey(target, partition)
+	c.gateFlushMu.Lock()
+	defer c.gateFlushMu.Unlock()
+	c.gateMu.Lock()
+	buf := c.gateBuf[key]
+	c.gateBuf[key] = nil
+	// The catch-up is over: the next chunk's batches wait for its own
+	// ChunkReady.
+	delete(c.gateReady, key)
+	close(c.gateDrain)
+	c.gateDrain = make(chan struct{})
+	c.gateMu.Unlock()
+	return c.enqueueWindowed(ctx, target, chunkID, buf)
+}
+
 // closeWindow releases any remaining gated batches (post-last-chunk) for
 // one partition's window and closes just that window — other partitions
 // of the same table still snapshotting keep their own windows open. The
 // trailing events are ordinary live changes: no window tag.
 func (c *Coordinator) closeWindow(ctx context.Context, target string, partition int) error {
 	key := gateKey(target, partition)
+	c.gateFlushMu.Lock()
+	defer c.gateFlushMu.Unlock()
 	c.gateMu.Lock()
 	buf := c.gateBuf[key]
 	delete(c.gateOn, key)
 	delete(c.gateWin, key)
 	delete(c.gateBuf, key)
+	delete(c.gateReady, key)
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
@@ -1547,6 +1620,7 @@ func (c *Coordinator) releaseAllGates() {
 		delete(c.gateOn, k)
 		delete(c.gateWin, k)
 		delete(c.gateBuf, k)
+		delete(c.gateReady, k)
 	}
 	// Wake any pump blocked on a full gate so it re-checks and sees the gate
 	// gone (gateHold returns false and the batch flows as live).
@@ -1766,6 +1840,7 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 		return err
 	}
 	c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID)
+	c.markChunkReady(ref.Target, partition, chunkID)
 
 	// The worker has the chunk rows in its window; prove the reader is
 	// caught up before releasing anything that touches this window. The
