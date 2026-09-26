@@ -178,7 +178,10 @@ type chaosState struct {
 	ActiveChaos    []string          `json:"activeChaos"`
 }
 
-// chaosEvent is one injected experiment.
+// chaosEvent is one experiment the controller decided on: injected, failed
+// to inject (Error), or — a reactive network fault while another is active —
+// skipped (Skipped), in which case only Kind, Trigger, Requested and Skipped
+// are set: no resource was created.
 type chaosEvent struct {
 	Seq        int           `json:"seq"`
 	Trigger    string        `json:"trigger"` // "planner", or what a reactive injection answered
@@ -194,7 +197,10 @@ type chaosEvent struct {
 	RemovedAt  time.Time     `json:"removedAt,omitzero"`
 	Injected   bool          `json:"injected"`
 	Error      string        `json:"error,omitempty"`
-	State      chaosState    `json:"state"`
+	// Skipped is why a reactive fault was not injected at all (not a
+	// failure: the record shows the transition was seen).
+	Skipped string     `json:"skipped,omitempty"`
+	State   chaosState `json:"state"`
 }
 
 // ── executor ────────────────────────────────────────────────────────────
@@ -213,6 +219,11 @@ type chaosController struct {
 	seq      int  // experiment counter, shared by the planner loop and injectNow
 	events   []*chaosEvent
 	active   map[string]string // CR name → resource kind, still present
+	// network holds the active experiments that are network faults. Chaos
+	// Mesh cannot stack two NetworkChaos on one Pod (the second fails with
+	// "unable to flush ip sets"), and every network fault can reach every
+	// Pod, so they never overlap.
+	network map[string]bool
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -222,8 +233,37 @@ func newChaosController(ns, pipeline string, seed uint64, p chaosProfile, worklo
 	return &chaosController{
 		ns: ns, pipeline: pipeline, seed: seed, profile: p,
 		planner: newChaosPlanner(seed, p), reactive: newChaosPlanner(seed^0x5EAC7, p), workload: workload,
-		active: map[string]string{},
+		active: map[string]string{}, network: map[string]bool{},
 	}
+}
+
+// isNetworkFault reports whether kind is a NetworkChaos experiment.
+func isNetworkFault(kind chaosKind) bool {
+	return kind == chaosNetworkPartition || kind == chaosNetworkLoss || kind == chaosNetworkDelay
+}
+
+// admit reports whether a planner draw may start now, and reserves its slot
+// when it may. Caller holds c.mu.
+func (c *chaosController) admit(d chaosDecision) (seq int, ok bool) {
+	n := len(c.active)
+	if n >= c.profile.MaxConcurrent || (n > 0 && !d.Overlap) {
+		return 0, false
+	}
+	if isNetworkFault(d.Kind) && len(c.network) > 0 {
+		return 0, false
+	}
+	return c.reserve(d.Kind), true
+}
+
+// reserve takes the next experiment slot for kind. Caller holds c.mu.
+func (c *chaosController) reserve(kind chaosKind) int {
+	c.seq++
+	name := c.name(c.seq)
+	c.active[name] = reserved
+	if isNetworkFault(kind) {
+		c.network[name] = true
+	}
+	return c.seq
 }
 
 // kubectlTimeout bounds one controller kubectl call.
@@ -267,15 +307,11 @@ func (c *chaosController) start(ctx context.Context) {
 			// active from here, before its resource exists, so two quick
 			// draws cannot both pass the limit.
 			c.mu.Lock()
-			n := len(c.active)
-			if n >= c.profile.MaxConcurrent || (n > 0 && !d.Overlap) {
-				c.mu.Unlock()
+			seq, ok := c.admit(d)
+			c.mu.Unlock()
+			if !ok {
 				continue // this draw would overlap more than allowed: skip it
 			}
-			c.seq++
-			seq := c.seq
-			c.active[c.name(seq)] = reserved
-			c.mu.Unlock()
 			c.wg.Add(1)
 			go func(seq int, d chaosDecision) {
 				defer c.wg.Done()
@@ -299,13 +335,19 @@ func (c *chaosController) injectNow(ctx context.Context, kind chaosKind, trigger
 		c.mu.Unlock()
 		return
 	}
+	// A network fault cannot stack on another (see network): the
+	// transition is recorded with the reason instead.
+	if isNetworkFault(kind) && len(c.network) > 0 {
+		c.events = append(c.events, &chaosEvent{Kind: kind, Trigger: trigger, Requested: time.Now(),
+			Skipped: "another network fault is active; Chaos Mesh cannot stack NetworkChaos on one Pod"})
+		c.mu.Unlock()
+		return
+	}
 	d := c.reactive.next()
-	c.seq++
-	seq := c.seq
 	// Reserved like a planner draw: it counts as active from here. A
 	// reactive fault may exceed MaxConcurrent on purpose (it answers a
 	// transition), but the planner then sees it and holds back.
-	c.active[c.name(seq)] = reserved
+	seq := c.reserve(kind)
 	c.wg.Add(1)
 	c.mu.Unlock()
 	d.Kind = kind
@@ -356,6 +398,7 @@ func (c *chaosController) stop() {
 func (c *chaosController) forget(name string) {
 	c.mu.Lock()
 	delete(c.active, name)
+	delete(c.network, name)
 	c.mu.Unlock()
 }
 
