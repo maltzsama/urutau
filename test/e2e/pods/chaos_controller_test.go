@@ -178,7 +178,10 @@ type chaosState struct {
 	ActiveChaos    []string          `json:"activeChaos"`
 }
 
-// chaosEvent is one injected experiment.
+// chaosEvent is one experiment the controller decided on: injected, failed
+// to inject (Error), or — a reactive network fault while another is active —
+// skipped (Skipped), in which case only Kind, Trigger, Requested and Skipped
+// are set: no resource was created.
 type chaosEvent struct {
 	Seq        int           `json:"seq"`
 	Trigger    string        `json:"trigger"` // "planner", or what a reactive injection answered
