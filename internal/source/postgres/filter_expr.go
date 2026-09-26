@@ -72,7 +72,7 @@ func filterExprSource(f *spec.Filter, st *TableState) (string, error) {
 	case f.Not != nil:
 		// Push the negation to the leaves so no `!` wraps an unknown-valued
 		// comparison.
-		return filterExprSource(negateFilter(f.Not), st)
+		return filterExprSource(f.Not.Negate(), st)
 	case f.Predicate != nil:
 		return filterExprPredicate(f.Predicate, st)
 	default:
@@ -345,62 +345,6 @@ func columnIsInteger(st *TableState, name string) bool {
 		return true
 	}
 	return false
-}
-
-// negateFilter returns the logical negation of f with NOT pushed down to the
-// leaves (De Morgan): all↔any and each predicate operator negated. It never
-// leaves a `not` node, so the emitted expression has no `!` over a comparison.
-func negateFilter(f *spec.Filter) *spec.Filter {
-	switch {
-	case f == nil:
-		return nil
-	case len(f.All) > 0:
-		out := make([]spec.Filter, len(f.All))
-		for i := range f.All {
-			out[i] = *negateFilter(&f.All[i])
-		}
-		return &spec.Filter{Any: out}
-	case len(f.Any) > 0:
-		out := make([]spec.Filter, len(f.Any))
-		for i := range f.Any {
-			out[i] = *negateFilter(&f.Any[i])
-		}
-		return &spec.Filter{All: out}
-	case f.Not != nil:
-		// NOT(NOT(x)) = x.
-		return f.Not
-	case f.Predicate != nil:
-		return &spec.Filter{Predicate: negatePredicate(f.Predicate)}
-	default:
-		return nil
-	}
-}
-
-func negatePredicate(p *spec.Predicate) *spec.Predicate {
-	op := p.Op
-	switch p.Op {
-	case spec.OpEq:
-		op = spec.OpNeq
-	case spec.OpNeq:
-		op = spec.OpEq
-	case spec.OpLt:
-		op = spec.OpGte
-	case spec.OpLte:
-		op = spec.OpGt
-	case spec.OpGt:
-		op = spec.OpLte
-	case spec.OpGte:
-		op = spec.OpLt
-	case spec.OpIn:
-		op = spec.OpNotIn
-	case spec.OpNotIn:
-		op = spec.OpIn
-	case spec.OpIsNull:
-		op = spec.OpIsNotNull
-	case spec.OpIsNotNull:
-		op = spec.OpIsNull
-	}
-	return &spec.Predicate{Column: p.Column, Op: op, Value: p.Value}
 }
 
 func exprOperator(op spec.Operator) string {
