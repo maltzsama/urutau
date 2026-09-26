@@ -58,6 +58,38 @@ func TestToInt32AndToInt64(t *testing.T) {
 			t.Errorf("int64 column, %T %v: want an error", v, v)
 		}
 	}
+	// The uint64 column takes any non-negative integer and errors, instead of
+	// panicking, on anything else.
+	uint64B := array.NewUint64Builder(memory.DefaultAllocator)
+	defer uint64B.Release()
+	for _, v := range []any{uint64(math.MaxUint64), int64(5), uint32(6)} {
+		if err := appendScalar(uint64B, v, true); err != nil {
+			t.Fatalf("uint64 column, %T: %v", v, err)
+		}
+	}
+	for _, v := range []any{"x", int64(-1), 1.5} {
+		if err := appendScalar(uint64B, v, true); err == nil {
+			t.Errorf("uint64 column, %T %v: want an error", v, v)
+		}
+	}
+	// The other typed columns error on a wrong type instead of panicking.
+	boolB := array.NewBooleanBuilder(memory.DefaultAllocator)
+	defer boolB.Release()
+	f32B := array.NewFloat32Builder(memory.DefaultAllocator)
+	defer f32B.Release()
+	f64B := array.NewFloat64Builder(memory.DefaultAllocator)
+	defer f64B.Release()
+	for _, c := range []struct {
+		b array.Builder
+		v any
+	}{{boolB, "x"}, {f32B, "x"}, {f64B, "x"}} {
+		if err := appendScalar(c.b, c.v, true); err == nil {
+			t.Errorf("%T with %T: want an error", c.b, c.v)
+		}
+	}
+	if err := appendScalar(f64B, int64(3), true); err != nil || f64B.NewFloat64Array().Value(0) != 3 {
+		t.Errorf("float64 column with an int64: %v", err)
+	}
 }
 
 func TestAppendScalarBranches(t *testing.T) {

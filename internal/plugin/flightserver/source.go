@@ -381,8 +381,8 @@ func appendStructRow(sb *array.StructBuilder, fields []arrow.Field, br *transpor
 }
 
 // appendScalar appends one value to its column builder. An integer column
-// takes any Go integer that fits it; any other value is an error, never a
-// silent zero (issue #403).
+// takes any Go integer that fits it, a float64 column any number; a value of
+// the wrong type is an error, never a silent zero or a panic (issue #403).
 func appendScalar(b array.Builder, v any, ok bool) error {
 	if !ok || v == nil {
 		b.AppendNull()
@@ -390,7 +390,11 @@ func appendScalar(b array.Builder, v any, ok bool) error {
 	}
 	switch bb := b.(type) {
 	case *array.BooleanBuilder:
-		bb.Append(v.(bool))
+		t, ok := v.(bool)
+		if !ok {
+			return fmt.Errorf("%T %v is not a bool", v, v)
+		}
+		bb.Append(t)
 	case *array.Int32Builder:
 		i, ok := core.AsInt64(v)
 		if !ok || i < math.MinInt32 || i > math.MaxInt32 {
@@ -404,11 +408,23 @@ func appendScalar(b array.Builder, v any, ok bool) error {
 		}
 		bb.Append(i)
 	case *array.Uint64Builder:
-		bb.Append(v.(uint64))
+		u, ok := core.AsUint64(v)
+		if !ok {
+			return fmt.Errorf("%T %v does not fit uint64", v, v)
+		}
+		bb.Append(u)
 	case *array.Float32Builder:
-		bb.Append(v.(float32))
+		t, ok := v.(float32)
+		if !ok {
+			return fmt.Errorf("%T %v is not a float32", v, v)
+		}
+		bb.Append(t)
 	case *array.Float64Builder:
-		bb.Append(v.(float64))
+		f, ok := core.AsFloat64(v)
+		if !ok {
+			return fmt.Errorf("%T %v is not a number", v, v)
+		}
+		bb.Append(f)
 	case *array.StringBuilder:
 		bb.Append(fmt.Sprintf("%v", v))
 	case *array.BinaryBuilder:
