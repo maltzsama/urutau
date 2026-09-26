@@ -8,32 +8,32 @@
 # The list only shrinks. An entry fails when its item grows past it, and when
 # the item drops back under the limit or no longer exists (a stale entry).
 # A new exemption needs a comment saying why, in the PR that adds it.
-core/cast.go 1020
-core/cast.go:CheckCast 122
-internal/coordinator/coordinator.go 3232
-internal/coordinator/coordinator.go:Coordinator.assignmentFor 133
-internal/coordinator/coordinator.go:Coordinator.enqueueBatch 147
-internal/coordinator/coordinator.go:Coordinator.run 543
-internal/coordinator/coordinator.go:controlServer.Session 130
-internal/dataplane/collapse.go:Collapse 163
-internal/dataplane/generator.go:EncodeKey 139
-internal/enrich/columnar.go:Stage.ColumnarJoin 289
-internal/enrich/enrich.go 906
-internal/enrich/enrich.go:New 150
-internal/operator/controller.go 997
-internal/operator/controller.go:CoordinatorReconciler.Reconcile 140
-internal/runner/runner.go 1185
-internal/runner/runner.go:newRunner 504
-internal/sink/iceberg/writer.go 1090
+core/cast.go 1020 # baseline (#398)
+core/cast.go:CheckCast 122 # baseline (#398)
+internal/coordinator/coordinator.go 3232 # baseline (#398)
+internal/coordinator/coordinator.go:Coordinator.assignmentFor 133 # baseline (#398)
+internal/coordinator/coordinator.go:Coordinator.enqueueBatch 147 # baseline (#398)
+internal/coordinator/coordinator.go:Coordinator.run 543 # baseline (#398)
+internal/coordinator/coordinator.go:controlServer.Session 130 # baseline (#398)
+internal/dataplane/collapse.go:Collapse 163 # baseline (#398)
+internal/dataplane/generator.go:EncodeKey 139 # baseline (#398)
+internal/enrich/columnar.go:Stage.ColumnarJoin 289 # baseline (#398)
+internal/enrich/enrich.go 906 # baseline (#398)
+internal/enrich/enrich.go:New 150 # baseline (#398)
+internal/operator/controller.go 997 # baseline (#398)
+internal/operator/controller.go:CoordinatorReconciler.Reconcile 140 # baseline (#398)
+internal/runner/runner.go 1185 # baseline (#398)
+internal/runner/runner.go:newRunner 504 # baseline (#398)
+internal/sink/iceberg/writer.go 1090 # baseline (#398)
 internal/sink/iceberg/writer.go:appendColumn 220 # exhaustive type switch over core.Kind
 internal/source/mysql/charset_tables.go 1674 # generated charset data tables, not logic
-internal/source/postgres/reader.go 890
-internal/transport/codec.go 814
+internal/source/postgres/reader.go 890 # baseline (#398)
+internal/transport/codec.go 814 # baseline (#398)
 internal/transport/codec.go:appendTypedValue 333 # exhaustive type switch over core.Kind
 internal/transport/codec.go:readTypedValue 162 # exhaustive type switch over core.Kind
-internal/worker/remote.go 828
-internal/worker/remote.go:RunRemote 377
-internal/worker/worker.go 1513
-internal/worker/worker.go:Worker.runBatcher 295
-spec/validate.go 933
-spec/validate.go:Spec.Validate 242
+internal/worker/remote.go 828 # baseline (#398)
+internal/worker/remote.go:RunRemote 377 # baseline (#398)
+internal/worker/worker.go 1513 # baseline (#398)
+internal/worker/worker.go:Worker.runBatcher 295 # baseline (#398)
+spec/validate.go 933 # baseline (#398)
+spec/validate.go:Spec.Validate 242 # baseline (#398)

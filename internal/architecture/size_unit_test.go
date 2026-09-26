@@ -19,8 +19,8 @@ func TestSizeProblems(t *testing.T) {
 		{key: "d.go:Split", lines: maxFuncLines + 5, limit: maxFuncLines}, // listed higher: shrank, still over: ok
 	}
 	allow := map[string]allowEntry{
-		"a.go": {max: 900}, "a.go:Big": {max: 125}, "a.go:Small": {max: 200},
-		"d.go:Split": {max: 300}, "gone.go:F": {max: 150},
+		"a.go": {max: 900, comment: "why"}, "a.go:Big": {max: 125, comment: "why"}, "a.go:Small": {max: 200, comment: "why"},
+		"d.go:Split": {max: 300, comment: "why"}, "gone.go:F": {max: 150, comment: "why"},
 	}
 	got := strings.Join(sizeProblems(items, allow), "\n")
 	for _, want := range []string{
@@ -39,12 +39,22 @@ func TestSizeProblems(t *testing.T) {
 	}
 }
 
+// An exemption without a reason is refused: the allowlist must say why.
+func TestSizeAllowlistEntryNeedsAComment(t *testing.T) {
+	items := []sizeItem{{key: "a.go:Big", lines: 130, limit: maxFuncLines}}
+	got := sizeProblems(items, map[string]allowEntry{"a.go:Big": {max: 130}})
+	if len(got) != 1 || !strings.Contains(got[0], "a.go:Big: allowlist entry has no `# why` comment") {
+		t.Fatalf("problems = %q", got)
+	}
+}
+
 func TestFuncName(t *testing.T) {
 	src := `package p
 func F() {}
 func (s *S) M() {}
 func (v V) N() {}
 func (g *G[T]) O() {}
+func (h H[T, U]) P() {}
 `
 	f, err := parser.ParseFile(token.NewFileSet(), "p.go", src, 0)
 	if err != nil {
@@ -54,7 +64,7 @@ func (g *G[T]) O() {}
 	for _, d := range f.Decls {
 		got = append(got, funcName(d.(*ast.FuncDecl)))
 	}
-	if strings.Join(got, ",") != "F,S.M,V.N,G.O" {
+	if strings.Join(got, ",") != "F,S.M,V.N,G.O,H.P" {
 		t.Fatalf("names = %v", got)
 	}
 }

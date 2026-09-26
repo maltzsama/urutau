@@ -89,8 +89,11 @@ func funcName(fn *ast.FuncDecl) string {
 	if star, ok := typ.(*ast.StarExpr); ok {
 		typ = star.X
 	}
-	if idx, ok := typ.(*ast.IndexExpr); ok { // generic receiver T[P]
-		typ = idx.X
+	switch g := typ.(type) { // generic receiver T[P] or T[P, Q]
+	case *ast.IndexExpr:
+		typ = g.X
+	case *ast.IndexListExpr:
+		typ = g.X
 	}
 	if id, ok := typ.(*ast.Ident); ok {
 		return id.Name + "." + fn.Name.Name
@@ -148,6 +151,8 @@ func sizeProblems(items []sizeItem, allow map[string]allowEntry) []string {
 		seen[it.key] = true
 		e, listed := allow[it.key]
 		switch {
+		case listed && e.comment == "":
+			out = append(out, fmt.Sprintf("%s: allowlist entry has no `# why` comment — an exemption must say why", it.key))
 		case listed && it.lines <= it.limit:
 			out = append(out, fmt.Sprintf("stale entry %s: it is %d lines, within the %d-line limit — remove it from %s", it.key, it.lines, it.limit, allowlist))
 		case listed && it.lines > e.max:
@@ -216,5 +221,6 @@ const allowlistHeader = `# Size ratchet allowlist (issue #398; see TestSizeRatch
 #
 # The list only shrinks. An entry fails when its item grows past it, and when
 # the item drops back under the limit or no longer exists (a stale entry).
-# A new exemption needs a comment saying why, in the PR that adds it.
+# Every entry says why. The ones the ratchet started from read
+# "baseline (#398)": code to split under the #397 restructuring.
 `
