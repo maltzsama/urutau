@@ -35,14 +35,16 @@ type progressSampler struct {
 
 	mu       sync.Mutex
 	samples  map[string][]progressSample
+	errors   map[string]int // failed reads per table
 	problems []string
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+	stopOnce sync.Once
 }
 
 func newProgressSampler(w *workload, trino *sql.DB, interval, starve time.Duration) *progressSampler {
-	return &progressSampler{w: w, trino: trino, interval: interval, starve: starve, samples: map[string][]progressSample{}}
+	return &progressSampler{w: w, trino: trino, interval: interval, starve: starve, samples: map[string][]progressSample{}, errors: map[string]int{}}
 }
 
 // committedPosition reads a table's cdc.position table property ("" when
@@ -74,9 +76,33 @@ func (s *progressSampler) start(ctx context.Context) {
 	}()
 }
 
+// stop ends sampling; safe to call more than once (the runner calls it
+// after the settle, and a cleanup calls it again on an early failure).
 func (s *progressSampler) stop() {
-	close(s.stopCh)
-	s.wg.Wait()
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+		s.wg.Wait()
+	})
+}
+
+// minSamples is how many reads a table needs for the regression and
+// starvation gates to have been evaluated at all.
+const minSamples = 2
+
+// coverageProblems reports each table the sampler could not read often
+// enough for its gates to mean anything: a run whose Trino was down for the
+// whole window must not pass them by default.
+func (s *progressSampler) coverageProblems(tables []*prTable) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, tb := range tables {
+		if n := len(s.samples[tb.Target]); n < minSamples {
+			out = append(out, fmt.Sprintf("%s: only %d progress sample(s) (%d failed reads): the regression and starvation gates were not evaluated",
+				tb.Target, n, s.errors[tb.Target]))
+		}
+	}
+	return out
 }
 
 func (s *progressSampler) sample(ctx context.Context) {
@@ -84,7 +110,12 @@ func (s *progressSampler) sample(ctx context.Context) {
 	for i, g := range s.w.gens {
 		pos, err := committedPosition(ctx, s.trino, g.t.Target)
 		if err != nil {
-			continue // not created yet, or Trino busy: the next poll retries
+			// Not created yet, or Trino busy: the next poll retries, and
+			// coverageProblems fails a table that was never read enough.
+			s.mu.Lock()
+			s.errors[g.t.Target]++
+			s.mu.Unlock()
+			continue
 		}
 		cur := progressSample{At: now, Produced: s.w.produced[i].Load(), Committed: pos}
 		s.mu.Lock()
@@ -164,18 +195,18 @@ func (s *progressSampler) report() (map[string][]progressSample, []string) {
 
 // positionProblems checks each table's committed position once the run has
 // drained, independently of its rows:
-//   - it is at or before what MySQL executed (never beyond the workload);
+//   - it is within what MySQL had executed when the workload stopped (never
+//     beyond the workload);
 //   - it covers everything MySQL had executed right before the table's last
 //     generated transaction, so that transaction was the last one pending.
 func positionProblems(ctx context.Context, w *workload, trino *sql.DB) []string {
 	var out []string
-	var executed string
-	if err := w.db.QueryRowContext(ctx, "SELECT @@GLOBAL.gtid_executed").Scan(&executed); err != nil {
-		return []string{fmt.Sprintf("read gtid_executed: %v", err)}
-	}
+	// The bound is what MySQL had executed when the workload stopped, not
+	// now: a later transaction must not widen "never beyond the workload".
+	executed := w.finalPos
 	exec, err := position.ParseGTID(executed)
 	if err != nil {
-		return []string{fmt.Sprintf("parse gtid_executed %q: %v", executed, err)}
+		return []string{fmt.Sprintf("parse the workload's final gtid_executed %q: %v", executed, err)}
 	}
 	for i, g := range w.gens {
 		pos, err := committedPosition(ctx, trino, g.t.Target)

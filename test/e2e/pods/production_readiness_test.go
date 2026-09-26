@@ -191,6 +191,7 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 	// left behind for 5 minutes while others advance is starved.
 	progress = newProgressSampler(w, trino, 15*time.Second, 5*time.Minute)
 	progress.start(ctx)
+	t.Cleanup(progress.stop) // an early failure must not leave it polling through teardown
 	run := &prRun{t: t, w: w, chaos: chaos, mysql: mysql, trino: trino, pipeline: pipeline, tables: tables, profile: profile}
 	if o.onLive != nil {
 		o.onLive(ctx, run)
@@ -220,7 +221,7 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		t.Fatalf("settle: %v", err)
 	}
 	_, sampled := progress.report()
-	for _, p := range sampled {
+	for _, p := range append(sampled, progress.coverageProblems(tables)...) {
 		t.Errorf("progress: %s", p)
 	}
 	// Position, independently of the rows.

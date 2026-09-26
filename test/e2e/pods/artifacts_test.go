@@ -38,7 +38,7 @@ type logCollector struct {
 	dir, ns, pipeline string
 
 	mu      sync.Mutex
-	started map[string]bool // "pod/restartCount"
+	started map[string]bool // "pod/container/restartCount"
 
 	stopCh   chan struct{}
 	cancel   context.CancelFunc
@@ -72,10 +72,11 @@ func (l *logCollector) start() error {
 	return nil
 }
 
-// poll starts a follower for every running container not followed yet.
+// poll starts a follower for every running container not followed yet:
+// every container of every Pod, one follower per restart.
 func (l *logCollector) poll(ctx context.Context) {
 	out, err := kubectlCmd("", "-n", l.ns, "get", "pods", "-l", "urutau.io/pipeline="+l.pipeline, "-o",
-		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.containerStatuses[0].restartCount}{"\n"}{end}`)
+		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.name}{"="}{.restartCount}{","}{end}{"\n"}{end}`)
 	if err != nil {
 		return
 	}
@@ -84,31 +85,47 @@ func (l *logCollector) poll(ctx context.Context) {
 		if len(f) != 3 || f[1] != "Running" {
 			continue
 		}
-		key := f[0] + "/" + f[2]
-		l.mu.Lock()
-		seen := l.started[key]
-		l.started[key] = true
-		l.mu.Unlock()
-		if seen {
-			continue
+		pod := f[0]
+		for _, cs := range strings.Split(strings.TrimSuffix(f[2], ","), ",") {
+			container, restarts, ok := strings.Cut(cs, "=")
+			if !ok || container == "" {
+				continue
+			}
+			l.follow(ctx, pod, container, restarts)
 		}
-		file, err := os.Create(filepath.Join(l.dir, f[0]+"-r"+f[2]+".log"))
-		if err != nil {
-			continue
-		}
-		cmd := exec.CommandContext(ctx, "kubectl", "-n", l.ns, "logs", "-f", f[0])
-		cmd.Stdout, cmd.Stderr = file, file
-		if err := cmd.Start(); err != nil {
-			_ = file.Close()
-			continue
-		}
-		l.wg.Add(1)
-		go func() {
-			defer l.wg.Done()
-			_ = cmd.Wait()
-			_ = file.Close()
-		}()
 	}
+}
+
+// follow starts one follower for a container's current run, unless one is
+// already running. The run is marked followed only once the file and the
+// process are up, so a failed start is retried on the next poll.
+func (l *logCollector) follow(ctx context.Context, pod, container, restarts string) {
+	key := pod + "/" + container + "/" + restarts
+	l.mu.Lock()
+	seen := l.started[key]
+	l.mu.Unlock()
+	if seen {
+		return
+	}
+	file, err := os.Create(filepath.Join(l.dir, pod+"-"+container+"-r"+restarts+".log"))
+	if err != nil {
+		return
+	}
+	cmd := exec.CommandContext(ctx, "kubectl", "-n", l.ns, "logs", "-f", pod, "-c", container)
+	cmd.Stdout, cmd.Stderr = file, file
+	if err := cmd.Start(); err != nil {
+		_ = file.Close()
+		return
+	}
+	l.mu.Lock()
+	l.started[key] = true
+	l.mu.Unlock()
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		_ = cmd.Wait()
+		_ = file.Close()
+	}()
 }
 
 // stop ends every follower, giving them a moment to flush the tail.

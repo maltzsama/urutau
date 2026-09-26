@@ -3,6 +3,7 @@ package pods
 // Cluster-free tests of the production-readiness gates.
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -75,4 +76,23 @@ func TestCheckStarvation(t *testing.T) {
 	if _, p := short.report(); len(p) != 0 {
 		t.Fatalf("a history shorter than the window cannot starve, got %v", p)
 	}
+}
+
+func TestProgressCoverageFailsAnUnreadTable(t *testing.T) {
+	s := newProgressSampler(nil, nil, time.Second, 5*time.Minute)
+	now := time.Now()
+	s.samples["read"] = []progressSample{{At: now}, {At: now.Add(time.Second)}}
+	s.samples["once"] = []progressSample{{At: now}}
+	s.errors["never"] = 7
+	got := s.coverageProblems([]*prTable{{Target: "read"}, {Target: "once"}, {Target: "never"}})
+	if len(got) != 2 || !strings.HasPrefix(got[0], "once:") || !strings.Contains(got[1], "never: only 0 progress sample(s) (7 failed reads)") {
+		t.Fatalf("coverage problems: %q", got)
+	}
+}
+
+func TestProgressStopIsIdempotent(t *testing.T) {
+	s := newProgressSampler(&workload{}, nil, time.Hour, 5*time.Minute)
+	s.start(context.Background())
+	s.stop()
+	s.stop() // the cleanup's second call must not panic on the closed channel
 }
