@@ -230,3 +230,43 @@ func drainMetas(t *testing.T, w *workerState) []*pb.BatchMeta {
 		}
 	}
 }
+
+// The done marker expects only the last window's worker, yet cannot commit
+// ahead of another partition's earlier window: a staged table's cycles commit
+// in send order whatever worker owns them. Delivered first, the done cycle
+// waits; the earlier window's delivery then commits both, window first.
+func TestSnapshotDoneWaitsForEveryEarlierWindow(t *testing.T) {
+	snk := newPropsSink()
+	c, w0 := coordHarness()
+	c.snk = snk
+	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
+	c.workers["w1"] = w1
+	c.index["w1"] = newPositionIndex("run-1")
+	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
+	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
+	ctx := context.Background()
+	if err := c.sendCloses(ctx, w0, "raw.orders", position.MustLSN("0/10"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.sendCloses(ctx, w1, "raw.orders", position.MustLSN("0/20"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.finishSnapshot(ctx, c.refs[0]); err != nil {
+		t.Fatal(err)
+	}
+	w0win := drainMetas(t, w0)[0]
+	w1metas := drainMetas(t, w1)
+	w1win, done := w1metas[0], w1metas[1]
+
+	// w1's window and the done marker are delivered; w0's window is not.
+	if got, _ := c.staged.deliver(stagedRef("raw.orders", "w1"), w1win.BatchId, []byte{1}, "0/20", "", nil); len(got) != 0 {
+		t.Fatalf("w1's window committed ahead of w0's earlier one: %d cycle(s)", len(got))
+	}
+	if got, _ := c.staged.deliver(stagedRef("raw.orders", "w1"), done.BatchId, []byte{2}, "", "complete", nil); len(got) != 0 {
+		t.Fatalf("the done cycle committed ahead of w0's window: %d cycle(s)", len(got))
+	}
+	got, _ := c.staged.deliver(stagedRef("raw.orders", "w0"), w0win.BatchId, []byte{3}, "0/10", "", nil)
+	if len(got) != 3 || got[0].seq != w0win.BatchId || got[2].seq != done.BatchId {
+		t.Fatalf("committable after w0's window: %d cycle(s), want w0's window, w1's window, then the done cycle", len(got))
+	}
+}

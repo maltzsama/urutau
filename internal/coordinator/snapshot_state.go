@@ -91,7 +91,9 @@ func (c *Coordinator) sentState(table string) (pos string, w *workerState) {
 // been sent. The done marker goes to the worker that got the last window,
 // behind everything sent to it, so it commits after that window; on a staged
 // table it is its own cycle of the send order, so it commits after every
-// window of every partition. A table that was never sent anything had no
+// window of every partition. Its cycle expects only that worker's delivery:
+// what holds it back is the table's send order, which commits cycles
+// head-first whatever worker owns them, not its owner set. A table that was never sent anything had no
 // rows to copy and no window to wait for: its completion is written directly.
 func (c *Coordinator) finishSnapshot(ctx context.Context, ref source.TableRef) error {
 	pos, w := c.sentState(ref.Target)
