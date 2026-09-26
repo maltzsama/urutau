@@ -99,10 +99,19 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 	w := newWorkload(seed, profile, tables, mysql)
 	pipeline, serverID := o.pipeline, o.serverID
 	var chaos *chaosController
+	var progress *progressSampler
+	dir, err := runArtifactsDir(profile.Name, seed)
+	if err != nil {
+		t.Fatalf("artifacts dir: %v", err)
+	}
+	t.Logf("artifacts: %s", dir)
 	t.Cleanup(func() {
 		rep := w.report()
 		if chaos != nil {
 			rep.Chaos = chaos.report()
+		}
+		if progress != nil {
+			rep.Progress, _ = progress.report()
 		}
 		if t.Failed() {
 			rep.Failure = "see the test log"
@@ -140,6 +149,23 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, crOptions{MaintenanceBlock: o.maintenance})
 	applyPipeline(t, testNS, pipeline, cr)
+	// Registered after applyPipeline, so it runs before the pipeline is torn
+	// down: the logs are flushed, and a failure is dumped while the Pods,
+	// the chaos resources and the tables still exist.
+	logs := newLogCollector(dir, testNS, pipeline)
+	if err := logs.start(); err != nil {
+		t.Fatalf("log collector: %v", err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			dumpDiagnostics(dctx, dir, testNS, pipeline, trino, tables)
+			dumpStates(dctx, dir, w, trino)
+			dcancel()
+			t.Logf("diagnostics dumped under %s", dir)
+		}
+		logs.stop()
+	})
 
 	// Live mutations start before the coordinator is up, so they overlap
 	// the snapshot as well as the stream.
@@ -160,6 +186,11 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		})
 		t.Log("chaos controller started")
 	}
+	// Committed positions and per-table progress, sampled over the live
+	// window and the settle. A restart pauses every table at once; a table
+	// left behind for 5 minutes while others advance is starved.
+	progress = newProgressSampler(w, trino, 15*time.Second, 5*time.Minute)
+	progress.start(ctx)
 	run := &prRun{t: t, w: w, chaos: chaos, mysql: mysql, trino: trino, pipeline: pipeline, tables: tables, profile: profile}
 	if o.onLive != nil {
 		o.onLive(ctx, run)
@@ -184,8 +215,30 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		return startPortForward(t, dataNS, "svc/trino", localTrinoPort, 8080, 30*time.Second)
 	}
 	checks, err := w.settle(ctx, trino, t.Logf, reconnect)
+	progress.stop()
 	if err != nil {
 		t.Fatalf("settle: %v", err)
+	}
+	_, sampled := progress.report()
+	for _, p := range sampled {
+		t.Errorf("progress: %s", p)
+	}
+	// Position, independently of the rows.
+	for _, p := range positionProblems(ctx, w, trino) {
+		t.Errorf("position: %s", p)
+	}
+	// Every table reads back through Trino, snapshots and properties too.
+	for _, tb := range tables {
+		for _, q := range []string{
+			"SELECT count(*) FROM " + tb.Target,
+			`SELECT count(*) FROM "` + tb.Target + `$snapshots"`,
+			`SELECT count(*) FROM "` + tb.Target + `$properties"`,
+		} {
+			var n int64
+			if err := trino.QueryRowContext(ctx, q).Scan(&n); err != nil {
+				t.Errorf("trino: %s: %v", q, err)
+			}
+		}
 	}
 	w.checks = checks
 	for _, tb := range tables {
@@ -221,6 +274,11 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		t.Errorf("workload: %s", e)
 	}
 	w.mu.Unlock()
+	// Every container of the run, restarted and replaced ones included.
+	logs.stop()
+	for _, r := range logs.races() {
+		t.Errorf("data race in %s", r)
+	}
 	assertNoRaces(t, testNS, pipeline+"-")
 }
 

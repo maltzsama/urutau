@@ -17,6 +17,8 @@ The code lives in `test/e2e/pods`:
 | `workload_gen_test.go` | Profiles, the three tables, random regimes, the transaction builder and the oracle. Pure: no database. |
 | `workload_run_test.go` | Runs the streams against MySQL, reconciles the oracle, reads and compares MySQL and Iceberg state. |
 | `workload_stats_test.go` | Observed distributions and the diagnostics file. |
+| `validation_test.go` | Position and progress gates (see [Position and progress gates](#position-and-progress-gates)). |
+| `artifacts_test.go` | The log collector and the failure dump (see [Artifacts](#artifacts)). |
 | `workload_unit_test.go` | Cluster-free tests of the generator, run by plain `go test`. |
 | `chaos_controller_test.go` | The chaos controller: planner, executor and record (see [Chaos](#chaos)). |
 | `chaos_controller_unit_test.go` | Cluster-free tests of the planner and the rendered Chaos Mesh resources. |
@@ -155,15 +157,40 @@ operation on every table, every operation on each side of 2^63 and of the
 single-row and a maximum-size transaction, and `events` payloads from under
 1 KiB to at least half the profile maximum.
 
-## Position
+## Position and progress gates
 
-When the streams stop, the workload records `@@GLOBAL.gtid_executed`: the
-source position once the last generated mutation committed. That is the
-expected position. Each stream also records `gtid_executed` when it stops,
-but that is only an upper bound on its own last position: other streams may
-commit in between, and the driver cannot report one transaction's own GTID.
-Comparing the expected position with the committed Iceberg `cdc.position` is
-the job of the validation layer (#387).
+Row state is one gate; the committed position is checked **independently**
+of it (`validation_test.go`).
+
+After the settle, each table's `cdc.position` (the table property, read
+through Trino's `$properties`):
+
+- is contained in MySQL's `gtid_executed`: never beyond what the source
+  executed;
+- strictly contains the `gtid_executed` read right before the table's last
+  generated transaction: the table's last change was the last one pending,
+  and it is covered.
+
+While the run lasts, a sampler reads every table's committed position and
+committed mutation count every 15 s:
+
+- **no regression**: a later committed position must contain the earlier
+  one;
+- **no starvation** (from #355): a table whose position has not moved for
+  5 minutes while its source kept changing fails the run, if another table's
+  position moved in that stretch. A restart pauses every table at once,
+  which is not starvation.
+
+The whole history lands in the diagnostics file under `progress`.
+
+When the streams stop, the workload also records `@@GLOBAL.gtid_executed`:
+the expected position once the last generated mutation committed. Each
+stream records `gtid_executed` when it stops as well, but that is only an
+upper bound on its own last position: other streams may commit in between,
+and the driver cannot report one transaction's own GTID.
+
+Every table must also read back through Trino once the run converges: its
+rows, `$snapshots` and `$properties`.
 
 ## Chaos
 
@@ -262,6 +289,21 @@ a median of 1–2 rows (#414), and took about 10 minutes to converge after a
 
 A failed run keeps its MySQL source tables (and, like every pod e2e run, its
 Iceberg targets), so the keys the diff names can be read back.
+
+## Artifacts
+
+Each run writes into `production-readiness-<profile>-<seed>/` under
+`URUTAU_E2E_ARTIFACTS`:
+
+- `logs/`: every container of the pipeline, followed from the moment it
+  runs, one file per Pod and restart (`<pod>-r<N>.log`), so a log survives
+  its container's replacement. The data-race gate scans all of them, not just
+  the containers alive at the end.
+- `diagnostics/` (on failure, dumped before teardown): the CDCPipeline, the
+  worker and coordinator StatefulSets, Pods and `describe`, events, Services,
+  ScaledObjects and HPAs, Chaos Mesh resources, the data services, each
+  table's `cdc.position`, properties and snapshots, and the oracle, MySQL and
+  Iceberg state of every table as sorted `key rev image` files.
 
 ## Diagnostics
 
