@@ -209,13 +209,10 @@ func (m *matrixSampler) sampleReplicas(ctx context.Context) {
 				if prev, ok := last[k]; ok && prev != n && m.r.chaos != nil {
 					m.mu.Lock()
 					m.transitions++
-					react := m.transitions <= 6
 					m.mu.Unlock()
-					if react {
-						trigger := fmt.Sprintf("re-slice %s %d->%d", k, prev, n)
-						m.r.chaos.injectNow(ctx, chaosWorkerKill, trigger)
-						m.r.chaos.injectNow(ctx, chaosNetworkPartition, trigger)
-					}
+					trigger := fmt.Sprintf("re-slice %s %d->%d", k, prev, n)
+					m.r.chaos.injectNow(ctx, chaosWorkerKill, trigger)
+					m.r.chaos.injectNow(ctx, chaosNetworkPartition, trigger)
 				}
 				last[k] = n
 			}

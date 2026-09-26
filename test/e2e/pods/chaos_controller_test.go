@@ -208,10 +208,11 @@ type chaosController struct {
 	reactive     *chaosPlanner // draws for injectNow, apart from the main stream
 	workload     func() string // the workload's phase, for the record
 
-	mu     sync.Mutex
-	seq    int // experiment counter, shared by the planner loop and injectNow
-	events []*chaosEvent
-	active map[string]string // CR name → resource kind, still present
+	mu       sync.Mutex
+	stopping bool // set by stop under mu before it waits: injectNow then refuses
+	seq      int  // experiment counter, shared by the planner loop and injectNow
+	events   []*chaosEvent
+	active   map[string]string // CR name → resource kind, still present
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -290,12 +291,14 @@ func (c *chaosController) start(ctx context.Context) {
 // still drawn at random, and the experiment is recorded like any other,
 // with trigger naming what caused it. It is a no-op once stop has begun.
 func (c *chaosController) injectNow(ctx context.Context, kind chaosKind, trigger string) {
-	select {
-	case <-c.stopCh:
-		return
-	default:
-	}
+	// Checked and counted under the lock stop takes before it waits, so a
+	// reactive injection either joins the wait group before stop waits on
+	// it, or does not start at all.
 	c.mu.Lock()
+	if c.stopping {
+		c.mu.Unlock()
+		return
+	}
 	d := c.reactive.next()
 	c.seq++
 	seq := c.seq
@@ -303,6 +306,7 @@ func (c *chaosController) injectNow(ctx context.Context, kind chaosKind, trigger
 	// reactive fault may exceed MaxConcurrent on purpose (it answers a
 	// transition), but the planner then sees it and holds back.
 	c.active[c.name(seq)] = reserved
+	c.wg.Add(1)
 	c.mu.Unlock()
 	d.Kind = kind
 	switch kind {
@@ -313,7 +317,6 @@ func (c *chaosController) injectNow(ctx context.Context, kind chaosKind, trigger
 	default:
 		d.Scope = scopeTableGroup
 	}
-	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		c.inject(ctx, seq, d, trigger)
@@ -331,6 +334,9 @@ func (c *chaosController) name(seq int) string {
 // stop ends the decision loop, waits for every experiment to end, and
 // removes anything still present.
 func (c *chaosController) stop() {
+	c.mu.Lock()
+	c.stopping = true
+	c.mu.Unlock()
 	close(c.stopCh)
 	c.wg.Wait()
 	c.mu.Lock()
