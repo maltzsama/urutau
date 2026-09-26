@@ -34,6 +34,27 @@ A fix without a test that fails before it is usually a fix that comes back.
 Prefer a test against the live path over one against a copy of the logic — the
 engine is columnar, so assert on columns.
 
+## File and function size
+
+`make test` runs a size ratchet (`internal/architecture/size_test.go`). In
+production code (not `_test.go`, `*.pb.go` or generated files), a file may
+not exceed **800 lines** and a function **120 lines**, counted from `func` to
+its closing brace.
+
+Code that was already over the limits is listed in
+`internal/architecture/size_allowlist.txt` at its size when the ratchet
+landed. The list only shrinks:
+
+- an allowlisted item that grows past its recorded size fails; split it
+  instead;
+- an entry whose item drops back under the limit, or no longer exists, fails
+  as stale; delete the entry in the same PR. To shrink every entry after a
+  split, run
+  `URUTAU_SIZE_ALLOWLIST_WRITE=1 go test ./internal/architecture -run TestSizeRatchet`
+  and review the diff: it must only lower sizes or remove lines;
+- a genuine exemption (a data table, an exhaustive type switch) goes in the
+  list with a `# why` comment, in the PR that adds it.
+
 ## Sign-off (DCO vs CLA) — open
 
 This project has not chosen a contributor sign-off policy yet. The two options

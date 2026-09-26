@@ -1,0 +1,39 @@
+# Size ratchet allowlist (issue #398; see TestSizeRatchet).
+#
+# Limits for production code: 800 lines per file, 120 per function (func to
+# closing brace). Each entry holds one item at most at its recorded size:
+#
+#   path[:Recv.Func] <max-lines> [# why it is exempt]
+#
+# The list only shrinks. An entry fails when its item grows past it, and when
+# the item drops back under the limit or no longer exists (a stale entry).
+# A new exemption needs a comment saying why, in the PR that adds it.
+core/cast.go 1020
+core/cast.go:CheckCast 122
+internal/coordinator/coordinator.go 3232
+internal/coordinator/coordinator.go:Coordinator.assignmentFor 133
+internal/coordinator/coordinator.go:Coordinator.enqueueBatch 147
+internal/coordinator/coordinator.go:Coordinator.run 543
+internal/coordinator/coordinator.go:controlServer.Session 130
+internal/dataplane/collapse.go:Collapse 163
+internal/dataplane/generator.go:EncodeKey 139
+internal/enrich/columnar.go:Stage.ColumnarJoin 289
+internal/enrich/enrich.go 906
+internal/enrich/enrich.go:New 150
+internal/operator/controller.go 997
+internal/operator/controller.go:CoordinatorReconciler.Reconcile 140
+internal/runner/runner.go 1185
+internal/runner/runner.go:newRunner 504
+internal/sink/iceberg/writer.go 1090
+internal/sink/iceberg/writer.go:appendColumn 220 # exhaustive type switch over core.Kind
+internal/source/mysql/charset_tables.go 1674 # generated charset data tables, not logic
+internal/source/postgres/reader.go 890
+internal/transport/codec.go 814
+internal/transport/codec.go:appendTypedValue 333 # exhaustive type switch over core.Kind
+internal/transport/codec.go:readTypedValue 162 # exhaustive type switch over core.Kind
+internal/worker/remote.go 828
+internal/worker/remote.go:RunRemote 377
+internal/worker/worker.go 1513
+internal/worker/worker.go:Worker.runBatcher 295
+spec/validate.go 933
+spec/validate.go:Spec.Validate 242
