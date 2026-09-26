@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/position"
 )
 
 func TestCanonicalForTargetFound(t *testing.T) {
@@ -27,8 +28,8 @@ func TestCanonicalForTargetNotFound(t *testing.T) {
 }
 
 func TestResumeOrNoneWithNil(t *testing.T) {
-	got := resumeOrNone(nil)
+	got := position.StringOrNone(nil)
 	if got != "none" {
-		t.Errorf("resumeOrNone(nil) = %q, want none", got)
+		t.Errorf("position.StringOrNone(nil) = %q, want none", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -286,7 +287,9 @@ func (w *doGetWriter) writeFlatBatch(b *dataplane.Batch) error {
 	for i := range n {
 		for fi, name := range names {
 			v, ok := br.Value(name, i)
-			appendScalar(bld.Field(fi), v, ok)
+			if err := appendScalar(bld.Field(fi), v, ok); err != nil {
+				return status.Errorf(codes.Internal, "flightserver: column %s: %v", name, err)
+			}
 		}
 	}
 
@@ -326,19 +329,27 @@ func (w *doGetWriter) writeChangeBatch(b *dataplane.Batch, tableFields []arrow.F
 		case rowchange.OpInsert:
 			opBld.Append(contract.OpInsert)
 			beforeBld.AppendNull()
-			appendStructRow(afterBld, tableFields, br, i)
+			if err := appendStructRow(afterBld, tableFields, br, i); err != nil {
+				return err
+			}
 		case rowchange.OpUpdate:
 			opBld.Append(contract.OpUpdate)
 			beforeBld.AppendNull()
-			appendStructRow(afterBld, tableFields, br, i)
+			if err := appendStructRow(afterBld, tableFields, br, i); err != nil {
+				return err
+			}
 		case rowchange.OpDelete:
 			opBld.Append(contract.OpDelete)
-			appendStructRow(beforeBld, tableFields, br, i)
+			if err := appendStructRow(beforeBld, tableFields, br, i); err != nil {
+				return err
+			}
 			afterBld.AppendNull()
 		default:
 			opBld.Append(contract.OpInsert)
 			beforeBld.AppendNull()
-			appendStructRow(afterBld, tableFields, br, i)
+			if err := appendStructRow(afterBld, tableFields, br, i); err != nil {
+				return err
+			}
 		}
 		offsetBld.Append([]byte(br.Position(i)))
 		if ts, ok := br.CommitTS(i); ok {
@@ -358,32 +369,62 @@ func (w *doGetWriter) writeChangeBatch(b *dataplane.Batch, tableFields []arrow.F
 	return w.stream.Send(&flight.FlightData{DataBody: body})
 }
 
-func appendStructRow(sb *array.StructBuilder, fields []arrow.Field, br *transport.BatchReader, row int) {
+func appendStructRow(sb *array.StructBuilder, fields []arrow.Field, br *transport.BatchReader, row int) error {
 	sb.Append(true)
 	for fi, f := range fields {
 		v, ok := br.Value(f.Name, row)
-		appendScalar(sb.FieldBuilder(fi), v, ok)
+		if err := appendScalar(sb.FieldBuilder(fi), v, ok); err != nil {
+			return status.Errorf(codes.Internal, "flightserver: column %s: %v", f.Name, err)
+		}
 	}
+	return nil
 }
 
-func appendScalar(b array.Builder, v any, ok bool) {
+// appendScalar appends one value to its column builder. An integer column
+// takes any Go integer that fits it, a float64 column any number; a value of
+// the wrong type is an error, never a silent zero or a panic (issue #403).
+func appendScalar(b array.Builder, v any, ok bool) error {
 	if !ok || v == nil {
 		b.AppendNull()
-		return
+		return nil
 	}
 	switch bb := b.(type) {
 	case *array.BooleanBuilder:
-		bb.Append(v.(bool))
+		t, ok := v.(bool)
+		if !ok {
+			return fmt.Errorf("%T %v is not a bool", v, v)
+		}
+		bb.Append(t)
 	case *array.Int32Builder:
-		bb.Append(toInt32(v))
+		i, ok := core.AsInt64(v)
+		if !ok || i < math.MinInt32 || i > math.MaxInt32 {
+			return fmt.Errorf("%T %v does not fit int32", v, v)
+		}
+		bb.Append(int32(i))
 	case *array.Int64Builder:
-		bb.Append(toInt64(v))
+		i, ok := core.AsInt64(v)
+		if !ok {
+			return fmt.Errorf("%T %v does not fit int64", v, v)
+		}
+		bb.Append(i)
 	case *array.Uint64Builder:
-		bb.Append(v.(uint64))
+		u, ok := core.AsUint64(v)
+		if !ok {
+			return fmt.Errorf("%T %v does not fit uint64", v, v)
+		}
+		bb.Append(u)
 	case *array.Float32Builder:
-		bb.Append(v.(float32))
+		t, ok := v.(float32)
+		if !ok {
+			return fmt.Errorf("%T %v is not a float32", v, v)
+		}
+		bb.Append(t)
 	case *array.Float64Builder:
-		bb.Append(v.(float64))
+		f, ok := core.AsFloat64(v)
+		if !ok {
+			return fmt.Errorf("%T %v is not a number", v, v)
+		}
+		bb.Append(f)
 	case *array.StringBuilder:
 		bb.Append(fmt.Sprintf("%v", v))
 	case *array.BinaryBuilder:
@@ -401,19 +442,7 @@ func appendScalar(b array.Builder, v any, ok bool) {
 	default:
 		b.AppendNull()
 	}
-}
-
-func toInt32(v any) int32 {
-	switch n := v.(type) {
-	case int32:
-		return n
-	case int64:
-		return int32(n)
-	case int:
-		return int32(n)
-	default:
-		return 0
-	}
+	return nil
 }
 
 // recordToIPCBytes serializes one record as a standalone IPC stream (schema
@@ -430,17 +459,4 @@ func recordToIPCBytes(schema *arrow.Schema, rec arrow.RecordBatch, alloc memory.
 		return nil, status.Errorf(codes.Internal, "flightserver: ipc close: %v", err)
 	}
 	return buf.Bytes(), nil
-}
-
-func toInt64(v any) int64 {
-	switch n := v.(type) {
-	case int64:
-		return n
-	case int32:
-		return int64(n)
-	case int:
-		return int64(n)
-	default:
-		return 0
-	}
 }

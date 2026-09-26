@@ -106,10 +106,10 @@ func TestPrimaryKeyFor(t *testing.T) {
 }
 
 func TestResumeOrNone(t *testing.T) {
-	if got := resumeOrNone(nil); got != "none" {
-		t.Fatalf("resumeOrNone(nil) = %q", got)
+	if got := position.StringOrNone(nil); got != "none" {
+		t.Fatalf("position.StringOrNone(nil) = %q", got)
 	}
-	if got := resumeOrNone(position.MustLSN("0/10")); got != "0/10" {
+	if got := position.StringOrNone(position.MustLSN("0/10")); got != "0/10" {
 		t.Fatalf("resumeOrNone = %q", got)
 	}
 }
@@ -145,12 +145,12 @@ func TestSupervisionConfig(t *testing.T) {
 
 func TestAsFloatAndCompareScalar(t *testing.T) {
 	for _, v := range []any{int64(1), int32(1), int(1), uint64(1), float64(1), float32(1)} {
-		if _, ok := asFloat(v); !ok {
-			t.Fatalf("asFloat(%T) = false", v)
+		if _, ok := core.AsFloat64(v); !ok {
+			t.Fatalf("core.AsFloat64(%T) = false", v)
 		}
 	}
-	if _, ok := asFloat("x"); ok {
-		t.Fatal("asFloat(string) must be false")
+	if _, ok := core.AsFloat64("x"); ok {
+		t.Fatal("core.AsFloat64(string) must be false")
 	}
 	cmpOK := func(a, b any) int {
 		t.Helper()

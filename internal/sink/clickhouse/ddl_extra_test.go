@@ -16,21 +16,21 @@ func TestPosQuoted(t *testing.T) {
 }
 
 func TestQuoteIdentEscapes(t *testing.T) {
-	got := quoteIdent("mytable")
+	got := quoteChIdent("mytable")
 	want := "`" + "mytable" + "`"
 	if got != want {
-		t.Errorf("quoteIdent = %q, want %q", got, want)
+		t.Errorf("quoteChIdent = %q, want %q", got, want)
 	}
 	// Backtick inside is escaped: strings.ReplaceAll replaces ` with \x60
-	got = quoteIdent("my\x60table")
+	got = quoteChIdent("my\x60table")
 	if len(got) < 4 || got[0] != '`' || got[len(got)-1] != '`' {
-		t.Fatalf("quoteIdent with backtick not wrapped: %q", got)
+		t.Fatalf("quoteChIdent with backtick not wrapped: %q", got)
 	}
 	inner := got[1 : len(got)-1]
 	// ReplaceAll replaces ` with \x60, so backtick becomes backslash+backtick
 	wantInner := "my\x5c\x60table"
 	if inner != wantInner {
-		t.Errorf("quoteIdent with backtick inner = %q, want %q", inner, wantInner)
+		t.Errorf("quoteChIdent with backtick inner = %q, want %q", inner, wantInner)
 	}
 }
 

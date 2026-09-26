@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"strings"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/source"
 )
 
@@ -104,7 +105,7 @@ func isStringType(dataType string) bool {
 }
 
 func (c *Chunker) minMax(ctx context.Context, col string) (minVal, maxVal any, err error) {
-	quoted := quoteIdent(col)
+	quoted := quotePgIdent(col)
 	query := psql.Select("MIN("+quoted+")", "MAX("+quoted+")").From(c.qualifiedTable())
 	sqlStr, args, err := query.ToSql()
 	if err != nil {
@@ -176,17 +177,17 @@ func rangesFromBoundaries(boundaries []any) []source.Chunk {
 // worker a full step, the extra partitions are empty [max,max) ranges (they
 // own nothing, and a key above max routes to the final open range).
 func (c *Chunker) partitionNumeric(minVal, maxVal any, n int) ([]source.Chunk, error) {
-	minI, ok := toInt64(minVal)
+	minI, ok := core.AsInt64(minVal)
 	if !ok {
-		f, fok := toFloat64(minVal)
+		f, fok := core.AsFloat64(minVal)
 		if !fok {
 			return nil, fmt.Errorf("postgres: partition: min value %T is not numeric", minVal)
 		}
 		minI = int64(f)
 	}
-	maxI, ok := toInt64(maxVal)
+	maxI, ok := core.AsInt64(maxVal)
 	if !ok {
-		f, fok := toFloat64(maxVal)
+		f, fok := core.AsFloat64(maxVal)
 		if !fok {
 			return nil, fmt.Errorf("postgres: partition: max value %T is not numeric", maxVal)
 		}
@@ -242,7 +243,7 @@ func (c *Chunker) partitionNumeric(minVal, maxVal any, n int) ([]source.Chunk, e
 // character set. A sparse table (fewer distinct keys than workers) is padded
 // with degenerate empty ranges so the count stays n.
 func (c *Chunker) partitionString(ctx context.Context, col string, n int) ([]source.Chunk, error) {
-	quoted := quoteIdent(col)
+	quoted := quotePgIdent(col)
 	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: partition: tx: %w", err)

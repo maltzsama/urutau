@@ -113,7 +113,7 @@ func filterExprSource(f *spec.Filter, tbl *schema.Table) (string, error) {
 	case len(f.Any) > 0:
 		return filterExprGroup(f.Any, tbl, "||")
 	case f.Not != nil:
-		return filterExprSource(negateFilter(f.Not), tbl)
+		return filterExprSource(f.Not.Negate(), tbl)
 	case f.Predicate != nil:
 		return filterExprPredicate(f.Predicate, tbl)
 	default:
@@ -339,60 +339,6 @@ func toDecimal(v any) (decimal.Decimal, error) {
 	default:
 		return decimal.Decimal{}, fmt.Errorf("mysql_decimal_cmp: unsupported type %T", v)
 	}
-}
-
-// negateFilter returns the logical negation of f with NOT pushed down to the
-// leaves (De Morgan). Mirrors the Postgres helper.
-func negateFilter(f *spec.Filter) *spec.Filter {
-	switch {
-	case f == nil:
-		return nil
-	case len(f.All) > 0:
-		out := make([]spec.Filter, len(f.All))
-		for i := range f.All {
-			out[i] = *negateFilter(&f.All[i])
-		}
-		return &spec.Filter{Any: out}
-	case len(f.Any) > 0:
-		out := make([]spec.Filter, len(f.Any))
-		for i := range f.Any {
-			out[i] = *negateFilter(&f.Any[i])
-		}
-		return &spec.Filter{All: out}
-	case f.Not != nil:
-		return f.Not
-	case f.Predicate != nil:
-		return &spec.Filter{Predicate: negatePredicate(f.Predicate)}
-	default:
-		return nil
-	}
-}
-
-func negatePredicate(p *spec.Predicate) *spec.Predicate {
-	op := p.Op
-	switch p.Op {
-	case spec.OpEq:
-		op = spec.OpNeq
-	case spec.OpNeq:
-		op = spec.OpEq
-	case spec.OpLt:
-		op = spec.OpGte
-	case spec.OpLte:
-		op = spec.OpGt
-	case spec.OpGt:
-		op = spec.OpLte
-	case spec.OpGte:
-		op = spec.OpLt
-	case spec.OpIn:
-		op = spec.OpNotIn
-	case spec.OpNotIn:
-		op = spec.OpIn
-	case spec.OpIsNull:
-		op = spec.OpIsNotNull
-	case spec.OpIsNotNull:
-		op = spec.OpIsNull
-	}
-	return &spec.Predicate{Column: p.Column, Op: op, Value: p.Value}
 }
 
 func exprOperator(op spec.Operator) string {

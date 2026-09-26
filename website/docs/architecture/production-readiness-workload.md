@@ -214,7 +214,7 @@ cluster:
 | Target | one Pod (workers, or for stress sometimes the coordinator), one table's workers, or every worker (network) |
 | Start | exponential gap around the profile mean (20 s smoke, 30 s full), capped at 4× the mean |
 | Duration | uniform between the profile bounds (5–30 s smoke, 10 s–2 min full) |
-| Overlap | whether it may start while others run, up to 2 (smoke) or 3 (full) at once |
+| Overlap | whether it may start while others run, up to 2 (smoke) or 3 (full) at once. Two network faults never overlap: Chaos Mesh cannot stack NetworkChaos on one Pod (the second fails with `unable to flush ip sets`), so a network draw is skipped while one is active |
 
 The **executor** resolves the concrete target when it injects, from the Pods
 running at that moment (scaling and re-slicing change them), creates the
@@ -252,7 +252,9 @@ URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessMatrix$
 - **Chaos**: the controller runs throughout; in addition, whenever a worker
   StatefulSet's replica count changes (a re-slice starting), it injects a
   worker pod-kill and a worker ↔ coordinator network partition at once, so
-  faults overlap partition transitions by construction.
+  faults overlap partition transitions by construction. When another network
+  fault is active, the partition is recorded as skipped (with the reason)
+  instead of failing to inject.
 - A longer live window (8 minutes) and settle (60 minutes): with four workers
   per table and staged tables committing one cycle at a time (#414), the
   backlog of a run took about 36 minutes to drain before converging exactly.

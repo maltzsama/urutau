@@ -144,15 +144,15 @@ func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, afte
 	if len(specTable.ColumnFilter) > 0 && !slices.Contains(specTable.ColumnFilter, cursor) {
 		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
 	}
-	q := psql.Select("*").From(quoteIdent(schema) + "." + quoteIdent(table))
+	q := psql.Select("*").From(quotePgIdent(schema) + "." + quotePgIdent(table))
 	if len(specTable.ColumnFilter) > 0 {
-		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quoteIdent(schema) + "." + quoteIdent(table))
+		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quotePgIdent(schema) + "." + quotePgIdent(table))
 	}
 	if after != "" {
 		// >=, not >: a non-unique cursor (updated_at) can have new rows at the
 		// same value as the last checkpoint. Re-reading the boundary is
 		// idempotent under upsert and never drops a row.
-		q = q.Where(sq.Expr(quoteIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, after))
+		q = q.Where(sq.Expr(quotePgIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, after))
 	}
 	if specTable.Filter != nil {
 		f, err := filterToSquirrel(specTable.Filter)
@@ -161,7 +161,7 @@ func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, afte
 		}
 		q = q.Where(f)
 	}
-	q = q.OrderBy(quoteIdent(cursor))
+	q = q.OrderBy(quotePgIdent(cursor))
 	query, args, err := q.ToSql()
 	if err != nil {
 		return "", nil, fmt.Errorf("postgres: incremental sql: %w", err)

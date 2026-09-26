@@ -775,7 +775,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.log.Info("coordinator resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
+	c.log.Info("coordinator resume", "from", position.StringOrNone(resume), "snapshot_tables", len(needsSnapshot))
 	// Before any worker can commit: a crash from here on must find these
 	// tables unfinished, whatever positions the stream commits to them.
 	if err := c.markSnapshotsPending(ctx, needsSnapshot); err != nil {
@@ -2245,8 +2245,8 @@ func compareScalar(a, b any) (int, error) {
 			return ai.compare(bi), nil
 		}
 	}
-	if af, aok := asFloat(a); aok {
-		if bf, bok := asFloat(b); bok {
+	if af, aok := core.AsFloat64(a); aok {
+		if bf, bok := core.AsFloat64(b); bok {
 			return cmp.Compare(af, bf), nil
 		}
 	}
@@ -2313,26 +2313,6 @@ func asInteger(v any) (integer, bool) {
 	default:
 		return integer{}, false
 	}
-}
-
-// asFloat widens any numeric value to float64, for a float key or a float
-// against an integer bound (the Postgres chunker builds integer bounds for a
-// float key).
-func asFloat(v any) (float64, bool) {
-	switch t := v.(type) {
-	case float64:
-		return t, true
-	case float32:
-		return float64(t), true
-	}
-	if i, ok := asInteger(v); ok {
-		f := float64(i.mag)
-		if i.neg {
-			f = -f
-		}
-		return f, true
-	}
-	return 0, false
 }
 
 // asBytes returns the bytes of a string or []byte key. Go orders strings
@@ -3188,13 +3168,6 @@ func (w *workerState) dropSent(ids []uint64) {
 }
 
 // ── Positions ─────────────────────────────────────────────────────────
-
-func resumeOrNone(p position.Position) string {
-	if p == nil {
-		return "none"
-	}
-	return p.String()
-}
 
 // randSuffix returns n hex chars of crypto randomness (run-id suffix).
 func randSuffix(n int) string {

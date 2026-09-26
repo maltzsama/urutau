@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/sink/rowmeta"
 )
 
 func TestJsonValueAllTypes(t *testing.T) {
@@ -74,7 +75,7 @@ func TestJsonValueAllTypes(t *testing.T) {
 
 func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 	now := time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC)
-	c := rowMeta{
+	c := rowmeta.Row{
 		Op:       1,
 		Position: "gtid:1",
 		CommitTS: now,
@@ -100,20 +101,20 @@ func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 		{core.MetaHeaders},
 	}
 	for _, tc := range cases {
-		_, err := metaValue(tc.key, c, "src.t")
+		_, err := rowmeta.Value(tc.key, c, "src.t")
 		if err != nil {
-			t.Errorf("metaValue(%q): %v", tc.key, err)
+			t.Errorf("rowmeta.Value(%q): %v", tc.key, err)
 		}
 	}
 
 	// Unknown key errors.
-	if _, err := metaValue("unknown", c, "t"); err == nil {
+	if _, err := rowmeta.Value("unknown", c, "t"); err == nil {
 		t.Error("unknown metadata key: want error")
 	}
 
 	// Zero commit TS returns nil.
-	zero := rowMeta{CommitTS: time.Time{}}
-	got, err := metaValue(core.MetaCommitTS, zero, "t")
+	zero := rowmeta.Row{CommitTS: time.Time{}}
+	got, err := rowmeta.Value(core.MetaCommitTS, zero, "t")
 	if err != nil {
 		t.Fatalf("zero commitTS: %v", err)
 	}
@@ -122,15 +123,15 @@ func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 	}
 
 	// Empty position returns nil for position and seq.
-	empty := rowMeta{}
-	got, err = metaValue(core.MetaPosition, empty, "t")
+	empty := rowmeta.Row{}
+	got, err = rowmeta.Value(core.MetaPosition, empty, "t")
 	if err != nil {
 		t.Fatalf("empty position: %v", err)
 	}
 	if got != nil {
 		t.Errorf("empty position = %v, want nil", got)
 	}
-	got, err = metaValue(core.MetaSeq, empty, "t")
+	got, err = rowmeta.Value(core.MetaSeq, empty, "t")
 	if err != nil {
 		t.Fatalf("empty seq: %v", err)
 	}
@@ -139,8 +140,8 @@ func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 	}
 
 	// Phase fallback to snapshot.
-	snap := rowMeta{Snapshot: true}
-	got, err = metaValue(core.MetaPhase, snap, "t")
+	snap := rowmeta.Row{Snapshot: true}
+	got, err = rowmeta.Value(core.MetaPhase, snap, "t")
 	if err != nil {
 		t.Fatalf("snapshot phase: %v", err)
 	}
@@ -149,8 +150,8 @@ func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 	}
 
 	// Phase fallback to stream.
-	stream := rowMeta{Snapshot: false}
-	got, err = metaValue(core.MetaPhase, stream, "t")
+	stream := rowmeta.Row{Snapshot: false}
+	got, err = rowmeta.Value(core.MetaPhase, stream, "t")
 	if err != nil {
 		t.Fatalf("stream phase: %v", err)
 	}
@@ -159,8 +160,8 @@ func TestMetaValueCouchbaseAllKeys(t *testing.T) {
 	}
 
 	// No phase, no snapshot defaults to stream.
-	noPhase := rowMeta{}
-	got, err = metaValue(core.MetaPhase, noPhase, "t")
+	noPhase := rowmeta.Row{}
+	got, err = rowmeta.Value(core.MetaPhase, noPhase, "t")
 	if err != nil {
 		t.Fatalf("no phase: %v", err)
 	}

@@ -23,6 +23,15 @@ type Position interface {
 	Contains(other Position) bool
 }
 
+// StringOrNone renders p for a log line, "none" when there is no position (a
+// fresh start).
+func StringOrNone(p Position) string {
+	if p == nil {
+		return "none"
+	}
+	return p.String()
+}
+
 // Meeter is implemented by positions with a PARTIAL order, where two values
 // can diverge without either containing the other. Meet returns their
 // greatest lower bound — the position every input contains — or false when

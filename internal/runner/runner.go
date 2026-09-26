@@ -459,13 +459,6 @@ func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger 
 
 // ── Collapsed pipeline ──────────────────────────────────────────────
 
-func resumeOrNone(p position.Position) string {
-	if p == nil {
-		return "none"
-	}
-	return p.String()
-}
-
 // markSnapshotsPending marks each table about to be snapshotted not_started,
 // unless an earlier run already left it unfinished (its in_progress carries
 // resumable bounds). It returns the tables that already hold committed rows:
@@ -884,13 +877,13 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		closeStages()
 		return nil, err
 	}
-	log.Info("resume", "from", resumeOrNone(resume), "snapshot_tables", len(needsSnapshot))
+	log.Info("resume", "from", position.StringOrNone(resume), "snapshot_tables", len(needsSnapshot))
 	if len(recovery) > 0 {
 		log.Info("crash recovery: streams ahead of the resume point replay from it",
-			"from", resumeOrNone(resume), "streams", recovery)
+			"from", position.StringOrNone(resume), "streams", recovery)
 	}
 	r.emit(eventlog.KindResume, map[string]any{
-		"from": resumeOrNone(resume), "snapshot_tables": len(needsSnapshot),
+		"from": position.StringOrNone(resume), "snapshot_tables": len(needsSnapshot),
 	})
 
 	// Before the stream can commit anything: a crash from here on must find

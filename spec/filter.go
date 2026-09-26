@@ -56,3 +56,63 @@ type Predicate struct {
 	Op     Operator `json:"op"`
 	Value  any      `json:"value,omitempty"`
 }
+
+// Negate returns the logical negation of f with NOT pushed down one level
+// (De Morgan): all↔any over negated children, each predicate's operator
+// negated, and a `not` node replaced by its operand as is (not(not(x)) = x).
+// That operand may itself hold `not` nodes: a renderer that meets one calls
+// Negate on it in turn, so the rendered expression never negates a
+// comparison. Shared by every SQL source (issue #403).
+func (f *Filter) Negate() *Filter {
+	switch {
+	case f == nil:
+		return nil
+	case len(f.All) > 0:
+		out := make([]Filter, len(f.All))
+		for i := range f.All {
+			out[i] = *f.All[i].Negate()
+		}
+		return &Filter{Any: out}
+	case len(f.Any) > 0:
+		out := make([]Filter, len(f.Any))
+		for i := range f.Any {
+			out[i] = *f.Any[i].Negate()
+		}
+		return &Filter{All: out}
+	case f.Not != nil:
+		return f.Not
+	case f.Predicate != nil:
+		return &Filter{Predicate: f.Predicate.Negate()}
+	default:
+		return nil
+	}
+}
+
+// Negate returns p with its operator negated (= ↔ !=, < ↔ >=, in ↔ not in,
+// is null ↔ is not null, …).
+func (p *Predicate) Negate() *Predicate {
+	op := p.Op
+	switch p.Op {
+	case OpEq:
+		op = OpNeq
+	case OpNeq:
+		op = OpEq
+	case OpLt:
+		op = OpGte
+	case OpLte:
+		op = OpGt
+	case OpGt:
+		op = OpLte
+	case OpGte:
+		op = OpLt
+	case OpIn:
+		op = OpNotIn
+	case OpNotIn:
+		op = OpIn
+	case OpIsNull:
+		op = OpIsNotNull
+	case OpIsNotNull:
+		op = OpIsNull
+	}
+	return &Predicate{Column: p.Column, Op: op, Value: p.Value}
+}
