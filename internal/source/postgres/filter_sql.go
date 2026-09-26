@@ -62,7 +62,7 @@ func filterGroupToSquirrel(nodes []spec.Filter) ([]sq.Sqlizer, error) {
 }
 
 func filterPredicateToSquirrel(p *spec.Predicate) (sq.Sqlizer, error) {
-	col := quoteIdent(p.Column)
+	col := quotePgIdent(p.Column)
 	switch p.Op {
 	case spec.OpEq:
 		return sq.Eq{col: p.Value}, nil

@@ -445,21 +445,13 @@ func asBytes(v any) ([]byte, error) {
 // date is int32 days, of a time int64 micros). A uint64 above MaxInt64 has no
 // exact int64 form and is rejected, never silently wrapped.
 func asInt64(v any) (int64, error) {
-	switch t := v.(type) {
-	case int:
-		return int64(t), nil
-	case int32:
-		return int64(t), nil
-	case int64:
-		return t, nil
-	case uint64:
-		if t > math.MaxInt64 {
-			return 0, fmt.Errorf("core: uint64 %d overflows int64", t)
-		}
-		return int64(t), nil
-	default:
-		return 0, fmt.Errorf("cannot interpret %T as an integer", v)
+	if i, ok := AsInt64(v); ok {
+		return i, nil
 	}
+	if u, ok := v.(uint64); ok {
+		return 0, fmt.Errorf("core: uint64 %d overflows int64", u)
+	}
+	return 0, fmt.Errorf("cannot interpret %T as an integer", v)
 }
 
 // formatUUID renders 16 raw bytes as the canonical 8-4-4-4-12 uuid text.

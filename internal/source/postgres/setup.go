@@ -81,7 +81,7 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 		schema, table, _ := strings.Cut(ref.Source, ".")
 		if _, err := db.ExecContext(ctx,
 			fmt.Sprintf(`ALTER TABLE %s.%s REPLICA IDENTITY FULL`,
-				quoteIdent(schema), quoteIdent(table))); err != nil {
+				quotePgIdent(schema), quotePgIdent(table))); err != nil {
 			return fmt.Errorf("postgres: replica identity %s: %w", ref.Source, err)
 		}
 	}
@@ -162,14 +162,14 @@ func ensurePublication(ctx context.Context, db *sql.DB, slotName string, tables 
 		defs := make([]string, 0, len(tables))
 		for _, ref := range tables {
 			schema, table, _ := strings.Cut(ref.Source, ".")
-			defs = append(defs, quoteIdent(schema)+"."+quoteIdent(table))
+			defs = append(defs, quotePgIdent(schema)+"."+quotePgIdent(table))
 		}
 		opts := ""
 		if viaRoot {
 			opts = " WITH (publish_via_partition_root = true)"
 		}
 		if _, err := db.ExecContext(ctx,
-			fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s%s`, quoteIdent(pub), strings.Join(defs, ", "), opts)); err != nil {
+			fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s%s`, quotePgIdent(pub), strings.Join(defs, ", "), opts)); err != nil {
 			return fmt.Errorf("postgres: create publication: %w", err)
 		}
 	} else {
@@ -178,7 +178,7 @@ func ensurePublication(ctx context.Context, db *sql.DB, slotName string, tables 
 		}
 		if viaRoot {
 			if _, err := db.ExecContext(ctx,
-				fmt.Sprintf(`ALTER PUBLICATION %s SET (publish_via_partition_root = true)`, quoteIdent(pub))); err != nil {
+				fmt.Sprintf(`ALTER PUBLICATION %s SET (publish_via_partition_root = true)`, quotePgIdent(pub))); err != nil {
 				return fmt.Errorf("postgres: publication partition root: %w", err)
 			}
 		}
@@ -238,7 +238,7 @@ func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []sourc
 			schema, table, _ := strings.Cut(src, ".")
 			if _, err := tx.ExecContext(ctx, fmt.Sprintf(
 				`ALTER PUBLICATION %s DROP TABLE %s.%s`,
-				quoteIdent(pub), quoteIdent(schema), quoteIdent(table))); err != nil {
+				quotePgIdent(pub), quotePgIdent(schema), quotePgIdent(table))); err != nil {
 				return fmt.Errorf("postgres: publication drop %s: %w", src, err)
 			}
 		}
@@ -248,7 +248,7 @@ func syncPublication(ctx context.Context, db *sql.DB, pub string, tables []sourc
 			schema, table, _ := strings.Cut(src, ".")
 			if _, err := tx.ExecContext(ctx, fmt.Sprintf(
 				`ALTER PUBLICATION %s ADD TABLE %s.%s`,
-				quoteIdent(pub), quoteIdent(schema), quoteIdent(table))); err != nil {
+				quotePgIdent(pub), quotePgIdent(schema), quotePgIdent(table))); err != nil {
 				return fmt.Errorf("postgres: publication add %s: %w", src, err)
 			}
 		}

@@ -269,7 +269,7 @@ func (c *Chunker) keyBounds(ctx context.Context) ([][]any, error) {
 
 // qualifiedTable is the quoted "schema"."table".
 func (c *Chunker) qualifiedTable() string {
-	return quoteIdent(c.schema) + "." + quoteIdent(c.table)
+	return quotePgIdent(c.schema) + "." + quotePgIdent(c.table)
 }
 
 // selectList is the SELECT column list: the projection, or * for all.
@@ -325,7 +325,7 @@ func (c *Chunker) chunkQuery(ch source.Chunk) (sq.SelectBuilder, error) {
 			q = q.Where(ctidCompare("<", ch.High[0]))
 		}
 	default:
-		col := quoteIdent(c.chunkColumn)
+		col := quotePgIdent(c.chunkColumn)
 		if ch.Low != nil {
 			q = q.Where(sq.GtOrEq{col: ch.Low[0]})
 		}
@@ -580,8 +580,8 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	return vals, nil
 }
 
-// quoteIdent quotes one identifier, doubling embedded quotes.
-func quoteIdent(s string) string {
+// quotePgIdent quotes one identifier, doubling embedded quotes.
+func quotePgIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
@@ -589,7 +589,7 @@ func quoteIdent(s string) string {
 func quotedIdents(cols []string) []string {
 	out := make([]string, len(cols))
 	for i, c := range cols {
-		out[i] = quoteIdent(strings.TrimSpace(c))
+		out[i] = quotePgIdent(strings.TrimSpace(c))
 	}
 	return out
 }

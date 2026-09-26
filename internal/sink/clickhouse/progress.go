@@ -23,9 +23,9 @@ const progressTable = "urutau_progress"
 // explicitly — bare only when the sink has no namespace.
 func (s *Sink) progressIdent() string {
 	if s.ns == "" {
-		return quoteIdent(progressTable)
+		return quoteChIdent(progressTable)
 	}
-	return quoteIdent(s.ns) + "." + quoteIdent(progressTable)
+	return quoteChIdent(s.ns) + "." + quoteChIdent(progressTable)
 }
 
 // ensureProgressTable creates the progress side table if absent.

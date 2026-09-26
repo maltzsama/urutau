@@ -235,7 +235,7 @@ func TestQuotedList(t *testing.T) {
 }
 
 func TestQuoteIdent(t *testing.T) {
-	if quoteIdent("orders") != `"orders"` {
-		t.Fatalf("quoteIdent = %q", quoteIdent("orders"))
+	if quotePgIdent("orders") != `"orders"` {
+		t.Fatalf("quotePgIdent = %q", quotePgIdent("orders"))
 	}
 }
