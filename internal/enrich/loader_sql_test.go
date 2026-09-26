@@ -134,7 +134,7 @@ func TestHasOrderBy(t *testing.T) {
 
 func TestAppendOrderBy(t *testing.T) {
 	// plain query → suffix
-	got := appendOrderBy("SELECT id, name FROM users", "id")
+	got := appendOrderBy("SELECT id, name FROM users", "id", quoteANSI)
 	if !strings.Contains(got, "ORDER BY") || !strings.Contains(got, `"id"`) {
 		t.Fatalf("plain: %q", got)
 	}
@@ -147,9 +147,13 @@ func TestAppendOrderBy(t *testing.T) {
 		"SELECT id FROM (SELECT id FROM base)",
 		"SELECT id, count(*) FROM t GROUP BY id",
 	} {
-		w := appendOrderBy(q, "id")
+		w := appendOrderBy(q, "id", quoteANSI)
 		if !strings.HasPrefix(w, "SELECT * FROM (") || !strings.HasSuffix(w, `ORDER BY "id"`) {
 			t.Fatalf("wrap(%q) = %q", q, w)
 		}
+	}
+	// MySQL reads "id" as a string literal: its loader quotes in backticks.
+	if got := appendOrderBy("SELECT id FROM t", "i`d", quoteMySQL); got != "SELECT id FROM t ORDER BY `i``d`" {
+		t.Fatalf("mysql: %q", got)
 	}
 }

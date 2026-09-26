@@ -10,6 +10,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/sink/rowmeta"
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
@@ -188,7 +189,7 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	}
 	for i := range reader.NumRows() {
 		isDeleted := reader.Op(i) == rowchange.OpDelete
-		row := clickhouseRowMetaOf(reader, i)
+		row := rowmeta.Of(reader, i)
 		for si, col := range w.cols {
 			v, err := resolvers[si](reader, i, isDeleted, batchPos, seq, row)
 			if err != nil {
@@ -236,7 +237,7 @@ func (w *tableWriter) Close() error { return nil }
 // against the record schema. The old project()/valueFor() pair built a
 // per-row map first and re-keyed it per column; the resolver reads the
 // value straight from the record.
-type colResolver func(r *transport.BatchReader, i int, isDeleted bool, batchPos string, seq uint64, row chRowMeta) (any, error)
+type colResolver func(r *transport.BatchReader, i int, isDeleted bool, batchPos string, seq uint64, row rowmeta.Row) (any, error)
 
 // bindResolvers maps every target column to its value source. Binding once
 // per commit keeps the row loop allocation-free.
@@ -246,17 +247,17 @@ func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, er
 		name := col.name
 		switch name {
 		case "position":
-			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, batchPos string, _ uint64, _ chRowMeta) (any, error) {
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, batchPos string, _ uint64, _ rowmeta.Row) (any, error) {
 				return batchPos, nil
 			}
 			continue
 		case "seq":
-			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, seq uint64, _ chRowMeta) (any, error) {
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, seq uint64, _ rowmeta.Row) (any, error) {
 				return seq, nil
 			}
 			continue
 		case "is_deleted":
-			resolvers[i] = func(_ *transport.BatchReader, _ int, isDeleted bool, _ string, _ uint64, _ chRowMeta) (any, error) {
+			resolvers[i] = func(_ *transport.BatchReader, _ int, isDeleted bool, _ string, _ uint64, _ rowmeta.Row) (any, error) {
 				if isDeleted {
 					return uint8(1), nil
 				}
@@ -266,8 +267,8 @@ func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, er
 		}
 		if m, ok := w.metaByName[name]; ok {
 			key := m.From
-			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, _ uint64, row chRowMeta) (any, error) {
-				v, err := metaValue(key, row, w.sourceTable)
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, _ uint64, row rowmeta.Row) (any, error) {
+				v, err := rowmeta.Value(key, row, w.sourceTable)
 				if err != nil {
 					return nil, fmt.Errorf("metadata %q: %w", name, err)
 				}
@@ -288,13 +289,13 @@ func (w *tableWriter) bindResolvers(r *transport.BatchReader) ([]colResolver, er
 			}
 			// A target column the stream does not carry: nil per the
 			// nullability rules, identical to the old absent-key path.
-			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, _ uint64, _ chRowMeta) (any, error) {
+			resolvers[i] = func(_ *transport.BatchReader, _ int, _ bool, _ string, _ uint64, _ rowmeta.Row) (any, error) {
 				return nil, nil
 			}
 			continue
 		}
 		colName := name
-		resolvers[i] = func(r *transport.BatchReader, i int, _ bool, _ string, _ uint64, _ chRowMeta) (any, error) {
+		resolvers[i] = func(r *transport.BatchReader, i int, _ bool, _ string, _ uint64, _ rowmeta.Row) (any, error) {
 			v, ok := r.Value(colName, i)
 			if !ok {
 				return nil, nil
@@ -338,75 +339,4 @@ func (w *tableWriter) valueOf(col column, v any) (any, error) {
 		return zeroOf(col.base), nil
 	}
 	return v, nil
-}
-
-// chRowMeta is the per-row metadata view the metadata resolvers need.
-type chRowMeta struct {
-	Op       rowchange.Op
-	Position string
-	CommitTS time.Time
-	IngestTS time.Time
-	Snapshot bool
-	Phase    string
-}
-
-func clickhouseRowMetaOf(r *transport.BatchReader, i int) chRowMeta {
-	commitTS, _ := r.CommitTS(i)
-	ingestTS, _ := r.IngestTS(i)
-	return chRowMeta{
-		Op:       r.Op(i),
-		Position: r.Position(i),
-		CommitTS: commitTS,
-		IngestTS: ingestTS,
-		Snapshot: r.Snapshot(i),
-		Phase:    r.Phase(i),
-	}
-}
-
-// metaValue resolves one metadata key to its concrete value for a row.
-func metaValue(key core.MetadataKey, c chRowMeta, sourceTable string) (any, error) {
-	switch key {
-	case core.MetaOp:
-		return c.Op.String(), nil
-	case core.MetaCommitTS:
-		if c.CommitTS.IsZero() {
-			return nil, nil
-		}
-		return c.CommitTS, nil
-	case core.MetaIngestTS:
-		return c.IngestTS, nil
-	case core.MetaPosition:
-		if c.Position == "" {
-			return nil, nil
-		}
-		return c.Position, nil
-	case core.MetaSourceTable:
-		return sourceTable, nil
-	case core.MetaPhase:
-		if c.Phase != "" {
-			return c.Phase, nil
-		}
-		if c.Snapshot {
-			return core.PhaseSnapshot, nil
-		}
-		return core.PhaseStream, nil
-	case core.MetaStream:
-		// Wire path: no transport envelope; the source table IS the stream.
-		return sourceTable, nil
-	case core.MetaShard:
-		return nil, nil
-	case core.MetaSeq:
-		if c.Position == "" {
-			return nil, nil
-		}
-		return c.Position, nil // CDC: the event coordinate (GTID/LSN)
-	case core.MetaMsgTS:
-		return nil, nil
-	case core.MetaMsgKey:
-		return nil, nil
-	case core.MetaHeaders:
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("unknown metadata key %q", key)
-	}
 }

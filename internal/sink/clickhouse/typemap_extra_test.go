@@ -7,6 +7,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/sink/rowmeta"
 	"github.com/shopspring/decimal"
 )
 
@@ -159,7 +160,7 @@ func TestToTimeEdgeCases(t *testing.T) {
 
 func TestMetaValueClickHouse(t *testing.T) {
 	now := time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC)
-	c := chRowMeta{
+	c := rowmeta.Row{
 		Op:       rowchange.OpInsert,
 		Position: "gtid:1",
 		CommitTS: now,
@@ -179,24 +180,36 @@ func TestMetaValueClickHouse(t *testing.T) {
 		{core.MetaPhase},
 	}
 	for _, tc := range cases {
-		_, err := metaValue(tc.key, c, "src.t")
+		_, err := rowmeta.Value(tc.key, c, "src.t")
 		if err != nil {
-			t.Errorf("metaValue(%q): %v", tc.key, err)
+			t.Errorf("rowmeta.Value(%q): %v", tc.key, err)
 		}
 	}
 
 	// Unknown key errors.
-	if _, err := metaValue("unknown", c, "t"); err == nil {
+	if _, err := rowmeta.Value("unknown", c, "t"); err == nil {
 		t.Error("unknown metadata key: want error")
 	}
 
 	// Zero commit TS returns nil.
-	zero := chRowMeta{CommitTS: time.Time{}}
-	got, err := metaValue(core.MetaCommitTS, zero, "t")
+	zero := rowmeta.Row{CommitTS: time.Time{}}
+	got, err := rowmeta.Value(core.MetaCommitTS, zero, "t")
 	if err != nil {
 		t.Fatalf("zero commitTS: %v", err)
 	}
 	if got != nil {
 		t.Errorf("zero commitTS = %v, want nil", got)
+	}
+}
+
+// A null ingest_ts lands as NULL, like commit_ts and like the Couchbase and
+// Iceberg sinks: every metadata column is nullable (issue #403).
+func TestMetaValueZeroIngestTSIsNull(t *testing.T) {
+	got, err := rowmeta.Value(core.MetaIngestTS, rowmeta.Row{}, "t")
+	if err != nil {
+		t.Fatalf("zero ingestTS: %v", err)
+	}
+	if got != nil {
+		t.Errorf("zero ingestTS = %v, want nil", got)
 	}
 }

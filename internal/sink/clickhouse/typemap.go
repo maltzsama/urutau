@@ -93,7 +93,7 @@ func chBaseType(ct core.ColumnType) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("struct field %q: %w", f.Name, err)
 			}
-			parts[i] = quoteIdent(f.Name) + " " + ft
+			parts[i] = quoteChIdent(f.Name) + " " + ft
 		}
 		return "Tuple(" + strings.Join(parts, ", ") + ")", nil
 	case core.KindUnknown:

@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
+
+	"github.com/maltzsama/urutau/core"
 )
 
 // maxChunkBounds caps the chunk count a value-range split may produce. A
@@ -16,7 +18,7 @@ const maxChunkBounds = 1 << 20
 // batchBounds splits an integer/float chunk column by value range: MIN..MAX
 // stepped by chunkSize. A dense key yields ~chunkSize rows per chunk.
 func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
-	col := quoteIdent(c.chunkColumn)
+	col := quotePgIdent(c.chunkColumn)
 	query, args, err := psql.
 		Select("MIN("+col+")", "MAX("+col+")").
 		From(c.qualifiedTable()).
@@ -36,8 +38,8 @@ func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
 	}
 
 	if c.chunkColumnKind == kindInt {
-		min, okMin := toInt64(minV)
-		max, okMax := toInt64(maxV)
+		min, okMin := core.AsInt64(minV)
+		max, okMax := core.AsInt64(maxV)
 		if !okMin || !okMax {
 			return c.nextBounds(ctx)
 		}
@@ -63,8 +65,8 @@ func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
 		return bounds, nil
 	}
 
-	min, okMin := toFloat64(minV)
-	max, okMax := toFloat64(maxV)
+	min, okMin := core.AsFloat64(minV)
+	max, okMax := core.AsFloat64(maxV)
 	if !okMin || !okMax {
 		return c.nextBounds(ctx)
 	}
@@ -90,7 +92,7 @@ func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
 // nextBounds steps a non-numeric chunk column by cursor: the next boundary is
 // the maximum of the first chunkSize values past the previous boundary.
 func (c *Chunker) nextBounds(ctx context.Context) ([][]any, error) {
-	col := quoteIdent(c.chunkColumn)
+	col := quotePgIdent(c.chunkColumn)
 	query, args, err := psql.Select("MIN(" + col + ")").From(c.qualifiedTable()).ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("postgres: chunker: min sql: %w", err)
@@ -122,7 +124,7 @@ func (c *Chunker) nextBounds(ctx context.Context) ([][]any, error) {
 
 // nextChunkEnd returns MAX(col) of the first chunkSize rows past prev.
 func (c *Chunker) nextChunkEnd(ctx context.Context, prev any) (any, error) {
-	col := quoteIdent(c.chunkColumn)
+	col := quotePgIdent(c.chunkColumn)
 	sub := psql.Select(col).
 		From(c.qualifiedTable()).
 		Where(sq.Gt{col: prev}).
@@ -140,30 +142,4 @@ func (c *Chunker) nextChunkEnd(ctx context.Context, prev any) (any, error) {
 		return nil, fmt.Errorf("postgres: chunker: next end: %w", err)
 	}
 	return next, nil
-}
-
-func toInt64(v any) (int64, bool) {
-	switch t := v.(type) {
-	case int64:
-		return t, true
-	case int:
-		return int64(t), true
-	case int32:
-		return int64(t), true
-	default:
-		return 0, false
-	}
-}
-
-func toFloat64(v any) (float64, bool) {
-	switch t := v.(type) {
-	case float64:
-		return t, true
-	case float32:
-		return float64(t), true
-	case int64:
-		return float64(t), true
-	default:
-		return 0, false
-	}
 }

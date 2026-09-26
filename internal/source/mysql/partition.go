@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/source"
 )
 
@@ -177,21 +178,16 @@ func boundTuple(v any) []any {
 	return []any{v}
 }
 
+// toInt64 reads a numeric partition bound: a Go integer, or the text form
+// the driver returns over the text protocol. Anything else is an error.
 func toInt64(v any) (int64, error) {
-	switch t := v.(type) {
-	case int64:
-		return t, nil
-	case int32:
-		return int64(t), nil
-	case int:
-		return int64(t), nil
-	case []byte:
-		var out int64
-		_, err := fmt.Sscanf(string(t), "%d", &out)
-		return out, err
-	default:
-		return 0, fmt.Errorf("unsupported numeric type %T", v)
+	if b, ok := v.([]byte); ok {
+		return core.ParseInt64(b)
 	}
+	if i, ok := core.AsInt64(v); ok {
+		return i, nil
+	}
+	return 0, fmt.Errorf("unsupported numeric type %T", v)
 }
 
 // partitionString splits a char/varchar primary key into n ranges by

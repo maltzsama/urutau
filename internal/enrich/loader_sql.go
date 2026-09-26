@@ -52,6 +52,7 @@ import (
 // but a loader with no cap here can peak memory before that check runs).
 func NewSQLLoader(uri, query, onRef string, maxRows int) (Loader, error) {
 	var connector driver.Connector
+	quote := quoteANSI
 	switch {
 	case strings.HasPrefix(uri, "mysql://"):
 		cfg, err := mysqlConfig(uri)
@@ -63,6 +64,7 @@ func NewSQLLoader(uri, query, onRef string, maxRows int) (Loader, error) {
 			return nil, fmt.Errorf("enrich: mysql connector: %w", err)
 		}
 		connector = c
+		quote = quoteMySQL
 	case strings.HasPrefix(uri, "postgres://") || strings.HasPrefix(uri, "postgresql://"):
 		dsn, err := pgx.ParseConfig(uri)
 		if err != nil {
@@ -75,7 +77,7 @@ func NewSQLLoader(uri, query, onRef string, maxRows int) (Loader, error) {
 	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1) // one sequential re-read per refresh; no pool theater
 	db.SetConnMaxLifetime(5 * time.Minute)
-	return &sqlLoader{db: db, query: query, onRef: onRef, alloc: memory.DefaultAllocator, maxRows: maxRows}, nil
+	return &sqlLoader{db: db, query: query, onRef: onRef, quote: quote, alloc: memory.DefaultAllocator, maxRows: maxRows}, nil
 }
 
 // mysqlConfig parses a mysql:// URI into the driver config — WITHOUT ever
@@ -126,6 +128,7 @@ type sqlLoader struct {
 	db      *sql.DB
 	query   string
 	onRef   string
+	quote   func(string) string // the engine's identifier quoting
 	alloc   memory.Allocator
 	maxRows int
 }
@@ -144,20 +147,27 @@ func hasOrderBy(q string) bool {
 // adjacent-diff duplicate check is valid. A bare query gets a suffix; a
 // query with LIMIT/GROUP BY/UNION near the end (where a suffix would bind
 // wrong) is wrapped in a subquery.
-func appendOrderBy(q, onRef string) string {
+func appendOrderBy(q, onRef string, quote func(string) string) string {
 	trimmed := strings.TrimRight(strings.TrimSpace(q), "; \t\n")
 	tail := strings.ToLower(trimmed)
 	if strings.Contains(tail, " limit ") || strings.Contains(tail, " union ") ||
 		strings.Contains(tail, " group by ") || strings.HasSuffix(tail, ")") {
-		return fmt.Sprintf("SELECT * FROM (%s) _enrich_ref ORDER BY %s", trimmed, quoteIdent(onRef))
+		return fmt.Sprintf("SELECT * FROM (%s) _enrich_ref ORDER BY %s", trimmed, quote(onRef))
 	}
-	return trimmed + " ORDER BY " + quoteIdent(onRef)
+	return trimmed + " ORDER BY " + quote(onRef)
 }
 
-func quoteIdent(s string) string {
-	// onRef comes from the spec, validated as an identifier; the quotes are
-	// belt-and-suspenders and portable enough for both engines.
+// quoteANSI quotes an identifier the SQL-standard way (Postgres). onRef
+// comes from the spec, validated as an identifier; the quotes are
+// belt-and-suspenders.
+func quoteANSI(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// quoteMySQL quotes an identifier in backticks: without ANSI_QUOTES, MySQL
+// reads "x" as a string literal, and ORDER BY a literal orders nothing.
+func quoteMySQL(s string) string {
+	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
 }
 
 // Load runs the reference query and returns every column as a typed Arrow
@@ -165,7 +175,7 @@ func quoteIdent(s string) string {
 func (l *sqlLoader) Load(ctx context.Context) (arrow.RecordBatch, error) {
 	q := l.query
 	if !hasOrderBy(q) {
-		q = appendOrderBy(q, l.onRef)
+		q = appendOrderBy(q, l.onRef, l.quote)
 	}
 	rows, err := l.db.QueryContext(ctx, q)
 	if err != nil {

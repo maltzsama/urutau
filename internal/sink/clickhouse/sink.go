@@ -67,7 +67,7 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	}
 	s := &Sink{conn: conn, ns: ns, sourceKind: cfg.SourceKind}
 	if s.ns != "" {
-		if err := conn.Exec(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdent(s.ns)); err != nil {
+		if err := conn.Exec(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteChIdent(s.ns)); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("clickhouse: ensure database %q: %w", s.ns, err)
 		}

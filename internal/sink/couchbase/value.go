@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/sink/rowmeta"
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
@@ -28,10 +28,10 @@ const reservedField = "_urutau"
 func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, map[string]any, error) {
 	data := make(map[string]any, len(p.schema.Columns))
 	meta := make(map[string]any, len(p.meta))
-	row := rowMetaOf(r, i)
+	row := rowmeta.Of(r, i)
 	for _, col := range p.schema.Columns {
 		if m, ok := p.meta[col.Name]; ok {
-			v, err := metaValue(m.From, row, p.sourceTable)
+			v, err := rowmeta.Value(m.From, row, p.sourceTable)
 			if err != nil {
 				return nil, nil, fmt.Errorf("metadata %q: %w", col.Name, err)
 			}
@@ -78,31 +78,6 @@ func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, m
 	return data, meta, nil
 }
 
-// rowMeta is the per-row metadata view metaValue needs, read straight from
-// the wire record. Transport-envelope fields (stream/shard/headers) are nil
-// on the wire path: their fallback semantics are unchanged.
-type rowMeta struct {
-	Op       rowchange.Op
-	Position string
-	CommitTS time.Time
-	IngestTS time.Time
-	Snapshot bool
-	Phase    string
-}
-
-func rowMetaOf(r *transport.BatchReader, i int) rowMeta {
-	commitTS, _ := r.CommitTS(i)
-	ingestTS, _ := r.IngestTS(i)
-	return rowMeta{
-		Op:       r.Op(i),
-		Position: r.Position(i),
-		CommitTS: commitTS,
-		IngestTS: ingestTS,
-		Snapshot: r.Snapshot(i),
-		Phase:    r.Phase(i),
-	}
-}
-
 // jsonValue converts a canonical Go value into its JSON document form.
 // Nested composites recurse; leaves use their natural JSON encoding.
 // KindUUID columns arrive as string after the cast converts them; raw
@@ -140,58 +115,5 @@ func jsonValue(v any) (any, error) {
 		return out, nil
 	default:
 		return nil, fmt.Errorf("couchbase: unsupported value type %T", v)
-	}
-}
-
-// metaValue resolves one metadata key to its concrete value for a rowchange.
-// Mirrors the ClickHouse and Iceberg projections — same keys, same nil
-// semantics. Time values stay time.Time: encoding/json renders RFC3339.
-func metaValue(key core.MetadataKey, c rowMeta, sourceTable string) (any, error) {
-	switch key {
-	case core.MetaOp:
-		return c.Op.String(), nil
-	case core.MetaCommitTS:
-		if c.CommitTS.IsZero() {
-			return nil, nil
-		}
-		return c.CommitTS, nil
-	case core.MetaIngestTS:
-		if c.IngestTS.IsZero() {
-			return nil, nil
-		}
-		return c.IngestTS, nil
-	case core.MetaPosition:
-		if c.Position == "" {
-			return nil, nil
-		}
-		return c.Position, nil
-	case core.MetaSourceTable:
-		return sourceTable, nil
-	case core.MetaPhase:
-		if c.Phase != "" {
-			return c.Phase, nil
-		}
-		if c.Snapshot {
-			return core.PhaseSnapshot, nil
-		}
-		return core.PhaseStream, nil
-	case core.MetaStream:
-		// Wire path: no transport envelope; the source table IS the stream.
-		return sourceTable, nil
-	case core.MetaShard:
-		return nil, nil
-	case core.MetaSeq:
-		if c.Position == "" {
-			return nil, nil
-		}
-		return c.Position, nil // CDC: the event coordinate (GTID/LSN)
-	case core.MetaMsgTS:
-		return nil, nil
-	case core.MetaMsgKey:
-		return nil, nil
-	case core.MetaHeaders:
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("unknown metadata key %q", key)
 	}
 }

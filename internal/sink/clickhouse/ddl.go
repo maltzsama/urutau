@@ -16,7 +16,7 @@ type tableIdent struct {
 }
 
 func (t tableIdent) quoted() string {
-	return quoteIdent(t.db) + "." + quoteIdent(t.table)
+	return quoteChIdent(t.db) + "." + quoteChIdent(t.table)
 }
 
 // posQuoted names the per-partition position table for this target: the
@@ -24,10 +24,11 @@ func (t tableIdent) quoted() string {
 // one row per worker group (owner, position, seq); Position() reads the
 // MinSafe across owners so a lagging partition is never resumed past.
 func (t tableIdent) posQuoted() string {
-	return quoteIdent(t.db) + "." + quoteIdent(t.table+"_urutau_position")
+	return quoteChIdent(t.db) + "." + quoteChIdent(t.table+"_urutau_position")
 }
 
-func quoteIdent(id string) string {
+// quoteChIdent quotes one ClickHouse identifier in backticks.
+func quoteChIdent(id string) string {
 	return "`" + strings.ReplaceAll(id, "`", "\\`") + "`"
 }
 
@@ -72,7 +73,7 @@ func buildDDL(ident tableIdent, ref core.TableRef, schema core.Schema, partition
 			if _, ok := byName[k]; !ok {
 				return "", fmt.Errorf("primary key column %q not in schema", k)
 			}
-			keys = append(keys, quoteIdent(k))
+			keys = append(keys, quoteChIdent(k))
 		}
 		order = "(" + strings.Join(keys, ", ") + ")"
 	} else {
@@ -88,11 +89,11 @@ func buildDDL(ident tableIdent, ref core.TableRef, schema core.Schema, partition
 		if err != nil {
 			return "", fmt.Errorf("column %q: %w", c.Name, err)
 		}
-		cols = append(cols, quoteIdent(c.Name)+" "+t)
+		cols = append(cols, quoteChIdent(c.Name)+" "+t)
 	}
-	cols = append(cols, quoteIdent("position")+" String", quoteIdent("seq")+" UInt64")
+	cols = append(cols, quoteChIdent("position")+" String", quoteChIdent("seq")+" UInt64")
 	if upsert {
-		cols = append(cols, quoteIdent("is_deleted")+" UInt8 DEFAULT 0")
+		cols = append(cols, quoteChIdent("is_deleted")+" UInt8 DEFAULT 0")
 	}
 	// Physical tombstone cleanup is the operator's maintenance (the engine
 	// hides deleted rows from FINAL reads; removing them physically takes
