@@ -737,8 +737,10 @@ func validateMaintenance(m *Maintenance, sinkType string, problems *[]string) {
 			}
 		}
 		if o.OlderThan != "" {
-			if _, err := time.ParseDuration(o.OlderThan); err != nil {
+			if d, err := time.ParseDuration(o.OlderThan); err != nil {
 				*problems = append(*problems, fmt.Sprintf("sink.maintenance.orphanCleanup.olderThan: %q is not a duration (e.g. 72h)", o.OlderThan))
+			} else if d < MinOrphanCleanupOlderThan {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.orphanCleanup.olderThan: %s is below the %s minimum: files a commit has not referenced yet (a worker's staged files waiting for the coordinator's commit) would be taken for orphans and deleted", d, MinOrphanCleanupOlderThan))
 			}
 		}
 	}

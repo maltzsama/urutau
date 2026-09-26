@@ -86,7 +86,10 @@ this applies identically to `upsert` and `append` tables.
 
 **Orphan cleanup**'s `olderThan` is a different, narrower safety window: it
 protects a file a concurrent read or in-flight commit might still
-reference, using `iceberg-go`'s own default (`72h`) unless overridden.
+reference, using `iceberg-go`'s own default (`72h`) unless overridden. It
+cannot be set below `1h` (a partitioned table's staged files wait unreferenced
+for the coordinator's commit), and a run that outlasts half of it stops
+deleting; see [Table maintenance](../guides/table-maintenance.md#safety).
 
 Only one maintenance pass runs per table at a time: a worker is never handed
 a second assignment while its previous pass is still running, so two passes

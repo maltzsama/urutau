@@ -201,3 +201,25 @@ func TestMaintenanceEnabledCases(t *testing.T) {
 		})
 	}
 }
+
+// olderThan is what keeps files a commit has not referenced yet — a worker's
+// staged files waiting for the coordinator's commit, a commit landing during
+// a long cleanup — from being taken for orphans. Below an hour a stalled
+// staged cycle outlives it, so a short window is refused at validation.
+func TestValidateOrphanCleanupOlderThanFloor(t *testing.T) {
+	for _, v := range []string{"1m", "30m", "59m59s"} {
+		s := maintSpec()
+		s.Sink.Maintenance.OrphanCleanup.OlderThan = v
+		err := s.Validate()
+		if err == nil || !strings.Contains(err.Error(), "orphanCleanup.olderThan") {
+			t.Errorf("olderThan %s: want a problem naming orphanCleanup.olderThan, got %v", v, err)
+		}
+	}
+	for _, v := range []string{"1h", "72h", ""} {
+		s := maintSpec()
+		s.Sink.Maintenance.OrphanCleanup.OlderThan = v
+		if err := s.Validate(); err != nil {
+			t.Errorf("olderThan %q: %v", v, err)
+		}
+	}
+}
