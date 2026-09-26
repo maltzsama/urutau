@@ -147,7 +147,14 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 			specs[i].Max = o.kedaMax
 		}
 	}
-	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, crOptions{MaintenanceBlock: o.maintenance})
+	opts := crOptions{MaintenanceBlock: o.maintenance}
+	if profile.Name == fullProfile.Name {
+		// The full profile streams ~1k mutations/s per table with payloads
+		// up to 256 KiB through a race-instrumented coordinator: at 2Gi it
+		// was OOM-killed catching up after its first snapshot chunk.
+		opts.CoordinatorMemory = "6Gi"
+	}
+	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
 	applyPipeline(t, testNS, pipeline, cr)
 	// Registered after applyPipeline, so it runs before the pipeline is torn
 	// down: the logs are flushed, and a failure is dumped while the Pods,

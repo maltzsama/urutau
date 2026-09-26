@@ -184,6 +184,8 @@ type crOptions struct {
 	// SnapshotChunkSize, when > 0, is the coordinator's DBLog chunk size
 	// (rows per chunk): a small one stretches a table's snapshot.
 	SnapshotChunkSize int
+	// CoordinatorMemory, when set, replaces the coordinator's 2Gi.
+	CoordinatorMemory string
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
@@ -230,6 +232,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		}
 	}
 	coordinator := map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080"}
+	if opts.CoordinatorMemory != "" {
+		coordinator["memory"] = opts.CoordinatorMemory
+	}
 	if opts.SnapshotChunkSize > 0 {
 		coordinator["snapshot"] = map[string]any{"chunkSize": opts.SnapshotChunkSize}
 	}
