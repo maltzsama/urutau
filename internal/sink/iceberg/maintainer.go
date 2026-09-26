@@ -85,6 +85,12 @@ type Maintainer struct {
 	// newest one lacking the property.
 	currentPosition func() string
 	metrics         sink.MaintainerMetrics
+
+	// Test seams for orphan cleanup: the clock, and a hook that runs right
+	// after the table is loaded (where a concurrent commit lands in
+	// production). Nil means time.Now and no hook.
+	now             func() time.Time
+	afterOrphanLoad func()
 }
 
 // NewMaintainer builds a Maintainer for one table. currentPosition and
@@ -350,15 +356,56 @@ func (m *Maintainer) cleanOrphans(ctx context.Context) error {
 	return fmt.Errorf("%w: orphan cleanup on %v: %w", ErrCommitExhausted, m.ident, lastErr)
 }
 
+// errOrphanWindowExceeded stops an orphan cleanup whose run outlasted half
+// its olderThan window (see cleanOrphansOnce).
+var errOrphanWindowExceeded = errors.New("orphan cleanup outlasted half its safety window")
+
 // cleanOrphansOnce runs one orphan-cleanup attempt against the table.
+//
+// Orphan cleanup computes the referenced files from the table version it
+// loaded. A commit that lands after that load is unreferenced in its view,
+// so it is safe only while its files are younger than olderThan — that is,
+// only while the cleanup finishes within olderThan of its load. On a table
+// with many manifests the reference scan can take longer than a short
+// olderThan, and the concurrent commits' files (the current metadata file
+// among them) were deleted, leaving the table unloadable. Every deletion
+// therefore checks the time since the load and refuses past half of
+// olderThan; the run is then skipped, not failed, and the next one retries.
 func (m *Maintainer) cleanOrphansOnce(ctx context.Context) error {
 	o := m.cfg.OrphanCleanup
+	now := m.now
+	if now == nil {
+		now = time.Now
+	}
+	loaded := now()
 	tbl, err := m.cat.LoadTable(ctx, m.ident)
 	if err != nil {
 		return fmt.Errorf("iceberg maintenance: orphan cleanup: load table: %w", err)
 	}
+	olderThan := durationOr(o.OlderThan, defaultOrphanCleanupOlderThan, m.log, "olderThan")
+	if m.afterOrphanLoad != nil {
+		m.afterOrphanLoad()
+	}
+	fsys, err := tbl.FS(ctx)
+	if err != nil {
+		return fmt.Errorf("iceberg maintenance: orphan cleanup: filesystem: %w", err)
+	}
+	guarded := func(path string) error {
+		if elapsed := now().Sub(loaded); elapsed >= olderThan/2 {
+			return fmt.Errorf("%w (%s since the table was loaded, olderThan %s)", errOrphanWindowExceeded, elapsed, olderThan)
+		}
+		return fsys.Remove(path)
+	}
 
-	result, err := tbl.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(durationOr(o.OlderThan, defaultOrphanCleanupOlderThan, m.log, "olderThan")))
+	result, err := tbl.DeleteOrphanFiles(ctx, table.WithFilesOlderThan(olderThan), table.WithDeleteFunc(guarded))
+	if errors.Is(err, errOrphanWindowExceeded) {
+		m.log.Warn("iceberg maintenance: orphan cleanup skipped: the run outlasted half its safety window, so commits made since its load could look orphaned",
+			"table", m.ident, "olderThan", olderThan, "elapsed", now().Sub(loaded), "deleted_before_stop", len(result.DeletedFiles))
+		if m.metrics != nil {
+			m.metrics.OrphanCleanupRun(identString(m.ident), len(result.DeletedFiles), 0, nil)
+		}
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("iceberg maintenance: orphan cleanup: %w", err)
 	}
