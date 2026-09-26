@@ -23,6 +23,11 @@
   .muted { opacity: .6; }
   .warn { color: #b91c1c; background: #ef444422; border: 1px solid #ef444466; border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; }
   button { font: inherit; margin-top: 8px; padding: 4px 10px; cursor: pointer; }
+  .filter { font-size: 12px; margin-bottom: 8px; opacity: .8; }
+  .filter select { font: inherit; }
+  td.level { white-space: nowrap; font-weight: 600; }
+  td.level.ERROR { color: #b91c1c; }
+  td.level.WARN { color: #b45309; }
 </style>
 </head>
 <body>
@@ -38,12 +43,24 @@
   </section>
   <section>
     <h2 id="events-title">Events</h2>
+    <div class="filter">Show
+      <select id="kind">
+        <option value="all">events + logs</option>
+        <option value="event">events only</option>
+        <option value="log">logs only</option>
+      </select>
+    </div>
     <div id="events"></div>
   </section>
 </main>
 <script>
 const API = '/api/v1';
 const $ = (id) => document.getElementById(id);
+// The writer's slog levels: whitelisted so a level from the trail can only
+// ever pick a class that exists in the stylesheet.
+const LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
+// The run on screen; the Show select reloads it under the new filter.
+let current = null;
 
 async function api(path) {
   const r = await fetch(API + path);
@@ -73,6 +90,7 @@ function renderList(el, items, label, onPick) {
 }
 
 async function pickPipeline(name) {
+  current = null;
   $('runs').replaceChildren();
   $('events').replaceChildren();
   $('events-title').textContent = 'Events';
@@ -88,6 +106,7 @@ async function pickPipeline(name) {
 }
 
 async function pickRun(pipeline, runID) {
+  current = {pipeline, run: runID};
   $('events-title').textContent = `Events — ${runID}`;
   $('events').replaceChildren();
   const table = document.createElement('table');
@@ -100,6 +119,16 @@ async function pickRun(pipeline, runID) {
   const more = document.createElement('button');
   more.textContent = 'Load more';
   more.hidden = true;
+
+  // The Show filter rides on every page: changing it restarts pagination, so
+  // the cursor never straddles two different filters.
+  function pageQuery() {
+    const parts = [];
+    const kind = $('kind').value;
+    if (kind && kind !== 'all') parts.push('kind=' + encodeURIComponent(kind));
+    if (cursor) parts.push('cursor=' + encodeURIComponent(cursor));
+    return parts.length ? '?' + parts.join('&') : '';
+  }
 
   // A truncated or abandoned run must not render as a clean one: the server
   // sends the completeness signals with every page (issues #329, #333).
@@ -116,9 +145,8 @@ async function pickRun(pipeline, runID) {
   }
 
   async function page() {
-    const q = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
     const {events = [], nextCursor = '', sealed = true, emitted = 0, dropped = false, missing = 0, outcome = 'unknown'} =
-      await api(`/pipelines/${encodeURIComponent(pipeline)}/runs/${encodeURIComponent(runID)}/events${q}`);
+      await api(`/pipelines/${encodeURIComponent(pipeline)}/runs/${encodeURIComponent(runID)}/events${pageQuery()}`);
     if (!headed) {
       headed = true;
       // The outcome is independent of the completeness signals (issue #350).
@@ -134,10 +162,21 @@ async function pickRun(pipeline, runID) {
       tdTime.className = 'muted';
       tdTime.textContent = e.timestamp ?? '';
       const tdKind = document.createElement('td');
-      tdKind.textContent = e.kind ?? '';
       const tdFields = document.createElement('td');
       tdFields.className = 'fields';
-      tdFields.textContent = JSON.stringify(e.fields ?? {});
+      if (e.kind === 'log') {
+        // A log record reads as a log line, not as JSON: the level takes the
+        // kind column, the message plus its context the fields column.
+        const f = e.fields ?? {};
+        const lvl = typeof f.level === 'string' ? f.level : '';
+        tdKind.className = 'level' + (LEVELS.includes(lvl) ? ' ' + lvl : '');
+        tdKind.textContent = lvl || 'log';
+        tdFields.textContent = String(f.msg ?? '') +
+          (f.attrs ? '  ' + JSON.stringify(f.attrs) : '');
+      } else {
+        tdKind.textContent = e.kind ?? '';
+        tdFields.textContent = JSON.stringify(e.fields ?? {});
+      }
       tr.append(tdTime, tdKind, tdFields);
       tbody.append(tr);
     }
@@ -151,6 +190,8 @@ async function pickRun(pipeline, runID) {
 }
 
 (async function init() {
+  // Re-render the open run under the new Show filter, cursor from scratch.
+  $('kind').onchange = () => { if (current) pickRun(current.pipeline, current.run); };
   try {
     const {pipelines = []} = await api('/pipelines');
     renderList($('pipelines'), pipelines, (p) => p.name, (p) => pickPipeline(p.name));
