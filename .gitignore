@@ -392,3 +392,4 @@ test/e2e/postgres/ssh/
 agent/
 skills-lock.json
 
+.e2e-artifacts/

@@ -585,14 +585,27 @@ func portForward(t *testing.T, ns, resource string, local, remote int) {
 func startPortForward(t *testing.T, ns, resource string, local, remote int, wait time.Duration) error {
 	t.Helper()
 	releasePort(local)
-	ctx, cancel := context.WithCancel(context.Background())
-	st := &forwardState{cancel: cancel}
-	cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "port-forward", resource,
-		fmt.Sprintf("%d:%d", local, remote))
-	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return fmt.Errorf("port-forward %s %d:%d: %w", resource, local, remote, err)
+	var st *forwardState
+	var wait4 func()
+	if inCluster() {
+		// In the cluster: dial the target directly (incluster_test.go).
+		cancel, err := startProxy(ns, resource, local, remote)
+		if err != nil {
+			return err
+		}
+		st = &forwardState{cancel: cancel}
+		wait4 = func() {}
+	} else {
+		ctx, cancel := context.WithCancel(context.Background())
+		cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "port-forward", resource,
+			fmt.Sprintf("%d:%d", local, remote))
+		cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+		if err := cmd.Start(); err != nil {
+			cancel()
+			return fmt.Errorf("port-forward %s %d:%d: %w", resource, local, remote, err)
+		}
+		st = &forwardState{cancel: cancel}
+		wait4 = func() { _ = cmd.Wait() }
 	}
 	forwardMu.Lock()
 	forwardStates[local] = st
@@ -603,8 +616,8 @@ func startPortForward(t *testing.T, ns, resource string, local, remote int, wait
 			delete(forwardStates, local)
 		}
 		forwardMu.Unlock()
-		cancel()
-		_ = cmd.Wait()
+		st.cancel()
+		wait4()
 	}
 	deadline := time.Now().Add(wait)
 	addr := fmt.Sprintf("127.0.0.1:%d", local)
