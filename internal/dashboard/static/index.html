@@ -192,8 +192,8 @@
       <div class="toolbar">
         <input placeholder="Filter streams…" x-model="streamFilter">
         <select x-model="sort">
-          <option value="lag">Lag desc</option>
           <option value="source">Source</option>
+          <option value="lag">Lag desc</option>
         </select>
       </div>
     </div>
@@ -298,25 +298,26 @@
 
   <!-- ── Logs ─────────────────────────────────────────────────────────── -->
   <section x-show="view === 'logs'">
-    <div class="sectionhead"><h2>Logs <span class="muted small">coordinator</span></h2></div>
+    <div class="sectionhead"><h2>Logs <span class="muted small">coordinator · live tail</span></h2></div>
     <div class="toolbar">
       <select x-model="logFilter">
         <option value="all">All</option>
         <option value="warnings">Warnings+</option>
         <option value="errors">Errors</option>
       </select>
-      <input placeholder="Search…" x-model="query">
+      <input placeholder="Search logs…" x-model="logQuery">
     </div>
     <template x-for="l in filteredLogs()" :key="l.ts + l.msg">
       <article class="event" :class="logClass(l)">
         <div class="row">
-          <span class="small muted"><span x-text="ts(l.ts)"></span> · <b x-text="l.level"></b></span>
+          <span class="small muted"><span x-text="ts(l.ts)"></span></span>
+          <span class="pill" :class="logLevelClass(l)" x-text="l.level"></span>
           <button class="copy-btn" type="button" aria-label="Copy log JSON" @click="copy(JSON.stringify(l))">⧉</button>
         </div>
         <div x-text="l.msg"></div>
         <div class="small muted">
-          <template x-for="(v, k) in (l.attrs || {})" :key="k">
-            <span class="badge" x-text="k + ': ' + v"></span>
+          <template x-for="c in logChips(l)" :key="c.k">
+            <span class="badge" :class="c.err ? 'err' : ''" x-text="c.k + ': ' + c.v"></span>
           </template>
         </div>
       </article>

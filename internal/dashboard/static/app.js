@@ -13,10 +13,14 @@ function app() {
   const HISTORY = 720; // 1h at a 5s sample
   const HISTORY_MS = 5000;
   const COLORS = ['#2563eb', '#16a34a', '#d97706', '#c0392b', '#7c3aed'];
+// The attrs an operator scans for first when reading a log line: who, where
+// and what failed lead the chip row; everything else follows alphabetically.
+const LOG_LEAD = ['worker', 'table', 'err', 'error'];
   let es = null; // the EventSource, kept outside Alpine's reactive data
   const charts = {}; // Chart.js instances, kept outside Alpine's reactive data
   const samples = {}; // global series buffers (chart data, non-reactive)
   const series = {}; // per-stream series buffers (chart data, non-reactive)
+  const streamColors = {}; // target -> color, assigned once so a stream never changes hue
   const workerTimeline = {}; // worker -> [{ t, status }] (non-reactive)
   let lastHistoryAt = 0;
 
@@ -30,11 +34,12 @@ function app() {
     logs: [],
     streamFilter: '',
     workerFilter: '',
-    sort: 'lag',
+    sort: 'source',
     eventFilter: 'all',
     logFilter: 'all',
     eventLimit: 200,
     query: '',
+    logQuery: '',
     paused: false,
     failures: 0,
     loaded: false,
@@ -265,17 +270,55 @@ function app() {
       return '';
     },
     logClass(l) { return l.level === 'ERROR' ? 'error' : l.level === 'WARN' ? 'warning' : ''; },
+    // logLevelClass colors the level pill; gray is debug noise, red is a
+    // failure, amber is a warning.
+    logLevelClass(l) {
+      return l.level === 'ERROR' ? 'red' : l.level === 'WARN' ? 'amber' : l.level === 'DEBUG' ? 'gray' : '';
+    },
+    // logChips orders a record's attrs for display. Curated keys lead, the
+    // rest sort alphabetically, so chips hold their place across updates
+    // instead of reshuffling with the map's iteration order.
+    logChips(l) {
+      const attrs = l.attrs || {};
+      const lead = (k) => { const i = LOG_LEAD.indexOf(k); return i < 0 ? LOG_LEAD.length : i; };
+      return Object.keys(attrs).sort((a, b) => lead(a) - lead(b) || a.localeCompare(b))
+        .map((k) => ({ k, v: attrs[k], err: k === 'err' || k === 'error' }));
+    },
     drawerTable() { return this.tables.find((t) => t.target === this.drawer.target) || null; },
     workerTransitions(name) {
       return (workerTimeline[name] || []).slice(-5);
     },
 
+    // streamOrder is the canonical, lag-independent order: source, then target
+    // as the tiebreak. Everything stable (the chart's series selection, the
+    // default list order) derives from it, so a changing lag can never reshuffle
+    // cards or legends.
+    streamOrder(a, b) {
+      return a.source.localeCompare(b.source) || a.target.localeCompare(b.target);
+    },
     filteredStreams() {
       let arr = this.tables.slice();
       if (this.streamFilter) arr = arr.filter((t) => (t.source + t.target).includes(this.streamFilter));
-      if (this.sort === 'lag') arr.sort((a, b) => b.lag_s - a.lag_s);
-      else arr.sort((a, b) => a.source.localeCompare(b.source));
+      if (this.sort === 'lag') {
+        // Lag desc only on explicit request, with the same deterministic
+        // tiebreak so equal lags never jitter between updates.
+        arr.sort((a, b) => (b.lag_s - a.lag_s) || this.streamOrder(a, b));
+      } else arr.sort(this.streamOrder);
       return arr;
+    },
+    // chartStreams picks the streams the overview lag chart shows. Selection
+    // follows streamOrder — never the live lag ranking — so the set of series
+    // (and therefore the legend) stays put while lag moves.
+    chartStreams() {
+      return this.tables.slice().sort(this.streamOrder).slice(0, 5);
+    },
+    // streamColor assigns a hue on first sight and keeps it forever, keyed by
+    // the stream's target rather than its position in the dataset array.
+    streamColor(target) {
+      if (!(target in streamColors)) {
+        streamColors[target] = COLORS[Object.keys(streamColors).length % COLORS.length];
+      }
+      return streamColors[target];
     },
     filteredWorkers() {
       return this.workers.filter((w) => !this.workerFilter || w.name.includes(this.workerFilter));
@@ -290,7 +333,7 @@ function app() {
       });
     },
     filteredLogs() {
-      const q = this.query.toLowerCase();
+      const q = this.logQuery.toLowerCase();
       return this.logs.filter((l) => {
         if (this.logFilter === 'errors' && l.level !== 'ERROR') return false;
         if (this.logFilter === 'warnings' && !['WARN', 'ERROR'].includes(l.level)) return false;
@@ -422,10 +465,11 @@ function app() {
       const grid = cssVar('--pico-muted-border-color', '#ddd');
       if (this.view === 'overview') {
         this.line('chart-throughput', [this.tail(samples.throughput)], ['Throughput'], grid);
-        const streams = this.filteredStreams().slice(0, 5);
+        const streams = this.chartStreams();
         this.line('chart-lag',
           streams.map((t) => this.tail((series[t.target] || {}).lag)),
-          streams.map((t) => t.source), grid);
+          streams.map((t) => t.source + ' → ' + t.target), grid,
+          streams.map((t) => this.streamColor(t.target)));
       }
       for (const id of ['spark-throughput', 'spark-lag', 'spark-commits', 'spark-errors', 'spark-workers', 'spark-snapshot']) {
         const key = id.replace('spark-', '');
@@ -433,12 +477,13 @@ function app() {
       }
       if (this.drawer.open) this.renderDrawerChart();
     },
-    line(id, datasets, labels, grid) {
+    line(id, datasets, labels, grid, colors) {
       const el = document.getElementById(id);
       if (!el) return;
       const data = {
         datasets: datasets.map((d, i) => ({
-          label: labels[i], data: this.points(d), borderColor: COLORS[i % COLORS.length],
+          label: labels[i], data: this.points(d),
+          borderColor: (colors && colors[i]) || COLORS[i % COLORS.length],
           backgroundColor: 'transparent', tension: 0.3, pointRadius: 0, borderWidth: 2,
         })),
       };

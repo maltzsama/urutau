@@ -45,6 +45,7 @@ nav a.active { color: var(--pico-color); border-color: var(--accent); font-weigh
   color: var(--pico-form-element-color); }
 .pill:before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .badge { background: var(--pico-card-background-color); }
+.badge.err { color: var(--err); border-color: var(--err); }
 .green { color: var(--ok); } .amber { color: var(--warn); }
 .red { color: var(--err); } .gray { color: var(--pico-muted-color); }
 
