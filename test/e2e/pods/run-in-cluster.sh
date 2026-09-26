@@ -68,8 +68,10 @@ spec:
               while [ ! -f /artifacts/.collected ]; do sleep 2; done
           env:
 ${envs}          resources:
-            requests: {cpu: "2", memory: 2Gi}
-            limits: {memory: 6Gi}
+            # The oracle holds every row the workload wrote: the full profile
+            # (3 x 1M rows with payloads) needs several GiB.
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {memory: 12Gi}
           volumeMounts:
             - {name: artifacts, mountPath: /artifacts}
       volumes:
