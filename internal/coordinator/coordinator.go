@@ -2692,6 +2692,11 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	var positions []position.Position
 	var needsSnapshot []source.TableRef
 	byTarget := make(map[string]position.Position, len(refs))
+	// bootCommitted gets its own parse of each position, never an object
+	// that may reach the source reader as its start: a reader advances its
+	// start in place, which raced coveredAtBoot and moved the "committed"
+	// position forward with the stream.
+	boot := make(map[string]position.Position, len(refs))
 	for _, ref := range refs {
 		// The expected partition count travels to the sink: a per-partition
 		// Position() must not return a MinSafe over an incomplete owner set,
@@ -2708,6 +2713,9 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 			}
 			positions = append(positions, p)
 			byTarget[ref.Target] = p
+			if own, err := c.src.ParsePosition(pos); err == nil {
+				boot[ref.Target] = own
+			}
 		} else if caps.Snapshot {
 			needsSnapshot = append(needsSnapshot, ref)
 		}
@@ -2715,7 +2723,7 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	if len(positions) == 0 {
 		return nil, needsSnapshot, nil
 	}
-	c.bootCommitted = byTarget
+	c.bootCommitted = boot
 	// MinSafe: an incomparable pair (should not happen for one source) is an
 	// error — guessing a minimum could resume past uncommitted data (P1).
 	best, err := position.MinSafe(positions)
