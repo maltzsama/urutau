@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
+	"time"
 )
 
 func discardLogger(buf *Buffer) *slog.Logger {
@@ -103,5 +105,51 @@ func TestTeeHandlerJSONSafeAttrs(t *testing.T) {
 	}
 	if _, err := json.Marshal(got[0].Attrs); err != nil {
 		t.Fatalf("attrs are not JSON-marshalable: %v", err)
+	}
+}
+
+func TestSetSinkWaitsForInFlightCallback(t *testing.T) {
+	buf := NewBuffer(1)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	buf.SetSink(func(Record) {
+		once.Do(func() { close(entered) })
+		<-release
+	})
+
+	log := discardLogger(buf)
+	logged := make(chan struct{})
+	go func() {
+		log.Info("in flight")
+		close(logged)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("sink callback did not start")
+	}
+
+	detached := make(chan struct{})
+	go func() {
+		buf.SetSink(nil)
+		close(detached)
+	}()
+	select {
+	case <-detached:
+		t.Fatal("SetSink returned before the in-flight callback finished")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-detached:
+	case <-time.After(time.Second):
+		t.Fatal("SetSink did not finish after releasing the callback")
+	}
+	select {
+	case <-logged:
+	case <-time.After(time.Second):
+		t.Fatal("logging goroutine did not finish")
 	}
 }

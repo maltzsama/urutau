@@ -29,6 +29,7 @@ type Buffer struct {
 	full     bool
 	onAppend func(Record)
 	sink     func(Record)
+	sinkWG   sync.WaitGroup
 }
 
 // SetOnAppend installs a hook called after every record is appended (outside
@@ -46,8 +47,15 @@ func (b *Buffer) SetOnAppend(f func(Record)) {
 // logging path. Nil detaches it (shutdown, before the trail is sealed).
 func (b *Buffer) SetSink(f func(Record)) {
 	b.mu.Lock()
+	old := b.sink
 	b.sink = f
 	b.mu.Unlock()
+	if f == nil && old != nil {
+		// Wait for callbacks that copied the old sink before it was detached.
+		// Without this, shutdown can seal the eventlog while one such callback
+		// is still trying to enqueue its record.
+		b.sinkWG.Wait()
+	}
 }
 
 // NewBuffer returns a Buffer holding at most capacity records. A non-positive
@@ -70,11 +78,15 @@ func (b *Buffer) add(r Record) {
 		b.full = true
 	}
 	f, sink := b.onAppend, b.sink
+	if sink != nil {
+		b.sinkWG.Add(1)
+	}
 	b.mu.Unlock()
 	if f != nil {
 		f(r)
 	}
 	if sink != nil {
+		defer b.sinkWG.Done()
 		sink(r)
 	}
 }

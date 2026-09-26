@@ -22,7 +22,7 @@ import (
 const (
 	// logTrailQueue bounds the records waiting for the next flush: a burst
 	// between flushes fits, and an S3 outage cannot grow the process without
-	// limit — beyond it the oldest queued records are dropped and counted.
+	// limit — beyond it incoming records are dropped and counted.
 	logTrailQueue = 4096
 	// logTrailBatch caps how many records travel in one PUT.
 	logTrailBatch = 128
@@ -42,14 +42,15 @@ type trailWriter interface {
 // path) and leave through one goroutine that batches them into EmitBatch
 // calls. Safe for concurrent use.
 type logTrail struct {
-	trail  trailWriter
-	buf    *logging.Buffer
-	log    *slog.Logger
-	ch     chan logging.Record
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	once   sync.Once
-	drop   atomic.Int64
+	trail       trailWriter
+	buf         *logging.Buffer
+	log         *slog.Logger
+	ch          chan logging.Record
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	once        sync.Once
+	drop        atomic.Int64
+	pendingDrop atomic.Int64
 }
 
 // newLogTrail attaches a trail to buf and starts its flusher.
@@ -77,6 +78,7 @@ func (t *logTrail) sink(r logging.Record) {
 	select {
 	case t.ch <- r:
 	default:
+		t.pendingDrop.Add(1)
 		if n := t.drop.Add(1); n == 1 || n%1000 == 0 {
 			t.log.Warn("coordinator: log trail queue full; records dropped",
 				"dropped", n, "queued", len(t.ch))
@@ -128,7 +130,19 @@ func (t *logTrail) loop() {
 // write: a failed PUT leaves the lines in the eventlog's own buffer, so the
 // next flush (or Close) re-uploads them rather than losing them.
 func (t *logTrail) emit(batch []logging.Record) {
-	fields := make([]map[string]any, 0, len(batch))
+	dropped := t.pendingDrop.Swap(0)
+	fields := make([]map[string]any, 0, len(batch)+1)
+	if dropped > 0 {
+		fields = append(fields, map[string]any{
+			"ts":    time.Now().UTC().Format(time.RFC3339Nano),
+			"level": slog.LevelWarn.String(),
+			"msg":   "coordinator: log trail queue full; records dropped",
+			"attrs": map[string]any{
+				"dropped": dropped,
+				"reason":  "log_trail_queue_full",
+			},
+		})
+	}
 	for _, r := range batch {
 		fields = append(fields, logRecordFields(r))
 	}

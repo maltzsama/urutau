@@ -180,3 +180,27 @@ func TestLogTrailBatches(t *testing.T) {
 		t.Fatalf("batches = %d, want >= 3 (cap %d over %d records)", got, logTrailBatch, n)
 	}
 }
+
+func TestLogTrailPersistsDropMarker(t *testing.T) {
+	_, buf, err := logging.NewBuffered("debug", "text", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &recordingTrail{}
+	lt := newLogTrail(tr, buf, slog.Default())
+	lt.pendingDrop.Store(3)
+	lt.sink(logging.Record{Time: time.Now(), Level: slog.LevelInfo, Message: "after drop"})
+	lt.stop()
+
+	_, recs := tr.records()
+	if len(recs) != 2 {
+		t.Fatalf("records = %d, want drop marker and log record", len(recs))
+	}
+	if recs[0]["msg"] != "coordinator: log trail queue full; records dropped" {
+		t.Fatalf("marker = %#v", recs[0])
+	}
+	attrs, ok := recs[0]["attrs"].(map[string]any)
+	if !ok || attrs["dropped"] != int64(3) || attrs["reason"] != "log_trail_queue_full" {
+		t.Fatalf("marker attrs = %#v", recs[0]["attrs"])
+	}
+}
