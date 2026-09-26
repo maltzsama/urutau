@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +39,10 @@ type workload struct {
 
 	mu   sync.Mutex
 	errs []string // oracle reconciliation failures; any one fails the run
+
+	// backlog is set while the events stream runs a backlog episode, for
+	// the chaos record.
+	backlog atomic.Bool
 
 	// Filled after the run, for the diagnostics file.
 	checks    []tableCheck
@@ -202,6 +207,18 @@ func (w *workload) start(ctx context.Context) {
 	}
 }
 
+// phase names what the workload is doing, for the chaos record.
+func (w *workload) phase() string {
+	switch {
+	case w.stopCh == nil:
+		return "seeding"
+	case w.backlog.Load():
+		return "live, backlog episode"
+	default:
+		return "live"
+	}
+}
+
 // stop ends the streams and records the expected final source position: the
 // GTID set executed once the last generated mutation committed.
 func (w *workload) stop(ctx context.Context) error {
@@ -248,10 +265,12 @@ func (w *workload) runStream(ctx context.Context, i int) {
 				open.End = now.Sub(w.liveFrom)
 				s.Backlog = append(s.Backlog, *open)
 				open = nil
+				w.backlog.Store(false)
 			}
 			backlog := backlogged && !now.Before(next)
 			g.regime = newRegime(g.r, p, g.t, now, backlog)
 			if backlog {
+				w.backlog.Store(true)
 				open = &episode{Start: now.Sub(w.liveFrom)}
 				next = now.Add(time.Duration(g.r.ExpFloat64() * float64(p.Duration/4)))
 			}

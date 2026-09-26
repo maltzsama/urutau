@@ -20,7 +20,27 @@ import (
 // varies). The diagnostics file (seed, observed distributions, final diffs)
 // is written under URUTAU_E2E_ARTIFACTS, or the system temp dir, pass or fail.
 func TestProductionReadinessWorkload(t *testing.T) {
+	runProductionReadiness(t, false)
+}
+
+// TestProductionReadinessChaos is the workload with the nondeterministic
+// Chaos Mesh controller (issue #385) injecting faults into the live
+// coordinator and worker Pods throughout the live window. The pass
+// condition is the workload's own: after the faults stop, every table
+// converges to MySQL exactly, and every experiment was injected and removed.
+// URUTAU_E2E_SEED seeds the fault stream too.
+func TestProductionReadinessChaos(t *testing.T) {
+	runProductionReadiness(t, true)
+}
+
+// runProductionReadiness is the shared body: the workload, optionally with
+// the chaos controller over the live window.
+func runProductionReadiness(t *testing.T, withChaos bool) {
+	t.Helper()
 	requirePods(t)
+	if withChaos {
+		verifyChaosMeshReady(t)
+	}
 	profile, err := selectedProfile()
 	if err != nil {
 		t.Fatal(err)
@@ -40,8 +60,16 @@ func TestProductionReadinessWorkload(t *testing.T) {
 	suffix := strconv.FormatInt(time.Now().UnixNano()%2176782336, 36)
 	tables := selectTables(t, productionTables(suffix, profile))
 	w := newWorkload(seed, profile, tables, mysql)
+	pipeline, serverID := "pod-pr-workload", "2320"
+	if withChaos {
+		pipeline, serverID = "pod-pr-chaos", "2321"
+	}
+	var chaos *chaosController
 	t.Cleanup(func() {
 		rep := w.report()
+		if chaos != nil {
+			rep.Chaos = chaos.report()
+		}
 		if t.Failed() {
 			rep.Failure = "see the test log"
 		}
@@ -69,12 +97,11 @@ func TestProductionReadinessWorkload(t *testing.T) {
 	}
 	t.Logf("seeded %d rows per table", profile.InitialRows)
 
-	const pipeline = "pod-pr-workload"
 	specs := make([]tableSpec, len(tables))
 	for i, tb := range tables {
 		specs[i] = tableSpec{Source: "shop." + tb.Name, Target: "raw." + tb.Target, PrimaryKey: tb.PK, Workers: tb.Workers, Cast: tb.Cast}
 	}
-	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2320", specs, crOptions{})
+	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, crOptions{})
 	applyPipeline(t, testNS, pipeline, cr)
 
 	// Live mutations start before the coordinator is up, so they overlap
@@ -82,10 +109,30 @@ func TestProductionReadinessWorkload(t *testing.T) {
 	w.start(ctx)
 	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 4*time.Minute)
 	t.Logf("coordinator up; workload live for %s", profile.Duration)
+	if withChaos {
+		chaos = newChaosController(testNS, pipeline, seed, chaosProfileFor(profile), w.phase)
+		chaos.start(ctx)
+		t.Cleanup(func() {
+			if chaos.stopCh != nil {
+				select {
+				case <-chaos.stopCh:
+				default:
+					chaos.stop()
+				}
+			}
+		})
+		t.Log("chaos controller started")
+	}
 	select {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	case <-time.After(time.Until(w.liveFrom.Add(profile.Duration))):
+	}
+	if chaos != nil {
+		// Faults end with the live window; the settle measures recovery.
+		chaos.stop()
+		rep := chaos.report()
+		t.Logf("chaos stopped: %d experiment(s), injected by kind %v", len(rep.Events), rep.Counts)
 	}
 	if err := w.stop(ctx); err != nil {
 		t.Fatalf("stop workload: %v", err)
@@ -119,6 +166,11 @@ func TestProductionReadinessWorkload(t *testing.T) {
 	}
 	for _, p := range w.coverageProblems() {
 		t.Errorf("coverage: %s", p)
+	}
+	if chaos != nil {
+		for _, p := range chaos.problems() {
+			t.Errorf("chaos: %s", p)
+		}
 	}
 	w.mu.Lock()
 	for _, e := range w.errs {

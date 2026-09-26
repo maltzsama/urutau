@@ -18,7 +18,9 @@ The code lives in `test/e2e/pods`:
 | `workload_run_test.go` | Runs the streams against MySQL, reconciles the oracle, reads and compares MySQL and Iceberg state. |
 | `workload_stats_test.go` | Observed distributions and the diagnostics file. |
 | `workload_unit_test.go` | Cluster-free tests of the generator, run by plain `go test`. |
-| `production_readiness_test.go` | `TestProductionReadinessWorkload`, the workload end to end in the pod e2e cluster. |
+| `chaos_controller_test.go` | The chaos controller: planner, executor and record (see [Chaos](#chaos)). |
+| `chaos_controller_unit_test.go` | Cluster-free tests of the planner and the rendered Chaos Mesh resources. |
+| `production_readiness_test.go` | `TestProductionReadinessWorkload` and `TestProductionReadinessChaos`, end to end in the pod e2e cluster. |
 
 ## Running it
 
@@ -161,6 +163,45 @@ but that is only an upper bound on its own last position: other streams may
 commit in between, and the driver cannot report one transaction's own GTID.
 Comparing the expected position with the committed Iceberg `cdc.position` is
 the job of the validation layer (#387).
+
+## Chaos
+
+`TestProductionReadinessChaos` runs the same workload with the chaos
+controller (`chaos_controller_test.go`) injecting faults into the live
+coordinator and worker Pods for the whole live window. The pass condition is
+the workload's own: once the faults stop, every table converges to MySQL
+exactly. The run also fails if no experiment was injected, if one failed to
+inject or to be removed, or if one is still present after the stop.
+
+```bash
+URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessChaos$' -v -timeout 60m
+```
+
+A seeded **planner** draws each fault; it is pure and unit-tested without a
+cluster:
+
+| Draw | Values |
+|------|--------|
+| Kind | worker or coordinator `pod-kill`, worker or coordinator `pod-failure`, worker ↔ coordinator network `partition`, `loss` (10–90 %) or `delay` (50–1000 ms), `cpu` stress (1–2 workers), `memory` stress (128–512 MB) |
+| Target | one Pod (workers, or for stress sometimes the coordinator), one table's workers, or every worker (network) |
+| Start | exponential gap around the profile mean (20 s smoke, 30 s full), capped at 4× the mean |
+| Duration | uniform between the profile bounds (5–30 s smoke, 10 s–2 min full) |
+| Overlap | whether it may start while others run, up to 2 (smoke) or 3 (full) at once |
+
+The **executor** resolves the concrete target when it injects, from the Pods
+running at that moment (scaling and re-slicing change them), creates the
+Chaos Mesh resource, waits for its `AllInjected` condition, holds it for its
+duration, and deletes it. A `pod-kill` is deleted as soon as the kill lands,
+because Chaos Mesh reapplies it to every new Pod the selector matches. The
+controller never deletes a Pod or signals a process itself.
+
+Every experiment is recorded in the diagnostics file under `chaos`: kind,
+Chaos Mesh resource and name, target, parameters, planned duration, request,
+injection and removal times, and the pipeline's state when it started (Pods
+with phase and restarts, each worker StatefulSet's replicas, maintenance
+Pods, whether the workload was in a backlog episode, and the experiments
+already active). The seed replays the draws, never the recorded times: the
+record is for diagnosis, not a schedule.
 
 ## Settling
 
