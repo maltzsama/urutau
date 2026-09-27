@@ -155,7 +155,7 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 	if f.catalogURI == "" {
 		return worker.RemoteConfig{}, fmt.Errorf("--catalog-uri must not be empty")
 	}
-	logger, err := logging.New(f.logLevel, f.logFormat)
+	logger, logBuffer, err := logging.NewBuffered(f.logLevel, f.logFormat, 2000)
 	if err != nil {
 		return worker.RemoteConfig{}, err
 	}
@@ -176,6 +176,7 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 		MaxRows:     f.maxRows,
 		MaxInterval: f.maxInterval,
 		Logger:      logger,
+		LogBuffer:   logBuffer,
 		MetricsAddr: f.metricsAddr,
 		TLS:         tlsCfg,
 	}, nil

@@ -2814,7 +2814,6 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		sessCancel()
 		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
 	}
-
 	defer func() {
 		c.mu.Lock()
 		w.attached, w.out, w.cancel = false, nil, nil
@@ -2842,7 +2841,6 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			return stream.Context().Err()
 		}
 	}
-
 	// Recv loop: acks and worker errors.
 	go func() {
 		for {
@@ -2875,6 +2873,8 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 				return
 			case *pb.WorkerMessage_SchemaDrift:
 				c.onSchemaDrift(hello.WorkerName, m.SchemaDrift)
+			case *pb.WorkerMessage_Log:
+				c.onWorkerLog(hello.WorkerName, m.Log)
 			}
 		}
 	}()

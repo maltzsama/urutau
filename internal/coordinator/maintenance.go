@@ -191,6 +191,9 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 				m.mu.Unlock()
 			}
 		}
+		if log := in.GetLog(); log != nil {
+			m.c.onWorkerLog(name, log)
+		}
 	}
 }
 

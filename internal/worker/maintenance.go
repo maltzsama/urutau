@@ -54,13 +54,18 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 	if err != nil {
 		return fmt.Errorf("worker: maintenance: session: %w", err)
 	}
-	if err := session.Send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Hello{Hello: &pb.Hello{
+	sender := &sessionSender{s: session}
+	if err := sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Hello{Hello: &pb.Hello{
 		WorkerName:  cfg.Name,
 		Phase:       pb.WorkerPhase_WORKER_PHASE_STARTING,
 		Epoch:       1,
 		Maintenance: true,
 	}}}); err != nil {
 		return fmt.Errorf("worker: maintenance: hello: %w", err)
+	}
+	if cfg.LogBuffer != nil {
+		forwarder := newWorkerLogForwarder(cfg.LogBuffer, sender, 1)
+		defer forwarder.stop()
 	}
 	cfg.Logger.Info("worker: maintenance: awaiting assignment", "worker", cfg.Name)
 
@@ -87,7 +92,7 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 		// run only once this report lands, so a pass that dies before it
 		// stays due. Report even on failure — the coordinator records the
 		// failed operation too.
-		sendErr := session.Send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_MaintenanceResult{
+		sendErr := sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_MaintenanceResult{
 			MaintenanceResult: &pb.MaintenanceResult{Ops: results},
 		}})
 		if sendErr != nil && passErr == nil {

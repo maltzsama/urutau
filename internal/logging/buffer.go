@@ -68,6 +68,12 @@ func NewBuffer(capacity int) *Buffer {
 	return &Buffer{buf: make([]Record, capacity)}
 }
 
+// Append adds a record produced outside the local slog handler. It preserves
+// the same dashboard and durable-trail hooks as a locally emitted record.
+func (b *Buffer) Append(r Record) {
+	b.add(r)
+}
+
 // add appends one record, evicting the oldest once full, then fires the
 // append and sink hooks (if any) outside the lock.
 func (b *Buffer) add(r Record) {

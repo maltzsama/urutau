@@ -26,6 +26,7 @@ import (
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/grpctls"
+	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -44,6 +45,7 @@ type RemoteConfig struct {
 	MaxRows     int
 	MaxInterval time.Duration
 	Logger      *slog.Logger
+	LogBuffer   *logging.Buffer
 	// MetricsAddr serves /metrics (Prometheus); empty disables it.
 	MetricsAddr string
 
@@ -185,15 +187,7 @@ func sessionWithRetry(ctx context.Context, conn *grpc.ClientConn, log *slog.Logg
 // change batches over Arrow Flight until the stream ends. All commits go
 // through the same collapsed worker core (batcher, windows, collapse).
 func RunRemote(ctx context.Context, cfg RemoteConfig) error {
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
-	}
-	if cfg.MaxRows <= 0 {
-		cfg.MaxRows = 1000
-	}
-	if cfg.MaxInterval <= 0 {
-		cfg.MaxInterval = 2 * time.Second
-	}
+	normalizeRemoteConfig(&cfg)
 
 	// One ClientConn, one parent context, three coupled streams: Session,
 	// Control and Flight all die together — the split-brain correction of
@@ -217,6 +211,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		return err
 	}
 	sender := &sessionSender{s: session}
+	defer startWorkerLogForwarder(cfg.LogBuffer, sender, assign.Epoch)()
 	cfg.Logger.Info("assignment", "tables", len(assign.Tables), "run", assign.RunId)
 
 	// Catalog + writers from the assignment: the coordinator owns DDL and
