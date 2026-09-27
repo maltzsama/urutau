@@ -189,9 +189,10 @@ type crOptions struct {
 	// WorkerMemoryOverhead, when set, replaces the workers' 1Gi of limit
 	// above their 2Gi request.
 	WorkerMemoryOverhead string
-	// CoordinatorCPU, when set, replaces the coordinator's 1 CPU;
-	// WorkerCPUOverhead the workers' 500m of limit above their request.
-	CoordinatorCPU    string
+	// CoordinatorCPU, when set, replaces the coordinator's 1 CPU.
+	CoordinatorCPU string
+	// WorkerCPUOverhead, when set, replaces the workers' 500m of limit
+	// above their request.
 	WorkerCPUOverhead string
 }
 
