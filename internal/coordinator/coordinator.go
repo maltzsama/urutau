@@ -1487,17 +1487,7 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
 
-	meta := &pb.BatchMeta{Table: target}
-	for i, b := range buf {
-		// A fresh meta per batch, as in flushWindow.
-		if err := c.enqueueBatch(ctx, b, cloneBatchMeta(meta)); err != nil {
-			for _, rest := range buf[i+1:] {
-				rest.Release()
-			}
-			return err
-		}
-	}
-	return nil
+	return c.enqueueHeld(ctx, &pb.BatchMeta{Table: target}, buf)
 }
 
 // releaseAllGates closes every open gate and releases the batches held in it.
