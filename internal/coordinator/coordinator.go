@@ -2836,7 +2836,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 			case *pb.WorkerMessage_Hello:
 				c.onHello(hello.WorkerName, m.Hello)
 			case *pb.WorkerMessage_WorkerMetrics:
-				c.onWorkerMetrics(m.WorkerMetrics)
+				c.onWorkerMetrics(hello.WorkerName, m.WorkerMetrics)
 			case *pb.WorkerMessage_ChunkReady:
 				// A full chunkReady buffer with no draining snapshot loop
 				// (stale replies after a reset) must not wedge this recv

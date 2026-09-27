@@ -1146,8 +1146,12 @@ func (x *OrphanResult) GetError() string {
 // enrich), so the coordinator can label its own registry. Counters are
 // cumulative totals, not deltas.
 type WorkerMetricsReport struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Tables        []*TableMetrics        `protobuf:"bytes,1,rep,name=tables,proto3" json:"tables,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Tables []*TableMetrics        `protobuf:"bytes,1,rep,name=tables,proto3" json:"tables,omitempty"`
+	// Cumulative bytes the worker's network namespace has sent (Linux
+	// /proc/self/net/dev, loopback excluded); 0 when unknown. Growth marks a
+	// worker busy on slow storage rather than stalled (#422).
+	NetTxBytes    int64 `protobuf:"varint,2,opt,name=net_tx_bytes,json=netTxBytes,proto3" json:"net_tx_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1187,6 +1191,13 @@ func (x *WorkerMetricsReport) GetTables() []*TableMetrics {
 		return x.Tables
 	}
 	return nil
+}
+
+func (x *WorkerMetricsReport) GetNetTxBytes() int64 {
+	if x != nil {
+		return x.NetTxBytes
+	}
+	return 0
 }
 
 type TableMetrics struct {
@@ -2770,9 +2781,11 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\rfiles_deleted\x18\x01 \x01(\x03R\ffilesDeleted\x12\x1f\n" +
 	"\vbytes_freed\x18\x02 \x01(\x03R\n" +
 	"bytesFreed\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"F\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"h\n" +
 	"\x13WorkerMetricsReport\x12/\n" +
-	"\x06tables\x18\x01 \x03(\v2\x17.urutau.v1.TableMetricsR\x06tables\"\x81\x02\n" +
+	"\x06tables\x18\x01 \x03(\v2\x17.urutau.v1.TableMetricsR\x06tables\x12 \n" +
+	"\fnet_tx_bytes\x18\x02 \x01(\x03R\n" +
+	"netTxBytes\"\x81\x02\n" +
 	"\fTableMetrics\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12'\n" +
 	"\x0fcommit_failures\x18\x02 \x01(\x03R\x0ecommitFailures\x12'\n" +

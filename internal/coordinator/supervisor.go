@@ -28,14 +28,19 @@ type supervisor struct {
 	lastAck map[string]time.Time // worker → last ack
 	resets  map[string][]time.Time
 	pending map[string]bool // worker reset but not yet reattached
+	// progress is each worker's network output as last reported, and when
+	// it last grew by progressMinBytes: a worker busy on slow storage is
+	// not a stalled one (#422).
+	progress map[string]progressMark
 }
 
 func newSupervisor(c *Coordinator) *supervisor {
 	return &supervisor{
-		c:       c,
-		lastAck: map[string]time.Time{},
-		resets:  map[string][]time.Time{},
-		pending: map[string]bool{},
+		c:        c,
+		lastAck:  map[string]time.Time{},
+		resets:   map[string][]time.Time{},
+		pending:  map[string]bool{},
+		progress: map[string]progressMark{},
 	}
 }
 
@@ -77,6 +82,7 @@ func (s *supervisor) forget(worker string) {
 	delete(s.lastAck, worker)
 	delete(s.pending, worker)
 	delete(s.resets, worker)
+	delete(s.progress, worker)
 	s.mu.Unlock()
 }
 
@@ -176,7 +182,8 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// so a reset is useless: flag it to terminate for a clean replay
 		// (issue #372).
 		detachedOwing := !p.attached && p.hadSession && p.owes && ok && now.Sub(at) > ack
-		if s.pending[p.name] || (p.attached && p.owes && (!ok || now.Sub(at) > ack)) || detachedOwing {
+		stalled := p.attached && p.owes && (!ok || now.Sub(at) > ack) && !s.busyLocked(p.name, now, at, ack)
+		if s.pending[p.name] || stalled || detachedOwing {
 			stale = append(stale, staleWorker{name: p.name, detachedOwing: detachedOwing})
 		}
 	}
@@ -311,4 +318,56 @@ func (c *Coordinator) resetWorker(w *workerState) {
 		w.cancel = nil
 	}
 	c.mu.Unlock()
+}
+
+// A worker that acks nothing past the ack timeout may be wedged, or writing
+// to storage slow enough that one commit outlasts the timeout. Terminating
+// the second replays the same load against the same storage: the matrix run
+// restarted 12 times against a struggling S3 and never converged (#422).
+// The worker reports its network output (WorkerMetricsReport.net_tx_bytes);
+// output that keeps growing marks it busy, not stalled.
+const (
+	// progressMinBytes is the growth that counts as progress: well above
+	// the control stream's own reports and logs.
+	progressMinBytes = 1 << 20
+	// progressAckCap bounds how long progress stands in for acks, in ack
+	// timeouts: a worker that keeps sending but never acks (retrying one
+	// failing upload, say) is ended all the same.
+	progressAckCap = 10
+)
+
+// progressMark is a worker's network output as last reported (bytes) and
+// when it last grew by progressMinBytes over base (grewAt).
+type progressMark struct {
+	base   int64
+	grewAt time.Time
+}
+
+// noteProgress records a worker's cumulative network output. A counter lower
+// than the last one belongs to a new process: it starts a new baseline.
+func (s *supervisor) noteProgress(worker string, txBytes int64, at time.Time) {
+	if txBytes <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.progress[worker]
+	switch {
+	case !ok || txBytes < m.base:
+		m = progressMark{base: txBytes}
+	case txBytes-m.base >= progressMinBytes:
+		m = progressMark{base: txBytes, grewAt: at}
+	}
+	s.progress[worker] = m
+}
+
+// busyLocked reports whether a worker past its ack timeout is making
+// progress: its output grew within the last ack timeout, and its last ack is
+// within progressAckCap timeouts. Caller holds s.mu.
+func (s *supervisor) busyLocked(worker string, now, lastAck time.Time, ack time.Duration) bool {
+	m, ok := s.progress[worker]
+	if !ok || m.grewAt.IsZero() || now.Sub(m.grewAt) > ack {
+		return false
+	}
+	return !lastAck.IsZero() && now.Sub(lastAck) <= progressAckCap*ack
 }

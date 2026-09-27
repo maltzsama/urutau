@@ -60,7 +60,7 @@ func (w *Worker) MetricsSnapshot() *pb.WorkerMetricsReport {
 		return nil
 	}
 	snap := w.metrics.WorkerSnapshot()
-	rep := &pb.WorkerMetricsReport{}
+	rep := &pb.WorkerMetricsReport{NetTxBytes: netTxBytes()}
 	byTable := map[string]*pb.TableMetrics{}
 	get := func(t string) *pb.TableMetrics {
 		tm := byTable[t]
