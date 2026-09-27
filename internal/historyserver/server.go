@@ -181,7 +181,16 @@ func (s *server) readRun(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	page, next, err := paginate(trail.Events, r.URL.Query().Get("cursor"), s.pageLimit)
+	// A terminated run's trail carries both its lifecycle events and its
+	// structured logs; ?kind narrows the page (and therefore the cursor)
+	// without touching the run's completeness signals, which always describe
+	// the whole trail.
+	events, err := filterKind(trail.Events, r.URL.Query().Get("kind"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	page, next, err := paginate(events, r.URL.Query().Get("cursor"), s.pageLimit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -206,6 +215,27 @@ func (s *server) readRun(w http.ResponseWriter, r *http.Request) {
 		resp["nextCursor"] = next
 	}
 	s.writeJSON(w, resp)
+}
+
+// filterKind narrows a trail to what a caller asked for: "log" keeps only the
+// structured log records, "event" only the lifecycle events, "all" or "" the
+// whole trail. Anything else is a caller error, not a silent pass-through.
+func filterKind(events []eventlog.Event, want string) ([]eventlog.Event, error) {
+	switch want {
+	case "", "all":
+		return events, nil
+	case "log", "event":
+		wantLog := want == "log"
+		out := make([]eventlog.Event, 0, len(events))
+		for _, e := range events {
+			if (e.Kind == eventlog.KindLog) == wantLog {
+				out = append(out, e)
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("invalid kind %q (want all|event|log)", want)
+	}
 }
 
 // paginate slices items from an offset cursor. The cursor is opaque to the

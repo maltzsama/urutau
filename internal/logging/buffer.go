@@ -28,6 +28,8 @@ type Buffer struct {
 	next     int
 	full     bool
 	onAppend func(Record)
+	sink     func(Record)
+	sinkWG   sync.WaitGroup
 }
 
 // SetOnAppend installs a hook called after every record is appended (outside
@@ -37,6 +39,23 @@ func (b *Buffer) SetOnAppend(f func(Record)) {
 	b.mu.Lock()
 	b.onAppend = f
 	b.mu.Unlock()
+}
+
+// SetSink installs a second hook, called the same way, for durable storage:
+// the coordinator appends every record to the run's S3 trail through it, so
+// the process history outlives this ring. It must not block — it runs on the
+// logging path. Nil detaches it (shutdown, before the trail is sealed).
+func (b *Buffer) SetSink(f func(Record)) {
+	b.mu.Lock()
+	old := b.sink
+	b.sink = f
+	b.mu.Unlock()
+	if f == nil && old != nil {
+		// Wait for callbacks that copied the old sink before it was detached.
+		// Without this, shutdown can seal the eventlog while one such callback
+		// is still trying to enqueue its record.
+		b.sinkWG.Wait()
+	}
 }
 
 // NewBuffer returns a Buffer holding at most capacity records. A non-positive
@@ -49,8 +68,14 @@ func NewBuffer(capacity int) *Buffer {
 	return &Buffer{buf: make([]Record, capacity)}
 }
 
-// add appends one record, evicting the oldest once full, then fires the append
-// hook (if any) outside the lock.
+// Append adds a record produced outside the local slog handler. It preserves
+// the same dashboard and durable-trail hooks as a locally emitted record.
+func (b *Buffer) Append(r Record) {
+	b.add(r)
+}
+
+// add appends one record, evicting the oldest once full, then fires the
+// append and sink hooks (if any) outside the lock.
 func (b *Buffer) add(r Record) {
 	b.mu.Lock()
 	b.buf[b.next] = r
@@ -58,10 +83,17 @@ func (b *Buffer) add(r Record) {
 	if b.next == 0 {
 		b.full = true
 	}
-	f := b.onAppend
+	f, sink := b.onAppend, b.sink
+	if sink != nil {
+		b.sinkWG.Add(1)
+	}
 	b.mu.Unlock()
 	if f != nil {
 		f(r)
+	}
+	if sink != nil {
+		defer b.sinkWG.Done()
+		sink(r)
 	}
 }
 

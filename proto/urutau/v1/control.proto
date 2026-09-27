@@ -24,6 +24,7 @@ message WorkerMessage {
     MaintenanceResult maintenance_result = 7;  // one ephemeral maintenance pass's outcome
     WorkerMetricsReport worker_metrics = 8;    // periodic worker-side series the coordinator cannot derive from acks
     SchemaDrift         schema_drift   = 9;    // the worker detected schema drift and is stopping (issue #272)
+    WorkerLog            log            = 10;   // structured worker log for the run trail (issue #351)
   }
 }
 
@@ -285,6 +286,17 @@ message WorkerError {
   string     code   = 2;  // stable machine-readable id, e.g. "commit_exhausted"
   string     detail = 3;
   string     table  = 4;  // optional
+}
+
+// WorkerLog carries one structured worker log over the Session stream. The
+// attrs stay JSON so their scalar types and nested values survive the wire;
+// the coordinator adds the worker identity before publishing the record.
+message WorkerLog {
+  string ts         = 1;
+  string level      = 2;
+  string msg        = 3;
+  bytes  attrs_json = 4;
+  uint64 epoch      = 5;
 }
 
 // ── Control signals ──────────────────────────────────────────────────────

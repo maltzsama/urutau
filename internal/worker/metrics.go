@@ -19,6 +19,25 @@ const workerMetricsInterval = 5 * time.Second
 // coordinator cannot scrape it. Best-effort: a send failure ends the reporter
 // (the session is gone anyway).
 func reportWorkerMetrics(ctx context.Context, w *Worker, sender *sessionSender, log *slog.Logger) {
+	// Report once immediately: waiting for the first tick would leave the
+	// dashboard without this worker's series for a full interval after a
+	// session (re)starts, which reads as "no data" on first open.
+	send := func() bool {
+		rep := w.MetricsSnapshot()
+		if rep == nil {
+			return true
+		}
+		if err := sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_WorkerMetrics{WorkerMetrics: rep}}); err != nil {
+			if log != nil {
+				log.Warn("worker: metrics report", "err", err)
+			}
+			return false
+		}
+		return true
+	}
+	if !send() {
+		return
+	}
 	ticker := time.NewTicker(workerMetricsInterval)
 	defer ticker.Stop()
 	for {
@@ -26,14 +45,7 @@ func reportWorkerMetrics(ctx context.Context, w *Worker, sender *sessionSender, 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			rep := w.MetricsSnapshot()
-			if rep == nil {
-				continue
-			}
-			if err := sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_WorkerMetrics{WorkerMetrics: rep}}); err != nil {
-				if log != nil {
-					log.Warn("worker: metrics report", "err", err)
-				}
+			if !send() {
 				return
 			}
 		}
