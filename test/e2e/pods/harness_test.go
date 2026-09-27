@@ -186,6 +186,9 @@ type crOptions struct {
 	SnapshotChunkSize int
 	// CoordinatorMemory, when set, replaces the coordinator's 2Gi.
 	CoordinatorMemory string
+	// WorkerMemoryOverhead, when set, replaces the workers' 1Gi of limit
+	// above their 2Gi request.
+	WorkerMemoryOverhead string
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
@@ -235,6 +238,16 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 	if opts.CoordinatorMemory != "" {
 		coordinator["memory"] = opts.CoordinatorMemory
 	}
+	worker := map[string]any{
+		"cpu": "500m", "cpu_overhead": "500m",
+		"memory": "2Gi", "memory_overhead": "1Gi",
+		// /metrics, and in the race image the Go profiler, so a
+		// run can read a worker's live heap.
+		"metricsAddr": ":8080",
+	}
+	if opts.WorkerMemoryOverhead != "" {
+		worker["memory_overhead"] = opts.WorkerMemoryOverhead
+	}
 	if opts.SnapshotChunkSize > 0 {
 		coordinator["snapshot"] = map[string]any{"chunkSize": opts.SnapshotChunkSize}
 	}
@@ -251,13 +264,7 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			// Race instrumentation roughly doubles the engine's footprint;
 			// the defaults are sized for the shipped (non-race) image.
 			"coordinator": coordinator,
-			"worker": map[string]any{
-				"cpu": "500m", "cpu_overhead": "500m",
-				"memory": "2Gi", "memory_overhead": "1Gi",
-				// /metrics, and in the race image the Go profiler, so a
-				// run can read a worker's live heap.
-				"metricsAddr": ":8080",
-			},
+			"worker":      worker,
 			"definition": map[string]any{
 				"inline": map[string]any{
 					"pipeline": name,

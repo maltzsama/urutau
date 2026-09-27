@@ -153,6 +153,11 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		// up to 256 KiB through a race-instrumented coordinator: at 2Gi it
 		// was OOM-killed catching up after its first snapshot chunk.
 		opts.CoordinatorMemory = "6Gi"
+		// The race runtime's own memory, outside the Go heap, is ~1.5 GiB in
+		// a worker: at a 3Gi limit the events worker, whose Go heap peaked
+		// near 1.2 GiB, was OOM-killed in every snapshot and restarted it
+		// from scratch. The request stays at 2Gi; only the limit grows.
+		opts.WorkerMemoryOverhead = "3Gi"
 	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
 	applyPipeline(t, testNS, pipeline, cr)
