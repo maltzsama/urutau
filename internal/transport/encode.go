@@ -108,33 +108,10 @@ func RecordFromChanges(rows []rowchange.Change, cs core.Schema, alloc memory.All
 				return nil, fmt.Errorf("transport: column %q row %d: %w", col.Name, i, err)
 			}
 		}
-		// Metadata columns.
-		bld.Field(numDataCols).(*array.Uint8Builder).Append(uint8(r.Op))
-		bld.Field(numDataCols + 1).(*array.StringBuilder).Append(r.Position)
-		if r.CommitTS.IsZero() {
-			bld.Field(numDataCols + 2).AppendNull()
-		} else {
-			bld.Field(numDataCols + 2).(*array.TimestampBuilder).AppendTime(r.CommitTS)
-		}
-		if r.IngestTS.IsZero() {
-			// Parity with CommitTS (M-4): a zero timestamp means "not set" —
-			// it must not masquerade as a real instant on the wire.
-			bld.Field(numDataCols + 3).AppendNull()
-		} else {
-			bld.Field(numDataCols + 3).(*array.TimestampBuilder).AppendTime(r.IngestTS)
-		}
-		bld.Field(numDataCols + 4).(*array.BooleanBuilder).Append(r.Snapshot)
-		// __phase: the producer's value when set, otherwise derived from the
-		// Snapshot boolean so producers that predate the Phase field still
-		// land a phase on the wire. Empty and non-snapshot → null.
-		switch {
-		case r.Phase != "":
-			bld.Field(numDataCols + 5).(*array.StringBuilder).Append(r.Phase)
-		case r.Snapshot:
-			bld.Field(numDataCols + 5).(*array.StringBuilder).Append(core.PhaseSnapshot)
-		default:
-			bld.Field(numDataCols + 5).(*array.StringBuilder).Append(core.PhaseStream)
-		}
+		appendRowMeta(bld, numDataCols, RowMeta{
+			Op: r.Op, Position: r.Position, CommitTS: r.CommitTS, IngestTS: r.IngestTS,
+			Snapshot: r.Snapshot, Phase: r.Phase,
+		})
 	}
 
 	return bld.NewRecordBatch(), nil

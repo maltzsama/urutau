@@ -11,7 +11,6 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/core"
@@ -1297,19 +1296,7 @@ func concatBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
 			return nil, fmt.Errorf("worker: concat: schema mismatch: %s vs %s (source batches must share a stable schema)", colsOf(sch), colsOf(first))
 		}
 	}
-	acc, err := mergeBatches(bs[0], nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	for _, b := range bs[1:] {
-		next, err := mergeBatches(acc, b, nil)
-		acc.Release()
-		if err != nil {
-			return nil, err
-		}
-		acc = next
-	}
-	return acc, nil
+	return concatAll(bs)
 }
 
 // sameSchema reports field-for-field equality (names, types, order).
@@ -1340,28 +1327,9 @@ func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.Writ
 	if len(idx) == 0 {
 		return nil, nil
 	}
-	rec := b.Record
-	ib := array.NewInt32Builder(memory.DefaultAllocator)
-	for _, v := range idx {
-		ib.Append(v)
-	}
-	idxArr := ib.NewInt32Array()
-	defer idxArr.Release()
-
-	cols := make([]arrow.Array, rec.NumCols())
-	for i := range int(rec.NumCols()) {
-		t, err := compute.TakeArray(context.Background(), rec.Column(i), idxArr)
-		if err != nil {
-			for j := range i {
-				cols[j].Release()
-			}
-			return nil, err
-		}
-		cols[i] = t
-	}
-	newRec := array.NewRecordBatch(rec.Schema(), cols, int64(len(idx)))
-	for _, c := range cols {
-		c.Release()
+	newRec, err := takeRows(b.Record, idx)
+	if err != nil {
+		return nil, err
 	}
 	return &dataplane.Batch{
 		Table:           b.Table,
