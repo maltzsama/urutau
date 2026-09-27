@@ -98,6 +98,11 @@ type Config struct {
 	// that keeps a slow worker from starving. Defaults 512Mi / 16Mi.
 	FlowTotalBytes   int64
 	FlowPerWorkerMin int64
+	// CycleMaxRows and CycleMaxAge bound how much of a staged table's
+	// consecutive source batches one cycle coalesces (coalesce.go); zero
+	// means the defaults.
+	CycleMaxRows int
+	CycleMaxAge  time.Duration
 
 	// Eventlog is optional: when set, the coordinator writes its per-run
 	// audit trail (job_started, snapshots, commits, terminal) to S3.
@@ -296,6 +301,9 @@ type Coordinator struct {
 	// to the last enqueue: the pump and the snapshot both drain, and the
 	// worker must receive the held batches in source order.
 	gateFlushMu sync.Mutex
+	// accum holds each staged table's batches not sent yet (coalesce.go),
+	// guarded by gateMu; sent under gateFlushMu.
+	accum map[string]*cycleAccum
 
 	// paused holds a table whose re-slice is draining. The flip waits for the
 	// table to owe nothing, which a continuously loaded table never reaches on
@@ -1308,8 +1316,16 @@ func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error
 // InWindow-tagged by flushWindow after the worker confirms ChunkReady. Other
 // tables flow freely.
 func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
+	tick := time.NewTicker(cycleCheckEvery)
+	defer tick.Stop()
+	defer c.releaseAccums()
 	for {
 		select {
+		case <-tick.C:
+			if err := c.flushDueAccums(ctx); err != nil {
+				c.pumpFail(ctx, err)
+				return
+			}
 		case b, ok := <-out:
 			if !ok {
 				return
@@ -1325,10 +1341,20 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 			// the flip, then enqueued under the new layout — so no batch
 			// spans the flip and ordering is preserved, and the pump keeps
 			// draining the reader for every other table (issue #343).
+			if err := c.flushAccumBeforePause(ctx, b.Table); err != nil {
+				c.pumpFail(ctx, err)
+				return
+			}
 			if c.pauseHold(b) {
 				continue
 			}
 			if c.gateHold(ctx, b) {
+				continue
+			}
+			if taken, err := c.accumulate(ctx, b); err != nil {
+				c.pumpFail(ctx, err)
+				return
+			} else if taken {
 				continue
 			}
 			// enqueueBatch takes ownership of b (serializes + releases).
@@ -1655,7 +1681,9 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 			return err
 		}
 		if i == 0 {
-			c.openWindow(ref.Target, partition)
+			if err := c.openWindowFlushed(ctx, ref.Target, partition); err != nil {
+				return err
+			}
 		}
 		// The snapshot watchdog: a worker that attaches but stops draining
 		// would otherwise block the chunk round-trip (send, wait, flush)

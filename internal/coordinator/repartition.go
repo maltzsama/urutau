@@ -141,6 +141,10 @@ func (c *Coordinator) flushPaused(ctx context.Context) error {
 	}
 	c.pausedMu.Unlock()
 	for table, batches := range held {
+		// Batches accumulated before the pause are older than those it held.
+		if err := c.flushAccum(ctx, table); err != nil {
+			return fmt.Errorf("flush accumulated batches for %s: %w", table, err)
+		}
 		for _, b := range batches {
 			if err := c.enqueueBatch(ctx, b, nil); err != nil {
 				return fmt.Errorf("flush held batches for %s: %w", table, err)
