@@ -162,8 +162,15 @@ func (m *Metrics) Handler(encoder func(w http.ResponseWriter, r *http.Request)) 
 	if encoder != nil {
 		mux.HandleFunc("/statusz", encoder)
 	}
+	for _, route := range debugRoutes {
+		route(mux)
+	}
 	return mux
 }
+
+// debugRoutes are extra handlers a test build mounts (pprof_debug.go, only
+// with the faultinject tag of the race e2e image); none in a release build.
+var debugRoutes []func(*http.ServeMux)
 
 // Serve exposes /metrics (and /statusz) on addr, blocking until the server
 // stops. A caller with extra routes builds a mux via Handler and calls ServeMux.

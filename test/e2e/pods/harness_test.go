@@ -254,6 +254,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			"worker": map[string]any{
 				"cpu": "500m", "cpu_overhead": "500m",
 				"memory": "2Gi", "memory_overhead": "1Gi",
+				// /metrics, and in the race image the Go profiler, so a
+				// run can read a worker's live heap.
+				"metricsAddr": ":8080",
 			},
 			"definition": map[string]any{
 				"inline": map[string]any{
