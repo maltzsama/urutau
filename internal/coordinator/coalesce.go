@@ -104,7 +104,7 @@ func (c *Coordinator) accumulate(ctx context.Context, b *dataplane.Batch) (bool,
 	for {
 		c.gateMu.Lock()
 		if key, held := c.openKeyForTableLocked(b.Table); held {
-			c.gateBuf[key] = append(c.gateBuf[key], b)
+			c.gateAppendLocked(key, b)
 			c.gateMu.Unlock()
 			return true, nil
 		}
