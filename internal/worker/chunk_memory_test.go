@@ -65,11 +65,33 @@ func TestChunkReadHoldsLittleMoreThanTheChunk(t *testing.T) {
 		qsrc:     payloadQuerySource{&payloadChunkSource{n: rows, size: size}},
 	}
 
+	// The live-heap metric is process-wide: goroutines other tests left
+	// running allocate too. The smallest of a few reads is the chunk's own.
+	var held uint64
+	for attempt := uint32(1); attempt <= 3; attempt++ {
+		h := peakDuring(t, func() error {
+			return x.run(context.Background(), &pb.ChunkRequest{Table: "src.t", ChunkId: attempt})
+		})
+		if attempt == 1 || h < held {
+			held = h
+		}
+	}
+
+	chunk := uint64(rows * size)
+	t.Logf("chunk %d MiB, peak live heap above baseline %d MiB (%.1fx)", chunk>>20, held>>20, float64(held)/float64(chunk))
+	if held > chunk*9/4 {
+		t.Fatalf("reading a %d MiB chunk held %d MiB live (%.1fx); want at most 2.25x", chunk>>20, held>>20, float64(held)/float64(chunk))
+	}
+}
+
+// peakDuring runs fn and returns the peak live heap above the baseline
+// while it ran.
+func peakDuring(t *testing.T, fn func() error) uint64 {
+	t.Helper()
 	runtime.GC()
 	base := liveHeap()
 	var peak atomic.Uint64
-	stop := make(chan struct{})
-	done := make(chan struct{})
+	stop, done := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
@@ -83,18 +105,16 @@ func TestChunkReadHoldsLittleMoreThanTheChunk(t *testing.T) {
 			}
 		}
 	}()
-	if err := x.run(context.Background(), &pb.ChunkRequest{Table: "src.t", ChunkId: 1}); err != nil {
-		t.Fatal(err)
-	}
+	err := fn()
 	close(stop)
 	<-done
-
-	chunk := uint64(rows * size)
-	held := peak.Load() - base
-	t.Logf("chunk %d MiB, peak live heap above baseline %d MiB (%.1fx)", chunk>>20, held>>20, float64(held)/float64(chunk))
-	if held > chunk*9/4 {
-		t.Fatalf("reading a %d MiB chunk held %d MiB live (%.1fx); want at most 2.25x", chunk>>20, held>>20, float64(held)/float64(chunk))
+	if err != nil {
+		t.Fatal(err)
 	}
+	if p := peak.Load(); p > base {
+		return p - base
+	}
+	return 0
 }
 
 type payloadQuerySource struct{ cs source.ChunkSource }
