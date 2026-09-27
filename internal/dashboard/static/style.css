@@ -35,9 +35,9 @@ h3 { font-size: .95rem; }
 .brand { display: flex; align-items: center; gap: 14px; }
 .brand a { display: flex; align-items: center; }
 .brand .logo { height: 48px; width: 48px; display: block; }
-.logo-dark { display: none; }
-[data-theme="dark"] .logo-light { display: none; }
-[data-theme="dark"] .logo-dark { display: block; }
+.brand .logo-dark { display: none; }
+[data-theme="dark"] .brand .logo-light { display: none; }
+[data-theme="dark"] .brand .logo-dark { display: block; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.05; }
 .brand-name {
   font-family: 'Future Socialism', ui-sans-serif, system-ui, sans-serif;
