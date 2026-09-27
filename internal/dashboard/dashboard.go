@@ -20,6 +20,7 @@ type PipelineSummary struct {
 	Status             string `json:"status"`
 	SnapshotActive     bool   `json:"snapshot_active"`
 	MaintenanceEnabled bool   `json:"maintenance_enabled"`
+	Version            string `json:"version,omitempty"`
 }
 
 // TableStatus is one stream (source → target) as the Streams view shows it.

@@ -23,22 +23,35 @@
 
 <main class="container">
   <header class="topbar">
-    <div>
-      <h1><span x-text="summary.pipeline || 'pipeline'"></span> <small class="muted">/ Coordinator</small></h1>
-      <div class="small muted inline-copy">
-        Run <span class="mono" x-text="summary.run_id || '—'"></span>
-        <button class="copy-btn" type="button" aria-label="Copy run ID"
-                @click="copy(summary.run_id)">⧉</button>
+    <div class="brand">
+      <a href="https://github.com/maltzsama/urutau" target="_blank" rel="noopener" aria-label="Urutau">
+        <img class="logo logo-light" src="img/icon.svg" alt="">
+        <img class="logo logo-dark" src="img/icon-dark.svg" alt="">
+      </a>
+      <div class="brand-text">
+        <a class="brand-name" href="https://github.com/maltzsama/urutau" target="_blank" rel="noopener">Urutau</a>
+        <span class="brand-sub muted small">coordinator dashboard</span>
       </div>
     </div>
-    <div class="topline">
-      <span class="pill" :class="statusClass(summary.status)" x-text="summary.status || 'unknown'"></span>
-      <span class="small">Uptime <b x-text="uptime()"></b></span>
-      <span class="small">Last poll <b x-text="lastPoll || '—'"></b></span>
-      <span class="pill" :class="failures > 3 ? 'red' : 'amber'" x-show="failures > 0"
-            x-text="'poll failures: ' + failures"></span>
-      <button class="theme-toggle" type="button" @click="cycleTheme()"
-              :aria-label="'Theme: ' + theme" x-text="themeLabel()"></button>
+    <div class="subbar">
+      <div class="topbar-right">
+        <h1><span x-text="summary.pipeline || 'pipeline'"></span> <small class="muted">/ Coordinator</small></h1>
+        <div class="small muted inline-copy">
+          Run <span class="mono" x-text="summary.run_id || '—'"></span>
+          <button class="copy-btn" type="button" aria-label="Copy run ID"
+                  @click="copy(summary.run_id)">⧉</button>
+        </div>
+      </div>
+      <div class="topline">
+        <span class="pill" :class="statusClass(summary.status)" x-text="summary.status || 'unknown'"></span>
+        <span class="small">Uptime <b x-text="uptime()"></b></span>
+        <span class="small">Last poll <b x-text="lastPoll || '—'"></b></span>
+        <span class="small" title="Urutau version" x-text="summary.version ? 'v' + summary.version : ''"></span>
+        <span class="pill" :class="failures > 3 ? 'red' : 'amber'" x-show="failures > 0"
+              x-text="'poll failures: ' + failures"></span>
+        <button class="theme-toggle" type="button" @click="cycleTheme()"
+                :aria-label="'Theme: ' + theme" x-text="themeLabel()"></button>
+      </div>
     </div>
   </header>
 

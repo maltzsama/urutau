@@ -3,6 +3,14 @@
    defaults are larger than a dense monitoring UI wants, so the base size and
    the form/button spacing are dialed down here. */
 
+@font-face {
+  font-family: 'Future Socialism';
+  src: url('fonts/Future Socialism.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --ok: #198754;
   --warn: #b7791f;
@@ -23,9 +31,25 @@ h2 { font-size: 1.05rem; }
 h3 { font-size: .95rem; }
 
 /* ── header / nav ─────────────────────────────────────────────────────── */
-.topbar { display: flex; gap: 16px; align-items: center; justify-content: space-between;
-  flex-wrap: wrap; margin-bottom: 12px; }
-.topbar h1 { margin: 0; }
+.topbar { display: flex; flex-direction: column; gap: 12px; margin-bottom: 14px; }
+.brand { display: flex; align-items: center; gap: 14px; }
+.brand a { display: flex; align-items: center; }
+.brand .logo { height: 48px; width: 48px; display: block; }
+.brand .logo-dark { display: none; }
+[data-theme="dark"] .brand .logo-light { display: none; }
+[data-theme="dark"] .brand .logo-dark { display: block; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.05; }
+.brand-name {
+  font-family: 'Future Socialism', ui-sans-serif, system-ui, sans-serif;
+  font-size: 1.7rem; font-weight: 500; letter-spacing: -.01em;
+  color: var(--pico-color); text-decoration: none; line-height: 1;
+}
+.brand-name:hover { color: var(--accent); }
+.brand-sub { font-size: .8rem; margin-top: 2px; }
+.subbar { display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap; }
+.topbar h1 { margin: 0; font-size: 1rem; }
+.topbar-right { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .topline { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .inline-copy { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; line-height: 1; }
 .mono { font-family: var(--pico-font-family-monospace, monospace); }

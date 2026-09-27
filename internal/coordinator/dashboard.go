@@ -10,6 +10,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/dashboard"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/internal/version"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -86,6 +87,7 @@ func (s dashState) Summary() dashboard.PipelineSummary {
 		Status:             status,
 		SnapshotActive:     c.snapshotActive.Load(),
 		MaintenanceEnabled: c.cfg.Spec.Sink.MaintenanceEnabled(),
+		Version:            version.Version,
 	}
 }
 

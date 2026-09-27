@@ -5,10 +5,31 @@ import (
 	"time"
 
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/internal/version"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
+
+// The pipeline summary carries the running project version, so the dashboard
+// can label the exact Urutau build on screen.
+func TestDashStateSummaryCarriesVersion(t *testing.T) {
+	c := &Coordinator{
+		cfg: Config{Spec: &spec.Spec{
+			Pipeline: "shop",
+			Source:   spec.Source{Kind: "mysql"},
+			Sink:     spec.Sink{Type: "iceberg"},
+		}},
+		startedAt: time.Now(),
+	}
+	got := dashState{c}.Summary()
+	if got.Version != version.Version {
+		t.Errorf("Version = %q, want %q", got.Version, version.Version)
+	}
+	if got.Pipeline != "shop" {
+		t.Errorf("Pipeline = %q, want shop", got.Pipeline)
+	}
+}
 
 // The dashboard's TableStatus is folded from acks (rows/deletes/commits) and
 // maintenance results — no worker scrape.
