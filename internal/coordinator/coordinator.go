@@ -98,6 +98,8 @@ type Config struct {
 	// that keeps a slow worker from starving. Defaults 512Mi / 16Mi.
 	FlowTotalBytes   int64
 	FlowPerWorkerMin int64
+	// FlowPerWorkerMax caps one worker's bytes in flight; zero means 128 MiB.
+	FlowPerWorkerMax int64
 	// CycleMaxRows and CycleMaxAge bound how much of a staged table's
 	// consecutive source batches one cycle coalesces (coalesce.go); zero
 	// means the defaults.
@@ -429,6 +431,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.FlowTotalBytes <= 0 {
 		cfg.FlowTotalBytes = 512 << 20
 	}
+	if cfg.FlowPerWorkerMax <= 0 {
+		cfg.FlowPerWorkerMax = 128 << 20
+	}
 	if cfg.FlowPerWorkerMin <= 0 {
 		cfg.FlowPerWorkerMin = 16 << 20
 	}
@@ -462,6 +467,7 @@ func Run(ctx context.Context, cfg Config) error {
 		stagedLocks: map[string]*sync.Mutex{},
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
+	c.budget.perWorkerMax = cfg.FlowPerWorkerMax
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
 	c.supervisor = newSupervisor(c)
 	c.terminate = make(chan error, 1)

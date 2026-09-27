@@ -106,7 +106,7 @@ the sink for its partition.
 | `--client-secret` | `$URUTAU_SINK_CLIENT_SECRET` | Catalog OAuth2 client secret |
 | `--scope` | `$URUTAU_SINK_SCOPE` or `PRINCIPAL_ROLE:ALL` | Catalog OAuth2 scope |
 | `--namespace` | `raw` | Fallback namespace for bare targets |
-| `--max-rows` | `1000` | Flush the batch once this many rows are buffered |
+| `--max-rows` | `10000` | Flush the batch once this many rows are buffered: at most one Iceberg commit per this many rows (`--max-interval` bounds the latency) |
 | `--max-interval` | `2s` | Flush cadence |
 | `--metrics-addr` | _(off)_ | Serve `/metrics` on this address |
 | `--plugin` | _(none)_ | Go plugin path; repeatable |

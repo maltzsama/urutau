@@ -249,3 +249,32 @@ func TestMarkCleanOnlyClearsItsGeneration(t *testing.T) {
 		t.Fatal("MarkClean with the current generation must clear dirty")
 	}
 }
+
+// A worker slower than the stream must not absorb the whole budget: under
+// the full profile one held ~490 MiB queued for it and was OOM-killed
+// decoding it (#437). It stops at perWorkerMax, the others keep flowing,
+// and a worker with nothing in flight is still admitted one batch past the
+// cap (a lone oversized batch must never deadlock).
+func TestFlowBudgetCapsOneWorker(t *testing.T) {
+	b := newFlowBudget(1000, 10)
+	b.perWorkerMax = 300
+	ctx := context.Background()
+	if err := b.acquire(ctx, "slow", 250); err != nil {
+		t.Fatal(err)
+	}
+	blocked, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := b.acquire(blocked, "slow", 100); err == nil {
+		t.Fatal("the slow worker went past its cap")
+	}
+	if err := b.acquire(ctx, "fast", 250); err != nil {
+		t.Fatalf("another worker was held back by the slow one's cap: %v", err)
+	}
+	if err := b.acquire(ctx, "idle", 400); err != nil {
+		t.Fatalf("a worker with nothing in flight was refused a batch past the cap: %v", err)
+	}
+	b.release("slow", 250)
+	if err := b.acquire(ctx, "slow", 100); err != nil {
+		t.Fatalf("the slow worker stayed blocked after its bytes were acked: %v", err)
+	}
+}
