@@ -7,6 +7,13 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
+// gateMaxBytes bounds one window's held live batches by size, as
+// gateMaxEvents does by count: rows carry payloads, and 1024 batches of the
+// full profile's events held GiBs and OOM-killed the coordinator (#438). A
+// gate is full once it holds this much; the batch that crosses it is
+// admitted, so one oversized batch never deadlocks the gate.
+const gateMaxBytes = 64 << 20
+
 // gateHold buffers a batch when a window is open for a partition its rows
 // could belong to. A full gate never grows without bound: once the window's
 // chunk is ready it drains InWindow-tagged (drainReadyWindow); before that
@@ -36,7 +43,7 @@ func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 	if !held {
 		return false
 	}
-	for len(c.gateBuf[key]) >= gateMaxEvents {
+	for len(c.gateBuf[key]) >= gateMaxEvents || c.gateBytes[key] >= gateMaxBytes {
 		_, ready := c.gateReady[key]
 		drain := c.gateDrain
 		c.gateMu.Unlock()
@@ -66,8 +73,26 @@ func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
 			return false
 		}
 	}
-	c.gateBuf[key] = append(c.gateBuf[key], b)
+	c.gateAppendLocked(key, b)
 	return true
+}
+
+// gateAppendLocked holds a batch in a window's gate. Caller holds gateMu.
+func (c *Coordinator) gateAppendLocked(key string, b *dataplane.Batch) {
+	if c.gateBytes == nil {
+		c.gateBytes = map[string]int64{}
+	}
+	c.gateBuf[key] = append(c.gateBuf[key], b)
+	c.gateBytes[key] += batchBytes(b)
+}
+
+// gateTakeLocked empties a window's gate and returns what it held, oldest
+// first. Caller holds gateMu.
+func (c *Coordinator) gateTakeLocked(key string) []*dataplane.Batch {
+	buf := c.gateBuf[key]
+	delete(c.gateBuf, key)
+	delete(c.gateBytes, key)
+	return buf
 }
 
 // markChunkReady records that chunkID's rows are in its worker's window (its
@@ -100,8 +125,7 @@ func (c *Coordinator) drainReadyWindow(ctx context.Context, key string) error {
 		c.gateMu.Unlock()
 		return nil
 	}
-	buf := c.gateBuf[key]
-	c.gateBuf[key] = nil
+	buf := c.gateTakeLocked(key)
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()

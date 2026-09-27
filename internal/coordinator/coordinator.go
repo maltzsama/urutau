@@ -287,7 +287,8 @@ type Coordinator struct {
 	// gateBuf holds source batches (live changes) per open window. Raw
 	// pre-encode batches: released by flushWindow/closeWindow after they
 	// are queued.
-	gateBuf map[string][]*dataplane.Batch
+	gateBuf   map[string][]*dataplane.Batch
+	gateBytes map[string]int64 // gateBuf's size per window (gateMaxBytes)
 	// gateDrain wakes a pump blocked on a full gate when flushWindow/
 	// closeWindow drains it (audit #5: the gate was the only buffer without
 	// a structural bound). One shared channel: any drain (of any window)
@@ -1465,8 +1466,7 @@ func (c *Coordinator) flushWindow(ctx context.Context, target string, partition 
 	c.gateFlushMu.Lock()
 	defer c.gateFlushMu.Unlock()
 	c.gateMu.Lock()
-	buf := c.gateBuf[key]
-	c.gateBuf[key] = nil
+	buf := c.gateTakeLocked(key)
 	// The catch-up is over: the next chunk's batches wait for its own
 	// ChunkReady.
 	delete(c.gateReady, key)
@@ -1485,10 +1485,9 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 	c.gateFlushMu.Lock()
 	defer c.gateFlushMu.Unlock()
 	c.gateMu.Lock()
-	buf := c.gateBuf[key]
+	buf := c.gateTakeLocked(key)
 	delete(c.gateOn, key)
 	delete(c.gateWin, key)
-	delete(c.gateBuf, key)
 	delete(c.gateReady, key)
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
@@ -1506,10 +1505,9 @@ func (c *Coordinator) releaseAllGates() {
 	c.gateMu.Lock()
 	var held []*dataplane.Batch
 	for k := range c.gateOn {
-		held = append(held, c.gateBuf[k]...)
+		held = append(held, c.gateTakeLocked(k)...)
 		delete(c.gateOn, k)
 		delete(c.gateWin, k)
-		delete(c.gateBuf, k)
 		delete(c.gateReady, k)
 	}
 	// Wake any pump blocked on a full gate so it re-checks and sees the gate
