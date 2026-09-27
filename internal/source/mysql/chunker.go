@@ -102,10 +102,12 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 
 // Scan executes the chunk SELECT (with the row-filter WHERE pushed — none
 // yet in this milestone) and calls fn for every row, keyed by column name.
-func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
+// chunkQuery renders one chunk's SELECT and its args: the key bounds, the
+// row filter (#163/#183) and the projection (#162/#183).
+func (c *Chunker) chunkQuery(ch source.Chunk) (string, []any, error) {
 	for _, k := range [][]any{ch.Low, ch.High} {
 		if k != nil && len(k) != len(c.pk) {
-			return fmt.Errorf("mysql: chunk scan: bound %v does not match the key %v", k, c.pk)
+			return "", nil, fmt.Errorf("mysql: chunk scan: bound %v does not match the key %v", k, c.pk)
 		}
 	}
 	cond := make([]string, 0, 2)
@@ -145,6 +147,14 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`%s ORDER BY %s",
 		selectCols, c.schema, c.table, where, cols)
 
+	return query, args, nil
+}
+
+func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
+	query, args, err := c.chunkQuery(ch)
+	if err != nil {
+		return err
+	}
 	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("mysql: chunk scan: %w", err)

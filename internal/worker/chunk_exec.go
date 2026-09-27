@@ -24,6 +24,9 @@ type chunkExecutor struct {
 	dsn      string
 	postgres []byte // JSON spec.PostgresSource (#170); empty = use dsn
 	chunkSz  int
+	// perRow is each target's last chunk's bytes per row per column: the
+	// next chunk's buffers are sized from it (readChunk).
+	perRow   map[string][]int
 	epoch    uint64                         // the Assignment epoch; echoed on ChunkReady so a stale reply is ignored
 	bySource map[string]*pb.TableAssignment // source table → target/PK
 	qsrc     source.QuerySource
@@ -170,7 +173,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return err
 	}
 
-	rec, rows, err := scanChunkRecord(ctx, chunker, source.Chunk{Low: low, High: high}, ta, x.w.KnownSchema(ta.TargetTable))
+	rec, rows, err := x.readChunk(ctx, chunker, source.Chunk{Low: low, High: high}, ta)
 	if err != nil {
 		return fmt.Errorf("worker: chunk %d: %w", req.ChunkId, err)
 	}
