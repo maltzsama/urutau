@@ -189,6 +189,11 @@ type crOptions struct {
 	// WorkerMemoryOverhead, when set, replaces the workers' 1Gi of limit
 	// above their 2Gi request.
 	WorkerMemoryOverhead string
+	// CoordinatorCPU, when set, replaces the coordinator's 1 CPU.
+	CoordinatorCPU string
+	// WorkerCPUOverhead, when set, replaces the workers' 500m of limit
+	// above their request.
+	WorkerCPUOverhead string
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
@@ -238,6 +243,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 	if opts.CoordinatorMemory != "" {
 		coordinator["memory"] = opts.CoordinatorMemory
 	}
+	if opts.CoordinatorCPU != "" {
+		coordinator["cpu"] = opts.CoordinatorCPU
+	}
 	worker := map[string]any{
 		"cpu": "500m", "cpu_overhead": "500m",
 		"memory": "2Gi", "memory_overhead": "1Gi",
@@ -247,6 +255,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 	}
 	if opts.WorkerMemoryOverhead != "" {
 		worker["memory_overhead"] = opts.WorkerMemoryOverhead
+	}
+	if opts.WorkerCPUOverhead != "" {
+		worker["cpu_overhead"] = opts.WorkerCPUOverhead
 	}
 	if opts.SnapshotChunkSize > 0 {
 		coordinator["snapshot"] = map[string]any{"chunkSize": opts.SnapshotChunkSize}
