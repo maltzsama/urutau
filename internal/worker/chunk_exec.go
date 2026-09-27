@@ -6,12 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
 
-	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
@@ -173,36 +170,9 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		return err
 	}
 
-	rows := make([]rowchange.Change, 0, x.chunkSz)
-	err = chunker.Scan(ctx, source.Chunk{Low: low, High: high}, func(row map[string]any) error {
-		key := make([]any, 0, len(ta.PrimaryKey))
-		for _, col := range ta.PrimaryKey {
-			key = append(key, row[col])
-		}
-		rows = append(rows, rowchange.Change{
-			Op:       rowchange.OpInsert,
-			Table:    ta.TargetTable,
-			Key:      key,
-			After:    row,
-			Snapshot: true,
-			Phase:    core.PhaseSnapshot,
-			IngestTS: time.Now(),
-		})
-		return nil
-	})
+	rec, rows, err := scanChunkRecord(ctx, chunker, source.Chunk{Low: low, High: high}, ta, x.w.KnownSchema(ta.TargetTable))
 	if err != nil {
-		return fmt.Errorf("worker: chunk %d scan: %w", req.ChunkId, err)
-	}
-
-	// Build the record against the introspected schema (the worker's known
-	// schema for this target), never a per-batch inference: window rows must
-	// carry the stable table shape the sink expects. MergeSchema keeps that
-	// shape and only appends columns a row carries that the schema lacks.
-	// Snapshot chunk rows are inserts only, so the bridge C-8 delete guard
-	// does not apply here.
-	rec, err := transport.RecordFromChanges(rows, transport.MergeSchema(rows, x.w.KnownSchema(ta.TargetTable)), nil)
-	if err != nil {
-		return fmt.Errorf("worker: chunk %d encode: %w", req.ChunkId, err)
+		return fmt.Errorf("worker: chunk %d: %w", req.ChunkId, err)
 	}
 	dpb := &dataplane.Batch{Table: ta.TargetTable, Record: rec, Mode: dataplane.AppendMode}
 	// AddWindowRows takes ownership of the batch (the window stores it).
@@ -212,7 +182,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	return x.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_ChunkReady{ChunkReady: &pb.ChunkReady{
 		Table:           req.Table,
 		ChunkId:         req.ChunkId,
-		Rows:            uint64(len(rows)),
+		Rows:            uint64(rows),
 		DroppedByWindow: uint64(x.w.DroppedByWindow(ta.TargetTable)),
 		Epoch:           x.epoch,
 	}}})
