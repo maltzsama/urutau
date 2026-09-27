@@ -297,3 +297,16 @@ func TestSupervisorCapsProgressWithoutAcks(t *testing.T) {
 		t.Fatalf("err = %v, want the stall termination past the cap", err)
 	}
 }
+
+// Growth is measured over the last ack timeout, not accumulated from an old
+// baseline: trickles of control traffic that add up to 1 MiB over minutes
+// are not progress (review of #450).
+func TestSupervisorProgressIsGrowthWithinTheTimeout(t *testing.T) {
+	s, _, now := progressHarness(2 * time.Minute)
+	s.noteProgress("w1", 100<<20, now.Add(-100*time.Second))
+	s.noteProgress("w1", 100<<20+600<<10, now.Add(-45*time.Second))
+	s.noteProgress("w1", 100<<20+1200<<10, now.Add(-5*time.Second)) // 600 KiB in the last 30 s
+	if err := s.tick(now, progressCfg); err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("err = %v, want the stall termination: under 1 MiB grew in the last timeout", err)
+	}
+}

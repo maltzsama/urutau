@@ -28,10 +28,9 @@ type supervisor struct {
 	lastAck map[string]time.Time // worker → last ack
 	resets  map[string][]time.Time
 	pending map[string]bool // worker reset but not yet reattached
-	// progress is each worker's network output as last reported, and when
-	// it last grew by progressMinBytes: a worker busy on slow storage is
-	// not a stalled one (#422).
-	progress map[string]progressMark
+	// progress is each worker's recent network output reports: a worker
+	// whose output grows is busy on slow storage, not stalled (#422).
+	progress map[string][]progressSample
 }
 
 func newSupervisor(c *Coordinator) *supervisor {
@@ -40,7 +39,7 @@ func newSupervisor(c *Coordinator) *supervisor {
 		lastAck:  map[string]time.Time{},
 		resets:   map[string][]time.Time{},
 		pending:  map[string]bool{},
-		progress: map[string]progressMark{},
+		progress: map[string][]progressSample{},
 	}
 }
 
@@ -336,38 +335,53 @@ const (
 	progressAckCap = 10
 )
 
-// progressMark is a worker's network output as last reported (bytes) and
-// when it last grew by progressMinBytes over base (grewAt).
-type progressMark struct {
-	base   int64
-	grewAt time.Time
+// progressSample is one reported network output and when it arrived.
+type progressSample struct {
+	at    time.Time
+	bytes int64
 }
 
+// progressKeep bounds the samples kept per worker: enough to span any sane
+// ack timeout at the worker's 5 s report cadence.
+const progressKeep = 128
+
 // noteProgress records a worker's cumulative network output. A counter lower
-// than the last one belongs to a new process: it starts a new baseline.
+// than the last one belongs to a new process: its samples start over.
 func (s *supervisor) noteProgress(worker string, txBytes int64, at time.Time) {
 	if txBytes <= 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m, ok := s.progress[worker]
-	switch {
-	case !ok || txBytes < m.base:
-		m = progressMark{base: txBytes}
-	case txBytes-m.base >= progressMinBytes:
-		m = progressMark{base: txBytes, grewAt: at}
+	h := s.progress[worker]
+	if n := len(h); n > 0 && txBytes < h[n-1].bytes {
+		h = h[:0]
 	}
-	s.progress[worker] = m
+	h = append(h, progressSample{at: at, bytes: txBytes})
+	if len(h) > progressKeep {
+		h = append(h[:0], h[len(h)-progressKeep:]...)
+	}
+	s.progress[worker] = h
 }
 
 // busyLocked reports whether a worker past its ack timeout is making
-// progress: its output grew within the last ack timeout, and its last ack is
+// progress: its output grew by progressMinBytes over the last ack timeout
+// (from the newest sample at or before its start), and its last ack is
 // within progressAckCap timeouts. Caller holds s.mu.
 func (s *supervisor) busyLocked(worker string, now, lastAck time.Time, ack time.Duration) bool {
-	m, ok := s.progress[worker]
-	if !ok || m.grewAt.IsZero() || now.Sub(m.grewAt) > ack {
+	if lastAck.IsZero() || now.Sub(lastAck) > progressAckCap*ack {
 		return false
 	}
-	return !lastAck.IsZero() && now.Sub(lastAck) <= progressAckCap*ack
+	h := s.progress[worker]
+	if len(h) < 2 || now.Sub(h[len(h)-1].at) > ack {
+		return false
+	}
+	from := h[0]
+	for _, p := range h {
+		if p.at.After(now.Add(-ack)) {
+			break
+		}
+		from = p
+	}
+	return h[len(h)-1].bytes-from.bytes >= progressMinBytes
 }
