@@ -51,4 +51,8 @@ func TestOnWorkerLogRejectsStaleEpoch(t *testing.T) {
 	if got := buf.Tail(0, 1); len(got) != 0 {
 		t.Fatalf("stale records = %v, want none", got)
 	}
+	c.onWorkerLog("worker-1", &pb.WorkerLog{Msg: "missing epoch"})
+	if got := buf.Tail(0, 1); len(got) != 0 {
+		t.Fatalf("zero-epoch records = %v, want none", got)
+	}
 }

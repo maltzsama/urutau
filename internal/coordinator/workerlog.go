@@ -19,7 +19,7 @@ func (c *Coordinator) onWorkerLog(worker string, msg *pb.WorkerLog) {
 	}
 	c.mu.Lock()
 	w := c.workers[worker]
-	validEpoch := (w != nil && (msg.Epoch == 0 || msg.Epoch == w.epoch)) ||
+	validEpoch := (w != nil && msg.Epoch == w.epoch) ||
 		(w == nil && c.maint != nil)
 	c.mu.Unlock()
 	if !validEpoch {
