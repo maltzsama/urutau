@@ -29,7 +29,10 @@ import (
 //
 // The accumulator is a group commit: it sends at once while none of the
 // table's cycles is pending, and grows while one is being committed — up to
-// cycleMaxRows rows or cycleMaxAge, whichever comes first.
+// cycleMaxRows rows, cycleMaxBytes bytes or cycleMaxAge, whichever comes
+// first. The byte bound matters as much as the row bound: rows carry
+// payloads (the full profile's reach 256 KiB), and a 10,000-row batch of them
+// OOM-killed a worker.
 //
 // Ordering is the invariant. A table's accumulated batches are older than
 // anything a DBLog window gates or a re-slice pauses after them, so they are
@@ -39,8 +42,9 @@ import (
 // gateFlushMu, like the gate's own drains.
 
 const (
-	defaultCycleMaxRows = 10000
-	defaultCycleMaxAge  = time.Second
+	defaultCycleMaxRows  = 10000
+	defaultCycleMaxBytes = 16 << 20
+	defaultCycleMaxAge   = time.Second
 	// cycleCheckEvery is how often the pump checks the accumulators it did
 	// not flush on arrival.
 	cycleCheckEvery = 20 * time.Millisecond
@@ -50,6 +54,7 @@ const (
 type cycleAccum struct {
 	batches []*dataplane.Batch
 	rows    int64
+	bytes   int64
 	since   time.Time
 }
 
@@ -58,6 +63,48 @@ func (c *Coordinator) cycleMaxRows() int64 {
 		return int64(c.cfg.CycleMaxRows)
 	}
 	return defaultCycleMaxRows
+}
+
+func (c *Coordinator) cycleMaxBytes() int64 {
+	if c.cfg.CycleMaxBytes > 0 {
+		return c.cfg.CycleMaxBytes
+	}
+	return defaultCycleMaxBytes
+}
+
+// batchBytes is a batch's in-memory size, the byte bound's measure: the
+// length of every buffer of every column, child arrays included.
+func batchBytes(b *dataplane.Batch) int64 {
+	if b.Record == nil {
+		return 0
+	}
+	var n int64
+	for _, col := range b.Record.Columns() {
+		n += arrayDataBytes(col.Data())
+	}
+	return n
+}
+
+func arrayDataBytes(d arrow.ArrayData) int64 {
+	var n int64
+	for _, buf := range d.Buffers() {
+		if buf != nil {
+			n += int64(buf.Len())
+		}
+	}
+	for _, child := range d.Children() {
+		n += arrayDataBytes(child)
+	}
+	return n
+}
+
+// fits reports whether a batch of rows/bytes may join one already holding
+// accRows/accBytes: always for the first, then within both bounds.
+func (c *Coordinator) fits(accRows, accBytes, rows, bytes int64) bool {
+	if accRows == 0 {
+		return true
+	}
+	return accRows+rows <= c.cycleMaxRows() && accBytes+bytes <= c.cycleMaxBytes()
 }
 
 func (c *Coordinator) cycleMaxAge() time.Duration {
@@ -75,24 +122,37 @@ func (c *Coordinator) accumulate(ctx context.Context, b *dataplane.Batch) (bool,
 	if b.Record == nil || !c.isStagedTable(b.Table) {
 		return false, nil
 	}
-	c.gateMu.Lock()
-	if key, held := c.openKeyForTableLocked(b.Table); held {
-		c.gateBuf[key] = append(c.gateBuf[key], b)
+	rows, bytes := b.Record.NumRows(), batchBytes(b)
+	for {
+		c.gateMu.Lock()
+		if key, held := c.openKeyForTableLocked(b.Table); held {
+			c.gateBuf[key] = append(c.gateBuf[key], b)
+			c.gateMu.Unlock()
+			return true, nil
+		}
+		if c.accum == nil {
+			c.accum = map[string]*cycleAccum{}
+		}
+		a := c.accum[b.Table]
+		if a == nil {
+			a = &cycleAccum{since: time.Now()}
+			c.accum[b.Table] = a
+		}
+		if c.fits(a.rows, a.bytes, rows, bytes) {
+			a.batches = append(a.batches, b)
+			a.rows += rows
+			a.bytes += bytes
+			c.gateMu.Unlock()
+			return true, c.flushAccumIfDue(ctx, b.Table)
+		}
 		c.gateMu.Unlock()
-		return true, nil
+		// The batch would take the cycle past a bound: send what is held
+		// first, so no cycle outgrows it, then take the batch.
+		if err := c.flushAccum(ctx, b.Table); err != nil {
+			b.Release()
+			return true, err
+		}
 	}
-	if c.accum == nil {
-		c.accum = map[string]*cycleAccum{}
-	}
-	a := c.accum[b.Table]
-	if a == nil {
-		a = &cycleAccum{since: time.Now()}
-		c.accum[b.Table] = a
-	}
-	a.batches = append(a.batches, b)
-	a.rows += b.Record.NumRows()
-	c.gateMu.Unlock()
-	return true, c.flushAccumIfDue(ctx, b.Table)
 }
 
 // accumDue reports whether a table's accumulator should be sent now.
@@ -100,7 +160,7 @@ func (c *Coordinator) accumDue(table string, a *cycleAccum) bool {
 	if a == nil || len(a.batches) == 0 {
 		return false
 	}
-	if a.rows >= c.cycleMaxRows() || time.Since(a.since) >= c.cycleMaxAge() {
+	if a.rows >= c.cycleMaxRows() || a.bytes >= c.cycleMaxBytes() || time.Since(a.since) >= c.cycleMaxAge() {
 		return true
 	}
 	// Nothing of the table is being committed: waiting would only add latency.

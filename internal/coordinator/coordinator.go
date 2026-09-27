@@ -101,8 +101,9 @@ type Config struct {
 	// CycleMaxRows and CycleMaxAge bound how much of a staged table's
 	// consecutive source batches one cycle coalesces (coalesce.go); zero
 	// means the defaults.
-	CycleMaxRows int
-	CycleMaxAge  time.Duration
+	CycleMaxRows  int
+	CycleMaxBytes int64
+	CycleMaxAge   time.Duration
 
 	// Eventlog is optional: when set, the coordinator writes its per-run
 	// audit trail (job_started, snapshots, commits, terminal) to S3.

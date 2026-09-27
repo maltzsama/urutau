@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
@@ -202,5 +204,68 @@ func TestConcatSourceBatchesKeepsSourceOrder(t *testing.T) {
 		if got := r.Position(i); got != want {
 			t.Fatalf("row %d position %s, want %s", i, got, want)
 		}
+	}
+}
+
+// payloadBatch is a one-row raw.orders batch whose v is size bytes.
+func payloadBatch(t *testing.T, id int64, pos string, size int) *dataplane.Batch {
+	t.Helper()
+	changes := []rowchange.Change{{
+		Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{id},
+		After: map[string]any{"id": id, "v": strings.Repeat("x", size)}, Position: pos, IngestTS: time.Now(),
+	}}
+	rec, err := transport.RecordFromChanges(changes, transport.InferSchemaFromChanges(changes), nil)
+	if err != nil {
+		t.Fatalf("RecordFromChanges: %v", err)
+	}
+	return &dataplane.Batch{Table: "raw.orders", Record: rec, Watermark: []byte(pos), Mode: dataplane.UpsertMode}
+}
+
+// Rows carry payloads: a cycle bounded by rows alone grew to hundreds of MB
+// under the full profile and OOM-killed a worker. Both the accumulator and a
+// gate drain keep every sent batch within CycleMaxBytes, and lose no row.
+func TestCoalescedBatchesStayWithinTheByteBound(t *testing.T) {
+	const payload, bound = 20 << 10, 64 << 10 // three rows fit, a fourth does not
+	for _, path := range []string{"accumulator", "gate drain"} {
+		t.Run(path, func(t *testing.T) {
+			c := gateStagedHarness(t)
+			c.cfg.CycleMaxBytes = bound
+			ctx := context.Background()
+			holdAccumulator(c)
+			if path == "gate drain" {
+				c.openWindow("raw.orders", 0)
+			}
+			const n = 10
+			for i := int64(1); i <= n; i++ { // ids 1-10: w0's partition
+				b := payloadBatch(t, i, fmt.Sprintf("0/%X", i), payload)
+				if path == "gate drain" {
+					if !c.gateHold(ctx, b) {
+						t.Fatal("the open window did not hold the batch")
+					}
+				} else if taken, err := c.accumulate(ctx, b); !taken || err != nil {
+					t.Fatalf("accumulate %d: taken=%v err=%v", i, taken, err)
+				}
+			}
+			var err error
+			if path == "gate drain" {
+				err = c.closeWindow(ctx, "raw.orders", 0)
+			} else {
+				err = c.flushAccum(ctx, "raw.orders")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, rows := drainQueue(t, c.workers["w0"])
+			total := int64(0)
+			for i, r := range rows {
+				if r > 3 {
+					t.Fatalf("sent batch %d holds %d rows of %d bytes: past the %d-byte bound", i, r, payload, bound)
+				}
+				total += r
+			}
+			if total != n || len(rows) < 3 {
+				t.Fatalf("sent %d rows in %d batches; want all %d, in several bounded batches", total, len(rows), n)
+			}
+		})
 	}
 }
