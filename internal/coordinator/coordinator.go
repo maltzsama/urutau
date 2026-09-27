@@ -325,6 +325,10 @@ type Coordinator struct {
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
+	// chunkMarkers are each worker's queued snapshot Closes markers, to pace
+	// chunks on commits (snapshot_pace.go).
+	chunkMarkersMu sync.Mutex
+	chunkMarkers   map[string][]uint64
 
 	// confirmed tracks the latest position each WORKER durably committed
 	// (from worker Acks). The minimum across workers is reported to the
@@ -1690,7 +1694,10 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 			timeout = defaultSnapshotChunkTimeout
 		}
 		chunkCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, ch, chunkID, epoch)
+		err := c.awaitChunkCommits(chunkCtx, w.name)
+		if err == nil {
+			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, ch, chunkID, epoch)
+		}
 		cancel()
 		if err != nil {
 			// A parent deadline/cancel (the run's own) surfaces here as
@@ -1778,6 +1785,7 @@ func (c *Coordinator) sendCloses(ctx context.Context, w *workerState, target str
 	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
 		return err
 	}
+	c.noteChunkMarker(w.name, meta.BatchId)
 	c.noteWindow(target, w)
 	return nil
 }
