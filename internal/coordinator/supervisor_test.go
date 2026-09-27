@@ -243,3 +243,70 @@ func TestRecordResetReturnsWindowedCount(t *testing.T) {
 		t.Fatalf("count = %d, want 1 after expiry", n)
 	}
 }
+
+// progressHarness is a worker that owes one in-flight batch and last acked
+// ago: past the ack timeout.
+func progressHarness(ago time.Duration) (*supervisor, *workerState, time.Time) {
+	s, workers := supervisorHarness()
+	s.c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
+	s.c.index["w1"].add(inflightBatch{id: 1, table: "t"})
+	now := time.Now()
+	s.noteAck("w1", now.Add(-ago))
+	return s, workers["w1"], now
+}
+
+var progressCfg = SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute}
+
+// Slow storage: a worker writing a large file to a slow S3 acks nothing for
+// longer than the ack timeout while its uploads advance. Terminating it
+// replays the same load against the same storage, and the matrix run
+// restarted 12 times without converging (#422). A worker whose network
+// output grows is busy, not stalled.
+func TestSupervisorSparesAWorkerMakingStorageProgress(t *testing.T) {
+	s, w, now := progressHarness(2 * time.Minute)
+	w.cancel = func() {}
+	s.noteProgress("w1", 100<<20, now.Add(-40*time.Second))
+	s.noteProgress("w1", 180<<20, now.Add(-5*time.Second))
+	if err := s.tick(now, progressCfg); err != nil {
+		t.Fatalf("tick terminated a worker whose uploads advance: %v", err)
+	}
+	if w.epoch != 0 || s.isPending("w1") {
+		t.Fatalf("a worker making progress was reset: epoch=%d", w.epoch)
+	}
+}
+
+// A worker whose output stands still is stalled, as before: a wedged worker
+// must still end the run promptly.
+func TestSupervisorTerminatesAWorkerWithoutProgress(t *testing.T) {
+	s, _, now := progressHarness(2 * time.Minute)
+	s.noteProgress("w1", 100<<20, now.Add(-90*time.Second))
+	s.noteProgress("w1", 100<<20+4096, now.Add(-5*time.Second)) // heartbeats only
+	if err := s.tick(now, progressCfg); err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("err = %v, want the stall termination", err)
+	}
+}
+
+// Progress without an ack for long is not trusted forever: a worker that
+// keeps sending (retrying one failing upload, say) but never acks is ended
+// at progressAckCap × the ack timeout.
+func TestSupervisorCapsProgressWithoutAcks(t *testing.T) {
+	s, _, now := progressHarness(progressAckCap*30*time.Second + time.Second)
+	s.noteProgress("w1", 100<<20, now.Add(-40*time.Second))
+	s.noteProgress("w1", 900<<20, now.Add(-5*time.Second))
+	if err := s.tick(now, progressCfg); err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("err = %v, want the stall termination past the cap", err)
+	}
+}
+
+// Growth is measured over the last ack timeout, not accumulated from an old
+// baseline: trickles of control traffic that add up to 1 MiB over minutes
+// are not progress (review of #450).
+func TestSupervisorProgressIsGrowthWithinTheTimeout(t *testing.T) {
+	s, _, now := progressHarness(2 * time.Minute)
+	s.noteProgress("w1", 100<<20, now.Add(-100*time.Second))
+	s.noteProgress("w1", 100<<20+600<<10, now.Add(-45*time.Second))
+	s.noteProgress("w1", 100<<20+1200<<10, now.Add(-5*time.Second)) // 600 KiB in the last 30 s
+	if err := s.tick(now, progressCfg); err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("err = %v, want the stall termination: under 1 MiB grew in the last timeout", err)
+	}
+}

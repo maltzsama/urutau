@@ -92,7 +92,7 @@ func TestOnWorkerMetricsFoldsTotals(t *testing.T) {
 			{Source: "shop.orders", Target: "raw.orders"},
 		}}},
 	}
-	c.onWorkerMetrics(&pb.WorkerMetricsReport{Tables: []*pb.TableMetrics{{
+	c.onWorkerMetrics("w1", &pb.WorkerMetricsReport{Tables: []*pb.TableMetrics{{
 		Table:            "raw.orders",
 		CommitFailures:   4,
 		DeletesDropped:   2,

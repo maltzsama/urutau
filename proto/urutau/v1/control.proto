@@ -133,6 +133,10 @@ message OrphanResult {
 // cumulative totals, not deltas.
 message WorkerMetricsReport {
   repeated TableMetrics tables = 1;
+  // Cumulative bytes the worker's network namespace has sent (Linux
+  // /proc/self/net/dev, loopback excluded); 0 when unknown. Growth marks a
+  // worker busy on slow storage rather than stalled (#422).
+  int64 net_tx_bytes = 2;
 }
 
 message TableMetrics {

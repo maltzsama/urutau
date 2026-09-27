@@ -396,10 +396,14 @@ func (c *Coordinator) recordMaintStats(table, op string, at time.Time, apply fun
 // aggregate the dashboard serves. It does not duplicate into the coordinator's
 // Prometheus registry: the worker's own /metrics is the Prometheus source for
 // these series, and the report exists for the dashboard, which cannot scrape
-// the worker.
-func (c *Coordinator) onWorkerMetrics(rep *pb.WorkerMetricsReport) {
+// the worker. Its network output also feeds the supervisor's progress signal
+// (#422).
+func (c *Coordinator) onWorkerMetrics(worker string, rep *pb.WorkerMetricsReport) {
 	if rep == nil {
 		return
+	}
+	if c.supervisor != nil {
+		c.supervisor.noteProgress(worker, rep.GetNetTxBytes(), time.Now())
 	}
 	c.statsMu.Lock()
 	if c.tableStats == nil {
