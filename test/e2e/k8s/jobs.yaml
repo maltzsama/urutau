@@ -83,7 +83,7 @@ spec:
                 curl -sf -X POST "$MGMT" \
                   -H "Authorization: Bearer $TOKEN" -H "Polaris-Realm: ${REALM}" \
                   -H 'Content-Type: application/json' \
-                  -d '{"catalog":{"name":"'${CATALOG_NAME}'","type":"INTERNAL","readOnly":false,"properties":{"default-base-location":"s3://warehouse"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://warehouse"],"endpoint":"http://rustfs.e2e.svc.cluster.local:9000","endpointInternal":"http://rustfs.e2e.svc.cluster.local:9000","pathStyleAccess":true,"region":"us-east-1"}}}'
+                  -d '{"catalog":{"name":"'${CATALOG_NAME}'","type":"INTERNAL","readOnly":false,"properties":{"default-base-location":"s3://warehouse","polaris.config.drop-with-purge.enabled":"true"},"storageConfigInfo":{"storageType":"S3","allowedLocations":["s3://warehouse"],"endpoint":"http://rustfs.e2e.svc.cluster.local:9000","endpointInternal":"http://rustfs.e2e.svc.cluster.local:9000","pathStyleAccess":true,"region":"us-east-1"}}}'
               fi
               curl -sf -X PUT "$MGMT/${CATALOG_NAME}/catalog-roles/catalog_admin/grants" \
                 -H "Authorization: Bearer $TOKEN" -H "Polaris-Realm: ${REALM}" \

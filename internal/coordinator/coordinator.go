@@ -98,6 +98,14 @@ type Config struct {
 	// that keeps a slow worker from starving. Defaults 512Mi / 16Mi.
 	FlowTotalBytes   int64
 	FlowPerWorkerMin int64
+	// FlowPerWorkerMax caps one worker's bytes in flight; zero means 128 MiB.
+	FlowPerWorkerMax int64
+	// CycleMaxRows and CycleMaxAge bound how much of a staged table's
+	// consecutive source batches one cycle coalesces (coalesce.go); zero
+	// means the defaults.
+	CycleMaxRows  int
+	CycleMaxBytes int64
+	CycleMaxAge   time.Duration
 
 	// Eventlog is optional: when set, the coordinator writes its per-run
 	// audit trail (job_started, snapshots, commits, terminal) to S3.
@@ -296,6 +304,9 @@ type Coordinator struct {
 	// to the last enqueue: the pump and the snapshot both drain, and the
 	// worker must receive the held batches in source order.
 	gateFlushMu sync.Mutex
+	// accum holds each staged table's batches not sent yet (coalesce.go),
+	// guarded by gateMu; sent under gateFlushMu.
+	accum map[string]*cycleAccum
 
 	// paused holds a table whose re-slice is draining. The flip waits for the
 	// table to owe nothing, which a continuously loaded table never reaches on
@@ -420,6 +431,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.FlowTotalBytes <= 0 {
 		cfg.FlowTotalBytes = 512 << 20
 	}
+	if cfg.FlowPerWorkerMax <= 0 {
+		cfg.FlowPerWorkerMax = 128 << 20
+	}
 	if cfg.FlowPerWorkerMin <= 0 {
 		cfg.FlowPerWorkerMin = 16 << 20
 	}
@@ -453,6 +467,7 @@ func Run(ctx context.Context, cfg Config) error {
 		stagedLocks: map[string]*sync.Mutex{},
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
+	c.budget.perWorkerMax = cfg.FlowPerWorkerMax
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
 	c.supervisor = newSupervisor(c)
 	c.terminate = make(chan error, 1)
@@ -1308,8 +1323,16 @@ func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error
 // InWindow-tagged by flushWindow after the worker confirms ChunkReady. Other
 // tables flow freely.
 func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
+	tick := time.NewTicker(cycleCheckEvery)
+	defer tick.Stop()
+	defer c.releaseAccums()
 	for {
 		select {
+		case <-tick.C:
+			if err := c.flushDueAccums(ctx); err != nil {
+				c.pumpFail(ctx, err)
+				return
+			}
 		case b, ok := <-out:
 			if !ok {
 				return
@@ -1325,10 +1348,20 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 			// the flip, then enqueued under the new layout — so no batch
 			// spans the flip and ordering is preserved, and the pump keeps
 			// draining the reader for every other table (issue #343).
+			if err := c.flushAccumBeforePause(ctx, b.Table); err != nil {
+				c.pumpFail(ctx, err)
+				return
+			}
 			if c.pauseHold(b) {
 				continue
 			}
 			if c.gateHold(ctx, b) {
+				continue
+			}
+			if taken, err := c.accumulate(ctx, b); err != nil {
+				c.pumpFail(ctx, err)
+				return
+			} else if taken {
 				continue
 			}
 			// enqueueBatch takes ownership of b (serializes + releases).
@@ -1461,17 +1494,7 @@ func (c *Coordinator) closeWindow(ctx context.Context, target string, partition 
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
 
-	meta := &pb.BatchMeta{Table: target}
-	for i, b := range buf {
-		// A fresh meta per batch, as in flushWindow.
-		if err := c.enqueueBatch(ctx, b, cloneBatchMeta(meta)); err != nil {
-			for _, rest := range buf[i+1:] {
-				rest.Release()
-			}
-			return err
-		}
-	}
-	return nil
+	return c.enqueueHeld(ctx, &pb.BatchMeta{Table: target}, buf)
 }
 
 // releaseAllGates closes every open gate and releases the batches held in it.
@@ -1655,7 +1678,9 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 			return err
 		}
 		if i == 0 {
-			c.openWindow(ref.Target, partition)
+			if err := c.openWindowFlushed(ctx, ref.Target, partition); err != nil {
+				return err
+			}
 		}
 		// The snapshot watchdog: a worker that attaches but stops draining
 		// would otherwise block the chunk round-trip (send, wait, flush)

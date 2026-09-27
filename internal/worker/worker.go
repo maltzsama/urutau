@@ -28,8 +28,10 @@ import (
 // Config tunes batch accumulation.
 type Config struct {
 	// MaxRows flushes the batch once this many changes are buffered.
-	// Byte-based triggers arrive with arrow sizing.
 	MaxRows int
+	// MaxBytes flushes once the buffered rows hold this many bytes (zero:
+	// 32 MiB): rows carry payloads, and a row count alone OOM-killed (#437).
+	MaxBytes int64
 	// MaxInterval flushes whatever is buffered on this cadence.
 	MaxInterval time.Duration
 	// MetricsAddr serves /metrics (Prometheus); empty disables it.
@@ -171,6 +173,9 @@ type Ingest struct {
 
 // New builds a worker; register tables before Run.
 func New(cfg Config) *Worker {
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = 32 << 20
+	}
 	w := &Worker{
 		cfg:    cfg,
 		tables: make(map[string]*tablePipeline),
@@ -624,7 +629,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	// mutate only side state (guard, windows, counters); the batches flow
 	// through to the columnar flush untouched.
 	var pending []*dataplane.Batch
-	pendingRows := 0
+	pendingRows, pendingBytes := 0, int64(0)
 	// pendingSeq is the coordinator cycle key shared by every batch in
 	// pending. A batch with a different Seq belongs to a different cycle and
 	// must be flushed on its own (WK-001 C5.4): the coordinator tracks each
@@ -640,7 +645,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			b.Release()
 		}
 		pending = nil
-		pendingRows = 0
+		pendingRows, pendingBytes = 0, 0
 		pendingSeq = 0
 	}
 
@@ -777,8 +782,8 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		}
 		pending = append(pending, b)
 		pendingSeq = b.Seq
-		pendingRows += rows
-		if w.cfg.MaxRows > 0 && pendingRows >= w.cfg.MaxRows {
+		pendingRows, pendingBytes = pendingRows+rows, pendingBytes+dpint.BatchBytes(b)
+		if (w.cfg.MaxRows > 0 && pendingRows >= w.cfg.MaxRows) || pendingBytes >= w.cfg.MaxBytes {
 			return flush()
 		}
 		return nil
@@ -1372,35 +1377,6 @@ func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.Writ
 		// silently downgrade a staged cycle to a direct commit.
 		Staged: b.Staged,
 	}, nil
-}
-
-// markerBatch is a 0-row batch in the table's wire schema that carries a
-// Closes marker's cycle, for a window that emitted no rows: the cycle still
-// owes the coordinator a delivery.
-func markerBatch(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
-	schema, err := transport.CoreSchemaToArrow(p.knownSchema)
-	if err != nil {
-		return nil, fmt.Errorf("worker: table %s: marker batch: %w", p.target, err)
-	}
-	bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
-	rec := bld.NewRecordBatch()
-	bld.Release()
-	return &dataplane.Batch{Table: p.target, Record: rec, Watermark: []byte(ing.Position), Mode: p.mode, Seq: ing.Seq, Staged: ing.Staged}, nil
-}
-
-// snapshotDoneBatch is the 0-row batch that commits a table's snapshot
-// completion: cdc.snapshot.state=complete and no position. The marker's
-// position is the coordinator's latest sent when it queued the marker; the
-// stream may have committed past it since, and the completion must not move
-// the table's position back. The committer acks the marker's position.
-func snapshotDoneBatch(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
-	b, err := markerBatch(p, ing)
-	if err != nil {
-		return nil, err
-	}
-	b.Watermark = nil
-	b.SnapshotState = string(snapshot.StateComplete)
-	return b, nil
 }
 
 // emptyBatch returns a 0-row batch with b's schema, carrying b's Seq and

@@ -10,12 +10,19 @@ import (
 // flowBudget is the coordinator's global in-flight budget (design §5.4.1):
 // a ceiling on serialized batch bytes queued or sent but not yet acked, per
 // PROCESS — not per worker. A slow worker may consume more than its share
-// but never starves the others below perWorkerMin; a budget that is full
-// blocks the producer, which is the structural backpressure down to the
-// reader loop.
+// but never starves the others below perWorkerMin, nor holds more than
+// perWorkerMax; a budget that is full blocks the producer, which is the
+// structural backpressure down to the reader loop.
 type flowBudget struct {
 	totalBytes   int64
 	perWorkerMin int64
+	// perWorkerMax caps one worker's bytes in flight (0: no cap). Without it
+	// a worker committing slower than the stream absorbed the whole budget:
+	// under the full production-readiness profile one held ~490 MiB queued
+	// for it, decoded it all, and was OOM-killed (#437). A worker with
+	// nothing in flight is still admitted one batch past the cap, so a batch
+	// larger than it can never deadlock.
+	perWorkerMax int64
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -38,6 +45,14 @@ func newFlowBudget(totalBytes, perWorkerMin int64) *flowBudget {
 	}
 	b.cond = sync.NewCond(&b.mu)
 	return b
+}
+
+// underWorkerMax reports whether n more bytes keep worker within
+// perWorkerMax; a worker with nothing in flight always may take one batch.
+// Caller holds b.mu.
+func (b *flowBudget) underWorkerMax(worker string, n int64) bool {
+	used := b.used[worker]
+	return b.perWorkerMax <= 0 || used == 0 || used+n <= b.perWorkerMax
 }
 
 func (b *flowBudget) sum() int64 {
@@ -75,7 +90,7 @@ func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error 
 			if b.oversizedOwner == "" {
 				break
 			}
-		} else if b.sum()+n <= b.totalBytes || b.used[worker]+n <= b.perWorkerMin {
+		} else if (b.sum()+n <= b.totalBytes || b.used[worker]+n <= b.perWorkerMin) && b.underWorkerMax(worker, n) {
 			break
 		}
 		if err := ctx.Err(); err != nil {

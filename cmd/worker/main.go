@@ -15,12 +15,15 @@ import (
 	_ "github.com/maltzsama/urutau/internal/builtin" // register built-in drivers via init()
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
+	"github.com/maltzsama/urutau/internal/memlimit"
 	"github.com/maltzsama/urutau/internal/plugin/flightwrap"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/sink"
 )
 
 func main() {
+	// The Pod's memory limit, given to the garbage collector (#437).
+	memlimit.Apply(slog.Default())
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "urutau-worker:", err)
 		os.Exit(1)
@@ -56,6 +59,7 @@ type workerFlags struct {
 	scope        string
 	namespace    string
 	maxRows      int
+	maxBytesMi   int64
 	maxInterval  time.Duration
 	metricsAddr  string
 	pluginPaths  []string
@@ -120,7 +124,8 @@ func runCmd() *cobra.Command {
 	fl.StringVar(&f.clientSecret, "client-secret", os.Getenv("URUTAU_SINK_CLIENT_SECRET"), "catalog OAuth2 client secret")
 	fl.StringVar(&f.scope, "scope", envOr("URUTAU_SINK_SCOPE", "PRINCIPAL_ROLE:ALL"), "catalog OAuth2 scope")
 	fl.StringVar(&f.namespace, "namespace", "raw", "fallback namespace for bare targets")
-	fl.IntVar(&f.maxRows, "max-rows", 1000, "flush the batch once this many rows are buffered")
+	fl.IntVar(&f.maxRows, "max-rows", 10000, "flush the batch once this many rows are buffered (one Iceberg commit)")
+	fl.Int64Var(&f.maxBytesMi, "max-bytes-mi", 32, "flush the batch once its buffered rows hold this many MiB")
 	fl.DurationVar(&f.maxInterval, "max-interval", 2*time.Second, "flush cadence")
 	fl.StringVar(&f.metricsAddr, "metrics-addr", "", "serve /metrics on this address (optional)")
 	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
@@ -174,6 +179,7 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 			},
 		},
 		MaxRows:     f.maxRows,
+		MaxBytes:    f.maxBytesMi << 20,
 		MaxInterval: f.maxInterval,
 		Logger:      logger,
 		LogBuffer:   logBuffer,

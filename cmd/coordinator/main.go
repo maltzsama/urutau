@@ -17,11 +17,14 @@ import (
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
+	"github.com/maltzsama/urutau/internal/memlimit"
 	"github.com/maltzsama/urutau/internal/plugin/flightwrap"
 	"github.com/maltzsama/urutau/spec"
 )
 
 func main() {
+	// The Pod's memory limit, given to the garbage collector (#437).
+	memlimit.Apply(slog.Default())
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "urutau-coordinator:", err)
 		os.Exit(1)

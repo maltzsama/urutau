@@ -46,12 +46,14 @@ func gateStagedHarness(t *testing.T) *Coordinator {
 }
 
 // Live batches held by the DBLog gate during a snapshot are released
-// together by flushWindow (and closeWindow). Each is its own binlog batch and
-// must be its own staged cycle. The drain passed one shared BatchMeta to
-// enqueueBatch, which assigns the cycle id into it: every held batch got the
-// first one's id, the first to complete committed the cycle, and the other
-// batches' deliveries arrived for a cycle that no longer existed ("staged
-// delivery not committable") and were dropped with their rows.
+// together by flushWindow (and closeWindow). The drain once passed one shared
+// BatchMeta to enqueueBatch, which assigns the cycle id into it: every held
+// batch got the first one's id, the first to complete committed the cycle,
+// and the other batches' deliveries arrived for a cycle that no longer
+// existed ("staged delivery not committable") and were dropped with their
+// rows. Since #437 the held batches go out concatenated, as one cycle split
+// by owner; what must hold is the same: every delivery belongs to a cycle
+// that expects it, and delivering them commits every cycle.
 func TestGateDrainGivesEachHeldBatchItsOwnCycle(t *testing.T) {
 	for _, drain := range []struct {
 		name string
@@ -74,10 +76,12 @@ func TestGateDrainGivesEachHeldBatchItsOwnCycle(t *testing.T) {
 			if err := drain.run(c); err != nil {
 				t.Fatalf("%s: %v", drain.name, err)
 			}
-			if n := c.staged.len(); n != 2 {
-				t.Fatalf("%d staged cycle(s) after draining two held batches; want 2", n)
+			type delivery struct {
+				worker string
+				id     uint64
+				pos    string
 			}
-			ids := map[uint64]bool{}
+			var got []delivery
 			for _, name := range []string{"w0", "w1"} {
 				select {
 				case q := <-c.workers[name].queue:
@@ -85,13 +89,21 @@ func TestGateDrainGivesEachHeldBatchItsOwnCycle(t *testing.T) {
 					if err := proto.Unmarshal(q.meta, &m); err != nil {
 						t.Fatalf("%s meta: %v", name, err)
 					}
-					ids[m.BatchId] = true
+					got = append(got, delivery{name, m.BatchId, m.HighPos})
 				default:
 					t.Fatalf("%s got nothing", name)
 				}
 			}
-			if len(ids) != 2 {
-				t.Fatalf("the two held batches went out with cycle ids %v; want two distinct ids", ids)
+			committed := 0
+			for _, d := range got {
+				cycles, known := c.staged.deliver(stagedRef("raw.orders", d.worker), d.id, []byte{1}, d.pos, "", nil)
+				if !known {
+					t.Fatalf("%s's delivery for cycle %d is unknown: it would be dropped with its rows", d.worker, d.id)
+				}
+				committed += len(cycles)
+			}
+			if committed == 0 || c.staged.len() != 0 {
+				t.Fatalf("after every delivery: %d cycle(s) committed, %d still open; want all committed", committed, c.staged.len())
 			}
 		})
 	}

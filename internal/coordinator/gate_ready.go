@@ -112,13 +112,37 @@ func (c *Coordinator) drainReadyWindow(ctx context.Context, key string) error {
 // A fresh meta per batch: enqueueBatch assigns the cycle id into it, and a
 // shared one would put every held batch in one cycle.
 func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, chunkID uint32, buf []*dataplane.Batch) error {
-	meta := &pb.BatchMeta{
+	return c.enqueueHeld(ctx, &pb.BatchMeta{
 		Table:  target,
 		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
-	}
-	for i, b := range buf {
-		if err := c.enqueueBatch(ctx, b, cloneBatchMeta(meta)); err != nil {
-			for _, rest := range buf[i+1:] {
+	}, buf)
+}
+
+// enqueueHeld sends a gate's held batches, in order, with meta's window tag.
+// They are consecutive batches of one table under one tag, so they go out
+// concatenated, up to cycleMaxRows rows and cycleMaxBytes bytes per batch
+// (coalesce.go): one held
+// batch per cycle made a window's drain hundreds of one-row commits (#437).
+// A fresh meta per sent batch: enqueueBatch assigns the cycle id into it.
+func (c *Coordinator) enqueueHeld(ctx context.Context, meta *pb.BatchMeta, buf []*dataplane.Batch) error {
+	for len(buf) > 0 {
+		n, rows, bytes := 0, int64(0), int64(0)
+		for n < len(buf) && c.fits(rows, bytes, buf[n].Record.NumRows(), batchBytes(buf[n])) {
+			rows += buf[n].Record.NumRows()
+			bytes += batchBytes(buf[n])
+			n++
+		}
+		group := buf[:n]
+		buf = buf[n:]
+		merged, err := concatSourceBatches(group)
+		for _, b := range group {
+			b.Release()
+		}
+		if err == nil {
+			err = c.enqueueBatch(ctx, merged, cloneBatchMeta(meta))
+		}
+		if err != nil {
+			for _, rest := range buf {
 				rest.Release()
 			}
 			return err
