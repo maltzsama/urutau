@@ -46,6 +46,7 @@
         <span class="pill" :class="statusClass(summary.status)" x-text="summary.status || 'unknown'"></span>
         <span class="small">Uptime <b x-text="uptime()"></b></span>
         <span class="small">Last poll <b x-text="lastPoll || '—'"></b></span>
+        <span class="small" title="coordinator version" x-text="summary.version ? 'v' + summary.version : 'dev'"></span>
         <span class="pill" :class="failures > 3 ? 'red' : 'amber'" x-show="failures > 0"
               x-text="'poll failures: ' + failures"></span>
         <button class="theme-toggle" type="button" @click="cycleTheme()"
