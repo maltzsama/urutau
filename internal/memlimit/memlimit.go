@@ -41,7 +41,7 @@ func Apply(log *slog.Logger) int64 {
 		}
 		limit, ok := parse(string(b))
 		if !ok {
-			return 0
+			continue // unlimited or unreadable here: the other version may set one
 		}
 		set := int64(float64(limit) * Fraction)
 		debug.SetMemoryLimit(set)

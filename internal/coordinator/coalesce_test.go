@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/maltzsama/urutau/core"
@@ -268,4 +269,29 @@ func TestCoalescedBatchesStayWithinTheByteBound(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A table's held batches leave pauseBuf when it resumes; if sending them
+// fails, they must be released, not dropped with their buffers.
+func TestFlushPausedReleasesHeldBatchesOnError(t *testing.T) {
+	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	c := gateStagedHarness(t)
+	held := func(id int64, pos string) *dataplane.Batch {
+		changes := []rowchange.Change{{
+			Op: rowchange.OpInsert, Table: "raw.nobody", Key: []any{id},
+			After: map[string]any{"id": id, "v": "x"}, Position: pos, IngestTS: time.Now(),
+		}}
+		rec, err := transport.RecordFromChanges(changes, transport.InferSchemaFromChanges(changes), alloc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &dataplane.Batch{Table: "raw.nobody", Record: rec, Watermark: []byte(pos), Mode: dataplane.UpsertMode}
+	}
+	c.pausedMu.Lock()
+	c.pauseBuf = map[string][]*dataplane.Batch{"raw.nobody": {held(1, "0/1"), held(2, "0/2"), held(3, "0/3")}}
+	c.pausedMu.Unlock()
+	if err := c.flushPaused(context.Background()); err == nil {
+		t.Fatal("flushPaused: want an error for a table no worker owns")
+	}
+	alloc.AssertSize(t, 0)
 }

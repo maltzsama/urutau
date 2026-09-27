@@ -140,13 +140,31 @@ func (c *Coordinator) flushPaused(ctx context.Context) error {
 		delete(c.pauseBuf, table)
 	}
 	c.pausedMu.Unlock()
+	// On an error, release every held batch not sent yet: they left pauseBuf,
+	// so nothing else ever would.
+	releaseHeld := func() {
+		for _, batches := range held {
+			for _, b := range batches {
+				b.Release()
+			}
+		}
+	}
 	for table, batches := range held {
+		delete(held, table)
 		// Batches accumulated before the pause are older than those it held.
 		if err := c.flushAccum(ctx, table); err != nil {
+			for _, b := range batches {
+				b.Release()
+			}
+			releaseHeld()
 			return fmt.Errorf("flush accumulated batches for %s: %w", table, err)
 		}
-		for _, b := range batches {
+		for i, b := range batches {
 			if err := c.enqueueBatch(ctx, b, nil); err != nil {
+				for _, rest := range batches[i+1:] {
+					rest.Release()
+				}
+				releaseHeld()
 				return fmt.Errorf("flush held batches for %s: %w", table, err)
 			}
 		}
