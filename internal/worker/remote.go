@@ -43,6 +43,7 @@ type RemoteConfig struct {
 	Sink        sink.Config // catalog access — workers own their writes
 	Namespace   string      // fallback namespace for bare targets
 	MaxRows     int
+	MaxBytes    int64
 	MaxInterval time.Duration
 	Logger      *slog.Logger
 	LogBuffer   *logging.Buffer
@@ -230,7 +231,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
-	w := New(Config{MaxRows: cfg.MaxRows, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
+	w := New(Config{MaxRows: cfg.MaxRows, MaxBytes: cfg.MaxBytes, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
 	// Installed BEFORE the assignment loop: SetStaged below refuses a staged
 	// table whose delivery callback is unset, so installing this afterwards
 	// failed every partitioned run on a staging sink at boot. It depends

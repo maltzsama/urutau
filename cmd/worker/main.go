@@ -56,6 +56,7 @@ type workerFlags struct {
 	scope        string
 	namespace    string
 	maxRows      int
+	maxBytesMi   int64
 	maxInterval  time.Duration
 	metricsAddr  string
 	pluginPaths  []string
@@ -121,6 +122,7 @@ func runCmd() *cobra.Command {
 	fl.StringVar(&f.scope, "scope", envOr("URUTAU_SINK_SCOPE", "PRINCIPAL_ROLE:ALL"), "catalog OAuth2 scope")
 	fl.StringVar(&f.namespace, "namespace", "raw", "fallback namespace for bare targets")
 	fl.IntVar(&f.maxRows, "max-rows", 10000, "flush the batch once this many rows are buffered (one Iceberg commit)")
+	fl.Int64Var(&f.maxBytesMi, "max-bytes-mi", 32, "flush the batch once its buffered rows hold this many MiB")
 	fl.DurationVar(&f.maxInterval, "max-interval", 2*time.Second, "flush cadence")
 	fl.StringVar(&f.metricsAddr, "metrics-addr", "", "serve /metrics on this address (optional)")
 	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
@@ -174,6 +176,7 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 			},
 		},
 		MaxRows:     f.maxRows,
+		MaxBytes:    f.maxBytesMi << 20,
 		MaxInterval: f.maxInterval,
 		Logger:      logger,
 		LogBuffer:   logBuffer,

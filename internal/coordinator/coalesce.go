@@ -11,6 +11,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 )
 
 // A staged table (several owners on a staging sink) commits one Iceberg
@@ -72,31 +73,8 @@ func (c *Coordinator) cycleMaxBytes() int64 {
 	return defaultCycleMaxBytes
 }
 
-// batchBytes is a batch's in-memory size, the byte bound's measure: the
-// length of every buffer of every column, child arrays included.
-func batchBytes(b *dataplane.Batch) int64 {
-	if b.Record == nil {
-		return 0
-	}
-	var n int64
-	for _, col := range b.Record.Columns() {
-		n += arrayDataBytes(col.Data())
-	}
-	return n
-}
-
-func arrayDataBytes(d arrow.ArrayData) int64 {
-	var n int64
-	for _, buf := range d.Buffers() {
-		if buf != nil {
-			n += int64(buf.Len())
-		}
-	}
-	for _, child := range d.Children() {
-		n += arrayDataBytes(child)
-	}
-	return n
-}
+// batchBytes is a batch's in-memory size, the byte bound's measure.
+func batchBytes(b *dataplane.Batch) int64 { return dpint.BatchBytes(b) }
 
 // fits reports whether a batch of rows/bytes may join one already holding
 // accRows/accBytes: always for the first, then within both bounds.
