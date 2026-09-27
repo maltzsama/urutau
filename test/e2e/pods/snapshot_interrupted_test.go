@@ -26,10 +26,18 @@ import (
 func TestSnapshotInterruptedAfterStreamCommits(t *testing.T) {
 	requirePods(t)
 	mysql, trino := setupPodEnv(t)
-	const pipeline = "pod-snap-interrupted"
+	runSnapshotInterrupted(t, mysql, trino, "pod-snap-interrupted", "2330")
+}
+
+// runSnapshotInterrupted is the P1 case on its own pipeline, shared with the
+// randomized boundary matrix.
+func runSnapshotInterrupted(t *testing.T, mysql, trino *sql.DB, pipeline, serverID string) {
+	t.Helper()
 	sfx := uniqueTarget("")[1:]
 	srcA, srcB := "snapint_a_"+sfx, "snapint_b_"+sfx
-	createOrdersLike(t, mysql, srcA, 20000)
+	// A is large enough, with the small chunk size below, that its snapshot
+	// outlasts B's first stream commits.
+	createOrdersLike(t, mysql, srcA, 100000)
 	createOrdersLike(t, mysql, srcB, 500)
 	t.Cleanup(func() {
 		if !t.Failed() {
@@ -53,7 +61,7 @@ func TestSnapshotInterruptedAfterStreamCommits(t *testing.T) {
 	stopWrites := sync.OnceFunc(func() { stop(); wg.Wait() })
 	t.Cleanup(stopWrites)
 
-	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", "2330", []tableSpec{
+	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, []tableSpec{
 		{Source: "shop." + srcA, Target: "raw." + srcA, PrimaryKey: []string{"id"}, Workers: 1},
 		{Source: "shop." + srcB, Target: "raw." + srcB, PrimaryKey: []string{"id"}, Workers: 1},
 	}, crOptions{SnapshotChunkSize: 100})
@@ -61,7 +69,12 @@ func TestSnapshotInterruptedAfterStreamCommits(t *testing.T) {
 	coord := waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)[0]
 	logs := followLogs(t, testNS, coord)
 	before := podRestarts(t, testNS, coord)
+	// The scenario is a table the stream committed to before its snapshot:
+	// arm the fault only once B holds a position, so its snapshot start is
+	// reached with one.
+	waitCommittedPosition(t, trino, srcB, 5*time.Minute)
 	armFault(t, testNS, coord, faultinject.CoordinatorSnapshotTableStart, "raw."+srcB)
+	reportBoundaryOnFailure(t, mysql, trino, pipeline, faultinject.CoordinatorSnapshotTableStart, srcA, srcB)
 	line := waitFaultFired(t, testNS, coord, logs, faultinject.CoordinatorSnapshotTableStart, before, 10*time.Minute)
 	t.Logf("fault fired: %s", line)
 
@@ -102,5 +115,20 @@ func createOrdersLike(t *testing.T, db *sql.DB, table string, n int) {
 		if _, err := db.Exec(b.String(), args...); err != nil {
 			t.Fatalf("seed %s: %v", table, err)
 		}
+	}
+}
+
+// waitCommittedPosition waits until a sink table holds a cdc.position.
+func waitCommittedPosition(t *testing.T, trino *sql.DB, table string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if pos, err := committedPosition(context.Background(), trino, table); err == nil && pos != "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never committed a position within %s", table, timeout)
+		}
+		time.Sleep(time.Second)
 	}
 }
