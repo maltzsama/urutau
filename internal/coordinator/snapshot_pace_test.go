@@ -65,7 +65,13 @@ func TestSnapshotChunksWaitForCommits(t *testing.T) {
 		done <- c.snapshotPartition(ctx, caughtUpReader{}, chunks, ref, source.Chunk{}, 0, w, snapshot.SnapshotConfig{})
 	}()
 
-	time.Sleep(300 * time.Millisecond)
+	// Wait for the paced requests, then long enough for any extra one to
+	// show: a fixed sleep alone fails on a slow machine (review of #453).
+	deadline := time.Now().Add(5 * time.Second)
+	for requested.Load() < maxUncommittedChunks && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
 	if got := requested.Load(); got != maxUncommittedChunks {
 		t.Fatalf("%d of %d chunks requested while none was committed; want %d", got, len(chunks), maxUncommittedChunks)
 	}
