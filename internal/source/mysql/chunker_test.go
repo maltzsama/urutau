@@ -14,12 +14,6 @@ func TestNormalize(t *testing.T) {
 	}
 }
 
-func TestPlaceholders(t *testing.T) {
-	if got := placeholders(3); got != "?, ?, ?" {
-		t.Fatalf("placeholders(3) = %q", got)
-	}
-}
-
 // The snapshot query parses in UTC; normalizeSnapshot re-tags naive temporals
 // into the operator's location so a snapshot row matches the CDC decode of the
 // same row (issue #139).

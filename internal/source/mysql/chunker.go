@@ -103,18 +103,24 @@ func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 // Scan executes the chunk SELECT (with the row-filter WHERE pushed — none
 // yet in this milestone) and calls fn for every row, keyed by column name.
 func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
-	// Row-constructor comparison keeps composite PKs lexicographic.
+	for _, k := range [][]any{ch.Low, ch.High} {
+		if k != nil && len(k) != len(c.pk) {
+			return fmt.Errorf("mysql: chunk scan: bound %v does not match the key %v", k, c.pk)
+		}
+	}
 	cond := make([]string, 0, 2)
-	args := make([]any, 0, 2*len(c.pk))
+	var args []any
 	cols := "`" + strings.Join(c.pk, "`, `") + "`"
 
 	if ch.Low != nil {
-		cond = append(cond, fmt.Sprintf("(%s) >= (%s)", cols, placeholders(len(c.pk))))
-		args = append(args, ch.Low...)
+		sql, a := keyBound(c.pk, ">", ">=", ch.Low)
+		cond = append(cond, sql)
+		args = append(args, a...)
 	}
 	if ch.High != nil {
-		cond = append(cond, fmt.Sprintf("(%s) < (%s)", cols, placeholders(len(c.pk))))
-		args = append(args, ch.High...)
+		sql, a := keyBound(c.pk, "<", "<", ch.High)
+		cond = append(cond, sql)
+		args = append(args, a...)
 	}
 	where := ""
 	if len(cond) > 0 {
@@ -171,6 +177,34 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 		}
 	}
 	return rows.Err()
+}
+
+// keyBound renders a lexicographic bound on the key columns pk, compared with
+// key: strict applies to every column but the last, last to the last. It is
+// the OR expansion of a row-constructor comparison, (a > ?) OR (a = ? AND
+// b >= ?), because MySQL 8.4 does not range-scan the primary key for
+// (a, b) >= (?, ?): every chunk read the whole table (#443).
+func keyBound(pk []string, strict, last string, key []any) (string, []any) {
+	terms := make([]string, 0, len(pk))
+	var args []any
+	for i := range pk {
+		op := strict
+		if i == len(pk)-1 {
+			op = last
+		}
+		parts := make([]string, 0, i+1)
+		for j := 0; j < i; j++ {
+			parts = append(parts, fmt.Sprintf("`%s` = ?", pk[j]))
+			args = append(args, key[j])
+		}
+		parts = append(parts, fmt.Sprintf("`%s` %s ?", pk[i], op))
+		args = append(args, key[i])
+		terms = append(terms, "("+strings.Join(parts, " AND ")+")")
+	}
+	if len(terms) == 1 {
+		return terms[0], args
+	}
+	return "(" + strings.Join(terms, " OR ") + ")", args
 }
 
 // dbTypeName returns column i's database type name (e.g. "DATETIME"), or "".
@@ -264,9 +298,4 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 		vals[i] = normalize(vals[i])
 	}
 	return vals, nil
-}
-
-// placeholders renders n comma-separated "?" placeholders.
-func placeholders(n int) string {
-	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }
