@@ -158,6 +158,12 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		// near 1.2 GiB, was OOM-killed in every snapshot and restarted it
 		// from scratch. The request stays at 2Gi; only the limit grows.
 		opts.WorkerMemoryOverhead = "3Gi"
+		// The race runtime multiplies the CPU the engine needs, too. At 1
+		// CPU the coordinator ran at 100% of its limit (12.7 of every 20 s
+		// throttled) catching up a DBLog window, and the window timed out
+		// at 5 min: the run restarted twice before its first chunk closed.
+		opts.CoordinatorCPU = "4"
+		opts.WorkerCPUOverhead = "1500m"
 	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
 	applyPipeline(t, testNS, pipeline, cr)
