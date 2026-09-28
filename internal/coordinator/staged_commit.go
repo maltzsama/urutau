@@ -82,13 +82,17 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 }
 
 // commitStagedCycle commits one complete cycle through the sink's
-// StagedCommitter, serialized per table. The commit position is the minimum
-// safe position over the cycle's deliveries: every partition's watermark is
-// durable in the same commit, so the lowest one is the new checkpoint floor.
+// StagedCommitter, serialized per table. A cycle of one source batch commits
+// the batch's last position: every partition received its whole share, so the
+// table is durable through it (#459). Any other cycle commits the minimum safe
+// position over its deliveries.
 func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
-	pos, err := c.minSafePositions(cy.positions)
-	if err != nil {
-		return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err)
+	pos := cy.batchPos
+	if pos == "" {
+		var err error
+		if pos, err = c.minSafePositions(cy.positions); err != nil {
+			return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err)
+		}
 	}
 	committer, ok := c.snk.(sink.StagedCommitter)
 	if !ok {

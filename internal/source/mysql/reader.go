@@ -90,6 +90,10 @@ type Reader struct {
 	done     chan struct{}
 	doneOnce sync.Once
 
+	// txnRows reports whether the transaction being decoded emitted a row
+	// yet. Only canal's event goroutine reads and writes it.
+	txnRows bool
+
 	canal.DummyEventHandler // unimplemented hooks are no-ops
 }
 
@@ -414,10 +418,26 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 func (r *Reader) emit(c rowchange.Change) error {
 	select {
 	case r.out <- c:
+		if c.Op != rowchange.OpTxnEnd {
+			r.txnRows = true
+		}
 		return nil
 	case <-r.done:
 		return errReaderStopped
 	}
+}
+
+// OnPosSynced marks the end of a transaction: canal calls it after an XID
+// event, a non-transactional COMMIT and a DDL. A transaction that emitted
+// rows is then closed with OpTxnEnd, so the puller never batches part of it
+// (#456). Canal.Close also calls it, with a nil header, from outside the
+// event goroutine and possibly mid-transaction: that call ends nothing.
+func (r *Reader) OnPosSynced(header *replication.EventHeader, _ gomysql.Position, _ gomysql.GTIDSet, _ bool) error {
+	if header == nil || !r.txnRows {
+		return nil
+	}
+	r.txnRows = false
+	return r.emit(rowchange.Change{Op: rowchange.OpTxnEnd})
 }
 
 // errReaderStopped is emit's sentinel for "the reader is shutting down" —

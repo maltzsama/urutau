@@ -26,12 +26,31 @@ func TestProductionReadinessWorkload(t *testing.T) {
 
 // TestProductionReadinessChaos is the workload with the nondeterministic
 // Chaos Mesh controller (issue #385) injecting faults into the live
-// coordinator and worker Pods throughout the live window. The pass
-// condition is the workload's own: after the faults stop, every table
-// converges to MySQL exactly, and every experiment was injected and removed.
-// URUTAU_E2E_SEED seeds the fault stream too.
+// coordinator and worker Pods throughout the profile's whole live window,
+// while KEDA scales the partitioned tables out and in (live re-slicing) and
+// every maintenance operation runs, as in TestProductionReadinessMatrix. It
+// passes on the matrix's conditions: every table converges to MySQL exactly,
+// KEDA scaled out and back in, maintenance compacted, expired and cleaned,
+// and every experiment was injected and removed. URUTAU_E2E_SEED seeds the
+// fault stream too.
 func TestProductionReadinessChaos(t *testing.T) {
-	runProductionReadiness(t, prOptions{pipeline: "pod-pr-chaos", serverID: "2321", chaos: true})
+	var m *matrixSampler
+	runProductionReadiness(t, prOptions{
+		pipeline: "pod-pr-chaos", serverID: "2321", chaos: true,
+		kedaMax: 4, maintenance: matrixMaintenance,
+		onLive: func(ctx context.Context, r *prRun) {
+			m = newMatrixSampler(r)
+			if err := m.plantOrphan(ctx); err != nil {
+				r.t.Fatalf("plant orphan: %v", err)
+			}
+			r.t.Logf("planted orphan %s", m.orphan)
+			m.start(ctx)
+		},
+		afterSettle: func(ctx context.Context, r *prRun) {
+			m.stop()
+			m.check(ctx)
+		},
+	})
 }
 
 // prOptions shapes one production-readiness run.

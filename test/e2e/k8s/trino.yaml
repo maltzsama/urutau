@@ -27,6 +27,9 @@ spec:
           volumeMounts:
             - name: catalog
               mountPath: /etc/trino/catalog
+            - name: config
+              mountPath: /etc/trino/config.properties
+              subPath: config.properties
           readinessProbe:
             httpGet:
               path: /v1/info
@@ -36,18 +39,23 @@ spec:
             failureThreshold: 60
           # The production-readiness settle reads whole merge-on-read tables
           # (many equality-delete files) every poll; at 2Gi Trino was
-          # OOMKilled mid-settle (#386).
+          # OOMKilled mid-settle (#386). 8Gi gives a 6.4 GB heap: the 3 GB
+          # per-query limit (../trino/config.properties) plus Trino's 30%
+          # heap headroom.
           resources:
             requests:
               cpu: 500m
               memory: 2Gi
             limits:
               cpu: "2"
-              memory: 6Gi
+              memory: 8Gi
       volumes:
         - name: catalog
           configMap:
             name: trino-catalog
+        - name: config
+          configMap:
+            name: trino-config
 ---
 apiVersion: v1
 kind: Service

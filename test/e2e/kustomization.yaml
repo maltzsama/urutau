@@ -31,3 +31,6 @@ configMapGenerator:
   - name: trino-catalog
     files:
       - iceberg.properties=trino/catalog/iceberg.properties
+  - name: trino-config
+    files:
+      - config.properties=trino/config.properties

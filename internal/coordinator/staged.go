@@ -17,10 +17,16 @@ type stagedCycle struct {
 	seq         uint64
 	expected    int
 	owners      map[string]bool // workers whose delivery this cycle needs
+	delivered   map[string]bool // owners whose delivery arrived
 	descriptors [][]byte
 	positions   []string
-	state       string
-	pending     []uint32
+	// batchPos is the source batch's last position, when the cycle holds
+	// every partition's share of one batch: the table is then durable
+	// through it once the cycle commits (#459). Empty for a cycle opened
+	// without it; the commit then falls back to the deliveries' minimum.
+	batchPos string
+	state    string
+	pending  []uint32
 }
 
 // stagedCycles tracks open cycles keyed by (table, seq). Cycles of one table
@@ -101,6 +107,12 @@ func ownerNames(m map[string]bool) []string {
 // sub-batch was sent to (a partition with no rows is not sent, so its worker
 // is not expected).
 func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
+	s.expectAt(ref, seq, owners, "")
+}
+
+// expectAt is expect for a cycle that carries every partition's share of one
+// source batch, whose last position is batchPos.
+func (s *stagedCycles) expectAt(ref core.TableRef, seq uint64, owners []string, batchPos string) {
 	if s == nil || len(owners) == 0 {
 		return
 	}
@@ -114,7 +126,7 @@ func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
 	for _, o := range owners {
 		own[o] = true
 	}
-	s.open[k] = &stagedCycle{ref: ref, seq: seq, expected: len(owners), owners: own}
+	s.open[k] = &stagedCycle{ref: ref, seq: seq, expected: len(owners), owners: own, batchPos: batchPos}
 	s.order[ref.Target] = append(s.order[ref.Target], seq)
 }
 
@@ -145,6 +157,19 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 			descriptors: [][]byte{desc}, positions: []string{pos},
 			state: state, pending: pending,
 		}}, true
+	}
+	// One delivery per expected owner: an owner's second delivery of the
+	// cycle (a redelivery after a session reset), or one from a worker the
+	// cycle was not sent to, must not stand in for another owner's and
+	// commit the cycle without its rows.
+	if ref.Owner != "" {
+		if !cy.owners[ref.Owner] || cy.delivered[ref.Owner] {
+			return nil, true
+		}
+		if cy.delivered == nil {
+			cy.delivered = make(map[string]bool, cy.expected)
+		}
+		cy.delivered[ref.Owner] = true
 	}
 	cy.descriptors = append(cy.descriptors, desc)
 	cy.positions = append(cy.positions, pos)
