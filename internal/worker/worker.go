@@ -168,6 +168,10 @@ type Ingest struct {
 	// sent ahead of it. The worker commits cdc.snapshot.state=complete after
 	// them, at Position, as the marker's cycle on a staged table (#428).
 	SnapshotDone bool
+	// SnapshotPending, on a Closes marker, is the table's snapshot chunks
+	// still to do after this window: the window's rows commit with them as
+	// cdc.snapshot.pending, state in_progress (issue #461).
+	SnapshotPending []uint32
 }
 
 // New builds a worker; register tables before Run.
@@ -685,9 +689,9 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		inSnapshot := p.snapshotState == string(snapshot.StateInProgress)
 		guard := p.bootstrapGuard
 		resumed := p.snapshotResumed
-		snapState := p.snapshotState
-		snapPending := p.snapshotPending
+		snapState, snapPending := p.snapshotState, p.snapshotPending
 		p.snapshotMu.Unlock()
+		snapState, snapPending = flushSnapshotProgress(snapState, snapPending, pending, merged)
 
 		defer func() {
 			merged.Release()
@@ -917,6 +921,39 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	}
 }
 
+// carrySnapshotPending gives a window's batch the snapshot chunks its Closes
+// marker names as still to do, with state in_progress: they commit with the
+// window's rows, so a restarted coordinator resumes there (#461).
+func carrySnapshotPending(b *dataplane.Batch, ing Ingest) {
+	if b != nil && ing.SnapshotPending != nil {
+		b.SnapshotState, b.SnapshotPending = string(snapshot.StateInProgress), ing.SnapshotPending
+	}
+}
+
+// flushSnapshotProgress is the snapshot state a flush commits. A pipeline
+// without its own (a coordinator's worker) commits the progress its windows'
+// Closes markers carried: the last window's, whose rows commit with every
+// earlier one (#461).
+func flushSnapshotProgress(state string, pending []uint32, batches []*dataplane.Batch, merged *dataplane.Batch) (string, []uint32) {
+	if state != "" {
+		return state, pending
+	}
+	state, pending = batchSnapshotProgress(batches)
+	merged.SnapshotState, merged.SnapshotPending = state, pending
+	return state, pending
+}
+
+// batchSnapshotProgress returns the snapshot state and pending chunks the last
+// of batches carrying them names, or none.
+func batchSnapshotProgress(batches []*dataplane.Batch) (string, []uint32) {
+	for i := len(batches) - 1; i >= 0; i-- {
+		if batches[i].SnapshotState != "" {
+			return batches[i].SnapshotState, batches[i].SnapshotPending
+		}
+	}
+	return "", nil
+}
+
 // collapseAndSend collapses one batch columnar and sends the merged single
 // batch to the committer.
 func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, rows int, pos string, ready func(*dataplane.Batch, int, int, int) error) (upCount, delCount int, err error) {
@@ -924,6 +961,9 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	snapState := p.snapshotState
 	snapPending := p.snapshotPending
 	p.snapshotMu.Unlock()
+	if snapState == "" {
+		snapState, snapPending = b.SnapshotState, b.SnapshotPending
+	}
 	upserts, deletes, cerr := dpint.Collapse(ctx, nil, b, p.knownSchema.PrimaryKey)
 	if cerr != nil {
 		return 0, 0, fmt.Errorf("worker: table %s: collapse: %w", p.target, cerr)
@@ -1009,6 +1049,7 @@ func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
 	if err != nil {
 		return nil, err
 	}
+	carrySnapshotPending(out, ing)
 	return out, nil
 }
 

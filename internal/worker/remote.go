@@ -753,9 +753,10 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 	case meta.Window != nil && meta.Window.Closes:
 		b.Release()
 		ing := Ingest{
-			Table:    meta.Table,
-			Win:      &rowchange.Window{Closes: true, ChunkID: meta.Window.ChunkId},
-			Position: meta.LowPos,
+			Table:           meta.Table,
+			Win:             &rowchange.Window{Closes: true, ChunkID: meta.Window.ChunkId},
+			Position:        meta.LowPos,
+			SnapshotPending: meta.Window.SnapshotPending,
 		}
 		// On a staged table the marker is a cycle of the coordinator's send
 		// order, and the window's rows are delivered as that cycle.

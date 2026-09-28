@@ -335,6 +335,10 @@ type Coordinator struct {
 	// chunks on commits (snapshot_pace.go).
 	chunkMarkersMu sync.Mutex
 	chunkMarkers   map[string][]chunkMarker
+	// snapshotTodo is each snapshotting table's chunks still to do
+	// (snapshotPlan); read-only once set.
+	snapshotTodoMu sync.Mutex
+	snapshotTodo   map[string]map[uint32]bool
 
 	// confirmed tracks the latest position each WORKER durably committed
 	// (from worker Acks). The minimum across workers is reported to the
@@ -1644,11 +1648,12 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	// chunks at snapshot time), unlike at boot, where an owner with no
 	// position could equally be one interrupted mid-snapshot (whose partition
 	// MUST re-snapshot, not be resumed past). WK-001 §2.6.
-	bounds, err := chunker.Bounds(ctx)
+	allChunks, todo, err := c.snapshotPlan(ctx, chunker, ref, ranges)
 	if err != nil {
 		return err
 	}
-	allChunks := snapshot.Chunks(bounds)
+	c.setSnapshotTodo(ref.Target, todo)
+	defer c.setSnapshotTodo(ref.Target, nil)
 	var emptyOwners []string
 	for p, w := range owners {
 		clipped, err := clipChunksToRange(allChunks, ranges[p])
@@ -1698,9 +1703,14 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 	windows := map[uint32]int{} // window id → chunk index, this partition
 	var epoch uint64
 	haveEpoch := false
+	todo := c.snapshotTodoFor(ref.Target)
 	for i := 0; i < len(chunks); {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if todo != nil && !todo[chunkRef(partition, i)] {
+			i++ // committed before a coordinator restart: resumed past
+			continue
 		}
 		if err := c.awaitReattached(ctx, w); err != nil {
 			return err
@@ -1740,7 +1750,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		chunkCtx, cancel := context.WithTimeout(ctx, timeout)
 		err := c.awaitChunkCommits(chunkCtx, w.name, maxUncommittedChunks, lost)
 		if err == nil {
-			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], window, epoch, lost)
+			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], window, epoch, lost, pendingAfter(todo, partition, i))
 		}
 		if err == nil && i == len(chunks)-1 {
 			// The partition's last chunk: its windows must all be committed
@@ -1774,7 +1784,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 // the worker's ChunkReady, prove the reader caught up, then release the gated
 // live rows and the Closes marker. ctx carries the watchdog deadline, so a
 // worker that never acks the chunk fails the run instead of wedging it.
-func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, epoch uint64, lost <-chan struct{}) error {
+func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, epoch uint64, lost <-chan struct{}, pending []uint32) error {
 	boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
 	if err != nil {
 		return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
@@ -1818,7 +1828,7 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
 		return err
 	}
-	return c.sendCloses(ctx, w, ref.Target, at, chunkID)
+	return c.sendClosesPending(ctx, w, ref.Target, at, chunkID, pending)
 }
 
 // sendCloses queues a chunk's Closes marker for its partition's worker —
@@ -1832,10 +1842,17 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 // table's committed position past live cycles still open, and a crash would
 // then take their replay for covered.
 func (c *Coordinator) sendCloses(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32) error {
+	return c.sendClosesPending(ctx, w, target, at, chunkID, nil)
+}
+
+// sendClosesPending is sendCloses naming the table's snapshot chunks still to
+// do after this window, which the worker commits with the window's rows so a
+// restarted coordinator resumes there (issue #461).
+func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32, pending []uint32) error {
 	meta := &pb.BatchMeta{
 		Table:  target,
 		LowPos: at.String(),
-		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
+		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID, SnapshotPending: pending},
 	}
 	if c.stagesCycles() && c.isStagedTable(target) {
 		meta.BatchId = c.batchSeq.Add(1)
