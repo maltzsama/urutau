@@ -125,12 +125,12 @@ type Config struct {
 	AckTimeout  time.Duration
 	MaxResets   int
 	ResetWindow time.Duration
-	// MaxLossesWithoutProgress ends the run once one worker is lost that
-	// many times in a row with no committed progress in between (default
-	// 3, recovery.go). WorkerAbsenceTimeout ends it once a lost worker has
-	// not reconnected for that long (default 5m).
-	MaxLossesWithoutProgress int
-	WorkerAbsenceTimeout     time.Duration
+	// MaxConsecutiveCrashes ends the run once one worker crashes that many
+	// times in a row without delivering what it owed (default 3,
+	// recovery.go). WorkerDeliveryTimeout ends it once a worker owing work
+	// has delivered none of it for that long (default 5m).
+	MaxConsecutiveCrashes int
+	WorkerDeliveryTimeout time.Duration
 
 	// ScaleDrainTimeout bounds how long a re-slice waits for a table's
 	// open staged cycles, and for a removed owner's in-flight batches, to
@@ -335,6 +335,12 @@ type Coordinator struct {
 	// chunks on commits (snapshot_pace.go).
 	chunkMarkersMu sync.Mutex
 	chunkMarkers   map[string][]chunkMarker
+	// lostWindows are the chunk windows each lost worker had not
+	// committed, taken at the loss (recovery.go); under chunkMarkersMu.
+	lostWindows map[string][]chunkMarker
+	// podTermination reads a worker's last container termination; nil
+	// reads it from Kubernetes (recovery.go). Set by tests.
+	podTermination func(worker string) (podTermination, bool)
 	// snapshotTodo is each snapshotting table's chunks still to do
 	// (snapshotPlan); read-only once set.
 	snapshotTodoMu sync.Mutex
@@ -1204,10 +1210,10 @@ func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, 
 // supervisionConfig maps the Config knobs to the supervisor defaults.
 func supervisionConfig(cfg Config) SupervisorConfig {
 	return SupervisorConfig{
-		AckTimeout:     cfg.AckTimeout,
-		MaxResets:      cfg.MaxResets,
-		ResetWindow:    cfg.ResetWindow,
-		AbsenceTimeout: cfg.WorkerAbsenceTimeout,
+		AckTimeout:      cfg.AckTimeout,
+		MaxResets:       cfg.MaxResets,
+		ResetWindow:     cfg.ResetWindow,
+		DeliveryTimeout: cfg.WorkerDeliveryTimeout,
 	}
 }
 
@@ -1973,7 +1979,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// A partition owner whose Pod died is routed to all the same: its queue
 	// is kept and redelivered when the Pod reconnects (issue #461), and its
 	// cycles stay open until then, so no later cycle commits over the gap.
-	// An owner that never comes back ends the run at the absence timeout
+	// An owner that never comes back ends the run at the delivery timeout
 	// (supervisor.tick).
 
 	if len(owners) == 1 {
@@ -2870,11 +2876,10 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	}
 	c.mu.Unlock()
 	if known {
-		// noteAttach takes the supervisor lock; calling it under c.mu would
-		// invert the order supervisor.tick uses (supervisor.mu → c.mu) and
-		// deadlock the two (audit #3).
-		c.supervisor.noteAttach(hello.WorkerName)
-		c.pushDashState() // the worker attached
+		if err := c.onAttach(hello.WorkerName); err != nil {
+			sessCancel()
+			return err
+		}
 	}
 	if !known {
 		sessCancel()
@@ -2972,7 +2977,7 @@ var errSessionReset = errors.New("session reset")
 // Pod comes back under the same name, reconnects, and is redelivered what it
 // owed. The session's end only ends the run when the worker reported an
 // error itself (schema drift, a failed commit), or when the same worker is
-// lost maxLossesWithoutProgress times in a row with no committed progress in
+// lost maxConsecutiveCrashes times in a row with no committed progress in
 // between (a crash loop). See recovery.go.
 func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
 	c.pushDashState() // the worker is no longer attached

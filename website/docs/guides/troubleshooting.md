@@ -130,10 +130,11 @@ work, so the coordinator resets it and redelivers what it owed. A few resets
 are normal (a worker restart); a steady stream means the worker is slow or
 dying — usually the sink, not the network.
 
-**Fix** — check the sink. The job ends by design when the same worker is
-lost `--max-losses-without-progress` times in a row without committing
-anything, or stays gone for `--worker-absence-timeout`; the error names the
-worker and the Pod's last termination reason (for example `OOMKilled`).
+**Fix** — check the sink. The job ends by design when the same worker
+crashes `--max-consecutive-crashes` times in a row without delivering what
+it owed, or delivers nothing of the work it owes for
+`--worker-delivery-timeout`; the error names the worker and the Pod's last
+termination reason (for example `OOMKilled`).
 Tune those in
 [Reliability](reliability.md#supervision-the-coordinator-heals-workers).
 

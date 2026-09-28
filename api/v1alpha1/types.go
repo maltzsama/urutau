@@ -114,15 +114,16 @@ type SnapshotSpec struct {
 }
 
 // SupervisionSpec tunes worker supervision. A lost worker is recovered, and
-// the job ends only once one worker is lost MaxLossesWithoutProgress times in
-// a row with no committed progress, or stays gone for WorkerAbsenceTimeout.
+// the job ends only once one worker crashes MaxConsecutiveCrashes times in a
+// row without delivering what it owed, or delivers nothing of the work it owes
+// for WorkerDeliveryTimeout.
 // MaxResets and Window are deprecated and ignored.
 type SupervisionSpec struct {
-	AckTimeout               string `json:"ackTimeout,omitempty"`
-	MaxResets                int    `json:"maxResets,omitempty"`
-	Window                   string `json:"window,omitempty"`
-	MaxLossesWithoutProgress int    `json:"maxLossesWithoutProgress,omitempty"`
-	WorkerAbsenceTimeout     string `json:"workerAbsenceTimeout,omitempty"`
+	AckTimeout            string `json:"ackTimeout,omitempty"`
+	MaxResets             int    `json:"maxResets,omitempty"`
+	Window                string `json:"window,omitempty"`
+	MaxConsecutiveCrashes int    `json:"maxConsecutiveCrashes,omitempty"`
+	WorkerDeliveryTimeout string `json:"workerDeliveryTimeout,omitempty"`
 }
 
 // WorkerDefaults is the resource default for every worker Deployment —

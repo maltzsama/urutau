@@ -19,11 +19,11 @@ func supervisionArgs(sup urutauv1alpha1.SupervisionSpec) []string {
 	if sup.Window != "" {
 		args = append(args, "--reset-window", sup.Window)
 	}
-	if sup.MaxLossesWithoutProgress > 0 {
-		args = append(args, "--max-losses-without-progress", strconv.Itoa(sup.MaxLossesWithoutProgress))
+	if sup.MaxConsecutiveCrashes > 0 {
+		args = append(args, "--max-consecutive-crashes", strconv.Itoa(sup.MaxConsecutiveCrashes))
 	}
-	if sup.WorkerAbsenceTimeout != "" {
-		args = append(args, "--worker-absence-timeout", sup.WorkerAbsenceTimeout)
+	if sup.WorkerDeliveryTimeout != "" {
+		args = append(args, "--worker-delivery-timeout", sup.WorkerDeliveryTimeout)
 	}
 	return args
 }

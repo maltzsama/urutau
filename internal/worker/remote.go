@@ -149,7 +149,7 @@ func workerHandshake(ctx context.Context, conn *grpc.ClientConn, name string, lo
 		last = err
 		log.Warn("worker: handshake retry", "attempt", attempt+1, "err", err)
 	}
-	return nil, nil, fmt.Errorf("worker: handshake: %w", last)
+	return nil, nil, CoordinatorLost(fmt.Errorf("worker: handshake: %w", last))
 }
 
 // sessionWithRetry opens the Session stream, tolerating a coordinator that
@@ -583,7 +583,7 @@ func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.
 		case <-runErr:
 		case <-time.After(5 * time.Second):
 		}
-		return fmt.Errorf("worker: channel lost: %w", cause)
+		return CoordinatorLost(fmt.Errorf("worker: channel lost: %w", cause))
 	}
 
 	// Graceful: drain whatever is buffered; pipeCtx is still alive unless
