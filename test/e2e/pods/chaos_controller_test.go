@@ -273,9 +273,14 @@ const kubectlTimeout = 2 * time.Minute
 // kubectlCmd runs kubectl without a *testing.T, for the controller's own
 // goroutines: a failure is an error to record, not a test abort.
 func kubectlCmd(stdin string, args ...string) (string, error) {
+	return kubectlCmdBy(time.Now().Add(kubectlTimeout), stdin, args...)
+}
+
+// kubectlCmdBy is kubectlCmd bounded by until instead of kubectlTimeout.
+func kubectlCmdBy(until time.Time, stdin string, args ...string) (string, error) {
 	// Bounded: a hung API server or deletion must not hang the experiment
 	// goroutine, and with it stop() and the test's cleanup.
-	ctx, cancel := context.WithTimeout(context.Background(), kubectlTimeout)
+	ctx, cancel := context.WithDeadline(context.Background(), until)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	if stdin != "" {
@@ -470,12 +475,13 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 		// work) fails in chaos-daemon ("container is not running"), and
 		// Chaos Mesh backs its retries off past the fault's duration (#458).
 		// A fresh resource retries at once. A failed delete is retried on
-		// the next poll; its error is reported if the deadline passes.
+		// the next poll; its error is reported if the deadline passes. Both
+		// commands end by the deadline, so stop() is never held past it.
 		if isNetworkFault(d.Kind) && time.Since(applied) > networkReapplyAfter {
-			if _, derr := kubectlCmd("", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); derr != nil {
+			if _, derr := kubectlCmdBy(deadline, "", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); derr != nil {
 				reapplyErr = derr
 			} else {
-				if _, aerr := kubectlCmd(manifest, "apply", "-f", "-"); aerr != nil {
+				if _, aerr := kubectlCmdBy(deadline, manifest, "apply", "-f", "-"); aerr != nil {
 					record(aerr)
 					return
 				}

@@ -17,6 +17,7 @@ type stagedCycle struct {
 	seq         uint64
 	expected    int
 	owners      map[string]bool // workers whose delivery this cycle needs
+	delivered   map[string]bool // owners whose delivery arrived
 	descriptors [][]byte
 	positions   []string
 	// batchPos is the source batch's last position, when the cycle holds
@@ -156,6 +157,18 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 			descriptors: [][]byte{desc}, positions: []string{pos},
 			state: state, pending: pending,
 		}}, true
+	}
+	// One delivery per owner: an owner's second delivery of the cycle (a
+	// redelivery after a session reset) must not stand in for another
+	// owner's and commit the cycle without its rows.
+	if ref.Owner != "" {
+		if cy.delivered[ref.Owner] {
+			return nil, true
+		}
+		if cy.delivered == nil {
+			cy.delivered = make(map[string]bool, cy.expected)
+		}
+		cy.delivered[ref.Owner] = true
 	}
 	cy.descriptors = append(cy.descriptors, desc)
 	cy.positions = append(cy.positions, pos)

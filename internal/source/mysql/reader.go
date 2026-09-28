@@ -430,9 +430,10 @@ func (r *Reader) emit(c rowchange.Change) error {
 // OnPosSynced marks the end of a transaction: canal calls it after an XID
 // event, a non-transactional COMMIT and a DDL. A transaction that emitted
 // rows is then closed with OpTxnEnd, so the puller never batches part of it
-// (#456).
-func (r *Reader) OnPosSynced(*replication.EventHeader, gomysql.Position, gomysql.GTIDSet, bool) error {
-	if !r.txnRows {
+// (#456). Canal.Close also calls it, with a nil header, from outside the
+// event goroutine and possibly mid-transaction: that call ends nothing.
+func (r *Reader) OnPosSynced(header *replication.EventHeader, _ gomysql.Position, _ gomysql.GTIDSet, _ bool) error {
+	if header == nil || !r.txnRows {
 		return nil
 	}
 	r.txnRows = false

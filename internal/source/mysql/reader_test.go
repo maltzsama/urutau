@@ -754,7 +754,7 @@ func TestTransactionEndFollowsItsRows(t *testing.T) {
 	out := make(chan rowchange.Change, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:1-9"
-	if err := r.OnPosSynced(nil, gomysql.Position{}, nil, false); err != nil {
+	if err := r.OnPosSynced(&replication.EventHeader{}, gomysql.Position{}, nil, false); err != nil {
 		t.Fatalf("OnPosSynced: %v", err)
 	}
 	e := &canal.RowsEvent{
@@ -765,7 +765,7 @@ func TestTransactionEndFollowsItsRows(t *testing.T) {
 	if err := r.OnRow(e); err != nil {
 		t.Fatalf("OnRow: %v", err)
 	}
-	if err := r.OnPosSynced(nil, gomysql.Position{}, nil, false); err != nil {
+	if err := r.OnPosSynced(&replication.EventHeader{}, gomysql.Position{}, nil, false); err != nil {
 		t.Fatalf("OnPosSynced: %v", err)
 	}
 	var ops []rowchange.Op
@@ -775,5 +775,32 @@ func TestTransactionEndFollowsItsRows(t *testing.T) {
 	want := []rowchange.Op{rowchange.OpInsert, rowchange.OpInsert, rowchange.OpTxnEnd}
 	if !slices.Equal(ops, want) {
 		t.Fatalf("emitted %v, want %v", ops, want)
+	}
+}
+
+// Canal.Close calls OnPosSynced with a nil header, outside the event
+// goroutine and possibly mid-transaction. That call ends no transaction: a
+// transaction end there would release part of one to a batch (#456).
+func TestShutdownSyncEndsNoTransaction(t *testing.T) {
+	out := make(chan rowchange.Change, 8)
+	r := newTestReader(out)
+	r.curGTID = "u:1-9"
+	e := &canal.RowsEvent{
+		Table:  ordersTable(),
+		Action: canal.InsertAction,
+		Rows:   [][]any{{int64(1), []byte("a"), 1.0}},
+	}
+	if err := r.OnRow(e); err != nil {
+		t.Fatalf("OnRow: %v", err)
+	}
+	if err := r.OnPosSynced(nil, gomysql.Position{}, nil, true); err != nil {
+		t.Fatalf("OnPosSynced: %v", err)
+	}
+	var ops []rowchange.Op
+	for len(out) > 0 {
+		ops = append(ops, (<-out).Op)
+	}
+	if !slices.Equal(ops, []rowchange.Op{rowchange.OpInsert}) {
+		t.Fatalf("emitted %v, want only the row: the shutdown sync must not end the transaction", ops)
 	}
 }

@@ -296,3 +296,20 @@ func (s *stagedCycles) len() int {
 	defer s.mu.Unlock()
 	return len(s.open) + len(s.done)
 }
+
+// A cycle completes once every expected owner delivered, not after as many
+// deliveries: an owner delivering the same cycle twice (a redelivery after a
+// session reset) must not commit it without the other owner's rows.
+func TestStagedCycleCountsOwnersNotDeliveries(t *testing.T) {
+	s := newStagedCycles()
+	s.expect(core.TableRef{Target: "t"}, 1, []string{"a", "b"})
+	if c, _ := s.deliver(core.TableRef{Target: "t", Owner: "a"}, 1, []byte{1}, "0/10", "", nil); len(c) != 0 {
+		t.Fatal("the cycle completed with one of two owners")
+	}
+	if c, known := s.deliver(core.TableRef{Target: "t", Owner: "a"}, 1, []byte{1}, "0/10", "", nil); len(c) != 0 || !known {
+		t.Fatalf("a's second delivery: committable=%d known=%v; want the cycle still waiting for b", len(c), known)
+	}
+	if c, _ := s.deliver(core.TableRef{Target: "t", Owner: "b"}, 1, []byte{2}, "0/20", "", nil); len(c) != 1 || len(c[0].descriptors) != 2 {
+		t.Fatalf("b's delivery: committable=%v; want the cycle with a's and b's descriptors", c)
+	}
+}
