@@ -451,6 +451,7 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 
 	deadline := time.Now().Add(90 * time.Second)
 	applied := time.Now()
+	var reapplyErr error
 	for {
 		out, err := kubectlCmd("", "-n", c.ns, "get", resource, ev.Name, "-o",
 			`jsonpath={.status.conditions[?(@.type=="AllInjected")].status}`)
@@ -461,16 +462,19 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 			break
 		}
 		if time.Now().After(deadline) {
-			record(fmt.Errorf("not injected within 90s after %d re-apply(s) (last %q, %v)", ev.Reapplied, out, err))
+			record(fmt.Errorf("not injected within 90s after %d re-apply(s) (last %q, %v; last re-apply error: %v)", ev.Reapplied, out, err, reapplyErr))
 			return
 		}
 		// A network fault whose target container is restarting (the
 		// coordinator exits for a clean replay when a worker dies owing
 		// work) fails in chaos-daemon ("container is not running"), and
 		// Chaos Mesh backs its retries off past the fault's duration (#458).
-		// A fresh resource retries at once.
+		// A fresh resource retries at once. A failed delete is retried on
+		// the next poll; its error is reported if the deadline passes.
 		if isNetworkFault(d.Kind) && time.Since(applied) > networkReapplyAfter {
-			if _, derr := kubectlCmd("", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); derr == nil {
+			if _, derr := kubectlCmd("", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); derr != nil {
+				reapplyErr = derr
+			} else {
 				if _, aerr := kubectlCmd(manifest, "apply", "-f", "-"); aerr != nil {
 					record(aerr)
 					return
@@ -478,8 +482,8 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 				c.mu.Lock()
 				ev.Reapplied++
 				c.mu.Unlock()
+				applied = time.Now()
 			}
-			applied = time.Now()
 		}
 		select {
 		case <-ctx.Done():

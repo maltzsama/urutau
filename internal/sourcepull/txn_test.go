@@ -3,9 +3,9 @@ package sourcepull
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
@@ -53,7 +53,22 @@ func TestBatchHoldsWholeTransactions(t *testing.T) {
 	}
 }
 
-// Rows of a transaction still open are never batched: Next waits for its end.
+// drained collects the rows of every batch Drain emits.
+func drained(t *testing.T, p *Puller) []int64 {
+	t.Helper()
+	var rows []int64
+	if err := p.Drain(context.Background(), func(b *dataplane.Batch) error {
+		rows = append(rows, b.Record.NumRows())
+		b.Release()
+		return nil
+	}); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	return rows
+}
+
+// Rows of a transaction still open are never batched; its end releases them
+// all in one batch.
 func TestOpenTransactionIsNotBatched(t *testing.T) {
 	ch := make(chan rowchange.Change, 1000)
 	p := New(ch)
@@ -62,30 +77,29 @@ func TestOpenTransactionIsNotBatched(t *testing.T) {
 	for _, c := range txnRows("a", "g:1-5", 0, 150) {
 		ch <- c
 	}
-
-	type result struct {
-		rows int64
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		b, err := p.Next(context.Background())
-		if err != nil {
-			done <- result{err: err}
-			return
-		}
-		done <- result{rows: b.Record.NumRows()}
-		b.Release()
-	}()
-	select {
-	case r := <-done:
-		t.Fatalf("Next returned %d rows (err %v) while the transaction was open", r.rows, r.err)
-	case <-time.After(200 * time.Millisecond):
+	if rows := drained(t, p); len(rows) != 0 {
+		t.Fatalf("batches of %v rows emitted while the transaction was open", rows)
 	}
 	ch <- rowchange.Change{Op: rowchange.OpTxnEnd}
-	r := <-done
-	if r.err != nil || r.rows != 150 {
-		t.Fatalf("after the transaction ended: rows=%d err=%v, want all 150", r.rows, r.err)
+	if rows := drained(t, p); len(rows) != 1 || rows[0] != 150 {
+		t.Fatalf("after the transaction ended: batches of %v rows, want one of 150", rows)
+	}
+}
+
+// A stream that ends inside a transaction batches nothing of it: the
+// transaction was never whole, and a resume reads it again.
+func TestStreamEndingInsideATransactionBatchesNothing(t *testing.T) {
+	ch := make(chan rowchange.Change, 1000)
+	p := New(ch)
+	p.SetSchemas(txnSchemas())
+	p.BoundTransactions()
+	for _, c := range txnRows("a", "g:1-5", 0, 150) {
+		ch <- c
+	}
+	close(ch)
+	b, err := p.Next(context.Background())
+	if err != nil || b != nil {
+		t.Fatalf("Next = %v, %v; want no batch at the stream's end", b, err)
 	}
 }
 
