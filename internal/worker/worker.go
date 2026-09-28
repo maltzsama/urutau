@@ -930,16 +930,14 @@ func carrySnapshotPending(b *dataplane.Batch, ing Ingest) {
 	}
 }
 
-// flushSnapshotProgress is the snapshot state a flush commits. A pipeline
-// without its own (a coordinator's worker) commits the progress its windows'
-// Closes markers carried: the last window's, whose rows commit with every
-// earlier one (#461).
+// flushSnapshotProgress is the snapshot state a flush commits: the progress
+// its windows' Closes markers carried, when they did — the last window's,
+// whose rows commit with every earlier one (#461) — else the pipeline's own.
 func flushSnapshotProgress(state string, pending []uint32, batches []*dataplane.Batch, merged *dataplane.Batch) (string, []uint32) {
-	if state != "" {
-		return state, pending
+	if markerState, markerPending := batchSnapshotProgress(batches); markerState != "" {
+		state, pending = markerState, markerPending
+		merged.SnapshotState, merged.SnapshotPending = state, pending
 	}
-	state, pending = batchSnapshotProgress(batches)
-	merged.SnapshotState, merged.SnapshotPending = state, pending
 	return state, pending
 }
 
@@ -961,7 +959,8 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	snapState := p.snapshotState
 	snapPending := p.snapshotPending
 	p.snapshotMu.Unlock()
-	if snapState == "" {
+	if b.SnapshotState != "" {
+		// A window's marker progress (flushSnapshotProgress) wins (#461).
 		snapState, snapPending = b.SnapshotState, b.SnapshotPending
 	}
 	upserts, deletes, cerr := dpint.Collapse(ctx, nil, b, p.knownSchema.PrimaryKey)
