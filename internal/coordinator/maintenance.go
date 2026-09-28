@@ -164,6 +164,7 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	if err := stream.Send(msg); err != nil {
 		return err
 	}
+	sent := time.Now()
 
 	// The worker reports a MaintenanceResult when the pass ends, then closes
 	// the stream. MarkRun happens on that report, not on the send above: a
@@ -184,6 +185,7 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 			return nil // the worker finished (or died); either way it is gone
 		}
 		if res := in.GetMaintenanceResult(); res != nil {
+			m.logPass(name, table, due, time.Since(sent), res)
 			m.recordResult(table, res)
 			if ran := succeededOps(res); len(ran) > 0 {
 				m.mu.Lock()
@@ -326,6 +328,36 @@ func (m *maintenanceScheduler) assignment(table string, ops []sink.MaintenanceOp
 			MaintenanceConfig: cfgJSON,
 		},
 	}}, nil
+}
+
+// logPass records one maintenance pass in the coordinator's log: its table,
+// the operations assigned, each one's outcome or error, and how long the
+// worker held the table (no other pass runs on it meanwhile). The worker's
+// own log reaches only the dashboard's buffer, and its Pod is deleted after
+// the pass, so this line is what shows why a table is not being maintained
+// (issue #457). A pass with a failed operation is a warning.
+func (m *maintenanceScheduler) logPass(worker, table string, due []sink.MaintenanceOp, took time.Duration, res *pb.MaintenanceResult) {
+	attrs := []any{"table", table, "worker", worker, "ops", due, "took", took.Round(time.Millisecond)}
+	failed := false
+	for _, op := range res.Ops {
+		switch r := op.Op.(type) {
+		case *pb.MaintenanceOpResult_Compaction:
+			attrs = append(attrs, "compaction_error", r.Compaction.Error,
+				"files_removed", r.Compaction.FilesRemoved, "files_added", r.Compaction.FilesAdded)
+			failed = failed || r.Compaction.Error != ""
+		case *pb.MaintenanceOpResult_Expiry:
+			attrs = append(attrs, "expiry_error", r.Expiry.Error, "snapshots_removed", r.Expiry.SnapshotsRemoved)
+			failed = failed || r.Expiry.Error != ""
+		case *pb.MaintenanceOpResult_Orphan:
+			attrs = append(attrs, "orphan_error", r.Orphan.Error, "files_deleted", r.Orphan.FilesDeleted)
+			failed = failed || r.Orphan.Error != ""
+		}
+	}
+	if failed {
+		m.c.log.Warn("coordinator: maintenance pass", attrs...)
+		return
+	}
+	m.c.log.Info("coordinator: maintenance pass", attrs...)
 }
 
 // recordResult folds one maintenance pass's reported outcome into the
