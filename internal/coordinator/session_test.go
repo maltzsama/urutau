@@ -291,6 +291,7 @@ func TestLossesWithoutProgressEndTheRun(t *testing.T) {
 	c.confirmed = map[string]position.Position{"w1": position.MustLSN("0/10")}
 
 	for i := 1; i <= defaultMaxLossesWithoutProgress; i++ {
+		s.noteAttach("w1") // it reconnected since its previous loss
 		c.signalSessionEnd("w1", context.Canceled)
 		select {
 		case err := <-c.sessionErrs:
@@ -317,6 +318,7 @@ func TestLossesWithProgressDoNotEndTheRun(t *testing.T) {
 	c.confirmed = map[string]position.Position{"w1": position.MustLSN("0/10")}
 
 	for i := 0; i < 2*defaultMaxLossesWithoutProgress; i++ {
+		s.noteAttach("w1") // it reconnected since its previous loss
 		c.signalSessionEnd("w1", context.Canceled)
 		c.recordConfirmed("w1", position.MustLSN(fmt.Sprintf("0/%X", 0x20+i)))
 	}
@@ -471,5 +473,21 @@ func TestWaitChunkReadyStaleOnlyTimesOut(t *testing.T) {
 	defer cancel()
 	if err := c.waitChunkReady(ctx, "t", 0, 2); err == nil {
 		t.Fatal("a stale-epoch reply must not satisfy the wait")
+	}
+}
+
+// A worker holds two streams, Session and Control, and both end when it is
+// lost: that is one loss, not two. Counting both ended a run after two real
+// losses (issue #461, full chaos run).
+func TestALossIsCountedOncePerEpoch(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	c.confirmed = map[string]position.Position{"w1": position.MustLSN("0/10")}
+
+	c.signalSessionEnd("w1", context.Canceled) // Session stream
+	c.signalSessionEnd("w1", context.Canceled) // Control stream, same loss
+	if got := s.losses["w1"].count; got != 1 {
+		t.Fatalf("losses = %d after one loss seen on both streams, want 1", got)
 	}
 }

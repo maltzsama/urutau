@@ -47,6 +47,7 @@ func (e *workerReportedError) Error() string { return "coordinator: worker error
 type lossRecord struct {
 	count int
 	at    string // the worker's committed position at those losses
+	epoch uint64 // the epoch of the last loss counted
 }
 
 // maxLossesWithoutProgress is the configured limit, or its default.
@@ -85,7 +86,12 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	c.supervisor.pendingSet(worker)
 
 	at := c.confirmedFor(worker)
-	n := c.supervisor.recordLoss(worker, at)
+	n, counted := c.supervisor.recordLoss(worker, at, epoch)
+	if !counted {
+		// The same loss seen again on the worker's other stream (Session
+		// and Control both end when it is lost).
+		return nil
+	}
 	c.log.Warn("coordinator: worker lost; awaiting its reconnect", "worker", worker,
 		"epoch", epoch, "losses_without_progress", n, "committed", at, "cause", cause)
 	c.emitLog(eventlog.KindWorkerReset, map[string]any{
@@ -123,17 +129,23 @@ func (c *Coordinator) lostSignal(w *workerState) <-chan struct{} {
 }
 
 // recordLoss counts worker's consecutive losses at the same committed
-// position: progress since the previous loss starts the count over.
-func (s *supervisor) recordLoss(worker, at string) int {
+// position: progress since the previous loss starts the count over. A loss is
+// counted once per epoch: both of the worker's streams end when it is lost,
+// and the second report returns counted false.
+func (s *supervisor) recordLoss(worker, at string, epoch uint64) (n int, counted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.losses[worker]
+	if r.count > 0 && r.epoch == epoch {
+		return r.count, false
+	}
 	if r.count == 0 || r.at != at {
 		r = lossRecord{at: at}
 	}
 	r.count++
+	r.epoch = epoch
 	s.losses[worker] = r
-	return r.count
+	return r.count, true
 }
 
 // workerTermination describes, for an error message, why the worker's Pod
