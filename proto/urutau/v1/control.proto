@@ -343,4 +343,9 @@ message WindowTag {
   // The table's snapshot is over: every window was sent ahead of this marker.
   // The worker commits cdc.snapshot.state=complete after them (issue #428).
   bool   snapshot_done = 5;
+  // On a Closes marker: the table's snapshot chunks still to do after this
+  // one. The worker commits them as cdc.snapshot.pending, with state
+  // in_progress, atomically with the window's rows, so a restarted
+  // coordinator resumes the snapshot there (issue #461).
+  repeated uint32 snapshot_pending = 6;
 }

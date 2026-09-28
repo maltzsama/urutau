@@ -21,7 +21,9 @@ func markerBatch(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
 	bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	rec := bld.NewRecordBatch()
 	bld.Release()
-	return &dataplane.Batch{Table: p.target, Record: rec, Watermark: []byte(ing.Position), Mode: p.mode, Seq: ing.Seq, Staged: ing.Staged}, nil
+	b := &dataplane.Batch{Table: p.target, Record: rec, Watermark: []byte(ing.Position), Mode: p.mode, Seq: ing.Seq, Staged: ing.Staged}
+	carrySnapshotPending(b, ing)
+	return b, nil
 }
 
 // snapshotDoneBatch is the 0-row batch that commits a table's snapshot

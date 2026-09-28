@@ -171,7 +171,7 @@ func TestSnapshotTableErrors(t *testing.T) {
 func TestSnapshotTableSeedsEmptyOwners(t *testing.T) {
 	ctx := context.Background()
 	c, _ := coordHarness()
-	seeder := &seedingSink{}
+	seeder := &seedingSink{Sink: newPropsSink()} // the snapshot records its progress in the table properties (#461)
 	c.snk = seeder
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
 	// One owner whose range (0,10) excludes every chunk (the domain starts at 50).
