@@ -48,14 +48,15 @@ Which path a batch takes is decided per batch by the coordinator
 
 Expected recovery:
 
-- **D1, D2, D4 (worker dies).** The worker's session ends owing work, so the
-  coordinator terminates the run for a clean replay (`signalSessionEnd`, the
-  supervisor's detached-owing check). The coordinator restarts, resumes from
-  the durable `cdc.position`, and re-reads the batch. In D4 the batch is
-  already durable, so the worker skips and acks it.
-- **D3 (worker dies).** The same replay re-applies the batch: the equality
+- **D1, D2, D4 (worker dies).** The coordinator keeps running and awaits the
+  worker (`loseWorker`): a new epoch, and the batch kept on its sent list.
+  When the Pod reconnects, the batch is redelivered. In D4 it is already
+  durable, so the worker skips and acks it. The run ends only if the worker
+  does not come back within the absence timeout, or is lost three times in a
+  row with no committed progress (issue #461).
+- **D3 (worker dies).** The redelivery re-applies the batch: the equality
   deletes are idempotent and the appends rewrite the rows. The keys are
-  missing from the sink only until the replay commits.
+  missing from the sink only until it commits.
 - **D5 (coordinator dies).** Nothing is lost: the ack's commit is already
   durable. The restarted coordinator resumes from `cdc.position`, and workers
   skip what they had committed.
@@ -76,12 +77,13 @@ unit, in send order (`stagedCycles`).
 
 Expected recovery:
 
-- **S1–S3 (worker dies).** The cycles that still needed this worker's
-  delivery can never complete. The coordinator discards exactly those cycles
-  (`discardWorker`), marks the table gapped so no later cycle commits over the
-  gap, and terminates the run for a clean replay. In S3 the delivery may have
-  arrived, so the cycle may commit before the terminate lands. That is safe:
-  the worker still owed an ack, and the replay skips what became durable.
+- **S1–S3 (worker dies).** The cycles that still need this worker's delivery
+  stay open, and so does every later cycle of the table, since cycles commit
+  in send order: nothing commits over the gap. When the worker reconnects, its
+  sub-batches are redelivered, restaged and delivered, and the cycles
+  complete. In S3 the delivery had arrived: the redelivered one is dropped
+  (one delivery per owner), and the worker skips the sub-batch once the cycle
+  is durable.
 - **S4 (coordinator dies).** Nothing of the cycle is durable. The restarted
   coordinator replays it from `cdc.position`.
 - **S5 (coordinator dies).** The cycle is durable. The restart resumes past
@@ -108,6 +110,20 @@ snapshot has run. A position therefore does not prove the snapshot finished;
   A table with a position and no state predates the marking and is taken as
   done.
 
+A snapshot records its progress before its first chunk: the chunk bounds,
+the partition ranges, and every chunk pending. Each window's Closes marker
+names the chunks still to do after it, and the worker commits them as
+`cdc.snapshot.pending`, state `in_progress`, in the same commit as the
+window's rows. A restarted coordinator resumes an `in_progress` table from
+there, with the recorded bounds, when the partition ranges are unchanged; it
+starts the table over otherwise, since chunk ids are relative to the ranges
+(issue #461).
+
+A worker lost mid-snapshot takes its windows with it. The coordinator does not
+end the run: once the worker is back, the partition redoes, under fresh
+window ids, every chunk whose Closes marker the worker had not committed, and
+it waits for its last windows to commit before it is done.
+
 | # | Step | Process | Durable after this step | Fault point |
 |---|------|---------|-------------------------|-------------|
 | P1 | About to snapshot a table the stream may already have committed to | coordinator | stream commits (a `cdc.position`), state `not_started` | `coordinator.snapshot-table-start` |
@@ -124,7 +140,7 @@ even though it holds a position. Re-copied rows are upserts.
 | Sink write staged, before commit | S2, S4 |
 | Sink commit completed, worker has not acked | D4, S3, S5 |
 | Ack sent, coordinator has not recorded the next state | D5 |
-| Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss) |
+| Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss; recovered by redelivery) |
 | Coordinator killed during an active commit cycle | S4, S5 |
 | Upsert split across two snapshots (not in the base matrix) | D3 |
 | Coordinator killed before a table's snapshot, after the stream committed to it | P1 |

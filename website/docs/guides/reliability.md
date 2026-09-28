@@ -27,18 +27,40 @@ beyond "start it again".
 ## Supervision: the coordinator heals workers
 
 The coordinator supervises its workers, not the other way around. A worker
-that stops acking is **reset**, not silently dropped:
+that dies or stops acking is **recovered**, not dropped, and the job keeps
+running:
 
-- `--ack-timeout` (`30s`) — a worker silent for this long is reset: its
-  partition is re-routed and it must reconnect and re-sync from the last
-  committed position.
-- `--max-resets` (`5`) within `--reset-window` (`15m`) — after this many
-  resets the coordinator **terminates** the job rather than loop forever.
+- A worker that is **lost** — its Pod killed or OOM-killed, its stream cut —
+  is awaited. The StatefulSet brings the Pod back under the same name; it
+  reconnects, and the coordinator redelivers what it owed: every batch it
+  was sent but had not acked, then its queue. The worker skips what its
+  committed position already covers, so nothing is applied twice on an
+  upsert table.
+- A worker that stops acking for `--ack-timeout` (`30s`) while it owes work
+  is **reset** and recovered the same way. A worker whose uploads keep
+  flowing is busy on slow storage, not stalled, and is left alone.
+- A lost worker in the middle of a snapshot takes its chunk windows with it.
+  Once it is back, its partition redoes the chunks whose rows it had not
+  committed; the other partitions and tables go on.
+- A restarted **coordinator** resumes a table's snapshot from its recorded
+  progress (`cdc.snapshot.pending`), not from its first chunk.
 
-Tune them together. A long `--ack-timeout` tolerates slow commits but
-delays recovery; a small `--max-resets` fails fast but can kill a job over
-a transient network blip. The defaults assume a healthy catalog and a
-stable network.
+The job ends only for what does not heal by itself:
+
+- an error the worker reports itself (schema drift, a failed commit);
+- `--max-losses-without-progress` (`3`): the same worker lost that many
+  times in a row with no committed progress in between — a crash loop, like
+  a batch that OOM-kills it every time. The error names the worker, its
+  committed position, and the Pod's last termination reason;
+- `--worker-absence-timeout` (`5m`): a lost worker that has not reconnected
+  for that long — a Pod that cannot be scheduled, a volume that does not
+  mount. The error carries the reason Kubernetes gives;
+- a stalled worker on an **append** table with unacked batches: redelivering
+  a batch that was committed before its ack was lost would append it twice.
+
+Progress resets the loss count, so a worker killed now and then under load,
+committing in between, never ends the job. `--max-resets` and
+`--reset-window` are deprecated and ignored.
 
 ## Audit trail (`--eventlog`)
 
