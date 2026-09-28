@@ -73,8 +73,10 @@ server, not a one-shot.
 | `--flow-per-worker-min-mi` | `16` | Per-worker minimum share of the flow budget (MiB) |
 | `--wait-worker` | `2m` | How long to wait for every expected worker session |
 | `--ack-timeout` | `30s` | A worker is stale without an ack for this long |
-| `--max-resets` | `5` | Resets within the window before the job terminates |
-| `--reset-window` | `15m` | Sliding window for the reset count |
+| `--max-losses-without-progress` | `3` | The same worker lost this many times in a row with no committed progress ends the job |
+| `--worker-absence-timeout` | `5m` | A lost worker that has not reconnected for this long ends the job |
+| `--max-resets` | `5` | Deprecated, ignored |
+| `--reset-window` | `15m` | Deprecated, ignored |
 | `--eventlog` | _(off)_ | `s3://bucket/prefix` audit trail |
 | `--checkpoint` | _(off)_ | `s3://bucket/prefix` async position manifests |
 | `--checkpoint-interval` | `10` | Checkpoint write interval (seconds) |

@@ -178,8 +178,8 @@ spec:
       maxParallelChunks: 4
     supervision:
       ackTimeout: 30s
-      maxResets: 5
-      window: 15m
+      maxLossesWithoutProgress: 3
+      workerAbsenceTimeout: 5m
   worker:
     cpu: "500m"
     cpu_overhead: "100m"
