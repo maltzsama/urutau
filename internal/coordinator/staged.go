@@ -19,8 +19,13 @@ type stagedCycle struct {
 	owners      map[string]bool // workers whose delivery this cycle needs
 	descriptors [][]byte
 	positions   []string
-	state       string
-	pending     []uint32
+	// batchPos is the source batch's last position, when the cycle holds
+	// every partition's share of one batch: the table is then durable
+	// through it once the cycle commits (#459). Empty for a cycle opened
+	// without it; the commit then falls back to the deliveries' minimum.
+	batchPos string
+	state    string
+	pending  []uint32
 }
 
 // stagedCycles tracks open cycles keyed by (table, seq). Cycles of one table
@@ -101,6 +106,12 @@ func ownerNames(m map[string]bool) []string {
 // sub-batch was sent to (a partition with no rows is not sent, so its worker
 // is not expected).
 func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
+	s.expectAt(ref, seq, owners, "")
+}
+
+// expectAt is expect for a cycle that carries every partition's share of one
+// source batch, whose last position is batchPos.
+func (s *stagedCycles) expectAt(ref core.TableRef, seq uint64, owners []string, batchPos string) {
 	if s == nil || len(owners) == 0 {
 		return
 	}
@@ -114,7 +125,7 @@ func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
 	for _, o := range owners {
 		own[o] = true
 	}
-	s.open[k] = &stagedCycle{ref: ref, seq: seq, expected: len(owners), owners: own}
+	s.open[k] = &stagedCycle{ref: ref, seq: seq, expected: len(owners), owners: own, batchPos: batchPos}
 	s.order[ref.Target] = append(s.order[ref.Target], seq)
 }
 
