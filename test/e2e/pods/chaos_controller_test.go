@@ -196,6 +196,7 @@ type chaosEvent struct {
 	InjectedAt time.Time     `json:"injectedAt,omitzero"`
 	RemovedAt  time.Time     `json:"removedAt,omitzero"`
 	Injected   bool          `json:"injected"`
+	Reapplied  int           `json:"reapplied,omitempty"` // network fault re-created before it injected
 	Error      string        `json:"error,omitempty"`
 	// Skipped is why a reactive fault was not injected at all (not a
 	// failure: the record shows the transition was seen).
@@ -365,6 +366,10 @@ func (c *chaosController) injectNow(ctx context.Context, kind chaosKind, trigger
 	}()
 }
 
+// networkReapplyAfter is how long a network fault may stay uninjected before
+// the controller re-creates it.
+const networkReapplyAfter = 15 * time.Second
+
 // reserved marks an active slot whose resource is not created yet.
 const reserved = "reserved"
 
@@ -445,6 +450,7 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 	}()
 
 	deadline := time.Now().Add(90 * time.Second)
+	applied := time.Now()
 	for {
 		out, err := kubectlCmd("", "-n", c.ns, "get", resource, ev.Name, "-o",
 			`jsonpath={.status.conditions[?(@.type=="AllInjected")].status}`)
@@ -455,8 +461,25 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 			break
 		}
 		if time.Now().After(deadline) {
-			record(fmt.Errorf("not injected within 90s (last %q, %v)", out, err))
+			record(fmt.Errorf("not injected within 90s after %d re-apply(s) (last %q, %v)", ev.Reapplied, out, err))
 			return
+		}
+		// A network fault whose target container is restarting (the
+		// coordinator exits for a clean replay when a worker dies owing
+		// work) fails in chaos-daemon ("container is not running"), and
+		// Chaos Mesh backs its retries off past the fault's duration (#458).
+		// A fresh resource retries at once.
+		if isNetworkFault(d.Kind) && time.Since(applied) > networkReapplyAfter {
+			if _, derr := kubectlCmd("", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); derr == nil {
+				if _, aerr := kubectlCmd(manifest, "apply", "-f", "-"); aerr != nil {
+					record(aerr)
+					return
+				}
+				c.mu.Lock()
+				ev.Reapplied++
+				c.mu.Unlock()
+			}
+			applied = time.Now()
 		}
 		select {
 		case <-ctx.Done():
