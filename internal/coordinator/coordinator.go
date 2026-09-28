@@ -1989,13 +1989,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// (ClickHouse, Couchbase) the workers commit their own sub-batches, so
 	// no cycle is tracked and none can leak.
 	if c.stagesCycles() && len(cycleOwners) > 0 {
-		// Every partition with rows gets its whole share, so the committed
-		// cycle holds the batch through its last row (#459).
-		var batchPos string
-		if nrows > 0 {
-			batchPos = reader.Position(nrows - 1)
-		}
-		c.staged.expectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, batchPos)
+		c.staged.expectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, lastPosition(reader))
 		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
 	for p, sub := range subBatches {
@@ -2014,6 +2008,16 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		}
 	}
 	return nil
+}
+
+// lastPosition is the position of a source batch's last row. Every partition
+// with rows gets its whole share of the batch, so a committed cycle holds the
+// batch through it (#459).
+func lastPosition(r *transport.BatchReader) string {
+	if r.NumRows() == 0 {
+		return ""
+	}
+	return r.Position(r.NumRows() - 1)
 }
 
 // coveredAtBoot mirrors the worker's covered check (batchReceiver.covered):
