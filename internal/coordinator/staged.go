@@ -158,11 +158,12 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 			state: state, pending: pending,
 		}}, true
 	}
-	// One delivery per owner: an owner's second delivery of the cycle (a
-	// redelivery after a session reset) must not stand in for another
-	// owner's and commit the cycle without its rows.
+	// One delivery per expected owner: an owner's second delivery of the
+	// cycle (a redelivery after a session reset), or one from a worker the
+	// cycle was not sent to, must not stand in for another owner's and
+	// commit the cycle without its rows.
 	if ref.Owner != "" {
-		if cy.delivered[ref.Owner] {
+		if !cy.owners[ref.Owner] || cy.delivered[ref.Owner] {
 			return nil, true
 		}
 		if cy.delivered == nil {
