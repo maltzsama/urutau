@@ -31,6 +31,11 @@ type Puller struct {
 	errCh   <-chan error
 	buf     []rowchange.Change
 	schemas map[string]core.Schema // target table -> canonical schema
+	// txnBounded: the decoder ends each transaction with OpTxnEnd. buf
+	// then holds only rows of ended transactions, and open the rows of
+	// the one being decoded.
+	txnBounded bool
+	open       []rowchange.Change
 }
 
 // New builds a puller over the decoder's change channel.
@@ -74,12 +79,89 @@ func (p *Puller) SetSourceSchemas(resolved map[string]core.Schema) {
 	}
 }
 
+// BoundTransactions declares that the decoder ends every transaction with an
+// OpTxnEnd change. Every row of a transaction carries its position, so a
+// batch then holds only whole transactions: a commit that recorded a
+// transaction's position with part of its rows would let a resume skip the
+// rest (#456).
+func (p *Puller) BoundTransactions() { p.txnBounded = true }
+
+// take files one decoded change: a row joins the open transaction, and
+// OpTxnEnd releases it to buf, grouped by table in order of first
+// appearance so that no batch holds part of a table's rows of it.
+func (p *Puller) take(c rowchange.Change) {
+	if c.Op != rowchange.OpTxnEnd {
+		p.open = append(p.open, c)
+		return
+	}
+	for len(p.open) > 0 {
+		table := p.open[0].Table
+		rest := p.open[:0]
+		for _, o := range p.open {
+			if o.Table == table {
+				p.buf = append(p.buf, o)
+			} else {
+				rest = append(rest, o)
+			}
+		}
+		p.open = rest
+	}
+}
+
+// nextTxn is Next for a transaction-bounded decoder. It batches only rows of
+// ended transactions, blocking while none has ended, and closes a batch as
+// Next does: at batchTarget rows, at a table change, or when nothing more is
+// pending right now.
+func (p *Puller) nextTxn(ctx context.Context) (*dataplane.Batch, error) {
+	for {
+		if len(p.buf) > 0 && (len(p.buf) >= batchTarget || p.buf[len(p.buf)-1].Table != p.buf[0].Table) {
+			return p.makeBatch()
+		}
+		if len(p.buf) > 0 {
+			select {
+			case c, ok := <-p.ch:
+				if !ok {
+					return p.makeBatch()
+				}
+				p.take(c)
+			case err := <-p.errCh:
+				if err != nil {
+					return nil, err
+				}
+				return p.makeBatch()
+			default:
+				return p.makeBatch()
+			}
+			continue
+		}
+		// A stream that ends inside a transaction leaves it unbatched:
+		// it was never whole, and a resume re-reads it.
+		select {
+		case c, ok := <-p.ch:
+			if !ok {
+				return nil, nil
+			}
+			p.take(c)
+		case err := <-p.errCh:
+			if err != nil {
+				return nil, err
+			}
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
 // SetErr installs the decoder's terminal-error channel.
 func (p *Puller) SetErr(errCh <-chan error) { p.errCh = errCh }
 
 // Next reads accumulated changes and bridges them into one batch. Returns
 // (nil, nil) at a clean stream end.
 func (p *Puller) Next(ctx context.Context) (*dataplane.Batch, error) {
+	if p.txnBounded {
+		return p.nextTxn(ctx)
+	}
 	if len(p.buf) == 0 {
 		select {
 		case c, ok := <-p.ch:
@@ -138,6 +220,25 @@ func (p *Puller) Drain(ctx context.Context, emit func(*dataplane.Batch) error) e
 // tryNext returns the next batch without blocking. ok=false means nothing
 // buffered or pending right now.
 func (p *Puller) tryNext(ctx context.Context) (*dataplane.Batch, bool, error) {
+	if p.txnBounded {
+		// Only ended transactions are pending; a transaction still open
+		// waits for its end.
+		for len(p.buf) == 0 {
+			select {
+			case c, ok := <-p.ch:
+				if !ok {
+					return nil, false, nil
+				}
+				p.take(c)
+			case err := <-p.errCh:
+				return nil, false, err
+			default:
+				return nil, false, nil
+			}
+		}
+		b, err := p.makeBatch()
+		return b, true, err
+	}
 	if len(p.buf) > 0 {
 		b, err := p.makeBatch()
 		return b, true, err

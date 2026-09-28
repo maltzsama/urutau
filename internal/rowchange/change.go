@@ -13,6 +13,10 @@ const (
 	OpInsert Op = iota
 	OpUpdate
 	OpDelete
+	// OpTxnEnd is not a row: a source decoder sends it after the last row
+	// of a transaction, so the puller never ends a batch inside one (#456).
+	// It carries no other field and never reaches a batch.
+	OpTxnEnd
 )
 
 func (o Op) String() string {
@@ -23,6 +27,8 @@ func (o Op) String() string {
 		return "update"
 	case OpDelete:
 		return "delete"
+	case OpTxnEnd:
+		return "txn-end"
 	default:
 		return "unknown"
 	}

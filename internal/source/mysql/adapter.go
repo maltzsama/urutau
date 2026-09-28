@@ -228,6 +228,8 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	}
 	puller := sourcepull.New(out)
 	puller.SetSchemas(schemas)
+	// The reader ends each transaction with OpTxnEnd (#456).
+	puller.BoundTransactions()
 	return stream{Reader: rdr, db: a.db, out: out, Puller: puller}, nil
 }
 

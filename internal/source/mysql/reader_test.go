@@ -5,10 +5,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/canal"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/schema"
 
@@ -741,5 +743,37 @@ func TestTemporalParityAcrossDST(t *testing.T) {
 	cdcDT := normalizeCol(schema.TableColumn{Name: "d", Type: schema.TYPE_DATETIME}, wall, loc).(time.Time)
 	if !snapDT.Equal(cdcDT) {
 		t.Fatalf("DST datetime parity: snap=%v cdc=%v", snapDT, cdcDT)
+	}
+}
+
+// Issue #456: the puller batches only whole transactions, so the reader ends
+// each transaction that emitted rows with OpTxnEnd, after its last row. A
+// synced position with no row since the last end (a DDL, a transaction on an
+// excluded table) emits nothing.
+func TestTransactionEndFollowsItsRows(t *testing.T) {
+	out := make(chan rowchange.Change, 8)
+	r := newTestReader(out)
+	r.curGTID = "u:1-9"
+	if err := r.OnPosSynced(nil, gomysql.Position{}, nil, false); err != nil {
+		t.Fatalf("OnPosSynced: %v", err)
+	}
+	e := &canal.RowsEvent{
+		Table:  ordersTable(),
+		Action: canal.InsertAction,
+		Rows:   [][]any{{int64(1), []byte("a"), 1.0}, {int64(2), []byte("b"), 2.0}},
+	}
+	if err := r.OnRow(e); err != nil {
+		t.Fatalf("OnRow: %v", err)
+	}
+	if err := r.OnPosSynced(nil, gomysql.Position{}, nil, false); err != nil {
+		t.Fatalf("OnPosSynced: %v", err)
+	}
+	var ops []rowchange.Op
+	for len(out) > 0 {
+		ops = append(ops, (<-out).Op)
+	}
+	want := []rowchange.Op{rowchange.OpInsert, rowchange.OpInsert, rowchange.OpTxnEnd}
+	if !slices.Equal(ops, want) {
+		t.Fatalf("emitted %v, want %v", ops, want)
 	}
 }
