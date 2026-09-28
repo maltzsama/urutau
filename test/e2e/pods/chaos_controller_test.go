@@ -375,6 +375,14 @@ func (c *chaosController) injectNow(ctx context.Context, kind chaosKind, trigger
 // the controller re-creates it.
 const networkReapplyAfter = 15 * time.Second
 
+// chaosRemovalTimeout bounds the removal of an experiment. Chaos Mesh holds
+// the resource until it has recovered every target, and recovering a network
+// fault took 3 minutes in a full-profile run (chaos-daemon retrying "unable
+// to flush ip sets" on busy workers) before it succeeded; kubectlTimeout
+// (2 minutes) counted that as a failed removal. An experiment still present
+// after this long is one.
+const chaosRemovalTimeout = 10 * time.Minute
+
 // reserved marks an active slot whose resource is not created yet.
 const reserved = "reserved"
 
@@ -399,7 +407,7 @@ func (c *chaosController) stop() {
 	c.mu.Unlock()
 	for name, kind := range left {
 		if kind != reserved {
-			_, _ = kubectlCmd("", "-n", c.ns, "delete", kind, name, "--ignore-not-found", "--wait=true")
+			_, _ = kubectlCmdBy(time.Now().Add(chaosRemovalTimeout), "", "-n", c.ns, "delete", kind, name, "--ignore-not-found", "--wait=true")
 		}
 		c.forget(name)
 	}
@@ -445,7 +453,7 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 	c.active[ev.Name] = resource
 	c.mu.Unlock()
 	defer func() {
-		if _, err := kubectlCmd("", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); err != nil {
+		if _, err := kubectlCmdBy(time.Now().Add(chaosRemovalTimeout), "", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); err != nil {
 			record(err)
 		}
 		c.forget(ev.Name)
