@@ -100,3 +100,29 @@ func (p *positionIndex) holds(id uint64) bool {
 	}
 	return false
 }
+
+// minHeldID returns the oldest unacked batch id, or 0.
+func (p *positionIndex) minHeldID() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var min uint64
+	for _, h := range p.head {
+		if min == 0 || h.id < min {
+			min = h.id
+		}
+	}
+	return min
+}
+
+// maxHeldID returns the newest unacked batch id, or 0.
+func (p *positionIndex) maxHeldID() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var max uint64
+	for _, h := range p.head {
+		if h.id > max {
+			max = h.id
+		}
+	}
+	return max
+}

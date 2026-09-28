@@ -27,15 +27,19 @@ import (
 // coordinator into CrashLoopBackOff under sustained worker kills: every
 // restart snapshotted again from chunk 0, and no table advanced.
 //
-// The run still ends on what does not heal by itself: an error the worker
-// reports (schema drift, a failed commit), the same worker lost
-// maxLossesWithoutProgress times in a row with no committed progress in
-// between (a batch that OOM-kills it every time), or a worker gone for longer
-// than the absence timeout (supervisor.tick).
+// The run still ends on what does not heal by itself:
+//   - an error the worker reports itself (schema drift, a failed commit);
+//   - a crash loop: the same worker crashing maxConsecutiveCrashes times in a
+//     row without delivering what it owed when it came back (a batch that
+//     OOM-kills it every time). Whether a loss was a crash is read from its
+//     Pod when it comes back: a lost network or a Pod replaced from outside
+//     is not one (workerBack);
+//   - a worker owing work that delivers none of it for the delivery timeout,
+//     connected or not (supervisor.tick).
 
-// defaultMaxLossesWithoutProgress is how many times in a row one worker may
-// be lost with no committed progress before the run ends.
-const defaultMaxLossesWithoutProgress = 3
+// defaultMaxConsecutiveCrashes is how many times in a row one worker may
+// crash without delivering what it owed before the run ends.
+const defaultMaxConsecutiveCrashes = 3
 
 // workerReportedError is an error the worker sent itself
 // (WorkerMessage_Error). It ends the run: it is not a hiccup.
@@ -43,27 +47,20 @@ type workerReportedError struct{ detail string }
 
 func (e *workerReportedError) Error() string { return "coordinator: worker error: " + e.detail }
 
-// lossRecord is a worker's run of consecutive losses without progress.
-type lossRecord struct {
-	count int
-	at    string // the worker's committed position at those losses
-	epoch uint64 // the epoch of the last loss counted
-}
-
-// maxLossesWithoutProgress is the configured limit, or its default.
-func (c *Coordinator) maxLossesWithoutProgress() int {
-	if c.cfg.MaxLossesWithoutProgress > 0 {
-		return c.cfg.MaxLossesWithoutProgress
+// maxConsecutiveCrashes is the configured limit, or its default.
+func (c *Coordinator) maxConsecutiveCrashes() int {
+	if c.cfg.MaxConsecutiveCrashes > 0 {
+		return c.cfg.MaxConsecutiveCrashes
 	}
-	return defaultMaxLossesWithoutProgress
+	return defaultMaxConsecutiveCrashes
 }
 
 // loseWorker handles a worker whose session ended. A worker no longer
 // registered was retired by a scale-in, whose cancel ended the session:
 // nothing to do. Any other worker is awaited like a supervisor reset: a new
 // epoch (a reply from the lost session is stale), its queue, sent batches and
-// staged cycles kept, and its snapshot loop told. It returns an error when the
-// loss ends the run.
+// staged cycles kept, and its snapshot loop told. Whether the loss was a
+// crash is only known once the worker is back (workerBack), from its Pod.
 func (c *Coordinator) loseWorker(worker string, cause error) error {
 	c.mu.Lock()
 	w, ok := c.workers[worker]
@@ -80,31 +77,129 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	lost := w.lostCh
 	w.lostCh = nil
 	c.mu.Unlock()
+	// The chunk windows the worker had not committed died with it. Taken
+	// now, before it can reconnect and ack their redelivered Closes markers
+	// as empty windows, which would hide them from the snapshot's redo.
+	c.noteLostWindows(worker)
 	if lost != nil {
 		close(lost)
 	}
 	c.supervisor.pendingSet(worker)
-
-	at := c.confirmedFor(worker)
-	n, counted := c.supervisor.recordLoss(worker, at, epoch)
-	if !counted {
+	if !c.supervisor.noteLoss(worker, epoch) {
 		// The same loss seen again on the worker's other stream (Session
 		// and Control both end when it is lost).
 		return nil
 	}
 	c.log.Warn("coordinator: worker lost; awaiting its reconnect", "worker", worker,
-		"epoch", epoch, "losses_without_progress", n, "committed", at, "cause", cause)
-	c.emitLog(eventlog.KindWorkerReset, map[string]any{
-		"worker": worker, "epoch": epoch, "reason": "session_lost", "losses_without_progress": n,
-	})
-	if n >= c.maxLossesWithoutProgress() {
-		return fmt.Errorf("coordinator: worker %s lost %d times in a row without progress (committed position %q)%s: %w",
-			worker, n, at, c.workerTermination(worker), errCrashLoop)
+		"epoch", epoch, "committed", c.confirmedFor(worker), "cause", cause)
+	c.emitLog(eventlog.KindWorkerReset, map[string]any{"worker": worker, "epoch": epoch, "reason": "session_lost"})
+	return nil
+}
+
+// onAttach records a worker's session attaching, outside c.mu: noteAttach
+// takes the supervisor lock, and calling it under c.mu would invert the order
+// supervisor.tick uses (supervisor.mu → c.mu) and deadlock the two (audit #3).
+// A worker back from a crash loop ends the run here, with its Pod's reason.
+func (c *Coordinator) onAttach(worker string) error {
+	c.supervisor.noteAttach(worker)
+	c.pushDashState() // the worker attached
+	if err := c.workerBack(worker); err != nil {
+		c.fail(err)
+		return err
 	}
 	return nil
 }
 
-// errCrashLoop marks a run ended by a worker lost without progress.
+// workerBack classifies the loss a reconnected worker comes back from, from
+// its Pod's last container termination: an OOM kill, a panic or an error is
+// a crash; a Pod replaced from outside (a pod-kill, a node drain) or a worker
+// that exited because it lost the coordinator ("network: ", written to its
+// termination message) is not. A crash counts toward a crash loop unless the
+// worker delivered everything it owed when it came back before crashing
+// again (supervisor.tick starts the count over). The limit's crash ends the
+// run, with the Pod's reason.
+func (c *Coordinator) workerBack(worker string) error {
+	term, ok := c.terminationFor(worker)
+	var mark uint64
+	if idx := c.indexOf(worker); idx != nil {
+		mark = idx.maxHeldID()
+	}
+	n, crashed, desc := c.supervisor.noteBack(worker, term, ok, mark, time.Now())
+	if !crashed {
+		return nil
+	}
+	c.log.Warn("coordinator: worker crashed", "worker", worker, "crashes_in_a_row", n, "termination", desc)
+	if n >= c.maxConsecutiveCrashes() {
+		return fmt.Errorf("coordinator: worker %s crashed %d times in a row without delivering what it owed (committed position %q); pod %s: %s: %w",
+			worker, n, c.confirmedFor(worker), worker, desc, errCrashLoop)
+	}
+	return nil
+}
+
+// terminationFor reads worker's last container termination.
+func (c *Coordinator) terminationFor(worker string) (podTermination, bool) {
+	if c.podTermination != nil {
+		return c.podTermination(worker)
+	}
+	return c.k8sTermination(worker)
+}
+
+// podTermination is a worker container's last termination, as its Pod status
+// reports it, with the Pod's identity and restart count to tell a fresh
+// termination from one already seen.
+type podTermination struct {
+	podUID   string
+	restarts int32
+	reason   string
+	exitCode int32
+	message  string
+}
+
+// networkExitPrefix starts the termination message of a worker that exited
+// because it lost the coordinator (cmd/worker writes it): not a crash.
+const networkExitPrefix = "network: "
+
+// crash reports whether the termination was the worker failing on its own,
+// and describes it.
+func (t podTermination) crash() (bool, string) {
+	desc := fmt.Sprintf("last terminated %s, exit code %d", t.reason, t.exitCode)
+	if msg := strings.TrimSpace(t.message); msg != "" {
+		desc += ": " + strings.SplitN(msg, "\n", 2)[0]
+	}
+	switch {
+	case t.reason == "OOMKilled":
+		return true, desc
+	case strings.HasPrefix(t.message, networkExitPrefix):
+		return false, desc
+	case t.exitCode == 0:
+		return false, desc
+	default:
+		return true, desc
+	}
+}
+
+// k8sTermination reads worker's Pod status from Kubernetes. Outside it there
+// is no Pod to read, and no loss is taken for a crash.
+func (c *Coordinator) k8sTermination(worker string) (podTermination, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cs, ns, _, err := c.workerClientset(ctx)
+	if err != nil || cs == nil {
+		return podTermination{}, false
+	}
+	pod, err := cs.CoreV1().Pods(ns).Get(ctx, worker, metav1.GetOptions{})
+	if err != nil || len(pod.Status.ContainerStatuses) == 0 {
+		return podTermination{}, false
+	}
+	st := pod.Status.ContainerStatuses[0]
+	t := podTermination{podUID: string(pod.UID), restarts: st.RestartCount}
+	if last := st.LastTerminationState.Terminated; last != nil {
+		t.reason, t.exitCode, t.message = last.Reason, last.ExitCode, last.Message
+	}
+	return t, true
+}
+
+// errCrashLoop marks a run ended by a worker crashing again and again.
 var errCrashLoop = errors.New("crash loop")
 
 // confirmedFor returns worker's latest durably committed position, or "".
@@ -128,24 +223,82 @@ func (c *Coordinator) lostSignal(w *workerState) <-chan struct{} {
 	return w.lostCh
 }
 
-// recordLoss counts worker's consecutive losses at the same committed
-// position: progress since the previous loss starts the count over. A loss is
-// counted once per epoch: both of the worker's streams end when it is lost,
-// and the second report returns counted false.
-func (s *supervisor) recordLoss(worker, at string, epoch uint64) (n int, counted bool) {
+// workerHealth is what the supervisor tracks of a worker's losses.
+type workerHealth struct {
+	lossEpoch    uint64 // the epoch of the last loss seen
+	lossPending  bool   // a loss not yet classified by the worker's return
+	crashes      int    // crashes in a row without delivering what it owed
+	seenUID      string // the Pod and restart count last read
+	seenRestarts int32
+	owedMark     uint64    // the highest batch id owed when it came back
+	backAt       time.Time // when it came back
+}
+
+// healthOf returns worker's record. Caller holds s.mu.
+func (s *supervisor) healthOf(worker string) *workerHealth {
+	h := s.health[worker]
+	if h == nil {
+		h = &workerHealth{}
+		s.health[worker] = h
+	}
+	return h
+}
+
+// noteLoss records a loss at epoch, reporting false for a loss already seen
+// (the worker's other stream).
+func (s *supervisor) noteLoss(worker string, epoch uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r := s.losses[worker]
-	if r.count > 0 && r.epoch == epoch {
-		return r.count, false
+	h := s.healthOf(worker)
+	if h.lossPending && h.lossEpoch == epoch {
+		return false
 	}
-	if r.count == 0 || r.at != at {
-		r = lossRecord{at: at}
+	h.lossEpoch, h.lossPending = epoch, true
+	return true
+}
+
+// noteBack classifies the loss a worker comes back from (see workerBack) and
+// returns its crashes in a row, whether this loss was one, and its
+// description.
+func (s *supervisor) noteBack(worker string, term podTermination, known bool, owedMark uint64, now time.Time) (int, bool, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := s.healthOf(worker)
+	h.owedMark, h.backAt = owedMark, now
+	crashed, desc := false, ""
+	if known {
+		fresh := (term.podUID == h.seenUID && term.restarts > h.seenRestarts) ||
+			(h.seenUID == "" && term.restarts > 0)
+		if h.lossPending && fresh {
+			crashed, desc = term.crash()
+		}
+		h.seenUID, h.seenRestarts = term.podUID, term.restarts
 	}
-	r.count++
-	r.epoch = epoch
-	s.losses[worker] = r
-	return r.count, true
+	h.lossPending = false
+	if crashed {
+		h.crashes++
+	}
+	return h.crashes, crashed, desc
+}
+
+// noteDelivering starts a worker's crash count over once it has delivered
+// every batch it owed when it came back and stayed up for ack: it is not
+// crash-looping. Caller holds s.mu.
+func (s *supervisor) noteDeliveringLocked(worker string, minHeld uint64, now time.Time, ack time.Duration) {
+	h := s.health[worker]
+	if h == nil || h.crashes == 0 || h.lossPending {
+		return
+	}
+	if (minHeld == 0 || minHeld > h.owedMark) && now.Sub(h.backAt) >= ack {
+		h.crashes = 0
+	}
+}
+
+// noteDeliveredAt records that worker delivered (acked, or owed nothing) at.
+func (s *supervisor) noteDeliveredAt(worker string, at time.Time) {
+	s.mu.Lock()
+	s.lastDelivered[worker] = at
+	s.mu.Unlock()
 }
 
 // workerTermination describes, for an error message, why the worker's Pod
@@ -201,7 +354,7 @@ func (c *Coordinator) workerAppends(worker string) bool {
 const reattachPoll = 50 * time.Millisecond
 
 // awaitReattached returns once w is attached and no longer awaited after a
-// loss or reset. A worker that never comes back ends the run at the absence
+// loss or reset. A worker that never comes back ends the run at the delivery
 // timeout (supervisor.tick), which cancels ctx.
 func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error {
 	for {
@@ -224,7 +377,7 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 // worker had not committed, whose rows died with its window.
 func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint32]int, next int) int {
 	from := next
-	for _, m := range c.heldChunkMarkers(w.name) {
+	for _, m := range c.takeLostWindows(w.name) {
 		if m.target != target {
 			continue
 		}
@@ -233,6 +386,29 @@ func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint32
 		}
 	}
 	return from
+}
+
+// noteLostWindows records the chunk windows a lost worker had not committed.
+func (c *Coordinator) noteLostWindows(worker string) {
+	held := c.heldChunkMarkers(worker)
+	if len(held) == 0 {
+		return
+	}
+	c.chunkMarkersMu.Lock()
+	defer c.chunkMarkersMu.Unlock()
+	if c.lostWindows == nil {
+		c.lostWindows = map[string][]chunkMarker{}
+	}
+	c.lostWindows[worker] = append(c.lostWindows[worker], held...)
+}
+
+// takeLostWindows returns and forgets the chunk windows worker lost.
+func (c *Coordinator) takeLostWindows(worker string) []chunkMarker {
+	c.chunkMarkersMu.Lock()
+	defer c.chunkMarkersMu.Unlock()
+	out := c.lostWindows[worker]
+	delete(c.lostWindows, worker)
+	return out
 }
 
 // clearChunkReady forgets that a partition's current chunk is in its

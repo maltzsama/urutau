@@ -52,8 +52,8 @@ Expected recovery:
   worker (`loseWorker`): a new epoch, and the batch kept on its sent list.
   When the Pod reconnects, the batch is redelivered. In D4 it is already
   durable, so the worker skips and acks it. The run ends only if the worker
-  does not come back within the absence timeout, or is lost three times in a
-  row with no committed progress (issue #461).
+  delivers nothing of what it owes for the delivery timeout, or crashes three
+  times in a row without delivering it (issue #461).
 - **D3 (worker dies).** The redelivery re-applies the batch: the equality
   deletes are idempotent and the appends rewrite the rows. The keys are
   missing from the sink only until it commits.

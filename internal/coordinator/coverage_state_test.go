@@ -82,14 +82,15 @@ func TestRestartWorkerResetsKnownWorker(t *testing.T) {
 func TestSupervisorRunEndsTheRunForAnAbsentWorker(t *testing.T) {
 	c, w := coordHarness()
 	w.attached, w.hadSession = false, true
-	c.supervisor.pendingSetAt("w0", time.Now().Add(-time.Hour))
+	w.queue <- queuedBatch{id: 1} // it owes work, and delivers none
+	c.supervisor.pendingSet("w0")
 	c.supervisor.noteAck("w0", time.Now().Add(-time.Hour))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	terminate := make(chan error, 1)
 	go c.supervisor.run(ctx, SupervisorConfig{
-		Poll: time.Millisecond, AckTimeout: time.Millisecond, AbsenceTimeout: time.Minute,
+		Poll: time.Millisecond, AckTimeout: time.Millisecond, DeliveryTimeout: time.Minute,
 	}, terminate)
 
 	select {

@@ -48,19 +48,25 @@ running:
 The job ends only for what does not heal by itself:
 
 - an error the worker reports itself (schema drift, a failed commit);
-- `--max-losses-without-progress` (`3`): the same worker lost that many
-  times in a row with no committed progress in between — a crash loop, like
-  a batch that OOM-kills it every time. The error names the worker, its
-  committed position, and the Pod's last termination reason;
-- `--worker-absence-timeout` (`5m`): a lost worker that has not reconnected
-  for that long — a Pod that cannot be scheduled, a volume that does not
-  mount. The error carries the reason Kubernetes gives;
+- `--max-consecutive-crashes` (`3`): a crash loop. The same worker crashes
+  that many times in a row without delivering what it owed when it came
+  back — a batch that OOM-kills it every time. The error names the worker,
+  its committed position, and the Pod's last termination reason;
+- `--worker-delivery-timeout` (`5m`): a worker that owes work and delivers
+  none of it for that long, connected or not — a Pod that cannot be
+  scheduled, a network partition that never heals. The error carries the
+  reason Kubernetes gives;
 - a stalled worker on an **append** table with unacked batches: redelivering
   a batch that was committed before its ack was lost would append it twice.
 
-Progress resets the loss count, so a worker killed now and then under load,
-committing in between, never ends the job. `--max-resets` and
-`--reset-window` are deprecated and ignored.
+Whether a loss was a crash is read from the worker's Pod when it comes back:
+an OOM kill, a panic or an error is a crash; a Pod replaced from outside (a
+drain, a pod-kill) is not, and neither is a worker that exited because it
+lost the coordinator, which it records as `network:` in its termination
+message. The count starts over once the worker has delivered everything it
+owed when it came back and stayed up for an ack timeout, so crashes spaced
+out by healthy stretches — hours apart on a quiet table — never add up.
+`--max-resets` and `--reset-window` are deprecated and ignored.
 
 ## Audit trail (`--eventlog`)
 

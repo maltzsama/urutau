@@ -138,9 +138,10 @@ snapshot from the progress its windows committed (`cdc.snapshot.pending`)
 when the partition ranges are unchanged, and starts it over otherwise.
 
 The job ends only for what does not heal by itself: an error the worker
-reports, the same worker lost `--max-losses-without-progress` (`3`) times in
-a row with no committed progress, a worker gone for
-`--worker-absence-timeout` (`5m`), or a stalled worker with unacked batches
+reports, the same worker crashing `--max-consecutive-crashes` (`3`) times
+in a row without delivering what it owed (a lost network or a replaced Pod
+is not a crash), a worker owing work that delivers none of it for
+`--worker-delivery-timeout` (`5m`), or a stalled worker with unacked batches
 on an append table. See [Reliability](reliability.md#supervision-the-coordinator-heals-workers).
 
 Resets are safe because the position lives in the **sink**, not in the

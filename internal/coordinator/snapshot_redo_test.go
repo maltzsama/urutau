@@ -108,14 +108,23 @@ func TestSnapshotRedoesTheChunksALostWorkerHeld(t *testing.T) {
 	default:
 	}
 
-	// It comes back, and commits from now on.
+	// The lost windows' Closes markers are redelivered to the restarted
+	// worker and acked as empty windows before the snapshot loop sees it
+	// back: the chunks to redo must have been taken at the loss.
+	mu.Lock()
+	commit = true
+	mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for c.uncommittedChunks(w.name) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the lost windows' markers were never acked")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	c.mu.Lock()
 	w.attached = true
 	c.mu.Unlock()
 	c.supervisor.noteAttach(w.name)
-	mu.Lock()
-	commit = true
-	mu.Unlock()
 
 	select {
 	case err := <-done:

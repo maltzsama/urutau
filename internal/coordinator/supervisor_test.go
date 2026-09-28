@@ -101,7 +101,7 @@ func TestSupervisorAwaitsAPendingWorker(t *testing.T) {
 	w := workers["w1"]
 	w.cancel = func() {}
 
-	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, AbsenceTimeout: 5 * time.Minute}
+	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}
 	now := time.Now()
 	s.noteAck("w1", now.Add(-time.Minute)) // stale
 
@@ -168,26 +168,26 @@ func TestSupervisorAwaitsALostWorkerOwingWork(t *testing.T) {
 	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
 	c.index["w1"].add(inflightBatch{id: 1, table: "t"})
 	now := time.Now()
-	s.pendingSetAt("w1", now.Add(-2*time.Minute))
+	s.pendingSet("w1")
 	s.noteAck("w1", now.Add(-2*time.Minute))
 
-	if err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, AbsenceTimeout: 5 * time.Minute}); err != nil {
+	if err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}); err != nil {
 		t.Fatalf("tick: %v; a worker gone for 2m of a 5m absence timeout must be awaited", err)
 	}
 }
 
 // A lost worker gone past the absence timeout ends the run: a Pod that never
 // comes back (unschedulable, a volume that does not mount) is not a hiccup.
-func TestSupervisorEndsTheRunForAWorkerGonePastTheAbsenceTimeout(t *testing.T) {
+func TestSupervisorEndsTheRunForAWorkerGonePastTheDeliveryTimeout(t *testing.T) {
 	s, workers := supervisorHarness()
 	w := workers["w1"]
 	w.attached, w.hadSession = false, true
 	now := time.Now()
-	s.pendingSetAt("w1", now.Add(-6*time.Minute))
+	s.pendingSet("w1")
 	s.noteAck("w1", now.Add(-6*time.Minute))
 
-	err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, AbsenceTimeout: 5 * time.Minute})
-	if err == nil || !strings.Contains(err.Error(), "not reconnected") {
+	err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute})
+	if err == nil || !strings.Contains(err.Error(), "delivered nothing") {
 		t.Fatalf("err = %v, want the run ended for a worker gone past the absence timeout", err)
 	}
 }

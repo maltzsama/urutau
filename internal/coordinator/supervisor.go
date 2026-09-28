@@ -16,14 +16,14 @@ import (
 type SupervisorConfig struct {
 	AckTimeout time.Duration
 	// MaxResets and ResetWindow are no longer read: a crash loop is a worker
-	// lost MaxLossesWithoutProgress times in a row (recovery.go), not a
+	// lost MaxConsecutiveCrashes times in a row (recovery.go), not a
 	// count of resets in a window. Kept for configuration compatibility.
 	MaxResets   int
 	ResetWindow time.Duration
-	// AbsenceTimeout ends the run once a lost worker has not reconnected
+	// DeliveryTimeout ends the run once a lost worker has not reconnected
 	// for this long (default 5m).
-	AbsenceTimeout time.Duration
-	Poll           time.Duration
+	DeliveryTimeout time.Duration
+	Poll            time.Duration
 }
 
 // supervisor watches the workers' ack health and owns the reset window.
@@ -37,21 +37,22 @@ type supervisor struct {
 	// progress is each worker's recent network output reports: a worker
 	// whose output grows is busy on slow storage, not stalled (#422).
 	progress map[string][]progressSample
-	// losses is each worker's run of losses without progress (recovery.go).
-	losses map[string]lossRecord
-	// absentSince is when a pending worker was lost or reset.
-	absentSince map[string]time.Time
+	// health is each worker's losses and crashes (recovery.go).
+	health map[string]*workerHealth
+	// lastDelivered is when each worker last delivered: an ack, or owing
+	// nothing. Unlike lastAck, a reconnect does not move it.
+	lastDelivered map[string]time.Time
 }
 
 func newSupervisor(c *Coordinator) *supervisor {
 	return &supervisor{
-		c:           c,
-		lastAck:     map[string]time.Time{},
-		resets:      map[string][]time.Time{},
-		pending:     map[string]bool{},
-		progress:    map[string][]progressSample{},
-		losses:      map[string]lossRecord{},
-		absentSince: map[string]time.Time{},
+		c:             c,
+		lastAck:       map[string]time.Time{},
+		resets:        map[string][]time.Time{},
+		pending:       map[string]bool{},
+		progress:      map[string][]progressSample{},
+		health:        map[string]*workerHealth{},
+		lastDelivered: map[string]time.Time{},
 	}
 }
 
@@ -66,13 +67,17 @@ func (s *supervisor) noteRegistered(worker string, at time.Time) {
 	if _, ok := s.lastAck[worker]; !ok {
 		s.lastAck[worker] = at
 	}
+	if _, ok := s.lastDelivered[worker]; !ok {
+		s.lastDelivered[worker] = at
+	}
 	s.mu.Unlock()
 }
 
-// noteAck records a worker's ack time.
+// noteAck records a worker's ack time: it delivered.
 func (s *supervisor) noteAck(worker string, at time.Time) {
 	s.mu.Lock()
 	s.lastAck[worker] = at
+	s.lastDelivered[worker] = at
 	s.mu.Unlock()
 }
 
@@ -80,7 +85,6 @@ func (s *supervisor) noteAck(worker string, at time.Time) {
 func (s *supervisor) noteAttach(worker string) {
 	s.mu.Lock()
 	delete(s.pending, worker)
-	delete(s.absentSince, worker)
 	s.lastAck[worker] = time.Now()
 	s.mu.Unlock()
 }
@@ -95,24 +99,15 @@ func (s *supervisor) forget(worker string) {
 	delete(s.pending, worker)
 	delete(s.resets, worker)
 	delete(s.progress, worker)
-	delete(s.losses, worker)
-	delete(s.absentSince, worker)
+	delete(s.health, worker)
+	delete(s.lastDelivered, worker)
 	s.mu.Unlock()
 }
 
 // pendingSet marks a worker as reset-and-not-reattached.
 func (s *supervisor) pendingSet(worker string) {
-	s.pendingSetAt(worker, time.Now())
-}
-
-// pendingSetAt marks a worker reset-and-not-reattached since at; an earlier
-// mark keeps its time, so the absence counts from the first loss.
-func (s *supervisor) pendingSetAt(worker string, at time.Time) {
 	s.mu.Lock()
 	s.pending[worker] = true
-	if _, ok := s.absentSince[worker]; !ok {
-		s.absentSince[worker] = at
-	}
 	s.mu.Unlock()
 }
 
@@ -150,17 +145,18 @@ func (s *supervisor) run(ctx context.Context, cfg SupervisorConfig, terminate ch
 // tick resets a worker that is attached, owes work and has stopped acking,
 // and awaits one that is lost or reset until it reconnects (issue #461). It
 // ends the run only for what does not heal by itself: a worker gone longer
-// than the absence timeout, or a stalled append worker whose unacked batches
+// than the delivery timeout, or a stalled append worker whose unacked batches
 // a redelivery would append twice. A crash loop — the same worker lost again
-// and again without progress — is ended by loseWorker (recovery.go).
+// and again without delivering what it owed — is ended by workerBack
+// (recovery.go).
 func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	ack := cfg.AckTimeout
 	if ack <= 0 {
 		ack = 30 * time.Second
 	}
-	absence := cfg.AbsenceTimeout
-	if absence <= 0 {
-		absence = defaultWorkerAbsenceTimeout
+	delivery := cfg.DeliveryTimeout
+	if delivery <= 0 {
+		delivery = defaultWorkerDeliveryTimeout
 	}
 
 	// Lock order: c.mu first, then s.mu. Session takes c.mu and calls
@@ -185,22 +181,40 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		probes[i].owes = probes[i].owes || s.c.inFlight(probes[i].name) > 0
 	}
 
+	type minHeld struct {
+		name string
+		id   uint64
+	}
+	held := make([]minHeld, 0, len(probes))
+	for _, p := range probes {
+		var id uint64
+		if idx := s.c.indexOf(p.name); idx != nil {
+			id = idx.minHeldID()
+		}
+		held = append(held, minHeld{p.name, id})
+	}
+
 	var stalled []string
 	var gone []string
 	s.mu.Lock()
-	for _, p := range probes {
-		if s.pending[p.name] || (!p.attached && p.hadSession) {
-			// Lost or reset, and not back yet: awaited. The absence counts
-			// from the loss; a detached worker the loss path has not marked
-			// yet counts from its last ack.
-			since, ok := s.absentSince[p.name]
-			if !ok {
-				since = s.lastAck[p.name]
-			}
-			if !p.attached && !since.IsZero() && now.Sub(since) > absence {
-				gone = append(gone, p.name)
-			}
+	for i, p := range probes {
+		if !p.owes {
+			s.lastDelivered[p.name] = now
+		}
+		if p.attached && !s.pending[p.name] {
+			s.noteDeliveringLocked(p.name, held[i].id, now, ack)
+		}
+		// A worker that owes work and has delivered none of it for the
+		// delivery timeout ends the run, attached or not: a partition that
+		// lets it reconnect for a moment every few seconds, or a Pod that
+		// never starts, is not a worker making progress. A worker whose
+		// uploads keep flowing is delivering to storage (#422).
+		if at, ok := s.lastDelivered[p.name]; ok && p.owes && now.Sub(at) > delivery && !s.busyLocked(p.name, now, at, delivery) {
+			gone = append(gone, p.name)
 			continue
+		}
+		if s.pending[p.name] || (!p.attached && p.hadSession) {
+			continue // lost or reset, and not back yet: awaited
 		}
 		// An ATTACHED worker that owes nothing is merely idle — a quiet
 		// table, or one that just went through a re-slice — and resetting it
@@ -213,8 +227,8 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	s.mu.Unlock()
 
 	for _, name := range gone {
-		return fmt.Errorf("coordinator: worker %s has not reconnected for over %s%s",
-			name, absence, s.c.workerTermination(name))
+		return fmt.Errorf("coordinator: worker %s has delivered nothing for over %s while owing work%s",
+			name, delivery, s.c.workerTermination(name))
 	}
 	for _, name := range stalled {
 		w, ok := s.c.workers[name]
@@ -234,9 +248,9 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	return nil
 }
 
-// defaultWorkerAbsenceTimeout is how long a lost worker may take to
+// defaultWorkerDeliveryTimeout is how long a lost worker may take to
 // reconnect before the run ends.
-const defaultWorkerAbsenceTimeout = 5 * time.Minute
+const defaultWorkerDeliveryTimeout = 5 * time.Minute
 
 // indexOf returns a worker's position index under indexMu, or nil.
 func (c *Coordinator) indexOf(worker string) *positionIndex {
