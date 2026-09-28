@@ -79,23 +79,23 @@ func TestRestartWorkerResetsKnownWorker(t *testing.T) {
 	}
 }
 
-func TestSupervisorRunTerminatesCrashloop(t *testing.T) {
+func TestSupervisorRunEndsTheRunForAnAbsentWorker(t *testing.T) {
 	c, w := coordHarness()
-	// The worker must OWE work to be stale; owing nothing makes it idle.
-	w.queue <- queuedBatch{id: 1}
+	w.attached, w.hadSession = false, true
+	c.supervisor.pendingSetAt("w0", time.Now().Add(-time.Hour))
 	c.supervisor.noteAck("w0", time.Now().Add(-time.Hour))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	terminate := make(chan error, 1)
 	go c.supervisor.run(ctx, SupervisorConfig{
-		Poll: time.Millisecond, AckTimeout: time.Millisecond, MaxResets: 1, ResetWindow: time.Hour,
+		Poll: time.Millisecond, AckTimeout: time.Millisecond, AbsenceTimeout: time.Minute,
 	}, terminate)
 
 	select {
 	case <-terminate:
 	case <-time.After(3 * time.Second):
-		t.Fatal("supervisor.run never terminated a crashlooping worker")
+		t.Fatal("supervisor.run never ended the run for a worker gone past the absence timeout")
 	}
 }
 

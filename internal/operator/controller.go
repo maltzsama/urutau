@@ -798,16 +798,7 @@ func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
 	if snap.MaxParallelChunks > 0 {
 		args = append(args, "--max-parallel-chunks", strconv.Itoa(snap.MaxParallelChunks))
 	}
-	sup := cr.Spec.Coordinator.Supervision
-	if sup.AckTimeout != "" {
-		args = append(args, "--ack-timeout", sup.AckTimeout)
-	}
-	if sup.MaxResets > 0 {
-		args = append(args, "--max-resets", strconv.Itoa(sup.MaxResets))
-	}
-	if sup.Window != "" {
-		args = append(args, "--reset-window", sup.Window)
-	}
+	args = append(args, supervisionArgs(cr.Spec.Coordinator.Supervision)...)
 	if ev := cr.Spec.Coordinator.Eventlog; ev != nil && ev.Bucket != "" {
 		args = append(args, "--eventlog", eventlogURI(ev))
 	}

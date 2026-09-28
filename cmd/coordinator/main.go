@@ -66,6 +66,8 @@ type coordinatorFlags struct {
 	ackTimeout      time.Duration
 	maxResets       int
 	resetWindow     time.Duration
+	maxLosses       int
+	absenceTimeout  time.Duration
 	eventlogURI     string
 	checkpointURI   string
 	checkpointSec   int
@@ -140,8 +142,12 @@ func runCmd() *cobra.Command {
 	fl.Int64Var(&f.flowPerWorkerMi, "flow-per-worker-min-mi", 16, "per-worker minimum share of the flow budget (MiB)")
 	fl.DurationVar(&f.waitWorker, "wait-worker", 2*time.Minute, "how long to wait for every expected worker session")
 	fl.DurationVar(&f.ackTimeout, "ack-timeout", 30*time.Second, "worker considered stale without an ack for this long")
-	fl.IntVar(&f.maxResets, "max-resets", 5, "resets within the window before the job terminates")
-	fl.DurationVar(&f.resetWindow, "reset-window", 15*time.Minute, "sliding window for the reset count")
+	fl.IntVar(&f.maxResets, "max-resets", 5, "deprecated, ignored: see --max-losses-without-progress")
+	fl.DurationVar(&f.resetWindow, "reset-window", 15*time.Minute, "deprecated, ignored: see --max-losses-without-progress")
+	_ = fl.MarkDeprecated("max-resets", "a worker is ended by --max-losses-without-progress instead")
+	_ = fl.MarkDeprecated("reset-window", "a worker is ended by --max-losses-without-progress instead")
+	fl.IntVar(&f.maxLosses, "max-losses-without-progress", 3, "a worker lost this many times in a row with no committed progress ends the job")
+	fl.DurationVar(&f.absenceTimeout, "worker-absence-timeout", 5*time.Minute, "a lost worker that has not reconnected for this long ends the job")
 	// audit / recovery
 	fl.StringVar(&f.eventlogURI, "eventlog", "", "s3://<bucket>/<prefix> audit trail store (optional)")
 	fl.StringVar(&f.checkpointURI, "checkpoint", "", "s3://<bucket>/<prefix> async position manifests (optional)")
@@ -186,26 +192,28 @@ func (f *coordinatorFlags) validate() error {
 
 func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger, logBuffer *logging.Buffer) coordinator.Config {
 	return coordinator.Config{
-		Spec:              s,
-		ListenAddr:        f.listen,
-		ServerID:          f.serverID,
-		Heartbeat:         5 * time.Second, // control-plane liveness cadence (protocol constant)
-		ChunkSize:         f.chunkSize,
-		MaxParallelChunks: f.maxParallel,
-		WindowTimeout:     f.windowTimeout,
-		CaughtUpPoll:      time.Second, // caught-up proof poll (protocol constant)
-		WaitWorker:        f.waitWorker,
-		FlowTotalBytes:    f.flowTotalBytes,
-		FlowPerWorkerMin:  f.flowPerWorkerMi << 20,
-		Eventlog:          eventlogConfig(f.eventlogURI),
-		Checkpoint:        checkpointConfig(f.checkpointURI, f.checkpointSec),
-		AckTimeout:        f.ackTimeout,
-		MaxResets:         f.maxResets,
-		ResetWindow:       f.resetWindow,
-		MetricsAddr:       f.metricsAddr,
-		LogBuffer:         logBuffer,
-		TLS:               grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA, AllowInsecure: f.allowInsecure},
-		Logger:            logger,
+		Spec:                     s,
+		ListenAddr:               f.listen,
+		ServerID:                 f.serverID,
+		Heartbeat:                5 * time.Second, // control-plane liveness cadence (protocol constant)
+		ChunkSize:                f.chunkSize,
+		MaxParallelChunks:        f.maxParallel,
+		WindowTimeout:            f.windowTimeout,
+		CaughtUpPoll:             time.Second, // caught-up proof poll (protocol constant)
+		WaitWorker:               f.waitWorker,
+		FlowTotalBytes:           f.flowTotalBytes,
+		FlowPerWorkerMin:         f.flowPerWorkerMi << 20,
+		Eventlog:                 eventlogConfig(f.eventlogURI),
+		Checkpoint:               checkpointConfig(f.checkpointURI, f.checkpointSec),
+		AckTimeout:               f.ackTimeout,
+		MaxResets:                f.maxResets,
+		ResetWindow:              f.resetWindow,
+		MaxLossesWithoutProgress: f.maxLosses,
+		WorkerAbsenceTimeout:     f.absenceTimeout,
+		MetricsAddr:              f.metricsAddr,
+		LogBuffer:                logBuffer,
+		TLS:                      grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA, AllowInsecure: f.allowInsecure},
+		Logger:                   logger,
 	}
 }
 
