@@ -93,24 +93,32 @@ func TestSupervisorTickFreshAttachedNoAckIsStale(t *testing.T) {
 	}
 }
 
-// Resets beyond MaxResets within the window terminate the job.
-func TestSupervisorTickTerminatesOnCrashloop(t *testing.T) {
+// A reset worker that has not reattached is awaited, not reset again: its
+// reconnect is on the way (issue #461). Resetting it on every tick counted
+// toward MaxResets and ended the run while the Pod was still restarting.
+func TestSupervisorAwaitsAPendingWorker(t *testing.T) {
 	s, workers := supervisorHarness()
 	w := workers["w1"]
 	w.cancel = func() {}
 
-	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 2, ResetWindow: 15 * time.Minute}
+	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, AbsenceTimeout: 5 * time.Minute}
 	now := time.Now()
 	s.noteAck("w1", now.Add(-time.Minute)) // stale
 
-	// First stale tick: one reset in the window (below MaxResets).
 	if err := s.tick(now, cfg); err != nil {
 		t.Fatalf("first tick: %v", err)
 	}
-	// Second stale tick (worker still pending): crosses MaxResets → terminal.
-	err := s.tick(now.Add(time.Minute), cfg)
-	if err == nil || err.Error() != "coordinator: crashloop: worker w1: 2 resets in 15m0s" {
-		t.Fatalf("second tick err = %v, want crashloop termination", err)
+	if w.epoch != 1 {
+		t.Fatalf("epoch = %d after the first stale tick, want 1", w.epoch)
+	}
+	w.attached = false // its session ended; the Pod is restarting
+	for i := 1; i <= 4; i++ {
+		if err := s.tick(now.Add(time.Duration(i)*time.Minute), cfg); err != nil {
+			t.Fatalf("tick %d while the worker restarts: %v", i, err)
+		}
+	}
+	if w.epoch != 1 {
+		t.Fatalf("epoch = %d, want 1: a pending worker must not be reset again", w.epoch)
 	}
 }
 
@@ -149,44 +157,38 @@ func TestSupervisorReattachClearsPending(t *testing.T) {
 	}
 }
 
-// A worker whose Pod was deleted (a re-slice scale-in) was attached and is
-// now detached with work owed: it can never drain its queue, so tick must
-// terminate for a clean replay rather than reset (issue #372).
-func TestSupervisorTickDetachedOwingTerminates(t *testing.T) {
+// A lost worker that owes work is awaited for the absence timeout: its Pod
+// comes back under the same name and is redelivered what it owed (issue
+// #461). Ending the run at once was the earlier "clean replay".
+func TestSupervisorAwaitsALostWorkerOwingWork(t *testing.T) {
 	s, workers := supervisorHarness()
 	c := s.c
 	w := workers["w1"]
-	w.attached = false
-	w.hadSession = true
+	w.attached, w.hadSession = false, true
 	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
 	c.index["w1"].add(inflightBatch{id: 1, table: "t"})
-	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+	now := time.Now()
+	s.pendingSetAt("w1", now.Add(-2*time.Minute))
+	s.noteAck("w1", now.Add(-2*time.Minute))
 
-	err := s.tick(time.Now(), SupervisorConfig{
-		AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute,
-	})
-	if err == nil || !strings.Contains(err.Error(), "detached") {
-		t.Fatalf("err = %v, want a terminate for the detached, owing worker", err)
+	if err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, AbsenceTimeout: 5 * time.Minute}); err != nil {
+		t.Fatalf("tick: %v; a worker gone for 2m of a 5m absence timeout must be awaited", err)
 	}
 }
 
-// A detached worker that owes only QUEUED work (no in-flight batch) must also
-// terminate: no session will ever drain its queue, so a reset strands it
-// (issue #372).
-func TestSupervisorTickDetachedQueuedTerminates(t *testing.T) {
+// A lost worker gone past the absence timeout ends the run: a Pod that never
+// comes back (unschedulable, a volume that does not mount) is not a hiccup.
+func TestSupervisorEndsTheRunForAWorkerGonePastTheAbsenceTimeout(t *testing.T) {
 	s, workers := supervisorHarness()
 	w := workers["w1"]
-	w.attached = false
-	w.hadSession = true
-	// supervisorHarness seeds one queued batch; the index stays empty, so the
-	// worker owes via the queue alone, not an in-flight batch.
-	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+	w.attached, w.hadSession = false, true
+	now := time.Now()
+	s.pendingSetAt("w1", now.Add(-6*time.Minute))
+	s.noteAck("w1", now.Add(-6*time.Minute))
 
-	err := s.tick(time.Now(), SupervisorConfig{
-		AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute,
-	})
-	if err == nil || !strings.Contains(err.Error(), "detached") {
-		t.Fatalf("err = %v, want a terminate for the detached, queued-owing worker", err)
+	err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, AbsenceTimeout: 5 * time.Minute})
+	if err == nil || !strings.Contains(err.Error(), "not reconnected") {
+		t.Fatalf("err = %v, want the run ended for a worker gone past the absence timeout", err)
 	}
 }
 
@@ -275,38 +277,48 @@ func TestSupervisorSparesAWorkerMakingStorageProgress(t *testing.T) {
 	}
 }
 
-// A worker whose output stands still is stalled, as before: a wedged worker
-// must still end the run promptly.
-func TestSupervisorTerminatesAWorkerWithoutProgress(t *testing.T) {
-	s, _, now := progressHarness(2 * time.Minute)
+// requireReset fails unless the stalled worker was reset (issue #461: a
+// stalled upsert worker is reset and redelivered, not a reason to end the
+// run).
+func requireReset(t *testing.T, s *supervisor, w *workerState, err error, why string) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("tick: %v; %s must be reset, not end the run", err, why)
+	}
+	if w.epoch != 1 || !s.isPending("w1") {
+		t.Fatalf("epoch=%d pending=%v; %s must be reset", w.epoch, s.isPending("w1"), why)
+	}
+}
+
+// A worker whose output stands still is stalled, as before, and is reset
+// promptly.
+func TestSupervisorResetsAWorkerWithoutProgress(t *testing.T) {
+	s, w, now := progressHarness(2 * time.Minute)
+	w.cancel = func() {}
 	s.noteProgress("w1", 100<<20, now.Add(-90*time.Second))
 	s.noteProgress("w1", 100<<20+4096, now.Add(-5*time.Second)) // heartbeats only
-	if err := s.tick(now, progressCfg); err == nil || !strings.Contains(err.Error(), "stalled") {
-		t.Fatalf("err = %v, want the stall termination", err)
-	}
+	requireReset(t, s, w, s.tick(now, progressCfg), "a worker without progress")
 }
 
 // Progress without an ack for long is not trusted forever: a worker that
 // keeps sending (retrying one failing upload, say) but never acks is ended
 // at progressAckCap × the ack timeout.
 func TestSupervisorCapsProgressWithoutAcks(t *testing.T) {
-	s, _, now := progressHarness(progressAckCap*30*time.Second + time.Second)
+	s, w, now := progressHarness(progressAckCap*30*time.Second + time.Second)
+	w.cancel = func() {}
 	s.noteProgress("w1", 100<<20, now.Add(-40*time.Second))
 	s.noteProgress("w1", 900<<20, now.Add(-5*time.Second))
-	if err := s.tick(now, progressCfg); err == nil || !strings.Contains(err.Error(), "stalled") {
-		t.Fatalf("err = %v, want the stall termination past the cap", err)
-	}
+	requireReset(t, s, w, s.tick(now, progressCfg), "a worker past the progress cap")
 }
 
 // Growth is measured over the last ack timeout, not accumulated from an old
 // baseline: trickles of control traffic that add up to 1 MiB over minutes
 // are not progress (review of #450).
 func TestSupervisorProgressIsGrowthWithinTheTimeout(t *testing.T) {
-	s, _, now := progressHarness(2 * time.Minute)
+	s, w, now := progressHarness(2 * time.Minute)
+	w.cancel = func() {}
 	s.noteProgress("w1", 100<<20, now.Add(-100*time.Second))
 	s.noteProgress("w1", 100<<20+600<<10, now.Add(-45*time.Second))
 	s.noteProgress("w1", 100<<20+1200<<10, now.Add(-5*time.Second)) // 600 KiB in the last 30 s
-	if err := s.tick(now, progressCfg); err == nil || !strings.Contains(err.Error(), "stalled") {
-		t.Fatalf("err = %v, want the stall termination: under 1 MiB grew in the last timeout", err)
-	}
+	requireReset(t, s, w, s.tick(now, progressCfg), "a worker that grew under 1 MiB in the last timeout")
 }

@@ -1,7 +1,6 @@
 package coordinator
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/maltzsama/urutau/core"
@@ -72,34 +71,6 @@ func (s *stagedCycles) isGapped(target string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gapped[target]
-}
-
-// debugOpen renders a table's open and done cycles in send order, with their
-// delivery positions and expected owners — a wedge diagnostic (issue #372).
-func (s *stagedCycles) debugOpen(target string) []string {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, 0, len(s.order[target]))
-	for _, seq := range s.order[target] {
-		k := cycleKey{target, seq}
-		if cy, ok := s.open[k]; ok {
-			out = append(out, fmt.Sprintf("%d:open@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
-		} else if cy, ok := s.done[k]; ok {
-			out = append(out, fmt.Sprintf("%d:done@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
-		}
-	}
-	return out
-}
-
-func ownerNames(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for name := range m {
-		out = append(out, name)
-	}
-	return out
 }
 
 // expect records that a delivery is expected from each of owners for

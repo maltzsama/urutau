@@ -5,6 +5,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -17,25 +18,42 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
-// CD-T1: a stall with unacked (in-flight) batches must TERMINATE, not reset.
-// A reset cancels the session; the in-flight batches are redelivered on
-// reconnect (issue #235), but that replays them (duplicating the work).
-// Terminating instead restarts the run and replays cleanly from the committed
-// position.
-func TestSupervisorResetWithInFlightTerminates(t *testing.T) {
-	s, _ := supervisorHarness()
+// A stalled worker with unacked batches is reset (issue #461): the batches
+// are redelivered on reconnect (issue #235), and on an upsert table the
+// worker skips what it committed and re-applies the rest idempotently.
+func TestSupervisorResetsAStalledWorkerWithInFlight(t *testing.T) {
+	s, workers := supervisorHarness()
 	c := s.c
+	w := workers["w1"]
+	cancelled := false
+	w.cancel = func() { cancelled = true }
 	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
 	c.index["w1"].add(inflightBatch{id: 1, table: "t"})
-
-	// Worker stopped acking (2 minutes ago).
 	s.noteAck("w1", time.Now().Add(-2*time.Minute))
 
-	err := s.tick(time.Now(), SupervisorConfig{
-		AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute,
-	})
-	if err == nil || !strings.Contains(err.Error(), "in-flight") {
-		t.Fatalf("err = %v, want a terminate citing in-flight batches", err)
+	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second}); err != nil {
+		t.Fatalf("tick: %v; a stalled upsert worker must be reset", err)
+	}
+	if !cancelled || w.epoch != 1 {
+		t.Fatalf("cancelled=%v epoch=%d; want the worker reset", cancelled, w.epoch)
+	}
+}
+
+// On an append table a redelivered batch that was committed before its ack
+// was lost would be appended twice (issue #235): a stalled append worker with
+// unacked batches ends the run instead.
+func TestSupervisorEndsTheRunForAStalledAppendWorkerWithInFlight(t *testing.T) {
+	s, workers := supervisorHarness()
+	c := s.c
+	workers["w1"].refs = []source.TableRef{{Source: "shop.t", Target: "raw.t"}}
+	c.cfg.Spec = &spec.Spec{Tables: []spec.Table{{Source: "shop.t", Target: "raw.t", WriteMode: spec.WriteModeAppend}}}
+	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
+	c.index["w1"].add(inflightBatch{id: 1, table: "raw.t"})
+	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+
+	err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "append") {
+		t.Fatalf("err = %v, want the run ended for a stalled append worker", err)
 	}
 }
 
@@ -84,28 +102,32 @@ func TestEnqueueBatchMarkerEmptyTableErrors(t *testing.T) {
 	}
 }
 
-// V7 / CD-T2: a session ending during an active snapshot must fail the run
-// fast — a reset mid-snapshot is NOT a recoverable non-failure here (the
-// worker's window died with it), and letting the snapshot loop continue
-// would either wait out AckTimeout/MaxResets or let a stale ChunkReady
-// satisfy the wait against an empty window.
-func TestSignalSessionEndDuringSnapshot(t *testing.T) {
-	s, _ := supervisorHarness()
+// A worker lost mid-snapshot does not end the run (issue #461): its chunk
+// window died with it, so the snapshot loop of its partition is told, and
+// redoes the chunks the lost window held once the worker is back. A stale
+// ChunkReady from the lost session cannot satisfy the wait: the loss bumps
+// the epoch.
+func TestSignalSessionEndDuringSnapshotSignalsTheSnapshot(t *testing.T) {
+	s, workers := supervisorHarness()
 	c := s.c
 	c.sessionErrs = make(chan error, 4)
 	c.snapshotActive.Store(true)
+	lost := c.lostSignal(workers["w1"])
 
-	// A reset (errSessionReset) mid-snapshot must still surface as a run
-	// error, not be swallowed by the reset-is-not-a-failure rule.
-	c.signalSessionEnd("w1", errSessionReset)
+	c.signalSessionEnd("w1", context.Canceled)
 
 	select {
 	case err := <-c.sessionErrs:
-		if err == nil || !strings.Contains(err.Error(), "during snapshot") {
-			t.Fatalf("err = %v, want a snapshot-session error", err)
-		}
+		t.Fatalf("a worker lost mid-snapshot must be recovered, not end the run: %v", err)
 	default:
-		t.Fatal("a reset mid-snapshot must fail the run")
+	}
+	select {
+	case <-lost:
+	default:
+		t.Fatal("the snapshot loop must be told its worker was lost")
+	}
+	if workers["w1"].epoch != 1 {
+		t.Fatalf("epoch = %d, want 1: a reply from the lost session must be stale", workers["w1"].epoch)
 	}
 }
 
@@ -151,9 +173,9 @@ func TestSignalSessionEndPendingDoesNotDiscard(t *testing.T) {
 	}
 }
 
-// A genuine worker death always surfaces, snapshot or not.
-func TestSignalSessionEndDeathSurfaces(t *testing.T) {
-	s, _ := supervisorHarness()
+// A stream that dies (network error, Pod killed) is a hiccup: recovered.
+func TestSignalSessionEndStreamErrorRecovers(t *testing.T) {
+	s, workers := supervisorHarness()
 	c := s.c
 	c.sessionErrs = make(chan error, 4)
 
@@ -161,19 +183,21 @@ func TestSignalSessionEndDeathSurfaces(t *testing.T) {
 
 	select {
 	case err := <-c.sessionErrs:
-		if err != errWorkerDead {
-			t.Fatalf("err = %v, want the death error", err)
-		}
+		t.Fatalf("a dead stream must be recovered, not end the run: %v", err)
 	default:
-		t.Fatal("a worker death must surface")
+	}
+	if workers["w1"].epoch != 1 || !s.isPending("w1") {
+		t.Fatal("the worker must be awaited under a new epoch")
 	}
 }
 
-// Issue #363: a session that ends while the worker still owes batches strands
-// them — the pump keeps routing to the detached owner and nothing drains the
-// queue, so a re-slice's drain waits on them forever and the flip never
-// commits. The run must terminate for a clean replay instead.
-func TestSignalSessionEndOwingWorkTerminates(t *testing.T) {
+// Issue #461: a worker lost while it owes batches is recovered, not a reason
+// to end the run. Its queued and sent-but-unacked batches stay with it and
+// are redelivered when its Pod reconnects (issue #235), under a new epoch, so
+// a reply from the lost session is ignored. The run ending instead put the
+// coordinator into CrashLoopBackOff under sustained worker kills, and no
+// table advanced.
+func TestSignalSessionEndOwingWorkRecovers(t *testing.T) {
 	s, workers := supervisorHarness()
 	c := s.c
 	c.sessionErrs = make(chan error, 4)
@@ -186,11 +210,14 @@ func TestSignalSessionEndOwingWorkTerminates(t *testing.T) {
 
 	select {
 	case err := <-c.sessionErrs:
-		if err == nil || !strings.Contains(err.Error(), "owing work") {
-			t.Fatalf("err = %v, want a session-lost-owing-work error", err)
-		}
+		t.Fatalf("a worker lost owing work must be recovered, not end the run: %v", err)
 	default:
-		t.Fatal("a session lost while owing work must fail the run for a clean replay")
+	}
+	if len(workers["w1"].queue) != 1 {
+		t.Fatalf("w1's queue holds %d batches, want its 1 owed batch kept for redelivery", len(workers["w1"].queue))
+	}
+	if workers["w1"].epoch != 1 || !s.isPending("w1") {
+		t.Fatalf("epoch=%d pending=%v; want a new epoch and the worker awaited like a reset", workers["w1"].epoch, s.isPending("w1"))
 	}
 }
 
@@ -211,17 +238,15 @@ func TestSignalSessionEndNothingOwedIsSilent(t *testing.T) {
 	}
 }
 
-// A worker whose open staged cycles are discarded on session loss also loses
-// rows: the cycle can never complete, and committing past it would drop the
-// gap. The run must terminate for a clean replay even when nothing is queued
-// or in-flight (issue #372).
-func TestSignalSessionEndDiscardedCyclesTerminates(t *testing.T) {
+// A lost worker's open staged cycles are kept: its reconnected session
+// redelivers the batches and stages them again, and the cycles complete.
+// Discarding them left a gap only a run restart recovered (issue #461).
+func TestSignalSessionEndKeepsOpenCycles(t *testing.T) {
 	s, workers := supervisorHarness()
 	c := s.c
 	c.sessionErrs = make(chan error, 4)
 	<-workers["w1"].queue // nothing owed: the loss is purely open cycles
 
-	// w1 was an expected deliverer of a cycle that never completed.
 	c.staged = newStagedCycles()
 	c.staged.expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1"})
 
@@ -229,11 +254,76 @@ func TestSignalSessionEndDiscardedCyclesTerminates(t *testing.T) {
 
 	select {
 	case err := <-c.sessionErrs:
-		if err == nil || !strings.Contains(err.Error(), "owing work") {
-			t.Fatalf("err = %v, want a session-lost-owing-work error", err)
+		t.Fatalf("a worker lost with open cycles must be recovered, not end the run: %v", err)
+	default:
+	}
+	if c.staged.isGapped("raw.t") || c.staged.openFor(core.TableRef{Target: "raw.t"}) != 1 {
+		t.Fatal("the lost worker's open cycle must stay open for its redelivery")
+	}
+}
+
+// A worker that reports an error itself (schema drift, a failed commit) is
+// not a hiccup: its session ends with that error, and the run ends.
+func TestSignalSessionEndWorkerReportedErrorIsFatal(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+
+	c.signalSessionEnd("w1", &workerReportedError{detail: "schema drift on raw.t"})
+
+	select {
+	case err := <-c.sessionErrs:
+		if err == nil || !strings.Contains(err.Error(), "schema drift") {
+			t.Fatalf("err = %v, want the worker's own error", err)
 		}
 	default:
-		t.Fatal("discarding a worker's open cycles must fail the run for a clean replay")
+		t.Fatal("an error the worker reported must end the run")
+	}
+}
+
+// Losses are bounded: the same worker lost maxLossesWithoutProgress times in
+// a row with no committed progress in between is a crash loop (a batch that
+// OOM-kills it every time), and the run ends with what it knows.
+func TestLossesWithoutProgressEndTheRun(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 4)
+	c.confirmed = map[string]position.Position{"w1": position.MustLSN("0/10")}
+
+	for i := 1; i <= defaultMaxLossesWithoutProgress; i++ {
+		c.signalSessionEnd("w1", context.Canceled)
+		select {
+		case err := <-c.sessionErrs:
+			if i < defaultMaxLossesWithoutProgress {
+				t.Fatalf("loss %d ended the run: %v", i, err)
+			}
+			if !strings.Contains(err.Error(), "without progress") || !strings.Contains(err.Error(), "0/10") {
+				t.Fatalf("err = %v, want the loss count and the stuck position", err)
+			}
+		default:
+			if i == defaultMaxLossesWithoutProgress {
+				t.Fatalf("%d losses without progress must end the run", i)
+			}
+		}
+	}
+}
+
+// Progress between losses restarts the count: a worker killed now and then
+// under chaos, committing in between, is never a crash loop.
+func TestLossesWithProgressDoNotEndTheRun(t *testing.T) {
+	s, _ := supervisorHarness()
+	c := s.c
+	c.sessionErrs = make(chan error, 8)
+	c.confirmed = map[string]position.Position{"w1": position.MustLSN("0/10")}
+
+	for i := 0; i < 2*defaultMaxLossesWithoutProgress; i++ {
+		c.signalSessionEnd("w1", context.Canceled)
+		c.recordConfirmed("w1", position.MustLSN(fmt.Sprintf("0/%X", 0x20+i)))
+	}
+	select {
+	case err := <-c.sessionErrs:
+		t.Fatalf("losses with progress in between ended the run: %v", err)
+	default:
 	}
 }
 
