@@ -262,3 +262,30 @@ func TestNoAckTimeoutResetDuringTheSnapshot(t *testing.T) {
 		t.Fatal("a worker late on acks was reset mid-snapshot")
 	}
 }
+
+// The snapshot can reach awaitReattached well after the loss (it was busy
+// with another chunk). The delivery timeout counts from the loss, not from
+// the start of the wait.
+func TestTheSnapshotWaitForALostWorkerCountsFromTheLoss(t *testing.T) {
+	c, s, _ := recoveryHarness(t)
+	c.cfg.WorkerDeliveryTimeout = time.Minute
+	w := c.workers["w1"]
+	c.signalSessionEnd("w1", context.Canceled)
+	c.mu.Lock()
+	w.attached = false
+	c.mu.Unlock()
+	s.mu.Lock()
+	s.healthOf("w1").lostAt = time.Now().Add(-2 * time.Minute)
+	s.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- c.awaitReattached(context.Background(), w) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "did not come back") {
+			t.Fatalf("err = %v, want the run ended for a worker lost 2m ago with a 1m timeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait restarted the delivery timeout instead of counting from the loss")
+	}
+}

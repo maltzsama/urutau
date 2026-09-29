@@ -232,6 +232,7 @@ type workerHealth struct {
 	seenRestarts int32
 	owedMark     uint64    // the highest batch id owed when it came back
 	backAt       time.Time // when it came back
+	lostAt       time.Time // when the last loss was seen
 }
 
 // healthOf returns worker's record. Caller holds s.mu.
@@ -244,6 +245,16 @@ func (s *supervisor) healthOf(worker string) *workerHealth {
 	return h
 }
 
+// lossTime is when worker's last loss was seen, or now if none was.
+func (s *supervisor) lossTime(worker string) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if h := s.health[worker]; h != nil && !h.lostAt.IsZero() {
+		return h.lostAt
+	}
+	return time.Now()
+}
+
 // noteLoss records a loss at epoch, reporting false for a loss already seen
 // (the worker's other stream).
 func (s *supervisor) noteLoss(worker string, epoch uint64) bool {
@@ -254,6 +265,7 @@ func (s *supervisor) noteLoss(worker string, epoch uint64) bool {
 		return false
 	}
 	h.lossEpoch, h.lossPending = epoch, true
+	h.lostAt = time.Now()
 	return true
 }
 
@@ -362,7 +374,7 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 	if timeout <= 0 {
 		timeout = defaultWorkerDeliveryTimeout
 	}
-	deadline := time.Now().Add(timeout)
+	deadline := c.supervisor.lossTime(w.name).Add(timeout)
 	for {
 		c.mu.Lock()
 		attached := w.attached
