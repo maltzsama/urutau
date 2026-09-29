@@ -354,15 +354,25 @@ func (c *Coordinator) workerAppends(worker string) bool {
 const reattachPoll = 50 * time.Millisecond
 
 // awaitReattached returns once w is attached and no longer awaited after a
-// loss or reset. A worker that never comes back ends the run at the delivery
-// timeout (supervisor.tick), which cancels ctx.
+// loss or reset. The supervisor starts after the snapshot, so its delivery
+// timeout does not cover this wait: a worker that does not come back within
+// --worker-delivery-timeout of the loss ends the run here.
 func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error {
+	timeout := c.cfg.WorkerDeliveryTimeout
+	if timeout <= 0 {
+		timeout = defaultWorkerDeliveryTimeout
+	}
+	deadline := time.Now().Add(timeout)
 	for {
 		c.mu.Lock()
 		attached := w.attached
 		c.mu.Unlock()
 		if attached && !c.supervisor.isPending(w.name) {
 			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("coordinator: worker %s did not come back within %s of its loss mid-snapshot (--worker-delivery-timeout)%s",
+				w.name, timeout, c.workerTermination(w.name))
 		}
 		select {
 		case <-ctx.Done():
