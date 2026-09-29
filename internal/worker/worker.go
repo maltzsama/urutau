@@ -802,29 +802,9 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// stored snapshot batch minus the keys live events touched),
 			// adopting the marker's position.
 			if ing.Win != nil && ing.Win.Closes {
-				cb, err := closeWindow(p, ing)
+				cb, err := closesBatch(p, ing, deliverEmpty)
 				if err != nil {
 					return err
-				}
-				// A marker with a seq is a cycle of the coordinator's send
-				// order: the window's rows go out as that cycle, so they
-				// commit after every live cycle released ahead of the
-				// marker (#416). A window that emits no rows still owes
-				// the cycle its delivery.
-				if ing.Seq != 0 {
-					if cb != nil {
-						cb.Seq, cb.Staged = ing.Seq, ing.Staged
-					} else {
-						eb, err := markerBatch(p, ing)
-						if err != nil {
-							return err
-						}
-						err = deliverEmpty(eb)
-						eb.Release()
-						if err != nil {
-							return err
-						}
-					}
 				}
 				if cb != nil {
 					if err := addPending(cb, int(cb.Record.NumRows())); err != nil {
@@ -1003,28 +983,63 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	return upCount, delCount, nil
 }
 
+// closesBatch handles a Closes marker: it returns the window's remaining
+// rows for the caller to buffer, or nil when there are none.
+//
+// A marker with a seq is a cycle of the coordinator's send order: the
+// window's rows go out as that cycle, so they commit after every live cycle
+// released ahead of the marker (#416). A window that emits no rows still
+// owes the cycle its delivery, made here through deliverEmpty. A window this
+// process never held — a lost one, its rows gone with the previous process —
+// owes that delivery too, but has done no chunk: its snapshot progress must
+// not commit, or a restarted coordinator resumes past the chunk's rows.
+func closesBatch(p *tablePipeline, ing Ingest, deliverEmpty func(*dataplane.Batch) error) (*dataplane.Batch, error) {
+	cb, held, err := closeWindow(p, ing)
+	if err != nil {
+		return nil, err
+	}
+	if !held {
+		ing.SnapshotPending = nil
+	}
+	if ing.Seq == 0 {
+		return cb, nil
+	}
+	if cb != nil {
+		cb.Seq, cb.Staged = ing.Seq, ing.Staged
+		return cb, nil
+	}
+	eb, err := markerBatch(p, ing)
+	if err != nil {
+		return nil, err
+	}
+	err = deliverEmpty(eb)
+	eb.Release()
+	return nil, err
+}
+
 // closeWindow returns the stored chunk batch minus the keys live InWindow
-// events touched, with every row's __pos adopted to the marker position. The
-// caller owns the returned batch (nil when the window is empty or fully
-// touched) and buffers it through the cycle-aware path.
-func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
+// events touched, with every row's __pos adopted to the marker position, and
+// whether this worker held the window at all. The caller owns the returned
+// batch (nil when the window is unknown, empty or fully touched) and buffers
+// it through the cycle-aware path.
+func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, bool, error) {
 	p.winMu.Lock()
 	win := p.windows[ing.Win.ChunkID]
 	if win == nil {
 		p.winMu.Unlock()
-		return nil, nil
+		return nil, false, nil
 	}
 	delete(p.windows, ing.Win.ChunkID)
 	p.winMu.Unlock()
 
 	if win.batch.Record == nil || win.batch.Record.NumRows() == 0 {
 		win.batch.Release()
-		return nil, nil
+		return nil, true, nil
 	}
 	reader, err := transport.NewBatchReader(win.batch.Record, p.knownSchema.PrimaryKey)
 	if err != nil {
 		win.batch.Release()
-		return nil, fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
+		return nil, true, fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
 	}
 	// Keep every row whose key was not touched by a live InWindow event.
 	var keepIdx []int32
@@ -1036,20 +1051,20 @@ func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
 	}
 	if len(keepIdx) == 0 {
 		win.batch.Release()
-		return nil, nil
+		return nil, true, nil
 	}
 	sel, err := selectRows(win.batch, keepIdx, "", dataplane.AppendMode, "", nil)
 	win.batch.Release() // the window is consumed; selectRows retained its columns
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	out, err := adoptWindowPos(sel, ing.Position)
 	sel.Release()
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	carrySnapshotPending(out, ing)
-	return out, nil
+	return out, true, nil
 }
 
 // adoptWindowPos rebuilds a batch with __pos replaced by a constant — the
