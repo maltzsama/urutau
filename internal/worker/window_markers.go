@@ -84,3 +84,15 @@ func closesBatch(p *tablePipeline, ing Ingest, deliverEmpty func(*dataplane.Batc
 	eb.Release()
 	return nil, err
 }
+
+// OnMarkerCommitted installs the observer told, by id, of every Closes marker
+// whose window's rows are committed (or that emitted none): the coordinator
+// releases the marker on it, never on a position ack (#468).
+func (w *Worker) OnMarkerCommitted(f func(table string, id uint64)) { w.onMarker = f }
+
+// markerCommitted reports a marker done, when it has an id to report.
+func (w *Worker) markerCommitted(table string, id uint64) {
+	if w.onMarker != nil && id != 0 {
+		w.onMarker(table, id)
+	}
+}

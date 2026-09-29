@@ -139,9 +139,10 @@ func TestWindowNoEventsClosesEmitsAll(t *testing.T) {
 	if len(ups) != 2 {
 		t.Fatalf("want both snapshot rows emitted, got %+v", ups)
 	}
-	// Emitted rows carry the marker's position (the safe resume point).
-	if b.Position != "p5" {
-		t.Fatalf("batch position = %q, want p5 (marker)", b.Position)
+	// Emitted rows carry no position: the marker's is the reader's, past
+	// stream batches still to come, and must not become the table's (#468).
+	if b.Position != "" {
+		t.Fatalf("batch position = %q, want none", b.Position)
 	}
 }
 

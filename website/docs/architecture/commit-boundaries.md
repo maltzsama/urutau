@@ -119,6 +119,15 @@ there, with the recorded bounds, when the partition ranges are unchanged; it
 starts the table over otherwise, since chunk ids are relative to the ranges
 (issue #461).
 
+A window's rows commit **no position**. Its Closes marker is sent at the
+reader's position, which can be past stream batches of the table still on
+their way through the pump; committed as the table's `cdc.position`, it would
+cover them, and a crash would skip them on replay (issue #468). Only the
+stream advances a table's position. After a crash the stream replays from it
+over the window's rows, which converges: every event carries its row's full
+image. The worker acks a Closes marker by its batch id once the window's rows
+are committed, and the coordinator releases the marker on nothing else.
+
 A worker lost mid-snapshot takes its windows with it. The coordinator does not
 end the run: once the worker is back, the partition redoes, under fresh
 window ids, every chunk whose Closes marker the worker had not committed, and

@@ -126,3 +126,23 @@ func (p *positionIndex) maxHeldID() uint64 {
 	}
 	return max
 }
+
+// onMarkerAck releases a Closes marker the worker acked by id: the window's
+// rows are committed (#468). It advances no position — the window's rows
+// carry none.
+func (c *Coordinator) onMarkerAck(worker string, id uint64) {
+	idx := c.indexOf(worker)
+	if idx == nil {
+		return
+	}
+	freed, freedOversized, popped := idx.releaseMarker(id)
+	if freed > 0 {
+		c.budget.release(worker, freed)
+	}
+	if freedOversized {
+		c.budget.clearOversized(worker)
+	}
+	if w := c.workers[worker]; w != nil {
+		w.dropSent(popped)
+	}
+}

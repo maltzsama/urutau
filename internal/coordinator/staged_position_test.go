@@ -49,3 +49,29 @@ func TestStagedCycleCommitsTheBatchPosition(t *testing.T) {
 		t.Fatalf("committed positions = %v, want [0/40]: the cycle holds both rows of the batch", snk.positions)
 	}
 }
+
+// A snapshot window's cycle carries the reader's position at the window's
+// close, past stream batches of the table still in the pump. Committed as the
+// table's position, it covered stream cycles never committed, and a crash
+// then skipped them on replay: chaos-1M-406f460 lost pr_items transactions
+// 25474-25483 under window cycles committed at 1-25495 (#468). A window's
+// cycle commits its rows and snapshot progress, never a position: only the
+// stream advances the table's position.
+func TestAWindowCycleCommitsNoPosition(t *testing.T) {
+	c := stagedReplayHarness(t)
+	snk := &positionStagedSink{}
+	c.snk = snk
+	c.runCtx = context.Background()
+	ref := stagedRef("raw.orders", "w0")
+	c.staged.expectWindow(core.TableRef{Target: "raw.orders"}, 77, []string{"w0"})
+	committable, known := c.staged.deliver(ref, 77, []byte{1}, "0/90", "in_progress", []uint32{5, 6})
+	if !known || len(committable) != 1 {
+		t.Fatalf("committable=%d known=%v", len(committable), known)
+	}
+	if err := c.commitStagedCycle(committable[0]); err != nil {
+		t.Fatalf("commitStagedCycle: %v", err)
+	}
+	if len(snk.positions) != 1 || snk.positions[0] != "" {
+		t.Fatalf("window cycle committed position %v, want none", snk.positions)
+	}
+}

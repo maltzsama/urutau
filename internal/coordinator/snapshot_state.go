@@ -268,7 +268,7 @@ func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, tar
 	}
 	if c.stagesCycles() && c.isStagedTable(target) {
 		meta.BatchId = c.batchSeq.Add(1)
-		c.staged.expect(core.TableRef{Target: target}, meta.BatchId, []string{w.name})
+		c.staged.expectWindow(core.TableRef{Target: target}, meta.BatchId, []string{w.name})
 	}
 	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
 		return err
