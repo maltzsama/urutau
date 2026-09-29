@@ -58,8 +58,6 @@ func coordHarness() (*Coordinator, *workerState) {
 		stagedLocks: map[string]*sync.Mutex{},
 		runID:       "run-1",
 		gateDrain:   make(chan struct{}),
-		// run sets it when the stream starts, before any snapshot.
-		streamStart: position.MustLSN("0/0"),
 	}
 	c.supervisor = newSupervisor(c)
 	c.publishRouting(&routing{

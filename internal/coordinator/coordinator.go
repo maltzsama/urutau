@@ -272,9 +272,6 @@ type Coordinator struct {
 	sentMu     sync.Mutex
 	lastSent   map[string]string
 	lastWindow map[string]*workerState
-	// streamStart is where the reader started: every event it emits comes
-	// after it, so it bounds a table's position when nothing was sent yet.
-	streamStart position.Position
 
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
 	// on the worker, live events of that table are held here instead of
@@ -918,7 +915,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err := rdr.Start(ctx, start); err != nil {
 		return fmt.Errorf("coordinator: start stream: %w", err)
 	}
-	c.streamStart = start
 	// Batch-native pump (G0/M4): the reader's batches are forwarded whole
 	// and serialized once per batch — no decode back to changes, no
 	// per-change one-row Flight batch. The FIFO queue preserves the wire
@@ -1830,16 +1826,18 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
 		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 	}
+	// The marker's position is the reader's, past every batch sent before
+	// it, so only a commit that includes the window's rows (or a later one)
+	// releases it from the worker's index. At the last position sent, the
+	// ack of the batch sent just before it released it too, with the rows
+	// still in the worker's memory (#468).
+	at := rdr.Synced()
 
 	// Release this chunk's gated live events (InWindow-tagged) ahead of
 	// the Closes marker — FIFO keeps them before it. The gate stays
 	// open: the next chunk's backlog must not race ahead of these.
 	if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
 		return err
-	}
-	at, err := c.closesPosition(ref.Target)
-	if err != nil {
-		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 	}
 	return c.sendClosesPending(ctx, w, ref.Target, at, chunkID, pending)
 }

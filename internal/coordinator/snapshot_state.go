@@ -277,18 +277,3 @@ func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, tar
 	c.noteWindow(target, w)
 	return nil
 }
-
-// closesPosition is the position a table's Closes marker carries, which the
-// window's rows commit at: the latest position sent for the table, or the
-// stream's start when nothing was. Never the reader's decode position — its
-// events past what was sent are still in the pump, and a committed position
-// past them would let a crash skip them as covered.
-func (c *Coordinator) closesPosition(target string) (position.Position, error) {
-	if pos, _ := c.sentState(target); pos != "" {
-		return c.src.ParsePosition(pos)
-	}
-	if c.streamStart == nil {
-		return nil, fmt.Errorf("coordinator: %s: window closed before the stream started", target)
-	}
-	return c.streamStart, nil
-}

@@ -25,7 +25,7 @@ func (aheadReader) Synced() position.Position { return position.MustLSN("0/100")
 
 // closesMarkerPos runs one chunk's window against a worker that answers at
 // once, and returns the position its Closes marker carried.
-func closesMarkerPos(t *testing.T, lastSent string, streamStart position.Position) string {
+func closesMarkerPos(t *testing.T, lastSent string) string {
 	t.Helper()
 	c, w := coordHarness()
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
@@ -33,7 +33,6 @@ func closesMarkerPos(t *testing.T, lastSent string, streamStart position.Positio
 		Columns:    []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}},
 		PrimaryKey: []string{"id"},
 	}}
-	c.streamStart = streamStart
 	if lastSent != "" {
 		c.noteSent("raw.orders", lastSent)
 	}
@@ -72,27 +71,5 @@ func closesMarkerPos(t *testing.T, lastSent string, streamStart position.Positio
 		case <-ctx.Done():
 			t.Fatal("no Closes marker was queued")
 		}
-	}
-}
-
-// A window's rows commit at its Closes marker's position, and a table's
-// committed position must not pass an event of the table the worker has not
-// been sent: a crash would then skip that event as covered. The reader's
-// decode position ran ahead of what the pump had sent — its events sit in
-// the pump's channel — so the marker carried a position past batches of the
-// table that reached the worker after it (chaos-1M-5a01915: pr_events
-// committed 1-20115 at a window, then a stream batch at 1-20112). The marker
-// takes the latest position sent for the table.
-func TestAClosesMarkerNeverPassesWhatTheTableWasSent(t *testing.T) {
-	if got := closesMarkerPos(t, "0/50", position.MustLSN("0/5")); got != "0/50" {
-		t.Fatalf("Closes marker at %s, want 0/50: the latest position sent for the table, not the reader's 0/100", got)
-	}
-}
-
-// Nothing of the table sent yet in this run: the stream's start position,
-// which every event the reader emits comes after.
-func TestAClosesMarkerWithNothingSentTakesTheStreamStart(t *testing.T) {
-	if got := closesMarkerPos(t, "", position.MustLSN("0/5")); got != "0/5" {
-		t.Fatalf("Closes marker at %s, want 0/5: the stream start, not the reader's 0/100", got)
 	}
 }
