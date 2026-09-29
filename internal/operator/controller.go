@@ -717,7 +717,7 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 				Name:      "coordinator",
 				Image:     image,
 				Command:   coordinatorCommand(cr),
-				Env:       coordinatorEnv(cr),
+				Env:       coordinatorContainerEnv(cr),
 				Resources: resourceRequirements(cr.Spec.Coordinator.CPU, "", cr.Spec.Coordinator.Memory, ""),
 				Ports: []corev1.ContainerPort{
 					{Name: "grpc", ContainerPort: coordinatorGRPCPort},
@@ -799,9 +799,7 @@ func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
 		args = append(args, "--max-parallel-chunks", strconv.Itoa(snap.MaxParallelChunks))
 	}
 	args = append(args, supervisionArgs(cr.Spec.Coordinator.Supervision)...)
-	if ev := cr.Spec.Coordinator.Eventlog; ev != nil && ev.Bucket != "" {
-		args = append(args, "--eventlog", eventlogURI(ev))
-	}
+	args = append(args, eventlogArgs(cr.Spec.Coordinator.Eventlog)...)
 	// Always pass a metrics address: the operator guarantees one so the
 	// /statusz probes have a stable endpoint, instead of leaving it to the
 	// CR author (an empty value disables /statusz entirely).
@@ -813,16 +811,6 @@ func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
 	// wiring real mTLS is future work.
 	args = append(args, "--allow-insecure-control-plane")
 	return args
-}
-
-// eventlogURI renders the CR's eventlog spec as the coordinator's
-// s3://<bucket>/<prefix> URI.
-func eventlogURI(ev *urutauv1alpha1.EventlogSpec) string {
-	prefix := strings.Trim(ev.RootPrefix, "/")
-	if prefix == "" {
-		return "s3://" + ev.Bucket
-	}
-	return "s3://" + ev.Bucket + "/" + prefix
 }
 
 // coordinatorMetricsAddr is the effective metrics/statusz listen address: the

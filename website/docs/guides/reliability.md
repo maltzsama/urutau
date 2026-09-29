@@ -104,9 +104,16 @@ spec:
       rootPrefix: urutau     # → --eventlog s3://my-trails/urutau
 ```
 
-S3 credentials still come from the standard `AWS_*` environment (or the
-Pod's workload identity); the trail is best-effort, so a missing credential
-warns rather than failing the pipeline.
+S3 credentials come from the standard `AWS_*` environment (or the Pod's
+workload identity). For an S3-compatible store (MinIO, RustFS), set
+`eventlog.endpoint` (rendered as `--eventlog-endpoint`, path-style addressing)
+and `eventlog.secret`, a Secret with `accessKeyId` and `secretAccessKey` that
+the operator mounts into the coordinator only. The trail is best-effort, so a
+missing credential warns rather than failing the pipeline.
+
+The trail also carries every coordinator and worker log line (`kind=log`), so
+a run's logs outlive its Pods: a replaced coordinator Pod starts a new run in
+the same pipeline's trail, and nothing it logged before is lost with it.
 
 ## Checkpoints (`--checkpoint`)
 

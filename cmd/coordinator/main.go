@@ -69,6 +69,7 @@ type coordinatorFlags struct {
 	maxCrashes      int
 	deliveryTimeout time.Duration
 	eventlogURI     string
+	eventlogEP      string
 	checkpointURI   string
 	checkpointSec   int
 	allowInsecure   bool
@@ -150,6 +151,7 @@ func runCmd() *cobra.Command {
 	fl.DurationVar(&f.deliveryTimeout, "worker-delivery-timeout", 5*time.Minute, "a worker owing work that delivers nothing for this long ends the job")
 	// audit / recovery
 	fl.StringVar(&f.eventlogURI, "eventlog", "", "s3://<bucket>/<prefix> audit trail store (optional)")
+	fl.StringVar(&f.eventlogEP, "eventlog-endpoint", "", "S3 API endpoint for the audit trail store (MinIO/RustFS, path-style); empty uses AWS")
 	fl.StringVar(&f.checkpointURI, "checkpoint", "", "s3://<bucket>/<prefix> async position manifests (optional)")
 	fl.IntVar(&f.checkpointSec, "checkpoint-interval", 10, "checkpoint write interval (seconds)")
 	// process
@@ -203,7 +205,7 @@ func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger, logBuffer *
 		WaitWorker:            f.waitWorker,
 		FlowTotalBytes:        f.flowTotalBytes,
 		FlowPerWorkerMin:      f.flowPerWorkerMi << 20,
-		Eventlog:              eventlogConfig(f.eventlogURI),
+		Eventlog:              eventlogConfig(f.eventlogURI, f.eventlogEP),
 		Checkpoint:            checkpointConfig(f.checkpointURI, f.checkpointSec),
 		AckTimeout:            f.ackTimeout,
 		MaxResets:             f.maxResets,
@@ -246,9 +248,9 @@ func checkpointConfig(uri string, intervalSec int) *coordinator.CheckpointConfig
 	}
 }
 
-func eventlogConfig(uri string) *eventlog.Config {
+func eventlogConfig(uri, endpoint string) *eventlog.Config {
 	if uri == "" {
 		return nil
 	}
-	return &eventlog.Config{URI: uri}
+	return &eventlog.Config{URI: uri, Endpoint: endpoint}
 }

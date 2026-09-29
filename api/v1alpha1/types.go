@@ -105,6 +105,13 @@ type EventlogSpec struct {
 	// RootPrefix is the key prefix every pipeline's trail lives under, e.g.
 	// "urutau". Empty means the bucket root.
 	RootPrefix string `json:"rootPrefix,omitempty"`
+	// Endpoint overrides the S3 API target for an S3-compatible store
+	// (MinIO, RustFS), addressed path-style. Empty uses AWS.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Secret names a Secret with the store's credentials under the keys
+	// "accessKeyId" and "secretAccessKey", mounted into the coordinator
+	// only. Empty leaves the standard AWS chain (workload identity).
+	Secret string `json:"secret,omitempty"`
 }
 
 // SnapshotSpec tunes the DBLog snapshot phase.

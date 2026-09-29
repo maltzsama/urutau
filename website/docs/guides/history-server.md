@@ -28,6 +28,20 @@ spec:
       rootPrefix: urutau
 ```
 
+On an S3-compatible store (MinIO, RustFS), also give the endpoint and a
+Secret holding the credentials under `accessKeyId` and `secretAccessKey`.
+The operator mounts that Secret into the coordinator only:
+
+```yaml title="Eventlog on an S3-compatible store"
+spec:
+  coordinator:
+    eventlog:
+      bucket: my-trails
+      rootPrefix: urutau
+      endpoint: http://rustfs.storage.svc:9000   # → --eventlog-endpoint
+      secret: trail-creds
+```
+
 That writes the trail under the shared key convention
 `s3://<bucket>/<prefix>/<pipeline>/run-<id>/events-NNNNNN.jsonl`, which is
 exactly what the server lists. A pipeline with no `eventlog` has no history.

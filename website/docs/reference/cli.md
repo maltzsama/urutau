@@ -78,6 +78,7 @@ server, not a one-shot.
 | `--max-resets` | `5` | Deprecated, ignored |
 | `--reset-window` | `15m` | Deprecated, ignored |
 | `--eventlog` | _(off)_ | `s3://bucket/prefix` audit trail |
+| `--eventlog-endpoint` | _(AWS)_ | S3 API endpoint of the audit trail store (MinIO/RustFS, path-style) |
 | `--checkpoint` | _(off)_ | `s3://bucket/prefix` async position manifests |
 | `--checkpoint-interval` | `10` | Checkpoint write interval (seconds) |
 | `--plugin` | _(none)_ | Go plugin path; repeatable |

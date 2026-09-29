@@ -79,6 +79,8 @@ spec:
                       properties:
                         bucket: {type: string}
                         rootPrefix: {type: string}
+                        endpoint: {type: string}
+                        secret: {type: string}
                 worker:
                   type: object
                   properties:
