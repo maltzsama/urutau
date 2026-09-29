@@ -4,6 +4,8 @@ package pods
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -140,8 +142,23 @@ func TestRenderChaosTargetsAndParses(t *testing.T) {
 // redirected elsewhere.
 func TestRenderChaosRefusesWithoutTarget(t *testing.T) {
 	d := chaosDecision{Kind: chaosCoordinatorKill, Scope: scopeCoordinator}
-	if _, _, _, _, err := renderChaos("pod-e2e", "p", d, "x", testPods[1:]); err == nil {
-		t.Fatal("a coordinator fault with no coordinator Pod must fail")
+	if _, _, _, _, err := renderChaos("pod-e2e", "p", d, "x", testPods[1:]); !errors.Is(err, errNoTarget) {
+		t.Fatalf("err = %v, want errNoTarget for a coordinator fault with no coordinator Pod", err)
+	}
+}
+
+// A draw with no running Pod to aim at — every worker restarting right after
+// a coordinator kill — is recorded as skipped, not as a failed injection:
+// nothing was created, and nothing failed to inject (issue #458, full chaos
+// run). Any other refusal is still an error.
+func TestADrawWithoutATargetIsSkipped(t *testing.T) {
+	ev := &chaosEvent{}
+	if failed := noteManifestErr(ev, fmt.Errorf("render: %w", errNoTarget)); failed || ev.Skipped == "" || ev.Error != "" {
+		t.Fatalf("event %+v (failed %v), want it skipped", ev, failed)
+	}
+	ev = &chaosEvent{}
+	if failed := noteManifestErr(ev, errors.New("kubectl get pods: connection refused")); !failed || ev.Error == "" {
+		t.Fatalf("event %+v (failed %v), want the error recorded", ev, failed)
 	}
 }
 
