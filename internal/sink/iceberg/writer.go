@@ -644,15 +644,6 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 	return nil
 }
 
-// props builds the commit properties carrying cdc.position (empty when there
-// is no position to advance).
-func props(pos string) iceberg.Properties {
-	if pos == "" {
-		return iceberg.Properties{}
-	}
-	return iceberg.Properties{propPosition: pos}
-}
-
 // sleepCtx waits d or returns early with the context error.
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)
