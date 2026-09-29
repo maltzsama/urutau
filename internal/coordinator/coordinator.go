@@ -1839,7 +1839,20 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
 		return err
 	}
-	return c.sendClosesPending(ctx, w, ref.Target, at, chunkID, pending)
+	if err := c.sendClosesPending(ctx, w, ref.Target, at, chunkID, pending); err != nil {
+		return err
+	}
+	// A worker lost since its ChunkReady took the window's rows with it, and
+	// a loss before the marker was sent does not record this chunk among its
+	// lost windows: the marker would reach a worker holding no such window,
+	// and the chunk would pass for done. Report the loss so the partition
+	// redoes it. A loss from here on finds the marker held and records it.
+	select {
+	case <-lost:
+		return errWorkerLost
+	default:
+		return nil
+	}
 }
 
 // clipChunksToRange keeps only the chunks that intersect partitionRange,
