@@ -431,24 +431,6 @@ func walkBackPosition(props iceberg.Properties, head *table.Snapshot, lookup tab
 	return ""
 }
 
-// SetTableProperties writes arbitrary properties to an Iceberg table.
-// Used by adoption to mark snapshot complete without committing data.
-func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Identifier, props iceberg.Properties) error {
-	if len(props) == 0 {
-		return nil
-	}
-	tbl, err := cat.LoadTable(ctx, ident)
-	if err != nil {
-		return fmt.Errorf("iceberg: load %v: %w", ident, err)
-	}
-	txn := tbl.NewTransaction()
-	if err := txn.SetProperties(props); err != nil {
-		return err
-	}
-	_, err = txn.Commit(ctx)
-	return err
-}
-
 // sortOrderFor builds the table's default sort order over its identifier
 // (primary-key) columns, ascending with nulls first. A sort order clusters
 // equal-key rows together within data files, so equality-delete pruning and
