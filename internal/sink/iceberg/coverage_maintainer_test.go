@@ -163,3 +163,23 @@ func TestMaintainerOperationsOnMissingTable(t *testing.T) {
 		t.Fatal("a failed orphan cleanup must still be recorded")
 	}
 }
+
+// Issue #457: expiry races the live CDC writer, so the table it commits over
+// has snapshots the pass never saw. The count is the snapshots the pass
+// removed, not the difference in totals: two removed while two landed is two,
+// not zero — a zero here hid every expiry that ran under load.
+func TestSnapshotsRemovedCountsIDsNotTotals(t *testing.T) {
+	snaps := func(ids ...int64) []table.Snapshot {
+		out := make([]table.Snapshot, len(ids))
+		for i, id := range ids {
+			out[i] = table.Snapshot{SnapshotID: id}
+		}
+		return out
+	}
+	if got := snapshotsRemoved(snaps(1, 2, 3), snaps(3, 4, 5)); got != 2 {
+		t.Fatalf("removed = %d, want 2 (1 and 2 expired while 4 and 5 were committed)", got)
+	}
+	if got := snapshotsRemoved(snaps(1, 2), snaps(1, 2, 3)); got != 0 {
+		t.Fatalf("removed = %d, want 0", got)
+	}
+}
