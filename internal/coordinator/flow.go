@@ -152,6 +152,10 @@ type inflightBatch struct {
 	// oversized marks a batch larger than the whole flow budget, so its ack
 	// can release the budget's single oversized slot.
 	oversized bool
+	// marker is a snapshot window's Closes marker: it leaves only on the ack
+	// of its own id, once the window's rows are committed, never on a
+	// position ack a batch of the same or a later position sent (#468).
+	marker bool
 }
 
 // positionIndex tracks each worker's unacked batches so an Ack can release
@@ -249,8 +253,18 @@ func (p *positionIndex) truncate(table string, pos position.Position) (freed int
 		p.dirty = true
 		p.gen++
 	}
+	return p.popCoveredLocked()
+}
+
+// popCoveredLocked pops the head while its batch's table is acked through
+// it, stopping at a Closes marker, which only releaseMarker removes. Caller
+// holds p.mu.
+func (p *positionIndex) popCoveredLocked() (freed int64, freedOversized bool, popped []uint64) {
 	for len(p.head) > 0 {
 		h := p.head[0]
+		if h.marker {
+			break
+		}
 		if h.high == nil {
 			if _, ok := p.acked[h.table]; !ok {
 				break
@@ -268,6 +282,26 @@ func (p *positionIndex) truncate(table string, pos position.Position) (freed int
 		p.gen++
 	}
 	return freed, freedOversized, popped
+}
+
+// releaseMarker removes a Closes marker on the ack of its id — the worker
+// committed the window's rows — and pops the batches behind it that their
+// table's acks already cover.
+func (p *positionIndex) releaseMarker(id uint64) (freed int64, freedOversized bool, popped []uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, h := range p.head {
+		if h.id == id && h.marker {
+			freed, freedOversized = h.bytes, h.oversized
+			popped = []uint64{h.id}
+			p.head = append(p.head[:i:i], p.head[i+1:]...)
+			p.dirty = true
+			p.gen++
+			break
+		}
+	}
+	f, o, pp := p.popCoveredLocked()
+	return freed + f, freedOversized || o, append(popped, pp...)
 }
 
 // advances reports whether pos is provably strictly greater than cur. An

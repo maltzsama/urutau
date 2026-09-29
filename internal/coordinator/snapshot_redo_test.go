@@ -67,7 +67,7 @@ func TestSnapshotRedoesTheChunksALostWorkerHeld(t *testing.T) {
 				on := commit
 				mu.Unlock()
 				if on {
-					c.index["w0"].truncate("raw.orders", position.MustLSN("0/1"))
+					commitEverything(c.index["w0"], "raw.orders", position.MustLSN("0/1"))
 				}
 			}
 		}

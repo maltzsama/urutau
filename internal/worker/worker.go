@@ -56,6 +56,7 @@ type OnStaged func(table string, seq uint64, descriptor []byte, pos, state strin
 type Worker struct {
 	cfg             Config
 	onCommit        OnCommit
+	onMarker        func(table string, id uint64)
 	onStaged        OnStaged
 	onDroppedDelete OnDroppedDelete
 	schemaDrift     func(SchemaDrift)
@@ -172,6 +173,9 @@ type Ingest struct {
 	// still to do after this window: the window's rows commit with them as
 	// cdc.snapshot.pending, state in_progress (issue #461).
 	SnapshotPending []uint32
+	// MarkerID, on a Closes marker, is the marker's batch id: the worker acks
+	// it by this id once the window's rows are committed (#468).
+	MarkerID uint64
 }
 
 // New builds a worker; register tables before Run.
@@ -673,7 +677,21 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		return ready(emptyBatch(b, p.mode), 0, 0, 0)
 	}
 
+	// The markers of the windows among pending, acked once they commit.
+	var pendingMarkers []uint64
+	var commitPending func() error
 	flush := func() error {
+		markers := pendingMarkers
+		pendingMarkers = nil
+		if err := commitPending(); err != nil {
+			return err
+		}
+		for _, id := range markers {
+			w.markerCommitted(p.target, id)
+		}
+		return nil
+	}
+	commitPending = func() error {
 		if len(pending) == 0 {
 			return nil
 		}
@@ -805,6 +823,12 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				cb, err := closesBatch(p, ing, deliverEmpty)
 				if err != nil {
 					return err
+				}
+				if cb == nil {
+					// No rows to commit: the marker is done now.
+					w.markerCommitted(p.target, ing.MarkerID)
+				} else if ing.MarkerID != 0 {
+					pendingMarkers = append(pendingMarkers, ing.MarkerID)
 				}
 				if cb != nil {
 					if err := addPending(cb, int(cb.Record.NumRows())); err != nil {
@@ -1024,7 +1048,11 @@ func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, bool, error) {
 	if err != nil {
 		return nil, true, err
 	}
-	out, err := adoptWindowPos(sel, ing.Position)
+	// The window's rows carry no position: the marker's is the reader's,
+	// past stream batches of the table still to come, and committed as the
+	// table's position it would cover them (#468). Only the stream advances
+	// a table's position.
+	out, err := adoptWindowPos(sel, "")
 	sel.Release()
 	if err != nil {
 		return nil, true, err
@@ -1298,7 +1326,14 @@ func lastRowPos(b *dataplane.Batch) string {
 	if err != nil {
 		return ""
 	}
-	return reader.Position(reader.NumRows() - 1)
+	// A snapshot window's rows carry no position (#468): the batch's is its
+	// last positioned row's.
+	for i := reader.NumRows() - 1; i >= 0; i-- {
+		if pos := reader.Position(i); pos != "" {
+			return pos
+		}
+	}
+	return ""
 }
 
 // concatBatches concatenates the row lists of the given batches, in order,

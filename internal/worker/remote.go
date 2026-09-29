@@ -413,22 +413,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	chunks := newChunkExecutor(assign, w, cfg.Logger, sender.send)
 	defer chunks.Close()
 
-	w.OnCommit(func(b *dataplane.Batch, rows int) {
-		if cfg.FaultAckGate != nil && cfg.FaultAckGate.Load() {
-			return
-		}
-		// Carry the equality-delete count so the coordinator's dashboard
-		// metrics (deletes, collapse ratio) are not always zero in distributed
-		// mode (issue #263).
-		_, deletes := CountOps(b)
-		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
-			Table:    b.Table,
-			Epoch:    assign.Epoch,
-			Position: string(b.Watermark),
-			Rows:     uint64(rows),
-			Deletes:  uint64(deletes),
-		}}})
-	})
+	installAcks(w, sender, assign.Epoch, cfg)
 
 	// Control plane (same ClientConn, urgent signals) — the Hello identifies
 	// this stream to the server.
@@ -757,6 +742,7 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 			Win:             &rowchange.Window{Closes: true, ChunkID: meta.Window.ChunkId},
 			Position:        meta.LowPos,
 			SnapshotPending: meta.Window.SnapshotPending,
+			MarkerID:        meta.BatchId,
 		}
 		// On a staged table the marker is a cycle of the coordinator's send
 		// order, and the window's rows are delivered as that cycle.

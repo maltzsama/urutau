@@ -87,8 +87,14 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 // table is durable through it (#459). Any other cycle commits the minimum safe
 // position over its deliveries.
 func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
+	// A snapshot window's cycle commits no position: its marker carries the
+	// reader's, past stream cycles of the table not committed yet, and a
+	// crash would then skip them as covered (#468). Only the stream advances
+	// a table's position.
 	pos := cy.batchPos
-	if pos == "" {
+	if cy.window {
+		pos = ""
+	} else if pos == "" {
 		var err error
 		if pos, err = c.minSafePositions(cy.positions); err != nil {
 			return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err)

@@ -2191,7 +2191,8 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	select {
 	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes}:
 		if idx := c.indexOf(w.name); idx != nil {
-			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
+			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
+				marker: meta.Window != nil && meta.Window.Closes})
 		}
 		c.noteSent(meta.Table, posStr)
 		return nil
@@ -2458,6 +2459,10 @@ func (c *Coordinator) onSchemaDrift(worker string, d *pb.SchemaDrift) {
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.noteAck(worker, time.Now())
+	if ack.BatchId != 0 && ack.Position == "" {
+		c.onMarkerAck(worker, ack.BatchId)
+		return
+	}
 	pos, err := c.src.ParsePosition(ack.Position)
 	if err != nil {
 		// The position format is a shared contract; a worker that cannot

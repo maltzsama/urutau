@@ -24,8 +24,11 @@ type stagedCycle struct {
 	// through it once the cycle commits (#459). Empty for a cycle opened
 	// without it; the commit then falls back to the deliveries' minimum.
 	batchPos string
-	state    string
-	pending  []uint32
+	// window marks a snapshot window's cycle: it commits the window's rows
+	// and snapshot progress but no position (#468).
+	window  bool
+	state   string
+	pending []uint32
 }
 
 // stagedCycles tracks open cycles keyed by (table, seq). Cycles of one table
@@ -79,6 +82,19 @@ func (s *stagedCycles) isGapped(target string) bool {
 // is not expected).
 func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
 	s.expectAt(ref, seq, owners, "")
+}
+
+// expectWindow is expect for a snapshot window's cycle (sendClosesPending).
+func (s *stagedCycles) expectWindow(ref core.TableRef, seq uint64, owners []string) {
+	s.expect(ref, seq, owners)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cy := s.open[cycleKey{ref.Target, seq}]; cy != nil {
+		cy.window = true
+	}
 }
 
 // expectAt is expect for a cycle that carries every partition's share of one
