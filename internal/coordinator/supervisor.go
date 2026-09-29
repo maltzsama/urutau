@@ -194,6 +194,9 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		held = append(held, minHeld{p.name, id})
 	}
 
+	// Mid-snapshot only the delivery rule applies: a reset would drop the
+	// worker's open windows, which the snapshot redoes on a loss instead.
+	snapshotting := s.c.snapshotActive.Load()
 	var stalled []string
 	var gone []string
 	s.mu.Lock()
@@ -213,8 +216,8 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 			gone = append(gone, p.name)
 			continue
 		}
-		if s.pending[p.name] || (!p.attached && p.hadSession) {
-			continue // lost or reset, and not back yet: awaited
+		if s.pending[p.name] || (!p.attached && p.hadSession) || snapshotting {
+			continue // lost or reset and awaited, or mid-snapshot
 		}
 		// An ATTACHED worker that owes nothing is merely idle — a quiet
 		// table, or one that just went through a re-slice — and resetting it
