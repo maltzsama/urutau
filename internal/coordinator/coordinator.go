@@ -272,6 +272,9 @@ type Coordinator struct {
 	sentMu     sync.Mutex
 	lastSent   map[string]string
 	lastWindow map[string]*workerState
+	// streamStart is where the reader started: every event it emits comes
+	// after it, so it bounds a table's position when nothing was sent yet.
+	streamStart position.Position
 
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
 	// on the worker, live events of that table are held here instead of
@@ -915,6 +918,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err := rdr.Start(ctx, start); err != nil {
 		return fmt.Errorf("coordinator: start stream: %w", err)
 	}
+	c.streamStart = start
 	// Batch-native pump (G0/M4): the reader's batches are forwarded whole
 	// and serialized once per batch — no decode back to changes, no
 	// per-change one-row Flight batch. The FIFO queue preserves the wire
@@ -1826,7 +1830,6 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
 		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 	}
-	at := rdr.Synced()
 
 	// Release this chunk's gated live events (InWindow-tagged) ahead of
 	// the Closes marker — FIFO keeps them before it. The gate stays
@@ -1834,7 +1837,26 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
 		return err
 	}
+	at, err := c.closesPosition(ref.Target)
+	if err != nil {
+		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+	}
 	return c.sendClosesPending(ctx, w, ref.Target, at, chunkID, pending)
+}
+
+// closesPosition is the position a table's Closes marker carries, which the
+// window's rows commit at: the latest position sent for the table, or the
+// stream's start when nothing was. Never the reader's decode position — its
+// events past what was sent are still in the pump, and a committed position
+// past them would let a crash skip them as covered.
+func (c *Coordinator) closesPosition(target string) (position.Position, error) {
+	if pos, _ := c.sentState(target); pos != "" {
+		return c.src.ParsePosition(pos)
+	}
+	if c.streamStart == nil {
+		return nil, fmt.Errorf("coordinator: %s: window closed before the stream started", target)
+	}
+	return c.streamStart, nil
 }
 
 // sendCloses queues a chunk's Closes marker for its partition's worker —
