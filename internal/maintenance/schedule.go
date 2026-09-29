@@ -79,13 +79,16 @@ func (s *Schedule) MarkRun(table string, ops []sink.MaintenanceOp, now time.Time
 }
 
 // opsInOrder is the order the scheduler reports due operations in, and the
-// order they must execute in: compaction creates new files and invalidates
-// old ones, snapshot expiry dereferences them, orphan cleanup physically
-// removes them.
+// order they execute in: snapshot expiry, orphan cleanup, then compaction.
+// Expiry and cleanup are cheap and do not need a compaction to run — the CDC
+// commits a snapshot per cycle — while a compaction can die in the Pod the
+// three share (iceberg-go v0.6.0 reads equality deletes in memory quadratic
+// in the table's delete files, #457). The files a compaction replaces are
+// freed by the next pass's expiry instead of this one's.
 var opsInOrder = []sink.MaintenanceOp{
-	sink.MaintenanceCompaction,
 	sink.MaintenanceSnapshotExpiry,
 	sink.MaintenanceOrphanCleanup,
+	sink.MaintenanceCompaction,
 }
 
 // intervalFor returns an operation's effective interval and whether it is

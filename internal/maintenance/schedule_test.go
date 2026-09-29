@@ -18,14 +18,18 @@ func enabledCfg() *spec.Maintenance {
 	}
 }
 
-// Never-run operations are all due, in execution order.
+// Never-run operations are all due, in execution order: expiry and orphan
+// cleanup first, compaction last. The three share one worker Pod, and a
+// compaction that dies there (iceberg-go v0.6.0's equality-delete read is
+// quadratic in the table's delete files, #457) must not take the cheap,
+// independent operations with it.
 func TestDueAllEnabledWhenNeverRun(t *testing.T) {
 	s := NewSchedule()
 	got := s.Due("raw.orders", enabledCfg(), time.Now())
 	want := []sink.MaintenanceOp{
-		sink.MaintenanceCompaction,
 		sink.MaintenanceSnapshotExpiry,
 		sink.MaintenanceOrphanCleanup,
+		sink.MaintenanceCompaction,
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("Due = %v, want %v (execution order)", got, want)
