@@ -14,6 +14,7 @@ package pods
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -383,6 +384,23 @@ const networkReapplyAfter = 15 * time.Second
 // after this long is one.
 const chaosRemovalTimeout = 10 * time.Minute
 
+// errNoTarget is a draw with no running Pod of the role it aims at.
+var errNoTarget = errors.New("no target to aim at")
+
+// noteManifestErr records why an experiment was not created. A draw with no
+// running Pod to aim at — every worker restarting right after a coordinator
+// kill — is skipped, not a failed injection: nothing was created and nothing
+// failed to inject (issue #458). It reports whether the event failed.
+// Caller holds c.mu for a shared event.
+func noteManifestErr(ev *chaosEvent, err error) bool {
+	if errors.Is(err, errNoTarget) {
+		ev.Skipped = err.Error()
+		return false
+	}
+	ev.Error = err.Error()
+	return true
+}
+
 // reserved marks an active slot whose resource is not created yet.
 const reserved = "reserved"
 
@@ -437,7 +455,9 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 	ev.State = c.snapshot()
 	manifest, resource, target, params, err := c.manifest(d, ev.Name)
 	if err != nil {
-		record(err)
+		c.mu.Lock()
+		noteManifestErr(ev, err)
+		c.mu.Unlock()
 		c.forget(ev.Name) // release the reservation: nothing was created
 		return
 	}
@@ -632,7 +652,7 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 			p, ok = pick(workers)
 		}
 		if !ok {
-			return p, fmt.Errorf("no running %s pod to target", d.Scope)
+			return p, fmt.Errorf("%w: no running %s pod", errNoTarget, d.Scope)
 		}
 		return p, nil
 	}
@@ -684,7 +704,7 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 			target = g
 		}
 		if len(side) == 0 {
-			return "", "", "", "", fmt.Errorf("no running worker pod to target")
+			return "", "", "", "", fmt.Errorf("%w: no running worker pod", errNoTarget)
 		}
 		var podList strings.Builder
 		for _, p := range side {
