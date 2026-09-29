@@ -37,11 +37,6 @@ sink:
       interval: 5m
       targetFileSize: 512Mi
       minInputFiles: 5
-      minCommitInterval: 15m
-      safemode:
-        enabled: true
-        maxDowntime: 10m
-        checkInterval: 1m
     snapshotExpiry:
       interval: 10m
       retainLast: 1
@@ -79,24 +74,12 @@ is written anyway — this is the expected behavior for low-volume tables.
 | `interval` | `5m` | How often to check and compact |
 | `targetFileSize` | `512Mi` | Target output file size |
 | `minInputFiles` | `5` | Minimum files in a partition to trigger compaction |
-| `minCommitInterval` | `15m` | Minimum time between commits (prevents write amplification) |
-| `safemode.enabled` | `true` | Reject commits during source downtime |
-| `safemode.maxDowntime` | `10m` | Max source downtime before safemode kicks in |
-| `safemode.checkInterval` | `1m` | How often to check source connectivity |
 
-### Safemode
-
-When safemode is enabled, the maintenance worker checks whether the
-source is reachable before committing a compaction. If the source has
-been unreachable for longer than `maxDowntime`, the commit is rejected.
-This prevents compacting away files that might be needed for a pending
-CDC replay.
-
-### Write amplification guard
-
-The `minCommitInterval` prevents compaction from firing too frequently on
-high-churn tables. If the last commit was less than `minCommitInterval`
-ago, the compaction pass is skipped even if there are enough input files.
+Compaction runs last in a pass, after snapshot expiry and orphan cleanup. On
+an `upsert` table under continuous load it is limited by the Iceberg library
+this release uses: see
+[Sinks › Iceberg](../reference/sinks.md) for the two upstream limits and what
+they mean for a table with many delete files.
 
 ## Snapshot expiry
 
@@ -239,7 +222,6 @@ sink:
       interval: 5m
       targetFileSize: 512Mi
       minInputFiles: 5
-      minCommitInterval: 15m
     snapshotExpiry:
       interval: 10m
       retainLast: 2
@@ -276,8 +258,10 @@ sink:
 - Check `maintenance.enabled: true` is set
 - Check `minInputFiles` — if your table has fewer files than this
   threshold, compaction won't trigger
-- Check `minCommitInterval` — if the last commit was recent, the pass
-  is skipped
+- On an `upsert` table under continuous load, a compaction that keeps
+  failing with `branch main has changed` or whose Pod is OOM-killed is the
+  upstream limit described in [Sinks › Iceberg](../reference/sinks.md);
+  snapshot expiry and orphan cleanup still run
 - Check events for errors (catalog connectivity, permissions)
 
 **Orphan files accumulating**

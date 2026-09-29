@@ -166,26 +166,23 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	}
 	sent := time.Now()
 
-	// The worker reports a MaintenanceResult when the pass ends, then closes
-	// the stream. MarkRun happens on that report, not on the send above: a
-	// worker that dies mid-pass (OOM, node drain) must leave the operations
-	// due rather than have them counted as run.
+	// The worker reports each operation in its own MaintenanceResult as the
+	// operation ends, then closes the stream when the pass does. MarkRun
+	// happens on those reports, not on the send above: a worker that dies
+	// mid-pass (OOM, node drain) leaves the operations it had not reported
+	// due, and keeps the ones it had (#457).
 	//
-	// Only the operations the worker reported as succeeded are marked, not
-	// the whole assignment. The worker reports on failure too (it has to —
-	// its own registry dies with the process), and its pass stops at the
-	// first error, so an assignment of [compaction, expiry, cleanup] that
-	// failed at expiry reports a successful compaction, a failed expiry, and
-	// nothing at all for the cleanup that never ran. Marking all three would
-	// record two operations as done that were not, holding the cleanup off
-	// for a full interval each time the expiry breaks.
+	// Only the operations reported as succeeded are marked. The worker
+	// reports failures too (its own registry dies with the process) and goes
+	// on past them, so a failed expiry is recorded, stays due, and does not
+	// hold the cleanup and compaction after it.
 	for {
 		in, err := stream.Recv()
 		if err != nil {
 			return nil // the worker finished (or died); either way it is gone
 		}
 		if res := in.GetMaintenanceResult(); res != nil {
-			m.logPass(name, table, due, time.Since(sent), res)
+			m.logPass(name, table, reportedOps(res), time.Since(sent), res)
 			m.recordResult(table, res)
 			if ran := succeededOps(res); len(ran) > 0 {
 				m.mu.Lock()
@@ -197,6 +194,22 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 			m.c.onWorkerLog(name, log)
 		}
 	}
+}
+
+// reportedOps returns the operations a worker's report covers, in order.
+func reportedOps(res *pb.MaintenanceResult) []sink.MaintenanceOp {
+	var ops []sink.MaintenanceOp
+	for _, op := range res.Ops {
+		switch op.Op.(type) {
+		case *pb.MaintenanceOpResult_Compaction:
+			ops = append(ops, sink.MaintenanceCompaction)
+		case *pb.MaintenanceOpResult_Expiry:
+			ops = append(ops, sink.MaintenanceSnapshotExpiry)
+		case *pb.MaintenanceOpResult_Orphan:
+			ops = append(ops, sink.MaintenanceOrphanCleanup)
+		}
+	}
+	return ops
 }
 
 // succeededOps returns the operations a worker's report says completed
@@ -330,12 +343,12 @@ func (m *maintenanceScheduler) assignment(table string, ops []sink.MaintenanceOp
 	}}, nil
 }
 
-// logPass records one maintenance pass in the coordinator's log: its table,
-// the operations assigned, each one's outcome or error, and how long the
-// worker held the table (no other pass runs on it meanwhile). The worker's
-// own log reaches only the dashboard's buffer, and its Pod is deleted after
-// the pass, so this line is what shows why a table is not being maintained
-// (issue #457). A pass with a failed operation is a warning.
+// logPass records a maintenance worker's report in the coordinator's log: its
+// table, the operations reported, each one's outcome or error, and how long
+// the worker had held the table by then (no other pass runs on it
+// meanwhile). The worker's Pod is deleted after the pass, so this line is
+// what shows why a table is not being maintained (issue #457). A report with
+// a failed operation is a warning.
 func (m *maintenanceScheduler) logPass(worker, table string, due []sink.MaintenanceOp, took time.Duration, res *pb.MaintenanceResult) {
 	attrs := []any{"table", table, "worker", worker, "ops", due, "took", took.Round(time.Millisecond)}
 	failed := false

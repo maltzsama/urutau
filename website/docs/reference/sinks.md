@@ -56,21 +56,43 @@ coordinator then deletes the Pod, so it terminates rather than restarting.
 The next due turn gets a fresh Pod. So a long compaction never competes with
 the coordinator's routing and commit path, and never takes the coordinator
 down with it. (In the collapsed single-process runner there is no worker to
-launch, so the pass runs in-process on the same schedule.) Because the pass is one-shot, the
-three operations run in order — compaction, then snapshot expiry, then orphan
-cleanup — so a compaction never races the expiry that dereferences the files
-it just wrote.
+launch, so the pass runs in-process on the same schedule.) The operations
+of a pass run one at a time, in order — snapshot expiry, orphan cleanup, then
+compaction — and each is reported to the coordinator as it ends. Expiry and
+cleanup are cheap and do not need a compaction to run (the CDC commits a
+snapshot per cycle), so they go first: a compaction that fails or kills its
+Pod no longer takes them with it. The files a compaction replaces are freed by
+the next pass's expiry.
 
 **Compaction** rewrites small files into `targetFileSize`-sized ones once a
-partition group has at least `minInputFiles` candidates. It needs no
-safety window: a concurrent CDC commit that deletes a row in a file being
-rewritten is caught by `iceberg-go`'s own rewrite conflict validator, and
-the same retry path an ordinary commit uses resolves it — this holds for
-both `upsert` and `append` tables (an append-only table never produces
-delete files, so there is nothing to conflict with in the first place).
-Every compaction commit also re-attaches the table's current `cdc.position`
-property, so resume stays on the O(1) fast path instead of falling back to
-the snapshot-summary walk-back.
+partition group has at least `minInputFiles` candidates. Every compaction
+commit also re-attaches the table's current `cdc.position` property, so
+resume stays on the O(1) fast path instead of falling back to the
+snapshot-summary walk-back.
+
+:::warning Compaction of `upsert` tables under continuous load (iceberg-go v0.6.0)
+
+Two limits of the Iceberg library this release is built on, both upstream:
+
+- **A rewrite loses to every concurrent equality delete.** `iceberg-go`
+  rejects a rewrite when *any* equality delete is committed while it runs,
+  whatever files it touches (`table/conflict_validation.go`: "any concurrent
+  eq-delete is a conflict for a rewrite"). An `upsert` table that commits
+  deletes every few seconds keeps losing that race; the compaction retries
+  for about two minutes and gives up. `append` tables are not affected.
+- **Its memory grows with the square of the table's delete files.** Reading
+  the files to rewrite, `iceberg-go` builds a separate set of every applicable
+  equality-delete key for each data file (`table/equality_delete_reader.go`).
+  Measured on a CDC-shaped table: 50 commits → 141 MiB, 100 → 539 MiB,
+  200 → 1.7 GiB, 400 → 5.6 GiB, on 1 MiB of data. A table with thousands of
+  delete files OOM-kills the maintenance Pod whatever its size.
+
+Snapshot expiry and orphan cleanup are unaffected and keep running. Both
+limits are addressed in `iceberg-go` 0.7.0 (shared delete-key sets, lazy
+per-task delete loading), evaluated in
+[#464](https://github.com/maltzsama/urutau/issues/464).
+
+:::
 
 **Snapshot expiry**'s `maxAge` is the one setting in this feature that is a
 genuine safety window, not just a retention knob. The committed position
