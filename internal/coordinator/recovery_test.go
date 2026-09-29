@@ -197,3 +197,28 @@ func (p *positionIndex) truncateAll() {
 	p.head = nil
 	p.mu.Unlock()
 }
+
+// The supervisor starts after the snapshot, so its delivery-timeout rule does
+// not cover a worker lost mid-snapshot: the snapshot waited for it without a
+// deadline, and a worker that never came back held the run forever (PR #462
+// review). The wait is bounded by the same --worker-delivery-timeout.
+func TestASnapshotWaitsForALostWorkerOnlyUpToTheDeliveryTimeout(t *testing.T) {
+	c, _, _ := recoveryHarness(t)
+	c.cfg.WorkerDeliveryTimeout = 50 * time.Millisecond
+	w := c.workers["w1"]
+	c.signalSessionEnd("w1", context.Canceled)
+	c.mu.Lock()
+	w.attached = false
+	c.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- c.awaitReattached(context.Background(), w) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "did not come back") {
+			t.Fatalf("err = %v, want the run ended for a worker gone past the delivery timeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the snapshot still waits for a worker gone past the delivery timeout")
+	}
+}
