@@ -16,8 +16,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/maltzsama/urutau/core"
@@ -152,38 +150,6 @@ func workerHandshake(ctx context.Context, conn *grpc.ClientConn, name string, lo
 	return nil, nil, CoordinatorLost(fmt.Errorf("worker: handshake: %w", last))
 }
 
-// sessionWithRetry opens the Session stream, tolerating a coordinator that
-// is still booting its listener.
-func sessionWithRetry(ctx context.Context, conn *grpc.ClientConn, log *slog.Logger) (pb.UrutauControl_SessionClient, error) {
-	const maxTries = 10
-	const base = 250 * time.Millisecond
-	const cap = 30 * time.Second
-	var last error
-	for attempt := 0; attempt < maxTries; attempt++ {
-		s, err := pb.NewUrutauControlClient(conn).Session(ctx)
-		if err == nil {
-			return s, nil
-		}
-		last = err
-		log.Warn("worker: session retry", "attempt", attempt+1, "err", err)
-		// Exponential backoff with jitter: a coordinator rolling out (a new
-		// Pod, a TLS cert swap) takes longer than a fixed 5s budget, and
-		// jitter keeps a fleet of workers from retrying in lockstep
-		// (issue #270).
-		d := base << attempt
-		if d > cap {
-			d = cap
-		}
-		d += time.Duration(rand.Int64N(int64(d)/2 + 1))
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(d):
-		}
-	}
-	return nil, last
-}
-
 // RunRemote connects to the coordinator, applies its assignment, and pulls
 // change batches over Arrow Flight until the stream ends. All commits go
 // through the same collapsed worker core (batcher, windows, collapse).
@@ -194,11 +160,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	// Control and Flight all die together — the split-brain correction of
 	// design §5.3. dialOpts carries the keepalive that turns a silently
 	// frozen coordinator into an error in ~15s.
-	opts, err := dialOpts(cfg.TLS)
-	if err != nil {
-		return err
-	}
-	conn, err := grpc.NewClient(cfg.Coordinator, opts...)
+	conn, err := dialCoordinator(cfg.Coordinator, cfg.TLS)
 	if err != nil {
 		return fmt.Errorf("worker: dial: %w", err)
 	}
@@ -581,37 +543,6 @@ func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.
 		pipeCancel()
 		return fmt.Errorf("worker: drain timeout: %w", cause)
 	}
-}
-
-// dialOpts carries keepalive that converts a frozen coordinator into a
-// dead channel in ~15s. MinTime on the server must be ≤ Time here, or the
-// server GOAWAYs the client for pinging too much. The max message size must
-// cover a full snapshot window chunk (default 4Mi is too small for real
-// batches).
-func dialOpts(tlsCfg grpctls.Config) ([]grpc.DialOption, error) {
-	creds := grpc.WithTransportCredentials(insecure.NewCredentials())
-	if tlsCfg.Enabled() {
-		c, err := tlsCfg.ClientCreds()
-		if err != nil {
-			// No correct plaintext fallback when TLS is configured: dialing
-			// insecure against a TLS coordinator is a silent downgrade
-			// (issue #265).
-			return nil, fmt.Errorf("worker: TLS client credentials: %w", err)
-		}
-		creds = grpc.WithTransportCredentials(c)
-	}
-	return []grpc.DialOption{
-		creds,
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second,
-			Timeout:             5 * time.Second,
-			PermitWithoutStream: false,
-		}),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(128<<20),
-			grpc.MaxCallSendMsgSize(128<<20),
-		),
-	}, nil
 }
 
 // batchReceiver routes decoded Flight batches into the worker core, skipping

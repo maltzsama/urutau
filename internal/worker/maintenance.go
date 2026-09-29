@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -40,11 +39,7 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	opts, err := dialOpts(cfg.TLS)
-	if err != nil {
-		return fmt.Errorf("worker: maintenance: %w", err)
-	}
-	conn, err := grpc.NewClient(cfg.Coordinator, opts...)
+	conn, err := dialCoordinator(cfg.Coordinator, cfg.TLS)
 	if err != nil {
 		return fmt.Errorf("worker: maintenance: dial: %w", err)
 	}
