@@ -185,6 +185,7 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		opts.WorkerCPUOverhead = "1500m"
 	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
+	applied := time.Now()
 	applyPipeline(t, testNS, pipeline, cr)
 	// Registered after applyPipeline, so it runs before the pipeline is torn
 	// down: the logs are flushed, and a failure is dumped while the Pods,
@@ -202,6 +203,11 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 			t.Logf("diagnostics dumped under %s", dir)
 		}
 		logs.stop()
+		// The trail outlives every replaced Pod, so it is kept pass or fail.
+		tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		n, err := dumpTrail(tctx, dir, pipeline, applied)
+		tcancel()
+		t.Logf("run trail: %d coordinator run(s) under %s/trail (err %v)", n, dir, err)
 	})
 
 	// Live mutations start before the coordinator is up, so they overlap

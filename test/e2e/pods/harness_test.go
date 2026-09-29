@@ -239,7 +239,7 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			"compaction": map[string]any{"minInputFiles": 2, "interval": interval},
 		}
 	}
-	coordinator := map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080"}
+	coordinator := map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080", "eventlog": e2eEventlog}
 	if opts.CoordinatorMemory != "" {
 		coordinator["memory"] = opts.CoordinatorMemory
 	}
@@ -337,7 +337,7 @@ func buildKafkaCR(name, ns, image, sourceSecret, catalogSecret string, tables []
 				"source":  sourceSecret,
 				"catalog": catalogSecret,
 			},
-			"coordinator": map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080"},
+			"coordinator": map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080", "eventlog": e2eEventlog},
 			"worker": map[string]any{
 				"cpu": "500m", "cpu_overhead": "500m",
 				"memory": "2Gi", "memory_overhead": "1Gi",
@@ -1036,6 +1036,7 @@ func setupPodEnv(t *testing.T) (mysql, trino *sql.DB) {
 		"clientSecret": "s3cr3t",
 		"scope":        "PRINCIPAL_ROLE:ALL",
 	})
+	ensureTrailSecret(t)
 	portForward(t, dataNS, "svc/mysql", localMySQLPort, 3306)
 	portForward(t, dataNS, "svc/trino", localTrinoPort, 8080)
 	return openMySQL(t, localMySQLPort), openTrino(t, localTrinoPort)
@@ -1060,6 +1061,7 @@ func setupPodEnvKafka(t *testing.T) (produce *kgo.Client, trino *sql.DB) {
 		"clientSecret": "s3cr3t",
 		"scope":        "PRINCIPAL_ROLE:ALL",
 	})
+	ensureTrailSecret(t)
 	portForward(t, dataNS, "svc/redpanda", localRedpandaPort, 19092)
 	portForward(t, dataNS, "svc/trino", localTrinoPort, 8080)
 	return openKafkaProducer(t, localRedpandaPort), openTrino(t, localTrinoPort)

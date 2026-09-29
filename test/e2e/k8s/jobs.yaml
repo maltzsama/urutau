@@ -2,7 +2,8 @@
 # `bucket-init` and `polaris-setup` services. Each retries until its
 # dependency answers, so they need no ordering guarantees.
 #
-#   bucket-init    creates the `warehouse` bucket RustFS does not create.
+#   bucket-init    creates the `warehouse` and `urutau-history` (eventlog)
+#                  buckets RustFS does not create.
 #   polaris-setup  creates quickstart_catalog with IN-CLUSTER S3 endpoints
 #                  (http://rustfs.e2e.svc.cluster.local:9000), so the coordinator and workers
 #                  reach the warehouse directly — no host gateway.
@@ -33,6 +34,7 @@ spec:
                 echo waiting for rustfs...; sleep 2
               done
               aws --endpoint-url http://rustfs.e2e.svc.cluster.local:9000 s3 mb s3://warehouse || true
+              aws --endpoint-url http://rustfs.e2e.svc.cluster.local:9000 s3 mb s3://urutau-history || true
               echo bucket ready
           resources:
             requests:
