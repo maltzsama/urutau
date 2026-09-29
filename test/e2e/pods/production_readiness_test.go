@@ -40,11 +40,13 @@ func TestProductionReadinessChaos(t *testing.T) {
 		kedaMax: 4, maintenance: matrixMaintenance,
 		onLive: func(ctx context.Context, r *prRun) {
 			m = newMatrixSampler(r)
+			m.start(ctx)
+		},
+		afterLive: func(ctx context.Context, r *prRun) {
 			if err := m.plantOrphan(ctx); err != nil {
 				r.t.Fatalf("plant orphan: %v", err)
 			}
 			r.t.Logf("planted orphan %s", m.orphan)
-			m.start(ctx)
 		},
 		afterSettle: func(ctx context.Context, r *prRun) {
 			m.stop()
@@ -62,8 +64,10 @@ type prOptions struct {
 	live               time.Duration  // > 0: overrides the profile's live window
 	settle             time.Duration  // > 0: overrides the profile's settle timeout
 	// onLive runs once the coordinator is up, before the live window
-	// elapses; afterSettle runs after the final comparison. Both see the run.
+	// elapses; afterLive once the workload has stopped, before the settle;
+	// afterSettle after the final comparison. All see the run.
 	onLive      func(ctx context.Context, r *prRun)
+	afterLive   func(ctx context.Context, r *prRun)
 	afterSettle func(ctx context.Context, r *prRun)
 }
 
@@ -254,6 +258,9 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		t.Fatalf("stop workload: %v", err)
 	}
 	t.Logf("workload stopped; expected source position %s", w.finalPos)
+	if o.afterLive != nil {
+		o.afterLive(ctx, run)
+	}
 
 	reconnect := func() error {
 		return startPortForward(t, dataNS, "svc/trino", localTrinoPort, 8080, 30*time.Second)
