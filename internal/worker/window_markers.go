@@ -67,7 +67,7 @@ func closesBatch(p *tablePipeline, ing Ingest, deliverEmpty func(*dataplane.Batc
 	// One line per window closed: which chunk, whether this worker held it,
 	// how many rows it emits and under which cycle — what shows a chunk
 	// recorded done with none of its rows.
-	slog.Info("worker: window closed", "table", p.target, "chunk", ing.Win.ChunkID,
+	slog.Debug("worker: window closed", "table", p.target, "chunk", ing.Win.ChunkID,
 		"held", held, "rows", rows, "seq", ing.Seq, "position", ing.Position, "pending", len(ing.SnapshotPending))
 	if ing.Seq == 0 {
 		return cb, nil

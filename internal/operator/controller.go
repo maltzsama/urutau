@@ -596,6 +596,9 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 	if cr.Spec.Worker.MetricsAddr != "" {
 		cmd = append(cmd, "--metrics-addr", cr.Spec.Worker.MetricsAddr)
 	}
+	if cr.Spec.LogLevel != "" {
+		cmd = append(cmd, "--log-level", cr.Spec.LogLevel)
+	}
 	pod := corev1.PodSpec{
 		ServiceAccountName: coordinatorSAName(cr),
 		Containers: []corev1.Container{{
@@ -800,6 +803,9 @@ func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
 	}
 	args = append(args, supervisionArgs(cr.Spec.Coordinator.Supervision)...)
 	args = append(args, eventlogArgs(cr.Spec.Coordinator.Eventlog)...)
+	if cr.Spec.LogLevel != "" {
+		args = append(args, "--log-level", cr.Spec.LogLevel)
+	}
 	// Always pass a metrics address: the operator guarantees one so the
 	// /statusz probes have a stable endpoint, instead of leaving it to the
 	// CR author (an empty value disables /statusz entirely).

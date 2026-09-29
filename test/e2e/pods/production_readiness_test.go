@@ -37,7 +37,7 @@ func TestProductionReadinessChaos(t *testing.T) {
 	var m *matrixSampler
 	runProductionReadiness(t, prOptions{
 		pipeline: "pod-pr-chaos", serverID: "2321", chaos: true,
-		kedaMax: 4, maintenance: matrixMaintenance,
+		kedaMax: 4, maintenance: matrixMaintenance, logLevel: "debug",
 		onLive: func(ctx context.Context, r *prRun) {
 			m = newMatrixSampler(r)
 			m.start(ctx)
@@ -60,6 +60,7 @@ type prOptions struct {
 	pipeline, serverID string
 	chaos              bool           // the chaos controller over the live window
 	kedaMax            int            // > 0: partitioned tables get workers.max for KEDA
+	logLevel           string         // the pipeline's spec.logLevel
 	maintenance        map[string]any // non-nil: the sink's maintenance block
 	live               time.Duration  // > 0: overrides the profile's live window
 	settle             time.Duration  // > 0: overrides the profile's settle timeout
@@ -170,7 +171,7 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 			specs[i].Max = o.kedaMax
 		}
 	}
-	opts := crOptions{MaintenanceBlock: o.maintenance}
+	opts := crOptions{MaintenanceBlock: o.maintenance, LogLevel: o.logLevel}
 	if profile.Name == fullProfile.Name {
 		// The full profile streams ~1k mutations/s per table with payloads
 		// up to 256 KiB through a race-instrumented coordinator: at 2Gi it

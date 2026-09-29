@@ -28,6 +28,10 @@ type CDCPipelineSpec struct {
 	// Image is left empty (workers must then be launched some other way).
 	Image string `json:"image,omitempty"`
 
+	// LogLevel is the coordinator's and every worker's --log-level
+	// (debug|info|warn|error). Empty keeps the binaries' default, info.
+	LogLevel string `json:"logLevel,omitempty"`
+
 	// Definition points at the job: a user image (official), an s3 script,
 	// or an inline table list.
 	Definition Definition `json:"definition"`
