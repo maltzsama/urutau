@@ -1597,25 +1597,26 @@ func (c *Coordinator) confirmedPosition() position.Position {
 // different epoch) is ignored, so a stale reply cannot satisfy the wait
 // against a dead window.
 func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32, epoch uint64) error {
-	return c.waitChunkReadyOr(ctx, table, chunkID, epoch, nil)
+	_, err := c.waitChunkReadyOr(ctx, table, chunkID, epoch, nil)
+	return err
 }
 
 // waitChunkReadyOr is waitChunkReady that also returns errWorkerLost when lost
 // closes: the worker's window died with its session, so no ChunkReady for it
 // will come.
-func (c *Coordinator) waitChunkReadyOr(ctx context.Context, table string, chunkID uint32, epoch uint64, lost <-chan struct{}) error {
+func (c *Coordinator) waitChunkReadyOr(ctx context.Context, table string, chunkID uint32, epoch uint64, lost <-chan struct{}) (rows uint64, err error) {
 	for {
 		select {
 		case cr := <-c.chunkReady:
 			if cr.Table == table && cr.ChunkId == chunkID && cr.Epoch == epoch {
-				return nil
+				return cr.Rows, nil
 			}
 			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
 				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
 		case <-lost:
-			return errWorkerLost
+			return 0, errWorkerLost
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 }
@@ -1808,10 +1809,11 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 		return ctx.Err()
 	}
 
-	if err := c.waitChunkReadyOr(ctx, ref.Source, chunkID, epoch, lost); err != nil {
+	rows, err := c.waitChunkReadyOr(ctx, ref.Source, chunkID, epoch, lost)
+	if err != nil {
 		return err
 	}
-	c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID)
+	c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID, "rows", rows)
 	c.markChunkReady(ref.Target, partition, chunkID)
 
 	// The worker has the chunk rows in its window; prove the reader is
