@@ -54,8 +54,9 @@ The job ends only for what does not heal by itself:
   its committed position, and the Pod's last termination reason;
 - `--worker-delivery-timeout` (`5m`): a worker that owes work and delivers
   none of it for that long, connected or not — a Pod that cannot be
-  scheduled, a network partition that never heals. The error carries the
-  reason Kubernetes gives;
+  scheduled, a network partition that never heals, a table's only worker
+  killed again every time it comes back. It holds during the snapshot too.
+  The error carries the reason Kubernetes gives;
 - a stalled worker on an **append** table with unacked batches: redelivering
   a batch that was committed before its ack was lost would append it twice.
 

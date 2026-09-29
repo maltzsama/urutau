@@ -938,6 +938,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 	snapCtx, snapCancel := context.WithCancel(ctx)
 	defer snapCancel()
 	c.snapshotActive.Store(true)
+	// Supervision from the start: mid-snapshot only its delivery rule
+	// applies (a table's only worker delivering nothing for the delivery
+	// timeout ends the run); the ack-timeout reset waits for the stream.
+	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
 	snapDone := make(chan error, 1)
 	go func() {
 		defer c.snapshotActive.Store(false)
@@ -1011,10 +1015,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 		c.emitLog(eventlog.KindJobTerminated, terminalFields(terminateReason(err), err))
 		return err
 	}
-
-	// Supervision after the snapshot phase: acks only flow once the stream
-	// is live, so a long snapshot must not look like a stale worker.
-	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
 
 	// Replica reconcile after the snapshot too: the snapshot assigns chunks
 	// by the boot routing, and a re-slice mid-snapshot would move a range

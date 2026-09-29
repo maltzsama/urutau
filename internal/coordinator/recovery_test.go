@@ -222,3 +222,43 @@ func TestASnapshotWaitsForALostWorkerOnlyUpToTheDeliveryTimeout(t *testing.T) {
 		t.Fatal("the snapshot still waits for a worker gone past the delivery timeout")
 	}
 }
+
+// The supervisor ran only after the snapshot, so a table's only worker could
+// come back from each kill and still deliver nothing for over the delivery
+// timeout without ending the job (chaos-1M-c428fc5: pr_events, 5m22s). During
+// the snapshot the delivery rule applies; the ack-timeout reset does not, as
+// a reset mid-window would drop the window's rows.
+func TestTheDeliveryTimeoutEndsTheRunDuringTheSnapshot(t *testing.T) {
+	c, s, _ := recoveryHarness(t)
+	c.snapshotActive.Store(true)
+	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}
+	now := time.Now()
+	s.noteDeliveredAt("w1", now.Add(-6*time.Minute))
+	err := s.tick(now, cfg)
+	if err == nil || !strings.Contains(err.Error(), "delivered nothing") {
+		t.Fatalf("err = %v, want the run ended for a worker delivering nothing for 6m mid-snapshot", err)
+	}
+	_ = c
+}
+
+// Mid-snapshot a worker late on acks is not reset: only the delivery rule
+// applies until the snapshot is done.
+func TestNoAckTimeoutResetDuringTheSnapshot(t *testing.T) {
+	c, s, _ := recoveryHarness(t)
+	c.snapshotActive.Store(true)
+	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}
+	now := time.Now()
+	s.noteAck("w1", now.Add(-2*time.Minute))
+	s.noteDeliveredAt("w1", now.Add(-2*time.Minute))
+	c.mu.Lock()
+	epoch := c.workers["w1"].epoch
+	c.mu.Unlock()
+	if err := s.tick(now, cfg); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.workers["w1"].epoch != epoch {
+		t.Fatal("a worker late on acks was reset mid-snapshot")
+	}
+}
