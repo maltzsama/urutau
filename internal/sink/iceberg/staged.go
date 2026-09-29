@@ -697,3 +697,12 @@ func readFileList(r *bytes.Reader, spec iceberg.PartitionSpec, schema *iceberg.S
 	}
 	return files, nil
 }
+
+// props builds the commit properties carrying cdc.position (empty when there
+// is no position to advance).
+func props(pos string) iceberg.Properties {
+	if pos == "" {
+		return iceberg.Properties{}
+	}
+	return iceberg.Properties{propPosition: pos}
+}
