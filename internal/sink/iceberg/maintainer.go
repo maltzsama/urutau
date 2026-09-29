@@ -297,7 +297,7 @@ func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {
 		return fmt.Errorf("iceberg maintenance: snapshot expiry: load table: %w", err)
 	}
 
-	before := len(tbl.Metadata().Snapshots())
+	before := tbl.Metadata().Snapshots()
 
 	txn := tbl.NewTransaction()
 	if err := txn.ExpireSnapshots(
@@ -311,7 +311,7 @@ func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {
 		return fmt.Errorf("iceberg maintenance: snapshot expiry: commit: %w", err)
 	}
 
-	removed := before - len(newTbl.Metadata().Snapshots())
+	removed := snapshotsRemoved(before, newTbl.Metadata().Snapshots())
 	if m.metrics != nil {
 		m.metrics.SnapshotExpiryRun(identString(m.ident), removed, nil)
 	}
@@ -319,6 +319,23 @@ func (m *Maintainer) expireSnapshotsOnce(ctx context.Context) error {
 		m.log.Info("iceberg maintenance: snapshot expiry", "table", m.ident, "removed_snapshots", removed)
 	}
 	return nil
+}
+
+// snapshotsRemoved counts the snapshots of before that after no longer has.
+// Not a difference in totals: the live writer commits while the expiry
+// retries, so after also holds snapshots before never had (#457).
+func snapshotsRemoved(before, after []table.Snapshot) int {
+	kept := make(map[int64]struct{}, len(after))
+	for _, s := range after {
+		kept[s.SnapshotID] = struct{}{}
+	}
+	n := 0
+	for _, s := range before {
+		if _, ok := kept[s.SnapshotID]; !ok {
+			n++
+		}
+	}
+	return n
 }
 
 // cleanOrphans deletes unreferenced files from the warehouse. OlderThan is
