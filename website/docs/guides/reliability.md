@@ -43,7 +43,10 @@ running:
   Once it is back, its partition redoes the chunks whose rows it had not
   committed; the other partitions and tables go on.
 - A restarted **coordinator** resumes a table's snapshot from its recorded
-  progress (`cdc.snapshot.pending`), not from its first chunk.
+  progress (`cdc.snapshot.pending`), not from its first chunk. Its workers
+  retry every few seconds (at most 5s apart) and resolve its name on every
+  attempt, so they find it again within seconds of its return, well inside
+  the time it waits for them.
 
 The job ends only for what does not heal by itself:
 
