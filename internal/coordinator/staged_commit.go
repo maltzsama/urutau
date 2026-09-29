@@ -108,7 +108,8 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	}
 	faultinject.At(faultinject.CoordinatorCycleCommittedBeforeRecord,
 		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
-	c.log.Debug("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos, "owners", len(cy.owners), "descriptors", len(cy.descriptors))
+	c.log.Info("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos,
+		"owners", len(cy.owners), "descriptors", len(cy.descriptors), "snapshot_state", cy.state, "pending", pendingHead(cy.pending))
 	// The cycle is durable: only now may source retention advance. Record the
 	// cycle's position for every owner it covered, so confirmedPosition (the
 	// min) reflects the whole cycle — the worker's per-batch ack does not
@@ -169,4 +170,16 @@ func (c *Coordinator) fail(err error) {
 	case c.terminate <- err:
 	default:
 	}
+}
+
+// pendingHead renders a snapshot's pending chunks for a log line: how many,
+// and the first, which is where a restarted coordinator would resume.
+func pendingHead(pending []uint32) string {
+	if pending == nil {
+		return ""
+	}
+	if len(pending) == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d from %d", len(pending), pending[0])
 }

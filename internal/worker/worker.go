@@ -983,40 +983,6 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	return upCount, delCount, nil
 }
 
-// closesBatch handles a Closes marker: it returns the window's remaining
-// rows for the caller to buffer, or nil when there are none.
-//
-// A marker with a seq is a cycle of the coordinator's send order: the
-// window's rows go out as that cycle, so they commit after every live cycle
-// released ahead of the marker (#416). A window that emits no rows still
-// owes the cycle its delivery, made here through deliverEmpty. A window this
-// process never held — a lost one, its rows gone with the previous process —
-// owes that delivery too, but has done no chunk: its snapshot progress must
-// not commit, or a restarted coordinator resumes past the chunk's rows.
-func closesBatch(p *tablePipeline, ing Ingest, deliverEmpty func(*dataplane.Batch) error) (*dataplane.Batch, error) {
-	cb, held, err := closeWindow(p, ing)
-	if err != nil {
-		return nil, err
-	}
-	if !held {
-		ing.SnapshotPending = nil
-	}
-	if ing.Seq == 0 {
-		return cb, nil
-	}
-	if cb != nil {
-		cb.Seq, cb.Staged = ing.Seq, ing.Staged
-		return cb, nil
-	}
-	eb, err := markerBatch(p, ing)
-	if err != nil {
-		return nil, err
-	}
-	err = deliverEmpty(eb)
-	eb.Release()
-	return nil, err
-}
-
 // closeWindow returns the stored chunk batch minus the keys live InWindow
 // events touched, with every row's __pos adopted to the marker position, and
 // whether this worker held the window at all. The caller owns the returned
