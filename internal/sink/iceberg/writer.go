@@ -194,12 +194,15 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		return err
 	}
 	if len(keys) > 0 {
-		// Position goes on the delete only when it IS the last commit.
-		delPos := ""
+		// Position and snapshot progress go on the delete only when it IS
+		// the last commit: a crash before the appends must leave both where
+		// they were, or a restart resumes past rows that never landed — a
+		// window's chunk recorded done with none of its rows (#461).
+		delPos, delState, delPending := "", "", []uint32(nil)
 		if upsertBatch == nil || upsertBatch.Record.NumRows() == 0 {
-			delPos = pos
+			delPos, delState, delPending = pos, b.SnapshotState, b.SnapshotPending
 		}
-		if err := w.commitDeletes(ctx, keys, delPos, b.SnapshotState, b.SnapshotPending); err != nil {
+		if err := w.commitDeletes(ctx, keys, delPos, delState, delPending); err != nil {
 			return err
 		}
 		if delPos == "" {
