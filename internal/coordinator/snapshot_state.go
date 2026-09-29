@@ -9,6 +9,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
 
@@ -240,4 +241,39 @@ func (c *Coordinator) snapshotTodoFor(target string) map[uint32]bool {
 	c.snapshotTodoMu.Lock()
 	defer c.snapshotTodoMu.Unlock()
 	return c.snapshotTodo[target]
+}
+
+// sendCloses queues a chunk's Closes marker for its partition's worker —
+// not routed through enqueueBatch's table-wide lookup, since a marker carries
+// no rows for enqueueBatch to route by key.
+//
+// On a staged table the worker delivers the window's rows as the marker's
+// cycle (#416), so the marker takes a place in the table's send order here,
+// expecting only this worker: the window commits after every live cycle
+// released ahead of it. Committed on arrival instead, it could move the
+// table's committed position past live cycles still open, and a crash would
+// then take their replay for covered.
+func (c *Coordinator) sendCloses(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32) error {
+	return c.sendClosesPending(ctx, w, target, at, chunkID, nil)
+}
+
+// sendClosesPending is sendCloses naming the table's snapshot chunks still to
+// do after this window, which the worker commits with the window's rows so a
+// restarted coordinator resumes there (issue #461).
+func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32, pending []uint32) error {
+	meta := &pb.BatchMeta{
+		Table:  target,
+		LowPos: at.String(),
+		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID, SnapshotPending: pending},
+	}
+	if c.stagesCycles() && c.isStagedTable(target) {
+		meta.BatchId = c.batchSeq.Add(1)
+		c.staged.expect(core.TableRef{Target: target}, meta.BatchId, []string{w.name})
+	}
+	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
+		return err
+	}
+	c.noteChunkMarker(w.name, meta.BatchId, target, chunkID)
+	c.noteWindow(target, w)
+	return nil
 }

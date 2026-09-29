@@ -4,6 +4,8 @@ package pods
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -140,8 +142,23 @@ func TestRenderChaosTargetsAndParses(t *testing.T) {
 // redirected elsewhere.
 func TestRenderChaosRefusesWithoutTarget(t *testing.T) {
 	d := chaosDecision{Kind: chaosCoordinatorKill, Scope: scopeCoordinator}
-	if _, _, _, _, err := renderChaos("pod-e2e", "p", d, "x", testPods[1:]); err == nil {
-		t.Fatal("a coordinator fault with no coordinator Pod must fail")
+	if _, _, _, _, err := renderChaos("pod-e2e", "p", d, "x", testPods[1:]); !errors.Is(err, errNoTarget) {
+		t.Fatalf("err = %v, want errNoTarget for a coordinator fault with no coordinator Pod", err)
+	}
+}
+
+// A draw with no running Pod to aim at — every worker restarting right after
+// a coordinator kill — is recorded as skipped, not as a failed injection:
+// nothing was created, and nothing failed to inject (issue #458, full chaos
+// run). Any other refusal is still an error.
+func TestADrawWithoutATargetIsSkipped(t *testing.T) {
+	ev := &chaosEvent{}
+	if failed := noteManifestErr(ev, fmt.Errorf("render: %w", errNoTarget)); failed || ev.Skipped == "" || ev.Error != "" {
+		t.Fatalf("event %+v (failed %v), want it skipped", ev, failed)
+	}
+	ev = &chaosEvent{}
+	if failed := noteManifestErr(ev, errors.New("kubectl get pods: connection refused")); !failed || ev.Error == "" {
+		t.Fatalf("event %+v (failed %v), want the error recorded", ev, failed)
 	}
 }
 
@@ -247,5 +264,37 @@ func TestReactiveNetworkFaultIsSkippedWhileOneIsActive(t *testing.T) {
 	}
 	if n := len(c.active); n != 1 {
 		t.Fatalf("%d active, want only the network fault already there", n)
+	}
+}
+
+// A fault whose target leaves while Chaos Mesh injects it — a worker Pod
+// recreated by a re-slice and left Pending with no CPU to schedule on, a
+// coordinator restarting — can never report AllInjected. That is the draw
+// losing its target, skipped as #458 skips a draw with none, not a failed
+// injection (chaos-race-cfe4699: 3 such faults failed the run).
+func TestATargetThatLeavesDuringInjectionIsDetected(t *testing.T) {
+	targets := []podInfo{
+		{name: "w-3", phase: "Running", restarts: "0", uid: "a"},
+		{name: "coord-0", phase: "Running", restarts: "4", uid: "c"},
+	}
+	cases := []struct {
+		name string
+		now  []podInfo
+		left bool
+	}{
+		{"unchanged", []podInfo{{name: "w-3", phase: "Running", restarts: "0", uid: "a"}, {name: "coord-0", phase: "Running", restarts: "4", uid: "c"}}, false},
+		{"recreated pending", []podInfo{{name: "w-3", phase: "Pending", restarts: "", uid: "b"}, {name: "coord-0", phase: "Running", restarts: "4", uid: "c"}}, true},
+		{"restarted", []podInfo{{name: "w-3", phase: "Running", restarts: "0", uid: "a"}, {name: "coord-0", phase: "Running", restarts: "5", uid: "c"}}, true},
+		{"gone", []podInfo{{name: "coord-0", phase: "Running", restarts: "4", uid: "c"}}, true},
+	}
+	for _, tc := range cases {
+		if _, left := targetLeft(targets, tc.now); left != tc.left {
+			t.Errorf("%s: left = %v, want %v", tc.name, left, tc.left)
+		}
+	}
+	m := "  selector:\n    pods:\n      pod-e2e:\n        - w-3\n  target:\n    selector:\n      namespaces:\n        - pod-e2e\n"
+	got := manifestTargets(m, []podInfo{{name: "w-3"}, {name: "w-2"}})
+	if len(got) != 1 || got[0].name != "w-3" {
+		t.Fatalf("manifest targets = %v, want [w-3]", got)
 	}
 }

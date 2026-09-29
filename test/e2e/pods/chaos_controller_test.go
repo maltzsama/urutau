@@ -14,6 +14,7 @@ package pods
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -383,6 +384,23 @@ const networkReapplyAfter = 15 * time.Second
 // after this long is one.
 const chaosRemovalTimeout = 10 * time.Minute
 
+// errNoTarget is a draw with no running Pod of the role it aims at.
+var errNoTarget = errors.New("no target to aim at")
+
+// noteManifestErr records why an experiment was not created. A draw with no
+// running Pod to aim at — every worker restarting right after a coordinator
+// kill — is skipped, not a failed injection: nothing was created and nothing
+// failed to inject (issue #458). It reports whether the event failed.
+// Caller holds c.mu for a shared event.
+func noteManifestErr(ev *chaosEvent, err error) bool {
+	if errors.Is(err, errNoTarget) {
+		ev.Skipped = err.Error()
+		return false
+	}
+	ev.Error = err.Error()
+	return true
+}
+
 // reserved marks an active slot whose resource is not created yet.
 const reserved = "reserved"
 
@@ -437,13 +455,19 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 	ev.State = c.snapshot()
 	manifest, resource, target, params, err := c.manifest(d, ev.Name)
 	if err != nil {
-		record(err)
+		c.mu.Lock()
+		noteManifestErr(ev, err)
+		c.mu.Unlock()
 		c.forget(ev.Name) // release the reservation: nothing was created
 		return
 	}
 	c.mu.Lock()
 	ev.Resource, ev.Target, ev.Params = resource, target, params
 	c.mu.Unlock()
+	var targets []podInfo
+	if pods, perr := c.pods(); perr == nil {
+		targets = manifestTargets(manifest, pods)
+	}
 	if _, err := kubectlCmd(manifest, "apply", "-f", "-"); err != nil {
 		record(err)
 		c.forget(ev.Name)
@@ -475,6 +499,17 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 			break
 		}
 		if time.Now().After(deadline) {
+			// A target that left mid-injection (recreated and Pending,
+			// restarting) can never report injected: the draw lost its
+			// target, skipped like a draw without one (#458).
+			if now, perr := c.pods(); perr == nil {
+				if why, left := targetLeft(targets, now); left {
+					c.mu.Lock()
+					ev.Skipped = "target left during injection: " + why
+					c.mu.Unlock()
+					return
+				}
+			}
 			record(fmt.Errorf("not injected within 90s after %d re-apply(s) (last %q, %v; last re-apply error: %v)", ev.Reapplied, out, err, reapplyErr))
 			return
 		}
@@ -521,7 +556,7 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 // pods lists the pipeline's Pods with the labels the controller selects on.
 func (c *chaosController) pods() ([]podInfo, error) {
 	out, err := kubectlCmd("", "-n", c.ns, "get", "pods", "-l", "urutau.io/pipeline="+c.pipeline, "-o",
-		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.app}{"\t"}{.metadata.labels.urutau\.io/worker}{"\t"}{.status.phase}{"\t"}{.status.containerStatuses[0].restartCount}{"\n"}{end}`)
+		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.app}{"\t"}{.metadata.labels.urutau\.io/worker}{"\t"}{.status.phase}{"\t"}{.status.containerStatuses[0].restartCount}{"\t"}{.metadata.uid}{"\n"}{end}`)
 	if err != nil {
 		return nil, err
 	}
@@ -531,13 +566,57 @@ func (c *chaosController) pods() ([]podInfo, error) {
 		if len(f) < 5 || f[0] == "" {
 			continue
 		}
-		pods = append(pods, podInfo{name: f[0], app: f[1], group: f[2], phase: f[3], restarts: f[4]})
+		p := podInfo{name: f[0], app: f[1], group: f[2], phase: f[3], restarts: f[4]}
+		if len(f) > 5 {
+			p.uid = f[5]
+		}
+		pods = append(pods, p)
 	}
 	sort.Slice(pods, func(i, j int) bool { return pods[i].name < pods[j].name })
 	return pods, nil
 }
 
-type podInfo struct{ name, app, group, phase, restarts string }
+type podInfo struct{ name, app, group, phase, restarts, uid string }
+
+// manifestTargets returns the Pods of pods a manifest names in its selector.
+func manifestTargets(manifest string, pods []podInfo) []podInfo {
+	named := map[string]bool{}
+	for _, line := range strings.Split(manifest, "\n") {
+		if name, ok := strings.CutPrefix(strings.TrimSpace(line), "- "); ok {
+			named[name] = true
+		}
+	}
+	var out []podInfo
+	for _, p := range pods {
+		if named[p.name] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// targetLeft reports whether a target of a fault left while it was being
+// injected: gone, no longer Running, replaced (another UID) or restarted.
+func targetLeft(targets, now []podInfo) (string, bool) {
+	byName := make(map[string]podInfo, len(now))
+	for _, p := range now {
+		byName[p.name] = p
+	}
+	for _, t := range targets {
+		p, ok := byName[t.name]
+		switch {
+		case !ok:
+			return t.name + " is gone", true
+		case p.phase != "Running":
+			return t.name + " is " + p.phase, true
+		case p.uid != t.uid:
+			return t.name + " was replaced", true
+		case p.restarts != t.restarts:
+			return t.name + " restarted", true
+		}
+	}
+	return "", false
+}
 
 // snapshot records the pipeline's state for an event.
 func (c *chaosController) snapshot() chaosState {
@@ -632,7 +711,7 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 			p, ok = pick(workers)
 		}
 		if !ok {
-			return p, fmt.Errorf("no running %s pod to target", d.Scope)
+			return p, fmt.Errorf("%w: no running %s pod", errNoTarget, d.Scope)
 		}
 		return p, nil
 	}
@@ -684,7 +763,7 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 			target = g
 		}
 		if len(side) == 0 {
-			return "", "", "", "", fmt.Errorf("no running worker pod to target")
+			return "", "", "", "", fmt.Errorf("%w: no running worker pod", errNoTarget)
 		}
 		var podList strings.Builder
 		for _, p := range side {

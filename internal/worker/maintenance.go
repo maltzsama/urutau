@@ -85,19 +85,16 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 		if assign == nil {
 			continue // ignore anything but the maintenance assignment
 		}
-		results, passErr := runMaintenancePass(ctx, cfg, assign)
-		// Report the outcome before exiting: this process's own /metrics
-		// dies with it, so a result not sent now is lost to the coordinator's
-		// long-lived registry. The coordinator also marks the operations as
-		// run only once this report lands, so a pass that dies before it
-		// stays due. Report even on failure — the coordinator records the
-		// failed operation too.
-		sendErr := sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_MaintenanceResult{
-			MaintenanceResult: &pb.MaintenanceResult{Ops: results},
-		}})
-		if sendErr != nil && passErr == nil {
-			return fmt.Errorf("worker: maintenance: report: %w", sendErr)
-		}
+		// Each operation is reported as it ends: this process's own /metrics
+		// dies with it, and the coordinator marks an operation run only once
+		// its report lands. Reported one by one, an operation that ran is not
+		// lost with a later one that kills the process (#457). Failures are
+		// reported too — the coordinator records the failed operation.
+		_, passErr := runMaintenancePass(ctx, cfg, assign, func(ops []*pb.MaintenanceOpResult) error {
+			return sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_MaintenanceResult{
+				MaintenanceResult: &pb.MaintenanceResult{Ops: ops},
+			}})
+		})
 		return passErr // one pass per process: exit for good
 	}
 }
@@ -107,7 +104,7 @@ func RunMaintenance(ctx context.Context, cfg RemoteConfig) error {
 // carries the table, the operations (in order), and the operation
 // parameters — the coordinator already decided which operations are due, so
 // the intervals in the config are ignored.
-func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.MaintenanceAssignment) ([]*pb.MaintenanceOpResult, error) {
+func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.MaintenanceAssignment, report func([]*pb.MaintenanceOpResult) error) ([]*pb.MaintenanceOpResult, error) {
 	var maint spec.Maintenance
 	if len(assign.MaintenanceConfig) > 0 {
 		if err := json.Unmarshal(assign.MaintenanceConfig, &maint); err != nil {
@@ -167,10 +164,16 @@ func runMaintenancePass(ctx context.Context, cfg RemoteConfig, assign *pb.Mainte
 		if err := ctx.Err(); err != nil {
 			break
 		}
+		done := len(collector.ops)
 		if err := m.RunOnce(ctx, []sink.MaintenanceOp{op}); err != nil {
 			cfg.Logger.Warn("worker: maintenance: failed", "table", assign.TargetTable, "op", op, "err", err)
 			if firstErr == nil {
 				firstErr = fmt.Errorf("worker: maintenance %s: %s: %w", assign.TargetTable, op, err)
+			}
+		}
+		if ran := collector.ops[done:]; len(ran) > 0 && report != nil {
+			if err := report(ran); err != nil {
+				return collector.ops, fmt.Errorf("worker: maintenance: report %s: %w", op, err)
 			}
 		}
 	}
