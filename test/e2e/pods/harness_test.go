@@ -189,6 +189,8 @@ type crOptions struct {
 	// WorkerMemoryOverhead, when set, replaces the workers' 1Gi of limit
 	// above their 2Gi request.
 	WorkerMemoryOverhead string
+	// LogLevel, when set, is the pipeline's spec.logLevel.
+	LogLevel string
 	// CoordinatorCPU, when set, replaces the coordinator's 1 CPU.
 	CoordinatorCPU string
 	// WorkerCPUOverhead, when set, replaces the workers' 500m of limit
@@ -285,6 +287,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 				},
 			},
 		},
+	}
+	if opts.LogLevel != "" {
+		cr["spec"].(map[string]any)["logLevel"] = opts.LogLevel
 	}
 	b, err := yaml.Marshal(cr)
 	if err != nil {

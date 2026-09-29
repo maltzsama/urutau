@@ -108,7 +108,7 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	}
 	faultinject.At(faultinject.CoordinatorCycleCommittedBeforeRecord,
 		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
-	c.log.Info("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos,
+	c.log.Debug("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos,
 		"owners", len(cy.owners), "descriptors", len(cy.descriptors), "snapshot_state", cy.state, "pending", pendingHead(cy.pending))
 	// The cycle is durable: only now may source retention advance. Record the
 	// cycle's position for every owner it covered, so confirmedPosition (the

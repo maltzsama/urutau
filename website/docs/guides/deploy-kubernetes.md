@@ -166,6 +166,7 @@ metadata:
   namespace: default
 spec:
   image: urutau:dev                 # coordinator + every worker it provisions
+  logLevel: info                    # --log-level of the coordinator and every worker (debug|info|warn|error)
   secrets:
     source: shop-mysql-creds
     catalog: polaris-creds

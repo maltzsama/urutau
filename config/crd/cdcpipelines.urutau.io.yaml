@@ -24,6 +24,9 @@ spec:
               type: object
               properties:
                 image: {type: string}
+                logLevel:
+                  type: string
+                  enum: [debug, info, warn, error]
                 definition:
                   type: object
                   properties:
