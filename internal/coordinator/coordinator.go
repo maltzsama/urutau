@@ -1309,17 +1309,21 @@ func (c *Coordinator) emit(kind string, fields map[string]any) error {
 	return nil
 }
 
-// waitWorkers blocks until every expected group has a session attached.
+// waitWorkers blocks until every expected group has had a session attached.
 // Counting ready signals would miscount a flapping worker that attaches,
 // dies, and reattaches inside the window (audit #4) — so the wait checks
-// the attached flag directly, woken by each attach and the poll.
+// each worker's own state, woken by each attach and the poll. A worker that
+// attached and was lost again counts: its loss is recovered like any other
+// (awaited, bounded by the delivery timeout). Requiring all of them attached
+// at one instant never held while workers were being killed, and the
+// coordinator restarted in a loop (chaos-1M-521691a).
 func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	allAttached := func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		for _, w := range c.workers {
-			if !w.attached {
+			if !w.attached && !w.hadSession {
 				return false
 			}
 		}
@@ -2846,7 +2850,22 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 
 	c.mu.Lock()
 	w, known := c.workers[hello.WorkerName]
-	if known && w.attached {
+	c.mu.Unlock()
+	if !known {
+		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+	}
+	// Assignment on every attach (including after a reset): the worker
+	// waits for it before opening Flight, and a resurrected worker needs a
+	// fresh one. It is queued before the session is published: a snapshot
+	// waiting for this worker sends chunk requests the moment it is
+	// attached, and a worker whose first message is not its Assignment fails
+	// the handshake (chaos-1M-521691a).
+	assign, err := c.assignmentFor(w)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if w.attached {
 		c.mu.Unlock()
 		return fmt.Errorf("coordinator: worker %q already connected", hello.WorkerName)
 	}
@@ -2857,23 +2876,16 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		out:  make(chan *pb.CoordinatorMessage, 16),
 		done: make(chan error, 1),
 	}
+	sess.out <- assign
 	// Publish the session BEFORE signaling ready: the ready send
 	// happens-before run's receive, so run may use w.out the moment it
 	// wakes — attaching after the signal is a data race.
-	if known {
-		w.out, w.attached, w.hadSession = sess.out, true, true
-		w.cancel = sessCancel
-	}
+	w.out, w.attached, w.hadSession = sess.out, true, true
+	w.cancel = sessCancel
 	c.mu.Unlock()
-	if known {
-		if err := c.onAttach(hello.WorkerName); err != nil {
-			sessCancel()
-			return err
-		}
-	}
-	if !known {
+	if err := c.onAttach(hello.WorkerName); err != nil {
 		sessCancel()
-		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+		return err
 	}
 	defer func() {
 		c.mu.Lock()
@@ -2890,18 +2902,6 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	}
 	c.log.Info("worker session", "worker", hello.WorkerName)
 
-	// Assignment on every attach (including after a reset): the worker
-	// waits for it before opening Flight, and a resurrected worker needs a
-	// fresh one.
-	if msg, err := c.assignmentFor(w); err != nil {
-		return err
-	} else {
-		select {
-		case sess.out <- msg:
-		case <-stream.Context().Done():
-			return stream.Context().Err()
-		}
-	}
 	// Recv loop: acks and worker errors.
 	go func() {
 		for {
