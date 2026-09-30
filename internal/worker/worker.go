@@ -148,7 +148,8 @@ type readyBatch struct {
 	// ackPos, when set, is the position acked once the batch is committed,
 	// in place of its watermark: a snapshot-done batch commits no position
 	// but acks the marker's (#428).
-	ackPos []byte
+	ackPos  []byte
+	markers []uint64 // a batch-less item: see queueMarkers
 }
 
 // Ingest is one unit the worker consumes: a columnar batch plus optional
@@ -531,7 +532,7 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 	if cerr != nil {
 		// Release what the committer never took.
 		for rb := range p.readyCh {
-			rb.batch.Release()
+			rb.release()
 		}
 	}
 	if err != nil && cerr != nil {
@@ -550,6 +551,9 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 // sink (commit 3 — the worker's main path produces dataplane.Batch).
 func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 	for rb := range p.readyCh {
+		if w.ackMarkers(p, rb) {
+			continue
+		}
 		start := time.Now()
 		// A zero-value WriteMode would silently default to upsert semantics.
 		// Every batch must carry an explicit mode; reject the unset one.
@@ -677,8 +681,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		return ready(emptyBatch(b, p.mode), 0, 0, 0)
 	}
 
-	// The markers of the windows among pending, acked once they commit.
-	var pendingMarkers []uint64
+	var pendingMarkers []uint64 // the markers of pending's windows (queueMarkers)
 	var commitPending func() error
 	flush := func() error {
 		markers := pendingMarkers
@@ -686,10 +689,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		if err := commitPending(); err != nil {
 			return err
 		}
-		for _, id := range markers {
-			w.markerCommitted(p.target, id)
-		}
-		return nil
+		return queueMarkers(ctx, p.readyCh, markers)
 	}
 	commitPending = func() error {
 		if len(pending) == 0 {
