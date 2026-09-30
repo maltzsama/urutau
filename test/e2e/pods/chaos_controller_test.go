@@ -480,6 +480,16 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 		if _, err := kubectlCmdBy(time.Now().Add(chaosRemovalTimeout), "", "-n", c.ns, "delete", resource, ev.Name, "--ignore-not-found", "--wait=true"); err != nil {
 			record(err)
 		}
+		// pod-failure swaps the container's image, so the kubelet restarts
+		// it in a crash loop for the whole fault, and after the removal still
+		// waits out the loop's backoff (up to 5m): the worker of
+		// chaos-1M-a3da90e came back 2m34s after its 107s fault ended. The
+		// fault is its drawn duration, so its Pod is replaced when it ends.
+		if d.Kind == chaosWorkerFailure || d.Kind == chaosCoordFailure {
+			if _, err := kubectlCmdBy(time.Now().Add(chaosRemovalTimeout), "", "-n", c.ns, "delete", "pod", target, "--ignore-not-found", "--wait=false"); err != nil {
+				record(err)
+			}
+		}
 		c.forget(ev.Name)
 		c.mu.Lock()
 		ev.RemovedAt = time.Now()
