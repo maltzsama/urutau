@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -94,5 +95,40 @@ func (w *Worker) OnMarkerCommitted(f func(table string, id uint64)) { w.onMarker
 func (w *Worker) markerCommitted(table string, id uint64) {
 	if w.onMarker != nil && id != 0 {
 		w.onMarker(table, id)
+	}
+}
+
+// queueMarkers hands the committer the Closes markers of the windows whose
+// rows it was just given. The committer acks them once those rows are staged
+// or committed: acked by the batcher, a worker killed before the ship had
+// already reported its window done, the coordinator skipped the chunk on redo
+// and the window's cycle blocked the table's send order (chaos-1M-a3da90e).
+func queueMarkers(ctx context.Context, ready chan<- readyBatch, markers []uint64) error {
+	if len(markers) == 0 {
+		return nil
+	}
+	select {
+	case ready <- readyBatch{markers: markers}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ackMarkers acks a batch-less item's markers, reporting whether rb was one.
+func (w *Worker) ackMarkers(p *tablePipeline, rb readyBatch) bool {
+	if rb.batch != nil {
+		return false
+	}
+	for _, id := range rb.markers {
+		w.markerCommitted(p.target, id)
+	}
+	return true
+}
+
+// release frees the batch the committer never took, if the item has one.
+func (rb readyBatch) release() {
+	if rb.batch != nil {
+		rb.batch.Release()
 	}
 }
