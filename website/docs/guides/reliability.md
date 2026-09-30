@@ -46,7 +46,9 @@ running:
   progress (`cdc.snapshot.pending`), not from its first chunk. Its workers
   retry every few seconds (at most 5s apart) and resolve its name on every
   attempt, so they find it again within seconds of its return, well inside
-  the time it waits for them.
+  the time it waits for them. At boot it waits until each worker has
+  connected once; a worker lost again after that is recovered like any
+  other lost worker, not awaited by the boot.
 
 The job ends only for what does not heal by itself:
 
