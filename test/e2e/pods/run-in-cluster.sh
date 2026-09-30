@@ -69,8 +69,11 @@ spec:
           env:
 ${envs}          resources:
             # The oracle holds every row the workload wrote: the full profile
-            # (3 x 1M rows with payloads) needs several GiB.
-            requests: {cpu: "2", memory: 4Gi}
+            # (3 x 1M rows with payloads) needs several GiB. CPU has no
+            # limit, so the request only reserves: at 2 CPU the pipeline's
+            # KEDA peak outgrew the 16-CPU node, and a worker killed by the
+            # chaos stayed Pending for minutes (chaos-1M-521691a).
+            requests: {cpu: 500m, memory: 4Gi}
             limits: {memory: 12Gi}
           volumeMounts:
             - {name: artifacts, mountPath: /artifacts}
