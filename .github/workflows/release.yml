@@ -122,7 +122,8 @@ jobs:
       # so an unsigned/scanned image is not the only difference between a
       # green and a red release.
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.28.0
+        # The action dropped its unprefixed tags (0.28.0) (#473).
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
           format: table
