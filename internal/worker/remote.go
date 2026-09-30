@@ -124,8 +124,13 @@ func workerHandshake(ctx context.Context, conn *grpc.ClientConn, name string, lo
 			case <-time.After(d):
 			}
 		}
-		session, err := sessionWithRetry(ctx, conn, log)
+		// Each attempt owns its Session: a failed attempt closes it, or the
+		// coordinator keeps the worker attached to it and refuses every
+		// retry as "already connected" (chaos-1M-521691a).
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		session, err := sessionWithRetry(attemptCtx, conn, log)
 		if err != nil {
+			cancelAttempt()
 			last = err
 			continue
 		}
@@ -139,11 +144,13 @@ func workerHandshake(ctx context.Context, conn *grpc.ClientConn, name string, lo
 			var msg *pb.CoordinatorMessage
 			if msg, err = session.Recv(); err == nil {
 				if assign := msg.GetAssign(); assign != nil {
+					context.AfterFunc(ctx, cancelAttempt)
 					return session, assign, nil
 				}
 				err = errors.New("worker: expected Assignment, got none")
 			}
 		}
+		cancelAttempt()
 		last = err
 		log.Warn("worker: handshake retry", "attempt", attempt+1, "err", err)
 	}

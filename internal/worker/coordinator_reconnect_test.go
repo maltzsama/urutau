@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -84,5 +86,69 @@ func TestWorkerFindsRestartedCoordinatorPromptly(t *testing.T) {
 	}
 	if lag := r.at.Sub(up); lag > 10*time.Second {
 		t.Fatalf("worker found the restarted coordinator %s after it came back; want ≤ 10s", lag.Round(time.Second))
+	}
+}
+
+// firstSessionMisfires answers the first Session with a message other than
+// the Assignment and, like the coordinator, refuses a second Session while
+// the first is still open.
+type firstSessionMisfires struct {
+	pb.UnimplementedUrutauControlServer
+	mu    sync.Mutex
+	calls int
+	open  bool
+}
+
+func (f *firstSessionMisfires) Session(s grpc.BidiStreamingServer[pb.WorkerMessage, pb.CoordinatorMessage]) error {
+	if _, err := s.Recv(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	if f.open {
+		f.mu.Unlock()
+		return errors.New("already connected")
+	}
+	f.calls++
+	first := f.calls == 1
+	f.open = true
+	f.mu.Unlock()
+	defer func() { f.mu.Lock(); f.open = false; f.mu.Unlock() }()
+	msg := &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Assign{Assign: &pb.Assignment{}}}
+	if first {
+		msg = &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: &pb.ChunkRequest{}}}
+	}
+	if err := s.Send(msg); err != nil {
+		return err
+	}
+	for {
+		if _, err := s.Recv(); err != nil {
+			return nil
+		}
+	}
+}
+
+// A handshake attempt that fails must close its Session. Left open, the
+// coordinator kept the worker attached to it and refused every retry as
+// "already connected" until the worker exited (chaos-1M-521691a: 3 minutes).
+func TestAFailedHandshakeClosesItsSession(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterUrutauControlServer(srv, &firstSessionMisfires{})
+	go func() { _ = srv.Serve(l) }()
+	defer srv.Stop()
+
+	conn, err := dialCoordinator(l.Addr().String(), grpctls.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, assign, err := workerHandshake(ctx, conn, "w-0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil || assign == nil {
+		t.Fatalf("handshake = %v, want the retry to get the Assignment once the failed session is closed", err)
 	}
 }
