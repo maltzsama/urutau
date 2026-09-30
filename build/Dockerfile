@@ -6,7 +6,7 @@
 # image for the coordinator StatefulSet and every worker Deployment). The Go
 # image is pinned to the same patch the go.mod directive requires — a floating
 # tag breaks the build whenever the toolchain patch lags the go directive.
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.6
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 # Version metadata for urutau version (defaults keep ad-hoc builds honest).
