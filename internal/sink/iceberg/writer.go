@@ -194,12 +194,15 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		return err
 	}
 	if len(keys) > 0 {
-		// Position goes on the delete only when it IS the last commit.
-		delPos := ""
+		// Position and snapshot progress go on the delete only when it IS
+		// the last commit: a crash before the appends must leave both where
+		// they were, or a restart resumes past rows that never landed — a
+		// window's chunk recorded done with none of its rows (#461).
+		delPos, delState, delPending := "", "", []uint32(nil)
 		if upsertBatch == nil || upsertBatch.Record.NumRows() == 0 {
-			delPos = pos
+			delPos, delState, delPending = pos, b.SnapshotState, b.SnapshotPending
 		}
-		if err := w.commitDeletes(ctx, keys, delPos, b.SnapshotState, b.SnapshotPending); err != nil {
+		if err := w.commitDeletes(ctx, keys, delPos, delState, delPending); err != nil {
 			return err
 		}
 		if delPos == "" {
@@ -428,24 +431,6 @@ func walkBackPosition(props iceberg.Properties, head *table.Snapshot, lookup tab
 	return ""
 }
 
-// SetTableProperties writes arbitrary properties to an Iceberg table.
-// Used by adoption to mark snapshot complete without committing data.
-func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Identifier, props iceberg.Properties) error {
-	if len(props) == 0 {
-		return nil
-	}
-	tbl, err := cat.LoadTable(ctx, ident)
-	if err != nil {
-		return fmt.Errorf("iceberg: load %v: %w", ident, err)
-	}
-	txn := tbl.NewTransaction()
-	if err := txn.SetProperties(props); err != nil {
-		return err
-	}
-	_, err = txn.Commit(ctx)
-	return err
-}
-
 // sortOrderFor builds the table's default sort order over its identifier
 // (primary-key) columns, ascending with nulls first. A sort order clusters
 // equal-key rows together within data files, so equality-delete pruning and
@@ -639,15 +624,6 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 		}
 	}
 	return nil
-}
-
-// props builds the commit properties carrying cdc.position (empty when there
-// is no position to advance).
-func props(pos string) iceberg.Properties {
-	if pos == "" {
-		return iceberg.Properties{}
-	}
-	return iceberg.Properties{propPosition: pos}
 }
 
 // sleepCtx waits d or returns early with the context error.

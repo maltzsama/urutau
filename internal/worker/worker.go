@@ -56,6 +56,7 @@ type OnStaged func(table string, seq uint64, descriptor []byte, pos, state strin
 type Worker struct {
 	cfg             Config
 	onCommit        OnCommit
+	onMarker        func(table string, id uint64)
 	onStaged        OnStaged
 	onDroppedDelete OnDroppedDelete
 	schemaDrift     func(SchemaDrift)
@@ -147,7 +148,8 @@ type readyBatch struct {
 	// ackPos, when set, is the position acked once the batch is committed,
 	// in place of its watermark: a snapshot-done batch commits no position
 	// but acks the marker's (#428).
-	ackPos []byte
+	ackPos  []byte
+	markers []uint64 // a batch-less item: see queueMarkers
 }
 
 // Ingest is one unit the worker consumes: a columnar batch plus optional
@@ -168,6 +170,13 @@ type Ingest struct {
 	// sent ahead of it. The worker commits cdc.snapshot.state=complete after
 	// them, at Position, as the marker's cycle on a staged table (#428).
 	SnapshotDone bool
+	// SnapshotPending, on a Closes marker, is the table's snapshot chunks
+	// still to do after this window: the window's rows commit with them as
+	// cdc.snapshot.pending, state in_progress (issue #461).
+	SnapshotPending []uint32
+	// MarkerID, on a Closes marker, is the marker's batch id: the worker acks
+	// it by this id once the window's rows are committed (#468).
+	MarkerID uint64
 }
 
 // New builds a worker; register tables before Run.
@@ -523,7 +532,7 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 	if cerr != nil {
 		// Release what the committer never took.
 		for rb := range p.readyCh {
-			rb.batch.Release()
+			rb.release()
 		}
 	}
 	if err != nil && cerr != nil {
@@ -542,6 +551,9 @@ func (w *Worker) runPipeline(ctx context.Context, p *tablePipeline) error {
 // sink (commit 3 — the worker's main path produces dataplane.Batch).
 func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 	for rb := range p.readyCh {
+		if w.ackMarkers(p, rb) {
+			continue
+		}
 		start := time.Now()
 		// A zero-value WriteMode would silently default to upsert semantics.
 		// Every batch must carry an explicit mode; reject the unset one.
@@ -669,7 +681,17 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		return ready(emptyBatch(b, p.mode), 0, 0, 0)
 	}
 
+	var pendingMarkers []uint64 // the markers of pending's windows (queueMarkers)
+	var commitPending func() error
 	flush := func() error {
+		markers := pendingMarkers
+		pendingMarkers = nil
+		if err := commitPending(); err != nil {
+			return err
+		}
+		return queueMarkers(ctx, p.readyCh, markers)
+	}
+	commitPending = func() error {
 		if len(pending) == 0 {
 			return nil
 		}
@@ -685,9 +707,9 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		inSnapshot := p.snapshotState == string(snapshot.StateInProgress)
 		guard := p.bootstrapGuard
 		resumed := p.snapshotResumed
-		snapState := p.snapshotState
-		snapPending := p.snapshotPending
+		snapState, snapPending := p.snapshotState, p.snapshotPending
 		p.snapshotMu.Unlock()
+		snapState, snapPending = flushSnapshotProgress(snapState, snapPending, pending, merged)
 
 		defer func() {
 			merged.Release()
@@ -798,29 +820,15 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// stored snapshot batch minus the keys live events touched),
 			// adopting the marker's position.
 			if ing.Win != nil && ing.Win.Closes {
-				cb, err := closeWindow(p, ing)
+				cb, err := closesBatch(p, ing, deliverEmpty)
 				if err != nil {
 					return err
 				}
-				// A marker with a seq is a cycle of the coordinator's send
-				// order: the window's rows go out as that cycle, so they
-				// commit after every live cycle released ahead of the
-				// marker (#416). A window that emits no rows still owes
-				// the cycle its delivery.
-				if ing.Seq != 0 {
-					if cb != nil {
-						cb.Seq, cb.Staged = ing.Seq, ing.Staged
-					} else {
-						eb, err := markerBatch(p, ing)
-						if err != nil {
-							return err
-						}
-						err = deliverEmpty(eb)
-						eb.Release()
-						if err != nil {
-							return err
-						}
-					}
+				if cb == nil {
+					// No rows to commit: the marker is done now.
+					w.markerCommitted(p.target, ing.MarkerID)
+				} else if ing.MarkerID != 0 {
+					pendingMarkers = append(pendingMarkers, ing.MarkerID)
 				}
 				if cb != nil {
 					if err := addPending(cb, int(cb.Record.NumRows())); err != nil {
@@ -917,6 +925,37 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	}
 }
 
+// carrySnapshotPending gives a window's batch the snapshot chunks its Closes
+// marker names as still to do, with state in_progress: they commit with the
+// window's rows, so a restarted coordinator resumes there (#461).
+func carrySnapshotPending(b *dataplane.Batch, ing Ingest) {
+	if b != nil && ing.SnapshotPending != nil {
+		b.SnapshotState, b.SnapshotPending = string(snapshot.StateInProgress), ing.SnapshotPending
+	}
+}
+
+// flushSnapshotProgress is the snapshot state a flush commits: the progress
+// its windows' Closes markers carried, when they did — the last window's,
+// whose rows commit with every earlier one (#461) — else the pipeline's own.
+func flushSnapshotProgress(state string, pending []uint32, batches []*dataplane.Batch, merged *dataplane.Batch) (string, []uint32) {
+	if markerState, markerPending := batchSnapshotProgress(batches); markerState != "" {
+		state, pending = markerState, markerPending
+		merged.SnapshotState, merged.SnapshotPending = state, pending
+	}
+	return state, pending
+}
+
+// batchSnapshotProgress returns the snapshot state and pending chunks the last
+// of batches carrying them names, or none.
+func batchSnapshotProgress(batches []*dataplane.Batch) (string, []uint32) {
+	for i := len(batches) - 1; i >= 0; i-- {
+		if batches[i].SnapshotState != "" {
+			return batches[i].SnapshotState, batches[i].SnapshotPending
+		}
+	}
+	return "", nil
+}
+
 // collapseAndSend collapses one batch columnar and sends the merged single
 // batch to the committer.
 func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, rows int, pos string, ready func(*dataplane.Batch, int, int, int) error) (upCount, delCount int, err error) {
@@ -924,6 +963,10 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	snapState := p.snapshotState
 	snapPending := p.snapshotPending
 	p.snapshotMu.Unlock()
+	if b.SnapshotState != "" {
+		// A window's marker progress (flushSnapshotProgress) wins (#461).
+		snapState, snapPending = b.SnapshotState, b.SnapshotPending
+	}
 	upserts, deletes, cerr := dpint.Collapse(ctx, nil, b, p.knownSchema.PrimaryKey)
 	if cerr != nil {
 		return 0, 0, fmt.Errorf("worker: table %s: collapse: %w", p.target, cerr)
@@ -965,27 +1008,28 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 }
 
 // closeWindow returns the stored chunk batch minus the keys live InWindow
-// events touched, with every row's __pos adopted to the marker position. The
-// caller owns the returned batch (nil when the window is empty or fully
-// touched) and buffers it through the cycle-aware path.
-func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
+// events touched, with every row's __pos adopted to the marker position, and
+// whether this worker held the window at all. The caller owns the returned
+// batch (nil when the window is unknown, empty or fully touched) and buffers
+// it through the cycle-aware path.
+func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, bool, error) {
 	p.winMu.Lock()
 	win := p.windows[ing.Win.ChunkID]
 	if win == nil {
 		p.winMu.Unlock()
-		return nil, nil
+		return nil, false, nil
 	}
 	delete(p.windows, ing.Win.ChunkID)
 	p.winMu.Unlock()
 
 	if win.batch.Record == nil || win.batch.Record.NumRows() == 0 {
 		win.batch.Release()
-		return nil, nil
+		return nil, true, nil
 	}
 	reader, err := transport.NewBatchReader(win.batch.Record, p.knownSchema.PrimaryKey)
 	if err != nil {
 		win.batch.Release()
-		return nil, fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
+		return nil, true, fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
 	}
 	// Keep every row whose key was not touched by a live InWindow event.
 	var keepIdx []int32
@@ -997,19 +1041,24 @@ func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
 	}
 	if len(keepIdx) == 0 {
 		win.batch.Release()
-		return nil, nil
+		return nil, true, nil
 	}
 	sel, err := selectRows(win.batch, keepIdx, "", dataplane.AppendMode, "", nil)
 	win.batch.Release() // the window is consumed; selectRows retained its columns
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
-	out, err := adoptWindowPos(sel, ing.Position)
+	// The window's rows carry no position: the marker's is the reader's,
+	// past stream batches of the table still to come, and committed as the
+	// table's position it would cover them (#468). Only the stream advances
+	// a table's position.
+	out, err := adoptWindowPos(sel, "")
 	sel.Release()
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
-	return out, nil
+	carrySnapshotPending(out, ing)
+	return out, true, nil
 }
 
 // adoptWindowPos rebuilds a batch with __pos replaced by a constant — the
@@ -1277,7 +1326,14 @@ func lastRowPos(b *dataplane.Batch) string {
 	if err != nil {
 		return ""
 	}
-	return reader.Position(reader.NumRows() - 1)
+	// A snapshot window's rows carry no position (#468): the batch's is its
+	// last positioned row's.
+	for i := reader.NumRows() - 1; i >= 0; i-- {
+		if pos := reader.Position(i); pos != "" {
+			return pos
+		}
+	}
+	return ""
 }
 
 // concatBatches concatenates the row lists of the given batches, in order,

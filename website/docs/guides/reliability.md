@@ -27,18 +27,52 @@ beyond "start it again".
 ## Supervision: the coordinator heals workers
 
 The coordinator supervises its workers, not the other way around. A worker
-that stops acking is **reset**, not silently dropped:
+that dies or stops acking is **recovered**, not dropped, and the job keeps
+running:
 
-- `--ack-timeout` (`30s`) — a worker silent for this long is reset: its
-  partition is re-routed and it must reconnect and re-sync from the last
-  committed position.
-- `--max-resets` (`5`) within `--reset-window` (`15m`) — after this many
-  resets the coordinator **terminates** the job rather than loop forever.
+- A worker that is **lost** — its Pod killed or OOM-killed, its stream cut —
+  is awaited. The StatefulSet brings the Pod back under the same name; it
+  reconnects, and the coordinator redelivers what it owed: every batch it
+  was sent but had not acked, then its queue. The worker skips what its
+  committed position already covers, so nothing is applied twice on an
+  upsert table.
+- A worker that stops acking for `--ack-timeout` (`30s`) while it owes work
+  is **reset** and recovered the same way. A worker whose uploads keep
+  flowing is busy on slow storage, not stalled, and is left alone.
+- A lost worker in the middle of a snapshot takes its chunk windows with it.
+  Once it is back, its partition redoes the chunks whose rows it had not
+  committed; the other partitions and tables go on.
+- A restarted **coordinator** resumes a table's snapshot from its recorded
+  progress (`cdc.snapshot.pending`), not from its first chunk. Its workers
+  retry every few seconds (at most 5s apart) and resolve its name on every
+  attempt, so they find it again within seconds of its return, well inside
+  the time it waits for them. At boot it waits until each worker has
+  connected once; a worker lost again after that is recovered like any
+  other lost worker, not awaited by the boot.
 
-Tune them together. A long `--ack-timeout` tolerates slow commits but
-delays recovery; a small `--max-resets` fails fast but can kill a job over
-a transient network blip. The defaults assume a healthy catalog and a
-stable network.
+The job ends only for what does not heal by itself:
+
+- an error the worker reports itself (schema drift, a failed commit);
+- `--max-consecutive-crashes` (`3`): a crash loop. The same worker crashes
+  that many times in a row without delivering what it owed when it came
+  back — a batch that OOM-kills it every time. The error names the worker,
+  its committed position, and the Pod's last termination reason;
+- `--worker-delivery-timeout` (`5m`): a worker that owes work and delivers
+  none of it for that long, connected or not — a Pod that cannot be
+  scheduled, a network partition that never heals, a table's only worker
+  killed again every time it comes back. It holds during the snapshot too.
+  The error carries the reason Kubernetes gives;
+- a stalled worker on an **append** table with unacked batches: redelivering
+  a batch that was committed before its ack was lost would append it twice.
+
+Whether a loss was a crash is read from the worker's Pod when it comes back:
+an OOM kill, a panic or an error is a crash; a Pod replaced from outside (a
+drain, a pod-kill) is not, and neither is a worker that exited because it
+lost the coordinator, which it records as `network:` in its termination
+message. The count starts over once the worker has delivered everything it
+owed when it came back and stayed up for an ack timeout, so crashes spaced
+out by healthy stretches — hours apart on a quiet table — never add up.
+`--max-resets` and `--reset-window` are deprecated and ignored.
 
 ## Audit trail (`--eventlog`)
 
@@ -76,9 +110,16 @@ spec:
       rootPrefix: urutau     # → --eventlog s3://my-trails/urutau
 ```
 
-S3 credentials still come from the standard `AWS_*` environment (or the
-Pod's workload identity); the trail is best-effort, so a missing credential
-warns rather than failing the pipeline.
+S3 credentials come from the standard `AWS_*` environment (or the Pod's
+workload identity). For an S3-compatible store (MinIO, RustFS), set
+`eventlog.endpoint` (rendered as `--eventlog-endpoint`, path-style addressing)
+and `eventlog.secret`, a Secret with `accessKeyId` and `secretAccessKey` that
+the operator mounts into the coordinator only. The trail is best-effort, so a
+missing credential warns rather than failing the pipeline.
+
+The trail also carries every coordinator and worker log line (`kind=log`), so
+a run's logs outlive its Pods: a replaced coordinator Pod starts a new run in
+the same pipeline's trail, and nothing it logged before is lost with it.
 
 ## Checkpoints (`--checkpoint`)
 

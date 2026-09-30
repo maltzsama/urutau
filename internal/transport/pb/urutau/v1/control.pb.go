@@ -2635,9 +2635,14 @@ type WindowTag struct {
 	Snapshot bool                   `protobuf:"varint,4,opt,name=snapshot,proto3" json:"snapshot,omitempty"` // true → rows feed AddWindowRows, not the ingest path
 	// The table's snapshot is over: every window was sent ahead of this marker.
 	// The worker commits cdc.snapshot.state=complete after them (issue #428).
-	SnapshotDone  bool `protobuf:"varint,5,opt,name=snapshot_done,json=snapshotDone,proto3" json:"snapshot_done,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SnapshotDone bool `protobuf:"varint,5,opt,name=snapshot_done,json=snapshotDone,proto3" json:"snapshot_done,omitempty"`
+	// On a Closes marker: the table's snapshot chunks still to do after this
+	// one. The worker commits them as cdc.snapshot.pending, with state
+	// in_progress, atomically with the window's rows, so a restarted
+	// coordinator resumes the snapshot there (issue #461).
+	SnapshotPending []uint32 `protobuf:"varint,6,rep,packed,name=snapshot_pending,json=snapshotPending,proto3" json:"snapshot_pending,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *WindowTag) Reset() {
@@ -2703,6 +2708,13 @@ func (x *WindowTag) GetSnapshotDone() bool {
 		return x.SnapshotDone
 	}
 	return false
+}
+
+func (x *WindowTag) GetSnapshotPending() []uint32 {
+	if x != nil {
+		return x.SnapshotPending
+	}
+	return nil
 }
 
 var File_urutau_v1_control_proto protoreflect.FileDescriptor
@@ -2923,13 +2935,14 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\bbatch_id\x18\x04 \x01(\x04R\abatchId\x12\x14\n" +
 	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\x12,\n" +
 	"\x06window\x18\x06 \x01(\v2\x14.urutau.v1.WindowTagR\x06window\x12\x16\n" +
-	"\x06staged\x18\a \x01(\bR\x06staged\"\x9c\x01\n" +
+	"\x06staged\x18\a \x01(\bR\x06staged\"\xc7\x01\n" +
 	"\tWindowTag\x12\x1b\n" +
 	"\tin_window\x18\x01 \x01(\bR\binWindow\x12\x16\n" +
 	"\x06closes\x18\x02 \x01(\bR\x06closes\x12\x19\n" +
 	"\bchunk_id\x18\x03 \x01(\rR\achunkId\x12\x1a\n" +
 	"\bsnapshot\x18\x04 \x01(\bR\bsnapshot\x12#\n" +
-	"\rsnapshot_done\x18\x05 \x01(\bR\fsnapshotDone*\x81\x01\n" +
+	"\rsnapshot_done\x18\x05 \x01(\bR\fsnapshotDone\x12)\n" +
+	"\x10snapshot_pending\x18\x06 \x03(\rR\x0fsnapshotPending*\x81\x01\n" +
 	"\vWorkerPhase\x12\x1c\n" +
 	"\x18WORKER_PHASE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15WORKER_PHASE_STARTING\x10\x01\x12\x1d\n" +

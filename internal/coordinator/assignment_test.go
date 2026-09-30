@@ -392,3 +392,21 @@ func TestAssignmentCarriesOnDelete(t *testing.T) {
 		t.Fatalf("assignment on_delete = %q, want skip", got)
 	}
 }
+
+// Under chaos a worker is killed seconds after it connects. Requiring every
+// worker attached at the same instant then never held within the wait, and
+// the coordinator restarted in a loop (chaos-1M-521691a: pr_accounts stuck
+// for 15m). A worker that attached once and was lost again is recovered like
+// any lost worker; the boot wait only needs each one to have come up.
+func TestWaitWorkersAcceptsAWorkerLostAfterItAttached(t *testing.T) {
+	c := &Coordinator{
+		workers: map[string]*workerState{
+			"a": {name: "a", hadSession: true},
+			"b": {name: "b", attached: true, hadSession: true},
+		},
+		ready: make(chan struct{}, 8),
+	}
+	if err := c.waitWorkers(context.Background(), 200*time.Millisecond); err != nil {
+		t.Fatalf("waitWorkers = %v, want nil: a lost worker that attached once is recovered, not awaited at boot", err)
+	}
+}

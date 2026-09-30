@@ -125,13 +125,17 @@ is the problem.
 
 **Symptom** — a steady stream of `coordinator: reset worker` log lines.
 
-**Cause** — a worker is not acking within `--ack-timeout`, so the
-coordinator re-routes its partition. A few resets are normal (a worker
-restart); a steady stream means the worker is slow or dying — usually the
-sink, not the network.
+**Cause** — a worker is not acking within `--ack-timeout` while it owes
+work, so the coordinator resets it and redelivers what it owed. A few resets
+are normal (a worker restart); a steady stream means the worker is slow or
+dying — usually the sink, not the network.
 
-**Fix** — check the sink. After `--max-resets` within `--reset-window` the
-job terminates by design; tune those in
+**Fix** — check the sink. The job ends by design when the same worker
+crashes `--max-consecutive-crashes` times in a row without delivering what
+it owed, or delivers nothing of the work it owes for
+`--worker-delivery-timeout`; the error names the worker and the Pod's last
+termination reason (for example `OOMKilled`).
+Tune those in
 [Reliability](reliability.md#supervision-the-coordinator-heals-workers).
 
 ## Data

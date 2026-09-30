@@ -38,7 +38,7 @@ type logCollector struct {
 	dir, ns, pipeline string
 
 	mu      sync.Mutex
-	started map[string]bool // "pod/container/restartCount"
+	started map[string]bool // "podUID/container/restartCount"
 
 	stopCh   chan struct{}
 	cancel   context.CancelFunc
@@ -76,42 +76,73 @@ func (l *logCollector) start() error {
 // every container of every Pod, one follower per restart.
 func (l *logCollector) poll(ctx context.Context) {
 	out, err := kubectlCmd("", "-n", l.ns, "get", "pods", "-l", "urutau.io/pipeline="+l.pipeline, "-o",
-		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.name}{"="}{.restartCount}{","}{end}{"\n"}{end}`)
+		`jsonpath={range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.status.phase}{"\t"}{range .status.containerStatuses[*]}{.name}{"="}{.restartCount}{","}{end}{"\n"}{end}`)
 	if err != nil {
 		return
 	}
 	for _, line := range strings.Split(out, "\n") {
-		f := strings.Split(line, "\t")
-		if len(f) != 3 || f[1] != "Running" {
-			continue
-		}
-		pod := f[0]
-		for _, cs := range strings.Split(strings.TrimSuffix(f[2], ","), ",") {
-			container, restarts, ok := strings.Cut(cs, "=")
-			if !ok || container == "" {
-				continue
-			}
-			l.follow(ctx, pod, container, restarts)
+		runs, _ := parsePodLine(line)
+		for _, r := range runs {
+			l.follow(ctx, r)
 		}
 	}
+}
+
+// containerRun is one run of one container: a Pod (by name and UID, since a
+// StatefulSet Pod replaced under the same name starts over at restart 0),
+// a container, and its restart count.
+type containerRun struct {
+	pod, uid, container, restarts string
+}
+
+func (r containerRun) key() string {
+	return r.uid + "/" + r.container + "/" + r.restarts
+}
+
+// fileName carries the UID's head so a replaced Pod's runs never overwrite
+// the previous Pod's.
+func (r containerRun) fileName() string {
+	uid := r.uid
+	if len(uid) > 8 {
+		uid = uid[:8]
+	}
+	return r.pod + "-" + uid + "-" + r.container + "-r" + r.restarts + ".log"
+}
+
+// parsePodLine reads one "name<TAB>uid<TAB>phase<TAB>c=n,c=n," line; a Pod
+// that is not Running has nothing to follow.
+func parsePodLine(line string) ([]containerRun, bool) {
+	f := strings.Split(line, "\t")
+	if len(f) != 4 || f[2] != "Running" {
+		return nil, false
+	}
+	var runs []containerRun
+	for _, cs := range strings.Split(strings.TrimSuffix(f[3], ","), ",") {
+		container, restarts, ok := strings.Cut(cs, "=")
+		if !ok || container == "" {
+			continue
+		}
+		runs = append(runs, containerRun{pod: f[0], uid: f[1], container: container, restarts: restarts})
+	}
+	return runs, true
 }
 
 // follow starts one follower for a container's current run, unless one is
 // already running. The run is marked followed only once the file and the
 // process are up, so a failed start is retried on the next poll.
-func (l *logCollector) follow(ctx context.Context, pod, container, restarts string) {
-	key := pod + "/" + container + "/" + restarts
+func (l *logCollector) follow(ctx context.Context, r containerRun) {
+	key := r.key()
 	l.mu.Lock()
 	seen := l.started[key]
 	l.mu.Unlock()
 	if seen {
 		return
 	}
-	file, err := os.Create(filepath.Join(l.dir, pod+"-"+container+"-r"+restarts+".log"))
+	file, err := os.Create(filepath.Join(l.dir, r.fileName()))
 	if err != nil {
 		return
 	}
-	cmd := exec.CommandContext(ctx, "kubectl", "-n", l.ns, "logs", "-f", pod, "-c", container)
+	cmd := exec.CommandContext(ctx, "kubectl", "-n", l.ns, "logs", "-f", r.pod, "-c", r.container)
 	cmd.Stdout, cmd.Stderr = file, file
 	if err := cmd.Start(); err != nil {
 		_ = file.Close()

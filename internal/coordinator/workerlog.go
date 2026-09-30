@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"time"
@@ -52,4 +53,14 @@ func (c *Coordinator) onWorkerLog(worker string, msg *pb.WorkerLog) {
 		Message: msg.Msg,
 		Attrs:   attrs,
 	})
+	// A maintenance worker's Pod is deleted after its one pass, taking its
+	// own log with it: its lines also go to the coordinator's log, which
+	// outlives the pass (issue #457). A data worker keeps its own Pod log.
+	if w == nil && c.log != nil {
+		args := make([]any, 0, 2*len(attrs))
+		for k, v := range attrs {
+			args = append(args, k, v)
+		}
+		c.log.Log(context.Background(), level, msg.Msg, args...)
+	}
 }

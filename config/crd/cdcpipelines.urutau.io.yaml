@@ -24,6 +24,9 @@ spec:
               type: object
               properties:
                 image: {type: string}
+                logLevel:
+                  type: string
+                  enum: [debug, info, warn, error]
                 definition:
                   type: object
                   properties:
@@ -52,6 +55,8 @@ spec:
                         ackTimeout: {type: string}
                         maxResets: {type: integer}
                         window: {type: string}
+                        maxConsecutiveCrashes: {type: integer}
+                        workerDeliveryTimeout: {type: string}
                     statusInterval: {type: string}
                     metricsAddr: {type: string}
                     cpu: {type: string}
@@ -62,6 +67,8 @@ spec:
                       properties:
                         bucket: {type: string}
                         rootPrefix: {type: string}
+                        endpoint: {type: string}
+                        secret: {type: string}
                 worker:
                   type: object
                   properties:

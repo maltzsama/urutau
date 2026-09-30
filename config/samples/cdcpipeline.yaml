@@ -41,8 +41,8 @@ spec:
       maxParallelChunks: 4
     supervision:
       ackTimeout: 30s
-      maxResets: 5
-      window: 15m
+      maxConsecutiveCrashes: 3
+      workerDeliveryTimeout: 5m
 
   # The resource default for every worker; a table's own workers.cpu/memory
   # overrides it. cpu/memory are the request, cpu+cpu_overhead /

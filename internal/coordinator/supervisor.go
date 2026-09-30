@@ -14,10 +14,16 @@ import (
 // worker suicides rather than reconfigure); resets within ResetWindow beyond
 // MaxResets are terminal.
 type SupervisorConfig struct {
-	AckTimeout  time.Duration
+	AckTimeout time.Duration
+	// MaxResets and ResetWindow are no longer read: a crash loop is a worker
+	// lost MaxConsecutiveCrashes times in a row (recovery.go), not a
+	// count of resets in a window. Kept for configuration compatibility.
 	MaxResets   int
 	ResetWindow time.Duration
-	Poll        time.Duration
+	// DeliveryTimeout ends the run once a lost worker has not reconnected
+	// for this long (default 5m).
+	DeliveryTimeout time.Duration
+	Poll            time.Duration
 }
 
 // supervisor watches the workers' ack health and owns the reset window.
@@ -31,15 +37,22 @@ type supervisor struct {
 	// progress is each worker's recent network output reports: a worker
 	// whose output grows is busy on slow storage, not stalled (#422).
 	progress map[string][]progressSample
+	// health is each worker's losses and crashes (recovery.go).
+	health map[string]*workerHealth
+	// lastDelivered is when each worker last delivered: an ack, or owing
+	// nothing. Unlike lastAck, a reconnect does not move it.
+	lastDelivered map[string]time.Time
 }
 
 func newSupervisor(c *Coordinator) *supervisor {
 	return &supervisor{
-		c:        c,
-		lastAck:  map[string]time.Time{},
-		resets:   map[string][]time.Time{},
-		pending:  map[string]bool{},
-		progress: map[string][]progressSample{},
+		c:             c,
+		lastAck:       map[string]time.Time{},
+		resets:        map[string][]time.Time{},
+		pending:       map[string]bool{},
+		progress:      map[string][]progressSample{},
+		health:        map[string]*workerHealth{},
+		lastDelivered: map[string]time.Time{},
 	}
 }
 
@@ -54,13 +67,17 @@ func (s *supervisor) noteRegistered(worker string, at time.Time) {
 	if _, ok := s.lastAck[worker]; !ok {
 		s.lastAck[worker] = at
 	}
+	if _, ok := s.lastDelivered[worker]; !ok {
+		s.lastDelivered[worker] = at
+	}
 	s.mu.Unlock()
 }
 
-// noteAck records a worker's ack time.
+// noteAck records a worker's ack time: it delivered.
 func (s *supervisor) noteAck(worker string, at time.Time) {
 	s.mu.Lock()
 	s.lastAck[worker] = at
+	s.lastDelivered[worker] = at
 	s.mu.Unlock()
 }
 
@@ -82,6 +99,8 @@ func (s *supervisor) forget(worker string) {
 	delete(s.pending, worker)
 	delete(s.resets, worker)
 	delete(s.progress, worker)
+	delete(s.health, worker)
+	delete(s.lastDelivered, worker)
 	s.mu.Unlock()
 }
 
@@ -123,27 +142,23 @@ func (s *supervisor) run(ctx context.Context, cfg SupervisorConfig, terminate ch
 	}
 }
 
-// tick resets every streaming worker past its ack timeout, and terminates
-// the job once the sliding window of resets is exhausted.
+// tick resets a worker that is attached, owes work and has stopped acking,
+// and awaits one that is lost or reset until it reconnects (issue #461). It
+// ends the run only for what does not heal by itself: a worker gone longer
+// than the delivery timeout, or a stalled append worker whose unacked batches
+// a redelivery would append twice. A crash loop — the same worker lost again
+// and again without delivering what it owed — is ended by workerBack
+// (recovery.go).
 func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	ack := cfg.AckTimeout
 	if ack <= 0 {
 		ack = 30 * time.Second
 	}
-	maxResets := cfg.MaxResets
-	if maxResets <= 0 {
-		maxResets = 5
-	}
-	window := cfg.ResetWindow
-	if window <= 0 {
-		window = 15 * time.Minute
+	delivery := cfg.DeliveryTimeout
+	if delivery <= 0 {
+		delivery = defaultWorkerDeliveryTimeout
 	}
 
-	type staleWorker struct {
-		name          string
-		detachedOwing bool
-	}
-	var stale []staleWorker
 	// Lock order: c.mu first, then s.mu. Session takes c.mu and calls
 	// noteAttach (s.mu) afterwards, so tick must never hold s.mu while
 	// taking c.mu — the two orders would deadlock (audit #3).
@@ -166,59 +181,79 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		probes[i].owes = probes[i].owes || s.c.inFlight(probes[i].name) > 0
 	}
 
-	s.mu.Lock()
+	type minHeld struct {
+		name string
+		id   uint64
+	}
+	held := make([]minHeld, 0, len(probes))
 	for _, p := range probes {
-		at, ok := s.lastAck[p.name]
-		// A reset worker that never reattached keeps the job in crashloop;
-		// an attached worker that never acked is just as stale.
-		// An ack timeout means a worker owes work and is not delivering it.
+		var id uint64
+		if idx := s.c.indexOf(p.name); idx != nil {
+			id = idx.minHeldID()
+		}
+		held = append(held, minHeld{p.name, id})
+	}
+
+	// Mid-snapshot only the delivery rule applies: a reset would drop the
+	// worker's open windows, which the snapshot redoes on a loss instead.
+	snapshotting := s.c.snapshotActive.Load()
+	var stalled []string
+	var gone []string
+	s.mu.Lock()
+	for i, p := range probes {
+		if !p.owes {
+			s.lastDelivered[p.name] = now
+		}
+		if p.attached && !s.pending[p.name] {
+			s.noteDeliveringLocked(p.name, held[i].id, now, ack)
+		}
+		// A worker that owes work and has delivered none of it for the
+		// delivery timeout ends the run, attached or not: a partition that
+		// lets it reconnect for a moment every few seconds, or a Pod that
+		// never starts, is not a worker making progress. A worker whose
+		// uploads keep flowing is delivering to storage (#422).
+		if at, ok := s.lastDelivered[p.name]; ok && p.owes && now.Sub(at) > delivery && !s.busyLocked(p.name, now, at, delivery) {
+			gone = append(gone, p.name)
+			continue
+		}
+		if s.pending[p.name] || (!p.attached && p.hadSession) || snapshotting {
+			continue // lost or reset and awaited, or mid-snapshot
+		}
 		// An ATTACHED worker that owes nothing is merely idle — a quiet
 		// table, or one that just went through a re-slice — and resetting it
-		// destroys its open staged cycles for no reason (issue #312).
-		// A worker that was attached and is now detached with work owed has
-		// lost its Pod (a re-slice scale-in deletes the StatefulSet Pods, and
-		// no reset or pending flag marks that). It can never drain its queue,
-		// so a reset is useless: flag it to terminate for a clean replay
-		// (issue #372).
-		detachedOwing := !p.attached && p.hadSession && p.owes && ok && now.Sub(at) > ack
-		stalled := p.attached && p.owes && (!ok || now.Sub(at) > ack) && !s.busyLocked(p.name, now, at, ack)
-		if s.pending[p.name] || stalled || detachedOwing {
-			stale = append(stale, staleWorker{name: p.name, detachedOwing: detachedOwing})
+		// is pointless (issue #312).
+		at, ok := s.lastAck[p.name]
+		if p.attached && p.owes && (!ok || now.Sub(at) > ack) && !s.busyLocked(p.name, now, at, ack) {
+			stalled = append(stalled, p.name)
 		}
 	}
 	s.mu.Unlock()
 
-	for _, sw := range stale {
-		w, ok := s.c.workers[sw.name]
+	for _, name := range gone {
+		return fmt.Errorf("coordinator: worker %s has delivered nothing for over %s while owing work%s",
+			name, delivery, s.c.workerTermination(name))
+	}
+	for _, name := range stalled {
+		w, ok := s.c.workers[name]
 		if !ok {
 			continue
 		}
-		// A detached worker that owes work can never drain it — no session
-		// will ever deliver its queue — so a reset (which assumes a reconnect
-		// and redelivery) is useless: terminate for a clean replay whether the
-		// work is queued or in flight (issue #372).
-		if sw.detachedOwing {
-			return fmt.Errorf("coordinator: worker %s is detached owing work — terminating for a clean replay", sw.name)
-		}
-		// CD-2: a reset cancels the session but is NOT a failure — the
-		// worker reconnects and drains the queue. The in-flight (unacked)
-		// batches are redelivered on reconnect (issue #235), so a reset no
-		// longer loses them — but it replays them, duplicating the work (and
-		// plain appends). With batches owed, terminate instead for a clean
-		// replay from the committed position. A reset is safe only when the
-		// worker owes nothing.
-		if n := s.c.inFlight(sw.name); n > 0 {
-			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) — a reset would replay them; terminating for a clean replay",
-				sw.name, n)
-		}
-		if n := s.recordReset(sw.name, now, window); n >= maxResets {
-			return fmt.Errorf("coordinator: crashloop: worker %s: %d resets in %s",
-				sw.name, maxResets, window)
+		// A reset redelivers the unacked batches on reconnect (issue #235):
+		// an upsert worker skips what it committed and re-applies the rest
+		// idempotently, but on an append table a batch committed before its
+		// ack was lost would be appended twice.
+		if n := s.c.inFlight(name); n > 0 && s.c.workerAppends(name) {
+			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) on an append table — a reset would append them twice",
+				name, n)
 		}
 		s.c.resetWorker(w)
 	}
 	return nil
 }
+
+// defaultWorkerDeliveryTimeout is how long a lost worker may take to
+// reconnect before the run ends.
+const defaultWorkerDeliveryTimeout = 5 * time.Minute
 
 // indexOf returns a worker's position index under indexMu, or nil.
 func (c *Coordinator) indexOf(worker string) *positionIndex {

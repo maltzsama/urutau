@@ -66,7 +66,10 @@ type coordinatorFlags struct {
 	ackTimeout      time.Duration
 	maxResets       int
 	resetWindow     time.Duration
+	maxCrashes      int
+	deliveryTimeout time.Duration
 	eventlogURI     string
+	eventlogEP      string
 	checkpointURI   string
 	checkpointSec   int
 	allowInsecure   bool
@@ -140,10 +143,15 @@ func runCmd() *cobra.Command {
 	fl.Int64Var(&f.flowPerWorkerMi, "flow-per-worker-min-mi", 16, "per-worker minimum share of the flow budget (MiB)")
 	fl.DurationVar(&f.waitWorker, "wait-worker", 2*time.Minute, "how long to wait for every expected worker session")
 	fl.DurationVar(&f.ackTimeout, "ack-timeout", 30*time.Second, "worker considered stale without an ack for this long")
-	fl.IntVar(&f.maxResets, "max-resets", 5, "resets within the window before the job terminates")
-	fl.DurationVar(&f.resetWindow, "reset-window", 15*time.Minute, "sliding window for the reset count")
+	fl.IntVar(&f.maxResets, "max-resets", 5, "deprecated, ignored: see --max-consecutive-crashes")
+	fl.DurationVar(&f.resetWindow, "reset-window", 15*time.Minute, "deprecated, ignored: see --max-consecutive-crashes")
+	_ = fl.MarkDeprecated("max-resets", "a worker is ended by --max-consecutive-crashes instead")
+	_ = fl.MarkDeprecated("reset-window", "a worker is ended by --max-consecutive-crashes instead")
+	fl.IntVar(&f.maxCrashes, "max-consecutive-crashes", 3, "a worker crashing this many times in a row without delivering what it owed ends the job")
+	fl.DurationVar(&f.deliveryTimeout, "worker-delivery-timeout", 5*time.Minute, "a worker owing work that delivers nothing for this long ends the job")
 	// audit / recovery
 	fl.StringVar(&f.eventlogURI, "eventlog", "", "s3://<bucket>/<prefix> audit trail store (optional)")
+	fl.StringVar(&f.eventlogEP, "eventlog-endpoint", "", "S3 API endpoint for the audit trail store (MinIO/RustFS, path-style); empty uses AWS")
 	fl.StringVar(&f.checkpointURI, "checkpoint", "", "s3://<bucket>/<prefix> async position manifests (optional)")
 	fl.IntVar(&f.checkpointSec, "checkpoint-interval", 10, "checkpoint write interval (seconds)")
 	// process
@@ -186,26 +194,28 @@ func (f *coordinatorFlags) validate() error {
 
 func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger, logBuffer *logging.Buffer) coordinator.Config {
 	return coordinator.Config{
-		Spec:              s,
-		ListenAddr:        f.listen,
-		ServerID:          f.serverID,
-		Heartbeat:         5 * time.Second, // control-plane liveness cadence (protocol constant)
-		ChunkSize:         f.chunkSize,
-		MaxParallelChunks: f.maxParallel,
-		WindowTimeout:     f.windowTimeout,
-		CaughtUpPoll:      time.Second, // caught-up proof poll (protocol constant)
-		WaitWorker:        f.waitWorker,
-		FlowTotalBytes:    f.flowTotalBytes,
-		FlowPerWorkerMin:  f.flowPerWorkerMi << 20,
-		Eventlog:          eventlogConfig(f.eventlogURI),
-		Checkpoint:        checkpointConfig(f.checkpointURI, f.checkpointSec),
-		AckTimeout:        f.ackTimeout,
-		MaxResets:         f.maxResets,
-		ResetWindow:       f.resetWindow,
-		MetricsAddr:       f.metricsAddr,
-		LogBuffer:         logBuffer,
-		TLS:               grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA, AllowInsecure: f.allowInsecure},
-		Logger:            logger,
+		Spec:                  s,
+		ListenAddr:            f.listen,
+		ServerID:              f.serverID,
+		Heartbeat:             5 * time.Second, // control-plane liveness cadence (protocol constant)
+		ChunkSize:             f.chunkSize,
+		MaxParallelChunks:     f.maxParallel,
+		WindowTimeout:         f.windowTimeout,
+		CaughtUpPoll:          time.Second, // caught-up proof poll (protocol constant)
+		WaitWorker:            f.waitWorker,
+		FlowTotalBytes:        f.flowTotalBytes,
+		FlowPerWorkerMin:      f.flowPerWorkerMi << 20,
+		Eventlog:              eventlogConfig(f.eventlogURI, f.eventlogEP),
+		Checkpoint:            checkpointConfig(f.checkpointURI, f.checkpointSec),
+		AckTimeout:            f.ackTimeout,
+		MaxResets:             f.maxResets,
+		ResetWindow:           f.resetWindow,
+		MaxConsecutiveCrashes: f.maxCrashes,
+		WorkerDeliveryTimeout: f.deliveryTimeout,
+		MetricsAddr:           f.metricsAddr,
+		LogBuffer:             logBuffer,
+		TLS:                   grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA, AllowInsecure: f.allowInsecure},
+		Logger:                logger,
 	}
 }
 
@@ -238,9 +248,9 @@ func checkpointConfig(uri string, intervalSec int) *coordinator.CheckpointConfig
 	}
 }
 
-func eventlogConfig(uri string) *eventlog.Config {
+func eventlogConfig(uri, endpoint string) *eventlog.Config {
 	if uri == "" {
 		return nil
 	}
-	return &eventlog.Config{URI: uri}
+	return &eventlog.Config{URI: uri, Endpoint: endpoint}
 }
