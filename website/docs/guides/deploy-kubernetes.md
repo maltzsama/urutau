@@ -166,6 +166,7 @@ metadata:
   namespace: default
 spec:
   image: urutau:dev                 # coordinator + every worker it provisions
+  logLevel: info                    # --log-level of the coordinator and every worker (debug|info|warn|error)
   secrets:
     source: shop-mysql-creds
     catalog: polaris-creds
@@ -178,8 +179,8 @@ spec:
       maxParallelChunks: 4
     supervision:
       ackTimeout: 30s
-      maxResets: 5
-      window: 15m
+      maxConsecutiveCrashes: 3
+      workerDeliveryTimeout: 5m
   worker:
     cpu: "500m"
     cpu_overhead: "100m"

@@ -160,10 +160,12 @@ func TestDashStateTablesPosition(t *testing.T) {
 	}
 }
 
-// #205: an operator restart must refuse a worker that owes in-flight batches,
-// exactly like the supervisor's own reset does — otherwise the click drops
-// delivered-but-unacked data silently.
-func TestRestartWorkerRefusesInFlight(t *testing.T) {
+// #205, revised by #461: an operator restart follows the supervisor's own
+// reset rule. A worker with in-flight batches on an upsert table is restarted
+// (they are redelivered and re-applied idempotently); on an append table it is
+// refused, since a redelivered batch that was committed would be appended
+// twice.
+func TestRestartWorkerRefusesInFlightOnAnAppendTable(t *testing.T) {
 	c, w := coordHarness()
 	ds := dashState{c}
 
@@ -175,13 +177,21 @@ func TestRestartWorkerRefusesInFlight(t *testing.T) {
 		t.Fatalf("idle restart must bump the epoch, got %d", w.epoch)
 	}
 
-	// With an in-flight batch: refused, and the epoch is NOT bumped.
+	// In-flight on an upsert table: allowed.
 	c.index[w.name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
-	err := ds.RestartWorker(w.name)
-	if err == nil {
-		t.Fatal("RestartWorker with in-flight batches must be refused")
+	if err := ds.RestartWorker(w.name); err != nil {
+		t.Fatalf("RestartWorker(in-flight, upsert) = %v, want nil", err)
 	}
-	if w.epoch != 1 {
+	if w.epoch != 2 {
+		t.Fatalf("the restart must bump the epoch, got %d", w.epoch)
+	}
+
+	// In-flight on an append table: refused, and the epoch is NOT bumped.
+	c.cfg.Spec.Tables = []spec.Table{{Source: "shop.orders", Target: "raw.orders", WriteMode: spec.WriteModeAppend}}
+	if err := ds.RestartWorker(w.name); err == nil {
+		t.Fatal("RestartWorker with in-flight batches on an append table must be refused")
+	}
+	if w.epoch != 2 {
 		t.Fatalf("a refused restart must not bump the epoch, got %d", w.epoch)
 	}
 

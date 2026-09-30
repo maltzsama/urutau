@@ -229,11 +229,12 @@ func (s dashState) RestartWorker(name string) error {
 		return fmt.Errorf("no worker %q", name)
 	}
 	// A reset cancels the session and bumps the epoch. The in-flight batches
-	// are redelivered on reconnect (issue #235), but that replays them; the
-	// supervisor refuses the same reset, so the dashboard must too — an
-	// operator click must not force a duplicate replay (issue #205).
-	if n := c.inFlight(name); n > 0 {
-		return fmt.Errorf("coordinator: worker %s has %d in-flight batch(es) — a restart would replay them; wait for it to drain", name, n)
+	// are redelivered on reconnect (issue #235): re-applied idempotently on
+	// an upsert table, but appended twice on an append table if one was
+	// committed before its ack was lost. The supervisor refuses the same
+	// reset there, so the dashboard must too (issues #205, #461).
+	if n := c.inFlight(name); n > 0 && c.workerAppends(name) {
+		return fmt.Errorf("coordinator: worker %s has %d in-flight batch(es) on an append table — a restart would append them twice; wait for it to drain", name, n)
 	}
 	c.supervisor.recordReset(name, time.Now(), supervisionConfig(c.cfg).ResetWindow)
 	c.resetWorker(w)

@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"runtime/metrics"
@@ -44,7 +46,16 @@ func liveHeap() uint64 {
 // must hold little more than the chunk's own bytes at any point: the rows are
 // encoded in parts as they arrive, and the parts concatenated once — 2.0x at
 // peak, from 3.1x when the whole chunk was held as row maps first.
+//
+// The live heap is process-wide, so the measurement runs in a process of its
+// own: goroutines earlier tests of this package left running allocate too,
+// and under a loaded full suite they pushed the reading to 2.3x (issue #466)
+// while the read alone stays at 2.0x.
 func TestChunkReadHoldsLittleMoreThanTheChunk(t *testing.T) {
+	if os.Getenv(chunkMemChildEnv) == "" {
+		runAlone(t, "TestChunkReadHoldsLittleMoreThanTheChunk")
+		return
+	}
 	const rows, size = 4000, 6 << 10 // ~24 MiB of payload
 	defer debug.SetGCPercent(debug.SetGCPercent(5))
 
@@ -81,6 +92,22 @@ func TestChunkReadHoldsLittleMoreThanTheChunk(t *testing.T) {
 	t.Logf("chunk %d MiB, peak live heap above baseline %d MiB (%.1fx)", chunk>>20, held>>20, float64(held)/float64(chunk))
 	if held > chunk*9/4 {
 		t.Fatalf("reading a %d MiB chunk held %d MiB live (%.1fx); want at most 2.25x", chunk>>20, held>>20, float64(held)/float64(chunk))
+	}
+}
+
+// chunkMemChildEnv marks the process runAlone starts.
+const chunkMemChildEnv = "URUTAU_CHUNK_MEM_CHILD"
+
+// runAlone re-runs one test in a fresh process of this test binary, with no
+// other test's goroutines in it, and fails if it fails.
+func runAlone(t *testing.T, name string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run", "^"+name+"$", "-test.v", "-test.count=1")
+	cmd.Env = append(os.Environ(), chunkMemChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	t.Logf("isolated run:\n%s", out)
+	if err != nil {
+		t.Fatalf("%s in its own process: %v", name, err)
 	}
 }
 

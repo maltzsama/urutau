@@ -1,7 +1,6 @@
 package coordinator
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/maltzsama/urutau/core"
@@ -25,8 +24,11 @@ type stagedCycle struct {
 	// through it once the cycle commits (#459). Empty for a cycle opened
 	// without it; the commit then falls back to the deliveries' minimum.
 	batchPos string
-	state    string
-	pending  []uint32
+	// window marks a snapshot window's cycle: it commits the window's rows
+	// and snapshot progress but no position (#468).
+	window  bool
+	state   string
+	pending []uint32
 }
 
 // stagedCycles tracks open cycles keyed by (table, seq). Cycles of one table
@@ -74,40 +76,25 @@ func (s *stagedCycles) isGapped(target string) bool {
 	return s.gapped[target]
 }
 
-// debugOpen renders a table's open and done cycles in send order, with their
-// delivery positions and expected owners — a wedge diagnostic (issue #372).
-func (s *stagedCycles) debugOpen(target string) []string {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, 0, len(s.order[target]))
-	for _, seq := range s.order[target] {
-		k := cycleKey{target, seq}
-		if cy, ok := s.open[k]; ok {
-			out = append(out, fmt.Sprintf("%d:open@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
-		} else if cy, ok := s.done[k]; ok {
-			out = append(out, fmt.Sprintf("%d:done@%v owners=%v", seq, cy.positions, ownerNames(cy.owners)))
-		}
-	}
-	return out
-}
-
-func ownerNames(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for name := range m {
-		out = append(out, name)
-	}
-	return out
-}
-
 // expect records that a delivery is expected from each of owners for
 // (ref.Target, seq). Called once per binlog batch, with exactly the workers a
 // sub-batch was sent to (a partition with no rows is not sent, so its worker
 // is not expected).
 func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
 	s.expectAt(ref, seq, owners, "")
+}
+
+// expectWindow is expect for a snapshot window's cycle (sendClosesPending).
+func (s *stagedCycles) expectWindow(ref core.TableRef, seq uint64, owners []string) {
+	s.expect(ref, seq, owners)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cy := s.open[cycleKey{ref.Target, seq}]; cy != nil {
+		cy.window = true
+	}
 }
 
 // expectAt is expect for a cycle that carries every partition's share of one

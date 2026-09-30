@@ -27,6 +27,7 @@ type committed struct {
 	rows      int64
 	watermark string
 	state     string
+	pending   []uint32
 }
 
 func (c *commitLog) Close() error { return nil }
@@ -38,7 +39,7 @@ func (c *commitLog) Commit(_ context.Context, b *dataplane.Batch) error {
 	if b.Record != nil {
 		n = b.Record.NumRows()
 	}
-	c.commits = append(c.commits, committed{rows: n, watermark: string(b.Watermark), state: b.SnapshotState})
+	c.commits = append(c.commits, committed{rows: n, watermark: string(b.Watermark), state: b.SnapshotState, pending: b.SnapshotPending})
 	return nil
 }
 

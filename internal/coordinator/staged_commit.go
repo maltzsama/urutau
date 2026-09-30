@@ -87,8 +87,14 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 // table is durable through it (#459). Any other cycle commits the minimum safe
 // position over its deliveries.
 func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
+	// A snapshot window's cycle commits no position: its marker carries the
+	// reader's, past stream cycles of the table not committed yet, and a
+	// crash would then skip them as covered (#468). Only the stream advances
+	// a table's position.
 	pos := cy.batchPos
-	if pos == "" {
+	if cy.window {
+		pos = ""
+	} else if pos == "" {
 		var err error
 		if pos, err = c.minSafePositions(cy.positions); err != nil {
 			return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err)
@@ -108,7 +114,8 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	}
 	faultinject.At(faultinject.CoordinatorCycleCommittedBeforeRecord,
 		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
-	c.log.Debug("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos, "owners", len(cy.owners), "descriptors", len(cy.descriptors))
+	c.log.Debug("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos,
+		"owners", len(cy.owners), "descriptors", len(cy.descriptors), "snapshot_state", cy.state, "pending", pendingHead(cy.pending))
 	// The cycle is durable: only now may source retention advance. Record the
 	// cycle's position for every owner it covered, so confirmedPosition (the
 	// min) reflects the whole cycle — the worker's per-batch ack does not
@@ -169,4 +176,16 @@ func (c *Coordinator) fail(err error) {
 	case c.terminate <- err:
 	default:
 	}
+}
+
+// pendingHead renders a snapshot's pending chunks for a log line: how many,
+// and the first, which is where a restarted coordinator would resume.
+func pendingHead(pending []uint32) string {
+	if pending == nil {
+		return ""
+	}
+	if len(pending) == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d from %d", len(pending), pending[0])
 }

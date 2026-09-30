@@ -121,16 +121,28 @@ The worker owns the snapshot chunk `SELECT`, so the coordinator sends it a
 
 ## Supervision and resets
 
-A worker that stops acking is not silently dropped. If a worker goes
-silent for `--ack-timeout` (`30s` default), the coordinator **resets** the
-assignment: the partition is re-routed, and the worker must reconnect and
-re-sync from the last committed position. This is the recovery path for a
-worker crash or a network partition.
+A worker that dies or stops acking is recovered, and the job keeps running.
+A **lost** worker (Pod killed, OOM-killed, stream cut) is awaited: its Pod
+comes back under the same name, reconnects under a new epoch, and the
+coordinator redelivers what it owed — its sent-but-unacked batches, then its
+queue. Its open staged cycles stay open until its redelivered stages
+complete them. A worker silent for `--ack-timeout` (`30s`) while it owes work
+is **reset** and recovered the same way. A reply from the lost session
+carries the old epoch and is ignored.
 
-Too many resets in a short window means something is systematically wrong
-(a bad sink, a flapping network), so the coordinator stops retrying: after
-`--max-resets` (`5`) resets within `--reset-window` (`15m`), the job
-**terminates** rather than loop forever. Both are configurable.
+During a snapshot, a lost worker's chunk windows die with it. Once it is
+back, its partition redoes the chunks whose Closes marker it had not
+committed, under fresh window ids, so a lost window's marker redelivered to
+it closes nothing it has open. A restarted coordinator resumes each table's
+snapshot from the progress its windows committed (`cdc.snapshot.pending`)
+when the partition ranges are unchanged, and starts it over otherwise.
+
+The job ends only for what does not heal by itself: an error the worker
+reports, the same worker crashing `--max-consecutive-crashes` (`3`) times
+in a row without delivering what it owed (a lost network or a replaced Pod
+is not a crash), a worker owing work that delivers none of it for
+`--worker-delivery-timeout` (`5m`), or a stalled worker with unacked batches
+on an append table. See [Reliability](reliability.md#supervision-the-coordinator-heals-workers).
 
 Resets are safe because the position lives in the **sink**, not in the
 worker: a resumed partition reads its last committed position back from
@@ -183,8 +195,7 @@ pause, never data loss.
 A prepare step that times out — the table never drains, a commit never lands
 — resumes the input and returns with the old layout intact. The scaler
 retries, and worker recovery stays the supervisor's job: a worker that
-stalls owing work is terminated for a clean replay from the committed
-position, not reset mid-flight (which would replay its batches).
+stalls owing work is reset and redelivered what it owed.
 
 Pausing one table does **not** stall the others. The pump buffers the paused
 table's batches instead of parking on them, and keeps routing every other

@@ -125,6 +125,12 @@ type Config struct {
 	AckTimeout  time.Duration
 	MaxResets   int
 	ResetWindow time.Duration
+	// MaxConsecutiveCrashes ends the run once one worker crashes that many
+	// times in a row without delivering what it owed (default 3,
+	// recovery.go). WorkerDeliveryTimeout ends it once a worker owing work
+	// has delivered none of it for that long (default 5m).
+	MaxConsecutiveCrashes int
+	WorkerDeliveryTimeout time.Duration
 
 	// ScaleDrainTimeout bounds how long a re-slice waits for a table's
 	// open staged cycles, and for a removed owner's in-flight batches, to
@@ -328,7 +334,17 @@ type Coordinator struct {
 	// chunkMarkers are each worker's queued snapshot Closes markers, to pace
 	// chunks on commits (snapshot_pace.go).
 	chunkMarkersMu sync.Mutex
-	chunkMarkers   map[string][]uint64
+	chunkMarkers   map[string][]chunkMarker
+	// lostWindows are the chunk windows each lost worker had not
+	// committed, taken at the loss (recovery.go); under chunkMarkersMu.
+	lostWindows map[string][]chunkMarker
+	// podTermination reads a worker's last container termination; nil
+	// reads it from Kubernetes (recovery.go). Set by tests.
+	podTermination func(worker string) (podTermination, bool)
+	// snapshotTodo is each snapshotting table's chunks still to do
+	// (snapshotPlan); read-only once set.
+	snapshotTodoMu sync.Mutex
+	snapshotTodo   map[string]map[uint32]bool
 
 	// confirmed tracks the latest position each WORKER durably committed
 	// (from worker Acks). The minimum across workers is reported to the
@@ -386,6 +402,9 @@ type workerState struct {
 	hadSession bool
 	epoch      uint64 // last accepted epoch (guards stale Hellos)
 	cancel     context.CancelFunc
+	// lostCh is closed when the current session is lost (recovery.go);
+	// guarded by c.mu.
+	lostCh chan struct{}
 
 	// sent holds the batches popped from the queue and delivered (or whose
 	// Send was attempted) but not yet acked, in send order. On session loss
@@ -919,6 +938,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 	snapCtx, snapCancel := context.WithCancel(ctx)
 	defer snapCancel()
 	c.snapshotActive.Store(true)
+	// Supervision from the start: mid-snapshot only its delivery rule
+	// applies (a table's only worker delivering nothing for the delivery
+	// timeout ends the run); the ack-timeout reset waits for the stream.
+	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
 	snapDone := make(chan error, 1)
 	go func() {
 		defer c.snapshotActive.Store(false)
@@ -992,10 +1015,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 		c.emitLog(eventlog.KindJobTerminated, terminalFields(terminateReason(err), err))
 		return err
 	}
-
-	// Supervision after the snapshot phase: acks only flow once the stream
-	// is live, so a long snapshot must not look like a stale worker.
-	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
 
 	// Replica reconcile after the snapshot too: the snapshot assigns chunks
 	// by the boot routing, and a re-slice mid-snapshot would move a range
@@ -1191,9 +1210,10 @@ func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, 
 // supervisionConfig maps the Config knobs to the supervisor defaults.
 func supervisionConfig(cfg Config) SupervisorConfig {
 	return SupervisorConfig{
-		AckTimeout:  cfg.AckTimeout,
-		MaxResets:   cfg.MaxResets,
-		ResetWindow: cfg.ResetWindow,
+		AckTimeout:      cfg.AckTimeout,
+		MaxResets:       cfg.MaxResets,
+		ResetWindow:     cfg.ResetWindow,
+		DeliveryTimeout: cfg.WorkerDeliveryTimeout,
 	}
 }
 
@@ -1289,17 +1309,21 @@ func (c *Coordinator) emit(kind string, fields map[string]any) error {
 	return nil
 }
 
-// waitWorkers blocks until every expected group has a session attached.
+// waitWorkers blocks until every expected group has had a session attached.
 // Counting ready signals would miscount a flapping worker that attaches,
 // dies, and reattaches inside the window (audit #4) — so the wait checks
-// the attached flag directly, woken by each attach and the poll.
+// each worker's own state, woken by each attach and the poll. A worker that
+// attached and was lost again counts: its loss is recovered like any other
+// (awaited, bounded by the delivery timeout). Requiring all of them attached
+// at one instant never held while workers were being killed, and the
+// coordinator restarted in a loop (chaos-1M-521691a).
 func (c *Coordinator) waitWorkers(ctx context.Context, wait time.Duration) error {
 	deadline := time.Now().Add(wait)
 	allAttached := func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		for _, w := range c.workers {
-			if !w.attached {
+			if !w.attached && !w.hadSession {
 				return false
 			}
 		}
@@ -1577,16 +1601,26 @@ func (c *Coordinator) confirmedPosition() position.Position {
 // different epoch) is ignored, so a stale reply cannot satisfy the wait
 // against a dead window.
 func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32, epoch uint64) error {
+	_, err := c.waitChunkReadyOr(ctx, table, chunkID, epoch, nil)
+	return err
+}
+
+// waitChunkReadyOr is waitChunkReady that also returns errWorkerLost when lost
+// closes: the worker's window died with its session, so no ChunkReady for it
+// will come.
+func (c *Coordinator) waitChunkReadyOr(ctx context.Context, table string, chunkID uint32, epoch uint64, lost <-chan struct{}) (rows uint64, err error) {
 	for {
 		select {
 		case cr := <-c.chunkReady:
 			if cr.Table == table && cr.ChunkId == chunkID && cr.Epoch == epoch {
-				return nil
+				return cr.Rows, nil
 			}
 			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
 				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
+		case <-lost:
+			return 0, errWorkerLost
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 }
@@ -1625,11 +1659,12 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	// chunks at snapshot time), unlike at boot, where an owner with no
 	// position could equally be one interrupted mid-snapshot (whose partition
 	// MUST re-snapshot, not be resumed past). WK-001 §2.6.
-	bounds, err := chunker.Bounds(ctx)
+	allChunks, todo, err := c.snapshotPlan(ctx, chunker, ref, ranges)
 	if err != nil {
 		return err
 	}
-	allChunks := snapshot.Chunks(bounds)
+	c.setSnapshotTodo(ref.Target, todo)
+	defer c.setSnapshotTodo(ref.Target, nil)
 	var emptyOwners []string
 	for p, w := range owners {
 		clipped, err := clipChunksToRange(allChunks, ranges[p])
@@ -1668,22 +1703,52 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 	if len(chunks) == 0 {
 		return nil // this partition's range contains no rows right now
 	}
-	// The epoch the ChunkRequests are sent under; the worker echoes it on
-	// ChunkReady so a reply from a superseded generation is ignored.
-	c.mu.Lock()
-	epoch := w.epoch
-	c.mu.Unlock()
-
-	for i, ch := range chunks {
-		chunkID := uint32(i)
+	// A worker lost mid-snapshot takes its windows with it (issue #461): the
+	// rows of every chunk whose Closes marker it had not committed lived only
+	// in its memory. Once it is back, the partition redoes from the first
+	// such chunk. Every round-trip gets a window id of its own (attempt in the
+	// high bits), so a lost window's Closes marker, redelivered to the
+	// reconnected worker, closes nothing it has open.
+	opened := false
+	var attempt uint32
+	windows := map[uint32]int{} // window id → chunk index, this partition
+	var epoch uint64
+	haveEpoch := false
+	todo := c.snapshotTodoFor(ref.Target)
+	for i := 0; i < len(chunks); {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if i == 0 {
+		if todo != nil && !todo[chunkRef(partition, i)] {
+			i++ // committed before a coordinator restart: resumed past
+			continue
+		}
+		if err := c.awaitReattached(ctx, w); err != nil {
+			return err
+		}
+		lost := c.lostSignal(w)
+		c.mu.Lock()
+		cur := w.epoch
+		c.mu.Unlock()
+		if haveEpoch && cur != epoch {
+			// Lost (and back) since the previous round-trip.
+			i = c.redoFrom(w, ref.Target, windows, i)
+			attempt++
+			c.clearChunkReady(ref.Target, partition)
+			c.log.Warn("coordinator: snapshot worker was lost; redoing its uncommitted chunks",
+				"table", ref.Source, "partition", partition, "worker", w.name, "from_chunk", i, "attempt", attempt)
+		}
+		// The epoch the ChunkRequests are sent under; the worker echoes it
+		// on ChunkReady so a reply from a superseded generation is ignored.
+		epoch, haveEpoch = cur, true
+		if !opened {
 			if err := c.openWindowFlushed(ctx, ref.Target, partition); err != nil {
 				return err
 			}
+			opened = true
 		}
+		window := attempt<<20 | uint32(i)
+		windows[window] = i
 		// The snapshot watchdog: a worker that attaches but stops draining
 		// would otherwise block the chunk round-trip (send, wait, flush)
 		// forever — the supervisor does not run during the snapshot (issue
@@ -1694,11 +1759,20 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 			timeout = defaultSnapshotChunkTimeout
 		}
 		chunkCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := c.awaitChunkCommits(chunkCtx, w.name)
+		err := c.awaitChunkCommits(chunkCtx, w.name, maxUncommittedChunks, lost)
 		if err == nil {
-			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, ch, chunkID, epoch)
+			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], window, epoch, lost, pendingAfter(todo, partition, i))
+		}
+		if err == nil && i == len(chunks)-1 {
+			// The partition's last chunk: its windows must all be committed
+			// before the partition is done, or a loss right after would
+			// leave rows only a lost window held.
+			err = c.awaitChunkCommits(chunkCtx, w.name, 1, lost)
 		}
 		cancel()
+		if errors.Is(err, errWorkerLost) {
+			continue // the next pass finds the new epoch and redoes
+		}
 		if err != nil {
 			// A parent deadline/cancel (the run's own) surfaces here as
 			// DeadlineExceeded too; report it as-is rather than blaming a
@@ -1706,10 +1780,11 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 			// watchdog firing.
 			if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
 				return fmt.Errorf("coordinator: snapshot %s: chunk %d did not complete within %s (the worker may be wedged): %w",
-					ref.Source, chunkID, timeout, err)
+					ref.Source, i, timeout, err)
 			}
 			return err
 		}
+		i++
 	}
 	// Seal this partition's gate and release anything collected after its
 	// last chunk. Other partitions' gates (if any) are untouched.
@@ -1720,23 +1795,29 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 // the worker's ChunkReady, prove the reader caught up, then release the gated
 // live rows and the Closes marker. ctx carries the watchdog deadline, so a
 // worker that never acks the chunk fails the run instead of wedging it.
-func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, epoch uint64) error {
+func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, epoch uint64, lost <-chan struct{}, pending []uint32) error {
 	boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
 	if err != nil {
 		return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
 	}
 	req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Bounds: boundsB}
 
+	c.mu.Lock()
+	out := w.out
+	c.mu.Unlock()
 	select {
-	case w.out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
+	case out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
+	case <-lost:
+		return errWorkerLost
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	if err := c.waitChunkReady(ctx, ref.Source, chunkID, epoch); err != nil {
+	rows, err := c.waitChunkReadyOr(ctx, ref.Source, chunkID, epoch, lost)
+	if err != nil {
 		return err
 	}
-	c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID)
+	c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID, "rows", rows)
 	c.markChunkReady(ref.Target, partition, chunkID)
 
 	// The worker has the chunk rows in its window; prove the reader is
@@ -1751,6 +1832,11 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
 		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
 	}
+	// The marker's position is the reader's, past every batch sent before
+	// it, so only a commit that includes the window's rows (or a later one)
+	// releases it from the worker's index. At the last position sent, the
+	// ack of the batch sent just before it released it too, with the rows
+	// still in the worker's memory (#468).
 	at := rdr.Synced()
 
 	// Release this chunk's gated live events (InWindow-tagged) ahead of
@@ -1759,35 +1845,20 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
 		return err
 	}
-	return c.sendCloses(ctx, w, ref.Target, at, chunkID)
-}
-
-// sendCloses queues a chunk's Closes marker for its partition's worker —
-// not routed through enqueueBatch's table-wide lookup, since a marker carries
-// no rows for enqueueBatch to route by key.
-//
-// On a staged table the worker delivers the window's rows as the marker's
-// cycle (#416), so the marker takes a place in the table's send order here,
-// expecting only this worker: the window commits after every live cycle
-// released ahead of it. Committed on arrival instead, it could move the
-// table's committed position past live cycles still open, and a crash would
-// then take their replay for covered.
-func (c *Coordinator) sendCloses(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32) error {
-	meta := &pb.BatchMeta{
-		Table:  target,
-		LowPos: at.String(),
-		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID},
-	}
-	if c.stagesCycles() && c.isStagedTable(target) {
-		meta.BatchId = c.batchSeq.Add(1)
-		c.staged.expect(core.TableRef{Target: target}, meta.BatchId, []string{w.name})
-	}
-	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
+	if err := c.sendClosesPending(ctx, w, ref.Target, at, chunkID, pending); err != nil {
 		return err
 	}
-	c.noteChunkMarker(w.name, meta.BatchId)
-	c.noteWindow(target, w)
-	return nil
+	// A worker lost since its ChunkReady took the window's rows with it, and
+	// a loss before the marker was sent does not record this chunk among its
+	// lost windows: the marker would reach a worker holding no such window,
+	// and the chunk would pass for done. Report the loss so the partition
+	// redoes it. A loss from here on finds the marker held and records it.
+	select {
+	case <-lost:
+		return errWorkerLost
+	default:
+		return nil
+	}
 }
 
 // clipChunksToRange keeps only the chunks that intersect partitionRange,
@@ -1894,18 +1965,11 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		return fmt.Errorf("coordinator: enqueueBatch requires a batch; window markers go through enqueueTo")
 	}
 
-	// A partition owner whose Pod died (its session attached, then detached)
-	// and has not been retired by a re-slice yet can never drain a batch
-	// routed to it: the batch strands, and other partitions' cycles advance
-	// the durable position over the gap. Fail for a clean replay instead of
-	// routing into the void (issue #372). A supervisor reset is excluded: it
-	// is detached only between the reset and the reconnect, and its queue
-	// survives, so the batch is delivered on reconnect rather than stranded.
-	for _, w := range owners {
-		if c.ownerDetached(w) && !c.supervisor.isPending(w.name) {
-			return fmt.Errorf("coordinator: owner %s of %s is detached; terminating for a clean replay", w.name, meta.Table)
-		}
-	}
+	// A partition owner whose Pod died is routed to all the same: its queue
+	// is kept and redelivered when the Pod reconnects (issue #461), and its
+	// cycles stay open until then, so no later cycle commits over the gap.
+	// An owner that never comes back ends the run at the delivery timeout
+	// (supervisor.tick).
 
 	if len(owners) == 1 {
 		return c.enqueueTo(ctx, owners[0], b, meta)
@@ -2131,7 +2195,8 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	select {
 	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes}:
 		if idx := c.indexOf(w.name); idx != nil {
-			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n)})
+			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
+				marker: meta.Window != nil && meta.Window.Closes})
 		}
 		c.noteSent(meta.Table, posStr)
 		return nil
@@ -2398,6 +2463,10 @@ func (c *Coordinator) onSchemaDrift(worker string, d *pb.SchemaDrift) {
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.noteAck(worker, time.Now())
+	if ack.BatchId != 0 && ack.Position == "" {
+		c.onMarkerAck(worker, ack.BatchId)
+		return
+	}
 	pos, err := c.src.ParsePosition(ack.Position)
 	if err != nil {
 		// The position format is a shared contract; a worker that cannot
@@ -2781,7 +2850,22 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 
 	c.mu.Lock()
 	w, known := c.workers[hello.WorkerName]
-	if known && w.attached {
+	c.mu.Unlock()
+	if !known {
+		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+	}
+	// Assignment on every attach (including after a reset): the worker
+	// waits for it before opening Flight, and a resurrected worker needs a
+	// fresh one. It is queued before the session is published: a snapshot
+	// waiting for this worker sends chunk requests the moment it is
+	// attached, and a worker whose first message is not its Assignment fails
+	// the handshake (chaos-1M-521691a).
+	assign, err := c.assignmentFor(w)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if w.attached {
 		c.mu.Unlock()
 		return fmt.Errorf("coordinator: worker %q already connected", hello.WorkerName)
 	}
@@ -2792,24 +2876,16 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		out:  make(chan *pb.CoordinatorMessage, 16),
 		done: make(chan error, 1),
 	}
+	sess.out <- assign
 	// Publish the session BEFORE signaling ready: the ready send
 	// happens-before run's receive, so run may use w.out the moment it
 	// wakes — attaching after the signal is a data race.
-	if known {
-		w.out, w.attached, w.hadSession = sess.out, true, true
-		w.cancel = sessCancel
-	}
+	w.out, w.attached, w.hadSession = sess.out, true, true
+	w.cancel = sessCancel
 	c.mu.Unlock()
-	if known {
-		// noteAttach takes the supervisor lock; calling it under c.mu would
-		// invert the order supervisor.tick uses (supervisor.mu → c.mu) and
-		// deadlock the two (audit #3).
-		c.supervisor.noteAttach(hello.WorkerName)
-		c.pushDashState() // the worker attached
-	}
-	if !known {
+	if err := c.onAttach(hello.WorkerName); err != nil {
 		sessCancel()
-		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
+		return err
 	}
 	defer func() {
 		c.mu.Lock()
@@ -2826,18 +2902,6 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 	}
 	c.log.Info("worker session", "worker", hello.WorkerName)
 
-	// Assignment on every attach (including after a reset): the worker
-	// waits for it before opening Flight, and a resurrected worker needs a
-	// fresh one.
-	if msg, err := c.assignmentFor(w); err != nil {
-		return err
-	} else {
-		select {
-		case sess.out <- msg:
-		case <-stream.Context().Done():
-			return stream.Context().Err()
-		}
-	}
 	// Recv loop: acks and worker errors.
 	go func() {
 		for {
@@ -2866,7 +2930,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 					return
 				}
 			case *pb.WorkerMessage_Error:
-				sess.done <- errors.New("coordinator: worker error: " + m.Error.Detail)
+				sess.done <- &workerReportedError{detail: m.Error.Detail}
 				return
 			case *pb.WorkerMessage_SchemaDrift:
 				c.onSchemaDrift(hello.WorkerName, m.SchemaDrift)
@@ -2899,84 +2963,22 @@ var errSessionReset = errors.New("session reset")
 
 // signalSessionEnd reports a session's terminal state to the run loop.
 //
-// A supervisor reset is not a worker failure, and neither is the death of a
-// worker mid-reset (it suicides on channel loss); the supervisor owns the
-// outcome. The one exception is a snapshot in progress: the worker's
-// in-memory window died with the session, so the protocol cannot continue —
-// either it waits out AckTimeout/MaxResets, or a stale ChunkReady from the
-// old generation satisfies waitChunkReady against an empty window (a
-// silently incomplete snapshot). Fail the run instead, so it restarts and
-// re-snapshots cleanly (CD-5).
+// A lost worker is recovered, not a reason to end the run (issue #461): its
+// Pod comes back under the same name, reconnects, and is redelivered what it
+// owed. The session's end only ends the run when the worker reported an
+// error itself (schema drift, a failed commit), or when the same worker is
+// lost maxConsecutiveCrashes times in a row with no committed progress in
+// between (a crash loop). See recovery.go.
 func (c *Coordinator) signalSessionEnd(worker string, retErr error) {
-	// A supervisor reset (pending) reconnects and redelivers its batches, so
-	// its open staged cycles must NOT be discarded: the reconnecting session's
-	// nonzero sequences are unknown to stagedCycles.deliver and would be
-	// dropped, losing the staged rows. Only a genuinely lost worker's cycles
-	// are discarded below.
-	pending := c.supervisor.isPending(worker)
-	discarded := 0
-	if !pending {
-		// A lost worker leaves the staged cycles it owed permanently
-		// incomplete: discard them (never commit a partial cycle). The run
-		// terminates below and replays every partition from the committed
-		// position, so no later cycle may be committed over the gap.
-		var open []string
-		for _, ref := range c.workerRefs(worker) {
-			open = append(open, c.staged.debugOpen(ref.Target)...)
-		}
-		discarded = c.staged.discardWorker(worker)
-		if discarded > 0 {
-			c.log.Warn("coordinator: discarded staged cycles of lost worker", "worker", worker, "cycles", discarded, "open-before", open)
-		}
-	}
 	c.pushDashState() // the worker is no longer attached
-	// A worker whose open staged cycles were just discarded (discarded > 0)
-	// lost rows — they were delivered to a cycle that can never complete — and
-	// discardWorker leaves a hole in the table's send order that drainLocked
-	// cannot pass, so a re-slice's drain waits until it times out (issue #372).
-	// A session that ends with context.Canceled — the Pod was deleted, or the
-	// client's stream closed — while the worker still owes batches strands them
-	// the same way: the pump keeps routing to the detached owner, no session
-	// will ever deliver them, and the flip never commits (issue #363). Both
-	// strand work that only a clean replay recovers, so fail the run for either
-	// — a discarded cycle regardless of the reset error type. A supervisor
-	// reset (pending) is excluded: that worker reconnects and redelivers.
-	if !pending && (discarded > 0 || (errors.Is(retErr, context.Canceled) && c.workerOwes(worker))) {
-		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost owing work: %w", worker, retErr)
+	var reported *workerReportedError
+	if errors.As(retErr, &reported) {
+		c.sessionErrs <- retErr
 		return
 	}
-	// A session cancelled by the coordinator — a supervisor reset or a
-	// re-slice retiring an owner — surfaces as errSessionReset OR, when the
-	// recv goroutine wins the race, as context.Canceled. Neither is a worker
-	// failure; only a real stream error is. Treating the cancel as a failure
-	// ended the whole run the moment a scale-in retired an owner.
-	if !errors.Is(retErr, errSessionReset) && !errors.Is(retErr, context.Canceled) && !pending {
-		c.sessionErrs <- retErr
-	} else if c.snapshotActive.Load() {
-		c.sessionErrs <- fmt.Errorf("coordinator: worker %s session lost during snapshot: %w", worker, retErr)
+	if err := c.loseWorker(worker, retErr); err != nil {
+		c.sessionErrs <- err
 	}
-}
-
-// workerOwes reports whether a worker still holds undelivered queued batches
-// or delivered-but-unacked in-flight batches — work a re-slice's drain would
-// wait on, and that no detached session can drain.
-func (c *Coordinator) workerOwes(worker string) bool {
-	c.mu.Lock()
-	w := c.workers[worker]
-	c.mu.Unlock()
-	if w == nil {
-		return false
-	}
-	return len(w.queue) > 0 || c.inFlight(worker) > 0
-}
-
-// ownerDetached reports whether an owner's Pod died — its session attached and
-// then detached — but no re-slice has retired it yet. Such an owner can never
-// drain a batch routed to it (issue #372).
-func (c *Coordinator) ownerDetached(w *workerState) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return w.hadSession && !w.attached
 }
 
 // workerByTicket looks up a worker by its Flight ticket under c.mu: a

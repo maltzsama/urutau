@@ -37,14 +37,16 @@ func TestProductionReadinessChaos(t *testing.T) {
 	var m *matrixSampler
 	runProductionReadiness(t, prOptions{
 		pipeline: "pod-pr-chaos", serverID: "2321", chaos: true,
-		kedaMax: 4, maintenance: matrixMaintenance,
+		kedaMax: 4, maintenance: matrixMaintenance, logLevel: "debug",
 		onLive: func(ctx context.Context, r *prRun) {
 			m = newMatrixSampler(r)
+			m.start(ctx)
+		},
+		afterLive: func(ctx context.Context, r *prRun) {
 			if err := m.plantOrphan(ctx); err != nil {
 				r.t.Fatalf("plant orphan: %v", err)
 			}
 			r.t.Logf("planted orphan %s", m.orphan)
-			m.start(ctx)
 		},
 		afterSettle: func(ctx context.Context, r *prRun) {
 			m.stop()
@@ -58,12 +60,15 @@ type prOptions struct {
 	pipeline, serverID string
 	chaos              bool           // the chaos controller over the live window
 	kedaMax            int            // > 0: partitioned tables get workers.max for KEDA
+	logLevel           string         // the pipeline's spec.logLevel
 	maintenance        map[string]any // non-nil: the sink's maintenance block
 	live               time.Duration  // > 0: overrides the profile's live window
 	settle             time.Duration  // > 0: overrides the profile's settle timeout
 	// onLive runs once the coordinator is up, before the live window
-	// elapses; afterSettle runs after the final comparison. Both see the run.
+	// elapses; afterLive once the workload has stopped, before the settle;
+	// afterSettle after the final comparison. All see the run.
 	onLive      func(ctx context.Context, r *prRun)
+	afterLive   func(ctx context.Context, r *prRun)
 	afterSettle func(ctx context.Context, r *prRun)
 }
 
@@ -166,7 +171,7 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 			specs[i].Max = o.kedaMax
 		}
 	}
-	opts := crOptions{MaintenanceBlock: o.maintenance}
+	opts := crOptions{MaintenanceBlock: o.maintenance, LogLevel: o.logLevel}
 	if profile.Name == fullProfile.Name {
 		// The full profile streams ~1k mutations/s per table with payloads
 		// up to 256 KiB through a race-instrumented coordinator: at 2Gi it
@@ -185,6 +190,7 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		opts.WorkerCPUOverhead = "1500m"
 	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
+	applied := time.Now()
 	applyPipeline(t, testNS, pipeline, cr)
 	// Registered after applyPipeline, so it runs before the pipeline is torn
 	// down: the logs are flushed, and a failure is dumped while the Pods,
@@ -202,6 +208,11 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 			t.Logf("diagnostics dumped under %s", dir)
 		}
 		logs.stop()
+		// The trail outlives every replaced Pod, so it is kept pass or fail.
+		tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		n, err := dumpTrail(tctx, dir, pipeline, applied)
+		tcancel()
+		t.Logf("run trail: %d coordinator run(s) under %s/trail (err %v)", n, dir, err)
 	})
 
 	// Live mutations start before the coordinator is up, so they overlap
@@ -248,6 +259,9 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		t.Fatalf("stop workload: %v", err)
 	}
 	t.Logf("workload stopped; expected source position %s", w.finalPos)
+	if o.afterLive != nil {
+		o.afterLive(ctx, run)
+	}
 
 	reconnect := func() error {
 		return startPortForward(t, dataNS, "svc/trino", localTrinoPort, 8080, 30*time.Second)

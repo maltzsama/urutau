@@ -73,9 +73,12 @@ server, not a one-shot.
 | `--flow-per-worker-min-mi` | `16` | Per-worker minimum share of the flow budget (MiB) |
 | `--wait-worker` | `2m` | How long to wait for every expected worker session |
 | `--ack-timeout` | `30s` | A worker is stale without an ack for this long |
-| `--max-resets` | `5` | Resets within the window before the job terminates |
-| `--reset-window` | `15m` | Sliding window for the reset count |
+| `--max-consecutive-crashes` | `3` | A worker crashing this many times in a row without delivering what it owed ends the job |
+| `--worker-delivery-timeout` | `5m` | A worker owing work that delivers none of it for this long ends the job |
+| `--max-resets` | `5` | Deprecated, ignored |
+| `--reset-window` | `15m` | Deprecated, ignored |
 | `--eventlog` | _(off)_ | `s3://bucket/prefix` audit trail |
+| `--eventlog-endpoint` | _(AWS)_ | S3 API endpoint of the audit trail store (MinIO/RustFS, path-style) |
 | `--checkpoint` | _(off)_ | `s3://bucket/prefix` async position manifests |
 | `--checkpoint-interval` | `10` | Checkpoint write interval (seconds) |
 | `--plugin` | _(none)_ | Go plugin path; repeatable |

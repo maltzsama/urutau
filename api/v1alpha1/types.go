@@ -28,6 +28,10 @@ type CDCPipelineSpec struct {
 	// Image is left empty (workers must then be launched some other way).
 	Image string `json:"image,omitempty"`
 
+	// LogLevel is the coordinator's and every worker's --log-level
+	// (debug|info|warn|error). Empty keeps the binaries' default, info.
+	LogLevel string `json:"logLevel,omitempty"`
+
 	// Definition points at the job: a user image (official), an s3 script,
 	// or an inline table list.
 	Definition Definition `json:"definition"`
@@ -105,6 +109,13 @@ type EventlogSpec struct {
 	// RootPrefix is the key prefix every pipeline's trail lives under, e.g.
 	// "urutau". Empty means the bucket root.
 	RootPrefix string `json:"rootPrefix,omitempty"`
+	// Endpoint overrides the S3 API target for an S3-compatible store
+	// (MinIO, RustFS), addressed path-style. Empty uses AWS.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Secret names a Secret with the store's credentials under the keys
+	// "accessKeyId" and "secretAccessKey", mounted into the coordinator
+	// only. Empty leaves the standard AWS chain (workload identity).
+	Secret string `json:"secret,omitempty"`
 }
 
 // SnapshotSpec tunes the DBLog snapshot phase.
@@ -113,11 +124,17 @@ type SnapshotSpec struct {
 	MaxParallelChunks int `json:"maxParallelChunks,omitempty"`
 }
 
-// SupervisionSpec tunes the reset/terminate window.
+// SupervisionSpec tunes worker supervision. A lost worker is recovered, and
+// the job ends only once one worker crashes MaxConsecutiveCrashes times in a
+// row without delivering what it owed, or delivers nothing of the work it owes
+// for WorkerDeliveryTimeout.
+// MaxResets and Window are deprecated and ignored.
 type SupervisionSpec struct {
-	AckTimeout string `json:"ackTimeout,omitempty"`
-	MaxResets  int    `json:"maxResets,omitempty"`
-	Window     string `json:"window,omitempty"`
+	AckTimeout            string `json:"ackTimeout,omitempty"`
+	MaxResets             int    `json:"maxResets,omitempty"`
+	Window                string `json:"window,omitempty"`
+	MaxConsecutiveCrashes int    `json:"maxConsecutiveCrashes,omitempty"`
+	WorkerDeliveryTimeout string `json:"workerDeliveryTimeout,omitempty"`
 }
 
 // WorkerDefaults is the resource default for every worker Deployment —

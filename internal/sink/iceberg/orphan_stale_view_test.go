@@ -98,7 +98,11 @@ func TestOrphanCleanupSparesCommitsAfterItsLoad(t *testing.T) {
 	}
 	dir := localDir(tbl.Location())
 	m.afterOrphanLoad = func() {
-		loaded := time.Now()
+		// mtime comes from the kernel's coarse clock, which trails
+		// time.Now() by up to a jiffy (measured 4.7 ms): a margin keeps a
+		// fast commit's files from looking older than the load (#467). The
+		// earlier files it also backdates are referenced, so spared anyway.
+		loaded := time.Now().Add(-time.Second)
 		appendOrder(t, s, 2) // a CDC commit lands mid-cleanup
 		old := time.Now().Add(-2 * olderThan)
 		if n := backdateFilesSince(t, dir, loaded, old); n == 0 {

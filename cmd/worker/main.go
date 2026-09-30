@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -26,8 +27,29 @@ func main() {
 	memlimit.Apply(slog.Default())
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "urutau-worker:", err)
+		writeTerminationMessage(err)
 		os.Exit(1)
 	}
+}
+
+// terminationLog is where Kubernetes reads a container's termination message.
+const terminationLog = "/dev/termination-log"
+
+// writeTerminationMessage records why the worker exited in its Pod's
+// termination message, which the coordinator reads when the worker comes
+// back to tell a crash from a lost network (issue #461). Best effort: outside
+// Kubernetes the file does not exist.
+func writeTerminationMessage(err error) {
+	_ = os.WriteFile(terminationLog, []byte(terminationMessage(err)), 0o644)
+}
+
+// terminationMessage is err, marked "network: " when the worker lost its
+// coordinator (see worker.ErrCoordinatorLost).
+func terminationMessage(err error) string {
+	if errors.Is(err, worker.ErrCoordinatorLost) {
+		return "network: " + err.Error()
+	}
+	return err.Error()
 }
 
 func run() error {
