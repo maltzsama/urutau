@@ -167,8 +167,12 @@ func TestTupleToMapByNameKeyOnly(t *testing.T) {
 		t.Fatalf("row = %+v, want v=hello", row)
 	}
 
-	// A key tuple wider than the key is an error, not a mis-map.
+	// A key tuple whose width does not match the key is an error, not a
+	// partial or mis-mapped row.
 	if _, err := tupleToMapByName(st, tuple(col("1"), col("2"), col("3")), []string{"id", "v"}); err == nil {
 		t.Fatal("want an error for a key tuple wider than the primary key")
+	}
+	if _, err := tupleToMapByName(st, tuple(col("1")), []string{"id", "v"}); err == nil {
+		t.Fatal("want an error for a key tuple narrower than the primary key")
 	}
 }

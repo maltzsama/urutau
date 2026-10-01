@@ -125,12 +125,15 @@ func decodeScalar(dataType string, data []byte) (any, error) {
 // key order, not the table's full column order, so a positional decode would
 // attribute them to the wrong columns (issue #500).
 func tupleToMapByName(st *TableState, tuple *pglogrepl.TupleData, names []string) (map[string]any, error) {
+	// A key-only tuple must carry exactly the identity key columns: a shorter
+	// one is a malformed/truncated identity tuple, and a partial map would let
+	// key extraction or filter evaluation run on missing key values.
+	if len(tuple.Columns) != len(names) {
+		return nil, fmt.Errorf("postgres: decode %s.%s: key tuple has %d columns, want the primary key's %d",
+			st.Schema, st.Name, len(tuple.Columns), len(names))
+	}
 	out := make(map[string]any, len(tuple.Columns))
 	for i, col := range tuple.Columns {
-		if i >= len(names) {
-			return nil, fmt.Errorf("postgres: decode %s.%s: key tuple has more columns than the primary key",
-				st.Schema, st.Name)
-		}
 		name := names[i]
 		j := st.FindColumn(name)
 		if j < 0 {
