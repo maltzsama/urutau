@@ -16,7 +16,7 @@
 # process at an exact step of the commit path for the crash-recovery matrix.
 # The shipped image (build/Dockerfile) never sets the tag, so there they are
 # empty functions.
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.6
 FROM golang:${GO_VERSION}-bookworm AS build
 WORKDIR /src
 # Version metadata for urutau version (defaults keep ad-hoc builds honest).

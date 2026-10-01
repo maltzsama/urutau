@@ -13,7 +13,7 @@
 # concurrency is covered by `go test -race` in CI. The harness drives the cluster with kubectl
 # (apply/delete CRs, Chaos Mesh, exec, logs), copied from the upstream image
 # at the cluster's minor version.
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.6
 ARG KUBECTL_VERSION=v1.35.1
 FROM registry.k8s.io/kubectl:${KUBECTL_VERSION} AS kubectl
 
