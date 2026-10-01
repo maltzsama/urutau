@@ -1829,8 +1829,12 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	if err != nil {
 		return fmt.Errorf("dblog: chunk %d: master: %w", chunkID, err)
 	}
-	if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
-		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+	// A worker lost while the reader catches up takes its window with it, and
+	// its full queue blocks the shared pump so the reader never reaches high;
+	// waiting out the window timeout would end the run (issue #526) instead of
+	// redoing the chunk, so the wait aborts on the loss.
+	if err := c.waitCaughtUpOrLost(ctx, rdr, high, cfg, chunkID, lost); err != nil {
+		return err
 	}
 	// The marker's position is the reader's, past every batch sent before
 	// it, so only a commit that includes the window's rows (or a later one)
