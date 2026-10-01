@@ -32,11 +32,13 @@ make e2e-pods-up        # once; needs make k8s-load-race first
 URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 60m
 # full profile:
 URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
+# the full load in a shorter run (100,000 seeded rows per table, 10-minute window, 15-minute settle):
+URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 40m
 ```
 
 | Variable | Effect |
 |----------|--------|
-| `URUTAU_E2E_PROFILE` | `smoke` (default) or `full`. |
+| `URUTAU_E2E_PROFILE` | `smoke` (default), `full` or `full-100k`. |
 | `URUTAU_E2E_SEED` | Replays a run's random choices. The seed is logged at the start of every run. |
 | `URUTAU_E2E_ARTIFACTS` | Directory for the diagnostics file (default: the system temp dir, under `urutau-e2e/`). |
 | `URUTAU_E2E_TABLES` | Comma-separated table kinds (`accounts`, `items`, `events`) to narrow a run while debugging one table. The coverage checks still expect all three, so a narrowed run always fails coverage, naming the omitted tables: it is never a pass of the matrix. |
@@ -44,6 +46,10 @@ URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full go test ./test/e2e/pods/ -run '^TestPr
 The test's own budget is the live window plus the settle timeout plus 15
 minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full),
 so the `-timeout` values above leave it room to report its own failure.
+`full-100k` is the exception: its budget is 40 minutes, the same as its
+`-timeout`, and 55 with the chaos run's post-settle checks. A run that does
+not converge fails on its settle about 28 minutes in; only one that uses
+every margin in full is cut by the `-timeout` instead.
 
 The seed reproduces every random draw, not the timing: regimes end on the
 wall clock, so a replay can cut them at different transactions.
@@ -66,16 +72,22 @@ lets the comparison tell a stale row from a wrong one.
 
 ## Profiles
 
-Smoke and full share every line of the generator; only the sizes differ.
+The profiles share every line of the generator; only the sizes differ.
 
-| | smoke | full |
-|---|---|---|
-| Initial rows per table | 2,000 | 1,000,000 |
-| Mean mutations/s per table | 30 | 1,000 |
-| Live window | 3 min | 30 min |
-| Largest transaction | 150 rows | 2,000 rows |
-| Largest `events` payload | 64 KiB | 256 KiB |
-| Settle timeout | 30 min | 60 min |
+| | smoke | full | full-100k |
+|---|---|---|---|
+| Initial rows per table | 2,000 | 1,000,000 | 100,000 |
+| Mean mutations/s per table | 30 | 1,000 | 1,000 |
+| Live window | 3 min | 30 min | 10 min |
+| Largest transaction | 150 rows | 2,000 rows | 2,000 rows |
+| Largest `events` payload | 64 KiB | 256 KiB | 256 KiB |
+| Settle timeout | 30 min | 60 min | 15 min |
+
+`full-100k` is the full load in a run that fits a 40-minute `-timeout`: a
+tenth of the seeded rows, a 10-minute live window and a 15-minute settle.
+The rate, the fault stream and the
+Pod resources are the full profile's; where this page says full for those,
+it means both.
 
 ## How the workload stays random
 

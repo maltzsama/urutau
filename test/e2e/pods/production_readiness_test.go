@@ -14,7 +14,7 @@ import (
 // (issue #384) against the real MySQL → Iceberg pipeline and checks
 // MySQL source state → oracle → Iceberg logical state exactly.
 //
-// URUTAU_E2E_PROFILE picks smoke (default) or full; URUTAU_E2E_TABLES
+// URUTAU_E2E_PROFILE picks smoke (default), full or full-100k; URUTAU_E2E_TABLES
 // (e.g. "accounts,items") narrows the run to some tables, for debugging only:
 // the coverage checks still expect all three. URUTAU_E2E_SEED replays
 // a run's random choices (the timing, and so the regime boundaries, still
@@ -172,8 +172,8 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		}
 	}
 	opts := crOptions{MaintenanceBlock: o.maintenance, LogLevel: o.logLevel}
-	if profile.Name == fullProfile.Name {
-		// The full profile streams ~1k mutations/s per table with payloads
+	if profile.fullLoad() {
+		// The full load streams ~1k mutations/s per table with payloads
 		// up to 256 KiB through a race-instrumented coordinator: at 2Gi it
 		// was OOM-killed catching up after its first snapshot chunk.
 		opts.CoordinatorMemory = "6Gi"

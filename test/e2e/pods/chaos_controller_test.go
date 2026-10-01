@@ -73,7 +73,7 @@ var (
 
 // chaosProfileFor pairs a chaos profile with the workload profile.
 func chaosProfileFor(p workloadProfile) chaosProfile {
-	if p.Name == fullProfile.Name {
+	if p.fullLoad() {
 		return fullChaos
 	}
 	return smokeChaos

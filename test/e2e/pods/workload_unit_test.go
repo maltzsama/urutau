@@ -38,6 +38,36 @@ func TestMD5HexMatchesMySQL(t *testing.T) {
 	}
 }
 
+// Issue #521: full-100k is the full load in a shorter run: fewer seeded
+// rows, a shorter live window and a shorter settle. Anything else that differed would make it
+// another scenario, and a profile the runner does not treat as full load
+// would get the smoke fault stream and the smoke Pod resources.
+func TestFull100kProfileIsTheFullLoadInAShorterRun(t *testing.T) {
+	t.Setenv("URUTAU_E2E_PROFILE", "full-100k")
+	p, err := selectedProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Name != "full-100k" || p.InitialRows != 100_000 || p.Duration != 10*time.Minute || p.Settle != 15*time.Minute {
+		t.Fatalf("profile %q seeds %d rows per table, live %s, settle %s; want full-100k with 100000, 10m, 15m", p.Name, p.InitialRows, p.Duration, p.Settle)
+	}
+	want := fullProfile
+	want.Name, want.InitialRows, want.Duration, want.Settle = p.Name, p.InitialRows, p.Duration, p.Settle
+	if p != want {
+		t.Fatalf("full-100k = %+v, want the full profile but for the seeded rows and the run's length: %+v", p, want)
+	}
+	if !p.fullLoad() || !fullProfile.fullLoad() || smokeProfile.fullLoad() {
+		t.Fatalf("fullLoad: full-100k=%v full=%v smoke=%v, want true, true, false",
+			p.fullLoad(), fullProfile.fullLoad(), smokeProfile.fullLoad())
+	}
+	if got := chaosProfileFor(p); !reflect.DeepEqual(got, fullChaos) {
+		t.Fatalf("full-100k fault stream = %+v, want the full one", got)
+	}
+	if got := chaosProfileFor(smokeProfile); !reflect.DeepEqual(got, smokeChaos) {
+		t.Fatalf("smoke fault stream = %+v, want the smoke one", got)
+	}
+}
+
 // simulate builds txns transactions per table with no database, committing
 // every one, and returns the generators and what they recorded.
 func simulate(t *testing.T, seed uint64, txns int) ([]*tableGen, []*tableStats) {
