@@ -32,8 +32,8 @@ make e2e-pods-up        # once; needs make k8s-load-race first
 URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 60m
 # full profile:
 URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
-# the full load on 100,000 seeded rows per table:
-URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
+# the full load in a shorter run (100,000 seeded rows per table, 10-minute window):
+URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 100m
 ```
 
 | Variable | Effect |
@@ -44,7 +44,7 @@ URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^T
 | `URUTAU_E2E_TABLES` | Comma-separated table kinds (`accounts`, `items`, `events`) to narrow a run while debugging one table. The coverage checks still expect all three, so a narrowed run always fails coverage, naming the omitted tables: it is never a pass of the matrix. |
 
 The test's own budget is the live window plus the settle timeout plus 15
-minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full and full-100k),
+minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full, 85 for full-100k),
 so the `-timeout` values above leave it room to report its own failure.
 
 The seed reproduces every random draw, not the timing: regimes end on the
@@ -74,14 +74,15 @@ The profiles share every line of the generator; only the sizes differ.
 |---|---|---|---|
 | Initial rows per table | 2,000 | 1,000,000 | 100,000 |
 | Mean mutations/s per table | 30 | 1,000 | 1,000 |
-| Live window | 3 min | 30 min | 30 min |
+| Live window | 3 min | 30 min | 10 min |
 | Largest transaction | 150 rows | 2,000 rows | 2,000 rows |
 | Largest `events` payload | 64 KiB | 256 KiB | 256 KiB |
 | Settle timeout | 30 min | 60 min | 60 min |
 
-`full-100k` is the full run on a tenth of the seeded rows: the load, the
-fault stream and the Pod resources are the full profile's. Where this page
-says full, it means both.
+`full-100k` is the full load in a run about a third as long: a tenth of the
+seeded rows and a 10-minute live window. The rate, the fault stream and the
+Pod resources are the full profile's; where this page says full for those,
+it means both.
 
 ## How the workload stays random
 
