@@ -492,6 +492,19 @@ func (r *Reader) Next(ctx context.Context) (*dataplane.Batch, error) {
 // (unknown topic, denied authorization, bad credentials) returns and fails
 // the pipeline: retrying it spins at full speed forever while making no
 // progress and reporting nothing upstream. A transient one backs off.
+// resolveRef maps a decoded change's table to its configured ref. The decoder
+// may name the source key (topic / envelope source) or, for a topic→target
+// mapping, the target; the routing table is keyed by the source (the topic),
+// so a table that is not itself a key falls back to the record's topic
+// (issue #482).
+func (r *Reader) resolveRef(table, topic string) (source.TableRef, bool) {
+	if ref, ok := r.refBySource[table]; ok {
+		return ref, true
+	}
+	ref, ok := r.refBySource[topic]
+	return ref, ok
+}
+
 func (r *Reader) consume(ctx context.Context) error {
 	backoff := minFetchBackoff
 	for {
@@ -547,14 +560,13 @@ func (r *Reader) consume(ctx context.Context) error {
 			for _, c := range changes {
 				// Resolve the source (envelope source for debezium, topic for
 				// raw) to the target the worker routes on, and attach the
-				// message-queue envelope for transport metadata.
-				src := c.Table
-				if src == "" {
-					src = rec.Topic
-				}
-				ref, ok := r.refBySource[src]
+				// message-queue envelope for transport metadata. A debezium
+				// topic→target mapping names the TARGET here; the routing
+				// table is keyed by the source/topic, so fall back to it
+				// (issue #482).
+				ref, ok := r.resolveRef(c.Table, rec.Topic)
 				if !ok {
-					r.logger.Warn("kafka: record for unmapped source", "topic", rec.Topic, "source", src)
+					r.logger.Warn("kafka: record for unmapped source", "topic", rec.Topic, "source", c.Table)
 					return
 				}
 				c.Table = ref.Target
