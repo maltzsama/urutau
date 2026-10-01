@@ -7,6 +7,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 )
 
 func TestTransportOf(t *testing.T) {
@@ -138,5 +139,27 @@ func TestAddMissingPartitionsNoNewPartitions(t *testing.T) {
 	addMissingPartitions(parts, map[string][]int32{"orders": {0}})
 	if len(parts["orders"]) != 1 {
 		t.Fatalf("parts = %v, want unchanged (1 partition)", parts["orders"])
+	}
+}
+
+// A debezium topic→target mapping makes the decoder name the TARGET, but the
+// routing table is keyed by the source (the topic); resolveRef must fall back
+// to the topic or the mapped record is dropped as unmapped (issue #482).
+func TestResolveRefFallsBackToTopic(t *testing.T) {
+	users := source.TableRef{Source: "db.shop.users", Target: "raw.users"}
+	r := &Reader{refBySource: map[string]source.TableRef{"db.shop.users": users}}
+
+	ref, ok := r.resolveRef("raw.users", "db.shop.users")
+	if !ok || ref.Target != "raw.users" {
+		t.Fatalf("resolveRef(mapped target) = %+v, %v; want raw.users", ref, ok)
+	}
+
+	ref, ok = r.resolveRef("", "db.shop.users")
+	if !ok || ref.Target != "raw.users" {
+		t.Fatalf("resolveRef(empty, topic) = %+v, %v; want raw.users", ref, ok)
+	}
+
+	if _, ok := r.resolveRef("raw.nope", "other.topic"); ok {
+		t.Fatal("want unmapped for an unknown table and topic")
 	}
 }
