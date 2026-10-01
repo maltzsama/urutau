@@ -6,6 +6,7 @@
 #   make e2e-pods-test                                   # every scenario
 #   RUN='^TestProductionReadinessChaos$' make e2e-pods-test
 #   URUTAU_E2E_PROFILE=full RUN='^TestProductionReadinessMatrix$' TIMEOUT=240m make e2e-pods-test
+#   URUTAU_E2E_PROFILE=full-100k RUN='^TestProductionReadinessChaos$' TIMEOUT=240m make e2e-pods-test
 #
 # Needs `make e2e-pods-up` (the stack and the operator) and `make
 # e2e-pods-image` (this harness as urutau-e2e:dev). The test's output streams

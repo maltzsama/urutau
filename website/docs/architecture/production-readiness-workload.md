@@ -32,17 +32,19 @@ make e2e-pods-up        # once; needs make k8s-load-race first
 URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 60m
 # full profile:
 URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
+# the full load on 100,000 seeded rows per table:
+URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
 ```
 
 | Variable | Effect |
 |----------|--------|
-| `URUTAU_E2E_PROFILE` | `smoke` (default) or `full`. |
+| `URUTAU_E2E_PROFILE` | `smoke` (default), `full` or `full-100k`. |
 | `URUTAU_E2E_SEED` | Replays a run's random choices. The seed is logged at the start of every run. |
 | `URUTAU_E2E_ARTIFACTS` | Directory for the diagnostics file (default: the system temp dir, under `urutau-e2e/`). |
 | `URUTAU_E2E_TABLES` | Comma-separated table kinds (`accounts`, `items`, `events`) to narrow a run while debugging one table. The coverage checks still expect all three, so a narrowed run always fails coverage, naming the omitted tables: it is never a pass of the matrix. |
 
 The test's own budget is the live window plus the settle timeout plus 15
-minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full),
+minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full and full-100k),
 so the `-timeout` values above leave it room to report its own failure.
 
 The seed reproduces every random draw, not the timing: regimes end on the
@@ -66,16 +68,20 @@ lets the comparison tell a stale row from a wrong one.
 
 ## Profiles
 
-Smoke and full share every line of the generator; only the sizes differ.
+The profiles share every line of the generator; only the sizes differ.
 
-| | smoke | full |
-|---|---|---|
-| Initial rows per table | 2,000 | 1,000,000 |
-| Mean mutations/s per table | 30 | 1,000 |
-| Live window | 3 min | 30 min |
-| Largest transaction | 150 rows | 2,000 rows |
-| Largest `events` payload | 64 KiB | 256 KiB |
-| Settle timeout | 30 min | 60 min |
+| | smoke | full | full-100k |
+|---|---|---|---|
+| Initial rows per table | 2,000 | 1,000,000 | 100,000 |
+| Mean mutations/s per table | 30 | 1,000 | 1,000 |
+| Live window | 3 min | 30 min | 30 min |
+| Largest transaction | 150 rows | 2,000 rows | 2,000 rows |
+| Largest `events` payload | 64 KiB | 256 KiB | 256 KiB |
+| Settle timeout | 30 min | 60 min | 60 min |
+
+`full-100k` is the full run on a tenth of the seeded rows: the load, the
+fault stream and the Pod resources are the full profile's. Where this page
+says full, it means both.
 
 ## How the workload stays random
 
