@@ -683,13 +683,13 @@ func (r *Reader) handleUpdate(payload []byte) error {
 	if !ok {
 		return nil
 	}
-	row, err := tupleToMap(entry.state, msg.NewTuple, msg.OldTuple)
+	row, err := tupleToMap(entry.state, msg.NewTuple, toastSource(msg.OldTuple, msg.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey))
 	if err != nil {
 		return err
 	}
 	var before map[string]any
 	if msg.OldTuple != nil {
-		before, err = tupleToMap(entry.state, msg.OldTuple, nil)
+		before, err = oldTupleToMap(entry.state, msg.OldTuple, msg.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey, entry.ref.PrimaryKey)
 		if err != nil {
 			return err
 		}
@@ -731,12 +731,12 @@ func (r *Reader) handleDelete(payload []byte) error {
 	if !ok {
 		return nil
 	}
-	// OldTuple holds either the full old row (REPLICA IDENTITY FULL) or
-	// just the identity key ('K') — both decode the same way.
+	// OldTuple is the full old row ('O') or just the identity key ('K'); the
+	// key-only tuple is decoded by key column name (issue #500).
 	if msg.OldTuple == nil {
 		return fmt.Errorf("postgres: delete %s: no old tuple", entry.ref.Source)
 	}
-	before, err := tupleToMap(entry.state, msg.OldTuple, nil)
+	before, err := oldTupleToMap(entry.state, msg.OldTuple, msg.OldTupleType == pglogrepl.DeleteMessageTupleTypeKey, entry.ref.PrimaryKey)
 	if err != nil {
 		return err
 	}

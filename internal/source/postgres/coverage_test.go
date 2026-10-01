@@ -5,7 +5,6 @@ package postgres
 
 import (
 	"encoding/hex"
-	"strings"
 	"testing"
 
 	"github.com/jackc/pglogrepl"
@@ -75,8 +74,11 @@ func TestCleanNumeric(t *testing.T) {
 	if got := cleanNumeric(" 42 "); got != "42" {
 		t.Fatalf("cleanNumeric(spaces) = %q", got)
 	}
-	if got := cleanNumeric("(5)"); !strings.HasPrefix(got, "-") {
+	if got := cleanNumeric("(5)"); got != "-5" {
 		t.Fatalf("a parenthesized numeric must become negative, got %q", got)
+	}
+	if got := cleanNumeric("($1,234.56)"); got != "-1234.56" {
+		t.Fatalf("a parenthesized money value must become a negative number, got %q", got)
 	}
 }
 

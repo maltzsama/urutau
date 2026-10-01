@@ -59,6 +59,10 @@ func (r *Reader) handleWal2json(ctx context.Context, payload []byte) error {
 	}
 	r.txn = r.txn[:0]
 	r.curCommitTS = parseWal2jsonTime(msg.Timestamp)
+	commitLSN, err := r.startWal2jsonTxn(msg.NextLSN)
+	if err != nil {
+		return err
+	}
 	for i := range msg.Change {
 		if err := r.handleWal2jsonChange(msg.Change[i]); err != nil {
 			return err
@@ -69,11 +73,25 @@ func (r *Reader) handleWal2json(ctx context.Context, payload []byte) error {
 	if msg.NextLSN == "" {
 		return nil
 	}
-	lsn, err := position.ParseLSN(msg.NextLSN)
-	if err != nil {
-		return fmt.Errorf("postgres: wal2json: commit lsn %q: %w", msg.NextLSN, err)
+	return r.handleCommit(ctx, pglogrepl.LSN(commitLSN))
+}
+
+// startWal2jsonTxn sets the reader's current-transaction LSN from the
+// message's nextlsn, BEFORE its changes are decoded, so currentWindow tags
+// InWindow against the right watermark. The pgoutput path sets curLSN from the
+// Begin message; wal2json never did, leaving it at 0 and silently disabling
+// the window dedup (issue #499). It returns the commit LSN for handleCommit.
+func (r *Reader) startWal2jsonTxn(nextLSN string) (position.LSN, error) {
+	if nextLSN == "" {
+		r.curLSN = 0
+		return 0, nil
 	}
-	return r.handleCommit(ctx, pglogrepl.LSN(*lsn))
+	lsn, err := position.ParseLSN(nextLSN)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: wal2json: commit lsn %q: %w", nextLSN, err)
+	}
+	r.curLSN = *lsn
+	return *lsn, nil
 }
 
 // handleWal2jsonChange maps one row change onto a rowchange.Change.

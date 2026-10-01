@@ -120,12 +120,63 @@ func decodeScalar(dataType string, data []byte) (any, error) {
 	}
 }
 
+// tupleToMapByName decodes a tuple whose column order is given explicitly by
+// names. A key-only old tuple ('K') carries just the identity key columns, in
+// key order, not the table's full column order, so a positional decode would
+// attribute them to the wrong columns (issue #500).
+func tupleToMapByName(st *TableState, tuple *pglogrepl.TupleData, names []string) (map[string]any, error) {
+	out := make(map[string]any, len(tuple.Columns))
+	for i, col := range tuple.Columns {
+		if i >= len(names) {
+			return nil, fmt.Errorf("postgres: decode %s.%s: key tuple has more columns than the primary key",
+				st.Schema, st.Name)
+		}
+		name := names[i]
+		j := st.FindColumn(name)
+		if j < 0 {
+			return nil, fmt.Errorf("postgres: decode %s.%s: key column %q not found", st.Schema, st.Name, name)
+		}
+		switch col.DataType {
+		case pglogrepl.TupleDataTypeNull:
+			out[name] = nil
+		case pglogrepl.TupleDataTypeText:
+			v, err := decodeScalar(st.Columns[j].DataType, col.Data)
+			if err != nil {
+				return nil, fmt.Errorf("postgres: decode %s.%s.%s: %w", st.Schema, st.Name, name, err)
+			}
+			out[name] = v
+		default:
+			return nil, fmt.Errorf("postgres: decode %s.%s.%s: unsupported key tuple kind %q",
+				st.Schema, st.Name, name, col.DataType)
+		}
+	}
+	return out, nil
+}
+
+// toastSource returns the tuple to recover unchanged TOAST columns from, or
+// nil when the old tuple is key-only ('K') and carries no TOAST values.
+func toastSource(old *pglogrepl.TupleData, keyOnly bool) *pglogrepl.TupleData {
+	if keyOnly {
+		return nil
+	}
+	return old
+}
+
+// oldTupleToMap decodes an old tuple: a key-only ('K') one by the primary
+// key's column order, a full ('O') one positionally (issue #500).
+func oldTupleToMap(st *TableState, t *pglogrepl.TupleData, keyOnly bool, key []string) (map[string]any, error) {
+	if keyOnly {
+		return tupleToMapByName(st, t, key)
+	}
+	return tupleToMap(st, t, nil)
+}
+
 // cleanNumeric strips the money decorations from a numeric text.
 // Parenthesized values like "($1,234.56)" are converted to negatives.
 func cleanNumeric(s string) string {
 	// Convert parenthesized negatives: (1234.56) → -1234.56
 	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
-		s = "-" + strings.TrimPrefix(strings.TrimSuffix(s, "("), ")")
+		s = "-" + strings.TrimSuffix(strings.TrimPrefix(s, "("), ")")
 	}
 	return strings.NewReplacer("$", "", ",", "", " ", "").Replace(s)
 }
