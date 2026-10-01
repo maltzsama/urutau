@@ -2493,9 +2493,7 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.budget.clearOversized(worker)
 	}
 	// The ack is durable evidence: the popped batches can leave the sent list
-	// and need no redelivery (issue #235). The registry is read under c.mu:
-	// live re-slicing (issue #312) mutates it at runtime, so the old
-	// "immutable after boot" assumption is gone (issue #479).
+	// and need no redelivery (issue #235); the registry is read under c.mu (#479).
 	if w := c.workerFor(worker); w != nil {
 		w.dropSent(popped)
 	}
@@ -2991,31 +2989,6 @@ func (c *Coordinator) workerByTicket(ticket string) (*workerState, bool) {
 	defer c.mu.Unlock()
 	w, ok := c.byTicket[ticket]
 	return w, ok
-}
-
-// workerFor returns the worker registered under name, or nil. It reads under
-// c.mu: registerOwner/retireOwner mutate the registry at runtime during a
-// re-slice (issue #312), so an unlocked read races them (issue #479). The
-// returned pointer stays valid even if the worker is retired concurrently (the
-// GC keeps it alive), which is what the ack path needs — it only prunes that
-// worker's own sent list.
-func (c *Coordinator) workerFor(name string) *workerState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.workers[name]
-}
-
-// workersSnapshot returns the registered workers at one instant, for a reader
-// that must touch several of them (shutdown, dashboard summary) without
-// holding c.mu across the loop.
-func (c *Coordinator) workersSnapshot() []*workerState {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]*workerState, 0, len(c.workers))
-	for _, w := range c.workers {
-		out = append(out, w)
-	}
-	return out
 }
 
 // workerRefs returns the table refs a worker owns, or nil if it is unknown.
