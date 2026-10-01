@@ -56,7 +56,7 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 		return nil, nil // skip non-CDC operations (t, etc.)
 	}
 
-	table := d.resolveTable(record.Key, env)
+	table := d.resolveTable(record.Topic, env)
 	target := env.Source.DB + "." + env.Source.Table
 	if table != "" {
 		target = table
@@ -111,10 +111,10 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 	return []rowchange.Change{c}, nil
 }
 
-func (d *DebeziumJSON) resolveTable(topic []byte, env debeziumEnvelope) string {
+func (d *DebeziumJSON) resolveTable(topic string, env debeziumEnvelope) string {
 	// Check the TopicToTable map first — allows explicit topic → target
 	// mapping when the envelope's source table doesn't match the pipeline.
-	if t, ok := d.TopicToTable[string(topic)]; ok {
+	if t, ok := d.TopicToTable[topic]; ok {
 		return t
 	}
 	// Fall back to the envelope's source table if available.

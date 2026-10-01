@@ -132,9 +132,9 @@ func TestDebeziumJSONCustomTableMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Envelope source takes precedence when available.
-	if changes[0].Table != "shop.users" {
-		t.Errorf("table = %q, want shop.users", changes[0].Table)
+	// The topic → target mapping wins over the envelope's source table.
+	if changes[0].Table != "raw.users" {
+		t.Errorf("table = %q, want raw.users", changes[0].Table)
 	}
 }
 
