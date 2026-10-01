@@ -25,8 +25,8 @@ import (
 
 // ── profiles ────────────────────────────────────────────────────────────
 
-// workloadProfile sizes a run. The smoke and full profiles share every line
-// of the generator; only these numbers differ.
+// workloadProfile sizes a run. The profiles share every line of the
+// generator; only these numbers differ.
 type workloadProfile struct {
 	Name        string
 	InitialRows int           // rows seeded per table before the pipeline starts
@@ -48,7 +48,20 @@ var (
 		Name: "full", InitialRows: 1_000_000, MeanRate: 1000, Duration: 30 * time.Minute,
 		MaxTxnRows: 2000, MaxPayload: 256 << 10, Settle: 60 * time.Minute,
 	}
+	// full100kProfile is the full profile on a tenth of the seeded rows:
+	// the same load, live window and settle (issue #521).
+	full100kProfile = func() workloadProfile {
+		p := fullProfile
+		p.Name, p.InitialRows = "full-100k", 100_000
+		return p
+	}()
 )
+
+// fullLoad reports whether the profile streams the full profile's load. The
+// fault stream and the Pod resources follow the load, not the seeded rows.
+func (p workloadProfile) fullLoad() bool {
+	return p.MeanRate >= fullProfile.MeanRate
+}
 
 // selectedProfile reads URUTAU_E2E_PROFILE (smoke by default).
 func selectedProfile() (workloadProfile, error) {
@@ -57,8 +70,10 @@ func selectedProfile() (workloadProfile, error) {
 		return smokeProfile, nil
 	case "full":
 		return fullProfile, nil
+	case "full-100k":
+		return full100kProfile, nil
 	default:
-		return workloadProfile{}, fmt.Errorf("URUTAU_E2E_PROFILE=%q: want smoke or full", v)
+		return workloadProfile{}, fmt.Errorf("URUTAU_E2E_PROFILE=%q: want smoke, full or full-100k", v)
 	}
 }
 
