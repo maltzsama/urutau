@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,19 +13,27 @@ import (
 )
 
 // neverCaughtReader never reaches the high watermark, so WaitCaughtUp would
-// poll until its window timeout unless the wait is aborted.
-type neverCaughtReader struct{}
+// poll until its window timeout unless the wait is aborted. polled closes on
+// the first Synced call, so a test can coordinate with the wait instead of
+// racing a sleep.
+type neverCaughtReader struct {
+	once   sync.Once
+	polled chan struct{}
+}
 
-func (neverCaughtReader) Synced() position.Position { return position.MustGTID("") }
+func (r *neverCaughtReader) Synced() position.Position {
+	r.once.Do(func() { close(r.polled) })
+	return position.MustGTID("")
+}
 
-func (neverCaughtReader) Master(context.Context) (position.Position, error) {
+func (r *neverCaughtReader) Master(context.Context) (position.Position, error) {
 	return position.MustGTID(""), nil
 }
 
-func (neverCaughtReader) OpenWindow(context.Context, uint32) {}
-func (neverCaughtReader) ClearWindow()                       {}
+func (r *neverCaughtReader) OpenWindow(context.Context, uint32) {}
+func (r *neverCaughtReader) ClearWindow()                       {}
 
-var _ source.SourceReader = neverCaughtReader{}
+var _ source.SourceReader = (*neverCaughtReader)(nil)
 
 // A worker lost while the reader catches up must abort the wait as a worker
 // loss (so the partition redoes the chunk, #461) instead of burning the whole
@@ -32,17 +41,20 @@ var _ source.SourceReader = neverCaughtReader{}
 func TestWaitCaughtUpOrLostAbortsOnWorkerLoss(t *testing.T) {
 	c := &Coordinator{}
 	lost := make(chan struct{})
+	reader := &neverCaughtReader{polled: make(chan struct{})}
 
 	high := position.MustGTID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-10")
 	cfg := snapshot.SnapshotConfig{CaughtUpPoll: time.Millisecond, WindowTimeout: 30 * time.Second}
 
+	// Close lost only once the wait is actually polling, so the abort lands
+	// mid-wait without a sleep.
 	go func() {
-		time.Sleep(20 * time.Millisecond)
+		<-reader.polled
 		close(lost)
 	}()
 
 	start := time.Now()
-	err := c.waitCaughtUpOrLost(context.Background(), neverCaughtReader{}, high, cfg, lost)
+	err := c.waitCaughtUpOrLost(context.Background(), reader, high, cfg, 0, lost)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, errWorkerLost) {

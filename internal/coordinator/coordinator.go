@@ -1833,7 +1833,7 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	// its full queue blocks the shared pump so the reader never reaches high;
 	// waiting out the window timeout would end the run (issue #526) instead of
 	// redoing the chunk, so the wait aborts on the loss.
-	if err := c.waitCaughtUpOrLost(ctx, rdr, high, cfg, lost); err != nil {
+	if err := c.waitCaughtUpOrLost(ctx, rdr, high, cfg, chunkID, lost); err != nil {
 		return err
 	}
 	// The marker's position is the reader's, past every batch sent before
