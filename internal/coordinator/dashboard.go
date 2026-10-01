@@ -75,13 +75,16 @@ func (s dashState) Summary() dashboard.PipelineSummary {
 	case c.anyWorkerDown():
 		status = "degraded"
 	}
+	c.mu.Lock()
+	workers := len(c.workers)
+	c.mu.Unlock()
 	return dashboard.PipelineSummary{
 		Pipeline:           c.cfg.Spec.Pipeline,
 		RunID:              c.runID,
 		SourceKind:         c.cfg.Spec.Source.Kind,
 		SinkType:           c.cfg.Spec.Sink.Type,
 		Tables:             len(c.cfg.Spec.Tables),
-		Workers:            len(c.workers),
+		Workers:            workers,
 		StartedAt:          c.startedAt.UTC().Format(time.RFC3339),
 		UptimeS:            int64(time.Since(c.startedAt).Seconds()),
 		Status:             status,

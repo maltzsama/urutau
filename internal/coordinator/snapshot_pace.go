@@ -142,7 +142,7 @@ func (c *Coordinator) onMarkerAck(worker string, id uint64) {
 	if freedOversized {
 		c.budget.clearOversized(worker)
 	}
-	if w := c.workers[worker]; w != nil {
+	if w := c.workerFor(worker); w != nil {
 		w.dropSent(popped)
 	}
 }

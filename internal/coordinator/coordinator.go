@@ -2493,8 +2493,8 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		c.budget.clearOversized(worker)
 	}
 	// The ack is durable evidence: the popped batches can leave the sent list
-	// and need no redelivery (issue #235). c.workers is immutable after boot.
-	if w := c.workers[worker]; w != nil {
+	// and need no redelivery (issue #235); the registry is read under c.mu (#479).
+	if w := c.workerFor(worker); w != nil {
 		w.dropSent(popped)
 	}
 	// The ack is evidence of a durable commit: record it and recompute the
@@ -3048,7 +3048,7 @@ func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr e
 // ack what is in flight, then exit 0 (design §5.3.2). Called on shutdown
 // and before terminal exits.
 func (c *Coordinator) gracefulShutdown() {
-	for _, w := range c.workers {
+	for _, w := range c.workersSnapshot() {
 		c.mu.Lock()
 		ctrl := w.control
 		c.mu.Unlock()
