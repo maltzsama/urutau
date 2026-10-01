@@ -138,3 +138,41 @@ func TestKeyFromSpecOrder(t *testing.T) {
 		t.Errorf("key = %v, want [nil x]", key)
 	}
 }
+
+// A key-only old tuple ('K') carries just the identity key columns, in key
+// order, not the table's full column order — so it must be decoded by name,
+// not positionally (issue #500).
+func TestTupleToMapByNameKeyOnly(t *testing.T) {
+	// orderState is id, v, amount, active. A key (id, v) whose tuple holds two
+	// columns: a positional decode would put v into amount/active.
+	st := orderState()
+
+	row, err := tupleToMapByName(st, tuple(col("7"), col("x")), []string{"id", "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row["id"] != int64(7) || row["v"] != "x" {
+		t.Fatalf("row = %+v, want id=7 v=x", row)
+	}
+
+	// A key that is not the leading column still maps by name.
+	st2 := orderState()
+	st2.PKColumns = []int{1}
+
+	row, err = tupleToMapByName(st2, tuple(col("hello")), []string{"v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row["v"] != "hello" {
+		t.Fatalf("row = %+v, want v=hello", row)
+	}
+
+	// A key tuple whose width does not match the key is an error, not a
+	// partial or mis-mapped row.
+	if _, err := tupleToMapByName(st, tuple(col("1"), col("2"), col("3")), []string{"id", "v"}); err == nil {
+		t.Fatal("want an error for a key tuple wider than the primary key")
+	}
+	if _, err := tupleToMapByName(st, tuple(col("1")), []string{"id", "v"}); err == nil {
+		t.Fatal("want an error for a key tuple narrower than the primary key")
+	}
+}

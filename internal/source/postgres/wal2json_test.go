@@ -3,6 +3,8 @@ package postgres
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/maltzsama/urutau/position"
 )
 
 func TestCoerceWal2json(t *testing.T) {
@@ -53,6 +55,32 @@ func TestWal2jsonRow(t *testing.T) {
 	}
 	if _, ok := row["v"]; ok {
 		t.Fatalf("row = %+v, want no v", row)
+	}
+}
+
+func TestStartWal2jsonTxnSetsCurLSN(t *testing.T) {
+	r := &Reader{}
+	want := *position.MustLSN("0/16B6C50")
+
+	got, err := r.startWal2jsonTxn("0/16B6C50")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.curLSN != want || got != want {
+		t.Fatalf("curLSN=%v lsn=%v, want %v (the window dedup needs curLSN set — #499)", r.curLSN, got, want)
+	}
+
+	// An idle message (no nextlsn) must not leave a stale LSN behind.
+	r.curLSN = want
+	if _, err := r.startWal2jsonTxn(""); err != nil {
+		t.Fatal(err)
+	}
+	if r.curLSN != 0 {
+		t.Fatalf("curLSN = %v, want 0 for an empty nextlsn", r.curLSN)
+	}
+
+	if _, err := r.startWal2jsonTxn("not-an-lsn"); err == nil {
+		t.Fatal("want an error for an unparseable nextlsn")
 	}
 }
 
