@@ -234,8 +234,8 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 			name, delivery, s.c.workerTermination(name))
 	}
 	for _, name := range stalled {
-		w, ok := s.c.workers[name]
-		if !ok {
+		w := s.c.workerFor(name)
+		if w == nil {
 			continue
 		}
 		// A reset redelivers the unacked batches on reconnect (issue #235):
