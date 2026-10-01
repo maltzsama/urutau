@@ -3,7 +3,9 @@ package flightserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -31,17 +33,17 @@ import (
 type SinkServer struct {
 	flight.BaseFlightServer
 
-	snk   sink.Sink
-	alloc memory.Allocator
-	mu    writerCache
+	snk     sink.Sink
+	alloc   memory.Allocator
+	writers writerCache
 }
 
 // NewSinkServer wraps snk for in-process Flight serving.
 func NewSinkServer(snk sink.Sink) *SinkServer {
 	return &SinkServer{
-		snk:   snk,
-		alloc: memory.NewGoAllocator(),
-		mu:    writerCache{writers: map[string]sink.TableWriter{}},
+		snk:     snk,
+		alloc:   memory.NewGoAllocator(),
+		writers: writerCache{tables: map[string]*tableWriter{}},
 	}
 }
 
@@ -76,7 +78,7 @@ func (s *SinkServer) DoAction(action *flight.Action, stream flight.FlightService
 		// (Iceberg and friends have no separate flush step); nothing to do.
 		return stream.Send(&flight.Result{})
 	case "urutau.shutdown":
-		s.mu.closeAll()
+		s.writers.closeAll()
 		return stream.Send(&flight.Result{})
 	default:
 		return status.Errorf(codes.Unimplemented, "flightserver: unknown action %q", action.Type)
@@ -105,7 +107,7 @@ func (s *SinkServer) DoPut(stream flight.FlightService_DoPutServer) error {
 		return status.Error(codes.InvalidArgument, "flightserver: doput descriptor missing table")
 	}
 
-	w, err := s.mu.writerFor(stream.Context(), s.snk, req.Table)
+	w, err := s.writers.writerFor(stream.Context(), s.snk, req.Table)
 	if err != nil {
 		return status.Errorf(codes.Internal, "flightserver: writer %s: %v", req.Table, err)
 	}
@@ -130,30 +132,120 @@ func (s *SinkServer) DoPut(stream flight.FlightService_DoPutServer) error {
 	return stream.Send(&flight.PutResult{})
 }
 
-// writerCache keeps one TableWriter per table for the sink's lifetime — the
+// writerCache keeps one committer per table for the sink's lifetime — the
 // plugin sink contract commits per DoPut call, but the wrapped sink.Sink's
-// Writer() is meant to be opened once per table and reused (Close releases
-// on shutdown).
+// Writer() is meant to be opened once per table and reused (Close releases on
+// shutdown). gRPC serves each DoPut stream in its own goroutine, so the cache
+// is concurrency-safe in three ways (issue #478):
+//
+//   - the table map is guarded by mu, so concurrent streams do not race it;
+//   - each table's committer is serialized by tableWriter, because a
+//     sink.TableWriter's Commit is not safe to call concurrently;
+//   - closeAll marks the cache closed, so a committer opened by an in-flight
+//     stream after shutdown is closed instead of leaked.
 type writerCache struct {
-	writers map[string]sink.TableWriter
+	mu     sync.Mutex
+	closed bool
+	tables map[string]*tableWriter
 }
 
-func (c *writerCache) writerFor(ctx context.Context, snk sink.Sink, table string) (sink.TableWriter, error) {
-	if w, ok := c.writers[table]; ok {
-		return w, nil
+// tableWriter serializes the calls a shared per-table committer receives:
+// concurrent DoPut streams for one table, and the shutdown Close.
+type tableWriter struct {
+	mu sync.Mutex
+	w  sink.TableWriter
+}
+
+func (t *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.w.Commit(ctx, b)
+}
+
+func (t *tableWriter) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return t.w.Close()
+}
+
+// errWriterCacheClosed is returned once the cache has been shut down: a DoPut
+// arriving after shutdown must fail rather than open a committer nothing will
+// close.
+var errWriterCacheClosed = errors.New("flightserver: writer cache is closed")
+
+// tableOpener is the slice of sink.Sink writerFor needs. Narrowing the
+// dependency keeps the cache unit-testable without a full sink double.
+type tableOpener interface {
+	Writer(ctx context.Context, ref core.TableRef, cast core.CastPolicy, meta []core.MetadataColumn) (sink.TableWriter, error)
+}
+
+// writerFor returns the table's committer, opening it once. The open happens
+// outside the lock: sink.Writer may block on the catalog, and holding the lock
+// across it would stall every other table's writerFor (and closeAll) behind
+// one slow open. A lost open race is closed and the winner returned, so every
+// caller still observes exactly one committer per table.
+func (c *writerCache) writerFor(ctx context.Context, opener tableOpener, table string) (sink.TableWriter, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+
+		return nil, errWriterCacheClosed
 	}
+	if tw, ok := c.tables[table]; ok {
+		c.mu.Unlock()
+
+		return tw, nil
+	}
+	c.mu.Unlock()
+
 	ref := core.TableRef{Target: table}
-	w, err := snk.Writer(ctx, ref, core.CastPolicy{}, nil)
+
+	created, err := opener.Writer(ctx, ref, core.CastPolicy{}, nil)
 	if err != nil {
 		return nil, err
 	}
-	c.writers[table] = w
-	return w, nil
+
+	tw := &tableWriter{w: created}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		_ = tw.Close()
+
+		return nil, errWriterCacheClosed
+	}
+	if existing, ok := c.tables[table]; ok {
+		c.mu.Unlock()
+		_ = tw.Close()
+
+		return existing, nil
+	}
+	c.tables[table] = tw
+	c.mu.Unlock()
+
+	return tw, nil
 }
 
 func (c *writerCache) closeAll() {
-	for _, w := range c.writers {
-		_ = w.Close()
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+
+		return
+	}
+	c.closed = true
+
+	tables := make([]*tableWriter, 0, len(c.tables))
+	for _, tw := range c.tables {
+		tables = append(tables, tw)
+	}
+	c.tables = nil
+	c.mu.Unlock()
+
+	for _, tw := range tables {
+		_ = tw.Close()
 	}
 }
 
