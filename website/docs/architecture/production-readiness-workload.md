@@ -32,8 +32,8 @@ make e2e-pods-up        # once; needs make k8s-load-race first
 URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 60m
 # full profile:
 URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 120m
-# the full load in a shorter run (100,000 seeded rows per table, 10-minute window):
-URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 100m
+# the full load in a shorter run (100,000 seeded rows per table, 10-minute window, 15-minute settle):
+URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^TestProductionReadinessWorkload$' -v -timeout 40m
 ```
 
 | Variable | Effect |
@@ -44,8 +44,12 @@ URUTAU_E2E_PODS=1 URUTAU_E2E_PROFILE=full-100k go test ./test/e2e/pods/ -run '^T
 | `URUTAU_E2E_TABLES` | Comma-separated table kinds (`accounts`, `items`, `events`) to narrow a run while debugging one table. The coverage checks still expect all three, so a narrowed run always fails coverage, naming the omitted tables: it is never a pass of the matrix. |
 
 The test's own budget is the live window plus the settle timeout plus 15
-minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full, 85 for full-100k),
+minutes for boot, seeding and teardown (48 minutes for smoke, 105 for full),
 so the `-timeout` values above leave it room to report its own failure.
+`full-100k` is the exception: its budget is 40 minutes, the same as its
+`-timeout`, and 55 with the chaos run's post-settle checks. A run that does
+not converge fails on its settle about 28 minutes in; only one that uses
+every margin in full is cut by the `-timeout` instead.
 
 The seed reproduces every random draw, not the timing: regimes end on the
 wall clock, so a replay can cut them at different transactions.
@@ -77,10 +81,11 @@ The profiles share every line of the generator; only the sizes differ.
 | Live window | 3 min | 30 min | 10 min |
 | Largest transaction | 150 rows | 2,000 rows | 2,000 rows |
 | Largest `events` payload | 64 KiB | 256 KiB | 256 KiB |
-| Settle timeout | 30 min | 60 min | 60 min |
+| Settle timeout | 30 min | 60 min | 15 min |
 
-`full-100k` is the full load in a run about a third as long: a tenth of the
-seeded rows and a 10-minute live window. The rate, the fault stream and the
+`full-100k` is the full load in a run that fits a 40-minute `-timeout`: a
+tenth of the seeded rows, a 10-minute live window and a 15-minute settle.
+The rate, the fault stream and the
 Pod resources are the full profile's; where this page says full for those,
 it means both.
 

@@ -48,20 +48,22 @@ var (
 		Name: "full", InitialRows: 1_000_000, MeanRate: 1000, Duration: 30 * time.Minute,
 		MaxTxnRows: 2000, MaxPayload: 256 << 10, Settle: 60 * time.Minute,
 	}
-	// full100kProfile is the full load in a run a third as long (issue
-	// #521): a tenth of the seeded rows and a 10-minute live window. In the
-	// full run chaos-1M-079e45b every fault kind had been injected 5.2
-	// minutes into the window.
+	// full100kProfile is the full load in a run that fits a 40-minute
+	// -timeout (issue #521): a tenth of the seeded rows, a 10-minute live
+	// window and a 15-minute settle. In the full run chaos-1M-079e45b every
+	// fault kind had been injected 5.2 minutes into the window, and the
+	// sink converged 7 minutes after a 30-minute one.
 	full100kProfile = func() workloadProfile {
 		p := fullProfile
-		p.Name, p.InitialRows, p.Duration = "full-100k", 100_000, 10*time.Minute
+		p.Name, p.InitialRows = "full-100k", 100_000
+		p.Duration, p.Settle = 10*time.Minute, 15*time.Minute
 		return p
 	}()
 )
 
 // fullLoad reports whether the profile streams the full profile's load. The
 // fault stream and the Pod resources follow the load, not the seeded rows
-// or the live window.
+// or the run's length.
 func (p workloadProfile) fullLoad() bool {
 	return p.MeanRate >= fullProfile.MeanRate
 }
