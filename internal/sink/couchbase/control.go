@@ -90,37 +90,51 @@ func readControl(ctx context.Context, kv kvStore) (*controlDoc, error) {
 }
 
 // positionOf reads the committed position for one collection from the
-// control document — one Get, O(1), no scan, no aggregation. When the
-// per-partition map is present (WK-001 C7) it returns the MinSafe across
-// owners, so a lagging partition is never resumed past; otherwise the scalar
-// (a pre-C7 document, or workers==1). Empty string means the collection was
-// never written and needs the snapshot. When ownerCount > 1 and the map is
-// incomplete, it returns "" — no safe minimum — rather than a MinSafe over a
-// subset that could advance past the missing owner.
-func positionOf(ctx context.Context, kv kvStore, sourceKind string, ownerCount int) (string, error) {
+// control document — one Get, O(1), no scan, no aggregation. It returns the
+// MinSafe across the CURRENT owners (WK-001 C7): an entry left by a retired
+// owner (a scale-in) is ignored rather than pinning the minimum forever.
+// When an owner names no committed position, it returns "" — no safe
+// minimum — rather than a MinSafe over a subset that could advance past it.
+// An empty owners list falls back to ownerCount and every entry (legacy).
+// Empty string means the collection was never written and needs the snapshot.
+func positionOf(ctx context.Context, kv kvStore, sourceKind string, ownerCount int, owners []string) (string, error) {
 	doc, err := readControl(ctx, kv)
 	if err != nil || doc == nil {
 		return "", err
 	}
-	if len(doc.Positions) > 0 {
-		if ownerCount > 1 && len(doc.Positions) < ownerCount {
+	if len(doc.Positions) == 0 {
+		return doc.Position, nil
+	}
+	names := owners
+	if len(names) == 0 {
+		names = make([]string, 0, len(doc.Positions))
+		for owner := range doc.Positions {
+			names = append(names, owner)
+		}
+		if ownerCount > len(names) {
 			return "", nil
 		}
-		parsed := make([]position.Position, 0, len(doc.Positions))
-		for owner, p := range doc.Positions {
-			pp, perr := position.Parse(sourceKind, p)
-			if perr != nil {
-				return "", fmt.Errorf("couchbase: position owner %s: %w", owner, perr)
-			}
-			parsed = append(parsed, pp)
+	}
+	parsed := make([]position.Position, 0, len(names))
+	for _, owner := range names {
+		p, ok := doc.Positions[owner]
+		if !ok {
+			// A current owner has not committed a position yet: no safe
+			// minimum, so the caller snapshots (idempotent).
+			return "", nil
 		}
-		best, err := position.MinSafe(parsed)
-		if err != nil {
-			return "", err
+		pp, perr := position.Parse(sourceKind, p)
+		if perr != nil {
+			return "", fmt.Errorf("couchbase: position owner %s: %w", owner, perr)
 		}
-		if best != nil {
-			return best.String(), nil
-		}
+		parsed = append(parsed, pp)
+	}
+	best, err := position.MinSafe(parsed)
+	if err != nil {
+		return "", err
+	}
+	if best != nil {
+		return best.String(), nil
 	}
 	return doc.Position, nil
 }

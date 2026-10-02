@@ -153,7 +153,7 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	if exists == 0 {
 		return "", nil
 	}
-	if pos, ok, err := s.partitionPosition(ctx, ident, ref.OwnerCount); err != nil {
+	if pos, ok, err := s.partitionPosition(ctx, ident, ref.OwnerCount, ref.Owners); err != nil {
 		return "", err
 	} else if ok {
 		return pos, nil
@@ -196,27 +196,40 @@ func (s *Sink) readOwnerPositions(ctx context.Context, ident tableIdent) (map[st
 }
 
 // partitionPosition reads the latest position per owner from the control
-// table and returns their MinSafe. ok is false when the table is absent or
-// has no rows (a pre-C7 table), so the caller falls back to the legacy read.
-// When ownerCount > 1 and fewer owners have committed, it returns ok=true
-// with an empty position — no safe minimum — so the caller snapshots rather
-// than resume past the missing owner (WK-001 §2.6).
-func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent, ownerCount int) (pos string, ok bool, err error) {
-	owners, err := s.readOwnerPositions(ctx, ident)
+// table and returns the MinSafe over the CURRENT owners. ok is false when the
+// table is absent or has no rows (a pre-C7 table), so the caller falls back to
+// the legacy read. An entry left by a retired owner (a scale-in) is ignored
+// rather than pinning the minimum. When a current owner has not committed, it
+// returns ok=true with an empty position — no safe minimum — so the caller
+// snapshots rather than resume past it (WK-001 §2.6). An empty owners list
+// falls back to ownerCount and every entry (legacy).
+func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent, ownerCount int, owners []string) (pos string, ok bool, err error) {
+	present, err := s.readOwnerPositions(ctx, ident)
 	if err != nil {
 		return "", false, err
 	}
-	if len(owners) == 0 {
+	if len(present) == 0 {
 		return "", false, nil
 	}
-	if ownerCount > 1 && len(owners) < ownerCount {
-		// An owner has not committed a position yet. A MinSafe over the
-		// present owners could advance past it, so there is no safe minimum:
-		// report "no position" and let the caller snapshot (idempotent).
-		return "", true, nil
+	names := owners
+	if len(names) == 0 {
+		names = make([]string, 0, len(present))
+		for o := range present {
+			names = append(names, o)
+		}
+		if ownerCount > len(names) {
+			return "", true, nil
+		}
 	}
-	positions := make([]string, 0, len(owners))
-	for _, p := range owners {
+	positions := make([]string, 0, len(names))
+	for _, o := range names {
+		p, ok := present[o]
+		if !ok {
+			// A current owner has not committed a position yet. A MinSafe
+			// over the present owners could advance past it, so there is no
+			// safe minimum: report "no position" and let the caller snapshot.
+			return "", true, nil
+		}
 		positions = append(positions, p)
 	}
 	pos, err = minSafePosition(s.sourceKind, positions)

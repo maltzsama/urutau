@@ -581,7 +581,7 @@ func TestPositionOfMinSafeAcrossOwners(t *testing.T) {
 		Position:  "0/100",
 		Positions: map[string]string{"w0": "0/100", "w1": "0/2"},
 	})
-	got, err := positionOf(context.Background(), kv, "postgres", 2)
+	got, err := positionOf(context.Background(), kv, "postgres", 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +593,7 @@ func TestPositionOfMinSafeAcrossOwners(t *testing.T) {
 	_ = kv1.upsert(context.Background(), controlKey, controlDoc{
 		Position: "0/2", Positions: map[string]string{"w0": "0/2"},
 	})
-	if got, err := positionOf(context.Background(), kv1, "postgres", 1); err != nil || got != "0/2" {
+	if got, err := positionOf(context.Background(), kv1, "postgres", 1, nil); err != nil || got != "0/2" {
 		t.Fatalf("single owner = %q, %v; want 0/2", got, err)
 	}
 }
@@ -602,7 +602,7 @@ func TestPositionOfMinSafeAcrossOwners(t *testing.T) {
 func TestPositionOfFallsBackToScalar(t *testing.T) {
 	kv := newFakeKV()
 	_ = kv.upsert(context.Background(), controlKey, controlDoc{Position: "g1:9"})
-	got, err := positionOf(context.Background(), kv, "mysql", 0)
+	got, err := positionOf(context.Background(), kv, "mysql", 0, nil)
 	if err != nil || got != "g1:9" {
 		t.Fatalf("positionOf = %q, %v; want g1:9", got, err)
 	}
@@ -630,7 +630,7 @@ func TestPositionOfHoldsBackOnIncompleteOwners(t *testing.T) {
 		Position:  "0/100",
 		Positions: map[string]string{"w0": "0/100"}, // 1 of 2 owners
 	})
-	if got, err := positionOf(context.Background(), kv, "postgres", 2); err != nil || got != "" {
+	if got, err := positionOf(context.Background(), kv, "postgres", 2, nil); err != nil || got != "" {
 		t.Fatalf("incomplete owner set = %q, %v; want no safe position", got, err)
 	}
 }
@@ -656,7 +656,7 @@ func TestSeedPositionsFillsMissingOwners(t *testing.T) {
 		t.Fatalf("seeded positions = %v, want w1/w2 = 0/100", doc.Positions)
 	}
 	// Position() now covers the full owner set.
-	if got, err := positionOf(context.Background(), kv, "postgres", 3); err != nil || got != "0/100" {
+	if got, err := positionOf(context.Background(), kv, "postgres", 3, nil); err != nil || got != "0/100" {
 		t.Fatalf("positionOf after seed = %q, %v; want 0/100", got, err)
 	}
 
@@ -667,5 +667,25 @@ func TestSeedPositionsFillsMissingOwners(t *testing.T) {
 	}
 	if doc, _ := readControl(context.Background(), fresh); doc != nil {
 		t.Fatalf("seed wrote a fresh table: %+v", doc)
+	}
+}
+
+// A retired owner's entry must not pin the resume point: a scale-in leaves
+// stale per-owner entries, and Position must consider only the current owners.
+func TestPositionOfIgnoresRetiredOwners(t *testing.T) {
+	kv := newFakeKV()
+	_ = kv.upsert(context.Background(), controlKey, controlDoc{
+		Position: "0/10",
+		Positions: map[string]string{
+			"w0": "0/100", "w1": "0/200", // current
+			"p-2": "0/5", "p-3": "0/6", // retired (scale-in)
+		},
+	})
+	if got, err := positionOf(context.Background(), kv, "postgres", 2, []string{"w0", "w1"}); err != nil || got != "0/100" {
+		t.Fatalf("positionOf = %q, %v; want 0/100 (retired owners ignored)", got, err)
+	}
+	// A current owner with no entry still holds the minimum back.
+	if got, err := positionOf(context.Background(), kv, "postgres", 3, []string{"w0", "w1", "w4"}); err != nil || got != "" {
+		t.Fatalf("incomplete = %q, %v; want no safe position", got, err)
 	}
 }

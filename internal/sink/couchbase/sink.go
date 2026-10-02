@@ -296,7 +296,7 @@ func (s *Sink) Position(ctx context.Context, ref core.TableRef) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind, ref.OwnerCount)
+	return positionOf(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, s.sourceKind, ref.OwnerCount, ref.Owners)
 }
 
 // SeedPositions records a baseline for every expected owner that has no
