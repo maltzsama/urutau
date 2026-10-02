@@ -2759,7 +2759,14 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 		// The expected partition count travels to the sink: a per-partition
 		// Position() must not return a MinSafe over an incomplete owner set,
 		// or an owner with no committed position yet is resumed past (§2.6).
-		ref.OwnerCount = len(c.loadRouting().owners[ref.Target])
+		// The current owner NAMES travel too, so an entry left by a retired
+		// owner (a scale-in) is ignored rather than pinning the minimum.
+		ws := c.loadRouting().owners[ref.Target]
+		ref.OwnerCount = len(ws)
+		ref.Owners = make([]string, 0, len(ws))
+		for _, w := range ws {
+			ref.Owners = append(ref.Owners, w.name)
+		}
 		pos, err := c.snk.Position(ctx, ref)
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)
