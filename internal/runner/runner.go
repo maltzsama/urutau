@@ -497,6 +497,7 @@ type Runner struct {
 	rdr                   source.Reader
 	snk                   sink.Sink
 	closeQuery            func()
+	cancel                context.CancelFunc // stops the worker/relay goroutines (issue #487)
 	workerErr, routerDone <-chan error
 
 	// committedPositions tracks the latest durably-committed position per
@@ -505,17 +506,6 @@ type Runner struct {
 	posMu              sync.Mutex
 	committedPositions map[string]position.Position
 	minConfirmed       position.Position // recomputed on each commit
-}
-
-// emit posts one lifecycle event to the audit trail, best-effort by
-// contract: a lost event is logged and the pipeline carries on.
-func (r *Runner) emit(kind string, fields map[string]any) {
-	if r.ev == nil {
-		return
-	}
-	if err := r.ev.Emit(context.Background(), kind, fields); err != nil {
-		r.log.Warn("eventlog: emit failed", "kind", kind, "err", err)
-	}
 }
 
 // NewRunner sets up the collapsed pipeline (catalog, writers, worker,
@@ -785,22 +775,20 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		}
 	},
 		committedPositions: make(map[string]position.Position)}
+	// Run-scoped context: the worker, relay and maintenance goroutines below
+	// outlive setup, so they run under a child context Run cancels on return
+	// (issue #487).
+	runCtx, cancel := context.WithCancel(ctx)
+	r.cancel = cancel
 
-	// Iceberg table maintenance (issue #96): the collapsed runner schedules
-	// maintenance in-process — one loop per target table, for the life of
-	// the pipeline (ctx, not a narrower setup-only context) — because there
-	// is no separate worker process to hand the pass to. The distributed
-	// coordinator instead provisions an ephemeral maintenance worker per
-	// table (see its scheduler). Checked against the NEUTRAL sink.Maintainable
-	// interface — never a concrete sink package, which
-	// internal/architecture's TestOrchestrationConsumesContracts forbids
-	// the runner from importing. Maintenance is Iceberg-only (spec.Validate
-	// rejects it on any other sink type), so a sink that does not implement
-	// the capability here is a bug, not a configuration to tolerate: fail
-	// loudly, matching requireConcurrentSink's hard capability check in the
-	// coordinator, rather than silently dropping the operator's maintenance
-	// block. Skipped entirely (no goroutine at all) when Maintenance is nil
-	// or disabled, so a pipeline that never configured it pays nothing.
+	// Iceberg table maintenance (issue #96): one in-process loop per target
+	// table for the life of the pipeline — there is no separate worker
+	// process to hand the pass to, unlike the coordinator's ephemeral
+	// maintenance workers. The sink is checked through the NEUTRAL
+	// sink.Maintainable interface (never a concrete sink package, which
+	// internal/architecture forbids); maintenance is Iceberg-only and
+	// spec.Validate rejects it elsewhere, so a sink lacking the capability is
+	// a bug, not a config to tolerate. No goroutine when Maintenance is off.
 	if s.Sink.MaintenanceEnabled() {
 		msnk, ok := snk.(sink.Maintainable)
 		if !ok {
@@ -827,7 +815,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 				return pos
 			}
 			m := msnk.Maintain(ref, *s.Sink.Maintenance, log, currentPosition, nil)
-			go maintenance.RunLoop(ctx, m, ref.Target, s.Sink.Maintenance, sched, log)
+			go maintenance.RunLoop(runCtx, m, ref.Target, s.Sink.Maintenance, sched, log)
 		}
 	}
 
@@ -869,7 +857,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		r.updateCommitted(b.Table, p)
 	})
 	workerErr := make(chan error, 1)
-	go func() { workerErr <- w.Run(ctx, ingest) }()
+	go func() { workerErr <- w.Run(runCtx, ingest) }()
 
 	resume, needsSnapshot, recovery, err := resumeFrom(ctx, src, snk, cdcRefs)
 	if err != nil {
@@ -977,7 +965,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		}
 		router = newRelay(ingest, w)
 		routerDone = make(chan error, 1)
-		go func() { routerDone <- router.run(ctx, rdr) }()
+		go func() { routerDone <- router.run(runCtx, rdr) }()
 	}
 
 	// Snapshot phase: DBLog for tables with no committed position, or whose
@@ -1101,11 +1089,13 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 // Run blocks until ctx is cancelled or a terminal error surfaces, then
 // releases the pipeline resources and seals the audit trail.
 func (r *Runner) Run(ctx context.Context) error {
-	// A terminal error from any goroutine must stop the others: run under a
-	// child context cancelled the moment the run returns (issue #487).
-	runCtx, cancel := context.WithCancel(ctx)
-	err := r.run(runCtx)
-	cancel()
+	err := r.run(ctx)
+	// Stop the worker, the relay and the maintenance loops that newRunner
+	// started under runCtx before releasing their resources: a terminal error
+	// from one of them would otherwise leave the peers running (issue #487).
+	if r.cancel != nil {
+		r.cancel()
+	}
 
 	if r.ev != nil {
 		reason := "error"
