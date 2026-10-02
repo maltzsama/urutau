@@ -45,11 +45,6 @@ type stagedCycles struct {
 	open  map[cycleKey]*stagedCycle // still accumulating
 	done  map[cycleKey]*stagedCycle // complete, waiting for its turn
 	order map[string][]uint64       // per table, seqs in send order
-	// gapped marks a table whose cycles were discarded after an owner was
-	// lost: a later cycle must not commit over the gap, or the durable
-	// position would advance past the discarded rows and a replay would
-	// never recover them (issue #372).
-	gapped map[string]bool
 }
 
 type cycleKey struct {
@@ -59,21 +54,10 @@ type cycleKey struct {
 
 func newStagedCycles() *stagedCycles {
 	return &stagedCycles{
-		open:   map[cycleKey]*stagedCycle{},
-		done:   map[cycleKey]*stagedCycle{},
-		order:  map[string][]uint64{},
-		gapped: map[string]bool{},
+		open:  map[cycleKey]*stagedCycle{},
+		done:  map[cycleKey]*stagedCycle{},
+		order: map[string][]uint64{},
 	}
-}
-
-// isGapped reports whether the table has a gap from a lost owner.
-func (s *stagedCycles) isGapped(target string) bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.gapped[target]
 }
 
 // expect records that a delivery is expected from each of owners for
@@ -191,45 +175,6 @@ func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
 	}
 	s.order[table] = q
 	return out
-}
-
-// discardWorker drops every cycle that still needed a delivery from worker —
-// on session loss those cycles can never complete, and an incomplete cycle must
-// never be committed. Cycles owned only by other workers are LEFT ALONE: they
-// can still complete (issue #372 — the old code discarded every cycle of the
-// affected table, losing rows a live owner had already staged). The table is
-// marked gapped instead, so onStagedBatch refuses to commit a cycle over the
-// discarded gap and the run terminates for a clean replay. Returns the number
-// discarded, for logging.
-//
-// A worker that owed nothing (the safe-reset case) leaves no open cycle here,
-// so an affected table never arises and nothing is discarded.
-func (s *stagedCycles) discardWorker(worker string) int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tables := map[string]bool{}
-	discarded := 0
-	for k, cy := range s.open {
-		if cy.owners[worker] {
-			tables[k.table] = true
-			delete(s.open, k)
-			discarded++
-		}
-	}
-	for k, cy := range s.done {
-		if cy.owners[worker] {
-			tables[k.table] = true
-			delete(s.done, k)
-			discarded++
-		}
-	}
-	for table := range tables {
-		s.gapped[table] = true
-	}
-	return discarded
 }
 
 // openFor counts the cycles of table that are not yet committed: still
