@@ -461,6 +461,10 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		}
 		puller.SetSchemas(schemas)
 	}
+	// The reader ends each transaction with OpTxnEnd, so a batch holds only
+	// whole transactions: recording a transaction's position with part of its
+	// rows would let a resume skip the rest.
+	puller.BoundTransactions()
 	keepReader = true
 	return stream{Reader: rdr, out: out, Puller: puller}, nil
 }
@@ -527,6 +531,7 @@ func (s stream) Start(ctx context.Context, from position.Position) error {
 	if err := AdvanceSlot(ctx, s.db, s.cfg.SlotName, *start); err != nil {
 		return err
 	}
+	s.SetResume(start.String())
 	errCh := make(chan error, 1)
 	s.SetErr(errCh)
 	go func() { errCh <- s.StartFromLSN(ctx, start) }()

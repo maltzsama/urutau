@@ -23,6 +23,14 @@ import (
 
 const batchTarget = 100
 
+// maxBatchRows caps one emitted batch. A transaction-bounded decoder releases
+// a whole transaction at once, so a multi-million-row transaction would
+// otherwise become a single RecordBatch that exceeds the 128 MiB gRPC limit
+// and loops forever. When a transaction is split, only its LAST piece carries
+// the transaction's position; every earlier piece carries the last safe
+// position, so acking it cannot free rows a later piece still owes.
+const maxBatchRows = 2000
+
 // Puller wraps a source's change channel and terminal-error channel into
 // the pull-based Next surface. The concrete source calls Start to launch
 // its decoder and wire the error channel.
@@ -36,6 +44,11 @@ type Puller struct {
 	// the one being decoded.
 	txnBounded bool
 	open       []rowchange.Change
+	// safePos is the position of the last fully emitted transaction (or the
+	// resume point before the first). A batch that splits a transaction is
+	// stamped with it, so an ack of the partial piece does not advance the
+	// durable position past rows still pending.
+	safePos string
 }
 
 // New builds a puller over the decoder's change channel.
@@ -85,6 +98,10 @@ func (p *Puller) SetSourceSchemas(resolved map[string]core.Schema) {
 // transaction's position with part of its rows would let a resume skip the
 // rest (#456).
 func (p *Puller) BoundTransactions() { p.txnBounded = true }
+
+// SetResume records the position the stream resumes from, the safe position
+// for a partial piece of the first transaction. Call before Next.
+func (p *Puller) SetResume(pos string) { p.safePos = pos }
 
 // take files one decoded change: a row joins the open transaction, and
 // OpTxnEnd releases it to buf, grouped by table in order of first
@@ -275,9 +292,26 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	for n < len(p.buf) && p.buf[n].Table == table {
 		n++
 	}
+	if n > maxBatchRows {
+		n = maxBatchRows
+	}
 	run, rest := p.buf[:n], append([]rowchange.Change(nil), p.buf[n:]...)
 	p.buf = run
 	defer func() { p.buf = rest }()
+
+	// A split transaction: only its last piece may carry its commit position.
+	// Every earlier piece carries the last safe position, so acking it cannot
+	// free rows the remaining pieces still owe. A transaction's rows are
+	// contiguous in the buffer (take groups each transaction at its end), so
+	// the head of rest is enough to tell whether it continues.
+	lastPos := run[len(run)-1].Position
+	if len(rest) > 0 && rest[0].Position == lastPos {
+		for i := range run {
+			run[i].Position = p.safePos
+		}
+	} else if lastPos != "" {
+		p.safePos = lastPos
+	}
 
 	// Drift check at the SOURCE boundary, where the native row shape
 	// exists: encode against the canonical schema would silently DROP a
