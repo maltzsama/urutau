@@ -495,6 +495,7 @@ type Runner struct {
 	log                   *slog.Logger
 	ev                    *eventlog.Run
 	rdr                   source.Reader
+	snk                   sink.Sink
 	closeQuery            func()
 	workerErr, routerDone <-chan error
 
@@ -778,7 +779,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 			w.SetEnricher(target, st)
 		}
 	}
-	r = &Runner{w: w, log: log, ev: ev, enrichStages: enrichStages, closeQuery: func() {
+	r = &Runner{w: w, log: log, ev: ev, snk: snk, enrichStages: enrichStages, closeQuery: func() {
 		if qsrc != nil {
 			_ = qsrc.CloseQuery()
 		}
@@ -1100,7 +1101,12 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 // Run blocks until ctx is cancelled or a terminal error surfaces, then
 // releases the pipeline resources and seals the audit trail.
 func (r *Runner) Run(ctx context.Context) error {
-	err := r.run(ctx)
+	// A terminal error from any goroutine must stop the others: run under a
+	// child context cancelled the moment the run returns (issue #487).
+	runCtx, cancel := context.WithCancel(ctx)
+	err := r.run(runCtx)
+	cancel()
+
 	if r.ev != nil {
 		reason := "error"
 		if errors.Is(err, context.Canceled) {
@@ -1113,13 +1119,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		_ = r.ev.Emit(context.Background(), eventlog.KindJobStopped, fields)
 		_ = r.ev.Close()
 	}
-	if r.rdr != nil {
-		r.rdr.Close()
-	}
-	r.closeQuery()
-	for _, st := range r.enrichStages {
-		st.Stop()
-	}
+	r.release()
 	return err
 }
 

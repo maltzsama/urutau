@@ -21,6 +21,7 @@ import (
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -513,5 +514,39 @@ func TestRelayCleanEndOfStreamIsNotAnError(t *testing.T) {
 
 	if err := r.run(context.Background(), &failingReader{err: nil}); err != nil {
 		t.Fatalf("relay.run = %v on a clean end of stream, want nil", err)
+	}
+}
+
+// fakeSink records Close for release tests.
+type fakeSink struct{ closed bool }
+
+func (f *fakeSink) EnsureTable(context.Context, core.TableRef, core.Schema, []string, core.CastPolicy, dataplane.WriteMode) error {
+	return nil
+}
+
+func (f *fakeSink) Writer(context.Context, core.TableRef, core.CastPolicy, []core.MetadataColumn) (sink.TableWriter, error) {
+	return nil, nil
+}
+
+func (f *fakeSink) Position(context.Context, core.TableRef) (string, error) { return "", nil }
+func (f *fakeSink) SetProperties(context.Context, core.TableRef, map[string]string) error {
+	return nil
+}
+
+func (f *fakeSink) Properties(context.Context, core.TableRef) (map[string]string, error) {
+	return nil, nil
+}
+
+func (f *fakeSink) Close() error { f.closed = true; return nil }
+
+// The collapsed runner owns the sink and must close it on the run path; only
+// closing it on startup failure leaks a ClickHouse/Couchbase/plugin
+// connection on every run (issue #487).
+func TestRunnerReleaseClosesSink(t *testing.T) {
+	fs := &fakeSink{}
+	r := &Runner{snk: fs, closeQuery: func() {}}
+	r.release()
+	if !fs.closed {
+		t.Fatal("release must close the sink")
 	}
 }
