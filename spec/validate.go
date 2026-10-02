@@ -540,16 +540,16 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 			*problems = append(*problems, fmt.Sprintf("%s.onColdStart: unsupported %q (want buffer | pass | drop)", ep, e.OnColdStart))
 		}
 		if e.Refresh != "" {
-			if _, err := time.ParseDuration(e.Refresh); err != nil {
-				*problems = append(*problems, fmt.Sprintf("%s.refresh: %q is not a duration (e.g. 5m)", ep, e.Refresh))
+			if !positiveDuration(e.Refresh) {
+				*problems = append(*problems, fmt.Sprintf("%s.refresh: %q is not a positive duration (e.g. 5m)", ep, e.Refresh))
 			}
 		}
 		if e.BufferLimits.MaxEvents < 0 {
 			*problems = append(*problems, ep+".bufferLimits.maxEvents: must be positive")
 		}
 		if e.BufferLimits.MaxWait != "" {
-			if _, err := time.ParseDuration(e.BufferLimits.MaxWait); err != nil {
-				*problems = append(*problems, fmt.Sprintf("%s.bufferLimits.maxWait: %q is not a duration (e.g. 30s)", ep, e.BufferLimits.MaxWait))
+			if !positiveDuration(e.BufferLimits.MaxWait) {
+				*problems = append(*problems, fmt.Sprintf("%s.bufferLimits.maxWait: %q is not a positive duration (e.g. 30s)", ep, e.BufferLimits.MaxWait))
 			}
 		}
 		if e.MaxRows < 0 {
@@ -705,8 +705,8 @@ func validateMaintenance(m *Maintenance, sinkType string, problems *[]string) {
 	}
 	if c := m.Compaction; c != nil {
 		if c.Interval != "" {
-			if _, err := time.ParseDuration(c.Interval); err != nil {
-				*problems = append(*problems, fmt.Sprintf("sink.maintenance.compaction.interval: %q is not a duration (e.g. 5m)", c.Interval))
+			if !positiveDuration(c.Interval) {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.compaction.interval: %q is not a positive duration (e.g. 5m)", c.Interval))
 			}
 		}
 		if c.TargetFileSize != "" {
@@ -717,13 +717,13 @@ func validateMaintenance(m *Maintenance, sinkType string, problems *[]string) {
 	}
 	if e := m.SnapshotExpiry; e != nil {
 		if e.Interval != "" {
-			if _, err := time.ParseDuration(e.Interval); err != nil {
-				*problems = append(*problems, fmt.Sprintf("sink.maintenance.snapshotExpiry.interval: %q is not a duration (e.g. 10m)", e.Interval))
+			if !positiveDuration(e.Interval) {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.snapshotExpiry.interval: %q is not a positive duration (e.g. 10m)", e.Interval))
 			}
 		}
 		if e.MaxAge != "" {
-			if _, err := time.ParseDuration(e.MaxAge); err != nil {
-				*problems = append(*problems, fmt.Sprintf("sink.maintenance.snapshotExpiry.maxAge: %q is not a duration (e.g. 168h)", e.MaxAge))
+			if !positiveDuration(e.MaxAge) {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.snapshotExpiry.maxAge: %q is not a positive duration (e.g. 168h)", e.MaxAge))
 			}
 		}
 		if e.RetainLast < 0 {
@@ -732,8 +732,8 @@ func validateMaintenance(m *Maintenance, sinkType string, problems *[]string) {
 	}
 	if o := m.OrphanCleanup; o != nil {
 		if o.Interval != "" {
-			if _, err := time.ParseDuration(o.Interval); err != nil {
-				*problems = append(*problems, fmt.Sprintf("sink.maintenance.orphanCleanup.interval: %q is not a duration (e.g. 1h)", o.Interval))
+			if !positiveDuration(o.Interval) {
+				*problems = append(*problems, fmt.Sprintf("sink.maintenance.orphanCleanup.interval: %q is not a positive duration (e.g. 1h)", o.Interval))
 			}
 		}
 		if o.OlderThan != "" {

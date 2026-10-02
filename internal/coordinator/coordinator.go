@@ -626,7 +626,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		}
 		res, warns, err := core.ResolveSchema(srcSchema, cast, t.Metadata)
 		if err != nil {
-			return err
+			return fmt.Errorf("coordinator: table %s: %w", t.Target, err)
 		}
 		c.surfaceWarnings(ref.Source, warns)
 		refs = append(refs, ref)

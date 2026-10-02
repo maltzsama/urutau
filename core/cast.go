@@ -500,21 +500,16 @@ func castToBinary(v any) (any, error) {
 }
 
 func castToInt64(v any) (any, error) {
-	switch t := v.(type) {
-	case nil:
+	if v == nil {
 		return nil, nil
-	case int:
-		return int64(t), nil
-	case int32:
-		return int64(t), nil
-	case int64:
-		return t, nil
 	}
-	if u, ok := unsignedValue(v); ok {
-		if u > math.MaxInt64 {
-			return nil, fmt.Errorf("core: %d overflows int64", u)
-		}
-		return int64(u), nil
+	// A uint64 above MaxInt64 has no exact int64 form; report the overflow.
+	if u, ok := unsignedValue(v); ok && u > math.MaxInt64 {
+		return nil, fmt.Errorf("core: %d overflows int64", u)
+	}
+	// AsInt64 covers every signed integer width (issue #502).
+	if n, ok := AsInt64(v); ok {
+		return n, nil
 	}
 	return nil, fmt.Errorf("core: cannot cast %T to int64", v)
 }
@@ -566,16 +561,12 @@ func unsignedValue(v any) (uint64, bool) {
 }
 
 func castToFloat64(v any) (any, error) {
-	switch t := v.(type) {
-	case nil:
+	if v == nil {
 		return nil, nil
-	case float32:
-		return float64(t), nil
-	case float64:
-		return t, nil
 	}
-	if u, ok := unsignedValue(v); ok {
-		return float64(u), nil
+	// AsFloat64 covers floats and every integer width (issue #502).
+	if f, ok := AsFloat64(v); ok {
+		return f, nil
 	}
 	return nil, fmt.Errorf("core: cannot cast %T to float64", v)
 }
@@ -990,6 +981,12 @@ func inPrimaryKey(name string, pk []string) bool {
 func ResolveSchema(src Schema, cast CastPolicy, meta []MetadataColumn) (Schema, []Warning, error) {
 	resolved, warns, err := cast.Resolve(src)
 	if err != nil {
+		return Schema{}, nil, err
+	}
+	// A float/double key is invalid however it arose — source-typed or via a
+	// cast — and Iceberg rejects it at the first equality delete. Fail at
+	// boot instead (issue #515).
+	if err := rejectFloatPrimaryKey(resolved); err != nil {
 		return Schema{}, nil, err
 	}
 	srcNames := make(map[string]bool, len(resolved.Columns))

@@ -623,3 +623,78 @@ func TestCheckCastRejectsEncodedStringOnUnknown(t *testing.T) {
 		t.Fatalf("plain string on KindUnknown must pass: %v", err)
 	}
 }
+
+// #502: the KindUnknown bypass admits int64/float64 targets, so the value
+// kernels must cover every integer width the scalar helpers (AsInt64,
+// AsFloat64) do — otherwise a cast passes boot and fails on the first row.
+func TestUnknownBypassConvertsEveryIntegerWidth(t *testing.T) {
+	ints := []any{int(7), int8(7), int16(7), int32(7), int64(7), uint8(7), uint16(7), uint32(7), uint(7), uint64(7)}
+	toInt := CastTarget{Type: ColumnType{Kind: KindInt64}}
+	for _, v := range ints {
+		got, err := toInt.Convert(KindUnknown, v)
+		if err != nil {
+			t.Errorf("int64 cast of %T: %v", v, err)
+			continue
+		}
+		if got.(int64) != 7 {
+			t.Errorf("int64 cast of %T = %v, want 7", v, got)
+		}
+	}
+
+	toFloat := CastTarget{Type: ColumnType{Kind: KindFloat64}}
+	floats := append([]any{float32(7), float64(7)}, ints...)
+	for _, v := range floats {
+		got, err := toFloat.Convert(KindUnknown, v)
+		if err != nil {
+			t.Errorf("float64 cast of %T: %v", v, err)
+			continue
+		}
+		if got.(float64) != 7 {
+			t.Errorf("float64 cast of %T = %v, want 7", v, got)
+		}
+	}
+
+	// An unsigned value above MaxInt64 still has no exact int64 form.
+	if _, err := toInt.Convert(KindUnknown, uint64(math.MaxUint64)); err == nil {
+		t.Error("uint64 MaxUint64 → int64 must overflow, not wrap")
+	}
+}
+
+// #515: a floating-point primary key is rejected in shared schema resolution,
+// so every sink fails at boot — whether the key is source-typed or arrives
+// via a cast.
+func TestResolveSchemaRejectsFloatPrimaryKey(t *testing.T) {
+	sourceTyped := Schema{
+		PrimaryKey: []string{"k"},
+		Columns: []Column{
+			{Name: "k", Type: ColumnType{Kind: KindFloat64}},
+			{Name: "v", Type: ColumnType{Kind: KindString}},
+		},
+	}
+	if _, _, err := ResolveSchema(sourceTyped, CastPolicy{}, nil); err == nil || !strings.Contains(err.Error(), "floating-point") {
+		t.Fatalf("source-typed float PK err = %v, want a floating-point rejection", err)
+	}
+
+	castTyped := Schema{
+		PrimaryKey: []string{"k"},
+		Columns:    []Column{{Name: "k", Type: ColumnType{Kind: KindUnknown}}},
+	}
+	cast := CastPolicy{Columns: map[string]CastTarget{"k": {Type: ColumnType{Kind: KindFloat64}}}}
+	if _, _, err := ResolveSchema(castTyped, cast, nil); err == nil || !strings.Contains(err.Error(), "floating-point") {
+		t.Fatalf("cast-to-float PK err = %v, want a floating-point rejection", err)
+	}
+
+	intKey := Schema{
+		PrimaryKey: []string{"k"},
+		Columns:    []Column{{Name: "k", Type: ColumnType{Kind: KindInt64}}},
+	}
+	if _, _, err := ResolveSchema(intKey, CastPolicy{}, nil); err != nil {
+		t.Fatalf("integer PK must validate: %v", err)
+	}
+
+	// A float column outside the key (append mode, no PK) is unaffected.
+	noKey := Schema{Columns: []Column{{Name: "v", Type: ColumnType{Kind: KindFloat64}}}}
+	if _, _, err := ResolveSchema(noKey, CastPolicy{}, nil); err != nil {
+		t.Fatalf("a float column with no primary key must validate: %v", err)
+	}
+}
