@@ -689,3 +689,17 @@ func TestPositionOfIgnoresRetiredOwners(t *testing.T) {
 		t.Fatalf("incomplete = %q, %v; want no safe position", got, err)
 	}
 }
+
+// A partitioned table whose control document has no per-owner entries (a
+// pre-C7 scalar) has no safe minimum: it must snapshot, not resume from the
+// scalar. A single owner still resumes from the scalar.
+func TestPositionOfScalarOnlyPartitionedSnapshots(t *testing.T) {
+	kv := newFakeKV()
+	_ = kv.upsert(context.Background(), controlKey, controlDoc{Position: "0/100"})
+	if got, err := positionOf(context.Background(), kv, "postgres", 2, []string{"w0", "w1"}); err != nil || got != "" {
+		t.Fatalf("scalar-only partitioned = %q, %v; want no safe position", got, err)
+	}
+	if got, err := positionOf(context.Background(), kv, "postgres", 1, []string{"w0"}); err != nil || got != "0/100" {
+		t.Fatalf("scalar-only single = %q, %v; want 0/100", got, err)
+	}
+}

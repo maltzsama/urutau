@@ -103,6 +103,12 @@ func positionOf(ctx context.Context, kv kvStore, sourceKind string, ownerCount i
 		return "", err
 	}
 	if len(doc.Positions) == 0 {
+		// A pre-C7 scalar (or a document with no per-owner map) is a safe
+		// resume only for a single owner. A partitioned table with no owner
+		// entries has no safe minimum and must snapshot.
+		if len(owners) > 1 || (len(owners) == 0 && ownerCount > 1) {
+			return "", nil
+		}
 		return doc.Position, nil
 	}
 	names := owners

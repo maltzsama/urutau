@@ -209,6 +209,13 @@ func (s *Sink) partitionPosition(ctx context.Context, ident tableIdent, ownerCou
 		return "", false, err
 	}
 	if len(present) == 0 {
+		// A pre-C7 table (no per-owner rows) is a safe resume only for a
+		// single owner. With several current owners there is no safe minimum,
+		// so report ok=true and let the caller snapshot rather than fall back
+		// to the legacy argMax.
+		if len(owners) > 1 || (len(owners) == 0 && ownerCount > 1) {
+			return "", true, nil
+		}
 		return "", false, nil
 	}
 	names := owners
