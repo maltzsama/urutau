@@ -258,7 +258,11 @@ type Coordinator struct {
 	// silently incomplete snapshot.
 	snapshotActive atomic.Bool
 	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
-	mu             sync.Mutex    // guards session attach/detach
+	// booted flips once waitWorkers has seen every group attach. Before that,
+	// Session blocks on ready to wake waitWorkers; after, nothing drains it,
+	// so a churny re-attach must skip the send or it would wedge (#493).
+	booted atomic.Bool
+	mu     sync.Mutex // guards session attach/detach
 
 	// WK-001 C5: open staged cycles (a partitioned table's sub-batches
 	// grouped by binlog batch). stagedLocks serializes CommitStaged per
@@ -371,6 +375,12 @@ type Coordinator struct {
 	supervisor *supervisor
 	terminate  chan error
 	metrics    *observability.Metrics
+	// metricsSrv is the dashboard/metrics listener, kept so run's return can
+	// Shutdown it instead of leaking the bound addr and its goroutine (#495).
+	metricsSrv *http.Server
+	// emitSem bounds the concurrent audit-trail uploads fired by onAck, so a
+	// slow S3 endpoint cannot spawn unbounded goroutines (#494).
+	emitSem chan struct{}
 
 	// Dashboard (issue #97): the recent-events ring, the read-only API handler,
 	// the run's start time, and the per-table/worker aggregates the API serves.
@@ -489,6 +499,7 @@ func Run(ctx context.Context, cfg Config) error {
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},
+		emitSem:     make(chan struct{}, maxConcurrentEmits),
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	c.budget.perWorkerMax = cfg.FlowPerWorkerMax
@@ -515,13 +526,15 @@ func Run(ctx context.Context, cfg Config) error {
 		if cfg.LogBuffer != nil {
 			cfg.LogBuffer.SetOnAppend(c.dash.PublishLog)
 		}
+		c.metricsSrv = observability.NewServer(cfg.MetricsAddr, mux)
 		go func() {
 			// A busy port silently disables observability otherwise — say so.
-			if err := observability.ServeMux(cfg.MetricsAddr, mux); err != nil {
+			if err := c.metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				c.log.Warn("coordinator: metrics server stopped", "addr", cfg.MetricsAddr, "err", err)
 			}
 		}()
 	}
+	defer c.shutdownMetrics()
 	return c.run(ctx)
 }
 
@@ -878,6 +891,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err := c.waitWorkers(ctx, wait); err != nil {
 		return err
 	}
+	c.booted.Store(true)
 
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.
@@ -2517,18 +2531,8 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.inFlight(worker))
 	// The audit trail upload is a synchronous S3 put; on the ack hot path a
 	// slow endpoint would delay budget release and trip the supervisor's
-	// stale-ack resets (audit #15). Fire it and forget.
-	go func() {
-		if err := c.emit(eventlog.KindCommit, map[string]any{
-			"worker":   worker,
-			"table":    ack.Table,
-			"rows":     ack.Rows,
-			"deletes":  ack.Deletes,
-			"position": ack.Position,
-		}); err != nil {
-			c.log.Warn("coordinator: eventlog emit", "err", err)
-		}
-	}()
+	// stale-ack resets (audit #15). Fire it and forget, bounded (#494).
+	c.emitCommit(worker, ack)
 }
 
 // assignmentFor builds one worker's table assignment with its own ticket.
@@ -2889,11 +2893,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		c.signalSessionEnd(hello.WorkerName, retErr)
 	}()
 
-	select {
-	case c.ready <- struct{}{}:
-	case <-stream.Context().Done():
-		return stream.Context().Err()
-	}
+	c.signalReady(sessCtx, stream.Context())
 	c.log.Info("worker session", "worker", hello.WorkerName)
 
 	// Recv loop: acks and worker errors.
