@@ -390,8 +390,8 @@ func TestConfirmedPositionIncomparableHoldsRetention(t *testing.T) {
 	}
 
 	// Comparable positions still fold to the minimum.
-	lo := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1")
-	hi := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:5")
+	lo := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-3")
+	hi := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
 	c2 := &Coordinator{
 		confirmed: map[string]position.Position{"a": lo, "b": hi},
 		log:       slog.New(slog.DiscardHandler),

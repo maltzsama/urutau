@@ -1,7 +1,6 @@
 package position
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -79,13 +78,17 @@ func TestMinContained(t *testing.T) {
 	}
 }
 
-func TestMinFallsBackToSmallestMax(t *testing.T) {
-	// Disjoint uuid universes: containment is impossible, the smallest max
-	// interval must win.
+func TestMinDisjointGTIDIsIncomparable(t *testing.T) {
+	// Disjoint uuid universes have no defined order. The old "smallest max
+	// interval" heuristic returned a value that could be ahead of the other,
+	// so a resume fold could skip data a failover had not replicated
+	// (issue #485). Compare now matches Offsets: Incomparable.
 	a := MustGTID(uuidA + ":1-5")
 	b := MustGTID(uuidB + ":1-2")
-	got := Min([]Position{a, b})
-	if !strings.Contains(got.String(), uuidB) {
-		t.Fatalf("min = %q, want the b-only set", got)
+	if got := a.Compare(b); got != Incomparable {
+		t.Fatalf("Compare(disjoint) = %d, want Incomparable", got)
+	}
+	if _, err := MinSafe([]Position{a, b}); err == nil {
+		t.Fatal("MinSafe of disjoint GTID sets must error, not pick a side")
 	}
 }

@@ -200,47 +200,28 @@ func (g *GTID) String() string {
 }
 
 // Compare orders sets. Containment is the natural order: a set containing
-// another is greater. Incomparable sets (disjoint uuid universes) fall back
-// to their maximum transaction number — a heuristic that may return 0 for
-// sets that are structurally different (e.g. uuid1:1 vs uuid2:1). Callers
-// that need strict equality should also check Contains in both directions.
+// another is greater. Sets that neither contains the other (disjoint or
+// diverging uuid universes) have no defined order and return Incomparable —
+// the same partial order Offsets uses. It does NOT fall back to the maximum
+// transaction number: that heuristic returned 0 for structurally different
+// sets (uuid1:1 vs uuid2:1), so a resume fold could pick past data a failover
+// had not replicated (issue #485). Callers that need strict equality can
+// still check Contains in both directions.
 func (g *GTID) Compare(other Position) int {
 	o, ok := other.(*GTID)
 	if !ok {
 		panic(fmt.Sprintf("position: cannot compare GTID to %T", other))
 	}
-	if g.Contains(o) {
-		if o.Contains(g) {
-			return 0
-		}
+	switch fwd, rev := g.Contains(o), o.Contains(g); {
+	case fwd && rev:
+		return 0
+	case fwd:
 		return 1
-	}
-	if o.Contains(g) {
+	case rev:
 		return -1
+	default:
+		return Incomparable
 	}
-	myMax := g.maxInterval()
-	otherMax := o.maxInterval()
-	if myMax < otherMax {
-		return -1
-	}
-	if myMax > otherMax {
-		return 1
-	}
-	return 0
-}
-
-// maxInterval returns the largest transaction number across all server
-// uuids in the set.
-func (g *GTID) maxInterval() uint64 {
-	var max uint64
-	for _, ivs := range g.sets {
-		for _, iv := range ivs {
-			if end := iv.stop - 1; end > max {
-				max = end
-			}
-		}
-	}
-	return max
 }
 
 // Contains reports whether every transaction in other is also in g.
