@@ -93,10 +93,12 @@ func (p *Puller) SetSourceSchemas(resolved map[string]core.Schema) {
 }
 
 // BoundTransactions declares that the decoder ends every transaction with an
-// OpTxnEnd change. Every row of a transaction carries its position, so a
-// batch then holds only whole transactions: a commit that recorded a
-// transaction's position with part of its rows would let a resume skip the
-// rest (#456).
+// OpTxnEnd change. Every row of a transaction carries its position, so the
+// puller batches whole transactions and never splits one at a batch target it
+// did not choose: a commit that recorded a transaction's position with part of
+// its rows would let a resume skip the rest. A transaction larger than
+// maxBatchRows is split anyway, and only its last piece then carries the
+// transaction's position.
 func (p *Puller) BoundTransactions() { p.txnBounded = true }
 
 // SetResume records the position the stream resumes from, the safe position

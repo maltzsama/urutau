@@ -2171,7 +2171,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 		}
 	}
 	n := int64(len(body) + len(metaBytes))
-	if n >= maxBatchBytes {
+	if n > maxBatchBytes {
 		return fmt.Errorf("coordinator: table %s: batch of %d bytes exceeds the %d-byte transport limit; the source transaction is too large — split it into smaller batches", meta.Table, n, maxBatchBytes)
 	}
 	if err := c.budget.acquire(ctx, w.name, n); err != nil {
