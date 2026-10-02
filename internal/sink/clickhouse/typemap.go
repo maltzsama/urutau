@@ -122,10 +122,12 @@ func parseCHType(s string) (base string, nullable bool) {
 }
 
 // coerce converts one canonical value into the Go representation the
-// clickhouse-go column expects for base. Temporal, decimal, uuid and json
-// values arrive as their canonical text (same discipline as the Iceberg
-// sink); numerics arrive as Go natives. A nil becomes nil here — the caller
-// decides between NULL (nullable column) and the type's zero (non-nullable).
+// clickhouse-go column expects for base. Numerics arrive as Go natives, text
+// as string/[]byte; temporal, uuid and nested values arrive in their NATIVE
+// wire forms (Date as int32 days, Time as int64 micros, UUID as 16 bytes,
+// Struct/List/Map as Go maps/slices), which the caller coerces here (issue
+// #483). A nil becomes nil here — the caller decides between NULL (nullable
+// column) and the type's zero (non-nullable).
 func coerce(base string, v any) (any, error) {
 	if v == nil {
 		return nil, nil
@@ -181,27 +183,11 @@ func coerce(base string, v any) (any, error) {
 			return t, nil
 		}
 	case strings.HasPrefix(base, "Array"):
-		// Nested types arrive as []any from the canonical decoder.
-		if arr, ok := v.([]any); ok {
-			return arr, nil
-		}
+		return coerceArray(base, v)
 	case strings.HasPrefix(base, "Tuple"):
-		switch t := v.(type) {
-		case []any:
-			return t, nil
-		case map[string]any:
-			// A struct arrives as map[string]any; the Tuple row wants its
-			// fields in declaration order (which the base string carries).
-			return tupleFromMap(base, t), nil
-		}
+		return coerceTuple(base, v)
 	case strings.HasPrefix(base, "Map"):
-		// Maps arrive as map[string]any or map[any]any from the canonical decoder.
-		if m, ok := v.(map[string]any); ok {
-			return m, nil
-		}
-		if m, ok := v.(map[any]any); ok {
-			return m, nil
-		}
+		return coerceMap(base, v)
 	}
 	return nil, fmt.Errorf("cannot encode %T as %s", v, base)
 }
@@ -486,44 +472,137 @@ func uuidText(b []byte) (string, error) {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
-// tupleFromMap orders a struct's map by the Tuple's declared field names, so
-// clickhouse-go's AppendRow receives them positionally.
-func tupleFromMap(base string, m map[string]any) []any {
-	names := tupleFieldNames(base)
-	out := make([]any, len(names))
-	for i, n := range names {
-		out[i] = m[n]
+// coerceArray coerces each element of a wire []any by the Array's element
+// type (a List<Date> holds native int32 days, not text).
+func coerceArray(base string, v any) (any, error) {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("cannot encode %T as %s", v, base)
+	}
+	elem := typeArg(base, "Array")
+	out := make([]any, len(arr))
+	for i, e := range arr {
+		cv, err := coerce(elem, e)
+		if err != nil {
+			return nil, fmt.Errorf("array element %d: %w", i, err)
+		}
+		out[i] = cv
+	}
+	return out, nil
+}
+
+// coerceTuple orders a wire struct's map by the Tuple's declared field order
+// and coerces each field (a struct may hold a Date/Time/UUID field).
+func coerceTuple(base string, v any) (any, error) {
+	switch t := v.(type) {
+	case []any:
+		return t, nil
+	case map[string]any:
+		fields := tupleFields(base)
+		out := make([]any, len(fields))
+		for i, f := range fields {
+			cv, err := coerce(f.typ, t[f.name])
+			if err != nil {
+				return nil, fmt.Errorf("tuple field %q: %w", f.name, err)
+			}
+			out[i] = cv
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("cannot encode %T as %s", v, base)
+	}
+}
+
+// coerceMap coerces a wire map's values by the Map's value type.
+func coerceMap(base string, v any) (any, error) {
+	val := typeArg2(base, "Map")
+	switch m := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(m))
+		for k, e := range m {
+			cv, err := coerce(val, e)
+			if err != nil {
+				return nil, fmt.Errorf("map value %q: %w", k, err)
+			}
+			out[k] = cv
+		}
+		return out, nil
+	case map[any]any:
+		out := make(map[any]any, len(m))
+		for k, e := range m {
+			cv, err := coerce(val, e)
+			if err != nil {
+				return nil, fmt.Errorf("map value %v: %w", k, err)
+			}
+			out[k] = cv
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("cannot encode %T as %s", v, base)
+	}
+}
+
+// typeArg returns the single argument of "Prefix(...)", e.g. "Array(T)" → "T".
+func typeArg(base, prefix string) string {
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(base, prefix+"("), ")"))
+}
+
+// typeArg2 returns the second (value) argument of "Prefix(K, V)", e.g.
+// "Map(K, V)" → "V".
+func typeArg2(base, prefix string) string {
+	args := splitTopLevelArgs(typeArg(base, prefix))
+	if len(args) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(args[1])
+}
+
+// tupleField is one generated Tuple member: its name and its ClickHouse type.
+type tupleField struct{ name, typ string }
+
+// tupleFields splits a generated "Tuple(`a` T, `b` U)" into its fields. Only
+// field names are backtick-quoted (types never are), so the leading quoted
+// token of each top-level part is the name.
+func tupleFields(base string) []tupleField {
+	var out []tupleField
+	for _, part := range splitTopLevelArgs(typeArg(base, "Tuple")) {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "`") {
+			continue
+		}
+		end := strings.Index(part[1:], "`")
+		if end < 0 {
+			continue
+		}
+		end++ // absolute index of the closing backtick
+		out = append(out, tupleField{
+			name: part[1:end],
+			typ:  strings.TrimSpace(part[end+1:]),
+		})
 	}
 	return out
 }
 
-// tupleFieldNames extracts the field names from a generated "Tuple(`a` T,
-// `b` U)" base. Only field names are backtick-quoted (types never are), so
-// every backtick-quoted run is a name, in declaration order.
-func tupleFieldNames(base string) []string {
-	var names []string
-	for i := 0; i < len(base); i++ {
-		if base[i] != '`' {
-			continue
-		}
-		var sb strings.Builder
-		j := i + 1
-		for j < len(base) {
-			if base[j] == '`' {
-				if j+1 < len(base) && base[j+1] == '`' {
-					sb.WriteByte('`')
-					j += 2
-					continue
-				}
-				break
+// splitTopLevelArgs splits s on commas not nested in parentheses.
+func splitTopLevelArgs(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
 			}
-			sb.WriteByte(base[j])
-			j++
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
 		}
-		names = append(names, sb.String())
-		i = j
 	}
-	return names
+	return append(out, s[start:])
 }
 
 func toTime(v any, layout string) (any, error) {

@@ -214,13 +214,14 @@ func TestCoerce(t *testing.T) {
 	}
 
 	// A struct arrives as map[string]any; a Tuple row wants its fields in
-	// declaration order (issue #483).
-	tup, err := coerce("Tuple(`a` Int64, `b` String)", map[string]any{"b": "y", "a": int64(1)})
+	// declaration order, each coerced — including a nested Date holding
+	// native int32 days (issue #483).
+	tup, err := coerce("Tuple(`a` Int64, `b` Date)", map[string]any{"b": int32(20630), "a": int64(1)})
 	if err != nil {
 		t.Fatalf("coerce tuple: %v", err)
 	}
-	if got, ok := tup.([]any); !ok || len(got) != 2 || got[0] != int64(1) || got[1] != "y" {
-		t.Errorf("coerce tuple = %v, want [1 y]", tup)
+	if got, ok := tup.([]any); !ok || len(got) != 2 || got[0] != int64(1) || got[1] != time.Unix(20630*86400, 0).UTC() {
+		t.Errorf("coerce tuple = %v, want [1 %v]", tup, time.Unix(20630*86400, 0).UTC())
 	}
 
 	// Decimal parses to shopspring's type; compare by text.
