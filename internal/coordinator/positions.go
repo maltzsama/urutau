@@ -1,37 +1,23 @@
 package coordinator
 
-import (
-	"github.com/maltzsama/urutau/position"
-	"github.com/maltzsama/urutau/source"
-)
+import "github.com/maltzsama/urutau/internal/transport"
 
-// maxPositions returns the greatest of a source batch's per-partition high
-// positions, parsing each exactly once. The coordinator records it as a staged
-// cycle's committed position: sub-batches are ordered by partition, not by
-// source position, so the batch maximum is the only position that safely
-// covers the whole cycle (issue #492). An empty or unparsable candidate is
-// skipped, and an Incomparable pair keeps the incumbent; no usable position
-// yields "".
-func maxPositions(src source.Source, highs []string) string {
-	var best position.Position
-	for _, s := range highs {
-		if s == "" {
-			continue
-		}
-		p, err := src.ParsePosition(s)
-		if err != nil {
-			continue
-		}
-		if best == nil {
-			best = p
-			continue
-		}
-		if c := p.Compare(best); c != position.Incomparable && c > 0 {
-			best = p
-		}
-	}
-	if best == nil {
+// batchPosition returns the source position of a batch's last row — the
+// position that covers every row it carries, whichever key range each row is
+// routed to. The coordinator records it as a staged cycle's committed
+// position. It must read the batch's own reader, not a partition sub-batch's:
+// sub-batches are ordered by key range while positions follow source order, so
+// the last sub-batch need not hold the batch's last position (issue #492).
+// It is "" for an empty batch.
+//
+// A maximum over the per-partition highs is NOT equivalent in general: a source
+// whose positions are opaque (incomparable across partitions, e.g. a plugin
+// adapter) has no ordering to take a maximum over, and picking one partition's
+// high would not cover the others' rows. The batch's last row is the
+// source-provided position that does.
+func batchPosition(r *transport.BatchReader) string {
+	if r.NumRows() == 0 {
 		return ""
 	}
-	return best.String()
+	return r.Position(r.NumRows() - 1)
 }

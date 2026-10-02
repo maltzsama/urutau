@@ -2057,7 +2057,7 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// (ClickHouse, Couchbase) the workers commit their own sub-batches, so
 	// no cycle is tracked and none can leak.
 	if c.stagesCycles() && len(cycleOwners) > 0 {
-		c.staged.expectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, maxPositions(c.src, highs))
+		c.staged.expectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, batchPosition(reader))
 		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
 	for p, sub := range subBatches {

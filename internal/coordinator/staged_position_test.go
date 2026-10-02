@@ -50,24 +50,25 @@ func TestStagedCycleCommitsTheBatchPosition(t *testing.T) {
 	}
 }
 
-// A cycle's committed position is the batch maximum, not the last partition's
-// high: sub-batches are ordered by key range while positions follow source
-// order, so the last sub-batch need not hold the highest position (issue #492).
+// A cycle's committed position is the batch's last source position, which can
+// belong to a key range other than the last partition's: sub-batches are
+// ordered by key range while positions follow source order, so the last
+// sub-batch need not hold the batch's last position (issue #492).
 func TestStagedCycleCommitsTheBatchMaximumNotLastPartition(t *testing.T) {
 	c := stagedReplayHarness(t)
 	snk := &positionStagedSink{}
 	c.snk = snk
-	// w0 (id < 100) holds the batch's highest position 0/40; the last source
-	// row belongs to w1 at the lower 0/30.
-	b := replayBatch(t, []int64{1, 150}, []string{"0/40", "0/30"})
+	// The batch's last source row is id 1 (w0) at 0/40; the last partition
+	// (w1) holds only the earlier row id 150 at 0/30.
+	b := replayBatch(t, []int64{150, 1}, []string{"0/30", "0/40"})
 	meta := &pb.BatchMeta{Table: "raw.orders"}
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	if committable, _ := c.staged.deliver(stagedRef("raw.orders", "w0"), meta.BatchId, []byte{1}, "0/40", "", nil); len(committable) != 0 {
+	if committable, _ := c.staged.deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{1}, "0/30", "", nil); len(committable) != 0 {
 		t.Fatal("the cycle completed with one of two owners")
 	}
-	committable, known := c.staged.deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{2}, "0/30", "", nil)
+	committable, known := c.staged.deliver(stagedRef("raw.orders", "w0"), meta.BatchId, []byte{2}, "0/40", "", nil)
 	if !known || len(committable) != 1 {
 		t.Fatalf("committable=%d known=%v; want the cycle complete", len(committable), known)
 	}
@@ -76,7 +77,7 @@ func TestStagedCycleCommitsTheBatchMaximumNotLastPartition(t *testing.T) {
 		t.Fatalf("commitStagedCycle: %v", err)
 	}
 	if len(snk.positions) != 1 || snk.positions[0] != "0/40" {
-		t.Fatalf("committed positions = %v, want [0/40]: the cycle holds the batch maximum", snk.positions)
+		t.Fatalf("committed positions = %v, want [0/40]: the cycle holds the batch's last position", snk.positions)
 	}
 }
 
