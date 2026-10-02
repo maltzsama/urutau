@@ -270,6 +270,7 @@ func (s stream) Start(ctx context.Context, from position.Position) error {
 	if err := s.checkNotPurged(ctx, g); err != nil {
 		return err
 	}
+	s.SetResume(g.String())
 	errCh := make(chan error, 1)
 	s.SetErr(errCh)
 	go func() { errCh <- s.StartFromGTID(ctx, g) }()

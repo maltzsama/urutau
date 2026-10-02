@@ -783,15 +783,9 @@ func (r *Reader) enqueue(entry relEntry, op rowchange.Op, after, before map[stri
 // does the synced position advance.
 func (r *Reader) handleCommit(ctx context.Context, endLSN pglogrepl.LSN) error {
 	pos := position.LSN(endLSN)
-	for _, c := range r.txn {
-		c.Position = pos.String()
-		select {
-		case r.out <- *c:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	if err := r.flushTxn(ctx, pos); err != nil {
+		return err
 	}
-	r.txn = r.txn[:0]
 
 	r.mu.Lock()
 	r.synced = &pos

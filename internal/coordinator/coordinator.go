@@ -165,6 +165,11 @@ const workerQueueCap = 64
 // config is silent (see Config.SnapshotChunkTimeout).
 const defaultSnapshotChunkTimeout = 10 * time.Minute
 
+// maxBatchBytes is the largest serialized batch the control plane will queue.
+// The gRPC servers cap messages at 128 MiB; fail loud with headroom instead of
+// looping on a batch the worker can never receive.
+const maxBatchBytes = 120 << 20
+
 // queuedBatch is one serialized batch waiting for the Flight stream.
 type queuedBatch struct {
 	id   uint64 // the inflight batch id, to correlate an ack with the sent list
@@ -2166,6 +2171,9 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 		}
 	}
 	n := int64(len(body) + len(metaBytes))
+	if n > maxBatchBytes {
+		return fmt.Errorf("coordinator: table %s: batch of %d bytes exceeds the %d-byte transport limit; the source transaction is too large — split it into smaller batches", meta.Table, n, maxBatchBytes)
+	}
 	if err := c.budget.acquire(ctx, w.name, n); err != nil {
 		return err
 	}

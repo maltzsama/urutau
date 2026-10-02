@@ -7,6 +7,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 func txnSchemas() map[string]core.Schema {
@@ -130,5 +131,57 @@ func TestTransactionOverTwoTablesSplitsByTable(t *testing.T) {
 			t.Fatalf("batch %d = %s/%d rows, want %s/%d", i, b.Table, b.Record.NumRows(), w.table, w.rows)
 		}
 		b.Release()
+	}
+}
+
+// A transaction larger than one batch is split, and only its LAST piece
+// carries the transaction's position. Every earlier piece carries the resume
+// (safe) position, so acking it cannot free rows a later piece still owes —
+// the whole transaction replays from its start on a crash.
+func TestHugeTransactionPositionsOnlyTheLastPiece(t *testing.T) {
+	const total = maxBatchRows*2 + 500
+	ch := make(chan rowchange.Change, total+1)
+	p := New(ch)
+	p.SetSchemas(txnSchemas())
+	p.BoundTransactions()
+	p.SetResume("g:0")
+	for _, c := range txnRows("a", "g:1-5000", 0, total) {
+		ch <- c
+	}
+	ch <- rowchange.Change{Op: rowchange.OpTxnEnd}
+	close(ch)
+
+	var positions []string
+	var rows int
+	for {
+		b, err := p.Next(context.Background())
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if b == nil {
+			break
+		}
+		r, rerr := transport.NewBatchReader(b.Record, nil)
+		if rerr != nil {
+			b.Release()
+			t.Fatalf("reader: %v", rerr)
+		}
+		positions = append(positions, r.Position(r.NumRows()-1))
+		rows += r.NumRows()
+		b.Release()
+	}
+	if rows != total {
+		t.Fatalf("rows = %d, want %d", rows, total)
+	}
+	if len(positions) < 2 {
+		t.Fatalf("expected the transaction to split, got %d batch(es)", len(positions))
+	}
+	for i, pos := range positions[:len(positions)-1] {
+		if pos != "g:0" {
+			t.Fatalf("batch %d position = %q, want the safe resume position g:0 (only the last piece may carry the transaction position)", i, pos)
+		}
+	}
+	if last := positions[len(positions)-1]; last != "g:1-5000" {
+		t.Fatalf("last batch position = %q, want g:1-5000", last)
 	}
 }
