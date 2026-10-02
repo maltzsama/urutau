@@ -155,8 +155,9 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		log.Info("pipeline spec changed; clearing terminal state",
 			"reason", cr.Status.Terminated.Reason,
 			"observed", cr.Status.ObservedGeneration, "generation", cr.Generation)
+		base := cr.DeepCopy()
 		cr.Status.Terminated = nil
-		if err := r.Status().Update(ctx, cr); err != nil {
+		if err := r.Status().Patch(ctx, cr, client.MergeFrom(base)); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -172,9 +173,8 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// failure: requeueing forever would burn the operator on a spec that
 	// can never succeed. Mark terminated and surface an event.
 	if err := r.validateSpec(cr); err != nil {
-		r.markTerminated(ctx, cr, "invalid_spec", err.Error())
 		r.eventf(cr, corev1.EventTypeWarning, "InvalidSpec", "%s", err.Error())
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.markTerminated(ctx, cr, "invalid_spec", err.Error())
 	}
 
 	// Ensure the coordinator identity (service account, Role, binding),
@@ -223,11 +223,9 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Validate that referenced secrets exist before creating the StatefulSet.
-	// A missing secret would cause the pod to fail at startup with a cryptic
-	// error; catching it here gives the operator a clear terminal state.
-	if err := r.validateSecrets(ctx, cr); err != nil {
-		r.markTerminated(ctx, cr, "SecretValidationFailed", err.Error())
-		return ctrl.Result{}, nil
+	// A not-ready one is requeued, an invalid reference terminates (#504).
+	if res, err, stop := r.checkSecrets(ctx, cr); stop {
+		return res, err
 	}
 
 	sts := coordinatorStatefulSet(cr, image)
@@ -250,9 +248,10 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// is distinguishable from the coordinator's running one.
 	hash := specHash(cr)
 	if cr.Status.ObservedGeneration != cr.Generation || cr.Status.SpecHash != hash {
+		base := cr.DeepCopy()
 		cr.Status.ObservedGeneration = cr.Generation
 		cr.Status.SpecHash = hash
-		if err := r.Status().Update(ctx, cr); err != nil {
+		if err := r.Status().Patch(ctx, cr, client.MergeFrom(base)); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -272,15 +271,21 @@ func (r *CoordinatorReconciler) validateSpec(cr *urutauv1alpha1.CDCPipeline) err
 	return nil
 }
 
-// markTerminated sets the terminal status. It is idempotent: a pipeline
-// already terminated stays terminated.
-func (r *CoordinatorReconciler) markTerminated(ctx context.Context, cr *urutauv1alpha1.CDCPipeline, reason, detail string) {
+// markTerminated sets the terminal status and returns any persistence error,
+// so a failed write is surfaced instead of silently leaving the pipeline
+// reconcilable. It patches only the fields it changes, so a concurrent
+// coordinator status write (phase/runId) is not clobbered (issue #505), and is
+// idempotent: a pipeline already terminated stays terminated.
+func (r *CoordinatorReconciler) markTerminated(ctx context.Context, cr *urutauv1alpha1.CDCPipeline, reason, detail string) error {
 	log.FromContext(ctx).Info("pipeline terminated by operator", "reason", reason, "detail", detail)
+	base := cr.DeepCopy()
 	cr.Status.Terminated = &urutauv1alpha1.Terminated{Reason: reason, At: time.Now().UTC().Format(time.RFC3339)}
 	cr.Status.ObservedGeneration = cr.Generation
-	if err := r.Status().Update(ctx, cr); err != nil {
+	if err := r.Status().Patch(ctx, cr, client.MergeFrom(base)); err != nil {
 		log.FromContext(ctx).Error(err, "mark terminated")
+		return err
 	}
+	return nil
 }
 
 // eventf emits a Kubernetes event when a recorder is wired (it is in the
@@ -968,9 +973,9 @@ func (r *CoordinatorReconciler) validateSecrets(ctx context.Context, cr *urutauv
 		key := types.NamespacedName{Name: n.name, Namespace: cr.Namespace}
 		if err := r.Get(ctx, key, secret); err != nil {
 			if apierrors.IsNotFound(err) {
-				return fmt.Errorf("secret %q not found in namespace %q", n.name, cr.Namespace)
+				return fmt.Errorf("%w: secret %q not found in namespace %q", errSecretNotReady, n.name, cr.Namespace)
 			}
-			return fmt.Errorf("check secret %q: %w", n.name, err)
+			return fmt.Errorf("%w: check secret %q: %v", errSecretNotReady, n.name, err)
 		}
 		for _, k := range n.keys {
 			if _, ok := secret.Data[k]; !ok {

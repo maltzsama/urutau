@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -262,5 +264,67 @@ func TestFieldManagerDefaultAndOverride(t *testing.T) {
 	r.FieldManager = "custom-controller"
 	if got := r.fieldManager(); got != "custom-controller" {
 		t.Fatalf("fieldManager = %q, want custom-controller", got)
+	}
+}
+
+// #504: an absent Secret is a transient condition (the reconciler must
+// requeue), while a present Secret missing a required key is a genuinely
+// invalid reference (terminal).
+func TestValidateSecretsMissingIsTransient(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	cr := &urutauv1alpha1.CDCPipeline{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns"},
+		Spec:       urutauv1alpha1.CDCPipelineSpec{Secrets: urutauv1alpha1.Secrets{Source: "src"}},
+	}
+
+	absent := &CoordinatorReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+	err := absent.validateSecrets(context.Background(), cr)
+	if !errors.Is(err, errSecretNotReady) {
+		t.Fatalf("missing secret err = %v, want errSecretNotReady so Reconcile requeues", err)
+	}
+
+	present := &CoordinatorReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "src", Namespace: "ns"}, Data: map[string][]byte{}}).
+		Build()}
+	err = present.validateSecrets(context.Background(), cr)
+	if err == nil || errors.Is(err, errSecretNotReady) {
+		t.Fatalf("missing-key err = %v, want a terminal (non-transient) error", err)
+	}
+}
+
+// #505: the operator must patch only its own status fields, so a concurrent
+// coordinator write (phase/runId) is not clobbered by a stale snapshot.
+func TestStatusPatchPreservesCoordinatorFields(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = urutauv1alpha1.AddToScheme(scheme)
+	key := types.NamespacedName{Name: "p", Namespace: "ns"}
+	cr := &urutauv1alpha1.CDCPipeline{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns"},
+		Status:     urutauv1alpha1.CDCPipelineStatus{Phase: "Running", RunID: "run-1"},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&urutauv1alpha1.CDCPipeline{}).
+		WithObjects(cr).Build()
+	r := &CoordinatorReconciler{Client: cli}
+
+	// A stale snapshot, as Reconcile's cache read yields.
+	stale := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(context.Background(), key, stale); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if err := r.markTerminated(context.Background(), stale, "invalid_spec", "boom"); err != nil {
+		t.Fatalf("markTerminated: %v", err)
+	}
+
+	after := &urutauv1alpha1.CDCPipeline{}
+	if err := cli.Get(context.Background(), key, after); err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if after.Status.Phase != "Running" || after.Status.RunID != "run-1" {
+		t.Fatalf("operator patch clobbered coordinator status: phase=%q runId=%q", after.Status.Phase, after.Status.RunID)
+	}
+	if after.Status.Terminated == nil || after.Status.Terminated.Reason != "invalid_spec" {
+		t.Fatalf("terminated = %+v, want invalid_spec", after.Status.Terminated)
 	}
 }
