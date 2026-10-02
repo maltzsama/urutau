@@ -55,6 +55,10 @@ type Config struct {
 	// "db.table": the columns to emit and the compiled filter. Built by the
 	// adapter from the introspected table.
 	Projections map[string]projection
+	// UpsertTargets marks the target tables that maintain keyed state. An
+	// UPDATE that changes the primary key emits a delete of the old key only
+	// for these; append targets keep the old row.
+	UpsertTargets map[string]bool
 }
 
 // Reader wraps a canal instance and decodes its row events.
@@ -532,6 +536,26 @@ func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after,
 			c.Before = proj.project(fullBefore)
 			return c, true, nil
 		default:
+			// In upsert mode an UPDATE that changes the primary key must
+			// delete the OLD key: the update's own delete is built from the
+			// new key, so without this the old row survives forever. Append
+			// targets keep the old row by design.
+			if fullBefore != nil && r.cfg.UpsertTargets[ref.Target] {
+				oldKey, newKey := keyFrom(before), keyFrom(after)
+				if rowchange.KeyString(oldKey) != rowchange.KeyString(newKey) {
+					if err := r.emit(rowchange.Change{
+						Op:       rowchange.OpDelete,
+						Table:    ref.Target,
+						Position: pos,
+						CommitTS: commitTS,
+						IngestTS: time.Now(),
+						Key:      oldKey,
+						Before:   proj.project(fullBefore),
+					}); err != nil {
+						return rowchange.Change{}, false, err
+					}
+				}
+			}
 			c.Key = keyFrom(after)
 			c.After = proj.project(fullAfter)
 			if fullBefore != nil {
