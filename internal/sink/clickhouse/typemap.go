@@ -122,10 +122,12 @@ func parseCHType(s string) (base string, nullable bool) {
 }
 
 // coerce converts one canonical value into the Go representation the
-// clickhouse-go column expects for base. Temporal, decimal, uuid and json
-// values arrive as their canonical text (same discipline as the Iceberg
-// sink); numerics arrive as Go natives. A nil becomes nil here — the caller
-// decides between NULL (nullable column) and the type's zero (non-nullable).
+// clickhouse-go column expects for base. Numerics arrive as Go natives, text
+// as string/[]byte; temporal, uuid and nested values arrive in their NATIVE
+// wire forms (Date as int32 days, Time as int64 micros, UUID as 16 bytes,
+// Struct/List/Map as Go maps/slices), which the caller coerces here (issue
+// #483). A nil becomes nil here — the caller decides between NULL (nullable
+// column) and the type's zero (non-nullable).
 func coerce(base string, v any) (any, error) {
 	if v == nil {
 		return nil, nil
@@ -137,6 +139,10 @@ func coerce(base string, v any) (any, error) {
 			return t, nil
 		case []byte:
 			return string(t), nil
+		case int64:
+			// KindTime arrives from the wire as micros since midnight
+			// (transport.readTypedValue); render it as canonical time text.
+			return timeOfDayText(t)
 		}
 	case base == "Bool":
 		switch t := v.(type) {
@@ -155,12 +161,15 @@ func coerce(base string, v any) (any, error) {
 	case base == "Float32" || base == "Float64":
 		return toFloat(base, v)
 	case base == "Date":
-		return toTime(v, "2006-01-02")
+		return dateValue(v)
 	case strings.HasPrefix(base, "DateTime64"):
 		return toTime(v, "")
 	case base == "UUID":
-		if s, ok := v.(string); ok {
-			return s, nil
+		switch t := v.(type) {
+		case string:
+			return t, nil
+		case []byte:
+			return uuidText(t)
 		}
 	case strings.HasPrefix(base, "Decimal"):
 		switch t := v.(type) {
@@ -173,19 +182,12 @@ func coerce(base string, v any) (any, error) {
 		case decimal.Decimal:
 			return t, nil
 		}
-	case strings.HasPrefix(base, "Array"), strings.HasPrefix(base, "Tuple"):
-		// Nested types arrive as []any from the canonical decoder.
-		if arr, ok := v.([]any); ok {
-			return arr, nil
-		}
+	case strings.HasPrefix(base, "Array"):
+		return coerceArray(base, v)
+	case strings.HasPrefix(base, "Tuple"):
+		return coerceTuple(base, v)
 	case strings.HasPrefix(base, "Map"):
-		// Maps arrive as map[string]any or map[any]any from the canonical decoder.
-		if m, ok := v.(map[string]any); ok {
-			return m, nil
-		}
-		if m, ok := v.(map[any]any); ok {
-			return m, nil
-		}
+		return coerceMap(base, v)
 	}
 	return nil, fmt.Errorf("cannot encode %T as %s", v, base)
 }
@@ -425,6 +427,182 @@ func floatValue(v any) (float64, error) {
 		return f, nil
 	}
 	return 0, fmt.Errorf("cannot encode %T as Float", v)
+}
+
+// dateValue converts a wire Date (int32 days since epoch) or a canonical text
+// into the time.Time a ClickHouse Date column expects.
+func dateValue(v any) (any, error) {
+	switch t := v.(type) {
+	case int32:
+		return time.Unix(int64(t)*86400, 0).UTC(), nil
+	case int64:
+		return time.Unix(t*86400, 0).UTC(), nil
+	default:
+		return toTime(v, "2006-01-02")
+	}
+}
+
+// timeOfDayText renders micros-since-midnight as canonical time text,
+// matching core.castToString's KindTime output.
+func timeOfDayText(micros int64) (string, error) {
+	if micros < 0 {
+		return "", fmt.Errorf("time-of-day %d micros is negative", micros)
+	}
+	if micros >= int64(24*time.Hour/time.Microsecond) {
+		return "", fmt.Errorf("time-of-day %d micros is at or past 24h", micros)
+	}
+	ns := micros * 1000
+	h := ns / int64(time.Hour)
+	ns -= h * int64(time.Hour)
+	m := ns / int64(time.Minute)
+	ns -= m * int64(time.Minute)
+	s := ns / int64(time.Second)
+	ns -= s * int64(time.Second)
+	if ns == 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s), nil
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000), nil
+}
+
+// uuidText renders 16 raw bytes as the canonical hyphenated UUID text.
+func uuidText(b []byte) (string, error) {
+	if len(b) != 16 {
+		return "", fmt.Errorf("uuid bytes must be 16 long, got %d", len(b))
+	}
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// coerceArray coerces each element of a wire []any by the Array's element
+// type (a List<Date> holds native int32 days, not text).
+func coerceArray(base string, v any) (any, error) {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("cannot encode %T as %s", v, base)
+	}
+	elem := typeArg(base, "Array")
+	out := make([]any, len(arr))
+	for i, e := range arr {
+		cv, err := coerce(elem, e)
+		if err != nil {
+			return nil, fmt.Errorf("array element %d: %w", i, err)
+		}
+		out[i] = cv
+	}
+	return out, nil
+}
+
+// coerceTuple orders a wire struct's map by the Tuple's declared field order
+// and coerces each field (a struct may hold a Date/Time/UUID field).
+func coerceTuple(base string, v any) (any, error) {
+	switch t := v.(type) {
+	case []any:
+		return t, nil
+	case map[string]any:
+		fields := tupleFields(base)
+		out := make([]any, len(fields))
+		for i, f := range fields {
+			cv, err := coerce(f.typ, t[f.name])
+			if err != nil {
+				return nil, fmt.Errorf("tuple field %q: %w", f.name, err)
+			}
+			out[i] = cv
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("cannot encode %T as %s", v, base)
+	}
+}
+
+// coerceMap coerces a wire map's values by the Map's value type.
+func coerceMap(base string, v any) (any, error) {
+	val := typeArg2(base, "Map")
+	switch m := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(m))
+		for k, e := range m {
+			cv, err := coerce(val, e)
+			if err != nil {
+				return nil, fmt.Errorf("map value %q: %w", k, err)
+			}
+			out[k] = cv
+		}
+		return out, nil
+	case map[any]any:
+		out := make(map[any]any, len(m))
+		for k, e := range m {
+			cv, err := coerce(val, e)
+			if err != nil {
+				return nil, fmt.Errorf("map value %v: %w", k, err)
+			}
+			out[k] = cv
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("cannot encode %T as %s", v, base)
+	}
+}
+
+// typeArg returns the single argument of "Prefix(...)", e.g. "Array(T)" → "T".
+func typeArg(base, prefix string) string {
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(base, prefix+"("), ")"))
+}
+
+// typeArg2 returns the second (value) argument of "Prefix(K, V)", e.g.
+// "Map(K, V)" → "V".
+func typeArg2(base, prefix string) string {
+	args := splitTopLevelArgs(typeArg(base, prefix))
+	if len(args) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(args[1])
+}
+
+// tupleField is one generated Tuple member: its name and its ClickHouse type.
+type tupleField struct{ name, typ string }
+
+// tupleFields splits a generated "Tuple(`a` T, `b` U)" into its fields. Only
+// field names are backtick-quoted (types never are), so the leading quoted
+// token of each top-level part is the name.
+func tupleFields(base string) []tupleField {
+	var out []tupleField
+	for _, part := range splitTopLevelArgs(typeArg(base, "Tuple")) {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "`") {
+			continue
+		}
+		end := strings.Index(part[1:], "`")
+		if end < 0 {
+			continue
+		}
+		end++ // absolute index of the closing backtick
+		out = append(out, tupleField{
+			name: part[1:end],
+			typ:  strings.TrimSpace(part[end+1:]),
+		})
+	}
+	return out
+}
+
+// splitTopLevelArgs splits s on commas not nested in parentheses.
+func splitTopLevelArgs(s string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
 }
 
 func toTime(v any, layout string) (any, error) {
