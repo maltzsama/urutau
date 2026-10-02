@@ -198,3 +198,11 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// In MySQL REAL is a synonym for DOUBLE (unless REAL_AS_FLOAT), not DECIMAL
+// (issue #507).
+func TestMapTypeByNameRealIsFloat(t *testing.T) {
+	if got := mapTypeByName("real"); got != schema.TYPE_FLOAT {
+		t.Fatalf("mapTypeByName(real) = %d, want TYPE_FLOAT", got)
+	}
+}

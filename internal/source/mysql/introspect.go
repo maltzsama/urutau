@@ -243,9 +243,11 @@ func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
 func mapTypeByName(dataType string) int {
 	t := strings.ToLower(dataType)
 	switch {
-	case strings.HasPrefix(t, "float"), strings.HasPrefix(t, "double"):
+	case strings.HasPrefix(t, "float"), strings.HasPrefix(t, "double"), t == "real":
+		// MySQL REAL is a synonym for DOUBLE (unless REAL_AS_FLOAT), not
+		// DECIMAL (issue #507).
 		return schema.TYPE_FLOAT
-	case strings.HasPrefix(t, "decimal"), t == "numeric", t == "real":
+	case strings.HasPrefix(t, "decimal"), t == "numeric":
 		return schema.TYPE_DECIMAL
 	case strings.HasPrefix(t, "enum"):
 		return schema.TYPE_ENUM

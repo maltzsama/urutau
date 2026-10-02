@@ -71,12 +71,16 @@ func (d *Raw) extract(value []byte, spec TopicExtraction) (map[string]any, error
 	}
 
 	var doc map[string]any
-	dec := json.NewDecoder(bytes.NewReader(value))
+	r := bytes.NewReader(value)
+	dec := json.NewDecoder(r)
 	dec.UseNumber()
 	if err := dec.Decode(&doc); err != nil {
 		return nil, &ErrNotJSON{Err: err}
 	}
-	remaining, _ := io.ReadAll(dec.Buffered())
+	// The decoder's buffer is not the whole remainder: a value ending exactly
+	// at a buffer boundary leaves trailing bytes only in the reader, so check
+	// both or `{"a":1}EXTRA` would slip through (issue #507).
+	remaining, _ := io.ReadAll(io.MultiReader(dec.Buffered(), r))
 	if len(bytes.TrimLeft(remaining, " \t\n\r")) > 0 {
 		return nil, &ErrNotJSON{Err: fmt.Errorf("raw: trailing data after JSON document")}
 	}
