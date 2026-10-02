@@ -45,6 +45,10 @@ type stagedCycles struct {
 	open  map[cycleKey]*stagedCycle // still accumulating
 	done  map[cycleKey]*stagedCycle // complete, waiting for its turn
 	order map[string][]uint64       // per table, seqs in send order
+	// poisoned marks a table whose cycle commit failed. Once set, no later
+	// cycle of the table may commit: a later commit would advance the durable
+	// position past the failed cycle's rows, which were never written (#543).
+	poisoned map[string]bool
 }
 
 type cycleKey struct {
@@ -54,10 +58,31 @@ type cycleKey struct {
 
 func newStagedCycles() *stagedCycles {
 	return &stagedCycles{
-		open:  map[cycleKey]*stagedCycle{},
-		done:  map[cycleKey]*stagedCycle{},
-		order: map[string][]uint64{},
+		open:     map[cycleKey]*stagedCycle{},
+		done:     map[cycleKey]*stagedCycle{},
+		order:    map[string][]uint64{},
+		poisoned: map[string]bool{},
 	}
+}
+
+// poison marks a table so no later cycle commits over a failed one (#543).
+func (s *stagedCycles) poison(table string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.poisoned[table] = true
+	s.mu.Unlock()
+}
+
+// isPoisoned reports whether the table's commit already failed (#543).
+func (s *stagedCycles) isPoisoned(table string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.poisoned[table]
 }
 
 // expect records that a delivery is expected from each of owners for

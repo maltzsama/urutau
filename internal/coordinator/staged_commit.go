@@ -32,6 +32,15 @@ func (c *Coordinator) isStagedTable(target string) bool {
 // the delivery and commits every cycle that is now complete and in turn. A
 // delivery from a superseded generation is dropped — accepting it would open
 // a fresh cycle for an already-committed seq and commit its data twice.
+//
+// The whole take-and-commit runs under the table's staged lock. The tracker
+// guarantees send order only while its own lock is held; the commit runs after
+// deliver returns, so a mutex around the commit alone does not preserve that
+// order (mutexes do not enforce arrival order) — a later cycle could commit
+// before an earlier one, or commit after an earlier cycle's commit failed,
+// advancing the durable position past rows that were never written (#543).
+// Holding the table lock across deliver and commit makes the pair atomic per
+// table; a failed commit poisons the table so no later cycle commits.
 func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 	if sb == nil {
 		return
@@ -52,6 +61,14 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		c.log.Warn("coordinator: stale staged epoch", "worker", worker, "have", epoch, "got", sb.Epoch)
 		return
 	}
+
+	mu := c.stagedLock(sb.Table)
+	mu.Lock()
+	defer mu.Unlock()
+	if c.staged.isPoisoned(sb.Table) {
+		return
+	}
+
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
 	committable, known := c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
 	if sb.Seq != 0 && !known {
@@ -62,23 +79,37 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		c.log.Warn("coordinator: staged delivery not committable", "worker", worker, "table", sb.Table, "seq", sb.Seq)
 	}
 	for _, cy := range committable {
-		// Cycles commit in send order; the first failure must stop the run
-		// here — committing a later cycle would advance the durable position
-		// past the gap the failed cycle left, and its data would never be
-		// replayed (WK-001 C5.4).
-		if err := c.commitStagedCycle(cy); err != nil {
+		// Cycles commit in send order; the first failure must stop every
+		// later cycle of the table — committing a later cycle would advance
+		// the durable position past the gap the failed cycle left, and its
+		// data would never be replayed (WK-001 C5.4).
+		if err := c.commitStagedCycleLocked(cy); err != nil {
+			c.staged.poison(sb.Table)
 			c.fail(err)
 			return
 		}
 	}
 }
 
-// commitStagedCycle commits one complete cycle through the sink's
-// StagedCommitter, serialized per table. A cycle of one source batch commits
+// commitStagedCycle commits one complete cycle, taking the table's staged
+// lock. Kept for callers that do not already hold it (tests, one-off paths).
+func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
+	mu := c.stagedLock(cy.ref.Target)
+	mu.Lock()
+	defer mu.Unlock()
+	if c.staged.isPoisoned(cy.ref.Target) {
+		return nil
+	}
+	return c.commitStagedCycleLocked(cy)
+}
+
+// commitStagedCycleLocked commits one complete cycle through the sink's
+// StagedCommitter. The caller holds the table's staged lock, so cycles of one
+// table commit strictly in send order. A cycle of one source batch commits
 // the batch's last position: every partition received its whole share, so the
 // table is durable through it (#459). Any other cycle commits the minimum safe
 // position over its deliveries.
-func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
+func (c *Coordinator) commitStagedCycleLocked(cy *stagedCycle) error {
 	// A snapshot window's cycle commits no position: its marker carries the
 	// reader's, past stream cycles of the table not committed yet, and a
 	// crash would then skip them as covered (#468). Only the stream advances
@@ -96,9 +127,6 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 	if !ok {
 		return fmt.Errorf("coordinator: table %s: sink does not stage commits", cy.ref.Target)
 	}
-	mu := c.stagedLock(cy.ref.Target)
-	mu.Lock()
-	defer mu.Unlock()
 	faultinject.At(faultinject.CoordinatorCycleBeforeCommit,
 		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
 	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {

@@ -2037,13 +2037,13 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		if sub == nil {
 			continue
 		}
-		reader, rerr := transport.NewBatchReader(sub, nil)
+		subReader, rerr := transport.NewBatchReader(sub, nil)
 		if rerr != nil {
 			releaseRecords(subBatches)
 			return fmt.Errorf("coordinator: table %s: partition %d: %w", meta.Table, p, rerr)
 		}
-		if reader.NumRows() > 0 {
-			highs[p] = reader.Position(reader.NumRows() - 1)
+		if subReader.NumRows() > 0 {
+			highs[p] = subReader.Position(subReader.NumRows() - 1)
 		}
 		if c.coveredAtBoot(meta.Table, highs[p]) {
 			continue
