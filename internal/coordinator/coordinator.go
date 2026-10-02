@@ -258,7 +258,13 @@ type Coordinator struct {
 	// silently incomplete snapshot.
 	snapshotActive atomic.Bool
 	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
-	mu             sync.Mutex    // guards session attach/detach
+	// booted closes once waitWorkers has seen every group attach. Before that,
+	// Session blocks on ready to wake waitWorkers; after, nothing drains it,
+	// so signalReady also selects on booted and never wedges (#493). Closing
+	// the channel (not a bool) makes the transition race-free: a session
+	// already blocked on a full ready unblocks the moment boot closes it.
+	booted chan struct{}
+	mu     sync.Mutex // guards session attach/detach
 
 	// WK-001 C5: open staged cycles (a partitioned table's sub-batches
 	// grouped by binlog batch). stagedLocks serializes CommitStaged per
@@ -371,6 +377,15 @@ type Coordinator struct {
 	supervisor *supervisor
 	terminate  chan error
 	metrics    *observability.Metrics
+	// metricsSrv is the dashboard/metrics listener, kept so run's return can
+	// Shutdown it instead of leaking the bound addr and its goroutine (#495).
+	metricsSrv *http.Server
+	// metricsDone closes when the metrics goroutine returns, so Run never
+	// returns before the listener is fully stopped (#495).
+	metricsDone chan struct{}
+	// emitSem bounds the concurrent audit-trail uploads fired by onAck, so a
+	// slow S3 endpoint cannot spawn unbounded goroutines (#494).
+	emitSem chan struct{}
 
 	// Dashboard (issue #97): the recent-events ring, the read-only API handler,
 	// the run's start time, and the per-table/worker aggregates the API serves.
@@ -489,6 +504,8 @@ func Run(ctx context.Context, cfg Config) error {
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},
+		booted:      make(chan struct{}),
+		emitSem:     make(chan struct{}, maxConcurrentEmits),
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	c.budget.perWorkerMax = cfg.FlowPerWorkerMax
@@ -515,13 +532,17 @@ func Run(ctx context.Context, cfg Config) error {
 		if cfg.LogBuffer != nil {
 			cfg.LogBuffer.SetOnAppend(c.dash.PublishLog)
 		}
+		c.metricsSrv = observability.NewServer(cfg.MetricsAddr, mux)
+		c.metricsDone = make(chan struct{})
 		go func() {
+			defer close(c.metricsDone)
 			// A busy port silently disables observability otherwise — say so.
-			if err := observability.ServeMux(cfg.MetricsAddr, mux); err != nil {
+			if err := c.metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				c.log.Warn("coordinator: metrics server stopped", "addr", cfg.MetricsAddr, "err", err)
 			}
 		}()
 	}
+	defer c.shutdownMetrics()
 	return c.run(ctx)
 }
 
@@ -878,6 +899,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err := c.waitWorkers(ctx, wait); err != nil {
 		return err
 	}
+	close(c.booted)
 
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.
@@ -1282,31 +1304,6 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(st); err != nil {
 		c.log.Warn("statusz encode", "err", err)
 	}
-}
-
-// emit writes one event to the audit trail when configured; best-effort by
-// contract (a lost trail must never fail the pipeline). The dashboard's
-// recent-events ring is fed here too, unconditionally, so the UI shows events
-// even when no audit trail is configured.
-func (c *Coordinator) emit(kind string, fields map[string]any) error {
-	if c.dashEvents != nil {
-		ev := c.dashEvents.Record(kind, fields)
-		if c.dash != nil {
-			c.dash.PublishEvent(ev)
-		}
-	}
-	if c.ev == nil {
-		return nil
-	}
-	// Bounded: the audit-trail upload must not hang the caller (the ack hot
-	// path already fires-and-forgets, but emit is also called synchronously
-	// on boot/terminal paths).
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := c.ev.Emit(ctx, kind, fields); err != nil {
-		return err
-	}
-	return nil
 }
 
 // waitWorkers blocks until every expected group has had a session attached.
@@ -2517,18 +2514,8 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.inFlight(worker))
 	// The audit trail upload is a synchronous S3 put; on the ack hot path a
 	// slow endpoint would delay budget release and trip the supervisor's
-	// stale-ack resets (audit #15). Fire it and forget.
-	go func() {
-		if err := c.emit(eventlog.KindCommit, map[string]any{
-			"worker":   worker,
-			"table":    ack.Table,
-			"rows":     ack.Rows,
-			"deletes":  ack.Deletes,
-			"position": ack.Position,
-		}); err != nil {
-			c.log.Warn("coordinator: eventlog emit", "err", err)
-		}
-	}()
+	// stale-ack resets (audit #15). Fire it and forget, bounded (#494).
+	c.emitCommit(worker, ack)
 }
 
 // assignmentFor builds one worker's table assignment with its own ticket.
@@ -2889,11 +2876,7 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 		c.signalSessionEnd(hello.WorkerName, retErr)
 	}()
 
-	select {
-	case c.ready <- struct{}{}:
-	case <-stream.Context().Done():
-		return stream.Context().Err()
-	}
+	c.signalReady(sessCtx, stream.Context())
 	c.log.Info("worker session", "worker", hello.WorkerName)
 
 	// Recv loop: acks and worker errors.

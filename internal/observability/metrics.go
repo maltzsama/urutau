@@ -178,16 +178,22 @@ func (m *Metrics) Serve(addr string, encoder func(w http.ResponseWriter, r *http
 	return ServeMux(addr, m.Handler(encoder))
 }
 
-// ServeMux runs an http.Server with the given handler on addr until it stops.
-func ServeMux(addr string, handler http.Handler) error {
-	srv := &http.Server{
+// NewServer builds the metrics/dashboard http.Server for addr. Unlike the
+// ServeMux convenience, it hands back the server so the caller can Shutdown it
+// on run return instead of leaking the listener (issue #495).
+func NewServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
-	return srv.ListenAndServe()
+}
+
+// ServeMux runs an http.Server with the given handler on addr until it stops.
+func ServeMux(addr string, handler http.Handler) error {
+	return NewServer(addr, handler).ListenAndServe()
 }
 
 // Registry exposes the underlying registry (for tests).
