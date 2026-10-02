@@ -131,6 +131,21 @@ func TestRawDecoderExtractionRequiresJSON(t *testing.T) {
 	}
 }
 
+// A JSON document followed by trailing non-whitespace is not valid; the check
+// must read the whole remainder, not just the decoder's own buffer (issue
+// #507).
+func TestRawDecoderExtractionRejectsTrailingData(t *testing.T) {
+	d := &Raw{ByTopic: map[string]TopicExtraction{
+		"orders": {Fields: []Field{{Name: "id"}}},
+	}}
+	rec := &kgo.Record{Topic: "orders", Value: []byte(`{"id":1}EXTRA`)}
+	_, err := d.Decode(rec)
+	var notJSON *ErrNotJSON
+	if !errors.As(err, &notJSON) {
+		t.Fatalf("err = %v, want *ErrNotJSON for trailing data", err)
+	}
+}
+
 // A tombstone with extraction declared lands every field NULL rather than
 // failing — "no payload" is the same absence as "no fields".
 func TestRawDecoderExtractionTombstoneAllNull(t *testing.T) {
