@@ -586,8 +586,8 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 		}
 		// Ack only AFTER the batch is durable (non-staged) or staged for the
 		// coordinator's CommitStaged (staged): acking first advances the
-		// confirmed position over data a failed commit never made durable,
-		// and a crash re-reads past the lost window (issue #260).
+		// confirmed position over a batch the commit did not persist, and a
+		// crash re-reads past the lost window (issue #260).
 		if rb.ackPos != nil {
 			rb.batch.Watermark = rb.ackPos
 		}
@@ -790,14 +790,14 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	}
 
 	// addPending buffers one batch, flushing first when its coordinator cycle
-	// (Seq) differs from the buffered one. Snapshot/window batches carry Seq 0
-	// and merge freely; each live binlog batch's sub-batch is its own cycle.
-	// Ownership of b transfers to pending.
+	// (Seq) differs from the buffered one; snapshot/window batches carry Seq 0
+	// and merge freely. Ownership transfers to pending only once appended.
 	addPending := func(b *dataplane.Batch, rows int) error {
 		// Only a staged batch is a coordinator cycle: for every other batch
 		// the flush stays on MaxRows/MaxInterval.
 		if p.stage(b) && len(pending) > 0 && b.Seq != pendingSeq {
 			if err := flush(); err != nil {
+				b.Release() // b was never buffered (issue #490)
 				return err
 			}
 		}
