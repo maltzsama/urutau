@@ -2,7 +2,8 @@
 // messages. The wire format is the Debezium JSON envelope: a top-level
 // object with "op" (c/u/d/r/t), "before", "after", "source" (with
 // "ts_ms", "db", "table"), and "transaction" fields. Only c (create),
-// u (update), and d (delete) map to pipeline changes; others are skipped.
+// u (update), and d (delete) map to pipeline changes; the truncate and
+// message ops (t/m) are skipped. A missing or unknown op is ErrNotEnvelope.
 package decoder
 
 import (
@@ -25,7 +26,9 @@ type debeziumEnvelope struct {
 }
 
 type debeziumSource struct {
-	TsMs  int64  `json:"ts_ms"`
+	// TsMs is the origin commit time. A pointer distinguishes an absent
+	// field from a legitimate epoch-zero value.
+	TsMs  *int64 `json:"ts_ms"`
 	DB    string `json:"db"`
 	Table string `json:"table"`
 }
@@ -40,8 +43,8 @@ type DebeziumJSON struct {
 
 // Decode implements Decoder.
 func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
-	if len(record.Value) == 0 {
-		return nil, nil // tombstone (null value): no row change
+	if record.Value == nil {
+		return nil, nil // null value is a Kafka tombstone: no row change
 	}
 	value := record.Value
 	// A Kafka Connect JsonConverter with schemas.enable=true (the default)
@@ -49,7 +52,7 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 	// is empty and every record is silently skipped.
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(value, &root); err != nil {
-		return nil, fmt.Errorf("debezium-json: unmarshal: %w", err)
+		return nil, &ErrNotEnvelope{Err: err}
 	}
 	if payload, ok := root["payload"]; ok {
 		value = payload
@@ -57,7 +60,7 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 
 	var env debeziumEnvelope
 	if err := decodeJSON(value, &env); err != nil {
-		return nil, fmt.Errorf("debezium-json: unmarshal: %w", err)
+		return nil, &ErrNotEnvelope{Err: err}
 	}
 
 	var op rowchange.Op
@@ -82,20 +85,20 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 
 	// source.ts_ms is the origin commit time; ts_ms is when Debezium
 	// processed the event. Prefer the origin, fall back to processing.
-	tsMs := env.Source.TsMs
-	if tsMs == 0 {
-		tsMs = env.TimestampMs
+	tsMs := env.TimestampMs
+	if env.Source.TsMs != nil {
+		tsMs = *env.Source.TsMs
 	}
 	commitTS := time.UnixMilli(tsMs)
 	ingestTS := time.Now()
 
 	after, err := decodeObject(env.After)
 	if err != nil {
-		return nil, fmt.Errorf("debezium-json: unmarshal after: %w", err)
+		return nil, &ErrNotEnvelope{Err: fmt.Errorf("after: %w", err)}
 	}
 	before, err := decodeObject(env.Before)
 	if err != nil {
-		return nil, fmt.Errorf("debezium-json: unmarshal before: %w", err)
+		return nil, &ErrNotEnvelope{Err: fmt.Errorf("before: %w", err)}
 	}
 
 	// Build key from the after image (create/update) or before image (delete).
@@ -118,17 +121,27 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 	return []rowchange.Change{c}, nil
 }
 
-// ErrNotEnvelope marks a message that is not a Debezium envelope — an empty op
-// or one this decoder does not know. It is fatal: the topic's format is an
-// assertion, and silently skipping every record is total data loss.
-type ErrNotEnvelope struct{ Op string }
+// ErrNotEnvelope marks a message that is not a Debezium envelope — an empty op,
+// an unknown op, or a payload that does not parse. It is fatal: the topic's
+// format is an assertion, and silently skipping every record is total data
+// loss.
+type ErrNotEnvelope struct {
+	Op  string
+	Err error
+}
 
 func (e *ErrNotEnvelope) Error() string {
-	if e.Op == "" {
+	switch {
+	case e.Err != nil:
+		return "debezium-json: " + e.Err.Error()
+	case e.Op == "":
 		return "debezium-json: message has no op — not a Debezium envelope"
+	default:
+		return fmt.Sprintf("debezium-json: unknown op %q", e.Op)
 	}
-	return fmt.Sprintf("debezium-json: unknown op %q", e.Op)
 }
+
+func (e *ErrNotEnvelope) Unwrap() error { return e.Err }
 
 // decodeJSON decodes one JSON document with json.Number preserved, so a bigint
 // above 2^53 does not lose precision through float64.

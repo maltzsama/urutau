@@ -253,3 +253,27 @@ func TestDebeziumJSONUsesSourceTsMs(t *testing.T) {
 		t.Fatalf("commitTS = %v, want source.ts_ms 1000", got)
 	}
 }
+
+// An empty (non-null) value is not a tombstone: it must not be skipped as a
+// quiet no-op.
+func TestDebeziumJSONEmptyValueIsFatal(t *testing.T) {
+	d := &DebeziumJSON{}
+	_, err := d.Decode(&kgo.Record{Topic: "s.t", Value: []byte{}})
+	var ne *ErrNotEnvelope
+	if !errors.As(err, &ne) {
+		t.Fatalf("empty value err = %v, want ErrNotEnvelope", err)
+	}
+}
+
+// A present source.ts_ms of zero is a legitimate origin time, not "absent".
+func TestDebeziumJSONZeroSourceTsIsPresent(t *testing.T) {
+	d := &DebeziumJSON{}
+	msg := []byte(`{"op":"c","after":{"id":1},"source":{"ts_ms":0,"db":"s","table":"t"},"ts_ms":2000}`)
+	changes, err := d.Decode(&kgo.Record{Topic: "s.t", Value: msg})
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got := changes[0].CommitTS; !got.Equal(time.UnixMilli(0)) {
+		t.Fatalf("commitTS = %v, want source.ts_ms 0", got)
+	}
+}
