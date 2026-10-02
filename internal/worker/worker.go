@@ -585,12 +585,9 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 				"table", p.target, "seq", rb.batch.Seq, "position", string(rb.batch.Watermark))
 		}
 		// Ack only AFTER the batch is durable (non-staged) or staged for the
-		// coordinator's commit (staged). Acking first advanced the
-		// coordinator's confirmed position over data that a failed commit
-		// never made durable — a crash then re-read past the lost window
-		// (issue #260). In staged mode the durable point is the coordinator's
-		// CommitStaged, so this ack is a delivery receipt, but it must still
-		// follow a successful stage.
+		// coordinator's CommitStaged (staged): acking first advances the
+		// confirmed position over a batch the commit did not persist, and a
+		// crash re-reads past the lost window (issue #260).
 		if rb.ackPos != nil {
 			rb.batch.Watermark = rb.ackPos
 		}
@@ -659,6 +656,8 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		pendingRows, pendingBytes = 0, 0
 		pendingSeq = 0
 	}
+	// Release buffered batches on an early error return (issue #490).
+	defer freePending()
 
 	// ready sends a prepared batch to the committer (ownership transfers).
 	ready := func(b *dataplane.Batch, rows, upserts, deletes int) error {
@@ -743,6 +742,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					return fmt.Errorf("worker: table %s: select rest: %w", p.target, err)
 				}
 				upCount, dCount, err := collapseAndSend(ctx, p, rest, rows, pos, ready)
+				rest.Release() // collapseAndSend borrows its input; the caller owns it (issue #489)
 				delCount = dCount
 				if err != nil {
 					return err
@@ -790,14 +790,14 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 	}
 
 	// addPending buffers one batch, flushing first when its coordinator cycle
-	// (Seq) differs from the buffered one. Snapshot/window batches carry Seq 0
-	// and merge freely; each live binlog batch's sub-batch is its own cycle.
-	// Ownership of b transfers to pending.
+	// (Seq) differs from the buffered one; snapshot/window batches carry Seq 0
+	// and merge freely. Ownership transfers to pending only once appended.
 	addPending := func(b *dataplane.Batch, rows int) error {
 		// Only a staged batch is a coordinator cycle: for every other batch
 		// the flush stays on MaxRows/MaxInterval.
 		if p.stage(b) && len(pending) > 0 && b.Seq != pendingSeq {
 			if err := flush(); err != nil {
+				b.Release() // b was never buffered (issue #490)
 				return err
 			}
 		}
