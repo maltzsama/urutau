@@ -200,11 +200,15 @@ func (captureLoader) Close() error { return nil }
 // resolution at boot (issue #486).
 func TestLoadWildcardColumnsOrdersByJoinKey(t *testing.T) {
 	var gotOnRef string
-	open := func(uri, query, onRef string, maxRows int) (Loader, error) {
+
+	orig := newSQLLoader
+	newSQLLoader = func(uri, query, onRef string, maxRows int) (Loader, error) {
 		gotOnRef = onRef
 		return captureLoader{}, nil
 	}
-	_, err := loadWildcardColumns(context.Background(), []spec.Enrich{starCfg(nil)}, open)
+	t.Cleanup(func() { newSQLLoader = orig })
+
+	_, err := LoadWildcardColumns(context.Background(), []spec.Enrich{starCfg(nil)})
 	if err == nil {
 		t.Fatal("want the captureLoader error to propagate")
 	}
