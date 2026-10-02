@@ -26,21 +26,30 @@ type SinkAdapter struct {
 	client *client.Client
 	alloc  memory.Allocator
 	logger *slog.Logger
+	// server is the in-process Flight server this adapter owns (flightwrap);
+	// nil for a subprocess plugin, whose supervisor owns the process.
+	server ServerStopper
 	mu     sync.Mutex
 	closed bool
 	wg     sync.WaitGroup // tracks in-flight DoPut operations
 }
 
-// NewSinkAdapter creates a sink adapter over a connected Flight client.
-func NewSinkAdapter(c *client.Client, logger *slog.Logger) *SinkAdapter {
+// NewSinkAdapter creates a sink adapter over a connected Flight client. An
+// optional ServerStopper is the in-process server flightwrap started, which
+// Close stops (issue #496).
+func NewSinkAdapter(c *client.Client, logger *slog.Logger, servers ...ServerStopper) *SinkAdapter {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &SinkAdapter{
+	a := &SinkAdapter{
 		client: c,
 		alloc:  memory.NewGoAllocator(),
 		logger: logger,
 	}
+	if len(servers) > 0 {
+		a.server = servers[0]
+	}
+	return a
 }
 
 // EnsureTable delegates to the plugin via Flight action. The plugin
@@ -76,7 +85,8 @@ func (a *SinkAdapter) Properties(_ context.Context, _ core.TableRef) (map[string
 	return map[string]string{}, nil
 }
 
-// Close waits for in-flight operations and releases the Flight client.
+// Close waits for in-flight operations, releases the Flight client, and stops
+// the in-process server flightwrap started (issue #496).
 func (a *SinkAdapter) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -85,7 +95,11 @@ func (a *SinkAdapter) Close() error {
 	}
 	a.closed = true
 	a.wg.Wait()
-	return a.client.Close()
+	err := a.client.Close()
+	if a.server != nil {
+		a.server.Stop()
+	}
+	return err
 }
 
 // sinkWriter implements sink.TableWriter over Flight DoPut.
@@ -113,6 +127,14 @@ func (w *sinkWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	if len(records) == 0 {
 		return nil
 	}
+	// Ref-counted Arrow buffers: every exit path — DoPut failure or Flush
+	// failure included — must release them, or a slow sink leaks on the hot
+	// write path (issue #497).
+	defer func() {
+		for _, r := range records {
+			r.Release()
+		}
+	}()
 
 	schema := records[0].Schema()
 	desc := contract.DoPutRequest{
@@ -124,19 +146,12 @@ func (w *sinkWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	defer w.wg.Done()
 
 	if err := w.client.DoPut(ctx, desc, schema, records); err != nil {
-		for _, r := range records {
-			r.Release()
-		}
 		return fmt.Errorf("doPut: %w", err)
 	}
 
 	// Flush to guarantee durability (contract §10).
 	if err := w.client.Flush(ctx); err != nil {
 		return fmt.Errorf("flush: %w", err)
-	}
-
-	for _, r := range records {
-		r.Release()
 	}
 	return nil
 }

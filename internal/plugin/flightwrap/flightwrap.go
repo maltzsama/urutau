@@ -51,7 +51,7 @@ func (Wrap) WrapSource(path string, real driver.SourceFactory) driver.SourceFact
 			srv.Stop()
 			return nil, fmt.Errorf("flightwrap: plugin %s: connect in-process flight server: %w", path, err)
 		}
-		return pluginadapter.NewSourceAdapter(c, s.Source, rt.Logger), nil
+		return pluginadapter.NewSourceAdapter(c, s.Source, rt.Logger, srv), nil
 	}
 }
 
@@ -77,7 +77,7 @@ func (Wrap) WrapSink(path string, real driver.SinkFactory) driver.SinkFactory {
 			srv.Stop()
 			return nil, fmt.Errorf("flightwrap: plugin %s: connect in-process flight server: %w", path, err)
 		}
-		return pluginadapter.NewSinkAdapter(c, slog.Default()), nil
+		return pluginadapter.NewSinkAdapter(c, slog.Default(), srv), nil
 	}
 }
 

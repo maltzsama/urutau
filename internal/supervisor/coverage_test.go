@@ -21,7 +21,7 @@ func TestNewStageSupervisorDefaultsLogger(t *testing.T) {
 	if s.Stage() != nil {
 		t.Fatal("a fresh supervisor has no stage")
 	}
-	if err := s.stopStage(context.Background()); err != nil {
+	if err := s.stopStage(); err != nil {
 		t.Fatalf("stopStage(nil stage) = %v", err)
 	}
 }

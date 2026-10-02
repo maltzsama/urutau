@@ -30,6 +30,11 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
+// ServerStopper is an in-process Flight server an adapter owns and must stop
+// when it closes. flightwrap passes one; the subprocess path passes none — the
+// stage supervisor owns that process (issue #496).
+type ServerStopper interface{ Stop() }
+
 // StringPosition is an opaque position backed by a base64 offset string.
 // External plugins use opaque offsets; the runner never inspects them.
 type StringPosition struct {
@@ -68,19 +73,43 @@ type SourceAdapter struct {
 	spec   spec.Source
 	logger *slog.Logger
 	alloc  memory.Allocator
+	// server is the in-process Flight server this adapter owns (flightwrap);
+	// nil for a subprocess plugin, whose supervisor owns the process.
+	server    ServerStopper
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewSourceAdapter creates a source adapter over a connected Flight client.
-func NewSourceAdapter(c *client.Client, src spec.Source, logger *slog.Logger) *SourceAdapter {
+// An optional ServerStopper is the in-process server flightwrap started, which
+// Close stops (issue #496).
+func NewSourceAdapter(c *client.Client, src spec.Source, logger *slog.Logger, servers ...ServerStopper) *SourceAdapter {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &SourceAdapter{
+	a := &SourceAdapter{
 		client: c,
 		spec:   src,
 		logger: logger,
 		alloc:  memory.NewGoAllocator(),
 	}
+	if len(servers) > 0 {
+		a.server = servers[0]
+	}
+	return a
+}
+
+// Close releases the adapter: it closes the Flight client and stops the
+// in-process server flightwrap started. Idempotent, so a reader's Close and a
+// direct caller may both call it (issue #496).
+func (a *SourceAdapter) Close() error {
+	a.closeOnce.Do(func() {
+		a.closeErr = a.client.Close()
+		if a.server != nil {
+			a.server.Stop()
+		}
+	})
+	return a.closeErr
 }
 
 // Introspect resolves one spec table into its ref, schema, and warnings.
@@ -138,15 +167,24 @@ func (a *SourceAdapter) ParsePosition(s string) (position.Position, error) {
 // mode to get the schema and then starts streaming via DoGet.
 func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.Reader, error) {
 	ctx, cancel := context.WithCancel(ctx)
+	// An in-process source's client and server are owned by this adapter, and
+	// the reader's Close is the only teardown hook the source contract gives
+	// (source.Reader.Close). A subprocess source's supervisor owns its client,
+	// so leave it alone (issue #496).
+	var closeAdapter func() error
+	if a.server != nil {
+		closeAdapter = a.Close
+	}
 	r := &sourceReader{
-		client: a.client,
-		alloc:  a.alloc,
-		refs:   refs,
-		ctx:    ctx,
-		cancel: cancel,
-		logger: a.logger,
-		out:    make(chan *dataplane.Batch, 16),
-		errCh:  make(chan error, 1),
+		client:       a.client,
+		alloc:        a.alloc,
+		refs:         refs,
+		ctx:          ctx,
+		cancel:       cancel,
+		logger:       a.logger,
+		out:          make(chan *dataplane.Batch, 16),
+		errCh:        make(chan error, 1),
+		closeAdapter: closeAdapter,
 	}
 	return r, nil
 }
@@ -167,6 +205,9 @@ type sourceReader struct {
 	position StringPosition
 	mu       sync.Mutex
 	setConf  func() position.Position
+	// closeAdapter releases the owning adapter (client + in-process server) on
+	// Close; nil for a subprocess source (issue #496).
+	closeAdapter func() error
 }
 
 func (r *sourceReader) Start(ctx context.Context, from position.Position) error {
@@ -319,6 +360,9 @@ func (r *sourceReader) readBatches(ctx context.Context, stream flight.FlightServ
 
 func (r *sourceReader) Close() {
 	r.cancel()
+	if r.closeAdapter != nil {
+		_ = r.closeAdapter()
+	}
 }
 
 func (r *sourceReader) SetConfirmed(f func() position.Position) {
