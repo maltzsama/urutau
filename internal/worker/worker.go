@@ -585,12 +585,9 @@ func (w *Worker) runCommitter(ctx context.Context, p *tablePipeline) error {
 				"table", p.target, "seq", rb.batch.Seq, "position", string(rb.batch.Watermark))
 		}
 		// Ack only AFTER the batch is durable (non-staged) or staged for the
-		// coordinator's commit (staged). Acking first advanced the
-		// coordinator's confirmed position over data that a failed commit
-		// never made durable — a crash then re-read past the lost window
-		// (issue #260). In staged mode the durable point is the coordinator's
-		// CommitStaged, so this ack is a delivery receipt, but it must still
-		// follow a successful stage.
+		// coordinator's CommitStaged (staged): acking first advances the
+		// confirmed position over data a failed commit never made durable,
+		// and a crash re-reads past the lost window (issue #260).
 		if rb.ackPos != nil {
 			rb.batch.Watermark = rb.ackPos
 		}
@@ -659,6 +656,8 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		pendingRows, pendingBytes = 0, 0
 		pendingSeq = 0
 	}
+	// Release buffered batches on an early error return (issue #490).
+	defer freePending()
 
 	// ready sends a prepared batch to the committer (ownership transfers).
 	ready := func(b *dataplane.Batch, rows, upserts, deletes int) error {
@@ -743,6 +742,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 					return fmt.Errorf("worker: table %s: select rest: %w", p.target, err)
 				}
 				upCount, dCount, err := collapseAndSend(ctx, p, rest, rows, pos, ready)
+				rest.Release() // collapseAndSend borrows its input; the caller owns it (issue #489)
 				delCount = dCount
 				if err != nil {
 					return err
