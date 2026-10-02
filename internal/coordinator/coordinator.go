@@ -258,10 +258,12 @@ type Coordinator struct {
 	// silently incomplete snapshot.
 	snapshotActive atomic.Bool
 	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
-	// booted flips once waitWorkers has seen every group attach. Before that,
+	// booted closes once waitWorkers has seen every group attach. Before that,
 	// Session blocks on ready to wake waitWorkers; after, nothing drains it,
-	// so a churny re-attach must skip the send or it would wedge (#493).
-	booted atomic.Bool
+	// so signalReady also selects on booted and never wedges (#493). Closing
+	// the channel (not a bool) makes the transition race-free: a session
+	// already blocked on a full ready unblocks the moment boot closes it.
+	booted chan struct{}
 	mu     sync.Mutex // guards session attach/detach
 
 	// WK-001 C5: open staged cycles (a partitioned table's sub-batches
@@ -378,6 +380,9 @@ type Coordinator struct {
 	// metricsSrv is the dashboard/metrics listener, kept so run's return can
 	// Shutdown it instead of leaking the bound addr and its goroutine (#495).
 	metricsSrv *http.Server
+	// metricsDone closes when the metrics goroutine returns, so Run never
+	// returns before the listener is fully stopped (#495).
+	metricsDone chan struct{}
 	// emitSem bounds the concurrent audit-trail uploads fired by onAck, so a
 	// slow S3 endpoint cannot spawn unbounded goroutines (#494).
 	emitSem chan struct{}
@@ -499,6 +504,7 @@ func Run(ctx context.Context, cfg Config) error {
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},
+		booted:      make(chan struct{}),
 		emitSem:     make(chan struct{}, maxConcurrentEmits),
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
@@ -527,7 +533,9 @@ func Run(ctx context.Context, cfg Config) error {
 			cfg.LogBuffer.SetOnAppend(c.dash.PublishLog)
 		}
 		c.metricsSrv = observability.NewServer(cfg.MetricsAddr, mux)
+		c.metricsDone = make(chan struct{})
 		go func() {
+			defer close(c.metricsDone)
 			// A busy port silently disables observability otherwise — say so.
 			if err := c.metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				c.log.Warn("coordinator: metrics server stopped", "addr", cfg.MetricsAddr, "err", err)
@@ -891,7 +899,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	if err := c.waitWorkers(ctx, wait); err != nil {
 		return err
 	}
-	c.booted.Store(true)
+	close(c.booted)
 
 	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
 	// runs, routed over the wire instead of an in-process channel.

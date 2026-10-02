@@ -16,7 +16,8 @@ import (
 // on a full buffer.
 func TestSignalReadySkipsAfterBoot(t *testing.T) {
 	c := &Coordinator{ready: make(chan struct{})} // unbuffered, nothing drains
-	c.booted.Store(true)
+	c.booted = make(chan struct{})
+	close(c.booted)
 
 	done := make(chan struct{})
 	go func() {
@@ -32,7 +33,7 @@ func TestSignalReadySkipsAfterBoot(t *testing.T) {
 
 // #493: during boot the send still blocks so waitWorkers is woken.
 func TestSignalReadyBlocksDuringBootUntilDrained(t *testing.T) {
-	c := &Coordinator{ready: make(chan struct{})}
+	c := &Coordinator{ready: make(chan struct{})} // booted nil: still booting
 
 	done := make(chan struct{})
 	go func() {
@@ -49,6 +50,31 @@ func TestSignalReadyBlocksDuringBootUntilDrained(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("signalReady stayed blocked after ready was drained")
+	}
+}
+
+// #493: a session already blocked on a full ready must unblock when boot
+// finishes, even though nothing drains ready afterwards.
+func TestSignalReadyUnblocksOnBootWithFullReady(t *testing.T) {
+	c := &Coordinator{ready: make(chan struct{}, 1)}
+	c.ready <- struct{}{} // full: the send cannot proceed
+	c.booted = make(chan struct{})
+
+	done := make(chan struct{})
+	go func() {
+		c.signalReady(context.Background(), context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("signalReady returned before boot finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(c.booted)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("signalReady stayed blocked after boot with a full ready (issue #493)")
 	}
 }
 
@@ -82,10 +108,17 @@ func TestShutdownMetricsStopsServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := observability.NewServer(ln.Addr().String(), http.NotFoundHandler())
-	c := &Coordinator{log: slog.New(slog.DiscardHandler), metricsSrv: srv}
+	c := &Coordinator{
+		log:         slog.New(slog.DiscardHandler),
+		metricsSrv:  srv,
+		metricsDone: make(chan struct{}),
+	}
 
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(ln) }()
+	go func() {
+		defer close(c.metricsDone)
+		serveErr <- srv.Serve(ln)
+	}()
 
 	c.shutdownMetrics()
 

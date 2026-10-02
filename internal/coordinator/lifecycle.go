@@ -15,15 +15,13 @@ const maxConcurrentEmits = 8
 
 // signalReady wakes waitWorkers on an attach without ever wedging a session.
 // During boot it blocks on ready, which waitWorkers drains, and also aborts on
-// either context. Once booted, waitWorkers no longer drains ready, so a churny
-// re-attach skips the send entirely instead of blocking on a full buffer
-// (issue #493).
+// either context. booted is closed once waitWorkers returns; selecting on it
+// too means a session already blocked on a full ready unblocks the moment boot
+// finishes, even though nothing drains ready after that (issue #493).
 func (c *Coordinator) signalReady(sessCtx, streamCtx context.Context) {
-	if c.booted.Load() {
-		return
-	}
 	select {
 	case c.ready <- struct{}{}:
+	case <-c.booted:
 	case <-sessCtx.Done():
 	case <-streamCtx.Done():
 	}
@@ -56,7 +54,8 @@ func (c *Coordinator) emitCommit(worker string, ack *pb.Ack) {
 
 // shutdownMetrics stops the metrics/dashboard HTTP server, if one was started,
 // so run's return releases MetricsAddr instead of leaking the listener and its
-// goroutine (issue #495).
+// goroutine (issue #495). It waits for the server goroutine to exit, closing
+// the race where Shutdown lands before ListenAndServe first runs.
 func (c *Coordinator) shutdownMetrics() {
 	if c.metricsSrv == nil {
 		return
@@ -65,5 +64,8 @@ func (c *Coordinator) shutdownMetrics() {
 	defer cancel()
 	if err := c.metricsSrv.Shutdown(ctx); err != nil {
 		c.log.Warn("coordinator: metrics server shutdown", "err", err)
+	}
+	if c.metricsDone != nil {
+		<-c.metricsDone
 	}
 }
