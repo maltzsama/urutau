@@ -1567,28 +1567,51 @@ func (c *Coordinator) recordConfirmed(worker string, pos position.Position) {
 	c.confirmed[worker] = pos
 }
 
-// confirmedPosition returns the minimum committed position across all
-// workers; nil while nothing is durably committed.
+// confirmedPosition returns the minimum committed position across the workers
+// that still owe work; nil while nothing is provably committed.
 //
-// MinSafe, not Min: if the committed positions are not mutually comparable
-// (never for one source, but a guard), there is no safe minimum — advancing
-// the source's retention to an arbitrary one could pass uncommitted data.
-// Nil means "nothing provably committed", which holds retention back.
+// A worker with nothing in flight (empty queue and empty index) must NOT
+// constrain the minimum: an idle table never acks, so its committed position
+// would otherwise pin the source's retention forever and let the Postgres WAL
+// grow without bound. When no worker owes anything, every dispatched
+// batch is committed, so the confirmed may advance to the dispatched frontier.
+//
+// MinSafe, not Min: incomparable committed positions have no safe minimum, so
+// nil holds retention back rather than advancing past uncommitted data.
 func (c *Coordinator) confirmedPosition() position.Position {
+	owing := c.workersOwing()
+	dispatched := c.dispatchedPosition()
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
 	if len(c.confirmed) == 0 {
 		return nil
 	}
-	vals := make([]position.Position, 0, len(c.confirmed))
-	for _, p := range c.confirmed {
+	var vals []position.Position
+	anyOwing := false
+	for name, p := range c.confirmed {
+		if !owing[name] {
+			continue // idle: does not constrain the minimum
+		}
+		anyOwing = true
 		if p == nil {
-			// A registered worker with no committed position yet (its boot
-			// baseline): nothing is provably committed past the resume point,
-			// so hold retention back rather than advance over its data.
+			// A worker that owes work but has no committed position yet: hold
+			// retention back rather than advance over its data.
 			return nil
 		}
 		vals = append(vals, p)
+	}
+	if !anyOwing && dispatched != nil {
+		// Every dispatched batch is committed: advance to the frontier.
+		return dispatched
+	}
+	if !anyOwing {
+		// Nothing dispatched yet this run: the boot baseline, min over all.
+		for _, p := range c.confirmed {
+			if p == nil {
+				return nil
+			}
+			vals = append(vals, p)
+		}
 	}
 	best, err := position.MinSafe(vals)
 	if err != nil {
