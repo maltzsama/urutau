@@ -210,6 +210,11 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		}
 	}
 
+	upsertTargets := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		t, _ := a.tableFor(ref.Source)
+		upsertTargets[ref.Target] = spec.EffectiveWriteMode(t, a.spec.Sink.Defaults.WriteMode) == spec.WriteModeUpsert
+	}
 	rdr, err := New(ctx, Config{
 		Addr:                 conn.Addr(),
 		User:                 conn.User,
@@ -222,6 +227,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		TimeLocation:         conn.TimeLocation(),
 		MaxReconnectAttempts: resolveMaxReconnectAttempts(a.spec.Source.MaxReconnectAttempts),
 		Projections:          projections,
+		UpsertTargets:        upsertTargets,
 	}, out)
 	if err != nil {
 		return nil, err

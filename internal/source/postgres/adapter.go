@@ -384,22 +384,28 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	// returned stream pulls from it. Creating it per attempt would orphan
 	// the reader's output on the attempt that succeeds.
 	filters, columns := a.filtersColumnsFor(refs)
+	upsertTargets := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		t, _ := a.tableFor(ref.Source)
+		upsertTargets[ref.Target] = spec.EffectiveWriteMode(t, a.spec.Sink.Defaults.WriteMode) == spec.WriteModeUpsert
+	}
 	out := make(chan rowchange.Change, 1024)
 	var rdr *Reader
 	var err error
 	for attempt := 0; ; attempt++ {
 		rdr, err = New(ctx, Config{
-			URI:         uri,
-			ConnCfg:     a.connCfg,
-			DB:          a.db,
-			SlotName:    slot,
-			Tables:      refs,
-			Logger:      a.rt.Logger,
-			RetryCount:  maxRetries,
-			InitialWait: initialWait,
-			Plugin:      plugin,
-			Filters:     filters,
-			Columns:     columns,
+			URI:           uri,
+			ConnCfg:       a.connCfg,
+			DB:            a.db,
+			SlotName:      slot,
+			Tables:        refs,
+			Logger:        a.rt.Logger,
+			RetryCount:    maxRetries,
+			InitialWait:   initialWait,
+			Plugin:        plugin,
+			Filters:       filters,
+			Columns:       columns,
+			UpsertTargets: upsertTargets,
 		}, out)
 		if err == nil {
 			break
