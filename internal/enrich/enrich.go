@@ -382,6 +382,12 @@ func RefColumnsFor(cfgs []spec.Enrich) []string {
 // time. Accepted, disclosed cost of the coordinator/worker split; not
 // avoidable without a protocol change.
 func LoadWildcardColumns(ctx context.Context, cfgs []spec.Enrich) ([]string, error) {
+	return loadWildcardColumns(ctx, cfgs, NewSQLLoader)
+}
+
+// loadWildcardColumns is LoadWildcardColumns with an injectable loader opener,
+// so a test can assert the onRef it is handed without a reference DB.
+func loadWildcardColumns(ctx context.Context, cfgs []spec.Enrich, open func(uri, query, onRef string, maxRows int) (Loader, error)) ([]string, error) {
 	out := RefColumnsFor(cfgs)
 	for _, cfg := range cfgs {
 		if !isWildcard(cfg) {
@@ -391,7 +397,7 @@ func LoadWildcardColumns(ctx context.Context, cfgs []spec.Enrich) ([]string, err
 		if maxRows == 0 {
 			maxRows = DefaultMaxRows
 		}
-		l, err := NewSQLLoader(cfg.Source.URI, cfg.Source.Query, "", maxRows)
+		l, err := open(cfg.Source.URI, cfg.Source.Query, onRefOf(cfg), maxRows)
 		if err != nil {
 			return nil, fmt.Errorf("enrich: reference %q: %w", cfg.Table, err)
 		}
