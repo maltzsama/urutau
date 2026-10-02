@@ -6,11 +6,13 @@ import (
 )
 
 // updateCommitted records the position a target table durably committed and
-// recomputes the pipeline-wide minimum — the value reported to the source so
-// its retention never advances past uncommitted data. The minimum uses the
-// position's own ordering: LSNs and GTID sets are not lexicographically
-// ordered ("0/10" sorts before "0/2" as strings, 16 after 2 as positions),
-// and a wrong minimum would advance the slot past data still in flight.
+// refreshes minConfirmed, the minimum over every committed table. That cache
+// is only the confirmed position when dispatch tracking is absent (a bare
+// Runner in tests); in production confirmedPosition derives the value from
+// delivered/dispatched. The minimum uses the position's own ordering: LSNs and
+// GTID sets are not lexicographically ordered ("0/10" sorts before "0/2" as
+// strings, 16 after 2 as positions), and a wrong minimum would advance the
+// slot past data still in flight.
 func (r *Runner) updateCommitted(table string, pos position.Position) {
 	if pos == nil {
 		return
