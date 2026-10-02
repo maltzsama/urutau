@@ -25,6 +25,9 @@ const (
 	circuitBreakerThreshold = 3
 	// circuitBreakerWindow is the rolling window for failure counting.
 	circuitBreakerWindow = 5 * time.Minute
+	// stageStopTimeout bounds a stage's Flight Shutdown during teardown, so a
+	// hung plugin cannot stall a restart or shutdown (issue #498).
+	stageStopTimeout = 5 * time.Second
 )
 
 // StageSupervisor manages the lifecycle of one plugin subprocess with
@@ -113,12 +116,16 @@ func (s *StageSupervisor) Run(ctx context.Context) error {
 		s.resetBackoff()
 		select {
 		case <-ctx.Done():
-			return s.stopStage(context.Background())
+			return s.stopStage()
 		case <-s.stage.Exited():
 			err := fmt.Errorf("plugin exited unexpectedly")
 			s.recordFailure()
 			s.logger.Error("plugin exited", "err", err, "bin", s.cfg.Bin)
 			s.advanceBackoff()
+			// Release the dead stage's Flight client and heartbeat before
+			// startOnce replaces it, or a crash-loop leaks one client per
+			// restart cycle (issue #498).
+			_ = s.stopStage()
 		}
 	}
 }
@@ -132,7 +139,9 @@ func (s *StageSupervisor) startOnce(ctx context.Context) error {
 	}
 
 	if err := stage.Connect(ctx); err != nil {
-		_ = stage.Stop(context.Background())
+		sctx, cancel := context.WithTimeout(context.Background(), stageStopTimeout)
+		_ = stage.Stop(sctx)
+		cancel()
 		return fmt.Errorf("connect: %w", err)
 	}
 
@@ -144,13 +153,19 @@ func (s *StageSupervisor) startOnce(ctx context.Context) error {
 	return nil
 }
 
-func (s *StageSupervisor) stopStage(ctx context.Context) error {
+// stopStage stops the current stage under a bounded teardown context, so a
+// Flight Shutdown that hangs cannot stall a restart or shutdown, and clears
+// s.stage so a later Stage() call never sees the stopped one (issue #498).
+func (s *StageSupervisor) stopStage() error {
 	s.mu.Lock()
 	stg := s.stage
+	s.stage = nil
 	s.mu.Unlock()
 	if stg == nil {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), stageStopTimeout)
+	defer cancel()
 	return stg.Stop(ctx)
 }
 

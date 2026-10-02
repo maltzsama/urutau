@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
@@ -29,10 +30,11 @@ import (
 // unix socket. Addr()+Token() are what driver.LoadPlugin hands to
 // client.Connect — the same call a subprocess plugin's caller makes.
 type Server struct {
-	lis   net.Listener
-	grpc  *grpc.Server
-	addr  string
-	token string
+	lis      net.Listener
+	grpc     *grpc.Server
+	addr     string
+	token    string
+	stopOnce sync.Once
 }
 
 // Start listens on a fresh unix socket in dir and serves svc (a
@@ -65,9 +67,13 @@ func Start(dir, token string, svc flight.FlightServer) (*Server, error) {
 // Addr is the unix socket path — the address client.Connect dials.
 func (s *Server) Addr() string { return s.addr }
 
-// Stop gracefully stops the server and removes the socket.
+// Stop gracefully stops the server and removes its socket file. Idempotent:
+// an adapter may stop it on Close after an earlier error path already did.
 func (s *Server) Stop() {
-	s.grpc.GracefulStop()
+	s.stopOnce.Do(func() {
+		s.grpc.GracefulStop()
+		_ = os.Remove(s.addr)
+	})
 }
 
 // authInterceptor rejects any RPC other than Handshake that lacks the

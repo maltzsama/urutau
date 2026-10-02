@@ -301,5 +301,12 @@ func TestStartAddrStop(t *testing.T) {
 	if srv.Addr() == "" {
 		t.Fatal("Addr must be set")
 	}
+	if _, err := os.Stat(srv.Addr()); err != nil {
+		t.Fatalf("socket %s must exist while serving: %v", srv.Addr(), err)
+	}
 	srv.Stop()
+	if _, err := os.Stat(srv.Addr()); !os.IsNotExist(err) {
+		t.Fatalf("socket %s must be removed by Stop, stat err = %v", srv.Addr(), err)
+	}
+	srv.Stop() // idempotent
 }
