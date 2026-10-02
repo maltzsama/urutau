@@ -43,6 +43,10 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
+// newSQLLoader is a test seam: LoadWildcardColumns opens its per-reference
+// loader through it so a test can capture the onRef without a reference DB.
+var newSQLLoader = NewSQLLoader
+
 // NewSQLLoader opens the reference connection. The URI scheme picks the
 // driver (mysql:// or postgres://); onRef is the reference-side join column
 // name — the loader appends ORDER BY onRef when the query has no ORDER BY,

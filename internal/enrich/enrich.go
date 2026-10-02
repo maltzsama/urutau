@@ -391,7 +391,7 @@ func LoadWildcardColumns(ctx context.Context, cfgs []spec.Enrich) ([]string, err
 		if maxRows == 0 {
 			maxRows = DefaultMaxRows
 		}
-		l, err := NewSQLLoader(cfg.Source.URI, cfg.Source.Query, "", maxRows)
+		l, err := newSQLLoader(cfg.Source.URI, cfg.Source.Query, onRefOf(cfg), maxRows)
 		if err != nil {
 			return nil, fmt.Errorf("enrich: reference %q: %w", cfg.Table, err)
 		}

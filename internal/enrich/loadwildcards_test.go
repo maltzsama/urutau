@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -180,5 +182,37 @@ func TestLoadWildcardColumnsFailsLoudlyNamingReference(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), star.Table) {
 		t.Fatalf("LoadWildcardColumns error %q does not name reference %q", err.Error(), star.Table)
+	}
+}
+
+// captureLoader fails Load immediately; the test only needs the onRef its
+// opener was handed.
+type captureLoader struct{}
+
+func (captureLoader) Load(context.Context) (arrow.RecordBatch, error) {
+	return nil, errors.New("captureLoader: boom")
+}
+func (captureLoader) Close() error { return nil }
+
+// A wildcard reference with no ORDER BY gets one appended by the loader, and
+// the loader must be opened with the reference-side join key: an empty onRef
+// produced `ORDER BY ""` — invalid SQL that failed the coordinator's wildcard
+// resolution at boot (issue #486).
+func TestLoadWildcardColumnsOrdersByJoinKey(t *testing.T) {
+	var gotOnRef string
+
+	orig := newSQLLoader
+	newSQLLoader = func(uri, query, onRef string, maxRows int) (Loader, error) {
+		gotOnRef = onRef
+		return captureLoader{}, nil
+	}
+	t.Cleanup(func() { newSQLLoader = orig })
+
+	_, err := LoadWildcardColumns(context.Background(), []spec.Enrich{starCfg(nil)})
+	if err == nil {
+		t.Fatal("want the captureLoader error to propagate")
+	}
+	if gotOnRef != "id" {
+		t.Fatalf("onRef = %q, want the reference-side join key `id` (an empty value yields an invalid ORDER BY)", gotOnRef)
 	}
 }
