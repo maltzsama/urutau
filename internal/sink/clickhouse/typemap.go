@@ -137,6 +137,10 @@ func coerce(base string, v any) (any, error) {
 			return t, nil
 		case []byte:
 			return string(t), nil
+		case int64:
+			// KindTime arrives from the wire as micros since midnight
+			// (transport.readTypedValue); render it as canonical time text.
+			return timeOfDayText(t)
 		}
 	case base == "Bool":
 		switch t := v.(type) {
@@ -155,12 +159,15 @@ func coerce(base string, v any) (any, error) {
 	case base == "Float32" || base == "Float64":
 		return toFloat(base, v)
 	case base == "Date":
-		return toTime(v, "2006-01-02")
+		return dateValue(v)
 	case strings.HasPrefix(base, "DateTime64"):
 		return toTime(v, "")
 	case base == "UUID":
-		if s, ok := v.(string); ok {
-			return s, nil
+		switch t := v.(type) {
+		case string:
+			return t, nil
+		case []byte:
+			return uuidText(t)
 		}
 	case strings.HasPrefix(base, "Decimal"):
 		switch t := v.(type) {
@@ -173,10 +180,19 @@ func coerce(base string, v any) (any, error) {
 		case decimal.Decimal:
 			return t, nil
 		}
-	case strings.HasPrefix(base, "Array"), strings.HasPrefix(base, "Tuple"):
+	case strings.HasPrefix(base, "Array"):
 		// Nested types arrive as []any from the canonical decoder.
 		if arr, ok := v.([]any); ok {
 			return arr, nil
+		}
+	case strings.HasPrefix(base, "Tuple"):
+		switch t := v.(type) {
+		case []any:
+			return t, nil
+		case map[string]any:
+			// A struct arrives as map[string]any; the Tuple row wants its
+			// fields in declaration order (which the base string carries).
+			return tupleFromMap(base, t), nil
 		}
 	case strings.HasPrefix(base, "Map"):
 		// Maps arrive as map[string]any or map[any]any from the canonical decoder.
@@ -425,6 +441,89 @@ func floatValue(v any) (float64, error) {
 		return f, nil
 	}
 	return 0, fmt.Errorf("cannot encode %T as Float", v)
+}
+
+// dateValue converts a wire Date (int32 days since epoch) or a canonical text
+// into the time.Time a ClickHouse Date column expects.
+func dateValue(v any) (any, error) {
+	switch t := v.(type) {
+	case int32:
+		return time.Unix(int64(t)*86400, 0).UTC(), nil
+	case int64:
+		return time.Unix(t*86400, 0).UTC(), nil
+	default:
+		return toTime(v, "2006-01-02")
+	}
+}
+
+// timeOfDayText renders micros-since-midnight as canonical time text,
+// matching core.castToString's KindTime output.
+func timeOfDayText(micros int64) (string, error) {
+	if micros < 0 {
+		return "", fmt.Errorf("time-of-day %d micros is negative", micros)
+	}
+	if micros >= int64(24*time.Hour/time.Microsecond) {
+		return "", fmt.Errorf("time-of-day %d micros is at or past 24h", micros)
+	}
+	ns := micros * 1000
+	h := ns / int64(time.Hour)
+	ns -= h * int64(time.Hour)
+	m := ns / int64(time.Minute)
+	ns -= m * int64(time.Minute)
+	s := ns / int64(time.Second)
+	ns -= s * int64(time.Second)
+	if ns == 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s), nil
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000), nil
+}
+
+// uuidText renders 16 raw bytes as the canonical hyphenated UUID text.
+func uuidText(b []byte) (string, error) {
+	if len(b) != 16 {
+		return "", fmt.Errorf("uuid bytes must be 16 long, got %d", len(b))
+	}
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// tupleFromMap orders a struct's map by the Tuple's declared field names, so
+// clickhouse-go's AppendRow receives them positionally.
+func tupleFromMap(base string, m map[string]any) []any {
+	names := tupleFieldNames(base)
+	out := make([]any, len(names))
+	for i, n := range names {
+		out[i] = m[n]
+	}
+	return out
+}
+
+// tupleFieldNames extracts the field names from a generated "Tuple(`a` T,
+// `b` U)" base. Only field names are backtick-quoted (types never are), so
+// every backtick-quoted run is a name, in declaration order.
+func tupleFieldNames(base string) []string {
+	var names []string
+	for i := 0; i < len(base); i++ {
+		if base[i] != '`' {
+			continue
+		}
+		var sb strings.Builder
+		j := i + 1
+		for j < len(base) {
+			if base[j] == '`' {
+				if j+1 < len(base) && base[j+1] == '`' {
+					sb.WriteByte('`')
+					j += 2
+					continue
+				}
+				break
+			}
+			sb.WriteByte(base[j])
+			j++
+		}
+		names = append(names, sb.String())
+		i = j
+	}
+	return names
 }
 
 func toTime(v any, layout string) (any, error) {
