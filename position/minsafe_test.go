@@ -44,8 +44,9 @@ func TestMinSafeRejectsIncomparable(t *testing.T) {
 }
 
 func TestMinSafeFoldsOrdered(t *testing.T) {
-	a := MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1")
-	b := MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:5")
+	// Same uuid, ordered by containment: the smaller set is the safe minimum.
+	a := MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-3")
+	b := MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
 	got, err := MinSafe([]Position{a, b})
 	if err != nil {
 		t.Fatalf("MinSafe: %v", err)

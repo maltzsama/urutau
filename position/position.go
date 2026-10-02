@@ -40,8 +40,9 @@ func StringOrNone(p Position) string {
 // MinSafe needs this because a partial order has no minimum among the inputs
 // to select: for Kafka offsets {p0:100,p1:5} and {p0:5,p1:100}, neither is a
 // safe resume point, and the only safe one ({p0:5,p1:5}) is not in the list.
-// A totally ordered position (GTID, LSN) does not implement it — its minimum
-// is always one of the inputs.
+// LSN is linear; GTID is a partial order too (containment), and two sets from
+// different server uuids (a MySQL failover) are incomparable — GTID has no
+// Meet, so MinSafe errors rather than skip.
 type Meeter interface {
 	Meet(other Position) (Position, bool)
 }
@@ -80,12 +81,12 @@ func Min(positions []Position) Position {
 // MinSafe is Min for a RESUME decision: it returns a position that every
 // input contains, so resuming from it can never skip uncommitted data.
 //
-// For a totally ordered position (GTID, LSN) that is the smallest input.
-// For a PARTIAL order (Kafka offsets, folded one-per-partition-owner by
-// WK-001 C7) no input need be safe: {p0:100,p1:5} and {p0:5,p1:100} each
-// sit ahead of the other on one partition. Selecting either resumes past
-// the other's uncommitted range, so an incomparable pair is folded with
-// Meet into their greatest lower bound ({p0:5,p1:5}) instead.
+// For a linearly ordered position (LSN) that is the smallest input. For a
+// PARTIAL order (Kafka offsets, folded one-per-partition-owner by WK-001 C7;
+// GTID across a failover's server uuids) no input need be safe: {p0:100,p1:5}
+// and {p0:5,p1:100} each sit ahead of the other on one partition. Selecting
+// either resumes past the other's uncommitted range, so an incomparable pair
+// is folded with Meet into their greatest lower bound ({p0:5,p1:5}) instead.
 //
 // An incomparable pair with no meet is an error, not a silent skip: there
 // is no safe choice, so fail fast rather than resume past data (P1).

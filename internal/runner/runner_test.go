@@ -232,8 +232,8 @@ func TestUpdateCommittedIncomparableHolds(t *testing.T) {
 		t.Fatalf("incomparable positions must hold the confirmed point (nil), got %s", r.minConfirmed)
 	}
 
-	lo := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1")
-	hi := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:5")
+	lo := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-3")
+	hi := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
 	r2 := &Runner{log: slog.New(slog.DiscardHandler), committedPositions: map[string]position.Position{}}
 	r2.updateCommitted("a", lo)
 	r2.updateCommitted("b", hi)
