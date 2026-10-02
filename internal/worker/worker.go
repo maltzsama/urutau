@@ -891,16 +891,13 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// join, so no single-row special case is needed.
 			origRows := int(batch.Record.NumRows())
 			if p.enricher != nil {
-				enriched, err := p.enricher.EnrichBatch(ctx, batch, p.knownSchema.PrimaryKey)
-				batch.Release()
+				enriched, dropped, err := p.applyEnrich(ctx, batch, origRows, deliverEmpty)
 				if err != nil {
-					return fmt.Errorf("worker: table %s: enrich: %w", p.target, err)
+					return err
 				}
-				if enriched == nil {
-					p.enrichDropped.Add(int64(origRows))
+				if dropped {
 					continue
 				}
-				p.enrichDropped.Add(int64(origRows - int(enriched.Record.NumRows())))
 				batch = enriched
 			}
 
