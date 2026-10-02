@@ -69,7 +69,7 @@ func (p *tablePlan) buildDoc(r *transport.BatchReader, i int) (map[string]any, m
 			}
 			v = cv
 		}
-		jv, err := jsonValue(v)
+		jv, err := jsonValueKind(col.Type.Kind, v)
 		if err != nil {
 			return nil, nil, fmt.Errorf("column %q: %w", col.Name, err)
 		}
@@ -86,7 +86,7 @@ func jsonValue(v any) (any, error) {
 	switch t := v.(type) {
 	case nil:
 		return nil, nil
-	case bool, string, int32, int64, float32, float64, time.Time:
+	case bool, string, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, time.Time:
 		return v, nil
 	case []byte:
 		// Binary data serializes to base64 via encoding/json. The cast
@@ -116,4 +116,60 @@ func jsonValue(v any) (any, error) {
 	default:
 		return nil, fmt.Errorf("couchbase: unsupported value type %T", v)
 	}
+}
+
+// couchbaseDateLayout is the canonical date text form.
+const couchbaseDateLayout = "2006-01-02"
+
+// jsonValueKind converts a canonical value into its JSON document form using
+// the column's kind for the values whose wire form is ambiguous on its own: a
+// Date arrives as int32 days, a Time as int64 micros and a UUID as 16 raw
+// bytes — encoding those as a bare number/base64 corrupts the document
+// (issue #484). Everything else falls back to jsonValue's natural encoding.
+func jsonValueKind(kind core.Kind, v any) (any, error) {
+	switch kind {
+	case core.KindDate:
+		if days, ok := core.AsInt64(v); ok {
+			return time.Unix(days*86400, 0).UTC().Format(couchbaseDateLayout), nil
+		}
+	case core.KindTime:
+		if micros, ok := core.AsInt64(v); ok {
+			return microsOfDayText(micros)
+		}
+	case core.KindUUID:
+		switch t := v.(type) {
+		case string:
+			return t, nil
+		case []byte:
+			return uuidText(t)
+		}
+	}
+	return jsonValue(v)
+}
+
+// microsOfDayText renders micros-since-midnight as canonical time text,
+// matching core.castToString's KindTime output.
+func microsOfDayText(micros int64) (string, error) {
+	if micros < 0 || micros >= int64(24*time.Hour/time.Microsecond) {
+		return "", fmt.Errorf("time-of-day %d micros out of range", micros)
+	}
+	ns := micros * 1000
+	h := ns / int64(time.Hour)
+	ns -= h * int64(time.Hour)
+	m := ns / int64(time.Minute)
+	ns -= m * int64(time.Minute)
+	s := ns / int64(time.Second)
+	ns -= s * int64(time.Second)
+	if ns == 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s), nil
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000), nil
+}
+
+// uuidText renders 16 raw bytes as the canonical hyphenated UUID text.
+func uuidText(b []byte) (string, error) {
+	if len(b) != 16 {
+		return "", fmt.Errorf("uuid bytes must be 16 long, got %d", len(b))
+	}
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }

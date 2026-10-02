@@ -331,7 +331,17 @@ func (s *Sink) SetProperties(ctx context.Context, ref core.TableRef, props map[s
 	if err != nil {
 		return err
 	}
-	return setProperties(ctx, &realKV{coll: s.collection(scope, coll), dur: s.dur}, ref, props, s.now)
+	kv := &realKV{coll: s.collection(scope, coll), dur: s.dur}
+	if s.txns != nil {
+		// A concurrent worker commit writes the same control document; run
+		// the read-modify-write in a transaction so the merge cannot clobber
+		// it (issue #506), symmetric with SeedPositions.
+		tx := &realTx{txns: s.txns, coll: kv.coll, dur: s.dur}
+		return tx.run(ctx, func(tx kvStore) error {
+			return setProperties(ctx, tx, ref, props, s.now)
+		})
+	}
+	return setProperties(ctx, kv, ref, props, s.now)
 }
 
 // Properties reads the control document's property map (snapshot resume).
