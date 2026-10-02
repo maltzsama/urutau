@@ -810,6 +810,9 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		return nil
 	}
 
+	// bufferEmpty queues an empty batch so the flush delivers it in Seq order.
+	bufferEmpty := func(b *dataplane.Batch) error { return addPending(emptyBatch(b, p.mode), 0) }
+
 	for {
 		select {
 		case ing, ok := <-p.ch:
@@ -891,7 +894,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// join, so no single-row special case is needed.
 			origRows := int(batch.Record.NumRows())
 			if p.enricher != nil {
-				enriched, dropped, err := p.applyEnrich(ctx, batch, origRows, deliverEmpty)
+				enriched, dropped, err := p.applyEnrich(ctx, batch, origRows, bufferEmpty)
 				if err != nil {
 					return err
 				}

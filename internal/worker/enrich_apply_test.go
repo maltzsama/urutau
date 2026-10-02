@@ -20,7 +20,7 @@ func (nilEnricher) EnrichBatch(context.Context, *dataplane.Batch, []string) (*da
 
 // A batch the join drops entirely still needs its staged-cycle delivery, and
 // applyEnrich must release the input.
-func TestApplyEnrichDeliversEmptyWhenAllRowsDropped(t *testing.T) {
+func TestApplyEnrichBuffersEmptyWhenAllRowsDropped(t *testing.T) {
 	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
 	bld := array.NewRecordBuilder(memory.DefaultAllocator, schema)
 	bld.Field(0).(*array.Int64Builder).Append(1)
@@ -30,9 +30,9 @@ func TestApplyEnrichDeliversEmptyWhenAllRowsDropped(t *testing.T) {
 	p := &tablePipeline{target: "t", enricher: nilEnricher{}}
 	b := &dataplane.Batch{Table: "t", Record: rec, Staged: true, Seq: 3}
 
-	delivered := 0
+	queued := 0
 	_, dropped, err := p.applyEnrich(context.Background(), b, int(rec.NumRows()), func(*dataplane.Batch) error {
-		delivered++
+		queued++
 		return nil
 	})
 	if err != nil {
@@ -41,8 +41,8 @@ func TestApplyEnrichDeliversEmptyWhenAllRowsDropped(t *testing.T) {
 	if !dropped {
 		t.Fatal("dropped = false, want true when every row is dropped")
 	}
-	if delivered != 1 {
-		t.Fatalf("deliverEmpty calls = %d, want 1", delivered)
+	if queued != 1 {
+		t.Fatalf("bufferEmpty calls = %d, want 1", queued)
 	}
 	if b.Record != nil {
 		t.Fatal("applyEnrich must release the input batch")

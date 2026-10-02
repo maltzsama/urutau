@@ -134,20 +134,12 @@ func (b *Batch) Release() {
 	b.Record = nil
 }
 
-// WithRecord returns a shallow copy of b carrying a new Record, preserving
-// every control field (Table, Watermark, Mode, SnapshotState, SnapshotPending,
-// Seq, Staged). A transform that replaces the record must use this instead of
+// WithRecord returns a copy of b carrying a new Record, preserving every
+// control field. A transform that replaces the record must use this instead of
 // re-listing the fields by hand, or a newly added field is silently dropped —
 // which stranded a staged partition's cycle when enrich forgot Staged.
 func (b *Batch) WithRecord(rec arrow.RecordBatch) *Batch {
-	return &Batch{
-		Table:           b.Table,
-		Record:          rec,
-		Watermark:       b.Watermark,
-		Mode:            b.Mode,
-		SnapshotState:   b.SnapshotState,
-		SnapshotPending: b.SnapshotPending,
-		Seq:             b.Seq,
-		Staged:          b.Staged,
-	}
+	c := *b
+	c.Record = rec
+	return &c
 }
