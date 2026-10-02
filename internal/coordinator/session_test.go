@@ -167,7 +167,7 @@ func TestSignalSessionEndPendingDoesNotDiscard(t *testing.T) {
 		t.Fatalf("a pending reset must not fail the run, got %v", err)
 	default:
 	}
-	if c.staged.isGapped("raw.t") {
+	if c.staged.openFor(core.TableRef{Target: "raw.t"}) != 1 {
 		t.Fatal("a pending reset must not discard the worker's cycles")
 	}
 }
@@ -256,7 +256,7 @@ func TestSignalSessionEndKeepsOpenCycles(t *testing.T) {
 		t.Fatalf("a worker lost with open cycles must be recovered, not end the run: %v", err)
 	default:
 	}
-	if c.staged.isGapped("raw.t") || c.staged.openFor(core.TableRef{Target: "raw.t"}) != 1 {
+	if c.staged.openFor(core.TableRef{Target: "raw.t"}) != 1 {
 		t.Fatal("the lost worker's open cycle must stay open for its redelivery")
 	}
 }

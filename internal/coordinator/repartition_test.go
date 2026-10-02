@@ -430,6 +430,37 @@ func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
 	}
 }
 
+// retireOwner must forget the retired owner's supervisor state, symmetric with
+// unregisterOwner. Worker names are deterministic, so a later scale-out that
+// reuses the name would otherwise inherit stale ack/crash/delivery clocks and
+// could be terminated as a crash-loop or by the delivery timeout before its
+// first ack (issue #491).
+func TestRetireOwnerForgetsSupervisorState(t *testing.T) {
+	c, _ := scaleHarness(t)
+	w, _ := c.loadRouting().ownersOf("raw.orders")
+	owner := w[0]
+
+	c.supervisor.noteAck(owner.name, time.Now())
+	c.supervisor.pendingSet(owner.name)
+	c.supervisor.noteProgress(owner.name, 1<<20, time.Now())
+	c.supervisor.recordReset(owner.name, time.Now(), time.Minute)
+
+	c.retireOwner(context.Background(), owner)
+
+	c.supervisor.mu.Lock()
+	_, ack := c.supervisor.lastAck[owner.name]
+	_, pending := c.supervisor.pending[owner.name]
+	_, resets := c.supervisor.resets[owner.name]
+	_, progress := c.supervisor.progress[owner.name]
+	_, delivered := c.supervisor.lastDelivered[owner.name]
+	_, health := c.supervisor.health[owner.name]
+	c.supervisor.mu.Unlock()
+	if ack || pending || resets || progress || delivered || health {
+		t.Fatalf("retired owner's supervisor state lingered: ack=%v pending=%v resets=%v progress=%v delivered=%v health=%v",
+			ack, pending, resets, progress, delivered, health)
+	}
+}
+
 // A re-slice registers owners (writing byTicket) while a worker opens or
 // reopens its Flight DoGet (reading byTicket): the lookup must hold c.mu, or
 // the concurrent map access races and, without -race, can panic.

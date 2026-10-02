@@ -475,7 +475,10 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 // retireOwner drains a removed owner's in-flight batches, then detaches it.
 // The drain is bounded: an owner that never drains is forced out and its
 // range replayed by the inheriting owner, which is safe because the writes
-// are idempotent upserts.
+// are idempotent upserts. It also forgets the owner's supervisor state,
+// symmetric with unregisterOwner: worker names are deterministic, so a later
+// scale-out that reuses the name must not inherit the retired owner's crash
+// and delivery clocks (issue #491).
 func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	deadline := time.NewTimer(c.drainTimeout())
 	defer deadline.Stop()
@@ -514,6 +517,8 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	c.confirmedMu.Lock()
 	delete(c.confirmed, w.name)
 	c.confirmedMu.Unlock()
+
+	c.supervisor.forget(w.name)
 
 	if err := c.emit(eventlog.KindWorkerRetired, map[string]any{
 		"worker": w.name,

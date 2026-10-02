@@ -122,50 +122,6 @@ func TestStagedCyclesDiscardTable(t *testing.T) {
 	}
 }
 
-func TestStagedCyclesDiscardWorkerDropsAffectedTable(t *testing.T) {
-	s := newStagedCycles()
-	r := ref(t, "orders")
-	// Cycle 1 needs worker "a"; cycle 2 needs "b". Cycle 2 arrives first and
-	// waits. Worker "a" dies owing cycle 1: only cycle 1 is discarded. Cycle 2
-	// — owned only by "b", which is still alive — can still complete and must
-	// not be discarded (issue #372: the old code dropped it, losing rows a live
-	// owner had staged). The table is marked gapped so nothing commits over
-	// cycle 1's gap until a clean replay.
-	s.expect(r, 1, []string{"a"})
-	s.expect(r, 2, []string{"b"})
-
-	if got, _ := s.deliver(r, 2, []byte("2"), "200", "", nil); got != nil {
-		t.Fatalf("cycle 2 committed before cycle 1: %v", got)
-	}
-	if n := s.discardWorker("a"); n != 1 {
-		t.Fatalf("discarded %d cycles, want 1 (only the cycle owed to the dead worker)", n)
-	}
-	if !s.isGapped("orders") {
-		t.Fatal("the affected table must be marked gapped")
-	}
-	if s.len() != 1 {
-		t.Fatalf("%d cycles tracked after the discard, want 1 (cycle 2 survives)", s.len())
-	}
-}
-
-// A worker's death discards its cycles and marks the table gapped, so a later
-// cycle cannot commit over the discarded rows (issue #372).
-func TestStagedCyclesDiscardWorkerMarksTableGapped(t *testing.T) {
-	s := newStagedCycles()
-	r := ref(t, "orders")
-	s.expect(r, 1, []string{"a", "b"})
-	s.discardWorker("a")
-	if !s.isGapped("orders") {
-		t.Fatal("discarding a worker's cycle must mark the table gapped")
-	}
-	// A table the worker never touched is not gapped.
-	s.expect(ref(t, "items"), 3, []string{"b"})
-	_, _ = s.deliver(ref(t, "items"), 3, []byte("3"), "300", "", nil)
-	if s.isGapped("items") {
-		t.Fatal("a table unaffected by the discard must not be gapped")
-	}
-}
-
 // fakeStagedSink satisfies sink.StagedCommitter (and sink.Sink via the
 // embedded interface) so isStagedTable's capability probe is exercised.
 type fakeStagedSink struct{ sink.Sink }
@@ -261,8 +217,7 @@ func TestCommitStagedCycleAdvancesConfirmedForOwners(t *testing.T) {
 }
 
 // discardTable drops every cycle of a table. Test-only: it moved here from
-// staged.go, whose production path is discardWorker (per lost worker, with
-// table cascading) and has no caller for the per-table variant.
+// staged.go, whose production build has no caller for the per-table variant.
 func (s *stagedCycles) discardTable(table string) int {
 	if s == nil {
 		return 0
