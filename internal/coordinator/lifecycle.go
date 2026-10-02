@@ -13,6 +13,45 @@ import (
 // (issue #494).
 const maxConcurrentEmits = 8
 
+// emit writes one event to the audit trail when configured; best-effort by
+// contract (a lost trail must never fail the pipeline). The dashboard's
+// recent-events ring is fed here too, unconditionally, so the UI shows events
+// even when no audit trail is configured.
+func (c *Coordinator) emit(kind string, fields map[string]any) error {
+	c.dashRecord(kind, fields)
+	return c.emitTrail(kind, fields)
+}
+
+// dashRecord records an event in the dashboard ring and pushes it to the SSE
+// subscribers. It is in-memory and cheap, so a saturated audit-trail queue on
+// the ack hot path must not suppress it (issue #494).
+func (c *Coordinator) dashRecord(kind string, fields map[string]any) {
+	if c.dashEvents == nil {
+		return
+	}
+	ev := c.dashEvents.Record(kind, fields)
+	if c.dash != nil {
+		c.dash.PublishEvent(ev)
+	}
+}
+
+// emitTrail writes an event to the audit trail (S3), bounded by its own
+// timeout. Callers on the ack hot path gate it behind emitSem.
+func (c *Coordinator) emitTrail(kind string, fields map[string]any) error {
+	if c.ev == nil {
+		return nil
+	}
+	// Bounded: the audit-trail upload must not hang the caller (the ack hot
+	// path already fires-and-forgets, but emit is also called synchronously
+	// on boot/terminal paths).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.ev.Emit(ctx, kind, fields); err != nil {
+		return err
+	}
+	return nil
+}
+
 // signalReady wakes waitWorkers on an attach without ever wedging a session.
 // During boot it blocks on ready, which waitWorkers drains, and also aborts on
 // either context. booted is closed once waitWorkers returns; selecting on it
@@ -27,10 +66,20 @@ func (c *Coordinator) signalReady(sessCtx, streamCtx context.Context) {
 	}
 }
 
-// emitCommit writes a commit event to the audit trail off the ack hot path,
-// bounded to maxConcurrentEmits in-flight uploads. A saturated queue drops the
-// event rather than stalling acks: the trail is best-effort (issue #494).
+// emitCommit records a commit event in the dashboard and writes it to the
+// audit trail off the ack hot path, bounded to maxConcurrentEmits in-flight
+// uploads. The dashboard is in-memory, so it records every commit even when
+// the upload queue is saturated; a saturated queue drops only the best-effort
+// S3 upload rather than stalling acks (issue #494).
 func (c *Coordinator) emitCommit(worker string, ack *pb.Ack) {
+	fields := map[string]any{
+		"worker":   worker,
+		"table":    ack.Table,
+		"rows":     ack.Rows,
+		"deletes":  ack.Deletes,
+		"position": ack.Position,
+	}
+	c.dashRecord(eventlog.KindCommit, fields)
 	select {
 	case c.emitSem <- struct{}{}:
 	default:
@@ -40,13 +89,7 @@ func (c *Coordinator) emitCommit(worker string, ack *pb.Ack) {
 	}
 	go func() {
 		defer func() { <-c.emitSem }()
-		if err := c.emit(eventlog.KindCommit, map[string]any{
-			"worker":   worker,
-			"table":    ack.Table,
-			"rows":     ack.Rows,
-			"deletes":  ack.Deletes,
-			"position": ack.Position,
-		}); err != nil {
+		if err := c.emitTrail(eventlog.KindCommit, fields); err != nil {
 			c.log.Warn("coordinator: eventlog emit", "err", err)
 		}
 	}()
@@ -64,6 +107,12 @@ func (c *Coordinator) shutdownMetrics() {
 	defer cancel()
 	if err := c.metricsSrv.Shutdown(ctx); err != nil {
 		c.log.Warn("coordinator: metrics server shutdown", "err", err)
+		// A streaming (SSE) handler ignores the write deadline and can hold
+		// its connection past ctx; Shutdown then returns with it still open.
+		// Force-close so Run does not leave it behind (issue #495).
+		if closeErr := c.metricsSrv.Close(); closeErr != nil {
+			c.log.Warn("coordinator: metrics server close", "err", closeErr)
+		}
 	}
 	if c.metricsDone != nil {
 		<-c.metricsDone

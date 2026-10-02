@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/observability"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
@@ -98,6 +99,22 @@ func TestEmitCommitDropsWhenSaturated(t *testing.T) {
 	}
 	if len(c.emitSem) != 1 {
 		t.Fatalf("emitSem len = %d, want 1: a dropped event must not enqueue", len(c.emitSem))
+	}
+}
+
+// #494: the in-memory dashboard event must survive a saturated upload queue.
+func TestEmitCommitRecordsDashboardWhenSaturated(t *testing.T) {
+	c := &Coordinator{
+		log:        slog.New(slog.DiscardHandler),
+		emitSem:    make(chan struct{}, 1),
+		dashEvents: dashboard.NewEvents(10),
+	}
+	c.emitSem <- struct{}{} // saturate the single slot
+
+	c.emitCommit("w", &pb.Ack{Table: "t"})
+
+	if got := c.dashEvents.List("", "", 10); len(got) != 1 {
+		t.Fatalf("dashboard events = %d, want 1: a saturated trail queue must not drop the dashboard event", len(got))
 	}
 }
 

@@ -1306,31 +1306,6 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// emit writes one event to the audit trail when configured; best-effort by
-// contract (a lost trail must never fail the pipeline). The dashboard's
-// recent-events ring is fed here too, unconditionally, so the UI shows events
-// even when no audit trail is configured.
-func (c *Coordinator) emit(kind string, fields map[string]any) error {
-	if c.dashEvents != nil {
-		ev := c.dashEvents.Record(kind, fields)
-		if c.dash != nil {
-			c.dash.PublishEvent(ev)
-		}
-	}
-	if c.ev == nil {
-		return nil
-	}
-	// Bounded: the audit-trail upload must not hang the caller (the ack hot
-	// path already fires-and-forgets, but emit is also called synchronously
-	// on boot/terminal paths).
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := c.ev.Emit(ctx, kind, fields); err != nil {
-		return err
-	}
-	return nil
-}
-
 // waitWorkers blocks until every expected group has had a session attached.
 // Counting ready signals would miscount a flapping worker that attaches,
 // dies, and reattaches inside the window (audit #4) — so the wait checks
