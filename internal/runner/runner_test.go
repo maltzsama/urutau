@@ -132,10 +132,15 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	}
 
 	// The chunk SELECT lands: id=1 is stale (v=a), id=2 stable (v=x).
-	if err := r.AddWindowRows("raw.orders", 0, []rowchange.Change{
+	cols := []rowchange.Change{
 		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "a"}, Position: at.String()},
 		{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(2)}, After: map[string]any{"id": int64(2), "v": "x"}, Position: at.String()},
-	}); err != nil {
+	}
+	rec, err := transport.RecordFromChanges(cols, transport.MergeSchema(cols, w.KnownSchema("raw.orders")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.AddWindowRows("raw.orders", 0, &dataplane.Batch{Table: "raw.orders", Record: rec, Mode: dataplane.AppendMode}); err != nil {
 		t.Fatalf("AddWindowRows: %v", err)
 	}
 
