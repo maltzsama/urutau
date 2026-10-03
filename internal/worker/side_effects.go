@@ -15,6 +15,12 @@ import (
 // every open window). Pure reads of the record; the batch itself is not
 // modified.
 func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) error {
+	// Build the reader first so a malformed record still surfaces its wrapped
+	// error, exactly as before the early return.
+	reader, err := transport.NewBatchReader(batch.Record, p.knownSchema.PrimaryKey)
+	if err != nil {
+		return fmt.Errorf("worker: table %s: %w", p.target, err)
+	}
 	// Steady state — snapshot done, no window open — has no side effect to
 	// apply; read the state once so the common case skips the per-row key
 	// allocation, KeyString and two mutex operations entirely (#577).
@@ -26,10 +32,6 @@ func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) 
 		return nil
 	}
 
-	reader, err := transport.NewBatchReader(batch.Record, p.knownSchema.PrimaryKey)
-	if err != nil {
-		return fmt.Errorf("worker: table %s: %w", p.target, err)
-	}
 	for i := range reader.NumRows() {
 		key := reader.Key(i)
 		if len(key) == 0 {
