@@ -8,7 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
@@ -54,18 +57,18 @@ func (f *fakeSource) Scan(ctx context.Context, ch source.Chunk, fn func(map[stri
 
 // fakeRelay records the orchestrator's calls in order.
 type fakeRelay struct {
-	ops    []string
-	rows   map[uint32][]rowchange.Change
-	relPos map[uint32]string
+	ops     []string
+	batches map[uint32]*dataplane.Batch
+	relPos  map[uint32]string
 }
 
 func (r *fakeRelay) Release(table string, id uint32, at position.Position) {
 	r.ops = append(r.ops, fmt.Sprintf("release:%d", id))
 	r.relPos[id] = at.String()
 }
-func (r *fakeRelay) AddWindowRows(target string, id uint32, rows []rowchange.Change) error {
-	r.ops = append(r.ops, fmt.Sprintf("add:%d:%d", id, len(rows)))
-	r.rows[id] = rows
+func (r *fakeRelay) AddWindowRows(target string, id uint32, batch *dataplane.Batch) error {
+	r.ops = append(r.ops, fmt.Sprintf("add:%d:%d", id, batch.Record.NumRows()))
+	r.batches[id] = batch
 	return nil
 }
 func (r *fakeRelay) GateOn(table string, id uint32) {
@@ -73,6 +76,17 @@ func (r *fakeRelay) GateOn(table string, id uint32) {
 }
 func (r *fakeRelay) GateFlush() {
 	r.ops = append(r.ops, "gateflush")
+}
+
+// ordersSchema is the canonical shape of the fake rows (id bigint, v text).
+func ordersSchema() core.Schema {
+	return core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+		},
+		PrimaryKey: []string{"id"},
+	}
 }
 
 // fakeReader converges to master after convergeAfter Synced() calls. The
@@ -115,11 +129,11 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 	// converges on its 4th Synced call: chunk 0's low is the pre-snapshot
 	// position, later chunks read an already-caught-up low.
 	src := rowsFor(6)
-	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{batches: map[uint32]*dataplane.Batch{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{CaughtUpPoll: time.Millisecond}, nil)
+		SnapshotConfig{CaughtUpPoll: time.Millisecond, Schema: ordersSchema()}, nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -145,10 +159,14 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 	// Window rows: inserts keyed by id. source.Chunk 0's rows carry the
 	// pre-snapshot low watermark; later chunks read an already-converged
 	// synced position.
-	for chunkID, rows := range relay.rows {
+	for chunkID, batch := range relay.batches {
 		wantLow := gt("1-1")
 		if chunkID > 0 {
 			wantLow = gt("1-9")
+		}
+		rows, err := transport.DecodeBatch(batch.Record, "raw.orders", []string{"id"})
+		if err != nil {
+			t.Fatal(err)
 		}
 		for j, row := range rows {
 			if row.Op != rowchange.OpInsert {
@@ -165,6 +183,7 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 				t.Fatalf("chunk %d row %d: position %q, want %q", chunkID, j, row.Position, wantLow)
 			}
 		}
+		batch.Record.Release()
 	}
 
 	// Releases only after caught-up: the release position is the master.
@@ -179,11 +198,11 @@ func TestSnapshotTableHappyPath(t *testing.T) {
 // positions — the proof that the orchestrator is source-agnostic.
 func TestSnapshotTableWithLSNPositions(t *testing.T) {
 	src := rowsFor(4)
-	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{batches: map[uint32]*dataplane.Batch{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: position.MustLSN("0/20"), early: position.MustLSN("0/10"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{CaughtUpPoll: time.Millisecond}, nil)
+		SnapshotConfig{CaughtUpPoll: time.Millisecond, Schema: ordersSchema()}, nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -194,16 +213,24 @@ func TestSnapshotTableWithLSNPositions(t *testing.T) {
 		t.Fatalf("releases at %v, want caught-up 0/20", relay.relPos)
 	}
 	// source.Chunk 0 rows carry the early watermark; chunk 1 rows the converged one.
-	if relay.rows[0][0].Position != "0/10" {
-		t.Errorf("chunk 0 position = %q, want 0/10", relay.rows[0][0].Position)
+	r0, err := transport.DecodeBatch(relay.batches[0].Record, "raw.orders", []string{"id"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if relay.rows[1][0].Position != "0/20" {
-		t.Errorf("chunk 1 position = %q, want 0/20", relay.rows[1][0].Position)
+	if r0[0].Position != "0/10" {
+		t.Errorf("chunk 0 position = %q, want 0/10", r0[0].Position)
+	}
+	r1, err := transport.DecodeBatch(relay.batches[1].Record, "raw.orders", []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1[0].Position != "0/20" {
+		t.Errorf("chunk 1 position = %q, want 0/20", r1[0].Position)
 	}
 }
 
 func TestSnapshotTableEmptySource(t *testing.T) {
-	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{batches: map[uint32]*dataplane.Batch{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-1"), early: gt("1-1")}
 
 	err := SnapshotTable(context.Background(), &fakeSource{}, reader, relay, "raw.orders", SnapshotConfig{}, nil)
@@ -220,12 +247,13 @@ func TestSnapshotTableEmptySource(t *testing.T) {
 // them over a table that has since received rows.
 func TestSnapshotTablePersistsBoundsOnColdStart(t *testing.T) {
 	src := rowsFor(4)
-	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{batches: map[uint32]*dataplane.Batch{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	var persisted *SnapshotProgress
 	cfg := SnapshotConfig{
 		CaughtUpPoll: time.Millisecond,
+		Schema:       ordersSchema(),
 		Persist: func(sp SnapshotProgress) error {
 			persisted = &sp
 			return nil
@@ -256,7 +284,7 @@ func TestSnapshotTablePersistsBoundsOnColdStart(t *testing.T) {
 // completed chunks are never touched again.
 func TestSnapshotTableResumesFromPersistedBounds(t *testing.T) {
 	src := rowsFor(6)
-	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{batches: map[uint32]*dataplane.Batch{}, relPos: map[uint32]string{}}
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 3}
 
 	bounds, _ := src.Bounds(context.Background())
@@ -264,6 +292,7 @@ func TestSnapshotTableResumesFromPersistedBounds(t *testing.T) {
 	remaining = RemoveFromPending(remaining, 1) // chunks 0,1 done on the earlier run
 	cfg := SnapshotConfig{
 		CaughtUpPoll: time.Millisecond,
+		Schema:       ordersSchema(),
 		Progress: &SnapshotProgress{
 			State:   StateInProgress,
 			Bounds:  bounds,
@@ -285,12 +314,12 @@ func TestSnapshotTableResumesFromPersistedBounds(t *testing.T) {
 
 func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 	src := rowsFor(4)
-	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{batches: map[uint32]*dataplane.Batch{}, relPos: map[uint32]string{}}
 	// The reader never converges: synced stays behind master forever.
 	reader := &fakeReader{master: gt("1-9"), early: gt("1-1"), convergeAfter: 1 << 30}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{WindowTimeout: 50 * time.Millisecond, CaughtUpPoll: 5 * time.Millisecond}, nil)
+		SnapshotConfig{WindowTimeout: 50 * time.Millisecond, CaughtUpPoll: 5 * time.Millisecond, Schema: ordersSchema()}, nil)
 	if err == nil {
 		t.Fatal("stuck window must surface as an error, never close on a timer")
 	}
@@ -311,14 +340,14 @@ func TestSnapshotTableWindowTimeoutIsPathology(t *testing.T) {
 
 func TestSnapshotTableLagConvergesBeforeRelease(t *testing.T) {
 	src := rowsFor(2)
-	relay := &fakeRelay{rows: map[uint32][]rowchange.Change{}, relPos: map[uint32]string{}}
+	relay := &fakeRelay{batches: map[uint32]*dataplane.Batch{}, relPos: map[uint32]string{}}
 	// Synced converges on the 4th call (low, poll×k, at) — proving Release
 	// waits for the caught-up proof against the fixed master high, never a
 	// timer.
 	reader := &fakeReader{master: gt("1-5"), early: gt("1-1"), convergeAfter: 3}
 
 	err := SnapshotTable(context.Background(), src, reader, relay, "raw.orders",
-		SnapshotConfig{CaughtUpPoll: time.Millisecond}, nil)
+		SnapshotConfig{CaughtUpPoll: time.Millisecond, Schema: ordersSchema()}, nil)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}

@@ -103,19 +103,10 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 	}
 }
 
-func (r *relay) AddWindowRows(target string, chunkID uint32, rows []rowchange.Change) error {
-	// Build the wire record against the introspected schema (the worker's
-	// known schema), never a per-batch inference. Snapshot chunk rows are
-	// inserts only, so the C-8 delete guard does not apply. MergeSchema
-	// keeps the known shape and only appends columns a row carries that it
-	// lacks.
-	rec, err := transport.RecordFromChanges(rows, transport.MergeSchema(rows, r.window.KnownSchema(target)), nil)
-	if err != nil {
-		return err
-	}
-	dpb := &dataplane.Batch{Table: target, Record: rec, Mode: dataplane.AppendMode}
-	// The worker window takes ownership of the batch.
-	return r.window.AddWindowRows(target, chunkID, dpb)
+func (r *relay) AddWindowRows(target string, chunkID uint32, batch *dataplane.Batch) error {
+	// The batch is already Arrow (the chunk SELECT was encoded straight into
+	// builders, #584); the worker window takes ownership.
+	return r.window.AddWindowRows(target, chunkID, batch)
 }
 
 // GateOn starts buffering the table's live events for a chunk SELECT in
@@ -1044,6 +1035,8 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 					WindowTimeout: cfg.WindowTimeout,
 					CaughtUpPoll:  cfg.CaughtUpPoll,
 					Progress:      progress,
+					Schema:        w.KnownSchema(ref.Target),
+					ChunkSize:     cfg.ChunkSize,
 					Persist: func(sp snapshot.SnapshotProgress) error {
 						return snk.SetProperties(ctx, ref, snapshot.EncodeSnapshotProgress(&sp))
 					},

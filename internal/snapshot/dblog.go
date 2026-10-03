@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
@@ -40,7 +42,9 @@ type Relay interface {
 	// resume point.
 	Release(table string, chunkID uint32, at position.Position)
 	// AddWindowRows feeds the chunk SELECT result into the worker's window.
-	AddWindowRows(target string, chunkID uint32, rows []rowchange.Change) error
+	// The batch is already Arrow (built straight from the chunk SELECT), so no
+	// []rowchange.Change or map[string]any is materialized (#584).
+	AddWindowRows(target string, chunkID uint32, batch *dataplane.Batch) error
 	// GateOn starts buffering the table's live events while its chunk
 	// SELECT is in flight; GateFlush releases them InWindow-tagged, only
 	// after AddWindowRows has populated the window. This is the ordering the
@@ -75,6 +79,13 @@ type SnapshotConfig struct {
 	// travel with the data commits; this hook covers only the initial
 	// state.
 	Persist func(SnapshotProgress) error
+	// Schema is the table's canonical (projected) schema, the shape the
+	// chunk SELECT is encoded into (#584). Required when the source has rows.
+	Schema core.Schema
+	// ChunkSize is the source's configured chunk size, passed to ScanArrow as
+	// the expected row count so the encoder sizes its buffers once instead of
+	// growing by doubling across a large chunk.
+	ChunkSize int
 }
 
 // SnapshotCallback is called when a chunk completes. The caller persists
@@ -155,7 +166,7 @@ func SnapshotTable(
 		reader.OpenWindow(ctx, chunkID)
 		low := reader.Synced()
 
-		rows, err := scanChunk(ctx, chunker, ch, target, low)
+		rows, err := scanChunk(ctx, chunker, ch, target, low, cfg.Schema, cfg.ChunkSize)
 		if err != nil {
 			reader.ClearWindow()
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
@@ -194,30 +205,73 @@ func SnapshotTable(
 	return nil
 }
 
-// scanChunk runs the chunk SELECT and wraps each row as an insert carrying
-// the low watermark position. Keys come from the source PK columns.
-func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, target string, low position.Position) ([]rowchange.Change, error) {
-	pk := src.PK()
-	var rows []rowchange.Change
-	err := src.Scan(ctx, ch, func(row map[string]any) error {
-		key := make([]any, 0, len(pk))
-		for _, col := range pk {
-			key = append(key, row[col])
+// arrowChunkScanner is a chunk source that reads a chunk straight into an
+// Arrow builder, bypassing the map[string]any row path (#448/#454).
+type arrowChunkScanner interface {
+	ScanArrow(ctx context.Context, ch source.Chunk, enc *transport.RowEncoder, expected int) (int, error)
+}
+
+// scanChunk runs the chunk SELECT and returns it as one Arrow batch of
+// snapshot inserts carrying the low watermark position. A source that reads
+// straight into Arrow (ScanArrow) is preferred; any other source falls back to
+// Scan, whose rows are appended cell by cell. Either way the chunk is held as
+// Arrow, never as []rowchange.Change + map[string]any (#584).
+func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, target string, low position.Position, cs core.Schema, expected int) (*dataplane.Batch, error) {
+	enc, err := transport.NewRowEncoder(cs, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer enc.Release()
+	pos := ""
+	if low != nil {
+		pos = low.String()
+	}
+
+	if s, ok := src.(arrowChunkScanner); ok {
+		if _, err := s.ScanArrow(ctx, ch, enc, expected); err != nil {
+			return nil, err
 		}
-		rows = append(rows, rowchange.Change{
+		rec := enc.NewRecord()
+		if pos != "" {
+			// Every snapshot row carries the low watermark; ScanArrow does
+			// not know it, so stamp the whole record once.
+			rec, err = transport.WithPosition(rec, pos)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &dataplane.Batch{Table: target, Record: rec, Mode: dataplane.AppendMode}, nil
+	}
+
+	n := 0
+	err = src.Scan(ctx, ch, func(row map[string]any) error {
+		for i, col := range cs.Columns {
+			if err := enc.AppendValue(i, row[col.Name]); err != nil {
+				return err
+			}
+		}
+		enc.EndRow(transport.RowMeta{
 			Op:       rowchange.OpInsert,
-			Table:    target,
-			Key:      key,
-			After:    row,
-			Position: low.String(),
+			Position: pos,
 			Snapshot: true,
 			Phase:    core.PhaseSnapshot,
 			IngestTS: time.Now(),
 		})
+		n++
+		if n == reserveAfterRows {
+			enc.Reserve(expected)
+		}
 		return nil
 	})
-	return rows, err
+	if err != nil {
+		return nil, err
+	}
+	return &dataplane.Batch{Table: target, Record: enc.NewRecord(), Mode: dataplane.AppendMode}, nil
 }
+
+// reserveAfterRows is how many rows the Scan fallback reads before sizing the
+// encoder's buffers for the whole chunk (mirrors ScanArrow).
+const reserveAfterRows = 32
 
 // WaitCaughtUp polls the reader's synced position until it contains high —
 // the proof that everything the source had committed by the end of the chunk
