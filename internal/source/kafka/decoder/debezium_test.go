@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -32,8 +33,8 @@ func TestDebeziumJSONCreate(t *testing.T) {
 	if c.Table != "shop.users" {
 		t.Errorf("table = %q, want shop.users", c.Table)
 	}
-	if c.After["id"] != float64(1) {
-		t.Errorf("after.id = %v, want 1", c.After["id"])
+	if c.After["id"] != int64(1) {
+		t.Errorf("after.id = %v (%T), want int64(1)", c.After["id"], c.After["id"])
 	}
 	if c.After["name"] != "alice" {
 		t.Errorf("after.name = %v, want alice", c.After["name"])
@@ -178,4 +179,101 @@ func TestOrderKeyNoopCases(t *testing.T) {
 	}
 	// Nil change must not panic.
 	OrderKey(nil, []string{"id"})
+}
+
+// A Kafka Connect JsonConverter with schemas.enable=true wraps the envelope in
+// {"schema":…,"payload":…}; the decoder must unwrap it instead of seeing an
+// empty op and skipping every record.
+func TestDebeziumJSONUnwrapsConnectEnvelope(t *testing.T) {
+	d := &DebeziumJSON{}
+	msg := []byte(`{
+		"schema": {"type": "struct"},
+		"payload": {
+			"op": "c",
+			"after": {"id": 1},
+			"source": {"ts_ms": 1700000000000, "db": "shop", "table": "users"},
+			"ts_ms": 1700000000000
+		}
+	}`)
+	changes, err := d.Decode(&kgo.Record{Topic: "db.shop.users", Value: msg})
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Op != rowchange.OpInsert {
+		t.Fatalf("changes = %+v, want one insert", changes)
+	}
+}
+
+// A tombstone (null value) is a delete with no payload: no error, no change.
+func TestDebeziumJSONTombstoneIsQuiet(t *testing.T) {
+	d := &DebeziumJSON{}
+	changes, err := d.Decode(&kgo.Record{Topic: "db.shop.users", Value: nil})
+	if err != nil || changes != nil {
+		t.Fatalf("tombstone: changes=%v err=%v, want nil,nil", changes, err)
+	}
+}
+
+// A bigint above 2^53 must keep its exact value, not round through float64.
+func TestDebeziumJSONBigintPrecision(t *testing.T) {
+	d := &DebeziumJSON{}
+	msg := []byte(`{"op":"c","after":{"id":9007199254740993},"source":{"ts_ms":1,"db":"s","table":"t"},"ts_ms":1}`)
+	changes, err := d.Decode(&kgo.Record{Topic: "s.t", Value: msg})
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got := changes[0].After["id"]; got != int64(9007199254740993) {
+		t.Fatalf("id = %v (%T), want int64(9007199254740993)", got, got)
+	}
+}
+
+// An empty or unknown op is not a Debezium envelope: fatal, never a silent skip.
+func TestDebeziumJSONUnknownOpIsFatal(t *testing.T) {
+	d := &DebeziumJSON{}
+	for _, msg := range []string{
+		`{"after":{"id":1},"source":{"db":"s","table":"t"}}`,
+		`{"op":"x","after":{"id":1},"source":{"db":"s","table":"t"}}`,
+	} {
+		_, err := d.Decode(&kgo.Record{Topic: "s.t", Value: []byte(msg)})
+		var ne *ErrNotEnvelope
+		if !errors.As(err, &ne) {
+			t.Fatalf("msg %s: err = %v, want ErrNotEnvelope", msg, err)
+		}
+	}
+}
+
+// source.ts_ms (origin commit) wins over ts_ms (processing time).
+func TestDebeziumJSONUsesSourceTsMs(t *testing.T) {
+	d := &DebeziumJSON{}
+	msg := []byte(`{"op":"c","after":{"id":1},"source":{"ts_ms":1000,"db":"s","table":"t"},"ts_ms":2000}`)
+	changes, err := d.Decode(&kgo.Record{Topic: "s.t", Value: msg})
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got := changes[0].CommitTS; !got.Equal(time.UnixMilli(1000)) {
+		t.Fatalf("commitTS = %v, want source.ts_ms 1000", got)
+	}
+}
+
+// An empty (non-null) value is not a tombstone: it must not be skipped as a
+// quiet no-op.
+func TestDebeziumJSONEmptyValueIsFatal(t *testing.T) {
+	d := &DebeziumJSON{}
+	_, err := d.Decode(&kgo.Record{Topic: "s.t", Value: []byte{}})
+	var ne *ErrNotEnvelope
+	if !errors.As(err, &ne) {
+		t.Fatalf("empty value err = %v, want ErrNotEnvelope", err)
+	}
+}
+
+// A present source.ts_ms of zero is a legitimate origin time, not "absent".
+func TestDebeziumJSONZeroSourceTsIsPresent(t *testing.T) {
+	d := &DebeziumJSON{}
+	msg := []byte(`{"op":"c","after":{"id":1},"source":{"ts_ms":0,"db":"s","table":"t"},"ts_ms":2000}`)
+	changes, err := d.Decode(&kgo.Record{Topic: "s.t", Value: msg})
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got := changes[0].CommitTS; !got.Equal(time.UnixMilli(0)) {
+		t.Fatalf("commitTS = %v, want source.ts_ms 0", got)
+	}
 }

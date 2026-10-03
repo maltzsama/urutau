@@ -2,10 +2,12 @@
 // messages. The wire format is the Debezium JSON envelope: a top-level
 // object with "op" (c/u/d/r/t), "before", "after", "source" (with
 // "ts_ms", "db", "table"), and "transaction" fields. Only c (create),
-// u (update), and d (delete) map to pipeline changes; others are skipped.
+// u (update), and d (delete) map to pipeline changes; the truncate and
+// message ops (t/m) are skipped. A missing or unknown op is ErrNotEnvelope.
 package decoder
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -24,7 +26,9 @@ type debeziumEnvelope struct {
 }
 
 type debeziumSource struct {
-	TsMs  int64  `json:"ts_ms"`
+	// TsMs is the origin commit time. A pointer distinguishes an absent
+	// field from a legitimate epoch-zero value.
+	TsMs  *int64 `json:"ts_ms"`
 	DB    string `json:"db"`
 	Table string `json:"table"`
 }
@@ -39,9 +43,24 @@ type DebeziumJSON struct {
 
 // Decode implements Decoder.
 func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
+	if record.Value == nil {
+		return nil, nil // null value is a Kafka tombstone: no row change
+	}
+	value := record.Value
+	// A Kafka Connect JsonConverter with schemas.enable=true (the default)
+	// wraps the envelope as {"schema":…,"payload":{…}}. Unwrap it, or the op
+	// is empty and every record is silently skipped.
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(value, &root); err != nil {
+		return nil, &ErrNotEnvelope{Err: err}
+	}
+	if payload, ok := root["payload"]; ok {
+		value = payload
+	}
+
 	var env debeziumEnvelope
-	if err := json.Unmarshal(record.Value, &env); err != nil {
-		return nil, fmt.Errorf("debezium-json: unmarshal: %w", err)
+	if err := decodeJSON(value, &env); err != nil {
+		return nil, &ErrNotEnvelope{Err: err}
 	}
 
 	var op rowchange.Op
@@ -52,8 +71,10 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 		op = rowchange.OpUpdate
 	case "d":
 		op = rowchange.OpDelete
+	case "t", "m":
+		return nil, nil // truncate / message: no row change
 	default:
-		return nil, nil // skip non-CDC operations (t, etc.)
+		return nil, &ErrNotEnvelope{Op: env.Op}
 	}
 
 	table := d.resolveTable(record.Topic, env)
@@ -62,33 +83,28 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 		target = table
 	}
 
-	commitTS := time.UnixMilli(env.TimestampMs)
+	// source.ts_ms is the origin commit time; ts_ms is when Debezium
+	// processed the event. Prefer the origin, fall back to processing.
+	tsMs := env.TimestampMs
+	if env.Source.TsMs != nil {
+		tsMs = *env.Source.TsMs
+	}
+	commitTS := time.UnixMilli(tsMs)
 	ingestTS := time.Now()
 
-	var after map[string]any
-	if env.After != nil {
-		if err := json.Unmarshal(*env.After, &after); err != nil {
-			return nil, fmt.Errorf("debezium-json: unmarshal after: %w", err)
-		}
+	after, err := decodeObject(env.After)
+	if err != nil {
+		return nil, &ErrNotEnvelope{Err: fmt.Errorf("after: %w", err)}
 	}
-
-	var before map[string]any
-	if env.Before != nil {
-		if err := json.Unmarshal(*env.Before, &before); err != nil {
-			return nil, fmt.Errorf("debezium-json: unmarshal before: %w", err)
-		}
+	before, err := decodeObject(env.Before)
+	if err != nil {
+		return nil, &ErrNotEnvelope{Err: fmt.Errorf("before: %w", err)}
 	}
 
 	// Build key from the after image (create/update) or before image (delete).
 	keyImage := after
 	if op == rowchange.OpDelete {
 		keyImage = before
-	}
-
-	pos := &position{
-		topic:  record.Topic,
-		part:   record.Partition,
-		offset: record.Offset,
 	}
 
 	c := rowchange.Change{
@@ -99,16 +115,80 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 		CommitTS: commitTS,
 		IngestTS: ingestTS,
 	}
-
-	// Extract key from after/before using the primary key columns from
-	// the envelope — debezium puts them in the key record. For now, use
-	// all values from the key image as the change key.
 	if keyImage != nil {
 		c.Key = extractKey(keyImage)
 	}
-
-	_ = pos // stored in the change's position field via the reader
 	return []rowchange.Change{c}, nil
+}
+
+// ErrNotEnvelope marks a message that is not a Debezium envelope — an empty op,
+// an unknown op, or a payload that does not parse. It is fatal: the topic's
+// format is an assertion, and silently skipping every record is total data
+// loss.
+type ErrNotEnvelope struct {
+	Op  string
+	Err error
+}
+
+func (e *ErrNotEnvelope) Error() string {
+	switch {
+	case e.Err != nil:
+		return "debezium-json: " + e.Err.Error()
+	case e.Op == "":
+		return "debezium-json: message has no op — not a Debezium envelope"
+	default:
+		return fmt.Sprintf("debezium-json: unknown op %q", e.Op)
+	}
+}
+
+func (e *ErrNotEnvelope) Unwrap() error { return e.Err }
+
+// decodeJSON decodes one JSON document with json.Number preserved, so a bigint
+// above 2^53 does not lose precision through float64.
+func decodeJSON(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return dec.Decode(v)
+}
+
+// decodeObject decodes a row image, normalizing json.Number to int64/float64.
+func decodeObject(raw *json.RawMessage) (map[string]any, error) {
+	if raw == nil || len(*raw) == 0 || string(*raw) == "null" {
+		return nil, nil
+	}
+	var m map[string]any
+	if err := decodeJSON(*raw, &m); err != nil {
+		return nil, err
+	}
+	normalizeNumbers(m)
+	return m, nil
+}
+
+// normalizeNumbers converts json.Number values to int64 (or float64 when not
+// integral) recursively, preserving bigint precision.
+func normalizeNumbers(v any) any {
+	switch t := v.(type) {
+	case json.Number:
+		if i, err := t.Int64(); err == nil {
+			return i
+		}
+		if f, err := t.Float64(); err == nil {
+			return f
+		}
+		return t.String()
+	case map[string]any:
+		for k, vv := range t {
+			t[k] = normalizeNumbers(vv)
+		}
+		return t
+	case []any:
+		for i, vv := range t {
+			t[i] = normalizeNumbers(vv)
+		}
+		return t
+	default:
+		return v
+	}
 }
 
 func (d *DebeziumJSON) resolveTable(topic string, env debeziumEnvelope) string {
@@ -160,12 +240,4 @@ func OrderKey(c *rowchange.Change, pk []string) {
 		key[i] = src[col]
 	}
 	c.Key = key
-}
-
-// position is a lightweight offset carrier for the decoder. The reader
-// wraps it in a proper position.Offsets.
-type position struct {
-	topic  string
-	part   int32
-	offset int64
 }

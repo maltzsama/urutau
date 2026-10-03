@@ -133,3 +133,13 @@ func (b *Batch) Release() {
 	b.Record.Release()
 	b.Record = nil
 }
+
+// WithRecord returns a copy of b carrying a new Record, preserving every
+// control field. A transform that replaces the record must use this instead of
+// re-listing the fields by hand, or a newly added field is silently dropped —
+// which stranded a staged partition's cycle when enrich forgot Staged.
+func (b *Batch) WithRecord(rec arrow.RecordBatch) *Batch {
+	c := *b
+	c.Record = rec
+	return &c
+}

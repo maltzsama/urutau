@@ -804,3 +804,54 @@ func TestShutdownSyncEndsNoTransaction(t *testing.T) {
 		t.Fatalf("emitted %v, want only the row: the shutdown sync must not end the transaction", ops)
 	}
 }
+
+// An upsert UPDATE that changes the primary key must delete the old key; the
+// update's own delete is built from the new key, so the old row would survive.
+func TestDecodeUpdateKeyChangeDeletesOldKey(t *testing.T) {
+	out := make(chan rowchange.Change, 4)
+	r := newTestReader(out)
+	r.cfg.UpsertTargets = map[string]bool{"raw.orders": true}
+	tbl := ordersTable()
+	before := []any{int64(7), []byte("old"), 1.0}
+	after := []any{int64(8), []byte("new"), 2.0}
+
+	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
+	if err != nil || !emit {
+		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	}
+	select {
+	case del := <-out:
+		if del.Op != rowchange.OpDelete || del.Key[0] != int64(7) {
+			t.Fatalf("synthetic change = %+v, want a delete of the old key 7", del)
+		}
+	default:
+		t.Fatal("an upsert key change must emit a delete of the old key first")
+	}
+	if c.Op != rowchange.OpUpdate || c.Key[0] != int64(8) {
+		t.Fatalf("update = %+v, want the new key 8", c)
+	}
+}
+
+// An append target keeps the old row by design; the key change must not emit a
+// delete.
+func TestDecodeUpdateKeyChangeAppendKeepsOldKey(t *testing.T) {
+	out := make(chan rowchange.Change, 4)
+	r := newTestReader(out)
+	r.cfg.UpsertTargets = map[string]bool{"raw.orders": false}
+	tbl := ordersTable()
+	before := []any{int64(7), []byte("old"), 1.0}
+	after := []any{int64(8), []byte("new"), 2.0}
+
+	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
+	if err != nil || !emit {
+		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	}
+	select {
+	case del := <-out:
+		t.Fatalf("append target emitted a synthetic change: %+v", del)
+	default:
+	}
+	if c.Key[0] != int64(8) {
+		t.Fatalf("update key = %v, want 8", c.Key)
+	}
+}

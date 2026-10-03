@@ -197,3 +197,33 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 		t.Fatalf("users.name = %q, want ana", name.Value(0))
 	}
 }
+
+// An enriched batch must keep the staged marker and the cycle identity: losing
+// Staged makes a partitioned table commit directly while the coordinator's
+// cycle stays open, wedging every later cycle of the table.
+func TestEnrichBatchPreservesStaged(t *testing.T) {
+	s, _ := newTestStage(t, refCfg(nil), usersRows())
+	in := pkBatch(t)
+	in.Staged = true
+	in.Seq = 7
+	in.Watermark = []byte("p2")
+	defer in.Release()
+
+	out, err := s.EnrichBatch(t.Context(), in, nil)
+	if err != nil {
+		t.Fatalf("EnrichBatch: %v", err)
+	}
+	if out == nil {
+		t.Fatal("expected output")
+	}
+	defer out.Release()
+	if !out.Staged {
+		t.Fatal("enrich dropped Staged")
+	}
+	if out.Seq != 7 {
+		t.Fatalf("Seq = %d, want 7", out.Seq)
+	}
+	if string(out.Watermark) != "p2" {
+		t.Fatalf("Watermark = %q, want p2", out.Watermark)
+	}
+}

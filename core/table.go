@@ -279,6 +279,10 @@ type TableRef struct {
 	// committed position would otherwise be resumed past. 0 or 1 means the
 	// collapsed single-owner path.
 	OwnerCount int
+	// Owners are the current partition owners (empty in collapsed mode). A
+	// per-partition Position() read considers ONLY these: an entry left by a
+	// retired owner (a scale-in) must not pin the resume point forever.
+	Owners []string
 }
 
 // ParseColumnType parses a textual canonical type string into a

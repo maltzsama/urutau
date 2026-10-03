@@ -64,6 +64,10 @@ type Config struct {
 	// introspected column types, so numeric columns compare numerically.
 	Filters map[string]*spec.Filter
 	Columns map[string][]string
+	// UpsertTargets marks the target tables that maintain keyed state. An
+	// UPDATE that changes the primary key emits a delete of the old key only
+	// for these; append targets keep the old row.
+	UpsertTargets map[string]bool
 }
 
 // Projection is a table's source-side read projection: the columns to emit
@@ -718,6 +722,7 @@ func (r *Reader) handleUpdate(payload []byte) error {
 			return nil
 		}
 	}
+	r.deleteChangedKey(entry, before, row)
 	r.enqueue(entry, rowchange.OpUpdate, entry.proj.project(row), entry.proj.project(before))
 	return nil
 }
@@ -783,15 +788,9 @@ func (r *Reader) enqueue(entry relEntry, op rowchange.Op, after, before map[stri
 // does the synced position advance.
 func (r *Reader) handleCommit(ctx context.Context, endLSN pglogrepl.LSN) error {
 	pos := position.LSN(endLSN)
-	for _, c := range r.txn {
-		c.Position = pos.String()
-		select {
-		case r.out <- *c:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	if err := r.flushTxn(ctx, pos); err != nil {
+		return err
 	}
-	r.txn = r.txn[:0]
 
 	r.mu.Lock()
 	r.synced = &pos

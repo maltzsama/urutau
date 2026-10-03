@@ -334,10 +334,7 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 	relOwned() // joined retains its own refs
 
 	if kept == int64(nrows) {
-		return &dataplane.Batch{
-			Table: b.Table, Record: joined, Watermark: b.Watermark, Mode: b.Mode,
-			SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq,
-		}, nil
+		return b.WithRecord(joined), nil
 	}
 	filtered, err := compute.FilterRecordBatch(ctx, joined, keep, compute.DefaultFilterOptions())
 	joined.Release()
@@ -348,10 +345,7 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 		filtered.Release()
 		return nil, nil
 	}
-	return &dataplane.Batch{
-		Table: b.Table, Record: filtered, Watermark: b.Watermark, Mode: b.Mode,
-		SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq,
-	}, nil
+	return b.WithRecord(filtered), nil
 }
 
 // gatherRefColumns builds one Arrow array per destination: where effHit is

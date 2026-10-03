@@ -165,6 +165,11 @@ const workerQueueCap = 64
 // config is silent (see Config.SnapshotChunkTimeout).
 const defaultSnapshotChunkTimeout = 10 * time.Minute
 
+// maxBatchBytes is the largest serialized batch the control plane will queue.
+// The gRPC servers cap messages at 128 MiB; fail loud with headroom instead of
+// looping on a batch the worker can never receive.
+const maxBatchBytes = 120 << 20
+
 // queuedBatch is one serialized batch waiting for the Flight stream.
 type queuedBatch struct {
 	id   uint64 // the inflight batch id, to correlate an ack with the sent list
@@ -2037,13 +2042,13 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		if sub == nil {
 			continue
 		}
-		reader, rerr := transport.NewBatchReader(sub, nil)
+		subReader, rerr := transport.NewBatchReader(sub, nil)
 		if rerr != nil {
 			releaseRecords(subBatches)
 			return fmt.Errorf("coordinator: table %s: partition %d: %w", meta.Table, p, rerr)
 		}
-		if reader.NumRows() > 0 {
-			highs[p] = reader.Position(reader.NumRows() - 1)
+		if subReader.NumRows() > 0 {
+			highs[p] = subReader.Position(subReader.NumRows() - 1)
 		}
 		if c.coveredAtBoot(meta.Table, highs[p]) {
 			continue
@@ -2166,6 +2171,9 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 		}
 	}
 	n := int64(len(body) + len(metaBytes))
+	if n > maxBatchBytes {
+		return fmt.Errorf("coordinator: table %s: batch of %d bytes exceeds the %d-byte transport limit; the source transaction is too large — split it into smaller batches", meta.Table, n, maxBatchBytes)
+	}
 	if err := c.budget.acquire(ctx, w.name, n); err != nil {
 		return err
 	}
@@ -2751,7 +2759,14 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 		// The expected partition count travels to the sink: a per-partition
 		// Position() must not return a MinSafe over an incomplete owner set,
 		// or an owner with no committed position yet is resumed past (§2.6).
-		ref.OwnerCount = len(c.loadRouting().owners[ref.Target])
+		// The current owner NAMES travel too, so an entry left by a retired
+		// owner (a scale-in) is ignored rather than pinning the minimum.
+		ws := c.loadRouting().owners[ref.Target]
+		ref.OwnerCount = len(ws)
+		ref.Owners = make([]string, 0, len(ws))
+		for _, w := range ws {
+			ref.Owners = append(ref.Owners, w.name)
+		}
 		pos, err := c.snk.Position(ctx, ref)
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: %w", ref.Target, err)

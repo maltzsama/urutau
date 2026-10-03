@@ -54,6 +54,21 @@ func (m WriteMode) ChangeMode() dataplane.WriteMode {
 	return dataplane.UpsertMode
 }
 
+// EffectiveWriteMode resolves a table's write mode against the sink default,
+// defaulting to upsert when both are unset. The CDC decoders use it to know
+// whether a change maintains keyed state (upsert) or only appends: an UPDATE
+// that changes the primary key must delete the old key only in upsert mode.
+func EffectiveWriteMode(t Table, sinkDefault WriteMode) WriteMode {
+	mode := t.WriteMode
+	if mode == "" {
+		mode = sinkDefault
+	}
+	if mode == "" {
+		mode = WriteModeUpsert
+	}
+	return mode
+}
+
 type Spec struct {
 	Pipeline string  `json:"pipeline"`
 	Source   Source  `json:"source"`

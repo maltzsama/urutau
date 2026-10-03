@@ -85,8 +85,10 @@ func decodeIsFatal(err error) bool {
 	var unknownSchema *decoder.ErrUnknownSchema
 	var notJSON *decoder.ErrNotJSON
 	var fieldMissing *decoder.ErrFieldMissing
+	var notEnvelope *decoder.ErrNotEnvelope
 	return errors.As(err, &badWire) || errors.As(err, &unknownSchema) ||
-		errors.As(err, &notJSON) || errors.As(err, &fieldMissing)
+		errors.As(err, &notJSON) || errors.As(err, &fieldMissing) ||
+		errors.As(err, &notEnvelope)
 }
 
 // ErrPositionLost marks retention having passed the consumer's offset. The
