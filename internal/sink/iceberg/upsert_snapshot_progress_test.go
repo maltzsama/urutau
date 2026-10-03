@@ -14,8 +14,8 @@ import (
 )
 
 // dyingCatalog lets commits through until it is armed, then lets armed of
-// them through and fails the next: the process dying between an upsert's
-// equality-delete commit and its append commit.
+// them through and fails the next: the process dying before an upsert's single
+// commit lands.
 type dyingCatalog struct {
 	catalog.Catalog
 	armed int // commits still let through once armed; -1 = not armed
@@ -42,13 +42,12 @@ func (c *dyingCatalog) CommitTable(ctx context.Context, id table.Identifier, req
 	return c.Catalog.CommitTable(ctx, id, reqs, ups)
 }
 
-// Issue #461 regression, seen in chaos-1M-5a01915: an upsert commits its
-// equality deletes and its appends as two catalog commits. A snapshot window's
-// progress (cdc.snapshot.pending) rode on the first, so a worker that died
-// between them left its chunk recorded as done with none of its rows, and a
-// restarted coordinator resumed past it: 7,991 rows of pr_events never
-// reached Iceberg. The progress, like the position, belongs on the last
-// commit only.
+// Issue #461 regression, seen in chaos-1M-5a01915: a snapshot window's
+// progress (cdc.snapshot.pending) must never be recorded without its rows. An
+// upsert's equality deletes and its appends now commit in ONE RowDelta (#550),
+// so the progress rides on the same snapshot as the rows: a process that dies
+// before that commit leaves the chunk pending, and a restarted coordinator
+// re-runs it instead of resuming past rows that never reached Iceberg.
 func TestAWindowsSnapshotProgressCommitsOnlyWithItsRows(t *testing.T) {
 	ctx := context.Background()
 	s := hadoopSink(t)
@@ -68,12 +67,12 @@ func TestAWindowsSnapshotProgressCommitsOnlyWithItsRows(t *testing.T) {
 	}
 	first.Release()
 
-	// Chunk 5's window closes; the process dies after its deletes commit.
+	// Chunk 5's window closes; the process dies before its single commit.
 	window := wireBatch(t, [3]any{int64(50), "chunk5", rowchange.OpUpdate}, [3]any{int64(51), "chunk5", rowchange.OpUpdate})
 	window.SnapshotState, window.SnapshotPending = string(snapshot.StateInProgress), []uint32{6, 7}
-	dying.armed = 1
+	dying.armed = 0
 	if err := w.Commit(ctx, window); !errors.Is(err, errDied) {
-		t.Fatalf("commit = %v, want the append to die", err)
+		t.Fatalf("commit = %v, want the window's commit to die", err)
 	}
 	window.Release()
 	dying.armed = -1

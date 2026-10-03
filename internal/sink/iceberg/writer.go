@@ -22,7 +22,6 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/internal/faultinject"
 )
 
 // ErrCommitExhausted marks a terminal commit failure: retries against the
@@ -124,20 +123,18 @@ func NewTableWriter(ctx context.Context, cat catalog.Catalog, ident table.Identi
 // satisfy sink.TableWriter.
 func (w *TableWriter) Close() error { return nil }
 
-// Commit applies the batch: snapshot one equality-deletes every key in it
-// (upserts delete their older versions, deletes are the last word), snapshot
-// two appends the surviving rows. The position is written only on the final
-// commit the batch actually executes: when there are upserts, the append is
-// last and carries the position; when the batch is delete-only, the delete
-// commit carries it. This prevents advancing the position past uncommitted
-// data on a crash between the two snapshots.
+// Commit applies the batch. In upsert mode it equality-deletes every key in
+// the batch (upserts delete their older versions, deletes are the last word)
+// and appends the surviving rows in ONE RowDelta snapshot, with the position
+// and snapshot state on that same commit — a reader never sees an updated key
+// absent, and a crash cannot advance the position past rows that did not land.
 //
 // In append mode the equality delete is skipped: every change becomes a row.
 //
-// CRASH SAFETY: a crash between commitDeletes and commitAppend leaves the
-// batch temporarily absent (old rows deleted, new rows not yet written) but
-// the position has not advanced. Resume reprocesses the batch: deletes are
-// idempotent, appends rewrite. Converges without loss.
+// CRASH SAFETY: the delete files and the data files of one batch land in a
+// single atomic snapshot. A crash before it leaves the batch unapplied and the
+// position unadvanced; resume reprocesses it (deletes are idempotent, appends
+// rewrite). Converges without loss.
 func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	pos := string(b.Watermark)
 
@@ -193,31 +190,7 @@ func (w *TableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	if err != nil {
 		return err
 	}
-	if len(keys) > 0 {
-		// Position and snapshot progress go on the delete only when it IS
-		// the last commit: a crash before the appends must leave both where
-		// they were, or a restart resumes past rows that never landed — a
-		// window's chunk recorded done with none of its rows (#461).
-		delPos, delState, delPending := "", "", []uint32(nil)
-		if upsertBatch == nil || upsertBatch.Record.NumRows() == 0 {
-			delPos, delState, delPending = pos, b.SnapshotState, b.SnapshotPending
-		}
-		if err := w.commitDeletes(ctx, keys, delPos, delState, delPending); err != nil {
-			return err
-		}
-		if delPos == "" {
-			// The deletes are durable, the appends and the position are not:
-			// the batch's keys are absent from the table until a replay.
-			faultinject.At(faultinject.IcebergUpsertBetweenDeleteAndAppend,
-				"table", identString(w.ident), "seq", b.Seq, "position", pos)
-		}
-	}
-	if upsertBatch != nil && upsertBatch.Record.NumRows() > 0 {
-		if err := w.commitAppend(ctx, upsertBatch, pos, b.SnapshotState, b.SnapshotPending); err != nil {
-			return err
-		}
-	}
-	return nil
+	return w.commitUpsert(ctx, keys, upsertBatch, pos, b.SnapshotState, b.SnapshotPending)
 }
 
 // commitDeletes writes the equality-delete files once, then commits them

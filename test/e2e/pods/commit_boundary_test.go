@@ -190,7 +190,6 @@ var (
 	directBoundaries = []boundaryCase{
 		{point: faultinject.WorkerBatchReceived},
 		{point: faultinject.WorkerCommitBefore},
-		{point: faultinject.IcebergUpsertBetweenDeleteAndAppend},
 		{point: faultinject.WorkerCommittedBeforeAck},
 		{point: faultinject.CoordinatorAckBeforeRecord, coordinator: true},
 	}
