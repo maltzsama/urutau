@@ -59,6 +59,26 @@ after the last one *finished*. So `interval: 5m` means "at most once every 5
 minutes of quiet time between runs", not "at 5-minute wall-clock boundaries".
 This is the same in single-process and distributed mode.
 
+## Commit-time metadata housekeeping
+
+Scheduled maintenance removes old snapshots and files, but a CDC table
+commits about once per second, and each commit writes a new `metadata.json`
+and normally adds a manifest. Two Iceberg table properties keep that growth
+bounded at commit time. Urutau sets both on **every table it creates or
+opens** — no spec change is needed, and a table created by an earlier
+release picks them up on its next boot:
+
+| Property | Value | Effect |
+| --- | --- | --- |
+| `write.metadata.delete-after-commit.enabled` | `true` | Deletes the superseded `metadata.json` at each commit, keeping the previous `write.metadata.previous-versions-max` (default `100`) for rollback and audit |
+| `commit.manifest-merge.enabled` | `true` | Merges the current snapshot's data manifests once there are at least `commit.manifest.min-count-to-merge` (default `100`) of them, toward `commit.manifest.target-size-bytes` (default `8 MiB`) |
+
+These bound the **metadata** side. They do not reduce the number of
+equality-delete files an upsert table accumulates — that is what compaction
+is for, subject to the upstream limits described in
+[Sinks › Iceberg](../reference/sinks.md) — and they do not replace snapshot
+expiry.
+
 ## Compaction
 
 Compaction merges small files into `targetFileSize`-sized outputs using
