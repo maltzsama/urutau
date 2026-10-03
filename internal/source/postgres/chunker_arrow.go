@@ -43,7 +43,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 	// Retry ONLY the setup — a fresh transaction and its query — before any
 	// row is appended. Re-running a mid-scan failure would double-count the
 	// rows already written into enc, so those fall back to the worker
-	// session's chunk redo (the coordinator reds uncommitted chunks when a
+	// session's chunk redo (the coordinator redoes uncommitted chunks when a
 	// worker is lost). Scan can retry the whole read because it buffers the
 	// rows first; ScanArrow streams into the caller's builders and cannot.
 	var (
