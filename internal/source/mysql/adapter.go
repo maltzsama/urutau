@@ -11,8 +11,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -181,7 +181,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	} else if warn != "" {
 		a.rt.Logger.Warn("mysql: server preflight", "warning", warn)
 	}
-	out := make(chan rowchange.Change, 1024)
+	batches := make(chan *dataplane.Batch, 256)
 	// Introspect each table once: the canonical schema (stable wire shape) and
 	// the read projection (#183: the column list and the compiled filter).
 	schemas := make(map[string]core.Schema, len(refs))
@@ -228,15 +228,18 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		MaxReconnectAttempts: resolveMaxReconnectAttempts(a.spec.Source.MaxReconnectAttempts),
 		Projections:          projections,
 		UpsertTargets:        upsertTargets,
-	}, out)
+		Schemas:              schemas,
+	}, batches)
 	if err != nil {
 		return nil, err
 	}
-	puller := sourcepull.New(out)
+	// Columnar puller: the reader decodes straight into Arrow and emits ready
+	// wire batches; the puller forwards them. The engine's resolved schemas
+	// reach the reader through the puller's hook before Start.
+	puller := sourcepull.NewColumnar(batches)
 	puller.SetSchemas(schemas)
-	// The reader ends each transaction with OpTxnEnd (#456).
-	puller.BoundTransactions()
-	return stream{Reader: rdr, db: a.db, out: out, Puller: puller}, nil
+	puller.SetOnSchemas(rdr.SetSourceSchemas)
+	return stream{Reader: rdr, db: a.db, Puller: puller}, nil
 }
 
 // InitialPosition returns the master's executed GTID set — the same query
@@ -262,9 +265,15 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 // universe ends at the CDC decoder; the worker is fully columnar.
 type stream struct {
 	*Reader
-	db  *sql.DB
-	out chan rowchange.Change
+	db *sql.DB
 	*sourcepull.Puller
+}
+
+// SetSourceSchemas implements source.SchemaSetter: the puller resolves the
+// canonical schemas and forwards them to the reader's encoders through the
+// SetOnSchemas hook installed at Open.
+func (s stream) SetSourceSchemas(schemas map[string]core.Schema) {
+	s.Puller.SetSourceSchemas(schemas)
 }
 
 // Start begins the stream at the given GTID set.
@@ -276,7 +285,7 @@ func (s stream) Start(ctx context.Context, from position.Position) error {
 	if err := s.checkNotPurged(ctx, g); err != nil {
 		return err
 	}
-	s.SetResume(g.String())
+	s.Reader.SetResume(g.String())
 	errCh := make(chan error, 1)
 	s.SetErr(errCh)
 	go func() { errCh <- s.StartFromGTID(ctx, g) }()

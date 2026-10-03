@@ -43,10 +43,23 @@ const maxBatchRows = 2000
 // Puller wraps a source's change channel and terminal-error channel into
 // the pull-based Next surface. The concrete source calls Start to launch
 // its decoder and wire the error channel.
+//
+// A puller is EITHER row-oriented (ch) or column-oriented (batchCh). A
+// column-oriented source decodes straight into Arrow (transport.RowEncoder)
+// and emits ready wire batches; the puller then forwards them unchanged, so
+// no map[string]any ever exists on the live path (#455). The reader owns
+// transaction bounding, the safe-position split and drift, because it sees
+// the native row shape and the transaction boundary.
 type Puller struct {
-	ch    <-chan rowchange.Change
-	errCh <-chan error
-	buf   []rowchange.Change
+	columnar bool
+	batchCh  <-chan *dataplane.Batch
+	// onSchemas, when set, receives the resolved canonical schemas
+	// SetSourceSchemas assigns; a columnar source uses it to (re)build its
+	// encoders against the cast-resolved types before it starts decoding.
+	onSchemas func(map[string]core.Schema)
+	ch        <-chan rowchange.Change
+	errCh     <-chan error
+	buf       []rowchange.Change
 	// bufBytes is the estimated wire size of buf, so a byte ceiling can close
 	// a batch of large rows before it buffers the whole row target (#579).
 	bufBytes int
@@ -70,6 +83,18 @@ type Puller struct {
 func New(ch <-chan rowchange.Change) *Puller {
 	return &Puller{ch: ch}
 }
+
+// NewColumnar builds a puller over a column-oriented source's batch channel.
+// The source emits wire-schema *dataplane.Batch values (one table each,
+// transaction-bounded and position-stamped); the puller forwards them.
+func NewColumnar(ch <-chan *dataplane.Batch) *Puller {
+	return &Puller{columnar: true, batchCh: ch}
+}
+
+// SetOnSchemas installs a callback that receives the resolved canonical
+// schemas SetSourceSchemas assigns. A columnar source uses it to rebuild its
+// encoders against the cast-resolved column types before decoding.
+func (p *Puller) SetOnSchemas(fn func(map[string]core.Schema)) { p.onSchemas = fn }
 
 // push buffers one change and accounts for its estimated wire size.
 func (p *Puller) push(c rowchange.Change) {
@@ -158,6 +183,9 @@ func (p *Puller) SetSourceSchemas(resolved map[string]core.Schema) {
 		cs.Columns = cols
 		p.schemas[table] = cs
 	}
+	if p.onSchemas != nil {
+		p.onSchemas(p.schemas)
+	}
 }
 
 // BoundTransactions declares that the decoder ends every transaction with an
@@ -243,9 +271,57 @@ func (p *Puller) nextTxn(ctx context.Context) (*dataplane.Batch, error) {
 // SetErr installs the decoder's terminal-error channel.
 func (p *Puller) SetErr(errCh <-chan error) { p.errCh = errCh }
 
+// nextColumnar returns the next ready batch from a column-oriented source. It
+// blocks for one; (nil, nil) is a clean stream end.
+func (p *Puller) nextColumnar(ctx context.Context) (*dataplane.Batch, error) {
+	for {
+		// Prefer a ready batch: a clean stream end must not drop the batches
+		// still buffered on the channel.
+		select {
+		case b, ok := <-p.batchCh:
+			if !ok {
+				return nil, nil
+			}
+			if b == nil {
+				continue
+			}
+			return b, nil
+		default:
+		}
+		select {
+		case b, ok := <-p.batchCh:
+			if !ok {
+				return nil, nil
+			}
+			if b == nil {
+				continue
+			}
+			return b, nil
+		case err := <-p.errCh:
+			if err != nil {
+				return nil, err
+			}
+			// Terminal nil: hand back one last buffered batch, if any.
+			select {
+			case b, ok := <-p.batchCh:
+				if ok && b != nil {
+					return b, nil
+				}
+			default:
+			}
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
 // Next reads accumulated changes and bridges them into one batch. Returns
 // (nil, nil) at a clean stream end.
 func (p *Puller) Next(ctx context.Context) (*dataplane.Batch, error) {
+	if p.columnar {
+		return p.nextColumnar(ctx)
+	}
 	if p.txnBounded {
 		return p.nextTxn(ctx)
 	}
@@ -290,6 +366,29 @@ func (p *Puller) Next(ctx context.Context) (*dataplane.Batch, error) {
 // channel) without blocking for new data. Used by the runner's relay to
 // flush decoded events ahead of a Closes marker.
 func (p *Puller) Drain(ctx context.Context, emit func(*dataplane.Batch) error) error {
+	if p.columnar {
+		for {
+			select {
+			case b, ok := <-p.batchCh:
+				if !ok {
+					return nil
+				}
+				if b == nil {
+					continue
+				}
+				if err := emit(b); err != nil {
+					return err
+				}
+			case err := <-p.errCh:
+				if err != nil {
+					return err
+				}
+				return nil
+			default:
+				return nil
+			}
+		}
+	}
 	for {
 		b, ok, err := p.tryNext(ctx)
 		if err != nil {

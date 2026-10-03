@@ -22,7 +22,9 @@ import (
 	"github.com/go-mysql-org/go-mysql/schema"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 )
 
@@ -59,38 +61,49 @@ type Config struct {
 	// UPDATE that changes the primary key emits a delete of the old key only
 	// for these; append targets keep the old row.
 	UpsertTargets map[string]bool
+	// Schemas is each target table's canonical (projected) schema, the shape
+	// the direct encoder builds. The engine's SetSourceSchemas replaces
+	// KindUnknown with the cast-resolved type before Start (#455).
+	Schemas map[string]core.Schema
 }
 
 // Reader wraps a canal instance and decodes its row events.
 type Reader struct {
 	cfg   Config
 	canal *canal.Canal
-	out   chan<- rowchange.Change
-	bySrc map[string]TableRef // "db.table" → ref (PK + target)
+	// batchOut is the columnar output: the reader decodes binlog rows straight
+	// into Arrow builders and emits ready wire batches (#455). There is no
+	// row-change channel and no map[string]any on the live path.
+	batchOut chan<- *dataplane.Batch
+	bySrc    map[string]TableRef // "db.table" → ref (PK + target)
 	// projections is the per-source read projection (#183): the columns to
 	// emit and the compiled filter, applied on each decoded row.
 	projections map[string]projection
-	mu          sync.Mutex
-	curSet      *position.GTID // accumulated GTID set through the current transaction
-	curGTID     string         // curSet.String() — the position rows of this txn carry
-	curTxn      *position.GTID // single GTID of the transaction being decoded (window check)
+	// encoders is the per-target-table Arrow builder, built at Start from the
+	// resolved schemas. encoderOrder preserves first-appearance order so a
+	// multi-table transaction emits tables deterministically.
+	encoders     map[string]*tableEncoder
+	encoderOrder []string
+	// pending holds the records materialized so far for the transaction being
+	// decoded; their positions are finalized (safe vs commit) when it ends.
+	pending []heldRec
+	// safePos is the position of the last fully emitted transaction (or the
+	// resume point before the first). Rows are stamped with it at decode; only
+	// a transaction's final record is restamped with its own position.
+	safePos string
+	mu      sync.Mutex
+	curSet  *position.GTID // accumulated GTID set through the current transaction
+	curGTID string         // curSet.String() — the position rows of this txn carry
 	// curCommitTS is the transaction's commit time, captured on the GTID
 	// event and stamped onto every row of the transaction (issue #137).
 	curCommitTS time.Time
 
-	winMu    sync.Mutex
-	winChunk uint32 // chunkID of the open DBLog window, when winOpen
-	winOpen  bool
-	winLow   *position.GTID // source watermark captured at OpenWindow
-
-	// done is closed once, by StartFromGTID on the way out (whether it
-	// exits via ctx.Done() or the stream ending on its own). OnRow selects
-	// on it alongside every send to r.out: without this, a stalled
-	// consumer blocks OnRow forever on canal's own event-loop goroutine,
-	// which stops canal from reading further binlog events (no GTIDs, no
-	// heartbeats, no rotates) and makes Close()/ctx cancellation hang,
-	// because neither can unblock a goroutine parked on a channel send —
-	// only a reader on the other end can. See issue #114.
+	// done is closed once by StartFromGTID on the way out. OnRow and the txn
+	// close select on it alongside every send: without it a stalled consumer
+	// would block OnRow forever on canal's own event-loop goroutine, which
+	// stops canal reading binlog events and makes Close()/ctx cancellation
+	// hang — only a reader on the other end can unblock a channel send. See
+	// issue #114.
 	done     chan struct{}
 	doneOnce sync.Once
 
@@ -101,40 +114,17 @@ type Reader struct {
 	canal.DummyEventHandler // unimplemented hooks are no-ops
 }
 
-// OpenWindow opens the DBLog window for chunkID. The reader captures its
-// source watermark — the master's executed GTID set — and, from now on, tags
-// decoded events whose transaction is strictly past that watermark InWindow
-// for the chunk, until ClearWindow. Events at or before the watermark are
-// already reflected in the chunk SELECT and must not be tagged. The tag is
-// applied synchronously at decode — no event can escape the window by racing
-// a channel pull.
-func (r *Reader) OpenWindow(ctx context.Context, chunkID uint32) {
-	var low *position.GTID
-	if g, ok := r.Synced().(*position.GTID); ok {
-		low = g
-	}
-	if m, err := r.Master(ctx); err == nil {
-		if g, ok := m.(*position.GTID); ok {
-			low = g
-		}
-	}
-	r.winMu.Lock()
-	r.winOpen = true
-	r.winChunk = chunkID
-	r.winLow = low
-	r.winMu.Unlock()
-}
+// OpenWindow is part of the SourceReader contract. The DBLog window tag is
+// applied by the coordinator's gate to the batches it holds (WindowTag on the
+// wire) — not by the source — so the reader keeps no window state.
+func (r *Reader) OpenWindow(_ context.Context, _ uint32) {}
 
-// ClearWindow closes the DBLog window opened by OpenWindow.
-func (r *Reader) ClearWindow() {
-	r.winMu.Lock()
-	r.winOpen = false
-	r.winLow = nil
-	r.winMu.Unlock()
-}
+// ClearWindow is part of the SourceReader contract; see OpenWindow.
+func (r *Reader) ClearWindow() {}
 
-// New builds the reader but does not start it.
-func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader, error) {
+// New builds the reader but does not start it. Rows decode straight into
+// Arrow and are emitted on batchOut as ready wire batches (#455).
+func New(ctx context.Context, cfg Config, batchOut chan<- *dataplane.Batch) (*Reader, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -150,9 +140,32 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		return nil, fmt.Errorf("mysql: new canal: %w", err)
 	}
 
-	r := &Reader{cfg: cfg, canal: c, out: out, bySrc: bySrc, projections: cfg.Projections, done: make(chan struct{})}
+	r := &Reader{
+		cfg:         cfg,
+		canal:       c,
+		batchOut:    batchOut,
+		bySrc:       bySrc,
+		projections: cfg.Projections,
+		encoders:    make(map[string]*tableEncoder, len(cfg.Tables)),
+		done:        make(chan struct{}),
+	}
 	c.SetEventHandler(r)
 	return r, nil
+}
+
+// SetResume records the position the stream resumes from: the safe position a
+// partial piece of the first transaction carries.
+func (r *Reader) SetResume(pos string) { r.safePos = pos }
+
+// SetSourceSchemas installs the cast-resolved canonical schemas before Start.
+// The direct encoder must see the resolved kinds: an unresolved KindUnknown
+// column cannot be built into an Arrow type.
+func (r *Reader) SetSourceSchemas(resolved map[string]core.Schema) {
+	for target, cs := range resolved {
+		if _, known := r.cfg.Schemas[target]; known {
+			r.cfg.Schemas[target] = cs
+		}
+	}
 }
 
 // canalConfig renders the neutral Config into go-mysql's canal.Config — split
@@ -305,7 +318,6 @@ func (r *Reader) OnGTID(header *replication.EventHeader, e gomysql.BinlogGTIDEve
 		}
 	}
 	r.mu.Lock()
-	r.curTxn = g
 	r.curCommitTS = commitTS
 	r.mu.Unlock()
 	r.mergeGTID(g)
@@ -336,7 +348,7 @@ func (r *Reader) mergeGTID(g *position.GTID) {
 	r.curGTID = r.curSet.String()
 }
 
-// OnRow decodes one row event into rowchange.Change values and emits them.
+// OnRow decodes one row event straight into the target tables' Arrow builders.
 func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	ref, ok := r.bySrc[e.Table.Schema+"."+e.Table.Name]
 	if !ok {
@@ -345,66 +357,30 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 
 	r.mu.Lock()
 	pos := r.curGTID
-	txn := r.curTxn
 	commitTS := r.curCommitTS
-	r.winMu.Lock()
-	var win *rowchange.Window
-	// Only events strictly past the low watermark are InWindow: an event at
-	// or before low is already reflected in the chunk SELECT (or in an
-	// earlier chunk), so tagging it would resurrect a stale value. A missing
-	// watermark falls back to tagging everything — over-tagging is safe.
-	if r.winOpen && (r.winLow == nil || txn == nil || !r.winLow.Contains(txn)) {
-		win = &rowchange.Window{ChunkID: r.winChunk, InWindow: true}
-	}
-	r.winMu.Unlock()
 	r.mu.Unlock()
 
 	if dbg := r.cfg.Logger; dbg != nil && os.Getenv("URUTAU_DEBUG_READER") != "" {
-		dbg.Info("row", "table", ref.Source, "action", e.Action, "pos", pos,
-			"nrows", len(e.Rows), "win", win)
+		dbg.Info("row", "table", ref.Source, "action", e.Action, "pos", pos, "nrows", len(e.Rows))
 	}
 
 	switch e.Action {
 	case canal.InsertAction:
 		for _, row := range e.Rows {
-			c, emit, err := r.decode(ref, e.Table, rowchange.OpInsert, row, nil, pos, commitTS)
-			if err != nil {
-				return err
-			}
-			if !emit {
-				continue
-			}
-			c.Window = win
-			if err := r.emit(c); err != nil {
+			if err := r.appendChange(ref, e.Table, rowchange.OpInsert, row, nil, pos, commitTS); err != nil {
 				return err
 			}
 		}
 	case canal.DeleteAction:
 		for _, row := range e.Rows {
-			c, emit, err := r.decode(ref, e.Table, rowchange.OpDelete, row, nil, pos, commitTS)
-			if err != nil {
-				return err
-			}
-			if !emit {
-				continue
-			}
-			c.Window = win
-			if err := r.emit(c); err != nil {
+			if err := r.appendChange(ref, e.Table, rowchange.OpDelete, row, nil, pos, commitTS); err != nil {
 				return err
 			}
 		}
 	case canal.UpdateAction:
 		// Rows come as [before, after] pairs.
 		for i := 0; i+1 < len(e.Rows); i += 2 {
-			c, emit, err := r.decode(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos, commitTS)
-			if err != nil {
-				return err
-			}
-			if !emit {
-				continue
-			}
-			c.Window = win
-			if err := r.emit(c); err != nil {
+			if err := r.appendChange(ref, e.Table, rowchange.OpUpdate, e.Rows[i+1], e.Rows[i], pos, commitTS); err != nil {
 				return err
 			}
 		}
@@ -412,19 +388,179 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	return nil
 }
 
-// emit sends c to the reader's output, or returns an error if the reader is
-// shutting down first. A bare `r.out <- c` would block OnRow — and with it
-// canal's whole event loop — for as long as a stalled consumer takes to
-// drain the channel, with Close()/context cancellation unable to break it
-// out (see the done field's doc comment, issue #114). Returning the error
-// makes canal tear the stream down instead of continuing to feed a reader
-// that is on its way out.
-func (r *Reader) emit(c rowchange.Change) error {
-	select {
-	case r.out <- c:
-		if c.Op != rowchange.OpTxnEnd {
-			r.txnRows = true
+// encoder returns (building once) the target table's Arrow builder. A table
+// image whose column count no longer matches the one the mapping was built
+// from is source drift: fail loud so the operator declares the change and
+// resumes, exactly where the native row shape exists.
+func (r *Reader) encoder(ref TableRef, tbl *schema.Table) (*tableEncoder, error) {
+	if te, ok := r.encoders[ref.Target]; ok {
+		return te, nil
+	}
+	cs, ok := r.cfg.Schemas[ref.Target]
+	if !ok || len(cs.Columns) == 0 {
+		return nil, fmt.Errorf("mysql: table %s has no canonical schema", ref.Target)
+	}
+	te, err := newTableEncoder(ref.Target, cs, tbl, r.projections[ref.Source])
+	if err != nil {
+		return nil, fmt.Errorf("mysql: %s: %w", ref.Source, err)
+	}
+	r.encoders[ref.Target] = te
+	r.encoderOrder = append(r.encoderOrder, ref.Target)
+	return te, nil
+}
+
+// appendChange applies the read filter/projection and appends the row image to
+// the target's builder as one Arrow row, with no map[string]any in between.
+// It mirrors the row path's semantics: a filtered-out row emits nothing; an
+// UPDATE that leaves the filter emits a delete of the before image; an upsert
+// target's primary-key change emits a delete of the OLD key as well.
+func (r *Reader) appendChange(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) error {
+	te, err := r.encoder(ref, tbl)
+	if err != nil {
+		return err
+	}
+	loc := r.loc()
+	proj := r.projections[ref.Source]
+
+	switch op {
+	case rowchange.OpDelete:
+		// The binlog puts the deleted row image in the after slot.
+		keep, err := proj.keep(after, tbl, loc)
+		if err != nil {
+			return err
 		}
+		if !keep {
+			return nil
+		}
+		return r.appendImage(te, tbl, op, after, pos, commitTS)
+	case rowchange.OpUpdate:
+		afterKeep, err := proj.keep(after, tbl, loc)
+		if err != nil {
+			return err
+		}
+		beforeKeep := false
+		if before != nil {
+			if beforeKeep, err = proj.keep(before, tbl, loc); err != nil {
+				return err
+			}
+		}
+		switch {
+		case !afterKeep && !beforeKeep:
+			return nil
+		case beforeKeep && !afterKeep:
+			// The row left the filter: emit a delete so an upsert target
+			// removes the now-excluded row instead of keeping a stale copy.
+			return r.appendImage(te, tbl, rowchange.OpDelete, before, pos, commitTS)
+		default:
+			// In upsert mode an UPDATE that changes the primary key must
+			// delete the OLD key: the update's own delete is built from the
+			// new key, so without this the old row survives forever. Append
+			// targets keep the old row by design.
+			if before != nil && r.cfg.UpsertTargets[ref.Target] {
+				oldKey := r.keyOf(ref, tbl, before)
+				newKey := r.keyOf(ref, tbl, after)
+				if rowchange.KeyString(oldKey) != rowchange.KeyString(newKey) {
+					if err := r.appendImage(te, tbl, rowchange.OpDelete, before, pos, commitTS); err != nil {
+						return err
+					}
+				}
+			}
+			return r.appendImage(te, tbl, rowchange.OpUpdate, after, pos, commitTS)
+		}
+	default: // insert
+		keep, err := proj.keep(after, tbl, loc)
+		if err != nil {
+			return err
+		}
+		if !keep {
+			return nil
+		}
+		return r.appendImage(te, tbl, op, after, pos, commitTS)
+	}
+}
+
+// appendImage writes one row image into the builder. A delete needs a primary
+// key in the canonical schema, or the equality delete would match nothing
+// (C-8). The row is stamped with the current SAFE position; only the
+// transaction's final record is restamped when it closes.
+func (r *Reader) appendImage(te *tableEncoder, tbl *schema.Table, op rowchange.Op, image []any, pos string, commitTS time.Time) error {
+	if op == rowchange.OpDelete && len(te.enc.Schema().PrimaryKey) == 0 {
+		return fmt.Errorf("sourcepull: batch %q carries a delete but the schema has no primary key — declare it and resume", te.target)
+	}
+	meta := transport.RowMeta{Op: op, Position: r.safePos, CommitTS: commitTS, IngestTS: time.Now()}
+	if err := te.appendRow(image, tbl, r.loc(), meta); err != nil {
+		return err
+	}
+	r.txnRows = true
+	if te.rows >= maxDirectRows || te.bytes >= maxDirectBytes {
+		r.pending = append(r.pending, heldRec{target: te.target, rec: te.materialize()})
+	}
+	return nil
+}
+
+// keyOf builds a row's primary-key tuple from the raw image, in spec order.
+func (r *Reader) keyOf(ref TableRef, tbl *schema.Table, row []any) []any {
+	key := make([]any, 0, len(ref.PrimaryKey))
+	for _, pk := range ref.PrimaryKey {
+		if idx := tbl.FindColumn(pk); idx >= 0 && idx < len(row) {
+			key = append(key, row[idx])
+		} else {
+			key = append(key, nil)
+		}
+	}
+	return key
+}
+
+// closeTxn materializes the transaction's remaining rows, stamps only its
+// final record with the transaction position, and emits every record in
+// order. Earlier pieces carry the previous safe position, so an ack cannot
+// advance the durable checkpoint past rows a later piece still owes (#456).
+func (r *Reader) closeTxn() error {
+	for _, target := range r.encoderOrder {
+		if rec := r.encoders[target].materialize(); rec != nil {
+			r.pending = append(r.pending, heldRec{target: target, rec: rec})
+		}
+	}
+	if len(r.pending) == 0 {
+		return nil
+	}
+	last := &r.pending[len(r.pending)-1]
+	rebuilt, err := withPosition(last.rec, r.curGTID)
+	if err != nil {
+		r.releasePending()
+		return err
+	}
+	last.rec.Release()
+	last.rec = rebuilt
+
+	pending := r.pending
+	r.pending = nil
+	for _, hb := range pending {
+		b := &dataplane.Batch{Table: hb.target, Record: hb.rec, Mode: dataplane.UpsertMode}
+		if err := r.sendBatch(b); err != nil {
+			hb.rec.Release()
+			return err
+		}
+	}
+	r.safePos = r.curGTID
+	return nil
+}
+
+// releasePending drops the buffered records of the transaction being decoded.
+func (r *Reader) releasePending() {
+	for _, hb := range r.pending {
+		if hb.rec != nil {
+			hb.rec.Release()
+		}
+	}
+	r.pending = nil
+}
+
+// sendBatch hands one record to the coordinator/runner, or reports the orderly
+// stop when the reader is shutting down first.
+func (r *Reader) sendBatch(b *dataplane.Batch) error {
+	select {
+	case r.batchOut <- b:
 		return nil
 	case <-r.done:
 		return errReaderStopped
@@ -441,7 +577,7 @@ func (r *Reader) OnPosSynced(header *replication.EventHeader, _ gomysql.Position
 		return nil
 	}
 	r.txnRows = false
-	return r.emit(rowchange.Change{Op: rowchange.OpTxnEnd})
+	return r.closeTxn()
 }
 
 // errReaderStopped is emit's sentinel for "the reader is shutting down" —
@@ -458,164 +594,12 @@ func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replic
 	return nil
 }
 
-// decode maps one row (in table column order) to a rowchange, applying the
-// table's read projection and filter (#183). It returns emit=false when the
-// filter excludes the row. key is built from the spec primary key columns, in
-// spec order. commitTS is the transaction's commit time, carried onto every
-// row of the transaction.
-//
-// The binlog puts the deleted row in the after slot for a DELETE and the old
-// row in before / the new row in after for an UPDATE.
-func (r *Reader) decode(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) (rowchange.Change, bool, error) {
-	proj := r.projections[ref.Source]
-	loc := r.loc()
-	if err := requireFullImage(tbl, after); err != nil {
-		return rowchange.Change{}, false, err
-	}
-	if before != nil {
-		if err := requireFullImage(tbl, before); err != nil {
-			return rowchange.Change{}, false, err
-		}
-	}
-	c := rowchange.Change{
-		Op:       op,
-		Table:    ref.Target,
-		Position: pos,
-		CommitTS: commitTS,
-		IngestTS: time.Now(),
-	}
-	keyFrom := func(row []any) []any {
-		key := make([]any, 0, len(ref.PrimaryKey))
-		for _, pk := range ref.PrimaryKey {
-			if idx := tbl.FindColumn(pk); idx >= 0 && idx < len(row) {
-				key = append(key, row[idx])
-			} else {
-				key = append(key, nil)
-			}
-		}
-		return key
-	}
-
-	switch op {
-	case rowchange.OpDelete:
-		full := rowToMap(tbl, after, loc)
-		keep, err := proj.keep(full)
-		if err != nil {
-			return rowchange.Change{}, false, err
-		}
-		if !keep {
-			return rowchange.Change{}, false, nil
-		}
-		c.Key = keyFrom(after)
-		c.Before = proj.project(full)
-		return c, true, nil
-	case rowchange.OpUpdate:
-		fullAfter := rowToMap(tbl, after, loc)
-		var fullBefore map[string]any
-		if before != nil {
-			fullBefore = rowToMap(tbl, before, loc)
-		}
-		afterKeep, err := proj.keep(fullAfter)
-		if err != nil {
-			return rowchange.Change{}, false, err
-		}
-		beforeKeep := false
-		if fullBefore != nil {
-			if beforeKeep, err = proj.keep(fullBefore); err != nil {
-				return rowchange.Change{}, false, err
-			}
-		}
-		switch {
-		case !afterKeep && !beforeKeep:
-			return rowchange.Change{}, false, nil
-		case beforeKeep && !afterKeep:
-			// The row left the filter: emit a delete so an upsert target
-			// removes the now-excluded row instead of keeping a stale copy.
-			c.Op = rowchange.OpDelete
-			c.Key = keyFrom(before)
-			c.Before = proj.project(fullBefore)
-			return c, true, nil
-		default:
-			// In upsert mode an UPDATE that changes the primary key must
-			// delete the OLD key: the update's own delete is built from the
-			// new key, so without this the old row survives forever. Append
-			// targets keep the old row by design.
-			if fullBefore != nil && r.cfg.UpsertTargets[ref.Target] {
-				oldKey, newKey := keyFrom(before), keyFrom(after)
-				if rowchange.KeyString(oldKey) != rowchange.KeyString(newKey) {
-					if err := r.emit(rowchange.Change{
-						Op:       rowchange.OpDelete,
-						Table:    ref.Target,
-						Position: pos,
-						CommitTS: commitTS,
-						IngestTS: time.Now(),
-						Key:      oldKey,
-						Before:   proj.project(fullBefore),
-					}); err != nil {
-						return rowchange.Change{}, false, err
-					}
-				}
-			}
-			c.Key = keyFrom(after)
-			c.After = proj.project(fullAfter)
-			if fullBefore != nil {
-				c.Before = proj.project(fullBefore)
-			}
-			return c, true, nil
-		}
-	default: // insert
-		full := rowToMap(tbl, after, loc)
-		keep, err := proj.keep(full)
-		if err != nil {
-			return rowchange.Change{}, false, err
-		}
-		if !keep {
-			return rowchange.Change{}, false, nil
-		}
-		c.Key = keyFrom(after)
-		c.After = proj.project(full)
-		return c, true, nil
-	}
-}
-
-// requireFullImage fails loud when the binlog row carries fewer columns than
-// the table. That happens only under binlog_row_image != FULL, where unchanged
-// columns are omitted — decoding such a row would silently treat the missing
-// columns as nil and corrupt the target. The boot preflight warns; this is the
-// runtime guarantee that a partial image never lands.
-func requireFullImage(tbl *schema.Table, row []any) error {
-	if len(row) < len(tbl.Columns) {
-		return fmt.Errorf("mysql: binlog row image carries %d of %d columns — set binlog_row_image=FULL (a partial image cannot be decoded safely)", len(row), len(tbl.Columns))
-	}
-	return nil
-}
-
 // loc returns the operator's temporal location, defaulting to UTC.
 func (r *Reader) loc() *time.Location {
 	if r.cfg.TimeLocation == nil {
 		return time.UTC
 	}
 	return r.cfg.TimeLocation
-}
-
-// rowToMap maps a row (in table column order) to column-name → value.
-// The binlog yields []byte for string columns; normalize them to string so
-// the writer's scalar type switch accepts them.
-//
-// ENUM and SET need the column definition, not just the value: the binlog
-// encodes them numerically (see decodeEnum/decodeSet), while the backfill's
-// SELECT returns them as text. Both paths feed the same target column, so
-// decoding here is what keeps a CDC row and a snapshot row of the same
-// source row identical.
-func rowToMap(tbl *schema.Table, row []any, loc *time.Location) map[string]any {
-	out := make(map[string]any, len(tbl.Columns))
-	for i, col := range tbl.Columns {
-		if i >= len(row) {
-			continue
-		}
-		out[col.Name] = normalizeCol(col, row[i], loc)
-	}
-	return out
 }
 
 // normalizeCol converts one binlog value using its column definition.

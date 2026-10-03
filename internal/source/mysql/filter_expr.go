@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
@@ -14,17 +15,33 @@ import (
 )
 
 // projection is a table's CDC read projection: the columns to emit and the
-// compiled filter a row must satisfy. Both are applied on the decoded map,
-// before the Arrow hot-path — mirroring the Postgres projection.
+// compiled filter a row must satisfy. The emitted column set is already the
+// canonical schema (the adapter filters it), so the live path appends the
+// projected columns straight into Arrow; only the filter needs named access,
+// and it reads a minimal map of just the columns it references.
 type projection struct {
 	Columns []string
 	program *vm.Program
+	// filterCols is the distinct source columns the compiled filter reads.
+	// keep builds its row map from exactly these, never the whole row.
+	filterCols []string
 }
 
-// keep reports whether a full decoded row satisfies the filter.
-func (p projection) keep(full map[string]any) (bool, error) {
+// keep reports whether a decoded row (in table column order) satisfies the
+// filter. It materializes a map of ONLY the filter-referenced columns — the
+// hot path never builds a full row map (#455).
+func (p projection) keep(row []any, tbl *schema.Table, loc *time.Location) (bool, error) {
 	if p.program == nil {
 		return true, nil
+	}
+	full := make(map[string]any, len(p.filterCols))
+	for _, name := range p.filterCols {
+		idx := tbl.FindColumn(name)
+		if idx < 0 || idx >= len(row) {
+			full[name] = nil
+			continue
+		}
+		full[name] = normalizeCol(tbl.Columns[idx], row[idx], loc)
 	}
 	out, err := expr.Run(p.program, map[string]any{"row": full})
 	if err != nil {
@@ -37,23 +54,37 @@ func (p projection) keep(full map[string]any) (bool, error) {
 	return ok, nil
 }
 
-// project narrows a full decoded row to the selected columns. An empty
-// projection returns the row unchanged.
-func (p projection) project(full map[string]any) map[string]any {
-	if len(p.Columns) == 0 {
-		return full
+// filterColumns returns the distinct source columns a filter references.
+func filterColumns(f *spec.Filter) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(*spec.Filter)
+	walk = func(n *spec.Filter) {
+		if n == nil {
+			return
+		}
+		for i := range n.All {
+			walk(&n.All[i])
+		}
+		for i := range n.Any {
+			walk(&n.Any[i])
+		}
+		if n.Not != nil {
+			walk(n.Not)
+		}
+		if n.Predicate != nil && n.Predicate.Column != "" && !seen[n.Predicate.Column] {
+			seen[n.Predicate.Column] = true
+			out = append(out, n.Predicate.Column)
+		}
 	}
-	out := make(map[string]any, len(p.Columns))
-	for _, c := range p.Columns {
-		out[c] = full[c]
-	}
+	walk(f)
 	return out
 }
 
 // newProjection builds a projection, compiling the structured filter to an
 // expr program once per table using the introspected column types.
 func newProjection(columns []string, f *spec.Filter, tbl *schema.Table) (projection, error) {
-	p := projection{Columns: columns}
+	p := projection{Columns: columns, filterCols: filterColumns(f)}
 	prog, err := compileFilterExpr(f, tbl)
 	if err != nil {
 		return projection{}, err
