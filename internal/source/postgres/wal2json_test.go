@@ -36,25 +36,25 @@ func TestCoerceWal2json(t *testing.T) {
 	}
 }
 
-func TestWal2jsonRow(t *testing.T) {
+func TestWal2jsonRowPos(t *testing.T) {
 	st := &TableState{Columns: []Column{
 		{Name: "id", DataType: "bigint"},
 		{Name: "v", DataType: "text"},
 	}}
-	row, err := wal2jsonRow(st, []string{"id", "v"}, []any{float64(1), "a"})
+	row, err := wal2jsonRowPos(st, []string{"id", "v"}, []any{float64(1), "a"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row["id"] != int64(1) || row["v"] != "a" {
+	if row[0] != int64(1) || row[1] != "a" {
 		t.Fatalf("row = %+v, want id=1 v=a", row)
 	}
-	// A column absent from the message stays absent.
-	row, err = wal2jsonRow(st, []string{"id"}, []any{float64(2)})
+	// A column absent from the message stays nil.
+	row, err = wal2jsonRowPos(st, []string{"id"}, []any{float64(2)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := row["v"]; ok {
-		t.Fatalf("row = %+v, want no v", row)
+	if row[1] != nil {
+		t.Fatalf("row = %+v, want v nil", row)
 	}
 }
 

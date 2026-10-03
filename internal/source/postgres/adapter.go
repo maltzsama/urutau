@@ -13,8 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sourcepull"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -380,67 +380,11 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		plugin = a.connCfg.Plugin
 	}
 
-	// One channel for the whole reader life: New writes into it and the
-	// returned stream pulls from it. Creating it per attempt would orphan
-	// the reader's output on the attempt that succeeds.
-	filters, columns := a.filtersColumnsFor(refs)
-	upsertTargets := make(map[string]bool, len(refs))
-	for _, ref := range refs {
-		t, _ := a.tableFor(ref.Source)
-		upsertTargets[ref.Target] = spec.EffectiveWriteMode(t, a.spec.Sink.Defaults.WriteMode) == spec.WriteModeUpsert
-	}
-	out := make(chan rowchange.Change, 1024)
-	var rdr *Reader
-	var err error
-	for attempt := 0; ; attempt++ {
-		rdr, err = New(ctx, Config{
-			URI:           uri,
-			ConnCfg:       a.connCfg,
-			DB:            a.db,
-			SlotName:      slot,
-			Tables:        refs,
-			Logger:        a.rt.Logger,
-			RetryCount:    maxRetries,
-			InitialWait:   initialWait,
-			Plugin:        plugin,
-			Filters:       filters,
-			Columns:       columns,
-			UpsertTargets: upsertTargets,
-		}, out)
-		if err == nil {
-			break
-		}
-		// Retry only transient failures: a permanent error (bad password,
-		// missing database) is not going to heal with backoff.
-		if !isTransient(err) || attempt >= maxRetries {
-			return nil, fmt.Errorf("postgres: open (after %d retries): %w", attempt, err)
-		}
-		a.rt.Logger.Warn("postgres: connection failed, retrying",
-			"attempt", attempt+1, "backoff", retryBackoff(attempt), "err", err)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(retryBackoff(attempt)):
-		}
-	}
-
-	// The reader holds an open replication connection. If the schema
-	// introspection below fails, close it before returning — otherwise the
-	// connection leaks on every failed open.
-	keepReader := false
-	defer func() {
-		if !keepReader {
-			rdr.Close()
-		}
-	}()
-
-	puller := sourcepull.New(out)
-	// Introspect each table so live batches encode against the canonical
-	// schema — a stable shape per table, never a per-drain inference. The
-	// schema is narrowed to the column projection so the live Arrow batches
-	// match the target table.
+	// Resolve the canonical (projected) schema per target table so live
+	// batches encode against a stable shape — the direct encoder needs it
+	// before it decodes the first row.
+	schemas := make(map[string]core.Schema, len(refs))
 	if a.db != nil {
-		schemas := make(map[string]core.Schema, len(refs))
 		for _, ref := range refs {
 			schemaName, tableName, ok := strings.Cut(ref.Source, ".")
 			if !ok {
@@ -465,14 +409,70 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 			}
 			schemas[ref.Target] = cs
 		}
-		puller.SetSchemas(schemas)
 	}
-	// The reader ends each transaction with OpTxnEnd, so a batch holds only
-	// whole transactions: recording a transaction's position with part of its
-	// rows would let a resume skip the rest.
-	puller.BoundTransactions()
+
+	filters, columns := a.filtersColumnsFor(refs)
+	upsertTargets := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		t, _ := a.tableFor(ref.Source)
+		upsertTargets[ref.Target] = spec.EffectiveWriteMode(t, a.spec.Sink.Defaults.WriteMode) == spec.WriteModeUpsert
+	}
+	// One channel for the whole reader life: New writes into it and the
+	// returned stream pulls from it. Creating it per attempt would orphan
+	// the reader's output on the attempt that succeeds.
+	batches := make(chan *dataplane.Batch, 256)
+	var rdr *Reader
+	var err error
+	for attempt := 0; ; attempt++ {
+		rdr, err = New(ctx, Config{
+			URI:           uri,
+			ConnCfg:       a.connCfg,
+			DB:            a.db,
+			SlotName:      slot,
+			Tables:        refs,
+			Logger:        a.rt.Logger,
+			RetryCount:    maxRetries,
+			InitialWait:   initialWait,
+			Plugin:        plugin,
+			Filters:       filters,
+			Columns:       columns,
+			UpsertTargets: upsertTargets,
+			Schemas:       schemas,
+		}, batches)
+		if err == nil {
+			break
+		}
+		// Retry only transient failures: a permanent error (bad password,
+		// missing database) is not going to heal with backoff.
+		if !isTransient(err) || attempt >= maxRetries {
+			return nil, fmt.Errorf("postgres: open (after %d retries): %w", attempt, err)
+		}
+		a.rt.Logger.Warn("postgres: connection failed, retrying",
+			"attempt", attempt+1, "backoff", retryBackoff(attempt), "err", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryBackoff(attempt)):
+		}
+	}
+
+	// The reader holds an open replication connection. If wiring fails, close
+	// it before returning — otherwise the connection leaks.
+	keepReader := false
+	defer func() {
+		if !keepReader {
+			rdr.Close()
+		}
+	}()
+
+	// Columnar puller: the reader decodes straight into Arrow and emits ready
+	// wire batches; the puller forwards them. The engine's resolved schemas
+	// reach the reader through the puller's hook before Start.
+	puller := sourcepull.NewColumnar(batches)
+	puller.SetSchemas(schemas)
+	puller.SetOnSchemas(rdr.SetSourceSchemas)
 	keepReader = true
-	return stream{Reader: rdr, out: out, Puller: puller}, nil
+	return stream{Reader: rdr, Puller: puller}, nil
 }
 
 // filtersColumnsFor builds the per-source filter and column projection maps
@@ -517,8 +517,14 @@ func (a Source) ParsePosition(s string) (position.Position, error) {
 // stream adapts the concrete pgoutput reader to the Reader contract.
 type stream struct {
 	*Reader
-	out chan rowchange.Change
 	*sourcepull.Puller
+}
+
+// SetSourceSchemas implements source.SchemaSetter: the puller resolves the
+// canonical schemas and forwards them to the reader's encoders through the
+// SetOnSchemas hook installed at Open.
+func (s stream) SetSourceSchemas(schemas map[string]core.Schema) {
+	s.Puller.SetSourceSchemas(schemas)
 }
 
 // Start begins the stream at the given LSN.
@@ -537,7 +543,7 @@ func (s stream) Start(ctx context.Context, from position.Position) error {
 	if err := AdvanceSlot(ctx, s.db, s.cfg.SlotName, *start); err != nil {
 		return err
 	}
-	s.SetResume(start.String())
+	s.Reader.SetResume(start.String())
 	errCh := make(chan error, 1)
 	s.SetErr(errCh)
 	go func() { errCh <- s.StartFromLSN(ctx, start) }()

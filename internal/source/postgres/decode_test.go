@@ -41,8 +41,8 @@ func tuple(cols ...*pglogrepl.TupleDataColumn) *pglogrepl.TupleData {
 	return &pglogrepl.TupleData{Columns: cols}
 }
 
-func TestTupleToMapScalars(t *testing.T) {
-	row, err := tupleToMap(orderState(), tuple(
+func TestTupleRowScalars(t *testing.T) {
+	row, err := tupleRow(orderState(), tuple(
 		col("42"),
 		col("hello world"),
 		col("1.99"),
@@ -51,22 +51,22 @@ func TestTupleToMapScalars(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if row["id"] != int64(42) {
-		t.Errorf("id = %v (%T), want int64(42)", row["id"], row["id"])
+	if row[0] != int64(42) {
+		t.Errorf("id = %v (%T), want int64(42)", row[0], row[0])
 	}
-	if row["v"] != "hello world" {
-		t.Errorf("v = %v, want string", row["v"])
+	if row[1] != "hello world" {
+		t.Errorf("v = %v, want string", row[1])
 	}
-	if row["amount"] != "1.99" {
-		t.Errorf("amount = %v (%T), want string \"1.99\"", row["amount"], row["amount"])
+	if row[2] != "1.99" {
+		t.Errorf("amount = %v (%T), want string \"1.99\"", row[2], row[2])
 	}
-	if row["active"] != true {
-		t.Errorf("active = %v, want true", row["active"])
+	if row[3] != true {
+		t.Errorf("active = %v, want true", row[3])
 	}
 }
 
-func TestTupleToMapNullsAndMoney(t *testing.T) {
-	row, err := tupleToMap(orderState(), tuple(
+func TestTupleRowNullsAndMoney(t *testing.T) {
+	row, err := tupleRow(orderState(), tuple(
 		col("7"),
 		nullCol(),
 		col("$1,234.50"),
@@ -75,20 +75,20 @@ func TestTupleToMapNullsAndMoney(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if v, ok := row["v"]; !ok || v != nil {
-		t.Errorf("v = %v (%T), want nil, present", v, v)
+	if row[1] != nil {
+		t.Errorf("v = %v (%T), want nil", row[1], row[1])
 	}
-	if row["amount"] != "1234.50" {
-		t.Errorf("amount = %v (%T), want string \"1234.50\"", row["amount"], row["amount"])
+	if row[2] != "1234.50" {
+		t.Errorf("amount = %v (%T), want string \"1234.50\"", row[2], row[2])
 	}
-	if row["active"] != false {
-		t.Errorf("active = %v, want false", row["active"])
+	if row[3] != false {
+		t.Errorf("active = %v, want false", row[3])
 	}
 }
 
-func TestTupleToMapToastRecoversFromOldImage(t *testing.T) {
+func TestTupleRowToastRecoversFromOldImage(t *testing.T) {
 	old := tuple(col("1"), col("the original toast"), col("0.5"), col("t"))
-	row, err := tupleToMap(orderState(), tuple(
+	row, err := tupleRow(orderState(), tuple(
 		col("1"),
 		toastCol(), // unchanged TOAST — recovered from the old tuple
 		col("0.75"),
@@ -97,82 +97,86 @@ func TestTupleToMapToastRecoversFromOldImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode with old image: %v", err)
 	}
-	if row["v"] != "the original toast" {
-		t.Errorf("v = %v, want recovered old value", row["v"])
+	if row[1] != "the original toast" {
+		t.Errorf("v = %v, want recovered old value", row[1])
 	}
-	if row["active"] != true {
-		t.Errorf("active = %v, want recovered old value", row["active"])
+	if row[3] != true {
+		t.Errorf("active = %v, want recovered old value", row[3])
 	}
 }
 
-func TestTupleToMapToastWithoutOldImageIsHardError(t *testing.T) {
-	_, err := tupleToMap(orderState(), tuple(col("1"), toastCol(), col("0.5"), col("t")), nil)
+func TestTupleRowToastWithoutOldImageIsHardError(t *testing.T) {
+	_, err := tupleRow(orderState(), tuple(col("1"), toastCol(), col("0.5"), col("t")), nil)
 	if err == nil {
 		t.Fatal("unchanged TOAST with no old image must be a hard error")
 	}
 }
 
-func TestTupleToMapBadScalarIsHardError(t *testing.T) {
-	if _, err := tupleToMap(orderState(), tuple(col("not-a-number"), col("x"), col("1"), col("t")), nil); err == nil {
+func TestTupleRowBadScalarIsHardError(t *testing.T) {
+	if _, err := tupleRow(orderState(), tuple(col("not-a-number"), col("x"), col("1"), col("t")), nil); err == nil {
 		t.Fatal("bad bigint must be a hard error")
 	}
-	if _, err := tupleToMap(orderState(), tuple(col("1"), col("x"), col("1"), col("maybe")), nil); err == nil {
+	if _, err := tupleRow(orderState(), tuple(col("1"), col("x"), col("1"), col("maybe")), nil); err == nil {
 		t.Fatal("bad boolean must be a hard error")
 	}
 }
 
-func TestKeyFromSpecOrder(t *testing.T) {
+func TestKeyTupleSpecOrder(t *testing.T) {
 	st := &TableState{Schema: "shop", Name: "orders", Columns: []Column{
 		{Name: "a"}, {Name: "b"}, {Name: "id"},
 	}, PKColumns: []int{2, 0}}
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id", "a"}}
 
-	key := keyFrom(st, ref, map[string]any{"id": int64(9), "a": "x", "b": "y"})
+	// Positional row in table column order: a, b, id.
+	key := keyTuple(st, ref, []any{"x", "y", int64(9)})
 	if len(key) != 2 || key[0] != int64(9) || key[1] != "x" {
 		t.Errorf("key = %v, want [9 x] in spec order", key)
 	}
 
 	// Missing column degrades to nil, never panics.
-	key = keyFrom(st, ref, map[string]any{"a": "x"})
+	key = keyTuple(st, ref, []any{nil, nil, nil})
 	if len(key) != 2 || key[0] != nil {
-		t.Errorf("key = %v, want [nil x]", key)
+		t.Errorf("key = %v, want [nil nil]", key)
 	}
 }
 
 // A key-only old tuple ('K') carries just the identity key columns, in key
-// order, not the table's full column order — so it must be decoded by name,
-// not positionally (issue #500).
-func TestTupleToMapByNameKeyOnly(t *testing.T) {
+// order, not the table's full column order — so it is decoded by name into the
+// positional row (issue #500).
+func TestKeyTupleRowByName(t *testing.T) {
 	// orderState is id, v, amount, active. A key (id, v) whose tuple holds two
 	// columns: a positional decode would put v into amount/active.
 	st := orderState()
 
-	row, err := tupleToMapByName(st, tuple(col("7"), col("x")), []string{"id", "v"})
+	row, err := keyTupleRow(st, tuple(col("7"), col("x")), []string{"id", "v"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row["id"] != int64(7) || row["v"] != "x" {
+	if row[0] != int64(7) || row[1] != "x" {
 		t.Fatalf("row = %+v, want id=7 v=x", row)
+	}
+	if row[2] != nil || row[3] != nil {
+		t.Fatalf("non-key columns must be nil, got %+v", row)
 	}
 
 	// A key that is not the leading column still maps by name.
 	st2 := orderState()
 	st2.PKColumns = []int{1}
 
-	row, err = tupleToMapByName(st2, tuple(col("hello")), []string{"v"})
+	row, err = keyTupleRow(st2, tuple(col("hello")), []string{"v"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row["v"] != "hello" {
+	if row[1] != "hello" {
 		t.Fatalf("row = %+v, want v=hello", row)
 	}
 
 	// A key tuple whose width does not match the key is an error, not a
 	// partial or mis-mapped row.
-	if _, err := tupleToMapByName(st, tuple(col("1"), col("2"), col("3")), []string{"id", "v"}); err == nil {
+	if _, err := keyTupleRow(st, tuple(col("1"), col("2"), col("3")), []string{"id", "v"}); err == nil {
 		t.Fatal("want an error for a key tuple wider than the primary key")
 	}
-	if _, err := tupleToMapByName(st, tuple(col("1")), []string{"id", "v"}); err == nil {
+	if _, err := keyTupleRow(st, tuple(col("1")), []string{"id", "v"}); err == nil {
 		t.Fatal("want an error for a key tuple narrower than the primary key")
 	}
 }

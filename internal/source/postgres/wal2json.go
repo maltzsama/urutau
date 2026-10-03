@@ -57,7 +57,7 @@ func (r *Reader) handleWal2json(ctx context.Context, payload []byte) error {
 	if err := dec.Decode(&msg); err != nil {
 		return fmt.Errorf("postgres: wal2json: %w", err)
 	}
-	r.txn = r.txn[:0]
+	r.resetTxn()
 	r.curCommitTS = parseWal2jsonTime(msg.Timestamp)
 	commitLSN, err := r.startWal2jsonTxn(msg.NextLSN)
 	if err != nil {
@@ -94,7 +94,8 @@ func (r *Reader) startWal2jsonTxn(nextLSN string) (position.LSN, error) {
 	return *lsn, nil
 }
 
-// handleWal2jsonChange maps one row change onto a rowchange.Change.
+// handleWal2jsonChange decodes one wal2json row change straight into the
+// target's Arrow builder.
 func (r *Reader) handleWal2jsonChange(msg wal2jsonChange) error {
 	src := msg.Schema + "." + msg.Table
 	ref, ok := r.bySrc[src]
@@ -107,36 +108,36 @@ func (r *Reader) handleWal2jsonChange(msg wal2jsonChange) error {
 	}
 	entry := relEntry{state: st, ref: ref, proj: r.projections[src]}
 
-	after, err := wal2jsonRow(st, msg.ColumnNames, msg.ColumnValues)
+	after, err := wal2jsonRowPos(st, msg.ColumnNames, msg.ColumnValues)
 	if err != nil {
 		return err
 	}
-	var before map[string]any
+	var before []any
 	if msg.OldKeys != nil {
-		if before, err = wal2jsonRow(st, msg.OldKeys.KeyNames, msg.OldKeys.KeyValues); err != nil {
+		if before, err = wal2jsonRowPos(st, msg.OldKeys.KeyNames, msg.OldKeys.KeyValues); err != nil {
 			return err
 		}
 	}
 
 	switch msg.Kind {
 	case "insert":
-		keep, err := entry.proj.keep(after)
+		keep, err := entry.proj.keep(after, st)
 		if err != nil {
 			return err
 		}
 		if !keep {
 			return nil
 		}
-		r.enqueue(entry, rowchange.OpInsert, entry.proj.project(after), nil)
+		return r.appendChange(entry, rowchange.OpInsert, after, nil)
 	case "update":
 		if entry.proj.hasFilter() {
-			afterMatch, err := entry.proj.keep(after)
+			afterMatch, err := entry.proj.keep(after, st)
 			if err != nil {
 				return err
 			}
 			beforeMatch := false
 			if before != nil {
-				if beforeMatch, err = entry.proj.keep(before); err != nil {
+				if beforeMatch, err = entry.proj.keep(before, st); err != nil {
 					return err
 				}
 			}
@@ -144,46 +145,24 @@ func (r *Reader) handleWal2jsonChange(msg wal2jsonChange) error {
 				return nil
 			}
 			if beforeMatch && !afterMatch {
-				r.enqueue(entry, rowchange.OpDelete, nil, entry.proj.project(before))
-				return nil
+				return r.appendChange(entry, rowchange.OpDelete, nil, before)
 			}
 		}
-		r.enqueue(entry, rowchange.OpUpdate, entry.proj.project(after), entry.proj.project(before))
+		return r.appendChange(entry, rowchange.OpUpdate, after, before)
 	case "delete":
 		if before == nil {
 			return fmt.Errorf("postgres: wal2json: delete %s: no old row", src)
 		}
-		keep, err := entry.proj.keep(before)
+		keep, err := entry.proj.keep(before, st)
 		if err != nil {
 			return err
 		}
 		if !keep {
 			return nil
 		}
-		r.enqueue(entry, rowchange.OpDelete, nil, entry.proj.project(before))
+		return r.appendChange(entry, rowchange.OpDelete, nil, before)
 	}
 	return nil
-}
-
-// wal2jsonRow keys column names to coerced values. A column absent from the
-// message (a delete carries only the identity) stays absent.
-func wal2jsonRow(st *TableState, names []string, values []any) (map[string]any, error) {
-	row := make(map[string]any, len(names))
-	for i, name := range names {
-		var v any
-		if i < len(values) {
-			v = values[i]
-		}
-		if col := st.FindColumn(name); col >= 0 {
-			cv, err := coerceWal2json(v, st.Columns[col].DataType)
-			if err != nil {
-				return nil, fmt.Errorf("postgres: wal2json: column %s: %w", name, err)
-			}
-			v = cv
-		}
-		row[name] = v
-	}
-	return row, nil
 }
 
 // coerceWal2json maps a JSON value onto the Go type urutau's Arrow encoder

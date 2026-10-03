@@ -17,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	errs "github.com/maltzsama/urutau/internal/errors"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
@@ -68,20 +70,28 @@ type Config struct {
 	// UPDATE that changes the primary key emits a delete of the old key only
 	// for these; append targets keep the old row.
 	UpsertTargets map[string]bool
+	// Schemas is each target table's canonical (projected) schema, the shape
+	// the direct encoder builds. The engine's SetSourceSchemas replaces
+	// KindUnknown with the cast-resolved type before Start (#455).
+	Schemas map[string]core.Schema
 }
 
 // Projection is a table's source-side read projection: the columns to emit
-// and the compiled filter a row must satisfy. Both are applied on the
-// decoded map, before the Arrow hot-path.
+// and the compiled filter a row must satisfy. The emitted column set is
+// already the canonical schema (the adapter filters it), so the live path
+// appends the projected columns straight into Arrow; only the filter needs
+// named access, and it reads a minimal map of just the columns it references.
 type Projection struct {
 	Columns []string
 	program *vm.Program
+	// filterCols is the distinct source columns the compiled filter reads.
+	filterCols []string
 }
 
 // newProjection builds a projection, compiling the structured filter (#163)
 // to an expr program once per table, using the introspected column types.
 func newProjection(columns []string, f *spec.Filter, st *TableState) (Projection, error) {
-	p := Projection{Columns: columns}
+	p := Projection{Columns: columns, filterCols: filterColumns(f)}
 	prog, err := compileFilterExpr(f, st)
 	if err != nil {
 		return Projection{}, err
@@ -93,12 +103,21 @@ func newProjection(columns []string, f *spec.Filter, st *TableState) (Projection
 // hasFilter reports whether a filter is configured.
 func (p Projection) hasFilter() bool { return p.program != nil }
 
-// keep reports whether a full decoded row satisfies the filter. The filter is
-// evaluated on the FULL row (its columns may be excluded from the
-// projection).
-func (p Projection) keep(full map[string]any) (bool, error) {
+// keep reports whether a decoded positional row (table column order) satisfies
+// the filter. It materializes a map of ONLY the filter-referenced columns — the
+// hot path never builds a full row map (#455).
+func (p Projection) keep(row []any, st *TableState) (bool, error) {
 	if p.program == nil {
 		return true, nil
+	}
+	full := make(map[string]any, len(p.filterCols))
+	for _, name := range p.filterCols {
+		j := st.FindColumn(name)
+		if j < 0 || j >= len(row) {
+			full[name] = nil
+			continue
+		}
+		full[name] = row[j]
 	}
 	out, err := expr.Run(p.program, map[string]any{"row": full})
 	if err != nil {
@@ -111,16 +130,30 @@ func (p Projection) keep(full map[string]any) (bool, error) {
 	return ok, nil
 }
 
-// project narrows a full decoded row to the selected columns. An empty
-// projection returns the row unchanged.
-func (p Projection) project(full map[string]any) map[string]any {
-	if len(p.Columns) == 0 {
-		return full
+// filterColumns returns the distinct source columns a filter references.
+func filterColumns(f *spec.Filter) []string {
+	seen := map[string]bool{}
+	var out []string
+	var walk func(*spec.Filter)
+	walk = func(n *spec.Filter) {
+		if n == nil {
+			return
+		}
+		for i := range n.All {
+			walk(&n.All[i])
+		}
+		for i := range n.Any {
+			walk(&n.Any[i])
+		}
+		if n.Not != nil {
+			walk(n.Not)
+		}
+		if n.Predicate != nil && n.Predicate.Column != "" && !seen[n.Predicate.Column] {
+			seen[n.Predicate.Column] = true
+			out = append(out, n.Predicate.Column)
+		}
 	}
-	out := make(map[string]any, len(p.Columns))
-	for _, c := range p.Columns {
-		out[c] = full[c]
-	}
+	walk(f)
 	return out
 }
 
@@ -148,21 +181,33 @@ type Reader struct {
 	// re-armed for a stream that has already proven data flows (#154).
 	primed bool
 	// plugin is the logical decoding plugin ("pgoutput"|"wal2json").
-	plugin  string
-	out     chan<- rowchange.Change
-	bySrc   map[string]source.TableRef // "schema.table" → ref (PK + target)
-	states  map[string]*TableState     // "schema.table" → introspected state
-	relByID map[uint32]relEntry        // relation id → state, from Relation messages
+	plugin string
+	// batchOut is the columnar output: decoded rows go straight into Arrow
+	// builders and are emitted as ready wire batches (#455). No map[string]any
+	// and no row-change channel on the live path.
+	batchOut chan<- *dataplane.Batch
+	bySrc    map[string]source.TableRef // "schema.table" → ref (PK + target)
+	states   map[string]*TableState     // "schema.table" → introspected state
+	relByID  map[uint32]relEntry        // relation id → state, from Relation messages
 	// projections is the per-source read projection (#162/#163).
 	projections map[string]Projection
 
-	// Transaction buffer: rows stream inside a transaction before its
-	// commit LSN is known, so they accumulate and flush at Commit.
-	txn []*rowchange.Change
+	// encoders is the per-target-table Arrow builder, built lazily from the
+	// resolved schemas; encoderOrder preserves first-appearance order so a
+	// multi-table transaction emits tables deterministically.
+	encoders     map[string]*pgTable
+	encoderOrder []string
+	// pending holds the records materialized so far for the transaction being
+	// decoded; their positions are finalized when it commits.
+	pending []heldRec
+	// safePos is the position of the last fully emitted transaction (or the
+	// resume point before the first). Rows are stamped with it at decode; only
+	// a transaction's final record is restamped with its commit LSN.
+	safePos string
 
 	// curLSN is the current transaction's final (commit) LSN, from the Begin
 	// message. The DBLog window uses it to tag only transactions committed
-	// after the low watermark. Loop-goroutine only, like txn.
+	// after the low watermark. Loop-goroutine only, like the encoders.
 	curLSN position.LSN
 
 	// curCommitTS is the current transaction's commit timestamp, from the
@@ -178,11 +223,6 @@ type Reader struct {
 	// instead of synced to avoid advancing the slot past uncommitted data.
 	confirmed func() position.Position
 
-	winMu    sync.Mutex
-	winChunk uint32
-	winOpen  bool
-	winLow   *position.LSN // source watermark (pg_current_wal_lsn) at OpenWindow
-
 	// loopCancel stops the replication loop; loopDone tells Close it has
 	// fully left pgx.
 	loopCancel context.CancelFunc
@@ -192,7 +232,7 @@ type Reader struct {
 // New introspects the tables, performs the server-side setup (replica
 // identity, publication, slot), and opens the replication connection —
 // but does not start streaming.
-func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader, error) {
+func New(ctx context.Context, cfg Config, batchOut chan<- *dataplane.Batch) (*Reader, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -272,47 +312,36 @@ func New(ctx context.Context, cfg Config, out chan<- rowchange.Change) (*Reader,
 		retries:     cfg.RetryCount,
 		initialWait: wait,
 		plugin:      cfg.Plugin,
-		out:         out,
+		batchOut:    batchOut,
 		bySrc:       bySrc,
 		states:      states,
 		relByID:     map[uint32]relEntry{},
+		encoders:    map[string]*pgTable{},
 		projections: projections,
 		synced:      position.MustLSN("0/0"),
 	}, nil
 }
 
-// OpenWindow opens the DBLog window for chunkID. The reader captures its
-// source watermark — the server's current WAL position — and, from now on,
-// tags decoded events whose commit LSN is strictly past that watermark
-// InWindow for the chunk, until ClearWindow. Transactions at or before the
-// watermark are already reflected in the chunk SELECT (or an earlier chunk)
-// and must not be tagged. The tag is applied synchronously at decode — no
-// event can escape the window by racing a channel pull. The watermark is an
-// LSN (64-bit, monotonic), never the 32-bit transaction xid — the pgoutput
-// Begin message only carries the raw xid, which wraps every ~4 billion
-// transactions; the LSN does not.
-func (r *Reader) OpenWindow(ctx context.Context, chunkID uint32) {
-	var low *position.LSN
-	if m, err := r.Master(ctx); err == nil {
-		if lsn, ok := m.(*position.LSN); ok {
-			low = lsn
-		}
-	} else {
-		r.cfg.Logger.Warn("postgres: window open without lsn watermark", "err", err)
-	}
-	r.winMu.Lock()
-	r.winOpen = true
-	r.winChunk = chunkID
-	r.winLow = low
-	r.winMu.Unlock()
-}
+// OpenWindow is part of the SourceReader contract. The DBLog window tag is
+// applied by the coordinator's gate to the batches it holds (WindowTag on the
+// wire) — not by the source — so the reader keeps no window state.
+func (r *Reader) OpenWindow(_ context.Context, _ uint32) {}
 
-// ClearWindow closes the DBLog window opened by OpenWindow.
-func (r *Reader) ClearWindow() {
-	r.winMu.Lock()
-	r.winOpen = false
-	r.winLow = nil
-	r.winMu.Unlock()
+// ClearWindow is part of the SourceReader contract; see OpenWindow.
+func (r *Reader) ClearWindow() {}
+
+// SetResume records the position the stream resumes from: the safe position a
+// partial piece of the first transaction carries.
+func (r *Reader) SetResume(pos string) { r.safePos = pos }
+
+// SetSourceSchemas installs the cast-resolved canonical schemas before Start.
+// The direct encoder must see the resolved kinds.
+func (r *Reader) SetSourceSchemas(resolved map[string]core.Schema) {
+	for target, cs := range resolved {
+		if _, known := r.cfg.Schemas[target]; known {
+			r.cfg.Schemas[target] = cs
+		}
+	}
 }
 
 // Synced reports the end LSN of the last committed transaction.
@@ -548,7 +577,7 @@ func (r *Reader) dialReplication(ctx context.Context) error {
 		return fmt.Errorf("postgres: replication reconnect: %w", err)
 	}
 	r.conn = conn
-	r.txn = r.txn[:0]
+	r.resetTxn()
 	return nil
 }
 
@@ -592,7 +621,7 @@ func (r *Reader) handleXLogData(ctx context.Context, xld pglogrepl.XLogData) err
 		if err := begin.Decode(body); err != nil {
 			return fmt.Errorf("postgres: begin: %w", err)
 		}
-		r.txn = r.txn[:0]
+		r.resetTxn()
 		r.curLSN = position.LSN(begin.FinalLSN)
 		// proto_version=1 carries the transaction commit time; every row of
 		// this transaction shares it.
@@ -663,19 +692,18 @@ func (r *Reader) handleInsert(payload []byte) error {
 	if !ok {
 		return nil
 	}
-	row, err := tupleToMap(entry.state, msg.Tuple, nil)
+	row, err := tupleRow(entry.state, msg.Tuple, nil)
 	if err != nil {
 		return err
 	}
-	keep, err := entry.proj.keep(row)
+	keep, err := entry.proj.keep(row, entry.state)
 	if err != nil {
 		return err
 	}
 	if !keep {
 		return nil
 	}
-	r.enqueue(entry, rowchange.OpInsert, entry.proj.project(row), nil)
-	return nil
+	return r.appendChange(entry, rowchange.OpInsert, row, nil)
 }
 
 func (r *Reader) handleUpdate(payload []byte) error {
@@ -687,27 +715,26 @@ func (r *Reader) handleUpdate(payload []byte) error {
 	if !ok {
 		return nil
 	}
-	row, err := tupleToMap(entry.state, msg.NewTuple, toastSource(msg.OldTuple, msg.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey))
+	row, err := tupleRow(entry.state, msg.NewTuple, toastSource(msg.OldTuple, msg.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey))
 	if err != nil {
 		return err
 	}
-	var before map[string]any
+	var before []any
 	if msg.OldTuple != nil {
-		before, err = oldTupleToMap(entry.state, msg.OldTuple, msg.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey, entry.ref.PrimaryKey)
+		before, err = oldTupleRow(entry.state, msg.OldTuple, msg.OldTupleType == pglogrepl.UpdateMessageTupleTypeKey, entry.ref.PrimaryKey)
 		if err != nil {
 			return err
 		}
 	}
 
 	if entry.proj.hasFilter() {
-		afterMatch, err := entry.proj.keep(row)
+		afterMatch, err := entry.proj.keep(row, entry.state)
 		if err != nil {
 			return err
 		}
 		beforeMatch := false
 		if before != nil {
-			beforeMatch, err = entry.proj.keep(before)
-			if err != nil {
+			if beforeMatch, err = entry.proj.keep(before, entry.state); err != nil {
 				return err
 			}
 		}
@@ -718,13 +745,13 @@ func (r *Reader) handleUpdate(payload []byte) error {
 		case beforeMatch && !afterMatch:
 			// The row left the filter: emit a delete so an upsert target
 			// removes the now-excluded row instead of keeping a stale copy.
-			r.enqueue(entry, rowchange.OpDelete, nil, entry.proj.project(before))
-			return nil
+			return r.appendChange(entry, rowchange.OpDelete, nil, before)
 		}
 	}
-	r.deleteChangedKey(entry, before, row)
-	r.enqueue(entry, rowchange.OpUpdate, entry.proj.project(row), entry.proj.project(before))
-	return nil
+	if err := r.deleteChangedKey(entry, before, row); err != nil {
+		return err
+	}
+	return r.appendChange(entry, rowchange.OpUpdate, row, before)
 }
 
 func (r *Reader) handleDelete(payload []byte) error {
@@ -741,46 +768,18 @@ func (r *Reader) handleDelete(payload []byte) error {
 	if msg.OldTuple == nil {
 		return fmt.Errorf("postgres: delete %s: no old tuple", entry.ref.Source)
 	}
-	before, err := oldTupleToMap(entry.state, msg.OldTuple, msg.OldTupleType == pglogrepl.DeleteMessageTupleTypeKey, entry.ref.PrimaryKey)
+	before, err := oldTupleRow(entry.state, msg.OldTuple, msg.OldTupleType == pglogrepl.DeleteMessageTupleTypeKey, entry.ref.PrimaryKey)
 	if err != nil {
 		return err
 	}
-	keep, err := entry.proj.keep(before)
+	keep, err := entry.proj.keep(before, entry.state)
 	if err != nil {
 		return err
 	}
 	if !keep {
 		return nil
 	}
-	r.enqueue(entry, rowchange.OpDelete, nil, entry.proj.project(before))
-	return nil
-}
-
-// enqueue decodes one row change into the transaction buffer. The window
-// tag is applied here — at decode time — while the commit position is
-// only stamped at Commit, when the LSN is known.
-func (r *Reader) enqueue(entry relEntry, op rowchange.Op, after, before map[string]any) {
-	c := rowchange.Change{
-		Op:       op,
-		Table:    entry.ref.Target,
-		IngestTS: time.Now(),
-		CommitTS: r.curCommitTS,
-	}
-	switch op {
-	case rowchange.OpDelete:
-		c.Before = before
-		c.Key = keyFrom(entry.state, entry.ref, before)
-	default:
-		c.After = after
-		c.Key = keyFrom(entry.state, entry.ref, after)
-		if before != nil {
-			c.Before = before
-		}
-	}
-	if w := r.currentWindow(); w != nil {
-		c.Window = w
-	}
-	r.txn = append(r.txn, &c)
+	return r.appendChange(entry, rowchange.OpDelete, nil, before)
 }
 
 // handleCommit flushes the transaction buffer: every buffered row is
@@ -788,7 +787,7 @@ func (r *Reader) enqueue(entry relEntry, op rowchange.Op, after, before map[stri
 // does the synced position advance.
 func (r *Reader) handleCommit(ctx context.Context, endLSN pglogrepl.LSN) error {
 	pos := position.LSN(endLSN)
-	if err := r.flushTxn(ctx, pos); err != nil {
+	if err := r.closeTxn(ctx, pos); err != nil {
 		return err
 	}
 
@@ -805,7 +804,7 @@ func (r *Reader) handleCommit(ctx context.Context, endLSN pglogrepl.LSN) error {
 func (r *Reader) advanceSyncedFloor(lsn pglogrepl.LSN) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.txn) > 0 {
+	if r.buffering() {
 		return
 	}
 	if position.LSN(lsn) > *r.synced {
@@ -851,37 +850,6 @@ func (r *Reader) confirmedLSN() position.LSN {
 		return 0
 	}
 	return *lsn
-}
-
-func (r *Reader) currentWindow() *rowchange.Window {
-	r.winMu.Lock()
-	defer r.winMu.Unlock()
-	if !r.winOpen {
-		return nil
-	}
-	// Only transactions committed past the low watermark's LSN are
-	// InWindow: an older transaction is already reflected in the chunk
-	// SELECT (or an earlier chunk), so tagging it would resurrect a stale
-	// value. A missing watermark falls back to tagging everything —
-	// over-tagging is safe. The comparison is on the 64-bit commit LSN
-	// (from the Begin message), not the 32-bit xid that wraps.
-	if r.winLow != nil && r.curLSN <= *r.winLow {
-		return nil
-	}
-	return &rowchange.Window{ChunkID: r.winChunk, InWindow: true}
-}
-
-// keyFrom builds the key tuple from the PK columns, in spec order.
-func keyFrom(st *TableState, ref source.TableRef, row map[string]any) []any {
-	key := make([]any, 0, len(ref.PrimaryKey))
-	for _, pk := range ref.PrimaryKey {
-		if v, ok := row[pk]; ok {
-			key = append(key, v)
-		} else {
-			key = append(key, nil)
-		}
-	}
-	return key
 }
 
 func splitSource(s string) (schema, table string, ok bool) {

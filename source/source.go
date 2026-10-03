@@ -228,7 +228,9 @@ type Discoverer interface {
 // with no replication slot. Incremental runs one pass and returns the new
 // cursor value — the last row's cursor, or "" when no rows — plus the decoded
 // rows. The cursor travels as a string; the source coerces it against the
-// cursor column's type.
+// cursor column's type. The rows are the source's public row universe; the
+// engine encodes them at the boundary. (A columnar incremental pass would
+// need a public encoder type in this contract; tracked follow-up to #455.)
 type IncrementalSource interface {
 	Incremental(ctx context.Context, t TableRef, cursor string, after string) (next string, rows []map[string]any, err error)
 }
