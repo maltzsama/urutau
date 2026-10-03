@@ -125,11 +125,16 @@ func TestValidateMaintenanceBadDurations(t *testing.T) {
 		want   string
 	}{
 		{"compaction interval", func(s *Spec) { s.Sink.Maintenance.Compaction.Interval = "five minutes" }, "compaction.interval"},
+		{"compaction interval zero", func(s *Spec) { s.Sink.Maintenance.Compaction.Interval = "0s" }, "compaction.interval"},
+		{"compaction interval negative", func(s *Spec) { s.Sink.Maintenance.Compaction.Interval = "-5m" }, "compaction.interval"},
 		{"compaction targetFileSize", func(s *Spec) { s.Sink.Maintenance.Compaction.TargetFileSize = "big" }, "compaction.targetFileSize"},
 		{"snapshotExpiry interval", func(s *Spec) { s.Sink.Maintenance.SnapshotExpiry.Interval = "soon" }, "snapshotExpiry.interval"},
+		{"snapshotExpiry interval negative", func(s *Spec) { s.Sink.Maintenance.SnapshotExpiry.Interval = "-10m" }, "snapshotExpiry.interval"},
 		{"snapshotExpiry maxAge", func(s *Spec) { s.Sink.Maintenance.SnapshotExpiry.MaxAge = "a week" }, "snapshotExpiry.maxAge"},
+		{"snapshotExpiry maxAge zero", func(s *Spec) { s.Sink.Maintenance.SnapshotExpiry.MaxAge = "0s" }, "snapshotExpiry.maxAge"},
 		{"snapshotExpiry retainLast", func(s *Spec) { s.Sink.Maintenance.SnapshotExpiry.RetainLast = -1 }, "snapshotExpiry.retainLast"},
 		{"orphanCleanup interval", func(s *Spec) { s.Sink.Maintenance.OrphanCleanup.Interval = "hourly" }, "orphanCleanup.interval"},
+		{"orphanCleanup interval negative", func(s *Spec) { s.Sink.Maintenance.OrphanCleanup.Interval = "-1h" }, "orphanCleanup.interval"},
 		{"orphanCleanup olderThan", func(s *Spec) { s.Sink.Maintenance.OrphanCleanup.OlderThan = "old" }, "orphanCleanup.olderThan"},
 	}
 	for _, c := range cases {

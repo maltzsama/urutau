@@ -436,7 +436,7 @@ func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger 
 		}
 		res, rwarns, rerr := core.ResolveSchema(srcSchema, cast, t.Metadata)
 		if rerr != nil {
-			return nil, nil, nil, nil, nil, rerr
+			return nil, nil, nil, nil, nil, fmt.Errorf("runner: table %s: %w", t.Target, rerr)
 		}
 		for _, w := range warns {
 			logger.Warn("schema", "table", ref.Source, "warning", w.Message)

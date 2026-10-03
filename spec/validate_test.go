@@ -78,6 +78,18 @@ func TestValidateEnrich(t *testing.T) {
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "refresh") {
 		t.Fatalf("want refresh duration, got %v", err)
 	}
+	// #503: a zero/negative duration parses but is silently swapped for the
+	// default at point of use — reject it at validation instead.
+	s = base()
+	s.Tables[0].Enrich[0].Refresh = "-5m"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "refresh") {
+		t.Fatalf("want refresh positive-duration problem, got %v", err)
+	}
+	s = base()
+	s.Tables[0].Enrich[0].BufferLimits.MaxWait = "0s"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "maxWait") {
+		t.Fatalf("want maxWait positive-duration problem, got %v", err)
+	}
 	s = base()
 	s.Tables[0].Enrich[0].Source.Query = ""
 	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "source.query") {
