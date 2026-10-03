@@ -85,6 +85,31 @@ func TestDriftAtBoundaryConformingPasses(t *testing.T) {
 	b.Release()
 }
 
+// An always-nil column the schema lacks is still materialized by the merge
+// (preserving MergeSchema's behavior), not silently dropped by the fused
+// pass that skips the merge when nothing is unknown (#581).
+func TestUnknownNilColumnStillMerges(t *testing.T) {
+	p := New(make(chan rowchange.Change))
+	p.SetSchemas(schemaFor("t"))
+
+	ch := make(chan rowchange.Change, 1)
+	feed(ch, rowchange.Change{Op: rowchange.OpInsert, Table: "t",
+		After: map[string]any{"id": int64(1), "v": "x", "ghost": nil}})
+	p.ch = ch
+
+	b, err := p.Next(context.Background())
+	if err != nil {
+		t.Fatalf("nil unknown column must not trip drift: %v", err)
+	}
+	defer b.Release()
+	for i := 0; i < int(b.Record.Schema().NumFields()); i++ {
+		if b.Record.Schema().Field(i).Name == "ghost" {
+			return
+		}
+	}
+	t.Fatalf("an always-nil unknown column must still be merged, schema = %v", b.Record.Schema())
+}
+
 func TestNoSchemaSkipsDriftCheck(t *testing.T) {
 	// A schema-less producer (no SetSchemas) keeps the inference fallback
 	// and no drift gate — its resolved schema is owned upstream.
