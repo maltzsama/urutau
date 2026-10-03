@@ -32,7 +32,7 @@ internal/transport/codec.go 814 # baseline (#398)
 internal/transport/codec.go:appendTypedValue 333 # exhaustive type switch over core.Kind
 internal/transport/codec.go:readTypedValue 162 # exhaustive type switch over core.Kind
 internal/worker/remote.go:RunRemote 377 # baseline (#398)
-internal/worker/worker.go 1513 # baseline (#398)
+internal/worker/worker.go 1471 # baseline (#398)
 internal/worker/worker.go:Worker.runBatcher 295 # baseline (#398)
 spec/validate.go 933 # baseline (#398)
 spec/validate.go:Spec.Validate 242 # baseline (#398)
