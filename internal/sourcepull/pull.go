@@ -21,7 +21,16 @@ import (
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
-const batchTarget = 100
+// batchTarget is the soft row ceiling a batch drains toward under backlog.
+// The channel emptying (or a table change) closes it early, so latency is
+// unaffected; the target only bounds how many tiny batches a sustained
+// stream is chopped into (#579).
+const batchTarget = 2000
+
+// batchTargetBytes is the byte ceiling for one drained batch: a run of large
+// rows (a 256 KiB payload, say) closes early instead of buffering up to
+// batchTarget rows in memory (#579).
+const batchTargetBytes = 4 << 20
 
 // maxBatchRows caps one emitted batch. A transaction-bounded decoder releases
 // a whole transaction at once, so a multi-million-row transaction would
@@ -35,10 +44,13 @@ const maxBatchRows = 2000
 // the pull-based Next surface. The concrete source calls Start to launch
 // its decoder and wire the error channel.
 type Puller struct {
-	ch      <-chan rowchange.Change
-	errCh   <-chan error
-	buf     []rowchange.Change
-	schemas map[string]core.Schema // target table -> canonical schema
+	ch    <-chan rowchange.Change
+	errCh <-chan error
+	buf   []rowchange.Change
+	// bufBytes is the estimated wire size of buf, so a byte ceiling can close
+	// a batch of large rows before it buffers the whole row target (#579).
+	bufBytes int
+	schemas  map[string]core.Schema // target table -> canonical schema
 	// index caches each target table's column-name -> position, so the drift
 	// check reads a map instead of scanning the schema per row (#581).
 	index map[string]map[string]int
@@ -57,6 +69,42 @@ type Puller struct {
 // New builds a puller over the decoder's change channel.
 func New(ch <-chan rowchange.Change) *Puller {
 	return &Puller{ch: ch}
+}
+
+// push buffers one change and accounts for its estimated wire size.
+func (p *Puller) push(c rowchange.Change) {
+	p.buf = append(p.buf, c)
+	p.bufBytes += changeBytes(c)
+}
+
+// changeBytes estimates a change's encoded size: the image RecordFromChanges
+// would write (After, or Before for a delete) plus the key and position.
+func changeBytes(c rowchange.Change) int {
+	n := len(c.Position) + 16
+	for _, k := range c.Key {
+		n += valueBytes(k)
+	}
+	src := c.After
+	if src == nil {
+		src = c.Before
+	}
+	for name, v := range src {
+		n += len(name) + valueBytes(v)
+	}
+	return n
+}
+
+// valueBytes estimates one cell's size: a string's or byte slice's length,
+// eight bytes for any other scalar.
+func valueBytes(v any) int {
+	switch t := v.(type) {
+	case string:
+		return len(t)
+	case []byte:
+		return len(t)
+	default:
+		return 8
+	}
 }
 
 // SetSchemas installs the canonical schema per target table so makeBatch
@@ -124,7 +172,7 @@ func (p *Puller) take(c rowchange.Change) {
 		rest := p.open[:0]
 		for _, o := range p.open {
 			if o.Table == table {
-				p.buf = append(p.buf, o)
+				p.push(o)
 			} else {
 				rest = append(rest, o)
 			}
@@ -139,7 +187,7 @@ func (p *Puller) take(c rowchange.Change) {
 // pending right now.
 func (p *Puller) nextTxn(ctx context.Context) (*dataplane.Batch, error) {
 	for {
-		if len(p.buf) > 0 && (len(p.buf) >= batchTarget || p.buf[len(p.buf)-1].Table != p.buf[0].Table) {
+		if len(p.buf) > 0 && (len(p.buf) >= batchTarget || p.bufBytes >= batchTargetBytes || p.buf[len(p.buf)-1].Table != p.buf[0].Table) {
 			return p.makeBatch()
 		}
 		if len(p.buf) > 0 {
@@ -193,7 +241,7 @@ func (p *Puller) Next(ctx context.Context) (*dataplane.Batch, error) {
 			if !ok {
 				return nil, nil
 			}
-			p.buf = append(p.buf, c)
+			p.push(c)
 		case err := <-p.errCh:
 			if err != nil {
 				return nil, err
@@ -205,13 +253,13 @@ func (p *Puller) Next(ctx context.Context) (*dataplane.Batch, error) {
 	}
 	// Drain a few more non-blockingly to batch. A change of another table
 	// ends the batch: it stays buffered and heads the next one.
-	for len(p.buf) < batchTarget && p.buf[len(p.buf)-1].Table == p.buf[0].Table {
+	for len(p.buf) < batchTarget && p.bufBytes < batchTargetBytes && p.buf[len(p.buf)-1].Table == p.buf[0].Table {
 		select {
 		case c, ok := <-p.ch:
 			if !ok {
 				return p.makeBatch()
 			}
-			p.buf = append(p.buf, c)
+			p.push(c)
 		case err := <-p.errCh:
 			if err != nil {
 				return nil, err
@@ -273,7 +321,7 @@ func (p *Puller) tryNext(ctx context.Context) (*dataplane.Batch, bool, error) {
 		if !ok {
 			return nil, false, nil
 		}
-		p.buf = append(p.buf, c)
+		p.push(c)
 		b, err := p.makeBatch()
 		return b, true, err
 	case err := <-p.errCh:
@@ -297,17 +345,25 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	// when the schemas match (issue #372).
 	table := p.buf[0].Table
 	n := 1
-	for n < len(p.buf) && p.buf[n].Table == table {
+	runBytes := changeBytes(p.buf[0])
+	for n < len(p.buf) && n < maxBatchRows && p.buf[n].Table == table {
+		b := changeBytes(p.buf[n])
+		if runBytes+b > batchTargetBytes {
+			break
+		}
+		runBytes += b
 		n++
-	}
-	if n > maxBatchRows {
-		n = maxBatchRows
 	}
 	// The tail is advanced by a read index, not copied: only the run's own
 	// elements are mutated (Position), and the tail is always p.buf[n:], so a
 	// later append writes past the run's region.
 	run, rest := p.buf[:n], p.buf[n:]
+	restBytes := p.bufBytes - runBytes
+	if restBytes < 0 {
+		restBytes = 0
+	}
 	p.buf = run
+	p.bufBytes = runBytes
 	defer func() {
 		// Drop the run's references before restoring the tail: the tail keeps
 		// the backing array alive, so without this its [0:n) elements would
@@ -317,6 +373,7 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 			run[i] = rowchange.Change{}
 		}
 		p.buf = rest
+		p.bufBytes = restBytes
 	}()
 
 	// A split transaction: only its last piece may carry its commit position.
