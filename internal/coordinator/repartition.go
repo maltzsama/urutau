@@ -626,7 +626,7 @@ func (c *Coordinator) drainTimeout() time.Duration {
 // else the default. A table that declares its own cap ignores the global one.
 func (c *Coordinator) maxWorkersFor(target string) int {
 	if c.cfg.Spec != nil {
-		for _, t := range c.cfg.Spec.Tables {
+		for _, t := range c.tablesOrSpec() {
 			if t.Target != target {
 				continue
 			}

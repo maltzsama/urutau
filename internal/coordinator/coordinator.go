@@ -181,6 +181,11 @@ type queuedBatch struct {
 type Coordinator struct {
 	cfg Config
 	log *slog.Logger
+	// tables is the expanded table list (a discovery pipeline enumerates it
+	// at boot). It is kept here, not written back into cfg.Spec, so a
+	// concurrent /statusz or dashboard read never races the boot write; both
+	// read it under c.mu (issue #556).
+	tables []spec.Table
 
 	src       source.Source
 	qsrc      source.QuerySource
@@ -604,22 +609,27 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	// A discovery pipeline lists no tables: the source enumerates them now.
 	// The write-back must land BEFORE the partition-range loop below, which
-	// indexes c.cfg.Spec.Tables positionally against refs — a second list
+	// indexes the expanded table list positionally against refs — a second list
 	// would desync the ranges from the tables.
 	tables, err := source.ExpandTables(ctx, src, c.cfg.Spec)
 	if err != nil {
 		return fmt.Errorf("coordinator: %w", err)
 	}
-	c.cfg.Spec.Tables = tables
+	// The metrics server boots before run() and serves /statusz concurrently,
+	// so the expanded list is stored under the lock those handlers read it
+	// with — cfg.Spec is left untouched (issue #556).
+	c.mu.Lock()
+	c.tables = tables
+	c.mu.Unlock()
 
-	refs := make([]source.TableRef, 0, len(c.cfg.Spec.Tables))
+	refs := make([]source.TableRef, 0, len(tables))
 	// canonical holds the WIRE shape (source types; the workers encode it
 	// and the sink casts). resolvedSchemas holds the sink's target shape
 	// (cast types + metadata columns) for DDL.
-	canonical := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
-	resolvedSchemas := make(map[string]core.Schema, len(c.cfg.Spec.Tables))
-	tableBySource := make(map[string]spec.Table, len(c.cfg.Spec.Tables))
-	for _, t := range c.cfg.Spec.Tables {
+	canonical := make(map[string]core.Schema, len(tables))
+	resolvedSchemas := make(map[string]core.Schema, len(tables))
+	tableBySource := make(map[string]spec.Table, len(tables))
+	for _, t := range tables {
 		ref, srcSchema, srcWarns, err := src.Introspect(ctx, t)
 		if err != nil {
 			return err
@@ -666,7 +676,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Incremental mode (#157) is implemented in the collapsed runner only.
 	// Reject it here rather than treat an incremental table as CDC and open a
 	// slot for it.
-	for _, t := range c.cfg.Spec.Tables {
+	for _, t := range tables {
 		if t.Mode == spec.ModeIncremental {
 			return fmt.Errorf("coordinator: %s: incremental mode is not supported in distributed mode yet — run this table in the collapsed runner", t.Target)
 		}
@@ -693,15 +703,15 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// or not. Workers<=1 short-circuits to a single unbounded range with
 	// no chunker query at all, so this is a no-op for every unpartitioned
 	// table (the overwhelming common case today).
-	bootRanges := make(map[string][]source.Chunk, len(c.cfg.Spec.Tables))
-	bootOwners := make(map[string][]*workerState, len(c.cfg.Spec.Tables))
-	c.chunkers = make(map[string]source.ChunkSource, len(c.cfg.Spec.Tables))
+	bootRanges := make(map[string][]source.Chunk, len(tables))
+	bootOwners := make(map[string][]*workerState, len(tables))
+	c.chunkers = make(map[string]source.ChunkSource, len(tables))
 	// workerTarget maps every derived worker group name back to the table
 	// target it belongs to — provisionWorkers uses it to pick that
 	// table's own worker Pod template (one per table, rendered by the
 	// operator into the coordinator's ConfigMap).
-	workerTarget := make(map[string]string, len(c.cfg.Spec.Tables))
-	for i, t := range c.cfg.Spec.Tables {
+	workerTarget := make(map[string]string, len(tables))
+	for i, t := range tables {
 		if err := requirePartitionKey(t, refs[i]); err != nil {
 			return err
 		}
@@ -721,30 +731,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 		owners := make([]*workerState, len(names))
 		for p, name := range names {
-			w, ok := c.workers[name]
-			if !ok {
-				// A 128-bit random ticket colliding is ~0, but the
-				// queue-lookup map is keyed by it — a collision would
-				// silently orphan a worker's stream, so regenerate
-				// rather than assume.
-				for {
-					ticket := randTicket()
-					if _, taken := c.byTicket[string(ticket)]; taken {
-						continue
-					}
-					w = &workerState{
-						name:   name,
-						queue:  make(chan queuedBatch, workerQueueCap),
-						ticket: ticket,
-					}
-					c.byTicket[string(ticket)] = w
-					break
-				}
-				c.workers[name] = w
-				c.setIndex(name, newPositionIndex(c.runID))
-			}
-			w.refs = append(w.refs, refs[i])
-			owners[p] = w
+			owners[p] = c.bootWorker(name, refs[i])
 			workerTarget[name] = t.Target
 		}
 		bootOwners[t.Target] = owners
@@ -793,7 +780,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// registers whatever name it wants. The capability must be declared
 	// false until the sink's concurrent path is actually built, so this
 	// refuses the boot instead of letting N writers corrupt one table.
-	for _, t := range c.cfg.Spec.Tables {
+	for _, t := range tables {
 		if err := requireConcurrentSink(t, c.snk); err != nil {
 			return err
 		}
@@ -950,7 +937,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Lag grows between commits, so the gauge needs its own clock: setting it
 	// on the ack path would pin it near zero after every commit and never let
 	// it rise. Mirrors the dashboard's on-demand Tables(). Started only now:
-	// it reads c.snk and c.cfg.Spec.Tables, which boot writes above, and a
+	// it reads c.snk and c.tables, which boot writes above, and a
 	// loop started earlier raced them (the race image aborted a restarting
 	// coordinator on it). Before the pump runs there is no lag to report.
 	if c.metrics != nil {
@@ -1277,17 +1264,18 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 	// Point-in-time enrichment is visible to the operator: enriched columns
 	// are NOT reproducible by replay (the reference is a snapshot, not
 	// CDC), and that trade is declared, not hidden.
-	for _, t := range c.cfg.Spec.Tables {
+	ws := map[string]*workerStatus{}
+	// One lock across the whole iteration: statusz runs from the metrics
+	// server, which boots BEFORE run() populates c.workers and writes back
+	// c.tables — an unlocked read here races those writes on boot
+	// (audit #13, issue #556).
+	c.mu.Lock()
+	for _, t := range c.tablesOrSpec() {
 		if len(t.Enrich) > 0 {
 			st["enrichment"] = "point-in-time"
 			break
 		}
 	}
-	ws := map[string]*workerStatus{}
-	// One lock across the whole iteration: statusz runs from the metrics
-	// server, which boots BEFORE run() populates c.workers — a per-entry
-	// lock still races the map write on boot (audit #13).
-	c.mu.Lock()
 	for name, w := range c.workers {
 		// Phase reflects reality: the field used to hardcode "attached" for
 		// every worker, which lied about detached/pending ones.
@@ -1567,28 +1555,56 @@ func (c *Coordinator) recordConfirmed(worker string, pos position.Position) {
 	c.confirmed[worker] = pos
 }
 
-// confirmedPosition returns the minimum committed position across all
-// workers; nil while nothing is durably committed.
+// confirmedPosition returns the minimum committed position across the workers
+// that still owe work; nil while nothing is provably committed.
 //
-// MinSafe, not Min: if the committed positions are not mutually comparable
-// (never for one source, but a guard), there is no safe minimum — advancing
-// the source's retention to an arbitrary one could pass uncommitted data.
-// Nil means "nothing provably committed", which holds retention back.
+// A worker with nothing in flight (empty queue and empty index) must NOT
+// constrain the minimum: an idle table never acks, so its committed position
+// would otherwise pin the source's retention forever and let the Postgres WAL
+// grow without bound. When no worker owes anything, every dispatched
+// batch is committed, so the confirmed may advance to the dispatched frontier.
+//
+// MinSafe, not Min: incomparable committed positions have no safe minimum, so
+// nil holds retention back rather than advancing past uncommitted data.
 func (c *Coordinator) confirmedPosition() position.Position {
+	// Read the dispatched frontier FIRST: enqueueTo makes a batch visible to
+	// the queue/index before noteSent records its position, so a frontier read
+	// before the owing snapshot can never name a batch that snapshot missed —
+	// reading the other order could pair a stale "nothing owing" with a newer
+	// frontier and confirm a batch that has not been acked.
+	dispatched := c.dispatchedPosition()
+	owing := c.workersOwing()
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
 	if len(c.confirmed) == 0 {
 		return nil
 	}
-	vals := make([]position.Position, 0, len(c.confirmed))
-	for _, p := range c.confirmed {
+	var vals []position.Position
+	anyOwing := false
+	for name, p := range c.confirmed {
+		if !owing[name] {
+			continue // idle: does not constrain the minimum
+		}
+		anyOwing = true
 		if p == nil {
-			// A registered worker with no committed position yet (its boot
-			// baseline): nothing is provably committed past the resume point,
-			// so hold retention back rather than advance over its data.
+			// A worker that owes work but has no committed position yet: hold
+			// retention back rather than advance over its data.
 			return nil
 		}
 		vals = append(vals, p)
+	}
+	if !anyOwing && dispatched != nil {
+		// Every dispatched batch is committed: advance to the frontier.
+		return dispatched
+	}
+	if !anyOwing {
+		// Nothing dispatched yet this run: the boot baseline, min over all.
+		for _, p := range c.confirmed {
+			if p == nil {
+				return nil
+			}
+			vals = append(vals, p)
+		}
 	}
 	best, err := position.MinSafe(vals)
 	if err != nil {
@@ -2637,7 +2653,7 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		}
 		// Broadcast reference joins travel with the assignment: the worker
 		// owns the join, the coordinator only forwards the declaration.
-		for _, t := range c.cfg.Spec.Tables {
+		for _, t := range c.tablesOrSpec() {
 			if t.Source != ref.Source {
 				continue
 			}
@@ -2665,7 +2681,7 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 
 // specForSource finds the spec table for a source name.
 func (c *Coordinator) specForSource(src string) (spec.Table, bool) {
-	for _, t := range c.cfg.Spec.Tables {
+	for _, t := range c.tablesOrSpec() {
 		if t.Source == src {
 			return t, true
 		}

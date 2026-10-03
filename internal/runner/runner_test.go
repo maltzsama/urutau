@@ -108,7 +108,7 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
-	r := newRelay(ingest, w)
+	r := newRelay(ingest, w, nil)
 	out := make(chan rowchange.Change, 64)
 	pr := &pullTestReader{Puller: sourcepull.New(out)}
 	relayDone := make(chan struct{})
@@ -492,7 +492,7 @@ func (f *failingReader) SetConfirmed(func() position.Position)             {}
 func TestRelayPropagatesSourceError(t *testing.T) {
 	ingest := make(chan worker.Ingest, 8)
 	w := worker.New(worker.Config{MaxRows: 100, MaxInterval: time.Hour})
-	r := newRelay(ingest, w)
+	r := newRelay(ingest, w, nil)
 
 	wantErr := errors.New("source connection lost mid-stream")
 	err := r.run(context.Background(), &failingReader{err: wantErr})
@@ -510,7 +510,7 @@ func TestRelayPropagatesSourceError(t *testing.T) {
 func TestRelayCleanEndOfStreamIsNotAnError(t *testing.T) {
 	ingest := make(chan worker.Ingest, 8)
 	w := worker.New(worker.Config{MaxRows: 100, MaxInterval: time.Hour})
-	r := newRelay(ingest, w)
+	r := newRelay(ingest, w, nil)
 
 	if err := r.run(context.Background(), &failingReader{err: nil}); err != nil {
 		t.Fatalf("relay.run = %v on a clean end of stream, want nil", err)
@@ -548,5 +548,61 @@ func TestRunnerReleaseClosesSink(t *testing.T) {
 	r.release()
 	if !fs.closed {
 		t.Fatal("release must close the sink")
+	}
+}
+
+// a table with decoded-but-uncommitted rows must hold the confirmed
+// point back. Before the fix, the table was absent from committedPositions,
+// so the minimum advanced past its pending row.
+func TestConfirmedPositionHoldsForInFlightTable(t *testing.T) {
+	newRunner := func() *Runner {
+		return &Runner{
+			log:                slog.New(slog.DiscardHandler),
+			committedPositions: map[string]position.Position{},
+			delivered:          map[string]position.Position{},
+		}
+	}
+
+	// B delivered a row but never committed: hold at nil, not A's 0/100.
+	r := newRunner()
+	r.noteDelivered("raw.a", position.MustLSN("0/100"))
+	r.updateCommitted("raw.a", position.MustLSN("0/100"))
+	r.noteDelivered("raw.b", position.MustLSN("0/90"))
+	if got := r.confirmedPosition(); got != nil {
+		t.Fatalf("confirmed = %v, want nil: B has an in-flight row and no committed baseline", got)
+	}
+
+	// B has an old committed baseline (0/50) and a pending row at 0/90: the
+	// confirmed holds at B's committed, not A's 0/100.
+	r2 := newRunner()
+	r2.noteDelivered("raw.a", position.MustLSN("0/100"))
+	r2.updateCommitted("raw.a", position.MustLSN("0/100"))
+	r2.updateCommitted("raw.b", position.MustLSN("0/50"))
+	r2.noteDelivered("raw.b", position.MustLSN("0/90"))
+	if got := r2.confirmedPosition(); got == nil || got.String() != "0/50" {
+		t.Fatalf("confirmed = %v, want 0/50 (held by B's pending row)", got)
+	}
+
+	// B commits 0/90: everything dispatched is committed, so advance to the
+	// last dispatched position.
+	r2.updateCommitted("raw.b", position.MustLSN("0/90"))
+	if got := r2.confirmedPosition(); got == nil || got.String() != "0/100" {
+		t.Fatalf("confirmed = %v, want 0/100 (last dispatched)", got)
+	}
+}
+
+// a table with nothing in flight must not pin the confirmed point.
+func TestConfirmedPositionIdleTableDoesNotPin(t *testing.T) {
+	r := &Runner{
+		log:                slog.New(slog.DiscardHandler),
+		committedPositions: map[string]position.Position{},
+		delivered:          map[string]position.Position{},
+	}
+	r.noteDelivered("busy", position.MustLSN("0/100"))
+	r.updateCommitted("busy", position.MustLSN("0/100"))
+	r.noteDelivered("idle", position.MustLSN("0/10"))
+	r.updateCommitted("idle", position.MustLSN("0/10"))
+	if got := r.confirmedPosition(); got == nil || got.String() != "0/100" {
+		t.Fatalf("confirmed = %v, want 0/100 (the idle table must not pin it)", got)
 	}
 }

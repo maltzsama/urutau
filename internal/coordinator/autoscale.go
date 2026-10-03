@@ -63,7 +63,7 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 		c.log.Debug("coordinator: scale reconcile skipped", "err", err)
 		return
 	}
-	for _, t := range c.cfg.Spec.Tables {
+	for _, t := range c.tablesOrSpec() {
 		if c.scaleRetryAfter[t.Target].After(time.Now()) {
 			continue // this table's recent scale failed; let it drain first
 		}
