@@ -319,7 +319,7 @@ services:
         echo catalog created
 
   trino:
-    image: trinodb/trino:470
+    image: trinodb/trino:483
     ports:
       - "8080:8080"
     depends_on:
