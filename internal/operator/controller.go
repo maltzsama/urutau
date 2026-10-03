@@ -891,28 +891,36 @@ func coordinatorEnv(cr *urutauv1alpha1.CDCPipeline) []corev1.EnvVar {
 	return env
 }
 
+// defaultCPU and defaultMemory are the fail-closed floor: a pod the spec
+// leaves without cpu/memory gets a fixed request and limit instead of
+// becoming BestEffort and eating the cluster. Overhead is the operator's
+// decision (spec), never a urutau default, so it is only ever added on top
+// of whatever base applies — specified or default.
+const (
+	defaultCPU    = "500m"
+	defaultMemory = "1Gi"
+)
+
 // resourceRequirements builds a container's resource request/limit from
 // Kubernetes quantity strings. cpu/memory become the request; cpu+overhead/
 // memory+overhead become the limit — the request alone when no overhead is
 // given (limit == request), matching CoordinatorSpec, which has no
-// overhead knob. Empty cpu/memory returns an empty ResourceRequirements
-// (no request or limit at all — the container is BestEffort), which is
-// the caller's responsibility to avoid for anything but an explicit,
-// deliberate default (see workerResources).
+// overhead knob. Empty cpu/memory fall back to defaultCPU/defaultMemory, so
+// the result is never empty (a pod is never BestEffort); overhead still adds
+// only to the limit.
 func resourceRequirements(cpu, cpuOverhead, memory, memOverhead string) corev1.ResourceRequirements {
-	if cpu == "" && memory == "" {
-		return corev1.ResourceRequirements{}
+	if cpu == "" {
+		cpu = defaultCPU
+	}
+	if memory == "" {
+		memory = defaultMemory
 	}
 	req := corev1.ResourceList{}
 	lim := corev1.ResourceList{}
-	if cpu != "" {
-		req[corev1.ResourceCPU] = resource.MustParse(cpu)
-		lim[corev1.ResourceCPU] = addQuantity(cpu, cpuOverhead)
-	}
-	if memory != "" {
-		req[corev1.ResourceMemory] = resource.MustParse(memory)
-		lim[corev1.ResourceMemory] = addQuantity(memory, memOverhead)
-	}
+	req[corev1.ResourceCPU] = resource.MustParse(cpu)
+	lim[corev1.ResourceCPU] = addQuantity(cpu, cpuOverhead)
+	req[corev1.ResourceMemory] = resource.MustParse(memory)
+	lim[corev1.ResourceMemory] = addQuantity(memory, memOverhead)
 	return corev1.ResourceRequirements{Requests: req, Limits: lim}
 }
 

@@ -241,7 +241,7 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			"compaction": map[string]any{"minInputFiles": 2, "interval": interval},
 		}
 	}
-	coordinator := map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080", "eventlog": e2eEventlog}
+	coordinator := map[string]any{"cpu": "500m", "memory": "1Gi", "metricsAddr": ":8080", "eventlog": e2eEventlog}
 	if opts.CoordinatorMemory != "" {
 		coordinator["memory"] = opts.CoordinatorMemory
 	}
@@ -249,8 +249,8 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		coordinator["cpu"] = opts.CoordinatorCPU
 	}
 	worker := map[string]any{
-		"cpu": "500m", "cpu_overhead": "500m",
-		"memory": "2Gi", "memory_overhead": "1Gi",
+		"cpu": "500m", "cpu_overhead": "250m",
+		"memory": "1Gi", "memory_overhead": "512Mi",
 		// /metrics, and in the race image the Go profiler, so a
 		// run can read a worker's live heap.
 		"metricsAddr": ":8080",

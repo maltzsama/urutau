@@ -172,23 +172,6 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		}
 	}
 	opts := crOptions{MaintenanceBlock: o.maintenance, LogLevel: o.logLevel}
-	if profile.fullLoad() {
-		// The full load streams ~1k mutations/s per table with payloads
-		// up to 256 KiB through a race-instrumented coordinator: at 2Gi it
-		// was OOM-killed catching up after its first snapshot chunk.
-		opts.CoordinatorMemory = "6Gi"
-		// The race runtime's own memory, outside the Go heap, is ~1.5 GiB in
-		// a worker: at a 3Gi limit the events worker, whose Go heap peaked
-		// near 1.2 GiB, was OOM-killed in every snapshot and restarted it
-		// from scratch. The request stays at 2Gi; only the limit grows.
-		opts.WorkerMemoryOverhead = "3Gi"
-		// The race runtime multiplies the CPU the engine needs, too. At 1
-		// CPU the coordinator ran at 100% of its limit (12.7 of every 20 s
-		// throttled) catching up a DBLog window, and the window timed out
-		// at 5 min: the run restarted twice before its first chunk closed.
-		opts.CoordinatorCPU = "4"
-		opts.WorkerCPUOverhead = "1500m"
-	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
 	applied := time.Now()
 	applyPipeline(t, testNS, pipeline, cr)
