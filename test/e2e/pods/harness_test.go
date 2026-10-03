@@ -184,17 +184,17 @@ type crOptions struct {
 	// SnapshotChunkSize, when > 0, is the coordinator's DBLog chunk size
 	// (rows per chunk): a small one stretches a table's snapshot.
 	SnapshotChunkSize int
-	// CoordinatorMemory, when set, replaces the coordinator's 2Gi.
+	// CoordinatorMemory, when set, replaces the coordinator's 1Gi.
 	CoordinatorMemory string
-	// WorkerMemoryOverhead, when set, replaces the workers' 1Gi of limit
-	// above their 2Gi request.
+	// WorkerMemoryOverhead, when set, replaces the workers' 512Mi of limit
+	// above their 1Gi request.
 	WorkerMemoryOverhead string
 	// LogLevel, when set, is the pipeline's spec.logLevel.
 	LogLevel string
-	// CoordinatorCPU, when set, replaces the coordinator's 1 CPU.
+	// CoordinatorCPU, when set, replaces the coordinator's 500m.
 	CoordinatorCPU string
-	// WorkerCPUOverhead, when set, replaces the workers' 500m of limit
-	// above their request.
+	// WorkerCPUOverhead, when set, replaces the workers' 250m of limit
+	// above their 500m request.
 	WorkerCPUOverhead string
 }
 
