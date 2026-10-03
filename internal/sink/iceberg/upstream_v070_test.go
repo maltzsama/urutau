@@ -247,12 +247,6 @@ func TestUpstreamStillCreatesFormatVersion2Tables(t *testing.T) {
 	if v := tbl.Metadata().Version(); v != 2 {
 		t.Fatalf("format version = %d, want 2", v)
 	}
-	if got := tbl.Properties().GetBool(table.ManifestMergeEnabledKey, false); got {
-		t.Fatalf("%s is on by default; #463 assumes it is off", table.ManifestMergeEnabledKey)
-	}
-	if got := tbl.Properties().GetBool(table.MetadataDeleteAfterCommitEnabledKey, false); got {
-		t.Fatalf("%s is on by default; #463 assumes it is off", table.MetadataDeleteAfterCommitEnabledKey)
-	}
 }
 
 // commitOrders commits n single-row upserts, one snapshot pair each, and

@@ -9,6 +9,30 @@ import (
 	"github.com/apache/iceberg-go/table"
 )
 
+// housekeepingProperties keep Iceberg metadata bounded under CDC's commit
+// rate (#463). delete-after-commit removes the superseded metadata.json files
+// at commit; manifest-merge folds the data manifests a commit would otherwise
+// add one at a time. Both are applied to every table urutau creates or opens,
+// so a table created before the setting existed converges on its next boot.
+var housekeepingProperties = iceberg.Properties{
+	table.MetadataDeleteAfterCommitEnabledKey: "true",
+	table.ManifestMergeEnabledKey:             "true",
+}
+
+// EnsureHousekeeping sets housekeepingProperties on an existing table when
+// they are not already "true", committing only the missing keys so a
+// steady-state boot writes no metadata. createTable passes the same
+// properties on create; this covers tables created before it did.
+func EnsureHousekeeping(ctx context.Context, cat catalog.Catalog, ident table.Identifier, tbl *table.Table) error {
+	missing := iceberg.Properties{}
+	for k, v := range housekeepingProperties {
+		if tbl.Properties().Get(k, "") != v {
+			missing[k] = v
+		}
+	}
+	return SetTableProperties(ctx, cat, ident, missing)
+}
+
 // SetTableProperties writes arbitrary properties to an Iceberg table.
 // Used by adoption to mark snapshot complete without committing data.
 func SetTableProperties(ctx context.Context, cat catalog.Catalog, ident table.Identifier, props iceberg.Properties) error {

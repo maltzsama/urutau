@@ -282,8 +282,15 @@ func TestSinkPropertiesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Properties: %v", err)
 	}
-	if len(props) != 0 {
-		t.Fatalf("fresh table properties = %v, want empty", props)
+	// A fresh table carries only the #463 housekeeping properties; no user
+	// property is set yet.
+	if props["owner"] != "" {
+		t.Fatalf("fresh table has owner = %q, want unset", props["owner"])
+	}
+	for k, v := range housekeepingProperties {
+		if props[k] != v {
+			t.Fatalf("fresh table %s = %q, want %q (#463)", k, props[k], v)
+		}
 	}
 
 	if err := s.SetProperties(ctx, ref, map[string]string{"owner": "alice"}); err != nil {

@@ -459,8 +459,12 @@ func sortOrderFor(schema *iceberg.Schema, primaryKey []string) (table.SortOrder,
 // A false return with a nil error means a concurrent creator won the race
 // (ErrTableAlreadyExists) — the caller must reload and validate that table.
 func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy, primaryKey []string) (bool, error) {
+	props := iceberg.Properties{"format-version": "2"}
+	for k, v := range housekeepingProperties {
+		props[k] = v
+	}
 	opts := []catalog.CreateTableOpt{
-		catalog.WithProperties(iceberg.Properties{"format-version": "2"}),
+		catalog.WithProperties(props),
 	}
 	if len(partitionBy) > 0 {
 		spec, err := buildPartitionSpec(schema, partitionBy)
@@ -622,6 +626,11 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 			return fmt.Errorf("iceberg: %v: partition spec divergence: spec wants %v, table has %v — partition evolution is a deliberate maintenance operation",
 				ident, wantSpec, existSpec)
 		}
+	}
+	// Housekeeping properties (#463) converge on boot, so a table created
+	// before urutau set them picks them up on its next boot.
+	if err := EnsureHousekeeping(ctx, cat, ident, existing); err != nil {
+		return fmt.Errorf("iceberg: %v: housekeeping: %w", ident, err)
 	}
 	return nil
 }
