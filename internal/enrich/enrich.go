@@ -230,8 +230,8 @@ func New(cfgs []spec.Enrich, eventSchema core.Schema, log *slog.Logger) (*Stage,
 		// is gone: the columnar join decides cold start per batch, not per
 		// row. See website/docs/reference/semantics.md.
 		if cfg.BufferLimits.MaxWait != "" {
-			if d, err := time.ParseDuration(cfg.BufferLimits.MaxWait); err != nil || d < 0 {
-				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a non-negative duration", cfg.Table, cfg.BufferLimits.MaxWait)
+			if d, err := time.ParseDuration(cfg.BufferLimits.MaxWait); err != nil || d <= 0 {
+				return nil, fmt.Errorf("enrich: reference %q: bufferLimits.maxWait %q is not a positive duration", cfg.Table, cfg.BufferLimits.MaxWait)
 			}
 		}
 		if cfg.BufferLimits.MaxEvents < 0 {
