@@ -23,7 +23,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/shopspring/decimal v1.4.0
 	github.com/spf13/cobra v1.10.2
-	github.com/trinodb/trino-go-client v0.333.0
+	github.com/trinodb/trino-go-client v0.337.0
 	github.com/twmb/franz-go v1.21.6
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1
 	golang.org/x/crypto v0.55.0
@@ -141,7 +141,7 @@ require (
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.19.2 // indirect
+	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/lann/builder v0.0.0-20180802200727-47ae307949d0 // indirect
@@ -152,8 +152,7 @@ require (
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/paulmach/orb v0.13.0 // indirect
-	github.com/pierrec/lz4 v2.6.1+incompatible // indirect
-	github.com/pierrec/lz4/v4 v4.1.29 // indirect
+	github.com/pierrec/lz4/v4 v4.1.30 // indirect
 	github.com/pingcap/errors v0.11.5-0.20260310054046-9c8b3586e4b2 // indirect
 	github.com/pingcap/failpoint v0.0.0-20260406204437-bbc9d102c19e // indirect
 	github.com/pingcap/log v1.1.1-0.20260227082333-572e590d08f1 // indirect

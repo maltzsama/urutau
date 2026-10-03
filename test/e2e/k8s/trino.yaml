@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
         - name: trino
-          image: trinodb/trino:470
+          image: trinodb/trino:483
           ports:
             - containerPort: 8080
           volumeMounts:
