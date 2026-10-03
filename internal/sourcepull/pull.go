@@ -308,7 +308,16 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	// later append writes past the run's region.
 	run, rest := p.buf[:n], p.buf[n:]
 	p.buf = run
-	defer func() { p.buf = rest }()
+	defer func() {
+		// Drop the run's references before restoring the tail: the tail keeps
+		// the backing array alive, so without this its [0:n) elements would
+		// retain the encoded batch's row maps until the array is replaced
+		// (Sourcery finding).
+		for i := range run {
+			run[i] = rowchange.Change{}
+		}
+		p.buf = rest
+	}()
 
 	// A split transaction: only its last piece may carry its commit position.
 	// Every earlier piece carries the last safe position, so acking it cannot

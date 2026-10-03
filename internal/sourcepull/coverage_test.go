@@ -271,3 +271,28 @@ func TestNextNeverMixesTables(t *testing.T) {
 		}
 	}
 }
+
+// The fused makeBatch advances the tail by a read index instead of copying;
+// it must zero the encoded run so the tail (which keeps the backing array
+// alive) does not retain the batch's row maps (Sourcery finding on #581).
+func TestMakeBatchReleasesTheEncodedRun(t *testing.T) {
+	p := New(make(chan rowchange.Change))
+	p.SetSchemas(schemaFor("t"))
+	p.buf = []rowchange.Change{sampleChange("t", 1), sampleChange("t", 2)}
+	backing := p.buf
+
+	b, err := p.makeBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Release()
+
+	for i := 0; i < 2; i++ {
+		if backing[i].After != nil || backing[i].Key != nil {
+			t.Fatalf("run element %d still retained after encode: %+v", i, backing[i])
+		}
+	}
+	if len(p.buf) != 0 {
+		t.Fatalf("p.buf has %d entries, want the empty tail", len(p.buf))
+	}
+}
