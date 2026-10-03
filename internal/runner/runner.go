@@ -1036,6 +1036,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 					CaughtUpPoll:  cfg.CaughtUpPoll,
 					Progress:      progress,
 					Schema:        w.KnownSchema(ref.Target),
+					ChunkSize:     cfg.ChunkSize,
 					Persist: func(sp snapshot.SnapshotProgress) error {
 						return snk.SetProperties(ctx, ref, snapshot.EncodeSnapshotProgress(&sp))
 					},

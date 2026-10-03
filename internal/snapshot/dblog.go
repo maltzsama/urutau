@@ -82,6 +82,10 @@ type SnapshotConfig struct {
 	// Schema is the table's canonical (projected) schema, the shape the
 	// chunk SELECT is encoded into (#584). Required when the source has rows.
 	Schema core.Schema
+	// ChunkSize is the source's configured chunk size, passed to ScanArrow as
+	// the expected row count so the encoder sizes its buffers once instead of
+	// growing by doubling across a large chunk.
+	ChunkSize int
 }
 
 // SnapshotCallback is called when a chunk completes. The caller persists
@@ -162,7 +166,7 @@ func SnapshotTable(
 		reader.OpenWindow(ctx, chunkID)
 		low := reader.Synced()
 
-		rows, err := scanChunk(ctx, chunker, ch, target, low, cfg.Schema)
+		rows, err := scanChunk(ctx, chunker, ch, target, low, cfg.Schema, cfg.ChunkSize)
 		if err != nil {
 			reader.ClearWindow()
 			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
@@ -212,7 +216,7 @@ type arrowChunkScanner interface {
 // straight into Arrow (ScanArrow) is preferred; any other source falls back to
 // Scan, whose rows are appended cell by cell. Either way the chunk is held as
 // Arrow, never as []rowchange.Change + map[string]any (#584).
-func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, target string, low position.Position, cs core.Schema) (*dataplane.Batch, error) {
+func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, target string, low position.Position, cs core.Schema, expected int) (*dataplane.Batch, error) {
 	enc, err := transport.NewRowEncoder(cs, nil)
 	if err != nil {
 		return nil, err
@@ -224,7 +228,7 @@ func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, tar
 	}
 
 	if s, ok := src.(arrowChunkScanner); ok {
-		if _, err := s.ScanArrow(ctx, ch, enc, 0); err != nil {
+		if _, err := s.ScanArrow(ctx, ch, enc, expected); err != nil {
 			return nil, err
 		}
 		rec := enc.NewRecord()
@@ -239,6 +243,7 @@ func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, tar
 		return &dataplane.Batch{Table: target, Record: rec, Mode: dataplane.AppendMode}, nil
 	}
 
+	n := 0
 	err = src.Scan(ctx, ch, func(row map[string]any) error {
 		for i, col := range cs.Columns {
 			if err := enc.AppendValue(i, row[col.Name]); err != nil {
@@ -252,6 +257,10 @@ func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, tar
 			Phase:    core.PhaseSnapshot,
 			IngestTS: time.Now(),
 		})
+		n++
+		if n == reserveAfterRows {
+			enc.Reserve(expected)
+		}
 		return nil
 	})
 	if err != nil {
@@ -259,6 +268,10 @@ func scanChunk(ctx context.Context, src source.ChunkSource, ch source.Chunk, tar
 	}
 	return &dataplane.Batch{Table: target, Record: enc.NewRecord(), Mode: dataplane.AppendMode}, nil
 }
+
+// reserveAfterRows is how many rows the Scan fallback reads before sizing the
+// encoder's buffers for the whole chunk (mirrors ScanArrow).
+const reserveAfterRows = 32
 
 // WaitCaughtUp polls the reader's synced position until it contains high —
 // the proof that everything the source had committed by the end of the chunk
