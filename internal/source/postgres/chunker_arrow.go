@@ -40,20 +40,37 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 		return 0, fmt.Errorf("postgres: chunk scan sql: %w", err)
 	}
 
-	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.LevelRepeatableRead,
-		ReadOnly:  true,
+	// Retry ONLY the setup — a fresh transaction and its query — before any
+	// row is appended. Re-running a mid-scan failure would double-count the
+	// rows already written into enc, so those fall back to the worker
+	// session's chunk redo (the coordinator reds uncommitted chunks when a
+	// worker is lost). Scan can retry the whole read because it buffers the
+	// rows first; ScanArrow streams into the caller's builders and cannot.
+	var (
+		tx   *sql.Tx
+		rows *sql.Rows
+	)
+	err = retryTransientErr(ctx, c.retries, func() error {
+		var e error
+		tx, e = c.db.BeginTx(ctx, &sql.TxOptions{
+			Isolation: sql.LevelRepeatableRead,
+			ReadOnly:  true,
+		})
+		if e != nil {
+			return fmt.Errorf("postgres: chunk scan tx: %w", e)
+		}
+		rows, e = tx.QueryContext(ctx, query, args...)
+		if e != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("postgres: chunk scan: %w", e)
+		}
+		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("postgres: chunk scan tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	rows, err := tx.QueryContext(ctx, query, args...)
-	if err != nil {
-		return 0, fmt.Errorf("postgres: chunk scan: %w", err)
+		return 0, err
 	}
 	defer func() { _ = rows.Close() }()
+	defer func() { _ = tx.Rollback() }()
 
 	names, err := rows.Columns()
 	if err != nil {
