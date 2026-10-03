@@ -21,23 +21,36 @@ func projectionTable() *schema.Table {
 	}
 }
 
+// rowFor builds a positional table row (table column order) from a sparse
+// named image; columns not named are NULL.
+func rowFor(tbl *schema.Table, vals map[string]any) []any {
+	row := make([]any, len(tbl.Columns))
+	for name, v := range vals {
+		if i := tbl.FindColumn(name); i >= 0 {
+			row[i] = v
+		}
+	}
+	return row
+}
+
 func TestProjectionKeepNumeric(t *testing.T) {
+	tbl := projectionTable()
 	p, err := newProjection(nil, &spec.Filter{
 		Predicate: &spec.Predicate{Column: "active", Op: spec.OpEq, Value: float64(1)},
-	}, projectionTable())
+	}, tbl)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, err := p.keep(map[string]any{"active": int64(1)})
+	ok, err := p.keep(rowFor(tbl, map[string]any{"active": int64(1)}), tbl, nil)
 	if err != nil || !ok {
 		t.Fatalf("keep(active=1) = %v, %v; want true", ok, err)
 	}
-	ok, err = p.keep(map[string]any{"active": int64(0)})
+	ok, err = p.keep(rowFor(tbl, map[string]any{"active": int64(0)}), tbl, nil)
 	if err != nil || ok {
 		t.Fatalf("keep(active=0) = %v, %v; want false", ok, err)
 	}
 	// NULL never satisfies a comparison.
-	ok, err = p.keep(map[string]any{"active": nil})
+	ok, err = p.keep(rowFor(tbl, map[string]any{"active": nil}), tbl, nil)
 	if err != nil || ok {
 		t.Fatalf("keep(active=NULL) = %v, %v; want false", ok, err)
 	}
@@ -46,9 +59,10 @@ func TestProjectionKeepNumeric(t *testing.T) {
 func TestProjectionKeepDecimalExact(t *testing.T) {
 	// DECIMAL compares exactly: a value one ulp past 100.5 must pass, and the
 	// boundary itself must not.
+	tbl := projectionTable()
 	p, err := newProjection(nil, &spec.Filter{
 		Predicate: &spec.Predicate{Column: "amount", Op: spec.OpGt, Value: "100.5"},
-	}, projectionTable())
+	}, tbl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,27 +75,10 @@ func TestProjectionKeepDecimalExact(t *testing.T) {
 		{"100.50", false},
 		{"100.4", false},
 	} {
-		ok, err := p.keep(map[string]any{"amount": tc.amount})
+		ok, err := p.keep(rowFor(tbl, map[string]any{"amount": tc.amount}), tbl, nil)
 		if err != nil || ok != tc.want {
 			t.Fatalf("keep(amount=%s) = %v, %v; want %v", tc.amount, ok, err, tc.want)
 		}
-	}
-}
-
-func TestProjectionProject(t *testing.T) {
-	p, err := newProjection([]string{"id", "v"}, nil, projectionTable())
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := p.project(map[string]any{"id": int64(1), "v": "a", "amount": "9.9", "active": int64(1)})
-	if len(out) != 2 || out["id"] != int64(1) || out["v"] != "a" {
-		t.Fatalf("project = %+v, want {id,v}", out)
-	}
-	// No projection: the row is unchanged.
-	empty, _ := newProjection(nil, nil, projectionTable())
-	full := map[string]any{"id": int64(1)}
-	if got := empty.project(full); len(got) != 1 {
-		t.Fatalf("empty projection = %+v, want unchanged", got)
 	}
 }
 
@@ -110,7 +107,7 @@ func TestProjectionKeepCaseInsensitive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := p.keep(map[string]any{"status": "ACTIVE"}); err != nil || !ok {
+	if ok, err := p.keep(rowFor(tbl, map[string]any{"status": "ACTIVE"}), tbl, nil); err != nil || !ok {
 		t.Fatalf("_ci keep(ACTIVE) = %v, %v; want true", ok, err)
 	}
 	// A _bin column stays case-sensitive.
@@ -120,7 +117,7 @@ func TestProjectionKeepCaseInsensitive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := b.keep(map[string]any{"code": "ABC"}); err != nil || ok {
+	if ok, err := b.keep(rowFor(tbl, map[string]any{"code": "ABC"}), tbl, nil); err != nil || ok {
 		t.Fatalf("_bin keep(ABC) = %v, %v; want false", ok, err)
 	}
 }

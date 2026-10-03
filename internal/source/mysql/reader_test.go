@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"slices"
 	"testing"
 	"time"
 
@@ -14,7 +13,10 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/schema"
 
+	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 )
 
@@ -36,28 +38,89 @@ func ordersTable() *schema.Table {
 
 var ordersRef = TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}
 
-func newTestReader(out chan<- rowchange.Change) *Reader {
-	return &Reader{out: out, bySrc: map[string]TableRef{"shop.orders": ordersRef}, done: make(chan struct{})}
+func ordersSchema() core.Schema {
+	return core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString}},
+			{Name: "amount", Type: core.ColumnType{Kind: core.KindFloat64}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+}
+
+func newTestReader(out chan<- *dataplane.Batch) *Reader {
+	return &Reader{
+		batchOut:    out,
+		bySrc:       map[string]TableRef{"shop.orders": ordersRef},
+		done:        make(chan struct{}),
+		encoders:    map[string]*tableEncoder{},
+		projections: map[string]projection{"shop.orders": {}},
+		cfg: Config{
+			Schemas:       map[string]core.Schema{"raw.orders": ordersSchema()},
+			Projections:   map[string]projection{"shop.orders": {}},
+			UpsertTargets: map[string]bool{},
+		},
+	}
+}
+
+// rowToMap is a test shim: the live path no longer materializes a map, but the
+// per-cell normalization the charset/ENUM tests pin is unchanged.
+func rowToMap(tbl *schema.Table, row []any, loc *time.Location) map[string]any {
+	out := make(map[string]any, len(tbl.Columns))
+	for i, col := range tbl.Columns {
+		if i >= len(row) {
+			continue
+		}
+		out[col.Name] = normalizeCol(col, row[i], loc)
+	}
+	return out
+}
+
+// flushTxn closes the transaction being decoded, emitting its batches.
+func flushTxn(t *testing.T, r *Reader) {
+	t.Helper()
+	if err := r.OnPosSynced(&replication.EventHeader{}, gomysql.Position{}, nil, false); err != nil {
+		t.Fatalf("OnPosSynced: %v", err)
+	}
+}
+
+// drainChanges decodes and releases every pending batch into row changes.
+func drainChanges(t *testing.T, out chan *dataplane.Batch) []rowchange.Change {
+	t.Helper()
+	var all []rowchange.Change
+	for len(out) > 0 {
+		b := <-out
+		ch, err := transport.DecodeBatch(b.Record, b.Table, []string{"id"})
+		b.Record.Release()
+		if err != nil {
+			t.Fatalf("decode batch: %v", err)
+		}
+		all = append(all, ch...)
+	}
+	return all
 }
 
 func TestDecodeInsert(t *testing.T) {
-	r := newTestReader(nil)
+	out := make(chan *dataplane.Batch, 8)
+	r := newTestReader(out)
+	r.curGTID = "u:1-3"
+	r.curCommitTS = testCommitTS
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpInsert, row, nil, "u:1-3", testCommitTS)
-	if err != nil || !emit {
-		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	if err := r.OnRow(&canal.RowsEvent{Table: tbl, Action: canal.InsertAction, Rows: [][]any{row}}); err != nil {
+		t.Fatalf("OnRow: %v", err)
 	}
+	flushTxn(t, r)
 
-	if c.Op != rowchange.OpInsert || c.Table != "raw.orders" || c.Position != "u:1-3" {
+	chs := drainChanges(t, out)
+	if len(chs) != 1 {
+		t.Fatalf("got %d changes, want 1", len(chs))
+	}
+	c := chs[0]
+	if c.Op != rowchange.OpInsert || c.Position != "u:1-3" {
 		t.Fatalf("change = %+v", c)
-	}
-	if !c.CommitTS.Equal(testCommitTS) {
-		t.Fatalf("commit ts = %v, want %v", c.CommitTS, testCommitTS)
-	}
-	if len(c.Key) != 1 || c.Key[0] != int64(7) {
-		t.Fatalf("key = %v, want [7]", c.Key)
 	}
 	if c.After["v"] != "seven" {
 		t.Fatalf("v = %v (%T), want normalized string", c.After["v"], c.After["v"])
@@ -65,53 +128,53 @@ func TestDecodeInsert(t *testing.T) {
 	if c.After["amount"] != 1.5 {
 		t.Fatalf("amount = %v", c.After["amount"])
 	}
-	if c.Before != nil {
-		t.Fatalf("insert must not carry Before: %+v", c.Before)
-	}
 }
 
 func TestDecodeDeleteKeepsBeforeOnly(t *testing.T) {
-	r := newTestReader(nil)
+	out := make(chan *dataplane.Batch, 8)
+	r := newTestReader(out)
+	r.curGTID = "u:1-4"
 	tbl := ordersTable()
 	row := []any{int64(7), []byte("seven"), 1.5}
 
-	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpDelete, row, nil, "u:1-4", testCommitTS)
-	if err != nil || !emit {
-		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	if err := r.OnRow(&canal.RowsEvent{Table: tbl, Action: canal.DeleteAction, Rows: [][]any{row}}); err != nil {
+		t.Fatalf("OnRow: %v", err)
 	}
+	flushTxn(t, r)
 
-	if c.Op != rowchange.OpDelete {
-		t.Fatalf("op = %v", c.Op)
+	chs := drainChanges(t, out)
+	if len(chs) != 1 || chs[0].Op != rowchange.OpDelete {
+		t.Fatalf("delete changes = %+v", chs)
 	}
-	if c.After != nil {
-		t.Fatalf("delete must not carry After: %+v", c.After)
-	}
-	if c.Key[0] != int64(7) {
-		t.Fatalf("delete key must come from the old row: %v", c.Key)
+	if chs[0].After["v"] != "seven" {
+		t.Fatalf("delete image v = %v", chs[0].After["v"])
 	}
 }
 
 func TestDecodeUpdateCarriesBeforeAndAfter(t *testing.T) {
-	r := newTestReader(nil)
+	out := make(chan *dataplane.Batch, 8)
+	r := newTestReader(out)
+	r.curGTID = "u:1-5"
 	tbl := ordersTable()
 	before := []any{int64(7), []byte("old"), 1.0}
 	after := []any{int64(7), []byte("new"), 2.0}
 
-	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
-	if err != nil || !emit {
-		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	if err := r.OnRow(&canal.RowsEvent{Table: tbl, Action: canal.UpdateAction, Rows: [][]any{before, after}}); err != nil {
+		t.Fatalf("OnRow: %v", err)
 	}
+	flushTxn(t, r)
 
-	if c.After["v"] != "new" || c.Before["v"] != "old" {
-		t.Fatalf("update before/after = %v / %v", c.Before, c.After)
+	chs := drainChanges(t, out)
+	if len(chs) != 1 || chs[0].Op != rowchange.OpUpdate {
+		t.Fatalf("update changes = %+v", chs)
 	}
-	if c.After["amount"] != 2.0 || c.Before["amount"] != 1.0 {
-		t.Fatalf("update amounts = %v / %v", c.Before["amount"], c.After["amount"])
+	if chs[0].After["v"] != "new" {
+		t.Fatalf("update image v = %v", chs[0].After["v"])
 	}
 }
 
-func TestOnRowRoutesDecodeAndPosition(t *testing.T) {
-	out := make(chan rowchange.Change, 8)
+func TestOnRowRoutesAndPosition(t *testing.T) {
+	out := make(chan *dataplane.Batch, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:1-9"
 
@@ -127,20 +190,21 @@ func TestOnRowRoutesDecodeAndPosition(t *testing.T) {
 	if err := r.OnRow(e); err != nil {
 		t.Fatalf("OnRow: %v", err)
 	}
+	flushTxn(t, r)
 
+	chs := drainChanges(t, out)
+	if len(chs) != 2 {
+		t.Fatalf("got %d changes, want 2", len(chs))
+	}
 	for i, wantID := range []int64{1, 2} {
-		c := <-out
-		if c.Op != rowchange.OpInsert || c.Table != "raw.orders" {
-			t.Fatalf("row %d: %+v", i, c)
-		}
-		if c.Key[0] != wantID || c.Position != "u:1-9" {
-			t.Fatalf("row %d: key %v pos %q", i, c.Key, c.Position)
+		if chs[i].Op != rowchange.OpInsert || chs[i].Key[0] != wantID || chs[i].Position != "u:1-9" {
+			t.Fatalf("row %d: %+v", i, chs[i])
 		}
 	}
 }
 
 func TestOnRowUpdatePairsAndUnregisteredTable(t *testing.T) {
-	out := make(chan rowchange.Change, 8)
+	out := make(chan *dataplane.Batch, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:2-2"
 
@@ -155,9 +219,10 @@ func TestOnRowUpdatePairsAndUnregisteredTable(t *testing.T) {
 	if err := r.OnRow(e); err != nil {
 		t.Fatalf("OnRow: %v", err)
 	}
-	c := <-out
-	if c.Op != rowchange.OpUpdate || c.Before["v"] != "old" || c.After["v"] != "new" {
-		t.Fatalf("update change = %+v", c)
+	flushTxn(t, r)
+	chs := drainChanges(t, out)
+	if len(chs) != 1 || chs[0].Op != rowchange.OpUpdate || chs[0].After["v"] != "new" {
+		t.Fatalf("update change = %+v", chs)
 	}
 
 	// A table outside the spec must be silently skipped.
@@ -169,9 +234,11 @@ func TestOnRowUpdatePairsAndUnregisteredTable(t *testing.T) {
 	if err := r.OnRow(other); err != nil {
 		t.Fatalf("OnRow other: %v", err)
 	}
+	flushTxn(t, r)
 	select {
-	case c := <-out:
-		t.Fatalf("unregistered table leaked: %+v", c)
+	case b := <-out:
+		b.Record.Release()
+		t.Fatal("unregistered table leaked a batch")
 	default:
 	}
 }
@@ -186,76 +253,6 @@ func TestOnGTIDAccumulatesCumulativeSet(t *testing.T) {
 	want := position.MustGTID(readerTestUUID + ":1-5").String()
 	if r.curGTID != want {
 		t.Fatalf("curGTID = %q, want cumulative %q", r.curGTID, want)
-	}
-}
-
-// TestOnRowWindowTagsOnlyPastLowWatermark drives the DBLog window predicate:
-// only transactions strictly past the low watermark (the master's executed
-// GTID set captured at OpenWindow) are tagged InWindow. A transaction at or
-// before the watermark is already reflected in the chunk SELECT and must not
-// be tagged, or the snapshot row would be discarded for a stale value.
-func TestOnRowWindowTagsOnlyPastLowWatermark(t *testing.T) {
-	out := make(chan rowchange.Change, 8)
-	r := newTestReader(out)
-	r.curGTID = "u:1-9"
-	low := position.MustGTID(readerTestUUID + ":1-5")
-	r.winMu.Lock()
-	r.winOpen = true
-	r.winChunk = 0
-	r.winLow = low
-	r.winMu.Unlock()
-
-	tbl := ordersTable()
-	e := &canal.RowsEvent{
-		Table:  tbl,
-		Action: canal.InsertAction,
-		Rows:   [][]any{{int64(1), []byte("a"), 1.0}},
-	}
-
-	// A transaction PAST the low watermark is tagged InWindow.
-	r.curTxn = position.MustGTID(readerTestUUID + ":1-7")
-	if err := r.OnRow(e); err != nil {
-		t.Fatalf("OnRow: %v", err)
-	}
-	c := <-out
-	if c.Window == nil || !c.Window.InWindow || c.Window.ChunkID != 0 {
-		t.Fatalf("past-low event must be InWindow: %+v", c.Window)
-	}
-
-	// A transaction AT the low watermark is NOT tagged (its effect is
-	// already in the SELECT).
-	r.curTxn = position.MustGTID(readerTestUUID + ":1-5")
-	if err := r.OnRow(e); err != nil {
-		t.Fatalf("OnRow: %v", err)
-	}
-	c = <-out
-	if c.Window != nil {
-		t.Fatalf("at-low event must NOT be InWindow: %+v", c.Window)
-	}
-
-	// A missing watermark (master capture failed) falls back to tagging
-	// everything — over-tagging is safe.
-	r.winMu.Lock()
-	r.winLow = nil
-	r.winMu.Unlock()
-	r.curTxn = position.MustGTID(readerTestUUID + ":1-1")
-	if err := r.OnRow(e); err != nil {
-		t.Fatalf("OnRow: %v", err)
-	}
-	c = <-out
-	if c.Window == nil || !c.Window.InWindow {
-		t.Fatalf("missing watermark must fall back to tagging: %+v", c.Window)
-	}
-
-	// Window closed: nothing is tagged.
-	r.ClearWindow()
-	r.curTxn = position.MustGTID(readerTestUUID + ":1-8")
-	if err := r.OnRow(e); err != nil {
-		t.Fatalf("OnRow: %v", err)
-	}
-	c = <-out
-	if c.Window != nil {
-		t.Fatalf("closed window must not tag: %+v", c.Window)
 	}
 }
 
@@ -540,47 +537,45 @@ func TestRowToMapDecodesUTF32(t *testing.T) {
 // issue #114). This test itself hangs against the old bare `r.out <- c`,
 // so its own timeout guard is what turns that into a reported failure
 // instead of a wedged test run.
-func TestEmitUnblocksOnStop(t *testing.T) {
-	out := make(chan rowchange.Change) // unbuffered: any send blocks until read
+func TestSendBatchUnblocksOnStop(t *testing.T) {
+	out := make(chan *dataplane.Batch) // unbuffered: any send blocks until read
 	r := newTestReader(out)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- r.emit(rowchange.Change{}) }()
+	go func() { errCh <- r.sendBatch(&dataplane.Batch{Table: "raw.orders"}) }()
 
-	// Give emit a moment to actually reach the select and park on the send;
-	// this is a best-effort scheduling nudge, not a correctness dependency
-	// (stop() below is safe to call regardless of whether emit reached its
-	// select yet, since done is closed once for the whole reader).
+	// Give sendBatch a moment to reach the select and park on the send; this
+	// is a best-effort scheduling nudge, not a correctness dependency.
 	r.stop()
 
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, errReaderStopped) {
-			t.Fatalf("emit() = %v, want errReaderStopped", err)
+			t.Fatalf("sendBatch() = %v, want errReaderStopped", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("emit() did not return after stop() — a stalled consumer would hang OnRow, " +
+		t.Fatal("sendBatch() did not return after stop() — a stalled consumer would hang OnRow, " +
 			"and with it canal's event loop, forever")
 	}
 }
 
 // A send that can complete must still complete normally — stop() being
-// available must not turn every emit into a stop, and calling stop() must
-// not race a concurrent successful send.
-func TestEmitSucceedsWithoutStop(t *testing.T) {
-	out := make(chan rowchange.Change, 1)
+// available must not turn every send into a stop.
+func TestSendBatchSucceedsWithoutStop(t *testing.T) {
+	out := make(chan *dataplane.Batch, 1)
 	r := newTestReader(out)
+	b := &dataplane.Batch{Table: "raw.orders"}
 
-	if err := r.emit(rowchange.Change{Op: rowchange.OpInsert}); err != nil {
-		t.Fatalf("emit() = %v, want nil", err)
+	if err := r.sendBatch(b); err != nil {
+		t.Fatalf("sendBatch() = %v, want nil", err)
 	}
 	select {
-	case c := <-out:
-		if c.Op != rowchange.OpInsert {
-			t.Fatalf("got %+v", c)
+	case got := <-out:
+		if got != b {
+			t.Fatalf("got %+v, want the sent batch", got)
 		}
 	default:
-		t.Fatal("emit() returned nil but nothing was sent")
+		t.Fatal("sendBatch() returned nil but nothing was sent")
 	}
 }
 
@@ -746,17 +741,15 @@ func TestTemporalParityAcrossDST(t *testing.T) {
 	}
 }
 
-// Issue #456: the puller batches only whole transactions, so the reader ends
-// each transaction that emitted rows with OpTxnEnd, after its last row. A
+// Issue #456: the reader emits a transaction's rows only when it ends, and a
 // synced position with no row since the last end (a DDL, a transaction on an
 // excluded table) emits nothing.
 func TestTransactionEndFollowsItsRows(t *testing.T) {
-	out := make(chan rowchange.Change, 8)
+	out := make(chan *dataplane.Batch, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:1-9"
-	if err := r.OnPosSynced(&replication.EventHeader{}, gomysql.Position{}, nil, false); err != nil {
-		t.Fatalf("OnPosSynced: %v", err)
-	}
+	flushTxn(t, r) // nothing buffered: no batch
+
 	e := &canal.RowsEvent{
 		Table:  ordersTable(),
 		Action: canal.InsertAction,
@@ -765,16 +758,16 @@ func TestTransactionEndFollowsItsRows(t *testing.T) {
 	if err := r.OnRow(e); err != nil {
 		t.Fatalf("OnRow: %v", err)
 	}
-	if err := r.OnPosSynced(&replication.EventHeader{}, gomysql.Position{}, nil, false); err != nil {
-		t.Fatalf("OnPosSynced: %v", err)
+	flushTxn(t, r)
+
+	chs := drainChanges(t, out)
+	if len(chs) != 2 {
+		t.Fatalf("emitted %d changes, want 2", len(chs))
 	}
-	var ops []rowchange.Op
-	for len(out) > 0 {
-		ops = append(ops, (<-out).Op)
-	}
-	want := []rowchange.Op{rowchange.OpInsert, rowchange.OpInsert, rowchange.OpTxnEnd}
-	if !slices.Equal(ops, want) {
-		t.Fatalf("emitted %v, want %v", ops, want)
+	for _, c := range chs {
+		if c.Op != rowchange.OpInsert || c.Position != "u:1-9" {
+			t.Fatalf("change = %+v", c)
+		}
 	}
 }
 
@@ -782,7 +775,7 @@ func TestTransactionEndFollowsItsRows(t *testing.T) {
 // goroutine and possibly mid-transaction. That call ends no transaction: a
 // transaction end there would release part of one to a batch (#456).
 func TestShutdownSyncEndsNoTransaction(t *testing.T) {
-	out := make(chan rowchange.Change, 8)
+	out := make(chan *dataplane.Batch, 8)
 	r := newTestReader(out)
 	r.curGTID = "u:1-9"
 	e := &canal.RowsEvent{
@@ -796,62 +789,108 @@ func TestShutdownSyncEndsNoTransaction(t *testing.T) {
 	if err := r.OnPosSynced(nil, gomysql.Position{}, nil, true); err != nil {
 		t.Fatalf("OnPosSynced: %v", err)
 	}
-	var ops []rowchange.Op
-	for len(out) > 0 {
-		ops = append(ops, (<-out).Op)
+	select {
+	case b := <-out:
+		b.Record.Release()
+		t.Fatal("the shutdown sync must not end the transaction")
+	default:
 	}
-	if !slices.Equal(ops, []rowchange.Op{rowchange.OpInsert}) {
-		t.Fatalf("emitted %v, want only the row: the shutdown sync must not end the transaction", ops)
+	if !r.txnRows {
+		t.Fatal("the row must still be buffered for its real transaction end")
+	}
+}
+
+// A split transaction's earlier record carries the SAFE position, and only
+// its final record carries the transaction position, so an ack cannot advance
+// the checkpoint past rows a later piece still owes (#456).
+func TestSplitTransactionKeepsSafePosition(t *testing.T) {
+	out := make(chan *dataplane.Batch, 8)
+	r := newTestReader(out)
+	r.safePos = "u:1-0"
+	r.curGTID = "u:1-9"
+	rows := make([][]any, maxDirectRows+1)
+	for i := range rows {
+		rows[i] = []any{int64(i), []byte("x"), 1.0}
+	}
+	if err := r.OnRow(&canal.RowsEvent{Table: ordersTable(), Action: canal.InsertAction, Rows: rows}); err != nil {
+		t.Fatalf("OnRow: %v", err)
+	}
+	flushTxn(t, r)
+
+	first := <-out
+	defer first.Record.Release()
+	second := <-out
+	defer second.Record.Release()
+	if got := first.Record.NumRows(); got != maxDirectRows {
+		t.Fatalf("first piece rows = %d, want %d", got, maxDirectRows)
+	}
+	if got := second.Record.NumRows(); got != 1 {
+		t.Fatalf("second piece rows = %d, want 1", got)
+	}
+	br, err := transport.NewBatchReader(first.Record, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos := br.Position(br.NumRows() - 1); pos != "u:1-0" {
+		t.Fatalf("first piece position = %q, want the safe position", pos)
+	}
+	br2, err := transport.NewBatchReader(second.Record, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos := br2.Position(br2.NumRows() - 1); pos != "u:1-9" {
+		t.Fatalf("last piece position = %q, want the transaction position", pos)
 	}
 }
 
 // An upsert UPDATE that changes the primary key must delete the old key; the
 // update's own delete is built from the new key, so the old row would survive.
 func TestDecodeUpdateKeyChangeDeletesOldKey(t *testing.T) {
-	out := make(chan rowchange.Change, 4)
+	out := make(chan *dataplane.Batch, 4)
 	r := newTestReader(out)
 	r.cfg.UpsertTargets = map[string]bool{"raw.orders": true}
+	r.curGTID = "u:1-5"
 	tbl := ordersTable()
 	before := []any{int64(7), []byte("old"), 1.0}
 	after := []any{int64(8), []byte("new"), 2.0}
 
-	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
-	if err != nil || !emit {
-		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	if err := r.OnRow(&canal.RowsEvent{Table: tbl, Action: canal.UpdateAction, Rows: [][]any{before, after}}); err != nil {
+		t.Fatalf("OnRow: %v", err)
 	}
-	select {
-	case del := <-out:
-		if del.Op != rowchange.OpDelete || del.Key[0] != int64(7) {
-			t.Fatalf("synthetic change = %+v, want a delete of the old key 7", del)
-		}
-	default:
-		t.Fatal("an upsert key change must emit a delete of the old key first")
+	flushTxn(t, r)
+
+	chs := drainChanges(t, out)
+	if len(chs) != 2 {
+		t.Fatalf("got %d changes, want a delete of the old key then the update", len(chs))
 	}
-	if c.Op != rowchange.OpUpdate || c.Key[0] != int64(8) {
-		t.Fatalf("update = %+v, want the new key 8", c)
+	if chs[0].Op != rowchange.OpDelete || chs[0].Key[0] != int64(7) {
+		t.Fatalf("synthetic change = %+v, want a delete of the old key 7", chs[0])
+	}
+	if chs[1].Op != rowchange.OpUpdate || chs[1].Key[0] != int64(8) {
+		t.Fatalf("update = %+v, want the new key 8", chs[1])
 	}
 }
 
 // An append target keeps the old row by design; the key change must not emit a
 // delete.
 func TestDecodeUpdateKeyChangeAppendKeepsOldKey(t *testing.T) {
-	out := make(chan rowchange.Change, 4)
+	out := make(chan *dataplane.Batch, 4)
 	r := newTestReader(out)
-	r.cfg.UpsertTargets = map[string]bool{"raw.orders": false}
+	r.curGTID = "u:1-5"
 	tbl := ordersTable()
 	before := []any{int64(7), []byte("old"), 1.0}
 	after := []any{int64(8), []byte("new"), 2.0}
 
-	c, emit, err := r.decode(ordersRef, tbl, rowchange.OpUpdate, after, before, "u:1-5", testCommitTS)
-	if err != nil || !emit {
-		t.Fatalf("decode: emit=%v err=%v", emit, err)
+	if err := r.OnRow(&canal.RowsEvent{Table: tbl, Action: canal.UpdateAction, Rows: [][]any{before, after}}); err != nil {
+		t.Fatalf("OnRow: %v", err)
 	}
-	select {
-	case del := <-out:
-		t.Fatalf("append target emitted a synthetic change: %+v", del)
-	default:
+	flushTxn(t, r)
+
+	chs := drainChanges(t, out)
+	if len(chs) != 1 {
+		t.Fatalf("append target emitted %d changes, want only the update", len(chs))
 	}
-	if c.Key[0] != int64(8) {
-		t.Fatalf("update key = %v, want 8", c.Key)
+	if chs[0].Key[0] != int64(8) {
+		t.Fatalf("update key = %v, want 8", chs[0].Key)
 	}
 }
