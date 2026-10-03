@@ -165,8 +165,9 @@ type relEntry struct {
 	proj  Projection
 }
 
-// Reader wraps one logical-decoding connection and decodes pgoutput row
-// changes into rowchange.Change, positioned at their commit LSN.
+// Reader wraps one logical-decoding connection and decodes pgoutput/wal2json
+// row changes straight into Arrow wire batches (emitted on batchOut at commit),
+// positioned at their commit LSN.
 type Reader struct {
 	cfg     Config
 	db      *sql.DB
