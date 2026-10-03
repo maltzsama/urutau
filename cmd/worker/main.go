@@ -143,7 +143,7 @@ func runCmd() *cobra.Command {
 	fl.StringVar(&f.catalogURI, "catalog-uri", envOr("URUTAU_SINK_URI", "http://localhost:8181/api/catalog"), "Iceberg REST catalog URI")
 	fl.StringVar(&f.warehouse, "warehouse", envOr("URUTAU_SINK_WAREHOUSE", "quickstart_catalog"), "catalog warehouse name")
 	fl.StringVar(&f.clientID, "client-id", os.Getenv("URUTAU_SINK_CLIENT_ID"), "catalog OAuth2 client id")
-	fl.StringVar(&f.clientSecret, "client-secret", os.Getenv("URUTAU_SINK_CLIENT_SECRET"), "catalog OAuth2 client secret")
+	fl.StringVar(&f.clientSecret, "client-secret", "", "catalog OAuth2 client secret (default: $URUTAU_SINK_CLIENT_SECRET)")
 	fl.StringVar(&f.scope, "scope", envOr("URUTAU_SINK_SCOPE", "PRINCIPAL_ROLE:ALL"), "catalog OAuth2 scope")
 	fl.StringVar(&f.namespace, "namespace", "raw", "fallback namespace for bare targets")
 	fl.IntVar(&f.maxRows, "max-rows", 10000, "flush the batch once this many rows are buffered (one Iceberg commit)")
@@ -187,6 +187,13 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 		return worker.RemoteConfig{}, err
 	}
 	slog.SetDefault(logger)
+	// The secret defaults to the environment, but only HERE — as a flag
+	// default it would be printed by --help and by a mistyped flag's usage,
+	// leaking the credential into logs (#597).
+	clientSecret := f.clientSecret
+	if clientSecret == "" {
+		clientSecret = os.Getenv("URUTAU_SINK_CLIENT_SECRET")
+	}
 	return worker.RemoteConfig{
 		Coordinator: f.coordinator,
 		Name:        f.name,
@@ -196,7 +203,7 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 			Options: map[string]string{
 				"warehouse":     f.warehouse,
 				"client_id":     f.clientID,
-				"client_secret": f.clientSecret,
+				"client_secret": clientSecret,
 				"scope":         f.scope,
 			},
 		},
