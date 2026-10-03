@@ -85,6 +85,27 @@ func TestDriftAtBoundaryConformingPasses(t *testing.T) {
 	b.Release()
 }
 
+// SetSchemas must invalidate the cached column index: a schema reordered or
+// shrunk after the cache was built would otherwise read the wrong column
+// (#581).
+func TestSetSchemasInvalidatesColumnIndex(t *testing.T) {
+	p := New(make(chan rowchange.Change))
+	p.SetSchemas(schemaFor("t"))
+	_ = p.colIndex("t", p.schemas["t"]) // build the cache from id,v
+
+	p.SetSchemas(map[string]core.Schema{"t": {
+		Columns: []core.Column{
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		},
+		PrimaryKey: []string{"id"},
+	}})
+	idx := p.colIndex("t", p.schemas["t"])
+	if idx["v"] != 0 || idx["id"] != 1 {
+		t.Fatalf("index = %v, want v=0 id=1 after SetSchemas rebuilt it", idx)
+	}
+}
+
 // An always-nil column the schema lacks is still materialized by the merge
 // (preserving MergeSchema's behavior), not silently dropped by the fused
 // pass that skips the merge when nothing is unknown (#581).

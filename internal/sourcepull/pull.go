@@ -64,6 +64,9 @@ func New(ch <-chan rowchange.Change) *Puller {
 // Next.
 func (p *Puller) SetSchemas(schemas map[string]core.Schema) {
 	p.schemas = schemas
+	// The cached column indexes belong to the replaced schemas; a later
+	// schema with reordered or removed columns must not reuse them (#581).
+	p.index = nil
 }
 
 // SetSourceSchemas implements source.SchemaSetter for every stream that
