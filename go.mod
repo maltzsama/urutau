@@ -6,7 +6,7 @@ require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
 	github.com/Masterminds/squirrel v1.5.4
 	github.com/apache/arrow-go/v18 v18.8.0
-	github.com/apache/iceberg-go v0.7.0-rc0
+	github.com/apache/iceberg-go v0.7.0
 	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.1
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.1
