@@ -172,6 +172,22 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		}
 	}
 	opts := crOptions{MaintenanceBlock: o.maintenance, LogLevel: o.logLevel}
+	if profile.fullLoad() {
+		// The race-instrumented image needs far more CPU and memory than the
+		// production binary: the race detector alone adds ~1.5 GiB outside
+		// the Go heap, and serializes CPU work. These are the OPERATOR's
+		// explicit resources for the race e2e (spec, not a urutau default) —
+		// the product's fail-closed 500m/1Gi floor still governs a real
+		// pipeline whose spec omits them. Without them the race coordinator
+		// OOM-kills at 2Gi and the events worker OOM-kills at 3Gi during a
+		// snapshot (Sourcery finding on this PR).
+		opts.CoordinatorMemory = "6Gi"
+		opts.CoordinatorCPU = "4"
+		// The harness worker's request is 1Gi; the race worker OOM-killed
+		// with a 3Gi limit, so this raises the limit to 5Gi.
+		opts.WorkerMemoryOverhead = "4Gi"
+		opts.WorkerCPUOverhead = "1500m"
+	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
 	applied := time.Now()
 	applyPipeline(t, testNS, pipeline, cr)
