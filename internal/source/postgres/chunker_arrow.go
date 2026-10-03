@@ -28,8 +28,10 @@ const reserveAfterRows = 32
 // converted exactly as Scan converts it.
 //
 // The read runs in one REPEATABLE READ, READ ONLY transaction, as Scan does,
-// so the chunk sees a single consistent snapshot. Unlike Scan it does not
-// retry: a retry after rows have been appended would double-count them.
+// so the chunk sees a single consistent snapshot. Transaction and query setup
+// are retried before the first row is appended; mid-scan failures are not
+// retried, since retrying after rows have been appended would double-count
+// them (they fall back to the coordinator's chunk redo on worker loss).
 func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport.RowEncoder, expected int) (int, error) {
 	q, err := c.chunkQuery(ch)
 	if err != nil {
@@ -76,8 +78,17 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 	if err != nil {
 		return 0, err
 	}
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return 0, err
+	}
 	// Each result column's encoder column and scan target: the driver's
-	// buffer for a text, JSON or binary column, a Go value for any other.
+	// buffer only for a PostgreSQL text, JSON or binary column; any other
+	// type (numeric, temporal, bool) goes through normalize + AppendValue
+	// exactly as Scan does. Selecting the raw path from the SOURCE type, not
+	// the destination schema, matters when a cast maps a TIMESTAMPTZ source
+	// to a string target: scanning time.Time into *[]byte would fail
+	// (Sourcery finding on #590).
 	cols := make([]int, len(names))
 	raw := make([]bool, len(names))
 	dest := make([]any, len(names))
@@ -88,7 +99,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 			return 0, fmt.Errorf("%w: %s", transport.ErrColumnNotInSchema, name)
 		}
 		cols[i], seen[col] = col, true
-		if enc.IsBytes(col) {
+		if enc.IsBytes(col) && pgRawBytesType(types[i].DatabaseTypeName()) {
 			raw[i] = true
 			dest[i] = new([]byte)
 		} else {
@@ -133,4 +144,16 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 		return n, fmt.Errorf("postgres: chunk scan commit: %w", err)
 	}
 	return n, nil
+}
+
+// pgRawBytesType reports whether a PostgreSQL column type reaches Scan as
+// bytes that normalize turns into the same string: the text, JSON and binary
+// types. Any other type goes through normalize + AppendValue, exactly as the
+// row path.
+func pgRawBytesType(dbType string) bool {
+	switch dbType {
+	case "TEXT", "VARCHAR", "CHAR", "BPCHAR", "NAME", "JSON", "JSONB", "BYTEA", "XML":
+		return true
+	}
+	return false
 }

@@ -44,6 +44,12 @@ func (r *mixedRows) Columns() []string {
 	return []string{"id", "name", "doc", "score", "ok", "at", "note"}
 }
 func (r *mixedRows) Close() error { return nil }
+
+// The source type names, so ScanArrow picks the raw-byte path only for the
+// text/JSON columns (Sourcery finding on #590).
+func (r *mixedRows) ColumnTypeDatabaseTypeName(i int) string {
+	return [...]string{"INT8", "TEXT", "JSONB", "FLOAT8", "BOOL", "TIMESTAMPTZ", "TEXT"}[i]
+}
 func (r *mixedRows) Next(dest []driver.Value) error {
 	if r.i >= 3 {
 		return io.EOF
