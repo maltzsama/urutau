@@ -1100,48 +1100,6 @@ func adoptWindowPos(b *dataplane.Batch, pos string) (*dataplane.Batch, error) {
 	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: []byte(pos), Mode: dataplane.AppendMode, Seq: b.Seq, Staged: b.Staged}, nil
 }
 
-// markBatchSideEffects applies the per-row, side-effect-only decisions for a
-// live batch: bootstrap-guard marking (a live key during snapshot takes the
-// upsert path) and InWindow dedup (a live key removes its snapshot row from
-// every open window). Pure reads of the record; the batch itself is not
-// modified.
-func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) error {
-	reader, err := transport.NewBatchReader(batch.Record, p.knownSchema.PrimaryKey)
-	if err != nil {
-		return fmt.Errorf("worker: table %s: %w", p.target, err)
-	}
-	inWindow := ing.Win != nil && ing.Win.InWindow
-	for i := range reader.NumRows() {
-		key := reader.Key(i)
-		if len(key) == 0 {
-			continue
-		}
-		k := rowchange.KeyString(key)
-		if !reader.Snapshot(i) {
-			p.snapshotMu.Lock()
-			if p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil {
-				p.bootstrapGuard.AddString(k)
-			}
-			p.snapshotMu.Unlock()
-		}
-		if inWindow {
-			p.winMu.Lock()
-			for _, win := range p.windows {
-				if _, hit := win.touched[k]; hit {
-					continue
-				}
-				// Only touch a key the window actually holds.
-				if _, held := win.keys[k]; held {
-					win.touched[k] = struct{}{}
-					p.dropped++
-				}
-			}
-			p.winMu.Unlock()
-		}
-	}
-	return nil
-}
-
 // partitionSnapshotRows splits a merged batch's row indices into untouched
 // snapshot PKs (pure append) and the rest.
 func partitionSnapshotRows(b *dataplane.Batch, guard *bloom.BloomFilter, pk []string) (untouched, rest []int32, err error) {
