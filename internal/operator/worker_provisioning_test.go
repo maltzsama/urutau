@@ -39,10 +39,48 @@ func TestResourceRequirementsNoOverheadLimitEqualsRequest(t *testing.T) {
 	}
 }
 
-func TestResourceRequirementsEmptyIsZeroValue(t *testing.T) {
+// An empty cpu/memory never yields a BestEffort pod: it falls back to the
+// fixed 500m/1Gi floor.
+func TestResourceRequirementsEmptyFallsBackToDefaults(t *testing.T) {
 	r := resourceRequirements("", "", "", "")
-	if r.Requests != nil || r.Limits != nil {
-		t.Fatalf("empty cpu/memory should produce a zero-value ResourceRequirements, got %+v", r)
+	if got := r.Requests.Cpu().String(); got != defaultCPU {
+		t.Fatalf("cpu request = %q, want default %s", got, defaultCPU)
+	}
+	if got := r.Requests.Memory().String(); got != defaultMemory {
+		t.Fatalf("memory request = %q, want default %s", got, defaultMemory)
+	}
+	if got := r.Limits.Cpu().String(); got != defaultCPU {
+		t.Fatalf("cpu limit = %q, want default %s (no overhead)", got, defaultCPU)
+	}
+	if got := r.Limits.Memory().String(); got != defaultMemory {
+		t.Fatalf("memory limit = %q, want default %s (no overhead)", got, defaultMemory)
+	}
+}
+
+// A CR that omits cpu/memory provisions neither the coordinator nor a worker
+// as BestEffort: both carry the fixed 500m/1Gi floor (fail-closed).
+func TestEmptyResourcesFailClosedToDefaults(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	coord := coordinatorStatefulSet(cr, "urutau:v1").Spec.Template.Spec.Containers[0]
+	if got := coord.Resources.Requests.Cpu().String(); got != defaultCPU {
+		t.Fatalf("coordinator cpu request = %q, want %s", got, defaultCPU)
+	}
+	if got := coord.Resources.Limits.Memory().String(); got != defaultMemory {
+		t.Fatalf("coordinator memory limit = %q, want %s", got, defaultMemory)
+	}
+	worker := workerPodTemplate(cr, "urutau:v1", urutauspec.Table{Source: "shop.orders", Target: "raw.orders"})
+	wc := worker.Spec.Containers[0]
+	if got := wc.Resources.Requests.Cpu().String(); got != defaultCPU {
+		t.Fatalf("worker cpu request = %q, want %s", got, defaultCPU)
+	}
+	if got := wc.Resources.Requests.Memory().String(); got != defaultMemory {
+		t.Fatalf("worker memory request = %q, want %s", got, defaultMemory)
+	}
+	if got := wc.Resources.Limits.Cpu().String(); got != defaultCPU {
+		t.Fatalf("worker cpu limit = %q, want %s", got, defaultCPU)
+	}
+	if got := wc.Resources.Limits.Memory().String(); got != defaultMemory {
+		t.Fatalf("worker memory limit = %q, want %s", got, defaultMemory)
 	}
 }
 
