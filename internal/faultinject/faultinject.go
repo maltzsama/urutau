@@ -50,9 +50,6 @@ const (
 	// WorkerCommitBefore: a collapsed batch is about to be committed
 	// directly (D2).
 	WorkerCommitBefore Point = "worker.commit-before"
-	// IcebergUpsertBetweenDeleteAndAppend: an upsert's equality deletes are
-	// committed, its appends and position are not (D3).
-	IcebergUpsertBetweenDeleteAndAppend Point = "iceberg.upsert-between-delete-and-append"
 	// WorkerCommittedBeforeAck: the direct commit (data and position) is
 	// durable, the ack was not sent (D4).
 	WorkerCommittedBeforeAck Point = "worker.committed-before-ack"
@@ -80,7 +77,6 @@ const (
 var Points = []Point{
 	WorkerBatchReceived,
 	WorkerCommitBefore,
-	IcebergUpsertBetweenDeleteAndAppend,
 	WorkerCommittedBeforeAck,
 	CoordinatorAckBeforeRecord,
 	WorkerStagedBeforeShip,

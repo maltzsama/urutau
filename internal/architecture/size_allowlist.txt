@@ -24,7 +24,7 @@ internal/operator/controller.go 997 # baseline (#398)
 internal/operator/controller.go:CoordinatorReconciler.Reconcile 140 # baseline (#398)
 internal/runner/runner.go 1185 # baseline (#398)
 internal/runner/runner.go:newRunner 504 # baseline (#398)
-internal/sink/iceberg/writer.go 1090 # baseline (#398)
+internal/sink/iceberg/writer.go 1039 # baseline (#398)
 internal/sink/iceberg/writer.go:appendColumn 220 # exhaustive type switch over core.Kind
 internal/source/mysql/charset_tables.go 1674 # generated charset data tables, not logic
 internal/source/postgres/reader.go 890 # baseline (#398)

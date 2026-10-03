@@ -42,22 +42,18 @@ Which path a batch takes is decided per batch by the coordinator
 |---|------|---------|-------------------------|-------------|
 | D1 | Batch received from the Flight stream, not yet applied | worker | nothing new | `worker.batch-received` |
 | D2 | Batch collapsed and handed to the committer, not yet committed | worker | nothing new | `worker.commit-before` |
-| D3 | Upsert: equality deletes committed, appends not yet | worker | the deletes (the batch's keys are **temporarily absent**); `cdc.position` **not** advanced | `iceberg.upsert-between-delete-and-append` |
-| D4 | Sink commit done (data + `cdc.position` in the same snapshot), ack not sent | worker | data and position | `worker.committed-before-ack` |
-| D5 | Ack received by the coordinator, not yet recorded | coordinator | data and position | `coordinator.ack-before-record` |
+| D3 | Sink commit done (equality deletes + data + `cdc.position` in one snapshot), ack not sent | worker | deletes, data and position | `worker.committed-before-ack` |
+| D4 | Ack received by the coordinator, not yet recorded | coordinator | deletes, data and position | `coordinator.ack-before-record` |
 
 Expected recovery:
 
-- **D1, D2, D4 (worker dies).** The coordinator keeps running and awaits the
+- **D1, D2, D3 (worker dies).** The coordinator keeps running and awaits the
   worker (`loseWorker`): a new epoch, and the batch kept on its sent list.
-  When the Pod reconnects, the batch is redelivered. In D4 it is already
+  When the Pod reconnects, the batch is redelivered. In D3 it is already
   durable, so the worker skips and acks it. The run ends only if the worker
   delivers nothing of what it owes for the delivery timeout, or crashes three
   times in a row without delivering it (issue #461).
-- **D3 (worker dies).** The redelivery re-applies the batch: the equality
-  deletes are idempotent and the appends rewrite the rows. The keys are
-  missing from the sink only until it commits.
-- **D5 (coordinator dies).** Nothing is lost: the ack's commit is already
+- **D4 (coordinator dies).** Nothing is lost: the ack's commit is already
   durable. The restarted coordinator resumes from `cdc.position`, and workers
   skip what they had committed.
 
@@ -147,11 +143,10 @@ even though it holds a position. Re-copied rows are upserts.
 |-----------------|------------|
 | Batch delivered to worker, before commit | D1, D2, S1 |
 | Sink write staged, before commit | S2, S4 |
-| Sink commit completed, worker has not acked | D4, S3, S5 |
-| Ack sent, coordinator has not recorded the next state | D5 |
+| Sink commit completed, worker has not acked | D3, S3, S5 |
+| Ack sent, coordinator has not recorded the next state | D4 |
 | Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss; recovered by redelivery) |
 | Coordinator killed during an active commit cycle | S4, S5 |
-| Upsert split across two snapshots (not in the base matrix) | D3 |
 | Coordinator killed before a table's snapshot, after the stream committed to it | P1 |
 
 ## Using the fault points
