@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -127,5 +129,72 @@ func TestChunkerScanArrowMatchesTheRowPath(t *testing.T) {
 		if !array.Equal(got.Column(i), want.Column(i)) {
 			t.Errorf("column %s: got %v, want %v", want.ColumnName(i), got.Column(i), want.Column(i))
 		}
+	}
+}
+
+// flakyDriver fails the first QueryContext with a transient error, then serves
+// rows, so ScanArrow's setup retry can be exercised (Sourcery finding #590).
+type flakyDriver struct{}
+
+var flakyQueries atomic.Int64
+
+func (flakyDriver) Open(string) (driver.Conn, error) { return flakyConn{}, nil }
+
+type flakyConn struct{}
+
+func (flakyConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unsupported") }
+func (flakyConn) Close() error                        { return nil }
+func (flakyConn) Begin() (driver.Tx, error)           { return nil, errors.New("unsupported") }
+func (flakyConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return captureTx{}, nil
+}
+func (flakyConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	if flakyQueries.Add(1) == 1 {
+		return nil, fmt.Errorf("query: %w", context.DeadlineExceeded)
+	}
+	return &mixedRows{}, nil
+}
+
+func init() { sql.Register("urutau_pg_flaky", flakyDriver{}) }
+
+// A transient failure while opening the chunk query is retried before any row
+// is appended (Sourcery finding on #590).
+func TestChunkerScanArrowRetriesTheSetup(t *testing.T) {
+	flakyQueries.Store(0)
+	db, err := sql.Open("urutau_pg_flaky", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	c, err := NewChunker(context.Background(), db, "public.mixed", "id", 10, WithWorkers(1), WithRetries(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := core.Schema{
+		Columns: []core.Column{
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+			{Name: "name", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+			{Name: "doc", Type: core.ColumnType{Kind: core.KindJSON, Nullable: true}},
+			{Name: "score", Type: core.ColumnType{Kind: core.KindFloat64, Nullable: true}},
+			{Name: "ok", Type: core.ColumnType{Kind: core.KindBool, Nullable: true}},
+			{Name: "at", Type: core.ColumnType{Kind: core.KindTimestamp, Nullable: true}},
+			{Name: "note", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	enc, err := transport.NewRowEncoder(cs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Release()
+	n, err := c.ScanArrow(context.Background(), source.Chunk{}, enc, 3)
+	if err != nil {
+		t.Fatalf("ScanArrow: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("rows = %d, want 3 after a retry", n)
+	}
+	if got := flakyQueries.Load(); got < 2 {
+		t.Fatalf("QueryContext calls = %d, want the setup retried at least once", got)
 	}
 }
