@@ -628,6 +628,22 @@ func normalizeCol(col schema.TableColumn, v any, loc *time.Location) any {
 		return decodeEnum(col, v)
 	case schema.TYPE_SET:
 		return decodeSet(col, v)
+	case schema.TYPE_BINARY:
+		// go-mysql maps binary(n) and varbinary(n) here. A fixed BINARY(n)
+		// arrives without its trailing 0x00 padding and the target is
+		// FixedSizeBinary(n), whose builder panics on a short value; repad to
+		// the declared width. A varbinary (FixedSize 0) keeps its
+		// byte-preserving string form, as before (#562).
+		b, ok := v.([]byte)
+		if !ok || col.FixedSize == 0 {
+			return normalize(v)
+		}
+		if n := int(col.FixedSize); len(b) < n {
+			padded := make([]byte, n)
+			copy(padded, b)
+			return padded
+		}
+		return b
 	case schema.TYPE_STRING:
 		// Text columns carry their bytes in the column's own character set,
 		// unconverted (see charset.go). TYPE_BINARY is deliberately not here:
