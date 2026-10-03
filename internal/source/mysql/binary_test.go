@@ -22,19 +22,16 @@ func TestNormalizeColRepadsFixedBinary(t *testing.T) {
 }
 
 // A varbinary (no fixed size) keeps its byte-preserving string form, as
-// before the repad (#562).
+// before the repad (#562). Assert the exact type: the documented contract is
+// a string, so a regression to []byte fails here (Sourcery nitpick).
 func TestNormalizeColLeavesVarBinary(t *testing.T) {
 	col := schema.TableColumn{Name: "b", Type: schema.TYPE_BINARY, FixedSize: 0}
-	var b []byte
-	switch got := normalizeCol(col, []byte{0x01}, time.UTC).(type) {
-	case string:
-		b = []byte(got)
-	case []byte:
-		b = got
-	default:
-		t.Fatalf("unexpected type %T", got)
+	got, ok := normalizeCol(col, []byte{0x01}, time.UTC).(string)
+	if !ok {
+		t.Fatalf("normalizeCol must return the byte-preserving string for a varbinary, got %T",
+			normalizeCol(col, []byte{0x01}, time.UTC))
 	}
-	if len(b) != 1 || b[0] != 0x01 {
+	if b := []byte(got); len(b) != 1 || b[0] != 0x01 {
 		t.Fatalf("varbinary = %v, want the raw byte", b)
 	}
 }
