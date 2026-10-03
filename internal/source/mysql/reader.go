@@ -535,10 +535,16 @@ func (r *Reader) closeTxn() error {
 
 	pending := r.pending
 	r.pending = nil
-	for _, hb := range pending {
+	for i, hb := range pending {
 		b := &dataplane.Batch{Table: hb.target, Record: hb.rec, Mode: dataplane.UpsertMode}
 		if err := r.sendBatch(b); err != nil {
-			hb.rec.Release()
+			// Release this record and every record not yet sent: a failed
+			// send must not leak the transaction's Arrow buffers.
+			for _, rest := range pending[i:] {
+				if rest.rec != nil {
+					rest.rec.Release()
+				}
+			}
 			return err
 		}
 	}
