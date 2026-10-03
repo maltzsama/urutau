@@ -39,6 +39,9 @@ type Puller struct {
 	errCh   <-chan error
 	buf     []rowchange.Change
 	schemas map[string]core.Schema // target table -> canonical schema
+	// index caches each target table's column-name -> position, so the drift
+	// check reads a map instead of scanning the schema per row (#581).
+	index map[string]map[string]int
 	// txnBounded: the decoder ends each transaction with OpTxnEnd. buf
 	// then holds only rows of ended transactions, and open the rows of
 	// the one being decoded.
@@ -61,6 +64,9 @@ func New(ch <-chan rowchange.Change) *Puller {
 // Next.
 func (p *Puller) SetSchemas(schemas map[string]core.Schema) {
 	p.schemas = schemas
+	// The cached column indexes belong to the replaced schemas; a later
+	// schema with reordered or removed columns must not reuse them (#581).
+	p.index = nil
 }
 
 // SetSourceSchemas implements source.SchemaSetter for every stream that
@@ -297,9 +303,21 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	if n > maxBatchRows {
 		n = maxBatchRows
 	}
-	run, rest := p.buf[:n], append([]rowchange.Change(nil), p.buf[n:]...)
+	// The tail is advanced by a read index, not copied: only the run's own
+	// elements are mutated (Position), and the tail is always p.buf[n:], so a
+	// later append writes past the run's region.
+	run, rest := p.buf[:n], p.buf[n:]
 	p.buf = run
-	defer func() { p.buf = rest }()
+	defer func() {
+		// Drop the run's references before restoring the tail: the tail keeps
+		// the backing array alive, so without this its [0:n) elements would
+		// retain the encoded batch's row maps until the array is replaced
+		// (Sourcery finding).
+		for i := range run {
+			run[i] = rowchange.Change{}
+		}
+		p.buf = rest
+	}()
 
 	// A split transaction: only its last piece may carry its commit position.
 	// Every earlier piece carries the last safe position, so acking it cannot
@@ -321,21 +339,35 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	// hiding source evolution from the downstream columnar worker. When the
 	// source installed canonical schemas, compare each buffered row's shape
 	// against it and fail loud — the operator declares the new column and
-	// resumes, exactly like the old worker-side drift contract.
-	if cs, ok := p.schemas[p.buf[0].Table]; ok && len(cs.Columns) > 0 {
+	// resumes, exactly like the old worker-side drift contract. The same
+	// pass reports whether any row carries a key the schema lacks (including
+	// a nil value, which MergeSchema would materialize): only then is the
+	// merge — a whole extra pass over every row — needed (#581).
+	cs, known := p.schemas[table]
+	if known && len(cs.Columns) > 0 {
+		index := p.colIndex(table, cs)
+		merge := false
 		for _, c := range p.buf {
 			src := c.After
 			if src == nil {
 				src = c.Before
 			}
-			if d, hit := driftAgainst(src, cs); hit {
+			d, hit, unknown := driftAgainst(src, cs, index)
+			if hit {
 				return nil, fmt.Errorf("sourcepull: schema drift: column %q is not in the spec — declare it and resume", d)
 			}
+			if unknown {
+				merge = true
+			}
 		}
+		if merge {
+			cs = transport.MergeSchema(p.buf, cs)
+		}
+	} else {
+		// Known schema plus any column a change carries that the schema lacks
+		// (schema-less producers, sparse rows). Empty cs → full inference.
+		cs = transport.MergeSchema(p.buf, p.schemas[table])
 	}
-	// Known schema plus any column a change carries that the schema lacks
-	// (schema-less producers, sparse rows). Empty cs → full inference.
-	cs := transport.MergeSchema(p.buf, p.schemas[table])
 
 	// C-8: a delete with no PK becomes an orphaned NULL tuple in the sink.
 	// The live CDC path carries deletes; the bridge used to guard this.
@@ -354,27 +386,53 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	return &dataplane.Batch{Table: table, Record: rec, Mode: dataplane.UpsertMode}, nil
 }
 
+// colIndex returns (building it once) the column-name -> position index for a
+// target table's canonical schema, so the drift check looks up a map instead
+// of scanning the schema per row (#581).
+func (p *Puller) colIndex(table string, cs core.Schema) map[string]int {
+	if idx, ok := p.index[table]; ok {
+		return idx
+	}
+	idx := make(map[string]int, len(cs.Columns))
+	for i, c := range cs.Columns {
+		idx[c.Name] = i
+	}
+	if p.index == nil {
+		p.index = make(map[string]map[string]int)
+	}
+	p.index[table] = idx
+	return idx
+}
+
 // driftAgainst reports the first column path a row carries that the schema
-// lacks, descending into struct values so a field added inside a nested
-// column is caught too.
-func driftAgainst(row map[string]any, schema core.Schema) (string, bool) {
+// lacks (descending into struct values so a field added inside a nested
+// column is caught too), and whether the row carries any top-level key the
+// schema lacks — a nil one included, since MergeSchema materializes it as a
+// column even when its value is absent from this row.
+func driftAgainst(row map[string]any, schema core.Schema, index map[string]int) (string, bool, bool) {
+	unknown := false
 	for name, v := range row {
+		i, ok := index[name]
+		if !ok {
+			unknown = true
+			if v == nil {
+				continue
+			}
+			return name, true, unknown
+		}
 		if v == nil {
 			continue
 		}
-		col, ok := schema.Column(name)
-		if !ok {
-			return name, true
-		}
+		col := schema.Columns[i]
 		if col.Type.Kind == core.KindStruct {
 			if nested, isMap := v.(map[string]any); isMap {
 				if path, hit := driftNested(name, nested, col.Type.Fields); hit {
-					return path, true
+					return path, true, unknown
 				}
 			}
 		}
 	}
-	return "", false
+	return "", false, unknown
 }
 
 func driftNested(path string, m map[string]any, fields []core.Column) (string, bool) {

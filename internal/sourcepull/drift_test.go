@@ -85,6 +85,77 @@ func TestDriftAtBoundaryConformingPasses(t *testing.T) {
 	b.Release()
 }
 
+// A conforming row against a canonical schema encodes against that schema
+// exactly (data columns in canonical order): the fused pass skips MergeSchema,
+// and the output shape must not change (#581).
+func TestConformingRowUsesCanonicalSchema(t *testing.T) {
+	p := New(make(chan rowchange.Change))
+	p.SetSchemas(schemaFor("t"))
+
+	ch := make(chan rowchange.Change, 1)
+	feed(ch, rowchange.Change{Op: rowchange.OpInsert, Table: "t",
+		After: map[string]any{"id": int64(1), "v": "x"}})
+	p.ch = ch
+
+	b, err := p.Next(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Release()
+	if got := b.Record.Schema().Field(0).Name; got != "id" {
+		t.Fatalf("field 0 = %q, want id (canonical order preserved)", got)
+	}
+	if got := b.Record.Schema().Field(1).Name; got != "v" {
+		t.Fatalf("field 1 = %q, want v (canonical order preserved)", got)
+	}
+}
+
+// SetSchemas must invalidate the cached column index: a schema reordered or
+// shrunk after the cache was built would otherwise read the wrong column
+// (#581).
+func TestSetSchemasInvalidatesColumnIndex(t *testing.T) {
+	p := New(make(chan rowchange.Change))
+	p.SetSchemas(schemaFor("t"))
+	_ = p.colIndex("t", p.schemas["t"]) // build the cache from id,v
+
+	p.SetSchemas(map[string]core.Schema{"t": {
+		Columns: []core.Column{
+			{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+		},
+		PrimaryKey: []string{"id"},
+	}})
+	idx := p.colIndex("t", p.schemas["t"])
+	if idx["v"] != 0 || idx["id"] != 1 {
+		t.Fatalf("index = %v, want v=0 id=1 after SetSchemas rebuilt it", idx)
+	}
+}
+
+// An always-nil column the schema lacks is still materialized by the merge
+// (preserving MergeSchema's behavior), not silently dropped by the fused
+// pass that skips the merge when nothing is unknown (#581).
+func TestUnknownNilColumnStillMerges(t *testing.T) {
+	p := New(make(chan rowchange.Change))
+	p.SetSchemas(schemaFor("t"))
+
+	ch := make(chan rowchange.Change, 1)
+	feed(ch, rowchange.Change{Op: rowchange.OpInsert, Table: "t",
+		After: map[string]any{"id": int64(1), "v": "x", "ghost": nil}})
+	p.ch = ch
+
+	b, err := p.Next(context.Background())
+	if err != nil {
+		t.Fatalf("nil unknown column must not trip drift: %v", err)
+	}
+	defer b.Release()
+	for i := 0; i < int(b.Record.Schema().NumFields()); i++ {
+		if b.Record.Schema().Field(i).Name == "ghost" {
+			return
+		}
+	}
+	t.Fatalf("an always-nil unknown column must still be merged, schema = %v", b.Record.Schema())
+}
+
 func TestNoSchemaSkipsDriftCheck(t *testing.T) {
 	// A schema-less producer (no SetSchemas) keeps the inference fallback
 	// and no drift gate — its resolved schema is owned upstream.
