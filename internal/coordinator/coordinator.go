@@ -1567,8 +1567,13 @@ func (c *Coordinator) recordConfirmed(worker string, pos position.Position) {
 // MinSafe, not Min: incomparable committed positions have no safe minimum, so
 // nil holds retention back rather than advancing past uncommitted data.
 func (c *Coordinator) confirmedPosition() position.Position {
-	owing := c.workersOwing()
+	// Read the dispatched frontier FIRST: enqueueTo makes a batch visible to
+	// the queue/index before noteSent records its position, so a frontier read
+	// before the owing snapshot can never name a batch that snapshot missed —
+	// reading the other order could pair a stale "nothing owing" with a newer
+	// frontier and confirm a batch that has not been acked.
 	dispatched := c.dispatchedPosition()
+	owing := c.workersOwing()
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
 	if len(c.confirmed) == 0 {
