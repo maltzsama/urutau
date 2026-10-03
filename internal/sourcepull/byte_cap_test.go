@@ -21,6 +21,18 @@ func payloadSchema() map[string]core.Schema {
 	}
 }
 
+// A composite cell (JSON object or list) is counted by its contents, not as
+// an 8-byte scalar, so the byte ceiling still bounds the batch (#632 review).
+func TestValueBytesCountsComposites(t *testing.T) {
+	big := strings.Repeat("x", 1<<20)
+	if got := valueBytes(map[string]any{"k": big, "list": []any{big, int64(1)}}); got < 2*(1<<20) {
+		t.Fatalf("valueBytes(map) = %d, want at least 2 MiB", got)
+	}
+	if got := valueBytes([]any{big, big}); got < 2*(1<<20) {
+		t.Fatalf("valueBytes(slice) = %d, want at least 2 MiB", got)
+	}
+}
+
 // A run of large rows closes a batch at the byte ceiling instead of buffering
 // the whole row target (#579).
 func TestByteCeilingSplitsABatch(t *testing.T) {

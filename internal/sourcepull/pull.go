@@ -95,13 +95,27 @@ func changeBytes(c rowchange.Change) int {
 }
 
 // valueBytes estimates one cell's size: a string's or byte slice's length,
-// eight bytes for any other scalar.
+// the sum of a composite's elements, eight bytes for any other scalar. JSON
+// objects and lists reach here as map[string]any / []any and can be large, so
+// they must not be counted as a scalar (#632 review).
 func valueBytes(v any) int {
 	switch t := v.(type) {
 	case string:
 		return len(t)
 	case []byte:
 		return len(t)
+	case map[string]any:
+		n := 0
+		for k, e := range t {
+			n += len(k) + valueBytes(e)
+		}
+		return n
+	case []any:
+		n := 0
+		for _, e := range t {
+			n += valueBytes(e)
+		}
+		return n
 	default:
 		return 8
 	}
