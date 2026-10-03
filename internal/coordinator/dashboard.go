@@ -77,13 +77,14 @@ func (s dashState) Summary() dashboard.PipelineSummary {
 	}
 	c.mu.Lock()
 	workers := len(c.workers)
+	tables := len(c.tablesOrSpec())
 	c.mu.Unlock()
 	return dashboard.PipelineSummary{
 		Pipeline:           c.cfg.Spec.Pipeline,
 		RunID:              c.runID,
 		SourceKind:         c.cfg.Spec.Source.Kind,
 		SinkType:           c.cfg.Spec.Sink.Type,
-		Tables:             len(c.cfg.Spec.Tables),
+		Tables:             tables,
 		Workers:            workers,
 		StartedAt:          c.startedAt.UTC().Format(time.RFC3339),
 		UptimeS:            int64(time.Since(c.startedAt).Seconds()),
@@ -114,17 +115,20 @@ func (s dashState) Tables() []dashboard.TableStatus {
 	if c.cfg.Spec == nil {
 		return nil
 	}
+	c.mu.Lock()
+	tables := c.tablesOrSpec()
+	c.mu.Unlock()
 	positions := c.tablePositions()
 	// Pending before statsMu, for the same reason publishLag does it: it
 	// takes other locks, and statsMu must not be held across them.
-	pending := make(map[string]int, len(c.cfg.Spec.Tables))
-	for _, t := range c.cfg.Spec.Tables {
+	pending := make(map[string]int, len(tables))
+	for _, t := range tables {
 		pending[t.Target] = c.tablePending(t.Target)
 	}
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
-	out := make([]dashboard.TableStatus, 0, len(c.cfg.Spec.Tables))
-	for _, t := range c.cfg.Spec.Tables {
+	out := make([]dashboard.TableStatus, 0, len(tables))
+	for _, t := range tables {
 		st := dashboard.TableStatus{
 			Source:    t.Source,
 			Target:    t.Target,
@@ -323,10 +327,13 @@ func (c *Coordinator) publishLag() {
 		return
 	}
 	now := time.Now()
+	c.mu.Lock()
+	tables := c.tablesOrSpec()
+	c.mu.Unlock()
 	// Pending is computed before statsMu: it reads routing and staged state
 	// under their own locks, and statsMu must not be held across them.
-	pending := make(map[string]int, len(c.cfg.Spec.Tables))
-	for _, t := range c.cfg.Spec.Tables {
+	pending := make(map[string]int, len(tables))
+	for _, t := range tables {
 		pending[t.Target] = c.tablePending(t.Target)
 	}
 	c.statsMu.Lock()
