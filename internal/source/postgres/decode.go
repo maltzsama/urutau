@@ -9,43 +9,6 @@ import (
 	pglogrepl "github.com/jackc/pglogrepl"
 )
 
-// tupleToMap decodes one pgoutput tuple into column-name → scalar, using
-// the introspected column types. Unchanged-TOAST columns (kind 'u') are
-// recovered from the old tuple — REPLICA IDENTITY FULL guarantees one —
-// and are a hard error otherwise, because silently dropping a column
-// would corrupt the mirror.
-func tupleToMap(st *TableState, tuple *pglogrepl.TupleData, old *pglogrepl.TupleData) (map[string]any, error) {
-	out := make(map[string]any, len(tuple.Columns))
-	for i, col := range tuple.Columns {
-		if i >= len(st.Columns) {
-			return nil, fmt.Errorf("postgres: decode %s.%s: tuple has more columns than introspection",
-				st.Schema, st.Name)
-		}
-		name := st.Columns[i].Name
-		switch col.DataType {
-		case pglogrepl.TupleDataTypeNull:
-			out[name] = nil
-		case pglogrepl.TupleDataTypeText:
-			v, err := decodeScalar(st.Columns[i].DataType, col.Data)
-			if err != nil {
-				return nil, fmt.Errorf("postgres: decode %s.%s.%s: %w", st.Schema, st.Name, name, err)
-			}
-			out[name] = v
-		case pglogrepl.TupleDataTypeToast:
-			if v, ok := toastFromOld(st, old, i); ok {
-				out[name] = v
-				continue
-			}
-			return nil, fmt.Errorf("postgres: decode %s.%s.%s: unchanged TOAST with no old image",
-				st.Schema, st.Name, name)
-		default:
-			return nil, fmt.Errorf("postgres: decode %s.%s.%s: unsupported tuple kind %q",
-				st.Schema, st.Name, name, col.DataType)
-		}
-	}
-	return out, nil
-}
-
 // toastFromOld recovers column i from the old tuple when it carries a
 // text value there.
 func toastFromOld(st *TableState, old *pglogrepl.TupleData, i int) (any, bool) {
@@ -120,42 +83,6 @@ func decodeScalar(dataType string, data []byte) (any, error) {
 	}
 }
 
-// tupleToMapByName decodes a tuple whose column order is given explicitly by
-// names. A key-only old tuple ('K') carries just the identity key columns, in
-// key order, not the table's full column order, so a positional decode would
-// attribute them to the wrong columns (issue #500).
-func tupleToMapByName(st *TableState, tuple *pglogrepl.TupleData, names []string) (map[string]any, error) {
-	// A key-only tuple must carry exactly the identity key columns: a shorter
-	// one is a malformed/truncated identity tuple, and a partial map would let
-	// key extraction or filter evaluation run on missing key values.
-	if len(tuple.Columns) != len(names) {
-		return nil, fmt.Errorf("postgres: decode %s.%s: key tuple has %d columns, want the primary key's %d",
-			st.Schema, st.Name, len(tuple.Columns), len(names))
-	}
-	out := make(map[string]any, len(tuple.Columns))
-	for i, col := range tuple.Columns {
-		name := names[i]
-		j := st.FindColumn(name)
-		if j < 0 {
-			return nil, fmt.Errorf("postgres: decode %s.%s: key column %q not found", st.Schema, st.Name, name)
-		}
-		switch col.DataType {
-		case pglogrepl.TupleDataTypeNull:
-			out[name] = nil
-		case pglogrepl.TupleDataTypeText:
-			v, err := decodeScalar(st.Columns[j].DataType, col.Data)
-			if err != nil {
-				return nil, fmt.Errorf("postgres: decode %s.%s.%s: %w", st.Schema, st.Name, name, err)
-			}
-			out[name] = v
-		default:
-			return nil, fmt.Errorf("postgres: decode %s.%s.%s: unsupported key tuple kind %q",
-				st.Schema, st.Name, name, col.DataType)
-		}
-	}
-	return out, nil
-}
-
 // toastSource returns the tuple to recover unchanged TOAST columns from, or
 // nil when the old tuple is key-only ('K') and carries no TOAST values.
 func toastSource(old *pglogrepl.TupleData, keyOnly bool) *pglogrepl.TupleData {
@@ -163,15 +90,6 @@ func toastSource(old *pglogrepl.TupleData, keyOnly bool) *pglogrepl.TupleData {
 		return nil
 	}
 	return old
-}
-
-// oldTupleToMap decodes an old tuple: a key-only ('K') one by the primary
-// key's column order, a full ('O') one positionally (issue #500).
-func oldTupleToMap(st *TableState, t *pglogrepl.TupleData, keyOnly bool, key []string) (map[string]any, error) {
-	if keyOnly {
-		return tupleToMapByName(st, t, key)
-	}
-	return tupleToMap(st, t, nil)
 }
 
 // cleanNumeric strips the money decorations from a numeric text.

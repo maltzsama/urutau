@@ -525,7 +525,7 @@ func (r *Reader) closeTxn() error {
 		return nil
 	}
 	last := &r.pending[len(r.pending)-1]
-	rebuilt, err := withPosition(last.rec, r.curGTID)
+	rebuilt, err := transport.WithPosition(last.rec, r.curGTID)
 	if err != nil {
 		r.releasePending()
 		return err

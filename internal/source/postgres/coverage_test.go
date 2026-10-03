@@ -9,7 +9,6 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
@@ -120,7 +119,7 @@ func TestAdvanceSyncedFloor(t *testing.T) {
 	}
 
 	// Mid-transaction the floor must hold.
-	r.txn = []*rowchange.Change{{}}
+	r.pending = []heldRec{{target: "raw.t"}}
 	r.advanceSyncedFloor(pglogrepl.LSN(30))
 	if *r.synced != 20 {
 		t.Fatalf("synced = %v, want 20 while a transaction is buffering", *r.synced)

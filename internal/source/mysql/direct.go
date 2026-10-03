@@ -5,8 +5,6 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/go-mysql-org/go-mysql/schema"
 
 	"github.com/maltzsama/urutau/core"
@@ -128,32 +126,4 @@ func (te *tableEncoder) materialize() arrow.RecordBatch {
 type heldRec struct {
 	target string
 	rec    arrow.RecordBatch
-}
-
-// withPosition returns rec with every row's __pos replaced by pos. The live
-// path stamps every row of a transaction with the last SAFE position and only
-// the transaction's final record with its own position, so acking a split
-// piece cannot advance the durable checkpoint past rows a later piece owes.
-func withPosition(rec arrow.RecordBatch, pos string) (arrow.RecordBatch, error) {
-	sch := rec.Schema()
-	numData := sch.NumFields() - len(transport.WireMetadataFields())
-	if numData < 0 {
-		return nil, fmt.Errorf("mysql: record is not wire schema (%d columns)", sch.NumFields())
-	}
-	n := int(rec.NumRows())
-	cols := make([]arrow.Array, sch.NumFields())
-	for j := range cols {
-		cols[j] = rec.Column(j)
-	}
-	b := array.NewStringBuilder(memory.DefaultAllocator)
-	for i := 0; i < n; i++ {
-		b.Append(pos)
-	}
-	posArr := b.NewStringArray()
-	b.Release()
-	cols[numData+1] = posArr
-	out := array.NewRecordBatch(sch, cols, int64(n))
-	rec.Release()
-	posArr.Release()
-	return out, nil
 }

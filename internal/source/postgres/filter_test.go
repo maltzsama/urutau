@@ -104,7 +104,7 @@ func TestProjectionFilterExpr(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := p.keep(row)
+			got, err := p.keep(rowPos(st, row), st)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -133,7 +133,7 @@ func TestFilterExprNullSemantics(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := p.keep(row)
+		got, err := p.keep(rowPos(st, row), st)
 		if err != nil {
 			t.Fatalf("case %d: %v", i, err)
 		}
@@ -161,7 +161,7 @@ func TestFilterExprNumericColumn(t *testing.T) {
 		{"9.00", false},   // lexical "9" > "100" would be true; numeric is false
 		{"100.00", false}, // not strictly greater
 	} {
-		got, err := p.keep(map[string]any{"amount": tc.val})
+		got, err := p.keep(rowPos(st, map[string]any{"amount": tc.val}), st)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.val, err)
 		}
@@ -183,7 +183,7 @@ func TestFilterExprNumericExactPrecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := p.keep(map[string]any{"amount": "9007199254740993"})
+	got, err := p.keep(rowPos(st, map[string]any{"amount": "9007199254740993"}), st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestFilterExprNumericSpecialValues(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := p.keep(map[string]any{"amount": c.val})
+			got, err := p.keep(rowPos(st, map[string]any{"amount": c.val}), st)
 			if err != nil {
 				t.Fatalf("keep: %v", err)
 			}
@@ -274,7 +274,7 @@ func TestFilterExprFloatSpecialValues(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := p.keep(map[string]any{"amount": c.val})
+			got, err := p.keep(rowPos(st, map[string]any{"amount": c.val}), st)
 			if err != nil {
 				t.Fatalf("keep: %v", err)
 			}

@@ -7,33 +7,32 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
-func TestProjectionKeepAndProject(t *testing.T) {
+func TestProjectionKeep(t *testing.T) {
+	st := &TableState{Columns: []Column{
+		{Name: "id", DataType: "bigint"},
+		{Name: "name", DataType: "text"},
+		{Name: "status", DataType: "text"},
+		{Name: "secret", DataType: "text"},
+	}}
 	p, err := newProjection([]string{"id", "name"}, &spec.Filter{
 		Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "active"},
-	}, nil)
+	}, st)
 	if err != nil {
 		t.Fatal(err)
 	}
-	full := map[string]any{"id": int64(1), "name": "a", "status": "active", "secret": "x"}
+	row := rowPos(st, map[string]any{"id": int64(1), "name": "a", "status": "active", "secret": "x"})
 
-	keep, err := p.keep(full)
+	keep, err := p.keep(row, st)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !keep {
 		t.Fatal("row must satisfy the filter")
 	}
-	got := p.project(full)
-	if len(got) != 2 || got["id"] != int64(1) || got["name"] != "a" {
-		t.Fatalf("project = %v, want only id+name", got)
-	}
-	if _, ok := got["secret"]; ok {
-		t.Fatal("projection leaked an unselected column")
-	}
 
 	// A row outside the filter is dropped.
-	full["status"] = "banned"
-	keep, err = p.keep(full)
+	row = rowPos(st, map[string]any{"id": int64(1), "name": "a", "status": "banned"})
+	keep, err = p.keep(row, st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,13 +41,9 @@ func TestProjectionKeepAndProject(t *testing.T) {
 	}
 }
 
-func TestProjectionEmptyColumnsKeepsAll(t *testing.T) {
+func TestProjectionEmptyFilterKeepsAll(t *testing.T) {
 	p := Projection{}
-	full := map[string]any{"id": int64(1), "name": "a"}
-	if got := p.project(full); len(got) != 2 {
-		t.Fatalf("empty projection must keep all columns, got %v", got)
-	}
-	keep, err := p.keep(full)
+	keep, err := p.keep(nil, nil)
 	if err != nil || !keep {
 		t.Fatalf("empty filter must keep the row: keep=%v err=%v", keep, err)
 	}

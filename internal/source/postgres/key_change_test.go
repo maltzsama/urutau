@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
 
@@ -37,49 +39,45 @@ func updatePayload(rel uint32, old, new []string) []byte {
 	return b
 }
 
-func keyChangeReader(upsert bool) *Reader {
-	st := orderState()
-	proj, _ := newProjection(nil, nil, st)
-	return &Reader{
-		cfg: Config{UpsertTargets: map[string]bool{"raw.orders": upsert}},
-		relByID: map[uint32]relEntry{1: {
-			state: st,
-			ref:   source.TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}},
-			proj:  proj,
-		}},
-	}
+func keyChangeReader(upsert bool, out chan *dataplane.Batch) (*Reader, source.TableRef) {
+	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}
+	return directReader(out, orderState(), ref, upsert), ref
 }
 
 // An upsert UPDATE that changes the primary key must delete the old key before
 // writing the new one.
 func TestUpdateKeyChangeDeletesOldKeyUpsert(t *testing.T) {
-	r := keyChangeReader(true)
+	out := make(chan *dataplane.Batch, 8)
+	r, ref := keyChangeReader(true, out)
 	payload := updatePayload(1, []string{"7", "old", "1.0", "t"}, []string{"8", "new", "2.0", "t"})
 	if err := r.handleUpdate(payload); err != nil {
 		t.Fatalf("handleUpdate: %v", err)
 	}
-	if len(r.txn) != 2 {
-		t.Fatalf("txn = %d changes, want a delete of the old key then the update", len(r.txn))
+	chs := flushAndDecode(t, r, out, ref, *position.MustLSN("0/40"))
+	if len(chs) != 2 {
+		t.Fatalf("changes = %d, want a delete of the old key then the update", len(chs))
 	}
-	if r.txn[0].Op != rowchange.OpDelete || r.txn[0].Key[0] != int64(7) {
-		t.Fatalf("first change = %+v, want a delete of key 7", r.txn[0])
+	if chs[0].Op != rowchange.OpDelete || chs[0].Key[0] != int64(7) {
+		t.Fatalf("first change = %+v, want a delete of key 7", chs[0])
 	}
-	if r.txn[1].Op != rowchange.OpUpdate || r.txn[1].Key[0] != int64(8) {
-		t.Fatalf("second change = %+v, want the update of key 8", r.txn[1])
+	if chs[1].Op != rowchange.OpUpdate || chs[1].Key[0] != int64(8) {
+		t.Fatalf("second change = %+v, want the update of key 8", chs[1])
 	}
 }
 
 // An append target keeps the old row; the key change must not emit a delete.
 func TestUpdateKeyChangeAppendKeepsOldKey(t *testing.T) {
-	r := keyChangeReader(false)
+	out := make(chan *dataplane.Batch, 8)
+	r, ref := keyChangeReader(false, out)
 	payload := updatePayload(1, []string{"7", "old", "1.0", "t"}, []string{"8", "new", "2.0", "t"})
 	if err := r.handleUpdate(payload); err != nil {
 		t.Fatalf("handleUpdate: %v", err)
 	}
-	if len(r.txn) != 1 {
-		t.Fatalf("txn = %d changes, want only the update for an append target", len(r.txn))
+	chs := flushAndDecode(t, r, out, ref, *position.MustLSN("0/40"))
+	if len(chs) != 1 {
+		t.Fatalf("changes = %d, want only the update for an append target", len(chs))
 	}
-	if r.txn[0].Op != rowchange.OpUpdate || r.txn[0].Key[0] != int64(8) {
-		t.Fatalf("change = %+v, want the update of key 8", r.txn[0])
+	if chs[0].Op != rowchange.OpUpdate || chs[0].Key[0] != int64(8) {
+		t.Fatalf("change = %+v, want the update of key 8", chs[0])
 	}
 }

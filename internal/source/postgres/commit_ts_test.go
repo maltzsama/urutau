@@ -8,7 +8,9 @@ import (
 
 	pglogrepl "github.com/jackc/pglogrepl"
 
+	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 )
 
@@ -30,7 +32,10 @@ func beginPayload(finalLSN uint64, commitTS time.Time, xid uint32) []byte {
 // TestCommitTSCapturedFromBegin covers #160: the transaction commit time from
 // the pgoutput Begin message is stamped on every row of the transaction.
 func TestCommitTSCapturedFromBegin(t *testing.T) {
-	r := &Reader{}
+	out := make(chan *dataplane.Batch, 8)
+	st := orderState()
+	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}
+	r := directReader(out, st, ref, false)
 	want := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
 	if err := r.handleXLogData(context.Background(), pglogrepl.XLogData{WALData: beginPayload(0x40, want, 7)}); err != nil {
 		t.Fatal(err)
@@ -38,17 +43,22 @@ func TestCommitTSCapturedFromBegin(t *testing.T) {
 	if !r.curCommitTS.Equal(want) {
 		t.Fatalf("curCommitTS = %v, want %v", r.curCommitTS, want)
 	}
-	r.enqueue(relEntry{ref: source.TableRef{Target: "raw.t"}}, rowchange.OpInsert, map[string]any{"id": int64(1)}, nil)
-	if len(r.txn) != 1 {
-		t.Fatalf("txn = %d rows, want 1", len(r.txn))
-	}
-	if !r.txn[0].CommitTS.Equal(want) {
-		t.Fatalf("change CommitTS = %v, want %v", r.txn[0].CommitTS, want)
+	entry := r.relByID[1]
+	if err := r.appendChange(entry, rowchange.OpInsert, []any{int64(1), "a", "1", true}, nil); err != nil {
+		t.Fatal(err)
 	}
 	// Every row of the same transaction shares the commit time.
-	r.enqueue(relEntry{ref: source.TableRef{Target: "raw.t"}}, rowchange.OpDelete, nil, map[string]any{"id": int64(2)})
-	if !r.txn[1].CommitTS.Equal(want) {
-		t.Fatalf("second change CommitTS = %v, want %v", r.txn[1].CommitTS, want)
+	if err := r.appendChange(entry, rowchange.OpDelete, nil, []any{int64(2), "b", "2", false}); err != nil {
+		t.Fatal(err)
+	}
+	chs := flushAndDecode(t, r, out, ref, *position.MustLSN("0/40"))
+	if len(chs) != 2 {
+		t.Fatalf("changes = %d, want 2", len(chs))
+	}
+	for i, c := range chs {
+		if !c.CommitTS.Equal(want) {
+			t.Fatalf("change %d CommitTS = %v, want %v", i, c.CommitTS, want)
+		}
 	}
 }
 
