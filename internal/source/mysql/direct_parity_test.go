@@ -113,7 +113,7 @@ func TestDirectPathAppliesFilter(t *testing.T) {
 	tbl := ordersTable()
 	out := make(chan *dataplane.Batch, 8)
 	r := newTestReader(out)
-	proj, err := newProjection(nil, &spec.Filter{
+	proj, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "id", Op: spec.OpGt, Value: float64(1)},
 	}, tbl)
 	if err != nil {

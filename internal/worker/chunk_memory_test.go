@@ -22,7 +22,6 @@ import (
 // a SQL driver does: every row's cells are new allocations.
 type payloadChunkSource struct{ n, size int }
 
-func (p *payloadChunkSource) PK() []string                            { return []string{"id"} }
 func (p *payloadChunkSource) Bounds(context.Context) ([][]any, error) { return nil, nil }
 func (p *payloadChunkSource) Scan(_ context.Context, _ source.Chunk, fn func(map[string]any) error) error {
 	for i := 0; i < p.n; i++ {

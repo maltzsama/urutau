@@ -18,7 +18,6 @@ type fakeChunkSource struct {
 	rows []map[string]any
 }
 
-func (f *fakeChunkSource) PK() []string { return f.pk }
 func (f *fakeChunkSource) Bounds(context.Context) ([][]any, error) {
 	return nil, nil
 }

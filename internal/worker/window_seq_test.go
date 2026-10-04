@@ -35,9 +35,10 @@ func runStagedWindow(t *testing.T, snap, live []rowchange.Change, seq uint64) []
 	}
 	ingest := make(chan Ingest, len(live)+1)
 	for _, c := range live {
-		ingest <- toIngest(t, c)
+		dpb := wireBatch(t, c.Table, dataplane.UpsertMode, []rowchange.Change{c})
+		ingest <- Ingest{Table: c.Table, Batch: dpb, Win: &rowchange.Window{ChunkID: 7, InWindow: true}}
 	}
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9", Window: &rowchange.Window{ChunkID: 7, Closes: true}})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
 	closes.Seq, closes.Staged = seq, true
 	ingest <- closes
 	close(ingest)
@@ -71,7 +72,6 @@ func TestStagedEmptyWindowDeliversItsSeq(t *testing.T) {
 	live := []rowchange.Change{{
 		Op: rowchange.OpUpdate, Table: "raw.orders", Key: []any{int64(1)},
 		After: map[string]any{"id": int64(1), "v": "z"}, Position: "p1",
-		Window: &rowchange.Window{ChunkID: 7, InWindow: true},
 	}}
 	seqs := runStagedWindow(t, []rowchange.Change{windowRow(1, "a")}, live, 42)
 	found := false

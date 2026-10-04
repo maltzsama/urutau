@@ -52,7 +52,7 @@ func testKind(dataType string) core.Kind {
 // the canonical schema, projection and relation entry the encoder needs.
 func directReader(out chan *dataplane.Batch, st *TableState, ref source.TableRef, upsert bool) *Reader {
 	cs := testSchema(st, ref.PrimaryKey)
-	proj, _ := newProjection(nil, nil, st)
+	proj, _ := newProjection(nil, st)
 	entry := relEntry{state: st, ref: ref, proj: proj}
 	return &Reader{
 		batchOut: out,

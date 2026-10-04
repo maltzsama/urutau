@@ -201,9 +201,6 @@ func (c *Chunker) resolveStrategy(ctx context.Context) error {
 	return nil
 }
 
-// PK returns the primary key columns.
-func (c *Chunker) PK() []string { return c.pk }
-
 // Bounds returns the ordered chunk boundary keys for the resolved strategy.
 // The whole computation is retried on a transient error.
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {

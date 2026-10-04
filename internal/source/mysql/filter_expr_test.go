@@ -35,7 +35,7 @@ func rowFor(tbl *schema.Table, vals map[string]any) []any {
 
 func TestProjectionKeepNumeric(t *testing.T) {
 	tbl := projectionTable()
-	p, err := newProjection(nil, &spec.Filter{
+	p, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "active", Op: spec.OpEq, Value: float64(1)},
 	}, tbl)
 	if err != nil {
@@ -60,7 +60,7 @@ func TestProjectionKeepDecimalExact(t *testing.T) {
 	// DECIMAL compares exactly: a value one ulp past 100.5 must pass, and the
 	// boundary itself must not.
 	tbl := projectionTable()
-	p, err := newProjection(nil, &spec.Filter{
+	p, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "amount", Op: spec.OpGt, Value: "100.5"},
 	}, tbl)
 	if err != nil {
@@ -83,7 +83,7 @@ func TestProjectionKeepDecimalExact(t *testing.T) {
 }
 
 func TestProjectionRejectsUnknownFilterColumn(t *testing.T) {
-	_, err := newProjection(nil, &spec.Filter{
+	_, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "nope", Op: spec.OpEq, Value: 1},
 	}, projectionTable())
 	if err == nil {
@@ -101,7 +101,7 @@ func TestProjectionKeepCaseInsensitive(t *testing.T) {
 		},
 	}
 	// A _ci column matches case-insensitively, matching the snapshot.
-	p, err := newProjection(nil, &spec.Filter{
+	p, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "active"},
 	}, tbl)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestProjectionKeepCaseInsensitive(t *testing.T) {
 		t.Fatalf("_ci keep(ACTIVE) = %v, %v; want true", ok, err)
 	}
 	// A _bin column stays case-sensitive.
-	b, err := newProjection(nil, &spec.Filter{
+	b, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "code", Op: spec.OpEq, Value: "abc"},
 	}, tbl)
 	if err != nil {

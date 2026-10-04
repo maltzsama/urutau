@@ -28,8 +28,6 @@ type fakeSource struct {
 	rows []map[string]any // ordered by id
 }
 
-func (f *fakeSource) PK() []string { return []string{"id"} }
-
 func (f *fakeSource) Bounds(ctx context.Context) ([][]any, error) {
 	// One bound every 2 rows: [1, 3, 5, ...].
 	var bounds [][]any

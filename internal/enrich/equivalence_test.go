@@ -95,14 +95,10 @@ func canonicalScenario() []rowchange.Change {
 	// PK 5 — enrich hit: user_ref 1 -> ana/gold.
 	add(ev(rowchange.OpInsert, 5, 1, "hit", 0))
 
-	// PK 6 — a snapshot window opens: InWindow rows, then a Closes marker.
-	win := &rowchange.Window{ChunkID: 7, InWindow: true}
-	c6a := ev(rowchange.OpInsert, 6, 1, "w1", 0)
-	c6a.Window = win
-	add(c6a)
-	c6b := ev(rowchange.OpUpdate, 6, 1, "w2", 0)
-	c6b.Window = win
-	add(c6b)
+	// PK 6 — windowed rows pass the seam in order. (The window tag itself now
+	// lives on the wire meta / Ingest.Win, not on rowchange.Change.)
+	add(ev(rowchange.OpInsert, 6, 1, "w1", 0))
+	add(ev(rowchange.OpUpdate, 6, 1, "w2", 0))
 
 	// Filler up to 30 so positions run pos-0001..0030 and the batch is not
 	// trivially small.

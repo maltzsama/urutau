@@ -64,7 +64,7 @@ func TestSnapshotDoneCommitsCompletionAfterTheWindow(t *testing.T) {
 		t.Fatalf("AddWindowRows: %v", err)
 	}
 	ingest := make(chan Ingest, 3)
-	ingest <- toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9", Window: &rowchange.Window{ChunkID: 7, Closes: true}})
+	ingest <- toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
 	ingest <- Ingest{Table: "raw.orders", Position: "p9", SnapshotDone: true}
 	close(ingest)
 	if err := w.Run(context.Background(), ingest); err != nil {

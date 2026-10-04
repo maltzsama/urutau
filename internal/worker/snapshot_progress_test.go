@@ -29,7 +29,7 @@ func TestWindowCommitsTheSnapshotPendingItsMarkerNames(t *testing.T) {
 	if err := w.AddWindowRows("raw.orders", 7, toWindow(t, "raw.orders", []rowchange.Change{windowRow(1, "a"), windowRow(2, "b")})); err != nil {
 		t.Fatalf("AddWindowRows: %v", err)
 	}
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9", Window: &rowchange.Window{ChunkID: 7, Closes: true}})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
 	closes.SnapshotPending = []uint32{3, 4}
 	ingest := make(chan Ingest, 1)
 	ingest <- closes
@@ -89,7 +89,7 @@ func TestWindowMarkerProgressWinsOverThePipelineState(t *testing.T) {
 	if err := w.AddWindowRows("raw.orders", 7, toWindow(t, "raw.orders", []rowchange.Change{windowRow(1, "a")})); err != nil {
 		t.Fatalf("AddWindowRows: %v", err)
 	}
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9", Window: &rowchange.Window{ChunkID: 7, Closes: true}})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
 	closes.SnapshotPending = []uint32{3, 4}
 	ingest := make(chan Ingest, 1)
 	ingest <- closes

@@ -125,17 +125,18 @@ func wireBatch(t *testing.T, table string, mode dataplane.WriteMode, changes []r
 	return &dataplane.Batch{Table: table, Record: rec, Mode: mode}
 }
 
-// toIngest wraps one change into an Ingest (bridging to a batch), or a
-// window marker into Ingest with Win set.
-func toIngest(t *testing.T, c rowchange.Change) Ingest {
+// toIngest wraps one change into an Ingest (bridging to a batch); a non-nil
+// win makes it a window event or (Closes) a window marker.
+func toIngest(t *testing.T, c rowchange.Change, win ...*rowchange.Window) Ingest {
 	t.Helper()
 	dpb := wireBatch(t, c.Table, dataplane.UpsertMode, []rowchange.Change{c})
-	if c.Window != nil {
-		if c.Window.Closes {
-			return Ingest{Table: c.Table, Win: c.Window, Position: c.Position}
+	if len(win) > 0 && win[0] != nil {
+		w := win[0]
+		if w.Closes {
+			return Ingest{Table: c.Table, Win: w, Position: c.Position}
 		}
 		// InWindow is DATA + a routing tag; the batch must survive.
-		return Ingest{Table: c.Table, Batch: dpb, Win: c.Window}
+		return Ingest{Table: c.Table, Batch: dpb, Win: w}
 	}
 	return Ingest{Table: c.Table, Batch: dpb}
 }

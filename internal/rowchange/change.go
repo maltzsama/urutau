@@ -72,9 +72,6 @@ type Change struct {
 	// orthogonal to Op — a snapshot row is semantically an insert. Sinks
 	// materialize it only when the table declares the phase metadata column.
 	Phase string
-	// Window tags the change as part of a DBLog snapshot window. Nil for
-	// plain stream events.
-	Window *Window
 	// Transport is the message-queue envelope when the event came from a
 	// message log (Kafka today, Kinesis next). CDC sources leave it nil and
 	// their transport metadata (stream = source table, sequence = position)
