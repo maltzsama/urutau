@@ -59,7 +59,7 @@ wait:
 		}
 	}
 
-	c.markChunkReady("raw.orders", 0, 1)
+	c.markWindowReady("raw.orders", 0, 1)
 	deadline = time.After(5 * time.Second)
 	for count < n {
 		select {

@@ -71,19 +71,19 @@ func TestChunkExecutorEmitsWireBatch(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 
-	if len(sent) != 1 || sent[0].GetChunkReady() == nil {
-		t.Fatalf("expected one ChunkReady, got %+v", sent)
+	if len(sent) != 2 || sent[0].GetWindowOpen() == nil || sent[1].GetChunkReady() == nil {
+		t.Fatalf("expected a WindowOpen then a ChunkReady, got %+v", sent)
 	}
-	if got := sent[0].GetChunkReady().Rows; got != 2 {
+	if got := sent[1].GetChunkReady().Rows; got != 2 {
 		t.Fatalf("ChunkReady.Rows = %d, want 2", got)
 	}
 
 	p := w.tables["dst.t"]
 	p.winMu.Lock()
-	win := p.windows[3]
+	win := p.windows[1] // the first (and only) window's seq
 	p.winMu.Unlock()
 	if win == nil {
-		t.Fatal("chunk 3 window not stored")
+		t.Fatal("window 1 not stored")
 	}
 	t.Cleanup(func() { win.batch.Release() })
 	br, err := transport.NewBatchReader(win.batch.Record, []string{"id"})

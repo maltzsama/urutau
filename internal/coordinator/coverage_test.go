@@ -58,6 +58,7 @@ func coordHarness() (*Coordinator, *workerState) {
 		stagedLocks: map[string]*sync.Mutex{},
 		runID:       "run-1",
 		gateDrain:   make(chan struct{}),
+		windowOpen:  make(chan *pb.WindowOpen, 1024),
 	}
 	c.supervisor = newSupervisor(c)
 	c.publishRouting(&routing{

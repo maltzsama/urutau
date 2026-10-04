@@ -35,6 +35,9 @@ type Config struct {
 	MaxInterval time.Duration
 	// MetricsAddr serves /metrics (Prometheus); empty disables it.
 	MetricsAddr string
+	// SnapshotReadChunkBytes is one DBLog snapshot window's byte cap (issue
+	// #622); zero: 64 MiB.
+	SnapshotReadChunkBytes int64
 }
 
 // OnCommit observes successful commits (bookkeeping, tests).
@@ -104,6 +107,9 @@ type tablePipeline struct {
 	winMu   sync.Mutex
 	windows map[uint64]*snapshotWindow
 	dropped int64
+	// winClosed signals (non-blocking) when a window closes, waking the chunk
+	// reader's backpressure wait (issue #622).
+	winClosed chan struct{}
 
 	// Snapshot state for resumable backfill. The snapshot state machine
 	// (not_started -> in_progress -> complete) and the pending chunk list
@@ -311,48 +317,10 @@ func newTablePipeline(target string, c sink.TableWriter, mode dataplane.WriteMod
 		ch:             make(chan Ingest, 1024),
 		readyCh:        make(chan readyBatch, 1),
 		windows:        map[uint64]*snapshotWindow{},
+		winClosed:      make(chan struct{}, 1),
 		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
 		driftReported:  map[string]bool{},
 	}
-}
-
-// snapshotWindow is one DBLog chunk's SELECT rows, stored as the batch the
-// snapshot source produced (no row decode). Live InWindow events mark keys
-// in touched; Closes emits the batch minus the touched rows.
-type snapshotWindow struct {
-	batch *dataplane.Batch
-	// keys is the set of PK key-strings the window holds, computed once when
-	// the chunk is stored. markBatchSideEffects tests membership here instead
-	// of re-scanning the batch per live row (issue #266).
-	keys    map[string]struct{}
-	touched map[string]struct{}
-}
-
-// AddWindowRows stores one chunk's SELECT batch for the snapshot window.
-// The window TAKES OWNERSHIP of the batch; the Closes handler releases it.
-func (w *Worker) AddWindowRows(target string, windowID uint64, batch *dataplane.Batch) error {
-	p, ok := w.tables[target]
-	if !ok {
-		batch.Release()
-		return fmt.Errorf("worker: window rows for unregistered table %s", target)
-	}
-	p.winMu.Lock()
-	defer p.winMu.Unlock()
-	if _, dup := p.windows[windowID]; dup {
-		batch.Release()
-		return fmt.Errorf("worker: window rows: duplicate window %d for %s", windowID, target)
-	}
-	// Precompute the window's key set once: the live path tests membership per
-	// row, and re-scanning the whole chunk per row was O(rows × windows ×
-	// window-rows) during the snapshot (issue #266).
-	keys := make(map[string]struct{}, batch.Record.NumRows())
-	if r, err := transport.NewBatchReader(batch.Record, p.knownSchema.PrimaryKey); err == nil {
-		for i := range r.NumRows() {
-			keys[rowchange.KeyString(r.Key(i))] = struct{}{}
-		}
-	}
-	p.windows[windowID] = &snapshotWindow{batch: batch, keys: keys, touched: make(map[string]struct{})}
-	return nil
 }
 
 // DroppedByWindow reports how many snapshot rows the DBLog window discarded
@@ -1020,6 +988,7 @@ func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, bool, error) {
 		return nil, false, nil
 	}
 	delete(p.windows, ing.Win.WindowID)
+	signalWindowClosed(p)
 	p.winMu.Unlock()
 
 	if win.batch.Record == nil || win.batch.Record.NumRows() == 0 {

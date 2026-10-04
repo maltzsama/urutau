@@ -95,9 +95,9 @@ func (c *Coordinator) gateTakeLocked(key string) []*dataplane.Batch {
 	return buf
 }
 
-// markChunkReady records that chunkID's rows are in its worker's window (its
-// ChunkReady arrived), and wakes a pump blocked on the full gate so it drains.
-func (c *Coordinator) markChunkReady(target string, partition int, chunkID uint32) {
+// markWindowReady records that windowID's rows are in the worker's window (a
+// WindowOpen arrived), and wakes a pump blocked on the full gate so it drains.
+func (c *Coordinator) markWindowReady(target string, partition int, windowID uint64) {
 	key := gateKey(target, partition)
 	c.gateMu.Lock()
 	defer c.gateMu.Unlock()
@@ -105,21 +105,21 @@ func (c *Coordinator) markChunkReady(target string, partition int, chunkID uint3
 		return
 	}
 	if c.gateReady == nil {
-		c.gateReady = map[string]uint32{}
+		c.gateReady = map[string]uint64{}
 	}
-	c.gateReady[key] = chunkID
+	c.gateReady[key] = windowID
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 }
 
-// drainReadyWindow is the pump's early flush of a full gate whose chunk is
-// ready: the held batches go out InWindow-tagged for that chunk, as
+// drainReadyWindow is the pump's early flush of a full gate whose window is
+// ready: the held batches go out InWindow-tagged for that window, as
 // flushWindow would at the end of the catch-up.
 func (c *Coordinator) drainReadyWindow(ctx context.Context, key string) error {
 	c.gateFlushMu.Lock()
 	defer c.gateFlushMu.Unlock()
 	c.gateMu.Lock()
-	chunkID, ready := c.gateReady[key]
+	windowID, ready := c.gateReady[key]
 	win, open := c.gateWin[key]
 	if !ready || !open {
 		c.gateMu.Unlock()
@@ -129,16 +129,16 @@ func (c *Coordinator) drainReadyWindow(ctx context.Context, key string) error {
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
-	return c.enqueueWindowed(ctx, win.target, chunkID, buf)
+	return c.enqueueWindowed(ctx, win.target, windowID, buf)
 }
 
-// enqueueWindowed queues held batches InWindow-tagged for chunkID, in order.
+// enqueueWindowed queues held batches InWindow-tagged for windowID, in order.
 // A fresh meta per batch: enqueueBatch assigns the cycle id into it, and a
 // shared one would put every held batch in one cycle.
-func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, chunkID uint32, buf []*dataplane.Batch) error {
+func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, windowID uint64, buf []*dataplane.Batch) error {
 	return c.enqueueHeld(ctx, &pb.BatchMeta{
 		Table:  target,
-		Window: &pb.WindowTag{InWindow: true, WindowId: uint64(chunkID)},
+		Window: &pb.WindowTag{InWindow: true, WindowId: windowID},
 	}, buf)
 }
 

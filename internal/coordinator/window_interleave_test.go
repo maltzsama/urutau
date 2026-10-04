@@ -36,22 +36,13 @@ import (
 // converge on post-E.
 
 // interleaveReader is a source reader whose caught-up position is fixed. The
-// position (Master/Synced) is injected by construction, so the caught-up
-// proof is a predicate over position, never a wait. Master refuses to be
-// called before the chunk read finished, which is the invariant under test.
+// position is injected by construction, so the caught-up proof is a predicate
+// over position, never a wait. The window's position now arrives in the
+// worker's WindowOpen (captured after the read — the invariant under test),
+// so the reader's Master is never consulted here.
 type interleaveReader struct {
 	source.SourceReader
-	pos      position.Position
-	readDone chan struct{} // closed by the worker once the chunk SELECT finished
-}
-
-func (r interleaveReader) Master(context.Context) (position.Position, error) {
-	select {
-	case <-r.readDone:
-		return r.pos, nil
-	default:
-		return nil, fmt.Errorf("the window position was captured before the chunk read finished")
-	}
+	pos position.Position
 }
 
 func (r interleaveReader) Synced() position.Position { return r.pos }
@@ -69,6 +60,7 @@ func interleaveHarness(t *testing.T) (*Coordinator, *workerState) {
 	w.out = make(chan *pb.CoordinatorMessage, 8)
 	w.queue = make(chan queuedBatch, 64)
 	c.chunkReady = make(chan *pb.ChunkReady, 8)
+	c.windowOpen = make(chan *pb.WindowOpen, 8)
 	return c, w
 }
 
@@ -88,9 +80,10 @@ func interleaveUpdate(t *testing.T, id int64, v, pos string) *dataplane.Batch {
 }
 
 // runSnapshotRoundTrip drives one snapshotChunk round-trip: the worker reads
-// the chunk (closing readDone) and reports ChunkReady, and the coordinator
-// captures the window position, proves caught-up, and flushes + closes.
-func runSnapshotRoundTrip(t *testing.T, c *Coordinator, w *workerState, rdr interleaveReader, chunkID uint32) error {
+// the chunk, captures pos AFTER the read (WindowOpen.pos), and reports one
+// window (seq 7) then ChunkReady. The coordinator proves caught up to pos and
+// flushes + closes the window.
+func runSnapshotRoundTrip(t *testing.T, c *Coordinator, w *workerState, rdr interleaveReader, chunkID uint32, pos string) error {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -98,14 +91,14 @@ func runSnapshotRoundTrip(t *testing.T, c *Coordinator, w *workerState, rdr inte
 	go func() {
 		m := <-w.out
 		if req := m.GetChunk(); req != nil {
-			close(rdr.readDone) // the chunk SELECT finished
-			c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: w.epoch}
+			c.windowOpen <- &pb.WindowOpen{Table: req.Table, ChunkId: req.ChunkId, Attempt: w.epoch, Seq: 7, Pos: pos}
+			c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: w.epoch, WindowIds: []uint64{7}}
 		}
 	}()
 
 	lost := c.lostSignal(w)
 	ch := source.Chunk{Low: []any{int64(1)}, High: []any{int64(2)}}
-	return c.snapshotChunk(ctx, rdr, c.refs[0], 0, w, snapshot.SnapshotConfig{}, ch, chunkID, w.epoch, lost, nil)
+	return c.snapshotChunk(ctx, rdr, c.refs[0], 0, w, snapshot.SnapshotConfig{}, ch, chunkID, 0, w.epoch, lost, nil, map[uint64]int{})
 }
 
 // queuedOut is one batch the worker received, with its meta and its Arrow IPC
@@ -194,8 +187,8 @@ func TestWindowInterleaveWithinTheWindow(t *testing.T) {
 		t.Fatal("the open window did not hold the live update")
 	}
 
-	rdr := interleaveReader{pos: position.MustLSN("0/10"), readDone: make(chan struct{})}
-	if err := runSnapshotRoundTrip(t, c, w, rdr, 7); err != nil {
+	rdr := interleaveReader{pos: position.MustLSN("0/10")}
+	if err := runSnapshotRoundTrip(t, c, w, rdr, 7, "0/10"); err != nil {
 		t.Fatalf("snapshot round-trip: %v", err)
 	}
 
@@ -220,8 +213,8 @@ func TestWindowInterleaveAfterTheWindow(t *testing.T) {
 	defer c.releaseAllGates()
 
 	c.openWindow("raw.orders", 0)
-	rdr := interleaveReader{pos: position.MustLSN("0/10"), readDone: make(chan struct{})}
-	if err := runSnapshotRoundTrip(t, c, w, rdr, 7); err != nil {
+	rdr := interleaveReader{pos: position.MustLSN("0/10")}
+	if err := runSnapshotRoundTrip(t, c, w, rdr, 7, "0/10"); err != nil {
 		t.Fatalf("snapshot round-trip: %v", err)
 	}
 

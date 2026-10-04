@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 // chunkRequest is one ChunkRequest a fake worker received.
 type chunkRequest struct {
 	bounds string
-	window uint32
+	window uint64
 }
 
 // Issue #461: a worker lost mid-snapshot takes its chunk windows with it: the
@@ -41,22 +42,26 @@ func TestSnapshotRedoesTheChunksALostWorkerHeld(t *testing.T) {
 	defer c.releaseAllGates()
 
 	// The worker answers every chunk at once, under its current epoch, and
-	// frees its budget; it commits only once commit is set.
+	// frees its budget; it commits only once commit is set. Each chunk opens
+	// one window under a fresh monotonic seq, as the byte-cap reader would.
 	var mu sync.Mutex
 	var requests []chunkRequest
 	var commit bool
+	var seq uint64
 	go func() {
 		for {
 			select {
 			case m := <-w.out:
 				if req := m.GetChunk(); req != nil {
-					mu.Lock()
-					requests = append(requests, chunkRequest{bounds: string(req.Bounds), window: req.ChunkId})
-					mu.Unlock()
 					c.mu.Lock()
 					epoch := w.epoch
 					c.mu.Unlock()
-					c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: epoch}
+					s := atomic.AddUint64(&seq, 1)
+					mu.Lock()
+					requests = append(requests, chunkRequest{bounds: string(req.Bounds), window: s})
+					mu.Unlock()
+					c.windowOpen <- &pb.WindowOpen{Table: req.Table, ChunkId: req.ChunkId, Attempt: epoch, Seq: s, Pos: "0/1"}
+					c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: epoch, WindowIds: []uint64{s}}
 				}
 			case q := <-w.queue:
 				c.budget.release(w.name, int64(len(q.body)+len(q.meta)))
@@ -139,7 +144,7 @@ func TestSnapshotRedoesTheChunksALostWorkerHeld(t *testing.T) {
 	if len(got) != maxUncommittedChunks+len(chunks) {
 		t.Fatalf("%d chunk requests, want %d: the %d lost chunks redone, then the rest", len(got), maxUncommittedChunks+len(chunks), maxUncommittedChunks)
 	}
-	lostWindows := map[uint32]bool{}
+	lostWindows := map[uint64]bool{}
 	for i := 0; i < maxUncommittedChunks; i++ {
 		lostWindows[got[i].window] = true
 	}

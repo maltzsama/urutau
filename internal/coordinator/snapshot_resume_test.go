@@ -63,7 +63,8 @@ func newResumeHarness(t *testing.T) *resumeHarness {
 					h.mu.Lock()
 					h.asked = append(h.asked, string(req.Bounds))
 					h.mu.Unlock()
-					c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId}
+					c.windowOpen <- &pb.WindowOpen{Table: req.Table, ChunkId: req.ChunkId, Attempt: w.epoch, Seq: uint64(req.ChunkId), Pos: "0/1"}
+					c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: w.epoch}
 				}
 			case q := <-w.queue:
 				meta := &pb.BatchMeta{}

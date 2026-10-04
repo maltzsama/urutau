@@ -30,11 +30,11 @@ const chunkCommitPoll = 20 * time.Millisecond
 type chunkMarker struct {
 	id     uint64
 	target string
-	window uint32
+	window uint64
 }
 
 // noteChunkMarker records a queued Closes marker of worker's snapshot.
-func (c *Coordinator) noteChunkMarker(worker string, id uint64, target string, window uint32) {
+func (c *Coordinator) noteChunkMarker(worker string, id uint64, target string, window uint64) {
 	c.chunkMarkersMu.Lock()
 	defer c.chunkMarkersMu.Unlock()
 	if c.chunkMarkers == nil {
