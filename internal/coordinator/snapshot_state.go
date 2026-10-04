@@ -243,9 +243,11 @@ func (c *Coordinator) snapshotTodoFor(target string) map[uint32]bool {
 	return c.snapshotTodo[target]
 }
 
-// sendCloses queues a chunk's Closes marker for its partition's worker —
-// not routed through enqueueBatch's table-wide lookup, since a marker carries
-// no rows for enqueueBatch to route by key.
+// sendClosesPending queues a chunk's Closes marker for its partition's worker
+// — not routed through enqueueBatch's table-wide lookup, since a marker carries
+// no rows for enqueueBatch to route by key. pending names the table's snapshot
+// chunks still to do after this window, which the worker commits with the
+// window's rows so a restarted coordinator resumes there (issue #461).
 //
 // On a staged table the worker delivers the window's rows as the marker's
 // cycle (#416), so the marker takes a place in the table's send order here,
@@ -253,13 +255,6 @@ func (c *Coordinator) snapshotTodoFor(target string) map[uint32]bool {
 // released ahead of it. Committed on arrival instead, it could move the
 // table's committed position past live cycles still open, and a crash would
 // then take their replay for covered.
-func (c *Coordinator) sendCloses(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32) error {
-	return c.sendClosesPending(ctx, w, target, at, chunkID, nil)
-}
-
-// sendClosesPending is sendCloses naming the table's snapshot chunks still to
-// do after this window, which the worker commits with the window's rows so a
-// restarted coordinator resumes there (issue #461).
 func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32, pending []uint32) error {
 	meta := &pb.BatchMeta{
 		Table:  target,

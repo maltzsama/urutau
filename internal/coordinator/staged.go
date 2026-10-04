@@ -39,7 +39,7 @@ type stagedCycle struct {
 // arrival. A DBLog window's rows are not one of those: live cycles flow
 // during a snapshot, so a window committed on arrival could move the table's
 // position past live cycles still open. They are delivered as their Closes
-// marker's cycle instead (sendCloses, #416).
+// marker's cycle instead (sendClosesPending, #416).
 type stagedCycles struct {
 	mu    sync.Mutex
 	open  map[cycleKey]*stagedCycle // still accumulating

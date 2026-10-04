@@ -3,13 +3,10 @@
 package position
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"sort"
 )
-
-var ErrNoPosition = errors.New("position: no known position")
 
 // Incomparable is the Compare result for two positions with no defined order.
 // Some positions are opaque cookies (plugin offsets, contract §8.2) — their

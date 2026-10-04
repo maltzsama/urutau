@@ -408,7 +408,7 @@ func TestWaitChunkReadyIgnoresStaleEpoch(t *testing.T) {
 	c := &Coordinator{chunkReady: make(chan *pb.ChunkReady, 4), log: slog.New(slog.DiscardHandler)}
 	c.chunkReady <- &pb.ChunkReady{Table: "t", ChunkId: 0, Epoch: 1} // stale
 	c.chunkReady <- &pb.ChunkReady{Table: "t", ChunkId: 0, Epoch: 2} // current
-	if err := c.waitChunkReady(context.Background(), "t", 0, 2); err != nil {
+	if _, err := c.waitChunkReadyOr(context.Background(), "t", 0, 2, nil); err != nil {
 		t.Fatalf("waitChunkReady: %v", err)
 	}
 	if len(c.chunkReady) != 0 {
@@ -422,7 +422,7 @@ func TestWaitChunkReadyStaleOnlyTimesOut(t *testing.T) {
 	c.chunkReady <- &pb.ChunkReady{Table: "t", ChunkId: 0, Epoch: 1}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if err := c.waitChunkReady(ctx, "t", 0, 2); err == nil {
+	if _, err := c.waitChunkReadyOr(ctx, "t", 0, 2, nil); err == nil {
 		t.Fatal("a stale-epoch reply must not satisfy the wait")
 	}
 }

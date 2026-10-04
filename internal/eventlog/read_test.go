@@ -76,10 +76,11 @@ func TestListRuns(t *testing.T) {
 }
 
 func TestReadRunConcatenatesRotations(t *testing.T) {
-	got, err := readRun(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "20260101T000000-aa")
+	tr, err := readRunTrail(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "20260101T000000-aa")
 	if err != nil {
 		t.Fatal(err)
 	}
+	got := tr.Events
 	if len(got) != 2 {
 		t.Fatalf("events = %d, want 2 (both rotated objects)", len(got))
 	}
@@ -147,7 +148,7 @@ func TestReadRunTrailUnsealed(t *testing.T) {
 
 // #329: a nonexistent run is ErrNotFound, not an empty success.
 func TestReadRunNotFound(t *testing.T) {
-	_, err := readRun(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "nope")
+	_, err := readRunTrail(context.Background(), testLister(), RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "nope")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
