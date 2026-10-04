@@ -196,7 +196,7 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 				}
 			}
 		} else {
-			hitMask, herr := mustIsIn(ctx, keyArr, snap.refTable.Column(0))
+			hitMask, herr := membershipMask(alloc, keyArr, snap)
 			if herr != nil {
 				participation.Release()
 				relOwned()
@@ -506,18 +506,26 @@ func mustOr(ctx context.Context, a, bm *array.Boolean) (*array.Boolean, error) {
 	return boolFromDatum(out), nil
 }
 
-func mustIsIn(ctx context.Context, values arrow.Array, valueSet arrow.Array) (*array.Boolean, error) {
-	out, err := compute.CallFunction(ctx, "is_in",
-		&compute.SetOptions{
-			ValueSet:     &compute.ArrayDatum{Value: valueSet.Data()},
-			NullBehavior: compute.NullMatchingSkip,
-		},
-		&compute.ArrayDatum{Value: values.Data()})
-	if err != nil {
-		return nil, fmt.Errorf("enrich: kernel is_in: %w", err)
+// membershipMask builds the participation hit mask from the snapshot's
+// keyIndex — built once per refresh — instead of the is_in kernel, which
+// rebuilds an Arrow hash set of the whole reference key column on every batch
+// (#589: a 100k-row reference costs ~7 ms / ~9 MB per 2000-row batch; a 5M-row
+// one ~1.3 s / ~557 MB). The keyIndex is the same source gatherRefColumns
+// already reads, so membership and the gather agree by construction. A NULL or
+// unknown key normalizes to a value the index never holds, so it is a miss —
+// the same verdict as is_in with NullMatchingSkip.
+func membershipMask(alloc memory.Allocator, keyArr arrow.Array, snap *snapshot) (*array.Boolean, error) {
+	n := keyArr.Len()
+	b := array.NewBooleanBuilder(alloc)
+	b.Reserve(n)
+	//allow:rowloop ref membership: reuse the once-per-refresh keyIndex, not a per-batch set rebuild (#589).
+	for i := 0; i < n; i++ {
+		_, ok := snap.keyIndex[normalizeKey(readArrowValue(keyArr, i))]
+		b.Append(ok)
 	}
-	defer out.Release()
-	return boolFromDatum(out), nil
+	out := b.NewBooleanArray()
+	b.Release()
+	return out, nil
 }
 
 func mustAllFalse(_ context.Context, n int) (*array.Boolean, error) {

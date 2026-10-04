@@ -813,7 +813,7 @@ func buildImage(rj *refJoin, rec arrow.RecordBatch) (*snapshot, error) {
 		if kc.IsNull(i) {
 			continue
 		}
-		k := normalizeKey(arrowValueAt(kc, i))
+		k := normalizeKey(readArrowValue(kc, i))
 		if _, dup := keyIndex[k]; dup {
 			dupCount++
 			continue
@@ -864,31 +864,10 @@ func normalizeKey(v any) any {
 	}
 }
 
-// arrowValueAt returns the canonical Go value at row i of an Arrow column,
-// nil when null. Only the reference value types are handled.
-func arrowValueAt(col arrow.Array, i int) any {
-	if col.IsNull(i) {
-		return nil
-	}
-	switch a := col.(type) {
-	case *array.String:
-		return a.Value(i)
-	case *array.Binary:
-		return a.Value(i)
-	case *array.Boolean:
-		return a.Value(i)
-	case *array.Int64:
-		return a.Value(i)
-	case *array.Uint64:
-		return a.Value(i)
-	case *array.Float64:
-		return a.Value(i)
-	case *array.Timestamp:
-		return a.Value(i).ToTime(arrow.Microsecond)
-	default:
-		return nil
-	}
-}
+// arrowValueAt was removed: the reference index is built with readArrowValue
+// (columnar.go) so the index builder and the batch lookup read a column's
+// value identically — arrowValueAt lacked the Int32/Float32 cases
+// readArrowValue has (issue #640).
 
 func (rj *refJoin) stickyErr() error {
 	rj.mu.Lock()
