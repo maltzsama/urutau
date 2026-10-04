@@ -184,8 +184,10 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		opts.CoordinatorMemory = "6Gi"
 		opts.CoordinatorCPU = "4"
 		// The harness worker's request is 1Gi; the race worker OOM-killed
-		// with a 3Gi limit, so this raises the limit to 5Gi.
-		opts.WorkerMemoryOverhead = "4Gi"
+		// with a 5Gi limit (the race detector's ~1.5 GiB sits outside the Go
+		// heap, so heap + race outgrew the cgroup during the full-100k
+		// snapshot). Raise the limit to 7Gi so the race image fits.
+		opts.WorkerMemoryOverhead = "6Gi"
 		opts.WorkerCPUOverhead = "1500m"
 	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
