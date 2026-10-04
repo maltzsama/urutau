@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,10 +13,11 @@ import (
 )
 
 // Chunker splits a table by its primary key, using the chunk-skipping
-// bounds trick: pick every chunkSize-th key with LIMIT 1 OFFSET n, then read
-// the slice between consecutive bounds. Reading ORDER BY pk LIMIT 1 OFFSET n
-// is O(n) per bounds query, but avoids scanning gaps and stays correct under
-// concurrent inserts (bounds are only seeds for the half-open range).
+// bounds trick: pick every chunkSize-th key, then read the slice between
+// consecutive bounds. Bounds are read by keyset seek (WHERE pk > last), a
+// B-tree descent per probe, not a growing OFFSET that re-scanned from the
+// first row (#588); the bounds stay correct under concurrent inserts because
+// they are only seeds for the half-open range.
 type Chunker struct {
 	db        *sql.DB
 	schema    string
@@ -69,32 +71,57 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int, loc *time.Location
 }
 
 // Bounds returns the ordered list of chunk boundary keys: key[0] is the
-// lowest PK, followed by every chunkSize-th key, then nil (the open high
-// bound of the last chunk).
+// lowest PK, followed by every chunkSize-th key (the open high bound of the
+// last chunk is added by Chunks, not here). Bounds are read by keyset seek —
+// WHERE pk > last ORDER BY pk LIMIT chunkSize-1, 1 — a B-tree descent plus a
+// chunkSize-key forward scan per probe, never a growing global OFFSET that
+// re-scanned from the first row every probe (#588).
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	cols := strings.Join(c.pk, ", ")
-	query := fmt.Sprintf(
-		"SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
-		cols, c.schema, c.table, cols,
-	)
-
-	var bounds [][]any
-	for offset := 0; ; offset += c.chunkSize {
-		rows, err := c.db.QueryContext(ctx, query, offset)
-		if err != nil {
-			return nil, fmt.Errorf("mysql: chunker bounds: %w", err)
-		}
-		key, err := scanRow(rows)
-		_ = rows.Close()
-		if err == sql.ErrNoRows {
+	// The first bound is the lowest PK.
+	first, err := c.boundSeek(ctx, cols, "", nil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // empty table
+	}
+	if err != nil {
+		return nil, err
+	}
+	bounds := [][]any{first}
+	for {
+		// The next bound is the chunkSize-th key strictly after the last: the
+		// row-constructor pk > last expansion from keyBound, so a composite PK
+		// seeks correctly (a > ? OR a = ? AND b > ?).
+		cond, args := keyBound(c.pk, ">", ">", bounds[len(bounds)-1])
+		next, err := c.boundSeek(ctx, cols, cond, args)
+		if errors.Is(err, sql.ErrNoRows) {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
-		bounds = append(bounds, key)
+		bounds = append(bounds, next)
 	}
 	return bounds, nil
+}
+
+// boundSeek runs one bounds probe: the lowest PK when cond is empty, else the
+// chunkSize-th key after the previous bound. The WHERE is bound to the index,
+// so each probe costs a descent plus chunkSize forward steps.
+func (c *Chunker) boundSeek(ctx context.Context, cols, cond string, args []any) ([]any, error) {
+	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`", cols, c.schema, c.table)
+	if cond != "" {
+		// Placeholder order: the WHERE (keyBound) args, then the LIMIT offset.
+		query += " WHERE " + cond + " ORDER BY " + cols + " LIMIT ?, 1"
+		args = append(args, c.chunkSize-1)
+	} else {
+		query += " ORDER BY " + cols + " LIMIT 1"
+	}
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: chunker bounds: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanRow(rows)
 }
 
 // Scan executes the chunk SELECT (with the row-filter WHERE pushed — none
