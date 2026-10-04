@@ -141,7 +141,7 @@ func snapValue(t *testing.T, snap *snapshot, key any, dest string) any {
 	}
 	for i, d := range snap.dests {
 		if d.as == dest {
-			return arrowValueAt(snap.refTable.Column(i+1), int(idx))
+			return readArrowValue(snap.refTable.Column(i+1), int(idx))
 		}
 	}
 	return nil
