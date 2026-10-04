@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -69,32 +70,56 @@ func NewChunker(db *sql.DB, source, pk string, chunkSize int, loc *time.Location
 }
 
 // Bounds returns the ordered list of chunk boundary keys: key[0] is the
-// lowest PK, followed by every chunkSize-th key, then nil (the open high
-// bound of the last chunk).
+// lowest PK, followed by every chunkSize-th key (the open high bound of the
+// last chunk is added by Chunks, not here). Bounds are read by keyset seek —
+// WHERE pk > last ORDER BY pk LIMIT chunkSize-1, 1 — a B-tree descent plus a
+// chunkSize-key forward scan per probe, never a growing global OFFSET that
+// re-scanned from the first row every probe (#588).
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	cols := strings.Join(c.pk, ", ")
-	query := fmt.Sprintf(
-		"SELECT %s FROM `%s`.`%s` ORDER BY %s LIMIT 1 OFFSET ?",
-		cols, c.schema, c.table, cols,
-	)
-
-	var bounds [][]any
-	for offset := 0; ; offset += c.chunkSize {
-		rows, err := c.db.QueryContext(ctx, query, offset)
-		if err != nil {
-			return nil, fmt.Errorf("mysql: chunker bounds: %w", err)
-		}
-		key, err := scanRow(rows)
-		_ = rows.Close()
-		if err == sql.ErrNoRows {
+	// The first bound is the lowest PK.
+	first, err := c.boundSeek(ctx, cols, "", nil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // empty table
+	}
+	if err != nil {
+		return nil, err
+	}
+	bounds := [][]any{first}
+	for {
+		// The next bound is the chunkSize-th key strictly after the last: the
+		// row-constructor pk > last expansion from keyBound, so a composite PK
+		// seeks correctly (a > ? OR a = ? AND b > ?).
+		cond, args := keyBound(c.pk, ">", ">", bounds[len(bounds)-1])
+		next, err := c.boundSeek(ctx, cols, cond, args)
+		if errors.Is(err, sql.ErrNoRows) {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
-		bounds = append(bounds, key)
+		bounds = append(bounds, next)
 	}
 	return bounds, nil
+}
+
+// boundSeek runs one bounds probe: the lowest PK when cond is empty, else the
+// chunkSize-th key after the previous bound. The WHERE is bound to the index,
+// so each probe costs a descent plus chunkSize forward steps.
+func (c *Chunker) boundSeek(ctx context.Context, cols, cond string, args []any) ([]any, error) {
+	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s`", cols, c.schema, c.table)
+	if cond != "" {
+		query += " WHERE " + cond + " ORDER BY " + cols + " LIMIT ?, 1"
+		args = append([]any{c.chunkSize - 1}, args...)
+	} else {
+		query += " ORDER BY " + cols + " LIMIT 1"
+	}
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: chunker bounds: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanRow(rows)
 }
 
 // Scan executes the chunk SELECT (with the row-filter WHERE pushed — none
