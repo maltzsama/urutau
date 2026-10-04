@@ -25,6 +25,7 @@ message WorkerMessage {
     WorkerMetricsReport worker_metrics = 8;    // periodic worker-side series the coordinator cannot derive from acks
     SchemaDrift         schema_drift   = 9;    // the worker detected schema drift and is stopping (issue #272)
     WorkerLog            log            = 10;   // structured worker log for the run trail (issue #351)
+    WindowOpen           window_open    = 11;   // the worker opened one DBLog window while reading a chunk (issue #622)
   }
 }
 
@@ -251,6 +252,25 @@ message ChunkReady {
   uint64 rows              = 3;
   uint64 dropped_by_window = 4;  // proves DBLog is working
   uint64 epoch             = 5;  // the Assignment epoch this reply belongs to; stale-epoch replies are ignored
+  // The window ids the worker opened while reading this chunk, in read order.
+  // The byte-cap reader can cut one chunk into many windows (issue #622), so
+  // the coordinator learns the boundaries here instead of pre-assigning them.
+  repeated uint64 window_ids = 6;
+}
+
+// WindowOpen announces one DBLog window the worker opened while reading a
+// chunk. With the byte-cap reader (issue #622) the cut happens at read time,
+// so the worker — not the coordinator — owns the window boundaries and their
+// ids. A window's id is (attempt, seq), namespaced by worker: attempt bumps
+// when the worker restarts (a redo mid-chunk), seq is the window's monotonic
+// order within the attempt. pos is the source position captured AFTER this
+// window's batch was read — never before (the interleave invariant).
+message WindowOpen {
+  string table    = 1;  // source table
+  uint32 chunk_id = 2;  // the scheduling chunk this window belongs to (chunkRef)
+  uint64 attempt  = 3;  // worker attempt (the assignment epoch), bumped on restart
+  uint64 seq      = 4;  // window sequence within the attempt
+  string pos      = 5;  // source position captured after this window's read
 }
 
 message ChunkFailed {
