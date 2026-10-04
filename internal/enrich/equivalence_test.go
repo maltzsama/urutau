@@ -2,12 +2,13 @@ package enrich
 
 // Behavioral harness for the columnar enrich seam (Stage.ColumnarJoin):
 // per-key version retention, reinsert-over-delete, delete-key backfill,
-// left-miss NULLs, hit values, windowed-row order.
+// left-miss NULLs, hit values, arrival order across the seam.
 //
 // The seam is a broadcast hash join on the reference key. It does not act on
-// windows or collapse — those are the worker's job downstream — but window
-// tags and op/key identity must survive it untouched, so the canonical
-// scenario carries them.
+// windows or collapse — those are the worker's job downstream — but op/key
+// identity and arrival order must survive it untouched, so the canonical
+// scenario carries them. (Window tags are not part of rowchange.Change; they
+// travel on the wire meta / Ingest.Win, which this seam never sees.)
 
 import (
 	"context"
@@ -47,7 +48,7 @@ func harnessSchema() core.Schema {
 //	PK 3: delete with a partial before      (key backfilled from the tuple)
 //	PK 4: enrich miss                       (reference columns land NULL)
 //	PK 5: enrich hit                        (reference columns land with values)
-//	PK 6: a window opens mid-stream         (InWindow + Closes survive)
+//	PK 6: two versions of one key        (arrival order survives the seam)
 //
 // The reference (users) is hot with id 1 -> ana/gold, id 2 -> beto/silver.
 // user_ref 1 hits; user_ref 99 (and nil) miss.
@@ -95,7 +96,7 @@ func canonicalScenario() []rowchange.Change {
 	// PK 5 — enrich hit: user_ref 1 -> ana/gold.
 	add(ev(rowchange.OpInsert, 5, 1, "hit", 0))
 
-	// PK 6 — windowed rows pass the seam in order. (The window tag itself now
+	// PK 6 — two versions of one key pass the seam in order. (The window tag now
 	// lives on the wire meta / Ingest.Win, not on rowchange.Change.)
 	add(ev(rowchange.OpInsert, 6, 1, "w1", 0))
 	add(ev(rowchange.OpUpdate, 6, 1, "w2", 0))
@@ -302,10 +303,10 @@ func TestLeftJoinMissNullsAndHitValues(t *testing.T) {
 	}
 }
 
-// TestWindowReleasesBeforeCloses — PK 6's window-tagged rows pass the seam
+// TestKeyVersionsPreserveArrivalOrder — PK 6's two versions pass the seam
 // with the join applied and their arrival order intact (the seam does not
-// reorder or drop windowed rows; Closes handling is the worker's).
-func TestWindowReleasesBeforeCloses(t *testing.T) {
+// reorder or drop versions; window/collapse handling is the worker's).
+func TestKeyVersionsPreserveArrivalOrder(t *testing.T) {
 	rows := harnessRows(t)
 	var pk6 []rowchange.Change
 	for _, r := range rows {
@@ -319,9 +320,9 @@ func TestWindowReleasesBeforeCloses(t *testing.T) {
 	if pk6[0].Position >= pk6[1].Position {
 		t.Fatalf("PK 6 rows out of order: %q then %q", pk6[0].Position, pk6[1].Position)
 	}
-	// The join still applies to windowed rows (user_ref 1 -> ana).
+	// The join still applies to both versions (user_ref 1 -> ana).
 	if pk6[0].After["users.name"] != "ana" || pk6[1].After["users.name"] != "ana" {
-		t.Fatalf("PK 6 windowed rows not enriched: %v / %v", pk6[0].After, pk6[1].After)
+		t.Fatalf("PK 6 rows not enriched: %v / %v", pk6[0].After, pk6[1].After)
 	}
 }
 
