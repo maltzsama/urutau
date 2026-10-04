@@ -138,7 +138,7 @@ func (c *Coordinator) drainReadyWindow(ctx context.Context, key string) error {
 func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, chunkID uint32, buf []*dataplane.Batch) error {
 	return c.enqueueHeld(ctx, &pb.BatchMeta{
 		Table:  target,
-		Window: &pb.WindowTag{InWindow: true, ChunkId: chunkID},
+		Window: &pb.WindowTag{InWindow: true, WindowId: uint64(chunkID)},
 	}, buf)
 }
 

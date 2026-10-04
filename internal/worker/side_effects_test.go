@@ -72,7 +72,7 @@ func TestMarkBatchSideEffectsWindowDedup(t *testing.T) {
 		touched: map[string]struct{}{},
 	}
 
-	ing := Ingest{Table: "t", Batch: batch, Win: &rowchange.Window{ChunkID: 7, InWindow: true}}
+	ing := Ingest{Table: "t", Batch: batch, Win: &rowchange.Window{WindowID: 7, InWindow: true}}
 	if err := markBatchSideEffects(p, batch, ing); err != nil {
 		t.Fatalf("window path: %v", err)
 	}

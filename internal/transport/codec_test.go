@@ -49,7 +49,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	meta := &pb.BatchMeta{
 		Table: "raw.orders", LowPos: "0/1A", HighPos: "0/1C",
 		BatchId: 9, Epoch: 1,
-		Window: &pb.WindowTag{ChunkId: 3, Snapshot: true},
+		Window: &pb.WindowTag{WindowId: 3, Snapshot: true},
 	}
 
 	body, metaBytes, err := EncodeBatch(rows, schema, meta, nil)
@@ -78,7 +78,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	if err := proto.Unmarshal(metaBytes, parsedMeta); err != nil {
 		t.Fatalf("unmarshal meta: %v", err)
 	}
-	if parsedMeta.Table != "raw.orders" || parsedMeta.BatchId != 9 || !parsedMeta.Window.Snapshot || parsedMeta.Window.ChunkId != 3 {
+	if parsedMeta.Table != "raw.orders" || parsedMeta.BatchId != 9 || !parsedMeta.Window.Snapshot || parsedMeta.Window.WindowId != 3 {
 		t.Fatalf("meta mismatch: %+v", parsedMeta)
 	}
 	if len(got) != len(rows) {

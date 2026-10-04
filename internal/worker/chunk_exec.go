@@ -179,7 +179,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	}
 	dpb := &dataplane.Batch{Table: ta.TargetTable, Record: rec, Mode: dataplane.AppendMode}
 	// AddWindowRows takes ownership of the batch (the window stores it).
-	if err := x.w.AddWindowRows(ta.TargetTable, req.ChunkId, dpb); err != nil {
+	if err := x.w.AddWindowRows(ta.TargetTable, uint64(req.ChunkId), dpb); err != nil {
 		return err
 	}
 	return x.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_ChunkReady{ChunkReady: &pb.ChunkReady{

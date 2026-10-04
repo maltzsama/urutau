@@ -97,7 +97,7 @@ type Transport struct {
 // batcher discards the superseded snapshot row, and emits a Closes marker
 // (with no row payload) once the reader has provably caught up past high.
 type Window struct {
-	ChunkID  uint32
+	WindowID uint64
 	InWindow bool
 	Closes   bool
 }

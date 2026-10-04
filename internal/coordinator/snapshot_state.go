@@ -259,7 +259,7 @@ func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, tar
 	meta := &pb.BatchMeta{
 		Table:  target,
 		LowPos: at.String(),
-		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID, SnapshotPending: pending},
+		Window: &pb.WindowTag{Closes: true, WindowId: uint64(chunkID), SnapshotPending: pending},
 	}
 	if c.stagesCycles() && c.isStagedTable(target) {
 		meta.BatchId = c.batchSeq.Add(1)

@@ -109,7 +109,7 @@ func TestWindowCatchUpDoesNotStallOnAFullGate(t *testing.T) {
 	}
 	var prev position.Position
 	for i, m := range got {
-		if m.Window == nil || !m.Window.InWindow || m.Window.ChunkId != 7 {
+		if m.Window == nil || !m.Window.InWindow || m.Window.WindowId != 7 {
 			t.Fatalf("drained batch %d: window %+v, want InWindow for chunk 7", i, m.Window)
 		}
 		p := position.MustLSN(m.HighPos)

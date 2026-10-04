@@ -203,7 +203,7 @@ func TestWindowInterleaveWithinTheWindow(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("worker got %d batches, want the InWindow update then the Closes marker", len(out))
 	}
-	if !out[0].meta.Window.GetInWindow() || out[0].meta.Window.ChunkId != 7 {
+	if !out[0].meta.Window.GetInWindow() || out[0].meta.Window.WindowId != 7 {
 		t.Fatalf("first batch window = %+v, want the live update InWindow-tagged for chunk 7", out[0].meta.Window)
 	}
 	if !out[1].meta.Window.GetCloses() {

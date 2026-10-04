@@ -49,7 +49,7 @@ func TestUntouchedWindowClosesWithoutCopying(t *testing.T) {
 	if err := w.AddWindowRows("raw.orders", 7, win); err != nil {
 		t.Fatal(err)
 	}
-	out, _, err := closeWindow(w.tables["raw.orders"], Ingest{Table: "raw.orders", Win: &rowchange.Window{Closes: true, ChunkID: 7}, Position: "0/9"})
+	out, _, err := closeWindow(w.tables["raw.orders"], Ingest{Table: "raw.orders", Win: &rowchange.Window{Closes: true, WindowID: 7}, Position: "0/9"})
 	if err != nil {
 		t.Fatal(err)
 	}

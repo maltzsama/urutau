@@ -102,7 +102,7 @@ type tablePipeline struct {
 	// batcher is still draining chunk N's buffered release. Guarded by
 	// winMu. The window OWNS its batch; Closes consumes and releases it.
 	winMu   sync.Mutex
-	windows map[uint32]*snapshotWindow
+	windows map[uint64]*snapshotWindow
 	dropped int64
 
 	// Snapshot state for resumable backfill. The snapshot state machine
@@ -310,7 +310,7 @@ func newTablePipeline(target string, c sink.TableWriter, mode dataplane.WriteMod
 		mode:           mode,
 		ch:             make(chan Ingest, 1024),
 		readyCh:        make(chan readyBatch, 1),
-		windows:        map[uint32]*snapshotWindow{},
+		windows:        map[uint64]*snapshotWindow{},
 		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
 		driftReported:  map[string]bool{},
 	}
@@ -330,7 +330,7 @@ type snapshotWindow struct {
 
 // AddWindowRows stores one chunk's SELECT batch for the snapshot window.
 // The window TAKES OWNERSHIP of the batch; the Closes handler releases it.
-func (w *Worker) AddWindowRows(target string, chunkID uint32, batch *dataplane.Batch) error {
+func (w *Worker) AddWindowRows(target string, windowID uint64, batch *dataplane.Batch) error {
 	p, ok := w.tables[target]
 	if !ok {
 		batch.Release()
@@ -338,9 +338,9 @@ func (w *Worker) AddWindowRows(target string, chunkID uint32, batch *dataplane.B
 	}
 	p.winMu.Lock()
 	defer p.winMu.Unlock()
-	if _, dup := p.windows[chunkID]; dup {
+	if _, dup := p.windows[windowID]; dup {
 		batch.Release()
-		return fmt.Errorf("worker: window rows: duplicate chunk %d for %s", chunkID, target)
+		return fmt.Errorf("worker: window rows: duplicate window %d for %s", windowID, target)
 	}
 	// Precompute the window's key set once: the live path tests membership per
 	// row, and re-scanning the whole chunk per row was O(rows × windows ×
@@ -351,7 +351,7 @@ func (w *Worker) AddWindowRows(target string, chunkID uint32, batch *dataplane.B
 			keys[rowchange.KeyString(r.Key(i))] = struct{}{}
 		}
 	}
-	p.windows[chunkID] = &snapshotWindow{batch: batch, keys: keys, touched: make(map[string]struct{})}
+	p.windows[windowID] = &snapshotWindow{batch: batch, keys: keys, touched: make(map[string]struct{})}
 	return nil
 }
 
@@ -1014,12 +1014,12 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 // it through the cycle-aware path.
 func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, bool, error) {
 	p.winMu.Lock()
-	win := p.windows[ing.Win.ChunkID]
+	win := p.windows[ing.Win.WindowID]
 	if win == nil {
 		p.winMu.Unlock()
 		return nil, false, nil
 	}
-	delete(p.windows, ing.Win.ChunkID)
+	delete(p.windows, ing.Win.WindowID)
 	p.winMu.Unlock()
 
 	if win.batch.Record == nil || win.batch.Record.NumRows() == 0 {
@@ -1029,7 +1029,7 @@ func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, bool, error) {
 	reader, err := transport.NewBatchReader(win.batch.Record, p.knownSchema.PrimaryKey)
 	if err != nil {
 		win.batch.Release()
-		return nil, true, fmt.Errorf("worker: window %d: %w", ing.Win.ChunkID, err)
+		return nil, true, fmt.Errorf("worker: window %d: %w", ing.Win.WindowID, err)
 	}
 	// Keep every row whose key was not touched by a live InWindow event.
 	var keepIdx []int32
