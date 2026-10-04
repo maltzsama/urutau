@@ -28,7 +28,7 @@ func TestClosesMarkerIsACycleOfTheSendOrder(t *testing.T) {
 		"raw.orders": {{High: []any{int64(100)}}, {Low: []any{int64(100)}}},
 	})
 
-	if err := c.sendCloses(context.Background(), w0, "raw.orders", position.MustLSN("0/10"), 7); err != nil {
+	if err := c.sendClosesPending(context.Background(), w0, "raw.orders", position.MustLSN("0/10"), 7, nil); err != nil {
 		t.Fatalf("sendCloses: %v", err)
 	}
 	var m pb.BatchMeta
@@ -58,7 +58,7 @@ func TestClosesMarkerOnAnUnstagedTableOpensNoCycle(t *testing.T) {
 	c, w0 := coordHarness()
 	c.snk = fakeStagedSink{}
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	if err := c.sendCloses(context.Background(), w0, "raw.orders", position.MustLSN("0/10"), 7); err != nil {
+	if err := c.sendClosesPending(context.Background(), w0, "raw.orders", position.MustLSN("0/10"), 7, nil); err != nil {
 		t.Fatalf("sendCloses: %v", err)
 	}
 	if n := c.staged.len(); n != 0 {

@@ -89,7 +89,7 @@ type Config struct {
 	Heartbeat            time.Duration
 	// MaxParallelChunks would cap concurrent chunk SELECTs during snapshot.
 	// The snapshot is currently strictly sequential (one chunk in flight,
-	// waitChunkReady blocks), so the knob is validated but reserved — it is
+	// waitChunkReadyOr blocks), so the knob is validated but reserved — it is
 	// not yet wired to concurrency.
 	MaxParallelChunks int
 
@@ -960,7 +960,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 
 	// The snapshot runs in its own goroutine: run's terminal select must
 	// stay live underneath it. A worker dying mid-snapshot otherwise wedges
-	// the run forever — the snapshot loop blocks on waitChunkReady, the
+	// the run forever — the snapshot loop blocks on waitChunkReadyOr, the
 	// session error lands in sessionErrs, and nobody reads it (audit #1).
 	snapCtx, snapCancel := context.WithCancel(ctx)
 	defer snapCancel()
@@ -1598,18 +1598,11 @@ func (c *Coordinator) confirmedPosition() position.Position {
 	return best
 }
 
-// waitChunkReady blocks until the worker reports the chunk SELECT done for
-// THIS epoch. A ChunkReady from a superseded generation (same table+chunkID,
-// different epoch) is ignored, so a stale reply cannot satisfy the wait
-// against a dead window.
-func (c *Coordinator) waitChunkReady(ctx context.Context, table string, chunkID uint32, epoch uint64) error {
-	_, err := c.waitChunkReadyOr(ctx, table, chunkID, epoch, nil)
-	return err
-}
-
-// waitChunkReadyOr is waitChunkReady that also returns errWorkerLost when lost
-// closes: the worker's window died with its session, so no ChunkReady for it
-// will come.
+// waitChunkReadyOr blocks until the worker reports the chunk SELECT done for
+// THIS epoch, also returning errWorkerLost when lost closes: the worker's
+// window died with its session, so no ChunkReady for it will come. A ChunkReady
+// from a superseded generation (same table+chunkID, different epoch) is
+// ignored, so a stale reply cannot satisfy the wait against a dead window.
 func (c *Coordinator) waitChunkReadyOr(ctx context.Context, table string, chunkID uint32, epoch uint64, lost <-chan struct{}) (rows uint64, err error) {
 	for {
 		select {

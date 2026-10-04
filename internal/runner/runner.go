@@ -1121,7 +1121,7 @@ func (r *Runner) run(ctx context.Context) error {
 }
 
 // DroppedByWindow returns the number of rows dropped by the window for a
-// target table (proof of caught-up state).
+// target table (the caught-up proof the e2e asserts).
 func (r *Runner) DroppedByWindow(target string) int64 {
 	return r.w.DroppedByWindow(target)
 }

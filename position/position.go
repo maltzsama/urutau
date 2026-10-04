@@ -9,6 +9,9 @@ import (
 	"sort"
 )
 
+// ErrNoPosition is retained: it is exported API of a public package, so it
+// cannot be removed without breaking downstream consumers (found in the #642
+// review), even though nothing in this repository references it.
 var ErrNoPosition = errors.New("position: no known position")
 
 // Incomparable is the Compare result for two positions with no defined order.

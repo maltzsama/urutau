@@ -162,7 +162,7 @@ func TestFinishSnapshotQueuesTheDoneMarkerBehindTheLastWindow(t *testing.T) {
 	c, w0 := coordHarness()
 	c.snk = snk
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	if err := c.sendCloses(context.Background(), w0, "raw.orders", position.MustLSN("0/10"), 3); err != nil {
+	if err := c.sendClosesPending(context.Background(), w0, "raw.orders", position.MustLSN("0/10"), 3, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.finishSnapshot(context.Background(), c.refs[0]); err != nil {
@@ -195,7 +195,7 @@ func TestFinishSnapshotOnAStagedTableIsACycle(t *testing.T) {
 	c.index["w1"] = newPositionIndex("run-1")
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	if err := c.sendCloses(context.Background(), w1, "raw.orders", position.MustLSN("0/10"), 0); err != nil {
+	if err := c.sendClosesPending(context.Background(), w1, "raw.orders", position.MustLSN("0/10"), 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.finishSnapshot(context.Background(), c.refs[0]); err != nil {
@@ -245,10 +245,10 @@ func TestSnapshotDoneWaitsForEveryEarlierWindow(t *testing.T) {
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	ctx := context.Background()
-	if err := c.sendCloses(ctx, w0, "raw.orders", position.MustLSN("0/10"), 0); err != nil {
+	if err := c.sendClosesPending(ctx, w0, "raw.orders", position.MustLSN("0/10"), 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.sendCloses(ctx, w1, "raw.orders", position.MustLSN("0/20"), 0); err != nil {
+	if err := c.sendClosesPending(ctx, w1, "raw.orders", position.MustLSN("0/20"), 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.finishSnapshot(ctx, c.refs[0]); err != nil {

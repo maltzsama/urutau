@@ -122,17 +122,6 @@ func ListRuns(ctx context.Context, cfg RootConfig, pipeline string) ([]RunSummar
 	return listRuns(ctx, l, cfg, pipeline)
 }
 
-// ReadRun returns a run's events in order: every rotated object under the
-// run's prefix, concatenated. Each object is a full re-upload of the events
-// since the previous rotation, so the objects never overlap.
-func ReadRun(ctx context.Context, cfg RootConfig, pipeline, runID string) ([]Event, error) {
-	t, err := ReadRunTrail(ctx, cfg, pipeline, runID)
-	if err != nil {
-		return nil, err
-	}
-	return t.Events, nil
-}
-
 // ReadRunTrail returns a run's events plus the completeness signals the writer
 // left in the trail (issue #333). A missing run yields ErrNotFound, so an HTTP
 // caller can answer 404 (issue #329).
@@ -200,14 +189,6 @@ func listRuns(ctx context.Context, l lister, cfg RootConfig, pipeline string) ([
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
-}
-
-func readRun(ctx context.Context, l lister, cfg RootConfig, pipeline, runID string) ([]Event, error) {
-	t, err := readRunTrail(ctx, l, cfg, pipeline, runID)
-	if err != nil {
-		return nil, err
-	}
-	return t.Events, nil
 }
 
 func readRunTrail(ctx context.Context, l lister, cfg RootConfig, pipeline, runID string) (Trail, error) {
