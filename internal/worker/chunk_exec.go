@@ -215,7 +215,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 // (the interleave invariant), assigns a window id, and announces it before
 // storing the page's rows. It takes ownership of page on success.
 func (x *chunkExecutor) emitWindow(ctx context.Context, req *pb.ChunkRequest, ta *pb.TableAssignment, page arrow.RecordBatch, n int, windowIDs *[]uint64) error {
-	for x.w.openWindows(ta.TargetTable) >= maxOpenSnapshotWindows {
+	for x.w.openWindows(ta.TargetTable) >= snapshotWindowInFlight() {
 		select {
 		case <-x.w.windowClosed(ta.TargetTable):
 		case <-ctx.Done():
@@ -247,8 +247,3 @@ func (x *chunkExecutor) emitWindow(ctx context.Context, req *pb.ChunkRequest, ta
 	// AddWindowRows takes ownership of the batch (the window stores it).
 	return x.w.AddWindowRows(ta.TargetTable, seq, &dataplane.Batch{Table: ta.TargetTable, Record: page, Mode: dataplane.AppendMode})
 }
-
-// maxOpenSnapshotWindows bounds how many byte-capped windows the chunk reader
-// holds open at once. Together with SnapshotReadChunkBytes it bounds the
-// worker's snapshot memory to in-flight × byte-cap (issue #622).
-const maxOpenSnapshotWindows = 2

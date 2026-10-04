@@ -33,11 +33,7 @@ func (x *chunkExecutor) readChunkPages(ctx context.Context, s byteCapScanner, ch
 		return 0, err
 	}
 	defer enc.Release()
-	cap := x.w.cfg.SnapshotReadChunkBytes
-	if cap <= 0 {
-		cap = 64 << 20
-	}
-	return s.ScanArrowPages(ctx, ch, enc, int(cap), emit)
+	return s.ScanArrowPages(ctx, ch, enc, snapshotWindowBytes(), emit)
 }
 
 // readChunk reads one chunk into a record and returns it with its row count.

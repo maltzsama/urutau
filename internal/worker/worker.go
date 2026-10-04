@@ -35,9 +35,6 @@ type Config struct {
 	MaxInterval time.Duration
 	// MetricsAddr serves /metrics (Prometheus); empty disables it.
 	MetricsAddr string
-	// SnapshotReadChunkBytes is one DBLog snapshot window's byte cap (issue
-	// #622); zero: 64 MiB.
-	SnapshotReadChunkBytes int64
 }
 
 // OnCommit observes successful commits (bookkeeping, tests).
