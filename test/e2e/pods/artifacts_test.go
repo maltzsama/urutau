@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -143,7 +144,12 @@ func (l *logCollector) follow(ctx context.Context, r containerRun) {
 		return
 	}
 	cmd := exec.CommandContext(ctx, "kubectl", "-n", l.ns, "logs", "-f", r.pod, "-c", r.container)
-	cmd.Stdout, cmd.Stderr = file, file
+	// The pod's logs arrive on kubectl's stdout; kubectl's own errors (e.g. a
+	// host-level "too many open files" when many followers run at once) go to
+	// its stderr and must NOT be mistaken for the pod's output — routing them
+	// into the log file attributed the harness's failure to every pod (#645).
+	cmd.Stdout = file
+	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		_ = file.Close()
 		return
