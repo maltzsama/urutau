@@ -95,8 +95,6 @@ type Chunk struct {
 // ChunkSource is the chunk SELECT surface the snapshot orchestrator
 // consumes. The SQL-backed chunkers implement it.
 type ChunkSource interface {
-	// PK returns the primary key columns, in key order.
-	PK() []string
 	// Bounds returns the ordered chunk boundary keys.
 	Bounds(ctx context.Context) ([][]any, error)
 	// Scan reads one chunk, calling fn per row keyed by column name.

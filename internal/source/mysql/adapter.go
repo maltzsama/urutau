@@ -201,7 +201,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 				return nil, fmt.Errorf("mysql: schema %s: %w", ref.Source, serr)
 			}
 			t, _ := a.tableFor(ref.Source)
-			proj, perr := newProjection(t.ColumnFilter, t.Filter, st.Table)
+			proj, perr := newProjection(t.Filter, st.Table)
 			if perr != nil {
 				return nil, fmt.Errorf("mysql: %s: %w", ref.Source, perr)
 			}

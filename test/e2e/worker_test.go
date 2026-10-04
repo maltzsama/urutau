@@ -39,12 +39,8 @@ func localIngestFromChanges(ctx context.Context, changes <-chan rowchange.Change
 					continue
 				}
 				dpb := &dataplane.Batch{Table: c.Table, Record: rec, Mode: dataplane.UpsertMode}
-				var win *rowchange.Window
-				if c.Window != nil && c.Window.InWindow {
-					win = &rowchange.Window{ChunkID: c.Window.ChunkID, InWindow: true}
-				}
 				select {
-				case out <- worker.Ingest{Table: c.Table, Batch: dpb, Win: win}:
+				case out <- worker.Ingest{Table: c.Table, Batch: dpb}:
 				case <-ctx.Done():
 					return
 				}

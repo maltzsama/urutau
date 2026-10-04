@@ -100,7 +100,7 @@ func TestProjectionFilterExpr(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			p, err := newProjection(nil, c.f, st)
+			p, err := newProjection(c.f, st)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -129,7 +129,7 @@ func TestFilterExprNullSemantics(t *testing.T) {
 		}}},
 	}
 	for i, f := range cases {
-		p, err := newProjection(nil, f, st)
+		p, err := newProjection(f, st)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,7 +147,7 @@ func TestFilterExprNullSemantics(t *testing.T) {
 // still compare numerically, not lexically or with a type error.
 func TestFilterExprNumericColumn(t *testing.T) {
 	st := testFilterState()
-	p, err := newProjection(nil, &spec.Filter{
+	p, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "amount", Op: spec.OpGt, Value: float64(100)},
 	}, st)
 	if err != nil {
@@ -177,7 +177,7 @@ func TestFilterExprNumericExactPrecision(t *testing.T) {
 	st := testFilterState()
 	// 9007199254740993 = 2^53+1 is not representable as float64 (it rounds to
 	// 2^53), so a float comparison would call it equal to 9007199254740992.
-	p, err := newProjection(nil, &spec.Filter{
+	p, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "amount", Op: spec.OpEq, Value: float64(9007199254740992)},
 	}, st)
 	if err != nil {
@@ -215,7 +215,7 @@ func TestFilterExprNumericSpecialValues(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			p, err := newProjection(nil, &spec.Filter{
+			p, err := newProjection(&spec.Filter{
 				Predicate: &spec.Predicate{Column: "amount", Op: c.op, Value: c.lit},
 			}, st)
 			if err != nil {
@@ -268,7 +268,7 @@ func TestFilterExprFloatSpecialValues(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			p, err := newProjection(nil, &spec.Filter{
+			p, err := newProjection(&spec.Filter{
 				Predicate: &spec.Predicate{Column: "amount", Op: c.op, Value: c.lit},
 			}, st)
 			if err != nil {

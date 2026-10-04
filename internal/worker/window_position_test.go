@@ -35,7 +35,7 @@ func runWindowAfterLive(t *testing.T, live bool) ([]committed, []uint64) {
 		ingest <- toIngest(t, rowchange.Change{Op: rowchange.OpInsert, Table: "raw.orders", Key: []any{int64(9)},
 			After: map[string]any{"id": int64(9), "v": "x"}, Position: "p5"})
 	}
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9", Window: &rowchange.Window{ChunkID: 7, Closes: true}})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
 	closes.MarkerID = 42
 	ingest <- closes
 	close(ingest)

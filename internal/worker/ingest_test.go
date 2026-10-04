@@ -50,29 +50,6 @@ func IngestFromChanges(ctx context.Context, changes <-chan rowchange.Change, sch
 					flush()
 					return
 				}
-				if c.Window != nil {
-					flush()
-					if c.Window.Closes {
-						select {
-						case out <- Ingest{Table: c.Table, Win: c.Window, Position: c.Position}:
-						case <-ctx.Done():
-							return
-						}
-						continue
-					}
-					one := []rowchange.Change{c}
-					rec, err := transport.RecordFromChanges(one, transport.MergeSchema(one, schema), nil)
-					if err != nil {
-						continue
-					}
-					dpb := &dataplane.Batch{Table: c.Table, Record: rec, Mode: dataplane.UpsertMode}
-					select {
-					case out <- Ingest{Table: c.Table, Batch: dpb, Win: c.Window}:
-					case <-ctx.Done():
-						return
-					}
-					continue
-				}
 				bufs[c.Table] = append(bufs[c.Table], c)
 				if len(bufs[c.Table]) >= 100 {
 					flush()

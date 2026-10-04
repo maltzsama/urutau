@@ -39,7 +39,7 @@ func TestAWindowsMarkerIsNotAckedBeforeItsRowsShip(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingest := make(chan Ingest, 1)
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9", Window: &rowchange.Window{ChunkID: 7, Closes: true}})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
 	closes.Seq, closes.Staged, closes.MarkerID = 5, true, 42
 	ingest <- closes
 	close(ingest)

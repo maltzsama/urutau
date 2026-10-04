@@ -128,7 +128,6 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 		Key:      []any{int64(1)},
 		After:    map[string]any{"id": int64(1), "v": "live"},
 		Position: at.String(),
-		Window:   &rowchange.Window{ChunkID: 0, InWindow: true},
 	}
 
 	// The chunk SELECT lands: id=1 is stale (v=a), id=2 stable (v=x).

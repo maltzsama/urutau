@@ -14,13 +14,12 @@ import (
 	"github.com/maltzsama/urutau/spec"
 )
 
-// projection is a table's CDC read projection: the columns to emit and the
-// compiled filter a row must satisfy. The emitted column set is already the
-// canonical schema (the adapter filters it), so the live path appends the
-// projected columns straight into Arrow; only the filter needs named access,
-// and it reads a minimal map of just the columns it references.
+// projection is a table's CDC read filter: the compiled filter a row must
+// satisfy. The emitted column set is the canonical schema (the adapter filters
+// it), so the live path appends the projected columns straight into Arrow; only
+// the filter needs named access, and it reads a minimal map of just the columns
+// it references.
 type projection struct {
-	Columns []string
 	program *vm.Program
 	// filterCols is the distinct source columns the compiled filter reads.
 	// keep builds its row map from exactly these, never the whole row.
@@ -83,8 +82,8 @@ func filterColumns(f *spec.Filter) []string {
 
 // newProjection builds a projection, compiling the structured filter to an
 // expr program once per table using the introspected column types.
-func newProjection(columns []string, f *spec.Filter, tbl *schema.Table) (projection, error) {
-	p := projection{Columns: columns, filterCols: filterColumns(f)}
+func newProjection(f *spec.Filter, tbl *schema.Table) (projection, error) {
+	p := projection{filterCols: filterColumns(f)}
 	prog, err := compileFilterExpr(f, tbl)
 	if err != nil {
 		return projection{}, err

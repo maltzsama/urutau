@@ -76,13 +76,12 @@ type Config struct {
 	Schemas map[string]core.Schema
 }
 
-// Projection is a table's source-side read projection: the columns to emit
-// and the compiled filter a row must satisfy. The emitted column set is
-// already the canonical schema (the adapter filters it), so the live path
-// appends the projected columns straight into Arrow; only the filter needs
-// named access, and it reads a minimal map of just the columns it references.
+// Projection is a table's source-side read filter: the compiled filter a row
+// must satisfy. The emitted column set is the canonical schema (the adapter
+// filters it), so the live path appends the projected columns straight into
+// Arrow; only the filter needs named access, and it reads a minimal map of just
+// the columns it references.
 type Projection struct {
-	Columns []string
 	program *vm.Program
 	// filterCols is the distinct source columns the compiled filter reads.
 	filterCols []string
@@ -90,8 +89,8 @@ type Projection struct {
 
 // newProjection builds a projection, compiling the structured filter (#163)
 // to an expr program once per table, using the introspected column types.
-func newProjection(columns []string, f *spec.Filter, st *TableState) (Projection, error) {
-	p := Projection{Columns: columns, filterCols: filterColumns(f)}
+func newProjection(f *spec.Filter, st *TableState) (Projection, error) {
+	p := Projection{filterCols: filterColumns(f)}
 	prog, err := compileFilterExpr(f, st)
 	if err != nil {
 		return Projection{}, err
@@ -271,7 +270,7 @@ func New(ctx context.Context, cfg Config, batchOut chan<- *dataplane.Batch) (*Re
 		if len(cols) == 0 && f == nil {
 			continue
 		}
-		p, perr := newProjection(cols, f, states[ref.Source])
+		p, perr := newProjection(f, states[ref.Source])
 		if perr != nil {
 			return nil, fmt.Errorf("postgres: reader: projection %s: %w", ref.Source, perr)
 		}

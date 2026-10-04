@@ -14,7 +14,7 @@ func TestProjectionKeep(t *testing.T) {
 		{Name: "status", DataType: "text"},
 		{Name: "secret", DataType: "text"},
 	}}
-	p, err := newProjection([]string{"id", "name"}, &spec.Filter{
+	p, err := newProjection(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "active"},
 	}, st)
 	if err != nil {
