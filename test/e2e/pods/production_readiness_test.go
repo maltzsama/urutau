@@ -183,11 +183,14 @@ func runProductionReadiness(t *testing.T, o prOptions) {
 		// snapshot (Sourcery finding on this PR).
 		opts.CoordinatorMemory = "6Gi"
 		opts.CoordinatorCPU = "4"
-		// The harness worker's request is 1Gi; the race worker OOM-killed
-		// with a 5Gi limit (the race detector's ~1.5 GiB sits outside the Go
-		// heap, so heap + race outgrew the cgroup during the full-100k
-		// snapshot). Raise the limit to 7Gi so the race image fits.
-		opts.WorkerMemoryOverhead = "6Gi"
+		// The harness worker's request is 1Gi; the race worker OOM-kills at
+		// 5Gi (the race detector's ~1.5 GiB sits outside the Go heap, so the
+		// full-100k snapshot's heap + race outgrows the cgroup). Raising the
+		// limit to 7Gi lets the worker fit but overloads the node once KEDA
+		// scales the partitioned tables out (9 workers × ~6 GiB > node), so
+		// the full-100k gate stays red on this node (#647). Production
+		// (non-race) is unaffected.
+		opts.WorkerMemoryOverhead = "4Gi"
 		opts.WorkerCPUOverhead = "1500m"
 	}
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID, specs, opts)
