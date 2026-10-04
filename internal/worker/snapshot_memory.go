@@ -9,22 +9,22 @@ import "runtime/debug"
 // payloads and OOMs the worker (issue #622).
 func snapshotWindowBytes() int {
 	mem := runtimeMemoryLimit()
-	w := mem / 16
+	w := mem / 32
 	if w < 64<<20 {
 		w = 64 << 20
 	}
-	if w > 512<<20 {
-		w = 512 << 20
+	if w > 256<<20 {
+		w = 256 << 20
 	}
 	return int(w)
 }
 
 // snapshotWindowInFlight derives how many byte-capped windows the chunk reader
-// holds open at once, keeping ≈ 1/8 of the worker's memory in windows, at
+// holds open at once, keeping ≈ 1/16 of the worker's memory in windows, at
 // least two. Together with snapshotWindowBytes it bounds the snapshot's
 // retention to in-flight × byte-cap.
 func snapshotWindowInFlight() int {
-	n := int(runtimeMemoryLimit() / 8 / int64(snapshotWindowBytes()))
+	n := int(runtimeMemoryLimit() / 16 / int64(snapshotWindowBytes()))
 	if n < 2 {
 		n = 2
 	}

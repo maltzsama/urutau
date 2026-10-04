@@ -17,10 +17,10 @@ func TestSnapshotWindowBytes(t *testing.T) {
 		want int
 	}{
 		{512 << 20, 64 << 20}, // clamped low
-		{1 << 30, 64 << 20},   // 1 GiB / 16
-		{4 << 30, 256 << 20},  // 4 GiB / 16
-		{8 << 30, 512 << 20},  // 8 GiB / 16
-		{64 << 30, 512 << 20}, // clamped high
+		{1 << 30, 64 << 20},   // clamped low (32 MiB → 64 MiB)
+		{4 << 30, 128 << 20},  // 4 GiB / 32
+		{8 << 30, 256 << 20},  // 8 GiB / 32
+		{16 << 30, 256 << 20}, // clamped high
 	} {
 		debug.SetMemoryLimit(c.mem)
 		if got := snapshotWindowBytes(); got != c.want {
@@ -36,8 +36,8 @@ func TestSnapshotWindowInFlight(t *testing.T) {
 		mem  int64
 		want int
 	}{
-		{4 << 30, 2},  // window 256 MiB, 4 GiB/8 = 512 MiB → 2
-		{16 << 30, 4}, // window 512 MiB (clamped), 16 GiB/8 = 2 GiB → 4
+		{4 << 30, 2},  // window 128 MiB, 4 GiB/16 = 256 MiB → 2
+		{16 << 30, 4}, // window 256 MiB (clamped), 16 GiB/16 = 1 GiB → 4
 	} {
 		debug.SetMemoryLimit(c.mem)
 		if got := snapshotWindowInFlight(); got != c.want {
