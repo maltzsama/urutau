@@ -4,20 +4,23 @@
 // Hypothesis (from the handoff): the coordinator "serializes the record into a
 // bytes.Buffer, Flight ships bytes instead of a native record batch, and the
 // worker deserializes it", so a native Flight record-batch stream would remove
-// a copy. Measured on a 2000-row wire batch (id/name/amount, ~252 KB):
+// a copy. One run of these benchmarks on the author's machine (2000-row wire
+// batch, id/name/amount, ~252 KB) gave:
 //
-//	EncodeRecord    153580 ns/op   703107 B/op   79 allocs/op
-//	DecodeRecord     64951 ns/op   263420 B/op  123 allocs/op
-//	ipc/rec = 0.9966  (251696 B IPC from 252566 B record)
+//	EncodeRecord   ~154 us/op   ~700 KB/op   ~79 allocs/op
+//	DecodeRecord    ~65 us/op   ~260 KB/op  ~123 allocs/op
+//	ipc/rec ~ 1.00   (IPC body the same size as the record)
 //
-// The IPC body is the SAME size as the record — Arrow Flight's wire format IS
-// Arrow IPC, so "shipping a native record batch" still serializes to IPC once
-// and deserializes once. There is no second copy to remove, no bandwidth win,
-// and the ~966 KB of transient allocations per batch are the unavoidable
-// encode/decode, not a double materialization. The coordinator already holds
-// only the body (the record is released after enqueue), so holding the record
-// instead is a wash. The bytes.Clone at codec.go is on the row path
-// (readTypedValue), not the hot columnar path.
+// Absolute numbers vary with CPU, Go and Arrow version — re-run to compare on
+// yours. The RATIO is the point, and it is structural, not machine-dependent:
+//
+// Arrow Flight's wire format IS Arrow IPC, so "shipping a native record batch"
+// still serializes to IPC once and deserializes once. There is no second copy
+// to remove, no bandwidth win, and the transient allocations per batch are the
+// unavoidable encode/decode, not a double materialization. The coordinator
+// already releases the record after enqueue, so it holds only the body;
+// holding the record instead is a wash. The bytes.Clone at codec.go is on the
+// row path (readTypedValue), not the hot columnar path.
 //
 // CONCLUSION: the "zero-copy transport" frontier (#455) is NOT justified and
 // was not implemented. These benchmarks stand as the evidence.
