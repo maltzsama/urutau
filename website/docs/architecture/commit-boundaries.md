@@ -107,7 +107,10 @@ snapshot has run. A position therefore does not prove the snapshot finished;
   done.
 
 A snapshot records its progress before its first chunk: the chunk bounds,
-the partition ranges, and every chunk pending. Each window's Closes marker
+the partition ranges, and every chunk pending. The chunk is the scheduling
+unit (its bounds come from a keyset seek, #588), but the reader cuts each
+chunk into **byte-capped windows** on the worker: the window size is derived
+from the worker's memory limit, never a flag. Each window's Closes marker
 names the chunks still to do after it, and the worker commits them as
 `cdc.snapshot.pending`, state `in_progress`, in the same commit as the
 window's rows. A restarted coordinator resumes an `in_progress` table from
@@ -124,10 +127,22 @@ over the window's rows, which converges: every event carries its row's full
 image. The worker acks a Closes marker by its batch id once the window's rows
 are committed, and the coordinator releases the marker on nothing else.
 
+The **worker** owns the window id and the position. It announces each window
+with `WindowOpen(attempt, seq, pos)` as it reads, capturing `pos` *after* the
+page's read, so the caught-up proof gates any event the window's SELECT could
+have seen as pre-image. The window id is a `uint64` in the worker's own
+namespace (`attempt` epoch plus a monotonic `seq`), never the coordinator's
+`chunk_id`. The coordinator closes each window with its own `Closes` after
+proving the reader caught up to that window's position — not the chunk's — and
+releases the window's gated live rows ahead of the marker.
+
 A worker lost mid-snapshot takes its windows with it. The coordinator does not
 end the run: once the worker is back, the partition redoes, under fresh
 window ids, every chunk whose Closes marker the worker had not committed, and
-it waits for its last windows to commit before it is done.
+it waits for its last windows to commit before it is done. A chunk the earlier
+generation committed **partially** is resumed from the last committed window's
+high key, so already-committed windows are not re-emitted (an append-only
+table would otherwise duplicate them; issue #646).
 
 | # | Step | Process | Durable after this step | Fault point |
 |---|------|---------|-------------------------|-------------|

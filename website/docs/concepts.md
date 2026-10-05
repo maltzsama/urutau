@@ -43,7 +43,8 @@ coordinator and workers for you. See
 ## The lifecycle: snapshot, then stream
 
 A table with no recorded position is **backfilled first**: the coordinator
-reads the existing rows in chunks (a "snapshot"). Only once the snapshot is
+reads the existing rows in chunks (a "snapshot"), and each chunk is cut into
+memory-bounded windows on the worker. Only once the snapshot is
 caught up does it switch to **streaming** the live change log. The handoff
 is safe under concurrent writes — a row changed during the snapshot is
 reconciled by key, not duplicated.
