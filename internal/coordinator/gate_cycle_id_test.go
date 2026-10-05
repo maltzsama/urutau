@@ -28,8 +28,9 @@ func gateBatch(t *testing.T, id int64, pos string) *dataplane.Batch {
 	return &dataplane.Batch{Table: "raw.orders", Record: rec, Watermark: []byte(pos), Mode: dataplane.UpsertMode}
 }
 
-// gateStagedHarness is a two-partition staged table (id < 100 → w0,
-// id >= 100 → w1) with no committed position yet: a first snapshot.
+// gateStagedHarness is a two-partition staged table (two owners, w0 and w1,
+// keys split by the rendezvous hash) with no committed position yet: a first
+// snapshot. Tests that need a key on a given owner use ownerKey.
 func gateStagedHarness(t *testing.T) *Coordinator {
 	t.Helper()
 	c, w0 := coordHarness()
@@ -65,9 +66,10 @@ func TestGateDrainGivesEachHeldBatchItsOwnCycle(t *testing.T) {
 		t.Run(drain.name, func(t *testing.T) {
 			c := gateStagedHarness(t)
 			c.openWindow("raw.orders", 0)
+			names := []string{"w0", "w1"}
 			for _, b := range []*dataplane.Batch{
-				gateBatch(t, 1, "0/10"),   // → w0
-				gateBatch(t, 150, "0/20"), // → w1
+				gateBatch(t, ownerKey(t, names, 0), "0/10"), // → w0
+				gateBatch(t, ownerKey(t, names, 1), "0/20"), // → w1
 			} {
 				if !c.gateHold(context.Background(), b) {
 					t.Fatal("gateHold: the open window did not hold the batch")

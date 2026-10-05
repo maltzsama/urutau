@@ -118,8 +118,9 @@ func TestAccumulatedBatchesPrecedeTheWindow(t *testing.T) {
 	c := gateStagedHarness(t)
 	ctx := context.Background()
 	holdAccumulator(c)
-	for i := int64(1); i <= 3; i++ { // ids 1-3: w0's partition
-		if taken, err := c.accumulate(ctx, gateBatch(t, i, fmt.Sprintf("0/%X", i))); !taken || err != nil {
+	keys := ownerKeys(t, []string{"w0", "w1"}, 0, 4) // all route to w0
+	for i := int64(1); i <= 3; i++ {
+		if taken, err := c.accumulate(ctx, gateBatch(t, keys[i-1], fmt.Sprintf("0/%X", i))); !taken || err != nil {
 			t.Fatalf("accumulate %d: taken=%v err=%v", i, taken, err)
 		}
 	}
@@ -130,7 +131,7 @@ func TestAccumulatedBatchesPrecedeTheWindow(t *testing.T) {
 	if err := c.openWindowFlushed(ctx, "raw.orders", 0); err != nil {
 		t.Fatal(err)
 	}
-	if !c.gateHold(ctx, gateBatch(t, 4, "0/4")) {
+	if !c.gateHold(ctx, gateBatch(t, keys[3], "0/4")) {
 		t.Fatal("the open window did not hold the live batch")
 	}
 	if err := c.flushWindow(ctx, "raw.orders", 0, 5); err != nil {
@@ -155,8 +156,9 @@ func TestAccumulatedBatchesPrecedeThePausedOnes(t *testing.T) {
 	c := gateStagedHarness(t)
 	ctx := context.Background()
 	holdAccumulator(c)
+	keys := ownerKeys(t, []string{"w0", "w1"}, 0, 3) // all route to w0
 	for i := int64(1); i <= 2; i++ {
-		if taken, err := c.accumulate(ctx, gateBatch(t, i, fmt.Sprintf("0/%X", i))); !taken || err != nil {
+		if taken, err := c.accumulate(ctx, gateBatch(t, keys[i-1], fmt.Sprintf("0/%X", i))); !taken || err != nil {
 			t.Fatalf("accumulate %d: taken=%v err=%v", i, taken, err)
 		}
 	}
@@ -166,7 +168,7 @@ func TestAccumulatedBatchesPrecedeThePausedOnes(t *testing.T) {
 	}
 	c.paused["raw.orders"] = make(chan struct{})
 	c.pausedMu.Unlock()
-	if !c.pauseHold(gateBatch(t, 3, "0/3")) {
+	if !c.pauseHold(gateBatch(t, keys[2], "0/3")) {
 		t.Fatal("the paused table did not hold the batch")
 	}
 	c.pausedMu.Lock()
@@ -237,8 +239,9 @@ func TestCoalescedBatchesStayWithinTheByteBound(t *testing.T) {
 				c.openWindow("raw.orders", 0)
 			}
 			const n = 10
-			for i := int64(1); i <= n; i++ { // ids 1-10: w0's partition
-				b := payloadBatch(t, i, fmt.Sprintf("0/%X", i), payload)
+			keys := ownerKeys(t, []string{"w0", "w1"}, 0, n) // all route to w0
+			for i := int64(1); i <= n; i++ {
+				b := payloadBatch(t, keys[i-1], fmt.Sprintf("0/%X", i), payload)
 				if path == "gate drain" {
 					if !c.gateHold(ctx, b) {
 						t.Fatal("the open window did not hold the batch")

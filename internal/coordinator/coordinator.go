@@ -50,6 +50,7 @@ import (
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
+	route "github.com/maltzsama/urutau/internal/routing"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -766,7 +767,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return fmt.Errorf("coordinator: checkpoint: %w", err)
 		}
 		c.cp = cp
-		go cp.run(ctx, c.runID, c.indexSnapshot(), c.log)
+		go cp.run(ctx, c.runID, c.indexSnapshot, c.log)
 		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
 	}
 
@@ -1653,6 +1654,12 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	if !ok {
 		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
 	}
+	// A partitioned table decouples the chunk's read range (collation) from
+	// ownership: the coordinator reads and fans out (snapshot_hash.go). A
+	// single owner needs no fan-out and keeps the worker-side path below.
+	if len(owners) > 1 {
+		return c.snapshotFanoutTable(ctx, rdr, chunker, ref, cfg)
+	}
 	ranges := rt.rangesOf(ref.Target)
 	if len(ranges) != len(owners) {
 		return fmt.Errorf("coordinator: snapshot: table %s: %d partition ranges for %d owners", ref.Target, len(ranges), len(owners))
@@ -1995,23 +2002,26 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if len(pk) == 0 {
 		return fmt.Errorf("coordinator: table %s has %d partition owners but no primary key to route by", meta.Table, len(owners))
 	}
-	ranges := rt.rangesOf(meta.Table)
-	if len(ranges) != len(owners) {
-		return fmt.Errorf("coordinator: table %s: %d partition ranges for %d owners", meta.Table, len(ranges), len(owners))
-	}
 	reader, err := transport.NewBatchReader(b.Record, pk)
 	if err != nil {
 		return fmt.Errorf("coordinator: table %s: partition routing: %w", meta.Table, err)
 	}
+	// ONE owner function for snapshot and stream: rendezvous hashing over the
+	// live owner names. The chunker's collation ranges drive only the snapshot
+	// READ (the index range scan), never ownership, so the ordering the
+	// database uses can no longer disagree with the routing Go uses (#574).
+	// A range cannot be the owner function when the bounds are sampled in a
+	// non-binary collation: those bounds are not contiguous in byte order.
+	names := ownerNames(owners)
 	nrows := reader.NumRows()
 	owner := make([]int, nrows)
 	for i := 0; i < nrows; i++ {
-		p, err := partitionOwner(ranges, reader.Key(i))
+		p, err := route.OwnerOfKey(reader.Key(i), names)
 		if err != nil {
 			return fmt.Errorf("coordinator: table %s: row %d: %w", meta.Table, i, err)
 		}
 		if p < 0 {
-			return fmt.Errorf("coordinator: table %s: row %d's key %v matches no partition range", meta.Table, i, reader.Key(i))
+			return fmt.Errorf("coordinator: table %s: row %d's key %v has no owner", meta.Table, i, reader.Key(i))
 		}
 		owner[i] = p
 	}
@@ -2171,6 +2181,14 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 		return err
 	}
 	c.log.Debug("coordinator: enqueue sub-batch", "owner", w.name, "table", meta.Table, "seq", meta.BatchId, "highPos", meta.HighPos, "staged", meta.Staged)
+	// A WindowTag.Snapshot batch carries rows into the worker's snapshot
+	// window; the worker stores it (AddWindowRows) and never acked-applies it,
+	// so it must NOT be registered as in-flight (the ack would never come and
+	// the supervisor would reset the worker for stalling) nor advance the
+	// table's sent position. The Closes marker that flushes the window is what
+	// carries the position and the staged cycle.
+	snapshotRows := meta.Window != nil && meta.Window.Snapshot
+
 	// Marker batches (window closes) carry their position in LowPos.
 	posStr := meta.HighPos
 	if posStr == "" {
@@ -2186,11 +2204,13 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	}
 	select {
 	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes}:
-		if idx := c.indexOf(w.name); idx != nil {
-			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
-				marker: meta.Window != nil && meta.Window.Closes})
+		if !snapshotRows {
+			if idx := c.indexOf(w.name); idx != nil {
+				idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
+					marker: meta.Window != nil && meta.Window.Closes})
+			}
+			c.noteSent(meta.Table, posStr)
 		}
-		c.noteSent(meta.Table, posStr)
 		return nil
 	case <-ctx.Done():
 		c.budget.release(w.name, n)

@@ -580,6 +580,17 @@ func partitionName(pipeline, target string, p int) string {
 	return fmt.Sprintf("%s-%d", spec.WorkerGroupPrefix(pipeline, target), p)
 }
 
+// ownerNames returns the live owner names, the input to the rendezvous owner
+// function. The order does not matter: the winner is chosen by hash, with the
+// name as an order-independent tie-break.
+func ownerNames(owners []*workerState) []string {
+	names := make([]string, len(owners))
+	for i, w := range owners {
+		names[i] = w.name
+	}
+	return names
+}
+
 // OwnerNames returns target's partition owner names in partition order — the
 // live routing layout. It is the read-only companion to ScaleTable: a scaler
 // (or a test) uses it to observe a re-slice's effect, including DURING a

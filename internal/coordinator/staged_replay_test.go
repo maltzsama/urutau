@@ -58,8 +58,9 @@ func stagedReplayHarness(t *testing.T) *Coordinator {
 // nothing was committed again, silently.
 func TestStagedReplayCycleWaitsOnlyForUncoveredOwners(t *testing.T) {
 	c := stagedReplayHarness(t)
-	// id 1 → w0 at 0/10 (covered by 0/20); id 150 → w1 at 0/30 (not covered).
-	b := replayBatch(t, []int64{1, 150}, []string{"0/10", "0/30"})
+	// w0's row at 0/10 is covered by 0/20; w1's at 0/30 is not.
+	names := []string{"w0", "w1"}
+	b := replayBatch(t, []int64{ownerKey(t, names, 0), ownerKey(t, names, 1)}, []string{"0/10", "0/30"})
 	meta := &pb.BatchMeta{Table: "raw.orders"}
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)

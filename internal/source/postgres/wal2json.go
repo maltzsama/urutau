@@ -148,6 +148,14 @@ func (r *Reader) handleWal2jsonChange(msg wal2jsonChange) error {
 				return r.appendChange(entry, rowchange.OpDelete, nil, before)
 			}
 		}
+		// An UPDATE that changes the primary key must delete the OLD key
+		// before the update writes the new one, exactly as the pgoutput path
+		// does (deleteChangedKey). The update's own equality delete is built
+		// from the new key, so without this the old row survives forever
+		// (issue #545; wal2json parity).
+		if err := r.deleteChangedKey(entry, before, after); err != nil {
+			return err
+		}
 		return r.appendChange(entry, rowchange.OpUpdate, after, before)
 	case "delete":
 		if before == nil {

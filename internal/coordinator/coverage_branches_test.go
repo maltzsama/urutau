@@ -79,26 +79,6 @@ func TestEnqueueBatchPartitionedErrors(t *testing.T) {
 	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
 		t.Fatal("a partitioned table without a primary key must error")
 	}
-
-	// Range count does not match owner count.
-	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	c.setRangesForTest(map[string][]source.Chunk{
-		"raw.orders": {{Low: nil, High: nil}},
-	})
-	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
-		t.Fatal("a range/owner count mismatch must error")
-	}
-
-	// A row whose key matches no range.
-	c.setRangesForTest(map[string][]source.Chunk{
-		"raw.orders": {
-			{Low: []any{int64(100)}, High: []any{int64(200)}},
-			{Low: []any{int64(200)}, High: nil},
-		},
-	})
-	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
-		t.Fatal("a key outside every range must error")
-	}
 }
 
 // A window-lifecycle marker goes through enqueueTo to one partition owner (the
@@ -160,7 +140,12 @@ func TestSnapshotTableErrors(t *testing.T) {
 		t.Fatal("range/owner mismatch must error")
 	}
 
-	// Bounds error.
+	// Bounds error. A partitioned table fans out, so it needs the canonical
+	// schema before SnapshotTable runs; the Bounds error still surfaces first
+	// because SnapshotTable reads the bounds before it touches the reader.
+	c.canonical = map[string]core.Schema{
+		"shop.orders": {Columns: []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}}, PrimaryKey: []string{"id"}},
+	}
 	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}, {}}})
 	boom := errors.New("bounds failed")
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{err: boom}, ref, snapshot.SnapshotConfig{}); !errors.Is(err, boom) {

@@ -194,11 +194,11 @@ func TestEnqueueBatchSplitsByPartition(t *testing.T) {
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.index["w1"] = newPositionIndex("run-1")
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	c.setRangesForTest(map[string][]source.Chunk{
-		"raw.orders": {{Low: nil, High: []any{int64(100)}}, {Low: []any{int64(100)}, High: nil}},
-	})
 
-	b := wireBatchIDs(t, 1, 150)
+	// Keys chosen by the production owner function so one routes to each
+	// owner; the split is by rendezvous hash, not by key range.
+	names := []string{"w0", "w1"}
+	b := wireBatchIDs(t, ownerKey(t, names, 0), ownerKey(t, names, 1))
 	if err := c.enqueueBatch(context.Background(), b, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
 		t.Fatalf("enqueueBatch(partitioned): %v", err)
 	}

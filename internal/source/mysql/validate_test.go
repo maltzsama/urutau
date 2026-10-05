@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/maltzsama/urutau/position"
@@ -45,19 +46,19 @@ func fakeDB(t *testing.T, cols []string, row []driver.Value) *sql.DB {
 }
 
 func TestValidateServer(t *testing.T) {
-	cols := []string{"log_bin", "binlog_format", "gtid_mode", "enforce_gtid_consistency", "binlog_row_image"}
+	cols := []string{"log_bin", "binlog_format", "gtid_mode", "enforce_gtid_consistency", "binlog_row_image", "binlog_row_value_options"}
 	cases := []struct {
 		name    string
 		row     []driver.Value
 		wantErr string
-		wantWrn bool
 	}{
-		{"ok", []driver.Value{"1", "ROW", "ON", "ON", "FULL"}, "", false},
-		{"binlog off", []driver.Value{"0", "ROW", "ON", "ON", "FULL"}, "log_bin", false},
-		{"statement format", []driver.Value{"1", "STATEMENT", "ON", "ON", "FULL"}, "binlog_format", false},
-		{"gtid off", []driver.Value{"1", "ROW", "OFF", "ON", "FULL"}, "gtid_mode", false},
-		{"enforce off", []driver.Value{"1", "ROW", "ON", "OFF", "FULL"}, "enforce_gtid_consistency", false},
-		{"row image minimal warns", []driver.Value{"1", "ROW", "ON", "ON", "MINIMAL"}, "", true},
+		{"ok", []driver.Value{"1", "ROW", "ON", "ON", "FULL", ""}, ""},
+		{"binlog off", []driver.Value{"0", "ROW", "ON", "ON", "FULL", ""}, "log_bin"},
+		{"statement format", []driver.Value{"1", "STATEMENT", "ON", "ON", "FULL", ""}, "binlog_format"},
+		{"gtid off", []driver.Value{"1", "ROW", "OFF", "ON", "FULL", ""}, "gtid_mode"},
+		{"enforce off", []driver.Value{"1", "ROW", "ON", "OFF", "FULL", ""}, "enforce_gtid_consistency"},
+		{"row image minimal", []driver.Value{"1", "ROW", "ON", "ON", "MINIMAL", ""}, "binlog_row_image"},
+		{"partial json", []driver.Value{"1", "ROW", "ON", "ON", "FULL", "PARTIAL_JSON"}, "PARTIAL_JSON"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -67,13 +68,16 @@ func TestValidateServer(t *testing.T) {
 				if err == nil {
 					t.Fatalf("want error containing %q, got nil", c.wantErr)
 				}
+				if !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("error %q does not contain %q", err, c.wantErr)
+				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if (warn != "") != c.wantWrn {
-				t.Fatalf("warning = %q, want non-empty=%v", warn, c.wantWrn)
+			if warn != "" {
+				t.Fatalf("warning = %q, want none", warn)
 			}
 		})
 	}
