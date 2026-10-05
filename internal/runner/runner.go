@@ -206,22 +206,64 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 	// once before close(batchCh), read only after the channel is drained, so
 	// the close/read pair carries the happens-before edge.
 	var readErr error
+	drainer, _ := rdr.(source.Drainer)
+
+	// readerMu serializes rdr.Next and rdr.Drain: both read the reader's own
+	// buffer, so a Release flush must never interleave a pull and reorder the
+	// InWindow events ahead of the Closes marker. drainReq asks the puller
+	// goroutine — the sole reader — to flush the reader's buffer into batchCh.
+	var readerMu sync.Mutex
+	drainReq := make(chan chan struct{}, 1)
+
+	// pushBatch routes one batch into batchCh, applying the delivered-note
+	// bookkeeping the normal pull does.
+	pushBatch := func(b *dataplane.Batch) error {
+		r.deliverNote(b)
+		select {
+		case batchCh <- b:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	go func() {
 		defer close(batchCh)
 		for {
+			// Service a pending drain before pulling: flush the reader's
+			// buffered events into batchCh, in order.
+			select {
+			case done := <-drainReq:
+				if drainer != nil {
+					readerMu.Lock()
+					err := drainer.Drain(ctx, pushBatch)
+					readerMu.Unlock()
+					if err != nil {
+						readErr = err
+						close(done)
+						return
+					}
+				}
+				close(done)
+				continue
+			default:
+			}
+
+			readerMu.Lock()
 			b, err := rdr.Next(ctx)
 			if err != nil {
+				readerMu.Unlock()
 				readErr = err
-
 				return
 			}
 			if b == nil {
+				readerMu.Unlock()
 				return
 			}
-			r.deliverNote(b)
-			select {
-			case batchCh <- b:
-			case <-ctx.Done():
+			err = pushBatch(b)
+			readerMu.Unlock()
+			if err != nil {
+				readErr = err
 				return
 			}
 		}
@@ -251,43 +293,11 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 				return ctx.Err()
 			}
 		case req := <-r.flushReq:
-			// Drain everything already decoded into ingest, then ack.
-		drain:
-			for {
-				select {
-				case b, ok := <-batchCh:
-					if !ok {
-						break drain
-					}
-					if r.gate(b) {
-						continue
-					}
-					select {
-					case r.ingest <- worker.Ingest{Table: b.Table, Batch: b}:
-					case <-ctx.Done():
-						close(req)
-						return ctx.Err()
-					}
-				default:
-					// give the puller a beat to flush its buffer
-					select {
-					case b, ok := <-batchCh:
-						if !ok {
-							break drain
-						}
-						if r.gate(b) {
-							continue
-						}
-						select {
-						case r.ingest <- worker.Ingest{Table: b.Table, Batch: b}:
-						case <-ctx.Done():
-							close(req)
-							return ctx.Err()
-						}
-					default:
-						break drain
-					}
-				}
+			// Drain the reader's own buffer ahead of the Closes marker, so no
+			// InWindow event is overtaken (issue #488).
+			if err := r.flushDecoded(ctx, drainer, drainReq, batchCh); err != nil {
+				close(req)
+				return err
 			}
 			close(req)
 		case req := <-r.gateFlushReq:
@@ -627,26 +637,14 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 
 	// Audit trail first: job_started marks the boot, and a startup failure
 	// still seals the trail with job_stopped.
-	var ev *eventlog.Run
-	if cfg.Eventlog != nil {
-		ec := *cfg.Eventlog
-		// Apply the shared key convention: the trail lives under the
-		// pipeline name so a reader can discover it by listing.
-		if ec.Pipeline == "" {
-			ec.Pipeline = s.Pipeline
-		}
-		e, eerr := eventlog.New(ctx, ec)
-		if eerr != nil {
-			return nil, eerr
-		}
-		ev = e
-		_ = ev.Emit(ctx, eventlog.KindJobStarted, map[string]any{
-			"pipeline": s.Pipeline, "source": s.Source.Kind, "tables": len(s.Tables),
-		})
+	ev, onFail, err := openEventlog(ctx, s, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if ev != nil {
 		defer func() {
 			if r == nil {
-				_ = ev.Emit(ctx, eventlog.KindJobStopped, map[string]any{"reason": "startup_failed"})
-				_ = ev.Close()
+				onFail()
 			}
 		}()
 	}

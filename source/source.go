@@ -169,6 +169,15 @@ type SchemaSetter interface {
 	SetSourceSchemas(schemas map[string]core.Schema)
 }
 
+// Drainer is an optional Reader capability: it flushes every event the
+// decoder has already produced — buffered or still on its channel — into
+// emit, without blocking for new data. The collapsed runner's relay uses it
+// to flush decoded events ahead of a Closes marker, so an event decoded but
+// not yet pulled can never be overtaken by the marker (issue #488).
+type Drainer interface {
+	Drain(ctx context.Context, emit func(*dataplane.Batch) error) error
+}
+
 // Positioner resolves the stream start position: the first-boot start and
 // the codec for a stored cdc.position.
 type Positioner interface {
