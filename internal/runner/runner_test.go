@@ -303,6 +303,7 @@ func TestFlushDecodedDrainsReaderBuffer(t *testing.T) {
 	if err := r.flushDecoded(context.Background(), rdr, drainReq, batchCh); err != nil {
 		t.Fatalf("flushDecoded: %v", err)
 	}
+	close(drainReq) // let the stand-in puller goroutine exit
 
 	select {
 	case in := <-ingest:
@@ -336,6 +337,7 @@ func TestFlushDecodedPropagatesDrainError(t *testing.T) {
 	if err := r.flushDecoded(context.Background(), rdr, drainReq, batchCh); !errors.Is(err, boom) {
 		t.Fatalf("flushDecoded = %v, want the drain error %v", err, boom)
 	}
+	close(drainReq) // let the stand-in puller goroutine exit
 }
 
 // A reader whose puller is blocked on Next (empty buffer) never accepts the
