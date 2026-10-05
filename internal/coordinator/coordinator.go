@@ -351,6 +351,8 @@ type Coordinator struct {
 	// lostWindows are the chunk windows each lost worker had not
 	// committed, taken at the loss (recovery.go); under chunkMarkersMu.
 	lostWindows map[string][]chunkMarker
+	// chunkCursor is, per chunkRef, the last acked window's high key (#646).
+	chunkCursor map[uint32][]any
 	// podTermination reads a worker's last container termination; nil
 	// reads it from Kubernetes (recovery.go). Set by tests.
 	podTermination func(worker string) (podTermination, bool)
@@ -1729,8 +1731,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		c.mu.Unlock()
 		if haveEpoch && cur != epoch {
 			// Lost (and back) since the previous round-trip.
-			i = c.redoFrom(w, ref.Target, windows, i)
-			c.clearChunkReady(ref.Target, partition)
+			i = c.resumeChunkAfterLoss(chunks, w, ref, partition, windows, i)
 			c.log.Warn("coordinator: snapshot worker was lost; redoing its uncommitted chunks",
 				"table", ref.Source, "partition", partition, "worker", w.name, "from_chunk", i)
 		}
@@ -1821,7 +1822,11 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 				continue
 			}
 			windows[wo.Seq] = index
-			if err := c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending); err != nil {
+			highKey, err := decodeWindowHighKey(wo.HighKey)
+			if err != nil {
+				return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
+			}
+			if err := c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending, chunkID, highKey); err != nil {
 				return err
 			}
 		case cr := <-c.chunkReady:
@@ -1836,46 +1841,6 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	}
-}
-
-// closeOneWindow proves the reader caught up to one window's position, then
-// releases its gated live rows (InWindow) and its Closes marker. The worker
-// captured pos AFTER the window's read — never before — so the caught-up proof
-// gates any event the window's SELECT could have seen as pre-image (the
-// interleave invariant).
-func (c *Coordinator) closeOneWindow(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, wo *pb.WindowOpen, lost <-chan struct{}, pending []uint32) error {
-	pos, err := c.src.ParsePosition(wo.Pos)
-	if err != nil {
-		return fmt.Errorf("coordinator: window %d pos %q: %w", wo.Seq, wo.Pos, err)
-	}
-	// A worker lost while the reader catches up takes its window with it, and
-	// its full queue blocks the shared pump so the reader never reaches high;
-	// waiting out the window timeout would end the run (issue #526) instead of
-	// redoing the chunk, so the wait aborts on the loss.
-	if err := c.waitCaughtUpOrLost(ctx, rdr, pos, cfg, wo.Seq, lost); err != nil {
-		return err
-	}
-	c.markWindowReady(ref.Target, partition, wo.Seq)
-	// Release the window's gated live events (InWindow-tagged) ahead of the
-	// Closes marker — FIFO keeps them before it.
-	if err := c.flushWindow(ctx, ref.Target, partition, wo.Seq); err != nil {
-		return err
-	}
-	// The marker's position is the window's own captured position, past every
-	// batch the window's read could have seen.
-	if err := c.sendClosesPending(ctx, w, ref.Target, pos, wo.Seq, pending); err != nil {
-		return err
-	}
-	// A worker lost before the marker was sent does not record this window
-	// among its lost windows: the marker would reach a worker holding no such
-	// window, and the chunk would pass for done. Report the loss so the
-	// partition redoes it.
-	select {
-	case <-lost:
-		return errWorkerLost
-	default:
-		return nil
 	}
 }
 

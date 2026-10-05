@@ -271,6 +271,12 @@ message WindowOpen {
   uint64 attempt  = 3;  // worker attempt (the assignment epoch), bumped on restart
   uint64 seq      = 4;  // window sequence within the attempt
   string pos      = 5;  // source position captured after this window's read
+  // high_key is the window's last row's PK tuple, encoded as a single-row
+  // bound (transport.EncodeBounds(key, nil)). The coordinator uses it as a
+  // per-chunk cursor: a mid-chunk redo resumes the chunk from the last
+  // committed window's high key instead of re-emitting windows that already
+  // committed (issue #646). Empty for the whole-chunk (non-byte-cap) path.
+  bytes  high_key = 6;
 }
 
 message ChunkFailed {

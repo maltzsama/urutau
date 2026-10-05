@@ -2141,12 +2141,18 @@ func (x *ChunkReady) GetWindowIds() []uint64 {
 // order within the attempt. pos is the source position captured AFTER this
 // window's batch was read — never before (the interleave invariant).
 type WindowOpen struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`                     // source table
-	ChunkId       uint32                 `protobuf:"varint,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"` // the scheduling chunk this window belongs to (chunkRef)
-	Attempt       uint64                 `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"`                // worker attempt (the assignment epoch), bumped on restart
-	Seq           uint64                 `protobuf:"varint,4,opt,name=seq,proto3" json:"seq,omitempty"`                        // window sequence within the attempt
-	Pos           string                 `protobuf:"bytes,5,opt,name=pos,proto3" json:"pos,omitempty"`                         // source position captured after this window's read
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Table   string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`                     // source table
+	ChunkId uint32                 `protobuf:"varint,2,opt,name=chunk_id,json=chunkId,proto3" json:"chunk_id,omitempty"` // the scheduling chunk this window belongs to (chunkRef)
+	Attempt uint64                 `protobuf:"varint,3,opt,name=attempt,proto3" json:"attempt,omitempty"`                // worker attempt (the assignment epoch), bumped on restart
+	Seq     uint64                 `protobuf:"varint,4,opt,name=seq,proto3" json:"seq,omitempty"`                        // window sequence within the attempt
+	Pos     string                 `protobuf:"bytes,5,opt,name=pos,proto3" json:"pos,omitempty"`                         // source position captured after this window's read
+	// high_key is the window's last row's PK tuple, encoded as a single-row
+	// bound (transport.EncodeBounds(key, nil)). The coordinator uses it as a
+	// per-chunk cursor: a mid-chunk redo resumes the chunk from the last
+	// committed window's high key instead of re-emitting windows that already
+	// committed (issue #646). Empty for the whole-chunk (non-byte-cap) path.
+	HighKey       []byte `protobuf:"bytes,6,opt,name=high_key,json=highKey,proto3" json:"high_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2214,6 +2220,13 @@ func (x *WindowOpen) GetPos() string {
 		return x.Pos
 	}
 	return ""
+}
+
+func (x *WindowOpen) GetHighKey() []byte {
+	if x != nil {
+		return x.HighKey
+	}
+	return nil
 }
 
 type ChunkFailed struct {
@@ -3010,14 +3023,15 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x11dropped_by_window\x18\x04 \x01(\x04R\x0fdroppedByWindow\x12\x14\n" +
 	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\x12\x1d\n" +
 	"\n" +
-	"window_ids\x18\x06 \x03(\x04R\twindowIds\"{\n" +
+	"window_ids\x18\x06 \x03(\x04R\twindowIds\"\x96\x01\n" +
 	"\n" +
 	"WindowOpen\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12\x18\n" +
 	"\aattempt\x18\x03 \x01(\x04R\aattempt\x12\x10\n" +
 	"\x03seq\x18\x04 \x01(\x04R\x03seq\x12\x10\n" +
-	"\x03pos\x18\x05 \x01(\tR\x03pos\"\x83\x01\n" +
+	"\x03pos\x18\x05 \x01(\tR\x03pos\x12\x19\n" +
+	"\bhigh_key\x18\x06 \x01(\fR\ahighKey\"\x83\x01\n" +
 	"\vChunkFailed\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12+\n" +

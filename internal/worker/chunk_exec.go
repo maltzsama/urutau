@@ -232,6 +232,22 @@ func (x *chunkExecutor) emitWindow(ctx context.Context, req *pb.ChunkRequest, ta
 		}
 		posStr = pos.String()
 	}
+	// The window's high key — the last row's PK tuple — is the cursor a
+	// mid-chunk redo resumes from (issue #646): the coordinator uses it to
+	// re-request the chunk from the last committed window, not its start.
+	var highKey []byte
+	if n > 0 && len(ta.PrimaryKey) > 0 {
+		reader, err := transport.NewBatchReader(page, ta.PrimaryKey)
+		if err != nil {
+			page.Release()
+			return fmt.Errorf("worker: window high key: %w", err)
+		}
+		highKey, err = transport.EncodeBounds(reader.Key(int(n)-1), nil)
+		if err != nil {
+			page.Release()
+			return fmt.Errorf("worker: window high key: %w", err)
+		}
+	}
 	seq := x.windowSeq.Add(1)
 	if err := x.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_WindowOpen{WindowOpen: &pb.WindowOpen{
 		Table:   req.Table,
@@ -239,6 +255,7 @@ func (x *chunkExecutor) emitWindow(ctx context.Context, req *pb.ChunkRequest, ta
 		Attempt: x.epoch,
 		Seq:     seq,
 		Pos:     posStr,
+		HighKey: highKey,
 	}}}); err != nil {
 		page.Release()
 		return err
