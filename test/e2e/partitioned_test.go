@@ -354,3 +354,125 @@ func TestDistributedPartitionedEmptyRangeResume(t *testing.T) {
 		t.Fatalf("restart did not resume — the empty owner was not seeded:\n%s", cap.String())
 	}
 }
+
+// TestDistributedStringKeyCollation is the #574 regression: a partitioned
+// table whose primary key is a string under a NON-BINARY collation
+// (utf8mb4_0900_ai_ci), where the database's ORDER BY and Go's byte order
+// disagree ('B' sorts before 'a' in bytes, after in ai_ci). With the snapshot
+// assigning a chunk's rows by the chunker's collation range while the stream
+// routed by bytes, the two laws disagreed: a key could be read by one worker
+// and streamed to another, and the collation-sampled bounds — not contiguous
+// in byte order — made clipChunksToRange drop chunks outright.
+//
+// This asserts the decoupled design: the snapshot reads by collation (the
+// index range scan, #588 intact) but ONE owner function (the rendezvous hash)
+// decides ownership for both snapshot and stream.
+func TestDistributedStringKeyCollation(t *testing.T) {
+	requireE2E(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+
+	addr := reserveAddr(t)
+	s := loadPipeline(t)
+	s.Tables = []spec.Table{{
+		Source:            "shop.collated",
+		Target:            "raw.collated",
+		PrimaryKey:        []string{"id"},
+		CreateIfNotExists: true,
+		Workers:           &spec.WorkerSpec{Number: 3},
+	}}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	groups := s.Tables[0].WorkerGroupNames(s.Pipeline)
+
+	db := mysqlConn(t)
+	resetBinlog(t, db)
+	dropIcebergNamed(t, ctx, "raw.collated")
+	if _, err := db.Exec(`DROP TABLE IF EXISTS collated`); err != nil {
+		t.Fatalf("drop collated: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE collated (
+		id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+		v  VARCHAR(64) NOT NULL,
+		PRIMARY KEY (id))`); err != nil {
+		t.Fatalf("create collated: %v", err)
+	}
+
+	// One case per distinct letter: every key stays DISTINCT under the
+	// accent/case-insensitive collation, while ai_ci orders a<b<c<... and
+	// bytes order all uppercase before all lowercase — so the two laws
+	// disagree. (Using both cases of one letter, or an accent of a letter
+	// already present, would collapse to the SAME key in ai_ci — camada B,
+	// not the ordering bug under test.)
+	bases := []string{"A", "b", "C", "d", "E", "f", "G", "h", "I", "j",
+		"K", "l", "M", "n", "O", "p", "Q", "r", "S", "t"}
+	const perBase = 30
+	var keys []string
+	for _, b := range bases {
+		for i := 0; i < perBase; i++ {
+			keys = append(keys, fmt.Sprintf("%s%03d", b, i))
+		}
+	}
+	for _, k := range keys {
+		dml(t, db, fmt.Sprintf("INSERT INTO collated (id, v) VALUES ('%s', 'seed')", k))
+	}
+	n := int64(len(keys))
+
+	stop, waitDone := bootPipeline(t, ctx, addr, s, groups...)
+
+	// Burst a few divergent keys during the snapshot. A snapshot window whose
+	// rows were owned by the wrong worker would overwrite the newer live event
+	// and leave 'seed' behind; a chunk dropped by the collation/byte clip
+	// mismatch would leave its keys missing from the count.
+	hot := []string{"A000", "b000", "C000", "d000", "E000", "f000", "G000", "h000",
+		"I000", "j000", "K000", "l000", "M000", "n000", "O000", "p000", "Q000", "r000", "S000", "t000"}
+	stopBurst := make(chan struct{})
+	burstDone := make(chan struct{})
+	go func() {
+		defer close(burstDone)
+		for {
+			select {
+			case <-stopBurst:
+				return
+			case <-time.After(30 * time.Millisecond):
+			}
+			for _, k := range hot {
+				if _, err := db.Exec(fmt.Sprintf("UPDATE collated SET v = 'burst' WHERE id = '%s'", k)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	waitTrino(t, ctx, `SELECT count(*) FROM collated`, n)
+	assertCount(t, ctx, `SELECT count(DISTINCT id) FROM collated`, n)
+	time.Sleep(500 * time.Millisecond)
+	close(stopBurst)
+	<-burstDone
+
+	// Every bursted key must read the live value: the snapshot row was either
+	// deduplicated (same owner) or overwritten by the newer live event.
+	for _, k := range hot {
+		waitTrino(t, ctx, fmt.Sprintf("SELECT v FROM collated WHERE id = '%s'", k), "burst")
+	}
+
+	// Live writes on divergent keys after the snapshot: they must overwrite
+	// the snapshot rows, whatever worker each key lands on.
+	divergent := []string{"A010", "b015", "M020", "t025", "S005"}
+	for i, k := range divergent {
+		dml(t, db, fmt.Sprintf("UPDATE collated SET v = 'live-%d' WHERE id = '%s'", i, k))
+	}
+	for i, k := range divergent {
+		waitTrino(t, ctx, fmt.Sprintf("SELECT v FROM collated WHERE id = '%s'", k), fmt.Sprintf("live-%d", i))
+	}
+	dml(t, db, `DELETE FROM collated WHERE id = 'D010'`)
+	assertMissing(t, ctx, `SELECT v FROM collated WHERE id = 'D010'`)
+	waitTrino(t, ctx, `SELECT count(*) FROM collated`, n-1)
+
+	t.Log("string-key collation ok: one owner function, no stale overwrite, no lost chunk")
+	stop()
+	if err := waitDone(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}

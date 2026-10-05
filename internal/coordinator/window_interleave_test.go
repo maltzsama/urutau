@@ -192,6 +192,12 @@ func TestWindowInterleaveWithinTheWindow(t *testing.T) {
 		t.Fatalf("snapshot round-trip: %v", err)
 	}
 
+	// The snapshot round-trip may enqueue through the gate asynchronously;
+	// wait for both batches instead of racing the drain.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(w.queue) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	out := drainQueued(t, w)
 	if len(out) != 2 {
 		t.Fatalf("worker got %d batches, want the InWindow update then the Closes marker", len(out))

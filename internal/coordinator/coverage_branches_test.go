@@ -79,26 +79,6 @@ func TestEnqueueBatchPartitionedErrors(t *testing.T) {
 	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
 		t.Fatal("a partitioned table without a primary key must error")
 	}
-
-	// Range count does not match owner count.
-	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
-	c.setRangesForTest(map[string][]source.Chunk{
-		"raw.orders": {{Low: nil, High: nil}},
-	})
-	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
-		t.Fatal("a range/owner count mismatch must error")
-	}
-
-	// A row whose key matches no range.
-	c.setRangesForTest(map[string][]source.Chunk{
-		"raw.orders": {
-			{Low: []any{int64(100)}, High: []any{int64(200)}},
-			{Low: []any{int64(200)}, High: nil},
-		},
-	})
-	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {
-		t.Fatal("a key outside every range must error")
-	}
 }
 
 // A window-lifecycle marker goes through enqueueTo to one partition owner (the
@@ -146,22 +126,24 @@ func (s *seedingSink) SeedPositions(context.Context, core.TableRef, []string) er
 func TestSnapshotTableErrors(t *testing.T) {
 	ctx := context.Background()
 	c, _ := coordHarness()
-	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
 
-	// No owner.
-	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{}, ref, snapshot.SnapshotConfig{}); err == nil {
+	// No owner: a target no worker is routed to.
+	ghost := source.TableRef{Source: "shop.ghost", Target: "raw.ghost"}
+	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{}, ghost, snapshot.SnapshotConfig{}); err == nil {
 		t.Fatal("no owning worker must error")
 	}
 
-	// Range/owner count mismatch.
-	c.setRouteForTest("raw.orders", []*workerState{{name: "w0"}, {name: "w1"}})
-	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}}})
+	// Range/owner count mismatch on a SINGLE owner: a multi-owner table fan
+	// outs and never consults the ranges, so the check only applies here.
+	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
+	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}, {}}})
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{}, ref, snapshot.SnapshotConfig{}); err == nil {
 		t.Fatal("range/owner mismatch must error")
 	}
 
-	// Bounds error.
-	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}, {}}})
+	// Bounds error on the single-owner path. SnapshotTable reads the bounds
+	// before it touches the reader, so the error surfaces here.
+	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}}})
 	boom := errors.New("bounds failed")
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{err: boom}, ref, snapshot.SnapshotConfig{}); !errors.Is(err, boom) {
 		t.Fatalf("snapshotTable(bounds err) = %v, want boom", err)

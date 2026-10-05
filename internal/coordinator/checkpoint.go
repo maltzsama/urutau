@@ -67,7 +67,13 @@ const putTimeout = 10 * time.Second
 
 // run writes the manifests until ctx is done. Async and best-effort by
 // contract: a failed checkpoint is logged, never fatal.
-func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*positionIndex, log *slog.Logger) {
+//
+// index is a function, not a map, because the owner set changes at runtime:
+// since #312 a scale-out registers owners (and a scale-in retires them), so a
+// boot-time snapshot would never checkpoint a dynamically added worker and
+// would keep checkpointing a retired one (issue #554). index must return a
+// fresh, race-safe copy (Coordinator.indexSnapshot).
+func (c *checkpoint) run(ctx context.Context, runID string, index func() map[string]*positionIndex, log *slog.Logger) {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 	for {
@@ -75,10 +81,9 @@ func (c *checkpoint) run(ctx context.Context, runID string, index map[string]*po
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// index is populated at boot and never mutated afterwards, so
-			// ranging it is safe. A dynamically added worker would require
-			// synchronizing this iteration (and the map) first.
-			for worker, idx := range index {
+			// Re-read the live owner set every tick; ranging a copy is safe
+			// while registerOwner/retireOwner mutate the real map.
+			for worker, idx := range index() {
 				if !idx.Dirty() {
 					continue
 				}

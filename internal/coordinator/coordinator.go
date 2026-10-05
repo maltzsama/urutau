@@ -10,8 +10,6 @@
 package coordinator
 
 import (
-	"bytes"
-	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -50,6 +48,7 @@ import (
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
+	route "github.com/maltzsama/urutau/internal/routing"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -365,6 +364,14 @@ type Coordinator struct {
 	// (snapshotPlan); read-only once set.
 	snapshotTodoMu sync.Mutex
 	snapshotTodo   map[string]map[uint32]bool
+
+	// snapshotting marks a table whose snapshot is running. A re-slice must
+	// not flip that table's owner layout mid-snapshot: the fan-out captured
+	// the owners at start and the live stream routes by the current layout,
+	// so a flip would send a key's snapshot row and its live row to different
+	// workers.
+	snapshottingMu sync.Mutex
+	snapshotting   map[string]bool
 
 	// confirmed tracks the latest position each WORKER durably committed
 	// (from worker Acks). The minimum across workers is reported to the
@@ -766,7 +773,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return fmt.Errorf("coordinator: checkpoint: %w", err)
 		}
 		c.cp = cp
-		go cp.run(ctx, c.runID, c.indexSnapshot(), c.log)
+		go cp.run(ctx, c.runID, c.indexSnapshot, c.log)
 		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
 	}
 
@@ -1648,10 +1655,19 @@ func (c *Coordinator) waitChunkReadyOr(ctx context.Context, table string, chunkI
 // Closes marker. The worker holds the chunk rows in its window; the window
 // is what InWindow events drain and the Closes marker flushes.
 func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
+	c.beginSnapshot(ref.Target)
+	defer c.endSnapshot(ref.Target)
+
 	rt := c.loadRouting()
 	owners, ok := rt.ownersOf(ref.Target)
 	if !ok {
 		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
+	}
+	// A partitioned table decouples the chunk's read range (collation) from
+	// ownership: the coordinator reads and fans out (snapshot_hash.go). A
+	// single owner needs no fan-out and keeps the worker-side path below.
+	if len(owners) > 1 {
+		return c.snapshotFanoutTable(ctx, rdr, chunker, ref, cfg)
 	}
 	ranges := rt.rangesOf(ref.Target)
 	if len(ranges) != len(owners) {
@@ -1826,29 +1842,49 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 		return ctx.Err()
 	}
 
+	// handleWindowOpen closes one announced window: prove caught up to its
+	// position, release its gated live rows, send its Closes.
+	handleWindowOpen := func(wo *pb.WindowOpen) error {
+		if wo.Table != ref.Source || wo.ChunkId != chunkID || wo.Attempt != epoch {
+			c.log.Warn("coordinator: ignoring stale/unexpected WindowOpen",
+				"table", wo.Table, "chunk", wo.ChunkId, "attempt", wo.Attempt, "want_epoch", epoch)
+			return nil
+		}
+		windows[wo.Seq] = index
+		highKey, err := decodeWindowHighKey(wo.HighKey)
+		if err != nil {
+			return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
+		}
+		return c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending, chunkID, highKey)
+	}
+
 	// The worker streams WindowOpen as it reads the chunk (byte-cap), then
-	// ChunkReady. Close each window as it opens, in order: prove caught up to
-	// that window's position, release its gated live rows, send its Closes.
+	// ChunkReady. Close each window as it opens, in order.
 	for {
 		select {
 		case wo := <-c.windowOpen:
-			if wo.Table != ref.Source || wo.ChunkId != chunkID || wo.Attempt != epoch {
-				c.log.Warn("coordinator: ignoring stale/unexpected WindowOpen",
-					"table", wo.Table, "chunk", wo.ChunkId, "attempt", wo.Attempt, "want_epoch", epoch)
-				continue
-			}
-			windows[wo.Seq] = index
-			highKey, err := decodeWindowHighKey(wo.HighKey)
-			if err != nil {
-				return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
-			}
-			if err := c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending, chunkID, highKey); err != nil {
+			if err := handleWindowOpen(wo); err != nil {
 				return err
 			}
 		case cr := <-c.chunkReady:
 			if cr.Table == ref.Source && cr.ChunkId == chunkID && cr.Epoch == epoch {
 				c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID, "rows", cr.Rows)
-				return nil
+				// WindowOpen and ChunkReady arrive on SEPARATE channels, so
+				// the select above can receive ChunkReady while earlier
+				// WindowOpen messages are still buffered. The worker sends
+				// every WindowOpen before ChunkReady, so drain and close the
+				// buffered ones now — otherwise their gated live rows are
+				// never released and their windows never commit.
+				for {
+					select {
+					case wo := <-c.windowOpen:
+						if err := handleWindowOpen(wo); err != nil {
+							return err
+						}
+					default:
+						return nil
+					}
+				}
 			}
 			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
 				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
@@ -1995,23 +2031,26 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	if len(pk) == 0 {
 		return fmt.Errorf("coordinator: table %s has %d partition owners but no primary key to route by", meta.Table, len(owners))
 	}
-	ranges := rt.rangesOf(meta.Table)
-	if len(ranges) != len(owners) {
-		return fmt.Errorf("coordinator: table %s: %d partition ranges for %d owners", meta.Table, len(ranges), len(owners))
-	}
 	reader, err := transport.NewBatchReader(b.Record, pk)
 	if err != nil {
 		return fmt.Errorf("coordinator: table %s: partition routing: %w", meta.Table, err)
 	}
+	// ONE owner function for snapshot and stream: rendezvous hashing over the
+	// live owner names. The chunker's collation ranges drive only the snapshot
+	// READ (the index range scan), never ownership, so the ordering the
+	// database uses can no longer disagree with the routing Go uses (#574).
+	// A range cannot be the owner function when the bounds are sampled in a
+	// non-binary collation: those bounds are not contiguous in byte order.
+	names := ownerNames(owners)
 	nrows := reader.NumRows()
 	owner := make([]int, nrows)
 	for i := 0; i < nrows; i++ {
-		p, err := partitionOwner(ranges, reader.Key(i))
+		p, err := route.OwnerOfKey(reader.Key(i), names)
 		if err != nil {
 			return fmt.Errorf("coordinator: table %s: row %d: %w", meta.Table, i, err)
 		}
 		if p < 0 {
-			return fmt.Errorf("coordinator: table %s: row %d's key %v matches no partition range", meta.Table, i, reader.Key(i))
+			return fmt.Errorf("coordinator: table %s: row %d's key %v has no owner", meta.Table, i, reader.Key(i))
 		}
 		owner[i] = p
 	}
@@ -2167,10 +2206,23 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if n > maxBatchBytes {
 		return fmt.Errorf("coordinator: table %s: batch of %d bytes exceeds the %d-byte transport limit; the source transaction is too large — split it into smaller batches", meta.Table, n, maxBatchBytes)
 	}
-	if err := c.budget.acquire(ctx, w.name, n); err != nil {
-		return err
+	// A WindowTag.Snapshot batch carries rows into the worker's snapshot
+	// window; the worker stores it (AddWindowRows) and never acked-applies it,
+	// so it must NOT be registered as in-flight (the ack would never come and
+	// the supervisor would reset the worker for stalling), must NOT advance
+	// the table's sent position, and must NOT be charged the flow budget: no
+	// ack would ever release the charge, so the budget would fill and stall
+	// the snapshot. The rows are already bounded to one chunk per owner by the
+	// sequential snapshot orchestrator. The Closes marker that flushes the
+	// window carries the position and the staged cycle.
+	snapshotRows := meta.Window != nil && meta.Window.Snapshot
+	if !snapshotRows {
+		if err := c.budget.acquire(ctx, w.name, n); err != nil {
+			return err
+		}
 	}
 	c.log.Debug("coordinator: enqueue sub-batch", "owner", w.name, "table", meta.Table, "seq", meta.BatchId, "highPos", meta.HighPos, "staged", meta.Staged)
+
 	// Marker batches (window closes) carry their position in LowPos.
 	posStr := meta.HighPos
 	if posStr == "" {
@@ -2180,20 +2232,26 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if posStr != "" {
 		high, err = c.src.ParsePosition(posStr)
 		if err != nil {
-			c.budget.release(w.name, n)
+			if !snapshotRows {
+				c.budget.release(w.name, n)
+			}
 			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
 		}
 	}
 	select {
 	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes}:
-		if idx := c.indexOf(w.name); idx != nil {
-			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
-				marker: meta.Window != nil && meta.Window.Closes})
+		if !snapshotRows {
+			if idx := c.indexOf(w.name); idx != nil {
+				idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
+					marker: meta.Window != nil && meta.Window.Closes})
+			}
+			c.noteSent(meta.Table, posStr)
 		}
-		c.noteSent(meta.Table, posStr)
 		return nil
 	case <-ctx.Done():
-		c.budget.release(w.name, n)
+		if !snapshotRows {
+			c.budget.release(w.name, n)
+		}
 		return ctx.Err()
 	}
 }
@@ -2215,157 +2273,6 @@ func (c *Coordinator) primaryKeyFor(target string) []string {
 // one struct across concurrent-ish sends.
 func cloneBatchMeta(meta *pb.BatchMeta) *pb.BatchMeta {
 	return proto.Clone(meta).(*pb.BatchMeta)
-}
-
-// partitionOwner returns the index of the partition range containing key
-// — the range r such that r.Low <= key < r.High (nil bounds are open).
-// Ranges must be contiguous and ordered (as Partitions/the single-range
-// default always produce); returns -1 only if no range matches, which
-// never happens for a correctly resolved table. A key that cannot be
-// ordered against the bounds is an error, never a guess.
-func partitionOwner(ranges []source.Chunk, key []any) (int, error) {
-	if len(ranges) == 1 {
-		return 0, nil // the common, unpartitioned case — skip the comparison
-	}
-	for i, r := range ranges {
-		if r.Low != nil {
-			c, err := comparePK(key, r.Low)
-			if err != nil {
-				return -1, err
-			}
-			if c < 0 {
-				continue
-			}
-		}
-		if r.High != nil {
-			c, err := comparePK(key, r.High)
-			if err != nil {
-				return -1, err
-			}
-			if c >= 0 {
-				continue
-			}
-		}
-		return i, nil
-	}
-	return -1, nil
-}
-
-// comparePK compares two same-shaped primary-key tuples column by
-// column, the same row-constructor semantics the chunkers' own bounds
-// comparisons use (lexicographic over the tuple). Supports the ordered
-// scalar types a partition key can be: signed and unsigned integers,
-// floats, and string/[]byte (partitioning today only supports a
-// single-column key — see source.PartitionSource — so in practice these
-// tuples always have exactly one element, but the comparison is written
-// for the general tuple shape to match Chunk's own []any convention).
-func comparePK(a, b []any) (int, error) {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		c, err := compareScalar(a[i], b[i])
-		if err != nil {
-			return 0, err
-		}
-		if c != 0 {
-			return c, nil
-		}
-	}
-	return len(a) - len(b), nil
-}
-
-// compareScalar orders two key values the way the source's SQL orders
-// them. Integers compare exactly, signed against unsigned included: float64
-// cannot represent adjacent int64 values above 2^53, so a float round-trip
-// would collapse distinct keys and boundaries and route a key to the wrong
-// worker. A pair with no common ordering (a number against a string, say)
-// is an error: a lexical fallback would order "100" before "50" and route
-// silently to the wrong partition (issue #406).
-func compareScalar(a, b any) (int, error) {
-	if ai, aok := asInteger(a); aok {
-		if bi, bok := asInteger(b); bok {
-			return ai.compare(bi), nil
-		}
-	}
-	if af, aok := core.AsFloat64(a); aok {
-		if bf, bok := core.AsFloat64(b); bok {
-			return cmp.Compare(af, bf), nil
-		}
-	}
-	if as, aok := asBytes(a); aok {
-		if bs, bok := asBytes(b); bok {
-			return bytes.Compare(as, bs), nil
-		}
-	}
-	return 0, fmt.Errorf("coordinator: cannot order partition key value %v (%T) against %v (%T)", a, a, b, b)
-}
-
-// integer is an exact integer of either signedness: a negative value is
-// always signed, so neg plus the magnitude orders every int64 and uint64.
-type integer struct {
-	neg bool
-	mag uint64 // |value|; for neg, the two's-complement magnitude
-}
-
-func (x integer) compare(y integer) int {
-	switch {
-	case x.neg && !y.neg:
-		return -1
-	case !x.neg && y.neg:
-		return 1
-	case x.neg: // both negative: the larger magnitude is the smaller value
-		return cmp.Compare(y.mag, x.mag)
-	default:
-		return cmp.Compare(x.mag, y.mag)
-	}
-}
-
-func signed(v int64) integer {
-	if v < 0 {
-		return integer{neg: true, mag: uint64(-(v + 1)) + 1} // -MinInt64 overflows int64
-	}
-	return integer{mag: uint64(v)}
-}
-
-// asInteger extracts an exact integer when v is an integer type. A float is
-// not coerced here: a float64 that is integral may still be an
-// approximation of a larger int64.
-func asInteger(v any) (integer, bool) {
-	switch t := v.(type) {
-	case int64:
-		return signed(t), true
-	case int32:
-		return signed(int64(t)), true
-	case int16:
-		return signed(int64(t)), true
-	case int8:
-		return signed(int64(t)), true
-	case int:
-		return signed(int64(t)), true
-	case uint64:
-		return integer{mag: t}, true
-	case uint32:
-		return integer{mag: uint64(t)}, true
-	case uint16:
-		return integer{mag: uint64(t)}, true
-	case uint8:
-		return integer{mag: uint64(t)}, true
-	case uint:
-		return integer{mag: uint64(t)}, true
-	default:
-		return integer{}, false
-	}
-}
-
-// asBytes returns the bytes of a string or []byte key. Go orders strings
-// bytewise, so both compare the same way.
-func asBytes(v any) ([]byte, bool) {
-	switch t := v.(type) {
-	case string:
-		return []byte(t), true
-	case []byte:
-		return t, true
-	default:
-		return nil, false
-	}
 }
 
 // splitByOwner filters rec into len(nOwners) sub-records, one per

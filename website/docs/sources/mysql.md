@@ -27,15 +27,21 @@ so a SELECT-only user and the same TLS/timezone settings reach it too.
 
 - `binlog_format=ROW` and `binlog_row_image=FULL` — the reader decodes row
   events, and a delete carries its before image.
+- `binlog_row_value_options` must not contain `PARTIAL_JSON` — a JSON column
+  updated in place would arrive as a partial document that cannot be decoded.
 - `gtid_mode=ON` — the position is a GTID set, so a restart resumes exactly
   where it stopped.
 - A user with `REPLICATION SLAVE` and `REPLICATION CLIENT`.
 
 The runner **validates these at boot** ([#182](https://github.com/maltzsama/urutau/issues/182)):
-`log_bin`, `binlog_format`, `gtid_mode` and `enforce_gtid_consistency` are read
-in one query and a wrong value fails loud, before the replication connection
-opens. `binlog_row_image` other than `FULL` logs a warning (a partial
-after-image can silently drop columns) instead of failing. The resume GTID is
+`log_bin`, `binlog_format`, `gtid_mode`, `enforce_gtid_consistency` and
+`binlog_row_image` are read in one query and a wrong value fails loud, before
+the replication connection opens. A `binlog_row_image` other than `FULL` fails
+boot (a partial after-image would silently drop columns), and
+`binlog_row_value_options` containing `PARTIAL_JSON` fails boot too.
+`binlog_row_value_options` is read tolerantly: a server that does not expose it
+(MySQL < 8.0.3, MariaDB) simply cannot enable partial JSON, so boot proceeds.
+The resume GTID is
 also compared against `@@GLOBAL.gtid_purged`: if the binlog the pipeline still
 needs was purged, boot fails with a clear "re-snapshot required" error rather
 than skipping the gap.

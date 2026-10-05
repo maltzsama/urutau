@@ -28,8 +28,9 @@ func TestStagedCycleCommitsTheBatchPosition(t *testing.T) {
 	c := stagedReplayHarness(t)
 	snk := &positionStagedSink{}
 	c.snk = snk
-	// id 1 → w0, the partition's last row at 0/30; id 150 → w1 at 0/40.
-	b := replayBatch(t, []int64{1, 150}, []string{"0/30", "0/40"})
+	// One key per owner: w0's row at 0/30, w1's at 0/40.
+	names := []string{"w0", "w1"}
+	b := replayBatch(t, []int64{ownerKey(t, names, 0), ownerKey(t, names, 1)}, []string{"0/30", "0/40"})
 	meta := &pb.BatchMeta{Table: "raw.orders"}
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
@@ -58,9 +59,10 @@ func TestStagedCycleCommitsTheBatchMaximumNotLastPartition(t *testing.T) {
 	c := stagedReplayHarness(t)
 	snk := &positionStagedSink{}
 	c.snk = snk
-	// The batch's last source row is id 1 (w0) at 0/40; the last partition
-	// (w1) holds only the earlier row id 150 at 0/30.
-	b := replayBatch(t, []int64{150, 1}, []string{"0/30", "0/40"})
+	// The batch's last source row belongs to w0 at 0/40; w1 holds only the
+	// earlier row at 0/30.
+	names := []string{"w0", "w1"}
+	b := replayBatch(t, []int64{ownerKey(t, names, 1), ownerKey(t, names, 0)}, []string{"0/30", "0/40"})
 	meta := &pb.BatchMeta{Table: "raw.orders"}
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)

@@ -220,6 +220,9 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	if len(owners) == n {
 		return nil
 	}
+	if err := c.refuseScaleDuringSnapshot(target); err != nil {
+		return err
+	}
 	if max := c.maxWorkersFor(target); n > max {
 		return fmt.Errorf("coordinator: scale %s: %d exceeds maxWorkers %d", target, n, max)
 	}
@@ -320,6 +323,17 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 		c.retireOwner(ctx, w)
 	}
 	c.pushDashState()
+	return nil
+}
+
+// refuseScaleDuringSnapshot rejects a scale of a table whose snapshot is
+// running: the fan-out captured the owners at start and the live stream routes
+// by the current layout, so a flip would send a key's snapshot row and its live
+// row to different workers. The scaler retries once the snapshot completes.
+func (c *Coordinator) refuseScaleDuringSnapshot(target string) error {
+	if c.isSnapshotting(target) {
+		return fmt.Errorf("coordinator: scale %s: snapshot in progress; retry once it completes", target)
+	}
 	return nil
 }
 
@@ -578,6 +592,17 @@ func (c *Coordinator) tableRef(target string) (source.TableRef, bool) {
 // spec.Table.WorkerGroupNames produces at boot.
 func partitionName(pipeline, target string, p int) string {
 	return fmt.Sprintf("%s-%d", spec.WorkerGroupPrefix(pipeline, target), p)
+}
+
+// ownerNames returns the live owner names, the input to the rendezvous owner
+// function. The order does not matter: the winner is chosen by hash, with the
+// name as an order-independent tie-break.
+func ownerNames(owners []*workerState) []string {
+	names := make([]string, len(owners))
+	for i, w := range owners {
+		names[i] = w.name
+	}
+	return names
 }
 
 // OwnerNames returns target's partition owner names in partition order — the

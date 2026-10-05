@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,7 +195,10 @@ func TestCheckpointMarkCleanOnlyOnSuccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	go func() { cp.run(ctx, "run", index, slog.Default()); close(done) }()
+	go func() {
+		cp.run(ctx, "run", func() map[string]*positionIndex { return index }, slog.Default())
+		close(done)
+	}()
 
 	fail.Store(true)
 	time.Sleep(80 * time.Millisecond)
@@ -208,6 +212,92 @@ func TestCheckpointMarkCleanOnlyOnSuccess(t *testing.T) {
 	}
 	if idx.Dirty() {
 		t.Fatal("index must clear once an upload succeeds")
+	}
+	cancel()
+	<-done
+}
+
+// TestCheckpointSeesDynamicallyAddedWorker covers issue #554: the checkpoint
+// must re-read the live owner set every tick, so an owner registered by a
+// scale-out (#312) is checkpointed from the next tick on — a boot-time
+// snapshot never saw it.
+func TestCheckpointSeesDynamicallyAddedWorker(t *testing.T) {
+	var mu sync.Mutex
+	paths := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths[r.URL.Path] = true
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cp := &checkpoint{
+		interval: 10 * time.Millisecond,
+		bucket:   "b",
+		prefix:   "",
+		client: s3.NewFromConfig(aws.Config{}, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(srv.URL)
+			o.UsePathStyle = true
+			o.Region = "us-east-1"
+			o.Retryer = aws.NopRetryer{}
+			o.Credentials = credentials.NewStaticCredentialsProvider("k", "s", "")
+		}),
+	}
+
+	boot := newPositionIndex("run")
+	boot.add(inflightBatch{id: 1, table: "t", bytes: 10})
+	owners := map[string]*positionIndex{"w0": boot}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		cp.run(ctx, "run", func() map[string]*positionIndex {
+			mu.Lock()
+			defer mu.Unlock()
+			out := make(map[string]*positionIndex, len(owners))
+			for k, v := range owners {
+				out[k] = v
+			}
+			return out
+		}, slog.Default())
+		close(done)
+	}()
+
+	waitPath := func(substr string) bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			found := false
+			for p := range paths {
+				if strings.Contains(p, substr) {
+					found = true
+					break
+				}
+			}
+			mu.Unlock()
+			if found {
+				return true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return false
+	}
+
+	if !waitPath("/w0/manifest.json") {
+		t.Fatal("boot worker not checkpointed")
+	}
+
+	// A scale-out registers w1 after boot.
+	added := newPositionIndex("run")
+	added.add(inflightBatch{id: 2, table: "t", bytes: 10})
+	mu.Lock()
+	owners["w1"] = added
+	mu.Unlock()
+
+	if !waitPath("/w1/manifest.json") {
+		t.Fatal("dynamically added worker never checkpointed (issue #554)")
 	}
 	cancel()
 	<-done

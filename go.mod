@@ -12,6 +12,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.109.1
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/couchbase/gocb/v2 v2.12.5
 	github.com/expr-lang/expr v1.17.8
 	github.com/go-mysql-org/go-mysql v1.16.0
@@ -80,7 +81,6 @@ require (
 	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
 	github.com/cockroachdb/apd/v3 v3.2.1 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
