@@ -174,6 +174,13 @@ snapshot.
 - **`append-idempotent`** — append, but a transport-metadata `identity`
   makes replay a no-op.
 
+A primary key may not include a `FLOAT`/`DOUBLE` column — source-typed or
+produced by a `cast`. Equality on floats is ill-defined (NaN, −0.0, rounding
+across engines), and Iceberg forbids float/double as identifier fields and
+equality-delete keys. The pipeline is rejected at boot, before any table is
+created or any row is read; pick an integer, string, decimal, UUID or timestamp
+key instead.
+
 ### `workers`
 
 `workers: {number: N}` splits the table's primary-key range into `N`

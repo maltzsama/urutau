@@ -839,9 +839,11 @@ func TestMaxWaitValidation(t *testing.T) {
 	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "-1s" })}, evSchema("user_ref", "v"), nil); err == nil {
 		t.Fatal("negative maxWait must be rejected at boot")
 	}
-	// "0s" and absent stay valid (both mean "no cap").
-	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "0s" })}, evSchema("user_ref", "v"), nil); err != nil {
-		t.Fatalf("0s maxWait must boot: %v", err)
+	// "0s" parses but is silently swapped for the default at point of use
+	// (spec.Validate now rejects a non-positive wantWait too); reject it
+	// here as well, so the runtime agrees with validation. Absent stays valid.
+	if _, err := New([]spec.Enrich{refCfg(func(c *spec.Enrich) { c.BufferLimits.MaxWait = "0s" })}, evSchema("user_ref", "v"), nil); err == nil {
+		t.Fatal("0s maxWait must be rejected at boot")
 	}
 	if _, err := New([]spec.Enrich{refCfg(nil)}, evSchema("user_ref", "v"), nil); err != nil {
 		t.Fatalf("absent maxWait must boot: %v", err)
