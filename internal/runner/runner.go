@@ -73,6 +73,9 @@ type relay struct {
 	ingest   chan<- worker.Ingest
 	window   *worker.Worker
 	flushReq chan chan struct{}
+	// onDeliver notes a batch's position as it is read from the source, so
+	// the runner can tell delivered (dispatched) from committed per table.
+	onDeliver func(table, pos string)
 
 	gateMu       sync.Mutex
 	gateOn       bool
@@ -83,10 +86,11 @@ type relay struct {
 	gateFlushReq chan chan struct{}
 }
 
-func newRelay(ingest chan<- worker.Ingest, window *worker.Worker) *relay {
+func newRelay(ingest chan<- worker.Ingest, window *worker.Worker, onDeliver func(table, pos string)) *relay {
 	return &relay{
 		ingest:       ingest,
 		window:       window,
+		onDeliver:    onDeliver,
 		flushReq:     make(chan chan struct{}, 1),
 		gateFlushReq: make(chan chan struct{}, 1),
 	}
@@ -131,6 +135,22 @@ func (r *relay) GateFlush() {
 	req := make(chan struct{})
 	r.gateFlushReq <- req
 	<-req
+}
+
+// deliverNote reports a batch's last position to the runner as it is read
+// from the source, before it is routed or gated. It is the "delivered" half
+// of the confirmed-point rule: a table with delivered past its committed has
+// data still in flight, so the confirmed position must not advance past its
+// committed.
+func (r *relay) deliverNote(b *dataplane.Batch) {
+	if r.onDeliver == nil || b == nil || b.Record == nil || b.Record.NumRows() == 0 {
+		return
+	}
+	reader, err := transport.NewBatchReader(b.Record, nil)
+	if err != nil {
+		return
+	}
+	r.onDeliver(b.Table, reader.Position(reader.NumRows()-1))
 }
 
 // gate buffers an event when the gate is on for its table.
@@ -198,6 +218,7 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 			if b == nil {
 				return
 			}
+			r.deliverNote(b)
 			select {
 			case batchCh <- b:
 			case <-ctx.Done():
@@ -497,6 +518,13 @@ type Runner struct {
 	posMu              sync.Mutex
 	committedPositions map[string]position.Position
 	minConfirmed       position.Position // recomputed on each commit
+	// delivered is the last position read from the source per target table;
+	// dispatched is the last across all tables. A table with delivered past
+	// its committed has data still in flight, so the confirmed position holds
+	// at its committed; a table with nothing in flight does not pin it, and
+	// when nothing is in flight the confirmed may advance to dispatched.
+	delivered  map[string]position.Position
+	dispatched position.Position
 }
 
 // NewRunner sets up the collapsed pipeline (catalog, writers, worker,
@@ -765,7 +793,8 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 			_ = qsrc.CloseQuery()
 		}
 	},
-		committedPositions: make(map[string]position.Position)}
+		committedPositions: make(map[string]position.Position),
+		delivered:          make(map[string]position.Position)}
 	// Run-scoped context: the worker, relay and maintenance goroutines below
 	// outlive setup, so they run under a child context Run cancels on return
 	// (issue #487).
@@ -954,7 +983,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		if err := rdr.Start(ctx, start); err != nil {
 			return nil, fmt.Errorf("runner: start stream: %w", err)
 		}
-		router = newRelay(ingest, w)
+		router = newRelay(ingest, w, r.deliverFunc(src))
 		routerDone = make(chan error, 1)
 		go func() { routerDone <- router.run(runCtx, rdr) }()
 	}
@@ -1129,40 +1158,3 @@ func (r *Runner) DroppedByWindow(target string) int64 {
 // updateCommitted is called from the OnCommit callback. It stores the
 // latest committed position for a target table and recomputes the minimum
 // across all tables.
-// updateCommitted records the position a target table durably committed and
-// recomputes the pipeline-wide minimum — the value reported to the source so
-// its retention never advances past uncommitted data. The minimum uses the
-// position's own ordering: LSNs and GTID sets are not lexicographically
-// ordered ("0/10" sorts before "0/2" as strings, 16 after 2 as positions),
-// and a wrong minimum would advance the slot past data still in flight.
-func (r *Runner) updateCommitted(table string, pos position.Position) {
-	if pos == nil {
-		return
-	}
-	r.posMu.Lock()
-	defer r.posMu.Unlock()
-	r.committedPositions[table] = pos
-	vals := make([]position.Position, 0, len(r.committedPositions))
-	for _, p := range r.committedPositions {
-		vals = append(vals, p)
-	}
-	// MinSafe: an incomparable pair has no safe minimum — nil holds the
-	// confirmed point back rather than advancing the slot past uncommitted
-	// data (same direction as StringPosition's incomparable).
-	best, err := position.MinSafe(vals)
-	if err != nil {
-		r.log.Warn("runner: incomparable committed positions; not advancing confirmed point", "err", err)
-		r.minConfirmed = nil
-		return
-	}
-	r.minConfirmed = best
-}
-
-// confirmedPosition returns the minimum committed position across all
-// target tables. The Postgres reader uses this to advance the slot's
-// confirmed_flush_lsn; nil means nothing is durably committed yet.
-func (r *Runner) confirmedPosition() position.Position {
-	r.posMu.Lock()
-	defer r.posMu.Unlock()
-	return r.minConfirmed
-}
