@@ -234,15 +234,7 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 			// buffered events into batchCh, in order.
 			select {
 			case req := <-drainReq:
-				close(req.accepted)
-				var err error
-				if drainer != nil {
-					readerMu.Lock()
-					err = drainer.Drain(ctx, pushBatch)
-					readerMu.Unlock()
-				}
-				req.err <- err
-				if err != nil {
+				if err := r.serviceDrain(ctx, req, drainer, &readerMu, pushBatch); err != nil {
 					readErr = err
 					return
 				}
