@@ -2,6 +2,7 @@ package worker
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -31,8 +32,14 @@ func (w *Worker) AddWindowRows(target string, windowID uint64, batch *dataplane.
 	p.winMu.Lock()
 	defer p.winMu.Unlock()
 	if _, dup := p.windows[windowID]; dup {
+		// Replay-safe: the coordinator fans snapshot rows out at least once,
+		// so a lost session between the rows and their Closes marker redelivers
+		// the same rows for the same window. The window already holds them;
+		// storing the duplicate would be a no-op at best and an error would
+		// wedge the chunk forever, so ignore it.
 		batch.Release()
-		return fmt.Errorf("worker: window rows: duplicate window %d for %s", windowID, target)
+		slog.Debug("worker: duplicate snapshot window rows ignored", "table", target, "window", windowID)
+		return nil
 	}
 	// Precompute the window's key set once: the live path tests membership per
 	// row, and re-scanning the whole chunk per row was O(rows × windows ×

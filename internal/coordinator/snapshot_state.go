@@ -243,6 +243,33 @@ func (c *Coordinator) snapshotTodoFor(target string) map[uint32]bool {
 	return c.snapshotTodo[target]
 }
 
+// beginSnapshot marks target's snapshot running; endSnapshot clears it.
+// ScaleTable refuses to flip a table whose snapshot is in progress, so the
+// fan-out's captured owners and the live stream's current owners cannot
+// diverge (a key's snapshot row and live row would otherwise reach different
+// workers).
+func (c *Coordinator) beginSnapshot(target string) {
+	c.snapshottingMu.Lock()
+	if c.snapshotting == nil {
+		c.snapshotting = map[string]bool{}
+	}
+	c.snapshotting[target] = true
+	c.snapshottingMu.Unlock()
+}
+
+func (c *Coordinator) endSnapshot(target string) {
+	c.snapshottingMu.Lock()
+	delete(c.snapshotting, target)
+	c.snapshottingMu.Unlock()
+}
+
+// isSnapshotting reports whether target's snapshot is in progress.
+func (c *Coordinator) isSnapshotting(target string) bool {
+	c.snapshottingMu.Lock()
+	defer c.snapshottingMu.Unlock()
+	return c.snapshotting[target]
+}
+
 // sendClosesPending queues a chunk's Closes marker for its partition's worker
 // — not routed through enqueueBatch's table-wide lookup, since a marker carries
 // no rows for enqueueBatch to route by key. pending names the table's snapshot

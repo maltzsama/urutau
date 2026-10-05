@@ -9,6 +9,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -198,13 +199,27 @@ func TestEnqueueBatchSplitsByPartition(t *testing.T) {
 	// Keys chosen by the production owner function so one routes to each
 	// owner; the split is by rendezvous hash, not by key range.
 	names := []string{"w0", "w1"}
-	b := wireBatchIDs(t, ownerKey(t, names, 0), ownerKey(t, names, 1))
+	k0, k1 := ownerKey(t, names, 0), ownerKey(t, names, 1)
+	b := wireBatchIDs(t, k0, k1)
 	if err := c.enqueueBatch(context.Background(), b, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
 		t.Fatalf("enqueueBatch(partitioned): %v", err)
 	}
-	if len(w0.queue) != 1 || len(w1.queue) != 1 {
-		t.Fatalf("queues = %d, %d; want 1, 1", len(w0.queue), len(w1.queue))
+	// Assert WHICH key each owner received, not merely that each got a batch:
+	// a swapped assignment would still leave one batch per queue.
+	assertOwnerKey := func(t *testing.T, w *workerState, want int64) {
+		t.Helper()
+		select {
+		case q := <-w.queue:
+			rows := batchRows(t, q.body)
+			if len(rows) != 1 || rows[0][0] != fmt.Sprintf("%d", want) {
+				t.Fatalf("worker %s got rows %v, want key %d", w.name, rows, want)
+			}
+		default:
+			t.Fatalf("worker %s got nothing", w.name)
+		}
 	}
+	assertOwnerKey(t, w0, k0)
+	assertOwnerKey(t, w1, k1)
 }
 
 // ── resolvePartitionRanges ───────────────────────────────────────────

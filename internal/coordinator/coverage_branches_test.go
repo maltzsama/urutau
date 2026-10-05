@@ -126,27 +126,24 @@ func (s *seedingSink) SeedPositions(context.Context, core.TableRef, []string) er
 func TestSnapshotTableErrors(t *testing.T) {
 	ctx := context.Background()
 	c, _ := coordHarness()
-	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
 
-	// No owner.
-	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{}, ref, snapshot.SnapshotConfig{}); err == nil {
+	// No owner: a target no worker is routed to.
+	ghost := source.TableRef{Source: "shop.ghost", Target: "raw.ghost"}
+	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{}, ghost, snapshot.SnapshotConfig{}); err == nil {
 		t.Fatal("no owning worker must error")
 	}
 
-	// Range/owner count mismatch.
-	c.setRouteForTest("raw.orders", []*workerState{{name: "w0"}, {name: "w1"}})
-	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}}})
+	// Range/owner count mismatch on a SINGLE owner: a multi-owner table fan
+	// outs and never consults the ranges, so the check only applies here.
+	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders"}
+	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}, {}}})
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{}, ref, snapshot.SnapshotConfig{}); err == nil {
 		t.Fatal("range/owner mismatch must error")
 	}
 
-	// Bounds error. A partitioned table fans out, so it needs the canonical
-	// schema before SnapshotTable runs; the Bounds error still surfaces first
-	// because SnapshotTable reads the bounds before it touches the reader.
-	c.canonical = map[string]core.Schema{
-		"shop.orders": {Columns: []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}}, PrimaryKey: []string{"id"}},
-	}
-	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}, {}}})
+	// Bounds error on the single-owner path. SnapshotTable reads the bounds
+	// before it touches the reader, so the error surfaces here.
+	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}}})
 	boom := errors.New("bounds failed")
 	if err := c.snapshotTable(ctx, fakeSourceReader{}, fakeChunkSource{err: boom}, ref, snapshot.SnapshotConfig{}); !errors.Is(err, boom) {
 		t.Fatalf("snapshotTable(bounds err) = %v, want boom", err)

@@ -52,6 +52,7 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 	}
 
 	tref := core.TableRef{Source: ref.Source, Target: ref.Target}
+	relay := &distributedRelay{c: c, ctx: ctx, ref: ref, owners: owners}
 	// Resume: reuse recorded bounds and pending when the previous run was
 	// interrupted mid-snapshot. The partition-layout guard of the range path
 	// is irrelevant here — chunks are not clipped per worker.
@@ -62,25 +63,25 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 				cfg.Progress = sp
 			}
 		}
+		// Persist is called once, at cold start, with the full chunk set. The
+		// list is captured here so Release can name the chunks still to do
+		// after each window; the worker commits that list atomically with the
+		// window's rows (SnapshotPending on the Closes marker), so a crash
+		// between a chunk's commit and the next never skips an uncommitted
+		// chunk. The coordinator must NOT write a reduced pending list itself:
+		// it would not be atomic with the rows (the range path's contract).
 		cfg.Persist = func(sp snapshot.SnapshotProgress) error {
+			if sp.Pending != nil {
+				relay.pending = append([]uint32(nil), sp.Pending...)
+			}
 			return c.snk.SetProperties(ctx, tref, snapshot.EncodeSnapshotProgress(&sp))
 		}
-	}
-	cb := func(_ string, _ uint32, remaining []uint32) {
-		if c.snk == nil {
-			return
-		}
-		props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
-			State:   snapshot.StateInProgress,
-			Pending: remaining,
-		})
-		if err := c.snk.SetProperties(ctx, tref, props); err != nil {
-			c.log.Warn("coordinator: snapshot progress", "table", ref.Target, "err", err)
+		if cfg.Progress != nil {
+			relay.pending = append([]uint32(nil), cfg.Progress.Pending...)
 		}
 	}
 
-	relay := &distributedRelay{c: c, ctx: ctx, ref: ref, owners: owners}
-	if err := snapshot.SnapshotTable(ctx, chunker, rdr, relay, ref.Target, cfg, cb); err != nil {
+	if err := snapshot.SnapshotTable(ctx, chunker, rdr, relay, ref.Target, cfg, nil); err != nil {
 		return err
 	}
 	if relay.err != nil {
@@ -104,7 +105,11 @@ type distributedRelay struct {
 	ref      source.TableRef
 	owners   []*workerState
 	windowID uint64
-	err      error
+	// pending is the table's chunk set still to do, from the cold-start
+	// Persist or the resumed progress. Release derives each window's
+	// SnapshotPending from it, which the worker commits with the rows.
+	pending []uint32
+	err     error
 }
 
 func (r *distributedRelay) fail(err error) {
@@ -206,17 +211,25 @@ func (r *distributedRelay) Release(table string, chunkID uint32, at position.Pos
 	if r.err != nil {
 		return
 	}
-	if err := r.c.closeFanoutChunk(r.ctx, r.ref, r.owners, at, uint64(chunkID)); err != nil {
+	// The chunks still to do AFTER this one: the worker commits this list
+	// with the window's rows, so a crash cannot resume past a chunk whose
+	// rows were never committed.
+	remaining := snapshot.RemoveFromPending(r.pending, chunkID)
+	r.pending = remaining
+	if err := r.c.closeFanoutChunk(r.ctx, r.ref, r.owners, at, uint64(chunkID), remaining); err != nil {
 		r.fail(err)
 	}
 }
 
-// closeFanoutChunk queues a Closes marker for one chunk on every owner.
-func (c *Coordinator) closeFanoutChunk(ctx context.Context, ref source.TableRef, owners []*workerState, at position.Position, windowID uint64) error {
+// closeFanoutChunk queues a Closes marker for one chunk on every owner. The
+// marker carries the chunks still to do, which the worker commits atomically
+// with the window's rows (#461) — the coordinator never persists that list
+// itself, which would not be atomic with the rows.
+func (c *Coordinator) closeFanoutChunk(ctx context.Context, ref source.TableRef, owners []*workerState, at position.Position, windowID uint64, pending []uint32) error {
 	meta := &pb.BatchMeta{
 		Table:  ref.Target,
 		LowPos: at.String(),
-		Window: &pb.WindowTag{Closes: true, WindowId: windowID},
+		Window: &pb.WindowTag{Closes: true, WindowId: windowID, SnapshotPending: pending},
 	}
 	if c.stagesCycles() && c.isStagedTable(ref.Target) {
 		meta.BatchId = c.batchSeq.Add(1)

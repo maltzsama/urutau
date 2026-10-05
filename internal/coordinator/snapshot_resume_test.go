@@ -132,9 +132,18 @@ func TestSnapshotRecordsItsProgress(t *testing.T) {
 	if !slices.Equal(sp.Pending, []uint32{0, 1, 2}) {
 		t.Fatalf("pending at start = %v, want every chunk", sp.Pending)
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	// The harness drains w.queue on its own goroutine, so snapshotTable
+	// returning does not mean every marker has been observed yet. Wait for
+	// them rather than reading the moment the snapshot returns.
 	want := [][]uint32{{1, 2}, {2}, nil}
+	deadline := time.Now().Add(5 * time.Second)
+	h.mu.Lock()
+	for len(h.markers) < len(want) && time.Now().Before(deadline) {
+		h.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		h.mu.Lock()
+	}
+	defer h.mu.Unlock()
 	if len(h.markers) != len(want) {
 		t.Fatalf("%d Closes markers, want %d", len(h.markers), len(want))
 	}

@@ -13,6 +13,13 @@ const serverPreflightSQL = `SELECT @@GLOBAL.log_bin, @@GLOBAL.binlog_format, ` +
 	`@@GLOBAL.gtid_mode, @@GLOBAL.enforce_gtid_consistency, @@GLOBAL.binlog_row_image, ` +
 	`@@GLOBAL.binlog_row_value_options`
 
+// serverPreflightSQLNoPartialJSON is the same preflight without
+// binlog_row_value_options, for servers that do not expose it (MySQL < 8.0.3,
+// most MariaDB): on those the option cannot be enabled, so the whole partial
+// JSON question is moot.
+const serverPreflightSQLNoPartialJSON = `SELECT @@GLOBAL.log_bin, @@GLOBAL.binlog_format, ` +
+	`@@GLOBAL.gtid_mode, @@GLOBAL.enforce_gtid_consistency, @@GLOBAL.binlog_row_image`
+
 // ValidateServer checks the server variables the MySQL replication reader
 // depends on. Every requirement is hard: a server that cannot produce a
 // complete row image must fail loud at boot, not decode a partial image
@@ -22,17 +29,25 @@ const serverPreflightSQL = `SELECT @@GLOBAL.log_bin, @@GLOBAL.binlog_format, ` +
 // carry a row's after-image as the row's content: a partial after-image (an
 // UPDATE that changed only some columns, or a DELETE with the key alone)
 // would drop every unchanged column. binlog_row_value_options must not
-// contain PARTIAL_JSON for the same reason one level down: a JSON column
-// updated in place would arrive as a partial document that cannot be
-// decoded safely.
+// contain PARTIAL_JSON because a JSON column updated in place would arrive as
+// a partial document that cannot be decoded safely. That option is read
+// separately-tolerant: a server without it simply cannot use PARTIAL_JSON.
 func ValidateServer(ctx context.Context, db *sql.DB) (warning string, err error) {
-	// All six scan as text: log_bin arrives as "1", the rest as their
+	// All values scan as text: log_bin arrives as "1", the rest as their
 	// keyword. A text scan is driver-agnostic and needs no per-type handling.
 	var logBin, binlogFormat, gtidMode, enforceGTID, rowImage, rowValueOptions string
-	if err := db.QueryRowContext(ctx, serverPreflightSQL).Scan(
+	err = db.QueryRowContext(ctx, serverPreflightSQL).Scan(
 		&logBin, &binlogFormat, &gtidMode, &enforceGTID, &rowImage, &rowValueOptions,
-	); err != nil {
-		return "", fmt.Errorf("mysql: server preflight: %w", err)
+	)
+	if err != nil {
+		// binlog_row_value_options is absent on older servers; retry without
+		// it rather than rejecting an otherwise usable server.
+		if qerr := db.QueryRowContext(ctx, serverPreflightSQLNoPartialJSON).Scan(
+			&logBin, &binlogFormat, &gtidMode, &enforceGTID, &rowImage,
+		); qerr != nil {
+			return "", fmt.Errorf("mysql: server preflight: %w", qerr)
+		}
+		rowValueOptions = ""
 	}
 
 	if logBin != "1" {
