@@ -213,7 +213,7 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 	// InWindow events ahead of the Closes marker. drainReq asks the puller
 	// goroutine — the sole reader — to flush the reader's buffer into batchCh.
 	var readerMu sync.Mutex
-	drainReq := make(chan chan struct{}, 1)
+	drainReq := make(chan *drainRequest, 1)
 
 	// pushBatch routes one batch into batchCh, applying the delivered-note
 	// bookkeeping the normal pull does.
@@ -233,18 +233,19 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 			// Service a pending drain before pulling: flush the reader's
 			// buffered events into batchCh, in order.
 			select {
-			case done := <-drainReq:
+			case req := <-drainReq:
+				close(req.accepted)
+				var err error
 				if drainer != nil {
 					readerMu.Lock()
-					err := drainer.Drain(ctx, pushBatch)
+					err = drainer.Drain(ctx, pushBatch)
 					readerMu.Unlock()
-					if err != nil {
-						readErr = err
-						close(done)
-						return
-					}
 				}
-				close(done)
+				req.err <- err
+				if err != nil {
+					readErr = err
+					return
+				}
 				continue
 			default:
 			}

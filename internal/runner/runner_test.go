@@ -284,18 +284,19 @@ func TestFlushDecodedDrainsReaderBuffer(t *testing.T) {
 	}
 	rdr.push(&dataplane.Batch{Table: "raw.orders", Record: rec, Mode: dataplane.UpsertMode})
 
-	drainReq := make(chan chan struct{}, 1)
+	drainReq := make(chan *drainRequest, 1)
 	batchCh := make(chan *dataplane.Batch, 16)
 
 	// Stand in for the puller goroutine: service a drain by flushing the
 	// reader's buffer into batchCh.
 	go func() {
-		for done := range drainReq {
-			_ = rdr.Drain(context.Background(), func(b *dataplane.Batch) error {
+		for req := range drainReq {
+			close(req.accepted)
+			err := rdr.Drain(context.Background(), func(b *dataplane.Batch) error {
 				batchCh <- b
 				return nil
 			})
-			close(done)
+			req.err <- err
 		}
 	}()
 
@@ -310,6 +311,51 @@ func TestFlushDecodedDrainsReaderBuffer(t *testing.T) {
 		}
 	default:
 		t.Fatal("the decoded-but-not-pulled batch was lost across the drain")
+	}
+}
+
+// A drain error must propagate to the caller, so Release never emits the
+// Closes marker past a failed flush (Sourcery #488 finding).
+func TestFlushDecodedPropagatesDrainError(t *testing.T) {
+	ingest := make(chan worker.Ingest, 16)
+	r := newRelay(ingest, nil, nil)
+	rdr := &bufferedReader{ch: make(chan struct{}, 1)}
+	rdr.push(&dataplane.Batch{Table: "raw.orders", Record: nil, Mode: dataplane.UpsertMode})
+
+	drainReq := make(chan *drainRequest, 1)
+	batchCh := make(chan *dataplane.Batch, 16)
+
+	boom := errors.New("decode failed")
+	go func() {
+		for req := range drainReq {
+			close(req.accepted)
+			req.err <- boom
+		}
+	}()
+
+	if err := r.flushDecoded(context.Background(), rdr, drainReq, batchCh); !errors.Is(err, boom) {
+		t.Fatalf("flushDecoded = %v, want the drain error %v", err, boom)
+	}
+}
+
+// A reader whose puller is blocked on Next (empty buffer) never accepts the
+// drain request; flushDecoded must give up after the acceptance deadline, not
+// wait forever (Sourcery #488 finding).
+func TestFlushDecodedEmptyReaderDeadline(t *testing.T) {
+	ingest := make(chan worker.Ingest, 16)
+	r := newRelay(ingest, nil, nil)
+	rdr := &bufferedReader{ch: make(chan struct{}, 1)} // empty buffer
+
+	drainReq := make(chan *drainRequest, 1)
+	batchCh := make(chan *dataplane.Batch, 16)
+	// No goroutine services drainReq: the puller is blocked on Next.
+
+	start := time.Now()
+	if err := r.flushDecoded(context.Background(), rdr, drainReq, batchCh); err != nil {
+		t.Fatalf("flushDecoded = %v, want nil (empty reader)", err)
+	}
+	if elapsed := time.Since(start); elapsed < drainWaitTimeout {
+		t.Fatalf("flushDecoded returned after %v, before the acceptance deadline %v", elapsed, drainWaitTimeout)
 	}
 }
 
