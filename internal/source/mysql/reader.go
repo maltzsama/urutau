@@ -415,6 +415,20 @@ func (r *Reader) encoder(ref TableRef, tbl *schema.Table) (*tableEncoder, error)
 // UPDATE that leaves the filter emits a delete of the before image; an upsert
 // target's primary-key change emits a delete of the OLD key as well.
 func (r *Reader) appendChange(ref TableRef, tbl *schema.Table, op rowchange.Op, after, before []any, pos string, commitTS time.Time) error {
+	// A partial JSON after-image cannot be decoded: with
+	// binlog_row_value_options=PARTIAL_JSON an UPDATE carries a JSON column as
+	// a diff, which go-mysql exposes as a *replication.JsonDiff, not the full
+	// document. The boot preflight rejects the option globally, but it is also
+	// settable per session, which a preflight cannot see — this is the
+	// decode-time backstop.
+	if err := rejectPartialJSON(ref, after); err != nil {
+		return err
+	}
+	if before != nil {
+		if err := rejectPartialJSON(ref, before); err != nil {
+			return err
+		}
+	}
 	te, err := r.encoder(ref, tbl)
 	if err != nil {
 		return err
@@ -483,6 +497,21 @@ func (r *Reader) appendChange(ref TableRef, tbl *schema.Table, op rowchange.Op, 
 // key in the canonical schema, or the equality delete would match nothing
 // (C-8). The row is stamped with the current SAFE position; only the
 // transaction's final record is restamped when it closes.
+// rejectPartialJSON fails loud when a row image carries a partial JSON value.
+// go-mysql decodes a PARTIAL_UPDATE_ROWS_EVENT's JSON column as a
+// *replication.JsonDiff (or a slice of them): the binlog does not carry the
+// full document, so urutau cannot reconstruct the after-image and would
+// otherwise write a partial value. Rejecting is the only safe outcome.
+func rejectPartialJSON(ref TableRef, image []any) error {
+	for i, v := range image {
+		switch v.(type) {
+		case *replication.JsonDiff, []*replication.JsonDiff:
+			return fmt.Errorf("mysql: %s: column %d arrived as a partial JSON diff (binlog_row_value_options=PARTIAL_JSON); the full document is not in the binlog — unset PARTIAL_JSON (globally and for the writing session)", ref.Source, i)
+		}
+	}
+	return nil
+}
+
 func (r *Reader) appendImage(te *tableEncoder, tbl *schema.Table, op rowchange.Op, image []any, pos string, commitTS time.Time) error {
 	if op == rowchange.OpDelete && len(te.enc.Schema().PrimaryKey) == 0 {
 		return fmt.Errorf("sourcepull: batch %q carries a delete but the schema has no primary key — declare it and resume", te.target)
