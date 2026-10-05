@@ -104,7 +104,15 @@ func (r *relay) flushDecoded(ctx context.Context, drainer source.Drainer, drainR
 	select {
 	case <-req.accepted:
 	case <-time.After(drainWaitTimeout):
-		return nil // the puller is blocked on Next: the reader is empty
+		// The deadline passed. Re-check non-blockingly: the puller may have
+		// accepted right at the deadline, in which case the flush must still
+		// run to completion below. Only an actually-unaccepted request means
+		// the reader is empty.
+		select {
+		case <-req.accepted:
+		default:
+			return nil // the puller is still blocked on Next: empty reader
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
