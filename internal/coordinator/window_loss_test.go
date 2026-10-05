@@ -54,19 +54,24 @@ func TestAWorkerLostBetweenChunkReadyAndClosesRedoesTheChunk(t *testing.T) {
 	defer c.releaseAllGates()
 
 	rdr := slowCatchUpReader{entered: make(chan struct{})}
+	// Capture the epoch once, before the loss: signalSessionEnd below bumps
+	// w.epoch under c.mu, so a goroutine reading w.epoch later races it.
+	c.mu.Lock()
+	epoch := w.epoch
+	c.mu.Unlock()
 	go func() {
 		m := <-w.out
 		req := m.GetChunk()
 		// The window's position is past the reader's synced position, so the
 		// caught-up proof blocks.
-		c.windowOpen <- &pb.WindowOpen{Table: req.Table, ChunkId: req.ChunkId, Attempt: w.epoch, Seq: 7, Pos: "0/200"}
-		c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: w.epoch, WindowIds: []uint64{7}}
+		c.windowOpen <- &pb.WindowOpen{Table: req.Table, ChunkId: req.ChunkId, Attempt: epoch, Seq: 7, Pos: "0/200"}
+		c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: epoch, WindowIds: []uint64{7}}
 	}()
 	lost := c.lostSignal(w)
 	chunks := snapshot.Chunks([][]any{{int64(10)}})
 	done := make(chan error, 1)
 	go func() {
-		done <- c.snapshotChunk(ctx, rdr, c.refs[0], 0, w, snapshot.SnapshotConfig{}, chunks[0], 7, 0, w.epoch, lost, nil, map[uint64]int{})
+		done <- c.snapshotChunk(ctx, rdr, c.refs[0], 0, w, snapshot.SnapshotConfig{}, chunks[0], 7, 0, epoch, lost, nil, map[uint64]int{})
 	}()
 
 	// The window is open; the worker is lost while the reader catches up.
