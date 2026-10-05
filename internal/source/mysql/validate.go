@@ -32,6 +32,12 @@ const serverPreflightSQLNoPartialJSON = `SELECT @@GLOBAL.log_bin, @@GLOBAL.binlo
 // contain PARTIAL_JSON because a JSON column updated in place would arrive as
 // a partial document that cannot be decoded safely. That option is read
 // separately-tolerant: a server without it simply cannot use PARTIAL_JSON.
+//
+// The PARTIAL_JSON check reads the GLOBAL value. MySQL also allows the option
+// per session, which a boot-time preflight cannot observe: a session that
+// enables it after boot can still write a partial JSON after-image. That event
+// (PARTIAL_UPDATE_ROWS_EVENT) is out of scope for the global check; the reader
+// must reject it at decode time rather than trust the preflight alone.
 func ValidateServer(ctx context.Context, db *sql.DB) (warning string, err error) {
 	// All values scan as text: log_bin arrives as "1", the rest as their
 	// keyword. A text scan is driver-agnostic and needs no per-type handling.
