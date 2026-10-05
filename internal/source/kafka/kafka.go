@@ -485,6 +485,13 @@ func (r *Reader) Next(ctx context.Context) (*dataplane.Batch, error) {
 	return r.puller.Next(ctx)
 }
 
+// Drain flushes every decoded change still buffered in the puller into emit,
+// without blocking for new data (source.Drainer). The runner's relay uses it
+// to flush decoded events ahead of a Closes marker (issue #488).
+func (r *Reader) Drain(ctx context.Context, emit func(*dataplane.Batch) error) error {
+	return r.puller.Drain(ctx, emit)
+}
+
 // consume is the blocking consume loop: it polls fetches and feeds decoded
 // changes to r.out, returning the terminal error.
 //

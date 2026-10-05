@@ -223,6 +223,144 @@ func (p *pullTestReader) ClearWindow()                                      {}
 func (p *pullTestReader) Close()                                            {}
 func (p *pullTestReader) SetConfirmed(func() position.Position)             {}
 
+// bufferedReader models a reader whose decoder has produced a batch but whose
+// Next has not pulled it: the batch sits in the reader's own buffer and is
+// only reachable through Drain (the source.Drainer surface).
+type bufferedReader struct {
+	mu  sync.Mutex
+	buf []*dataplane.Batch
+	ch  chan struct{}
+}
+
+func (b *bufferedReader) push(batch *dataplane.Batch) {
+	b.mu.Lock()
+	b.buf = append(b.buf, batch)
+	b.mu.Unlock()
+	select {
+	case b.ch <- struct{}{}:
+	default:
+	}
+}
+
+func (b *bufferedReader) Drain(_ context.Context, emit func(*dataplane.Batch) error) error {
+	b.mu.Lock()
+	buf := b.buf
+	b.buf = nil
+	b.mu.Unlock()
+	for _, batch := range buf {
+		if err := emit(batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *bufferedReader) Next(ctx context.Context) (*dataplane.Batch, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (b *bufferedReader) Start(context.Context, position.Position) error    { return nil }
+func (b *bufferedReader) Synced() position.Position                         { return nil }
+func (b *bufferedReader) Master(context.Context) (position.Position, error) { return nil, nil }
+func (b *bufferedReader) OpenWindow(context.Context, uint32)                {}
+func (b *bufferedReader) ClearWindow()                                      {}
+func (b *bufferedReader) Close()                                            {}
+func (b *bufferedReader) SetConfirmed(func() position.Position)             {}
+
+// TestFlushDecodedDrainsReaderBuffer guards #488: a live event decoded by the
+// reader but not yet pulled must be flushed ahead of the Closes marker, so it
+// is never lost across the marker.
+func TestFlushDecodedDrainsReaderBuffer(t *testing.T) {
+	ingest := make(chan worker.Ingest, 16)
+	r := newRelay(ingest, nil, nil)
+
+	rdr := &bufferedReader{ch: make(chan struct{}, 1)}
+	cols := []rowchange.Change{
+		{Op: rowchange.OpUpdate, Table: "raw.orders", Key: []any{int64(1)}, After: map[string]any{"id": int64(1), "v": "live"}, Position: "0/1"},
+	}
+	rec, err := transport.RecordFromChanges(cols, transport.MergeSchema(cols, core.Schema{}), nil)
+	if err != nil {
+		t.Fatalf("RecordFromChanges: %v", err)
+	}
+	rdr.push(&dataplane.Batch{Table: "raw.orders", Record: rec, Mode: dataplane.UpsertMode})
+
+	drainReq := make(chan *drainRequest, 1)
+	batchCh := make(chan *dataplane.Batch, 16)
+
+	// Stand in for the puller goroutine: service a drain by flushing the
+	// reader's buffer into batchCh.
+	go func() {
+		for req := range drainReq {
+			close(req.accepted)
+			err := rdr.Drain(context.Background(), func(b *dataplane.Batch) error {
+				batchCh <- b
+				return nil
+			})
+			req.err <- err
+		}
+	}()
+
+	if err := r.flushDecoded(context.Background(), rdr, drainReq, batchCh); err != nil {
+		t.Fatalf("flushDecoded: %v", err)
+	}
+	close(drainReq) // let the stand-in puller goroutine exit
+
+	select {
+	case in := <-ingest:
+		if in.Batch == nil {
+			t.Fatal("the drained batch was not flushed into ingest")
+		}
+	default:
+		t.Fatal("the decoded-but-not-pulled batch was lost across the drain")
+	}
+}
+
+// A drain error must propagate to the caller, so Release never emits the
+// Closes marker past a failed flush (Sourcery #488 finding).
+func TestFlushDecodedPropagatesDrainError(t *testing.T) {
+	ingest := make(chan worker.Ingest, 16)
+	r := newRelay(ingest, nil, nil)
+	rdr := &bufferedReader{ch: make(chan struct{}, 1)}
+	rdr.push(&dataplane.Batch{Table: "raw.orders", Record: nil, Mode: dataplane.UpsertMode})
+
+	drainReq := make(chan *drainRequest, 1)
+	batchCh := make(chan *dataplane.Batch, 16)
+
+	boom := errors.New("decode failed")
+	go func() {
+		for req := range drainReq {
+			close(req.accepted)
+			req.err <- boom
+		}
+	}()
+
+	if err := r.flushDecoded(context.Background(), rdr, drainReq, batchCh); !errors.Is(err, boom) {
+		t.Fatalf("flushDecoded = %v, want the drain error %v", err, boom)
+	}
+	close(drainReq) // let the stand-in puller goroutine exit
+}
+
+// A reader whose puller is blocked on Next (empty buffer) never accepts the
+// drain request; flushDecoded must give up after the acceptance deadline, not
+// wait forever (Sourcery #488 finding).
+func TestFlushDecodedEmptyReaderDeadline(t *testing.T) {
+	ingest := make(chan worker.Ingest, 16)
+	r := newRelay(ingest, nil, nil)
+	rdr := &bufferedReader{ch: make(chan struct{}, 1)} // empty buffer
+
+	drainReq := make(chan *drainRequest, 1)
+	batchCh := make(chan *dataplane.Batch, 16)
+	// No goroutine services drainReq: the puller is blocked on Next.
+
+	start := time.Now()
+	if err := r.flushDecoded(context.Background(), rdr, drainReq, batchCh); err != nil {
+		t.Fatalf("flushDecoded = %v, want nil (empty reader)", err)
+	}
+	if elapsed := time.Since(start); elapsed < drainWaitTimeout {
+		t.Fatalf("flushDecoded returned after %v, before the acceptance deadline %v", elapsed, drainWaitTimeout)
+	}
+}
+
 // P3 / retention: updateCommitted recomputes the confirmed point the Postgres
 // slot advances to. An incomparable pair must set it to nil (hold the slot
 // back), never an arbitrary minimum.
