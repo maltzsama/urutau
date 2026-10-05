@@ -396,8 +396,12 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 
 // redoFrom is where a partition's snapshot resumes after its worker was lost
 // at chunk next: the first chunk of this partition whose Closes marker the
-// worker had not committed, whose rows died with its window.
-func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint32]int, next int) int {
+// worker had not committed, whose rows died with its window. It also returns
+// that chunk's resume cursor — the high key of the last window whose Closes
+// marker the worker DID commit — so the redo resumes the chunk from there
+// instead of re-emitting committed windows (issue #646). A chunk with no
+// committed window returns nil, and is re-read from its start.
+func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint64]int, partition int, next int) (int, []any) {
 	from := next
 	for _, m := range c.takeLostWindows(w.name) {
 		if m.target != target {
@@ -407,7 +411,7 @@ func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint32
 			from = i
 		}
 	}
-	return from
+	return from, c.takeCursor(chunkRef(partition, from))
 }
 
 // noteLostWindows records the chunk windows a lost worker had not committed.

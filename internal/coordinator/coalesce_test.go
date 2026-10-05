@@ -144,7 +144,7 @@ func TestAccumulatedBatchesPrecedeTheWindow(t *testing.T) {
 	if metas[0].Window != nil || rows[0] != 3 || metas[0].HighPos != "0/3" {
 		t.Fatalf("first: window=%v rows=%d high=%s; want the 3 accumulated rows untagged, up to 0/3", metas[0].Window, rows[0], metas[0].HighPos)
 	}
-	if !metas[1].Window.GetInWindow() || metas[1].Window.ChunkId != 5 || metas[1].HighPos != "0/4" {
+	if !metas[1].Window.GetInWindow() || metas[1].Window.WindowId != 5 || metas[1].HighPos != "0/4" {
 		t.Fatalf("second: %+v; want the InWindow event at 0/4", metas[1])
 	}
 }

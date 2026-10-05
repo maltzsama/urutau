@@ -91,7 +91,7 @@ func TestWindowCatchUpDoesNotStallOnAFullGate(t *testing.T) {
 	n := gateMaxEvents + 200
 	rdr := newBackpressuredReader(t, n)
 	c.openWindow("raw.orders", 0)
-	c.markChunkReady("raw.orders", 0, 7) // the worker holds chunk 7's rows
+	c.markWindowReady("raw.orders", 0, 7) // the worker holds chunk 7's rows
 	out, _ := sourceBatches(ctx, rdr)
 	go c.pump(ctx, out)
 
@@ -109,7 +109,7 @@ func TestWindowCatchUpDoesNotStallOnAFullGate(t *testing.T) {
 	}
 	var prev position.Position
 	for i, m := range got {
-		if m.Window == nil || !m.Window.InWindow || m.Window.ChunkId != 7 {
+		if m.Window == nil || !m.Window.InWindow || m.Window.WindowId != 7 {
 			t.Fatalf("drained batch %d: window %+v, want InWindow for chunk 7", i, m.Window)
 		}
 		p := position.MustLSN(m.HighPos)
@@ -157,7 +157,7 @@ func TestFullGateWaitsForChunkReadyThenDrains(t *testing.T) {
 		t.Fatalf("%d batch(es) left the gate before ChunkReady", n)
 	}
 
-	c.markChunkReady("raw.orders", 0, 3)
+	c.markWindowReady("raw.orders", 0, 3)
 	cfg.WindowTimeout = 3 * time.Second
 	if err := snapshot.WaitCaughtUp(ctx, rdr, high, cfg); err != nil {
 		t.Fatalf("ChunkReady did not unblock the pump: %v", err)

@@ -40,9 +40,9 @@ func stagedClosesPending(t *testing.T, held bool) (delivered bool, pending []uin
 		ingest <- toIngest(t, rowchange.Change{
 			Op: rowchange.OpUpdate, Table: "raw.orders", Key: []any{int64(1)},
 			After: map[string]any{"id": int64(1), "v": "z"}, Position: "p1",
-		}, &rowchange.Window{ChunkID: 7, InWindow: true})
+		}, &rowchange.Window{WindowID: 7, InWindow: true})
 	}
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{WindowID: 7, Closes: true})
 	closes.Seq, closes.Staged, closes.SnapshotPending = 42, true, []uint32{8, 9}
 	ingest <- closes
 	close(ingest)

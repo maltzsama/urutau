@@ -18,6 +18,24 @@ type arrowChunkScanner interface {
 	ScanArrow(ctx context.Context, ch source.Chunk, enc *transport.RowEncoder, expected int) (int, error)
 }
 
+// byteCapScanner is a chunk source that reads a chunk in byte-capped pages
+// (the MySQL and Postgres chunkers): each page is at most maxBytes, cut at the
+// row that crosses the cap. emit is called per page with the page's record and
+// row count; the caller owns each record.
+type byteCapScanner interface {
+	ScanArrowPages(ctx context.Context, ch source.Chunk, enc *transport.RowEncoder, maxBytes int, emit func(rec arrow.RecordBatch, n int) error) (int, error)
+}
+
+// readChunkPages reads one chunk in byte-capped pages, calling emit per page.
+func (x *chunkExecutor) readChunkPages(ctx context.Context, s byteCapScanner, ch source.Chunk, ta *pb.TableAssignment, emit func(rec arrow.RecordBatch, n int) error) (int, error) {
+	enc, err := transport.NewRowEncoder(x.w.KnownSchema(ta.TargetTable), nil)
+	if err != nil {
+		return 0, err
+	}
+	defer enc.Release()
+	return s.ScanArrowPages(ctx, ch, enc, snapshotWindowBytes(), emit)
+}
+
 // readChunk reads one chunk into a record and returns it with its row count.
 // A source that reads straight into Arrow does, into buffers sized from the
 // table's previous chunk; any other source, or a chunk with a column the

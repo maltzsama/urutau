@@ -255,11 +255,11 @@ func (c *Coordinator) snapshotTodoFor(target string) map[uint32]bool {
 // released ahead of it. Committed on arrival instead, it could move the
 // table's committed position past live cycles still open, and a crash would
 // then take their replay for covered.
-func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, target string, at position.Position, chunkID uint32, pending []uint32) error {
+func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, target string, at position.Position, windowID uint64, pending []uint32, chunkRef uint32, highKey []any) error {
 	meta := &pb.BatchMeta{
 		Table:  target,
 		LowPos: at.String(),
-		Window: &pb.WindowTag{Closes: true, ChunkId: chunkID, SnapshotPending: pending},
+		Window: &pb.WindowTag{Closes: true, WindowId: windowID, SnapshotPending: pending},
 	}
 	if c.stagesCycles() && c.isStagedTable(target) {
 		meta.BatchId = c.batchSeq.Add(1)
@@ -268,7 +268,7 @@ func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, tar
 	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
 		return err
 	}
-	c.noteChunkMarker(w.name, meta.BatchId, target, chunkID)
+	c.noteChunkMarker(w.name, meta.BatchId, target, windowID, chunkRef, highKey)
 	c.noteWindow(target, w)
 	return nil
 }

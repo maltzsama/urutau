@@ -670,14 +670,14 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 	switch {
 	case meta.Window != nil && meta.Window.Snapshot:
 		// AddWindowRows takes ownership of the batch (the window stores it).
-		if err := r.w.AddWindowRows(meta.Table, meta.Window.ChunkId, b); err != nil {
+		if err := r.w.AddWindowRows(meta.Table, meta.Window.WindowId, b); err != nil {
 			return err
 		}
 	case meta.Window != nil && meta.Window.Closes:
 		b.Release()
 		ing := Ingest{
 			Table:           meta.Table,
-			Win:             &rowchange.Window{Closes: true, ChunkID: meta.Window.ChunkId},
+			Win:             &rowchange.Window{Closes: true, WindowID: meta.Window.WindowId},
 			Position:        meta.LowPos,
 			SnapshotPending: meta.Window.SnapshotPending,
 			MarkerID:        meta.BatchId,
@@ -698,7 +698,7 @@ func (r *batchReceiver) apply(fd *flight.FlightData) error {
 	default:
 		var win *rowchange.Window
 		if meta.Window != nil && meta.Window.InWindow {
-			win = &rowchange.Window{InWindow: true, ChunkID: meta.Window.ChunkId}
+			win = &rowchange.Window{InWindow: true, WindowID: meta.Window.WindowId}
 		}
 		return r.sendIngest(Ingest{Table: meta.Table, Batch: b, Win: win})
 	}

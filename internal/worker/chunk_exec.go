@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
+
+	"github.com/apache/arrow-go/v18/arrow"
 
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
@@ -26,13 +29,15 @@ type chunkExecutor struct {
 	chunkSz  int
 	// perRow is each target's last chunk's bytes per row per column: the
 	// next chunk's buffers are sized from it (readChunk).
-	perRow   map[string][]int
-	epoch    uint64                         // the Assignment epoch; echoed on ChunkReady so a stale reply is ignored
-	bySource map[string]*pb.TableAssignment // source table → target/PK
-	qsrc     source.QuerySource
-	w        *Worker
-	log      *slog.Logger
-	send     func(*pb.WorkerMessage) error // session sender, serialized
+	perRow    map[string][]int
+	epoch     uint64                         // the Assignment epoch; echoed on ChunkReady so a stale reply is ignored
+	bySource  map[string]*pb.TableAssignment // source table → target/PK
+	qsrc      source.QuerySource
+	pos       source.Positioner // captures the source position after each window read (WindowOpen.pos)
+	windowSeq atomic.Uint64     // the worker's monotonic window-id sequence
+	w         *Worker
+	log       *slog.Logger
+	send      func(*pb.WorkerMessage) error // session sender, serialized
 }
 
 func newChunkExecutor(assign *pb.Assignment, w *Worker, log *slog.Logger, send func(*pb.WorkerMessage) error) *chunkExecutor {
@@ -84,6 +89,7 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 		return nil, fmt.Errorf("worker: source %q has no SQL query surface", x.kind)
 	}
 	x.qsrc = q
+	x.pos = src
 	return q, nil
 }
 
@@ -136,7 +142,8 @@ func (x *chunkExecutor) Close() {
 	}
 }
 
-// run executes one chunk SELECT, feeds the window, and acks ChunkReady.
+// run executes one chunk SELECT, cuts it into byte-capped windows, and acks
+// ChunkReady with the window ids it opened.
 func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	ta, ok := x.bySource[req.Table]
 	if !ok {
@@ -172,21 +179,88 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	if err != nil {
 		return err
 	}
+	ch := source.Chunk{Low: low, High: high}
 
-	rec, rows, err := x.readChunk(ctx, chunker, source.Chunk{Low: low, High: high}, ta)
+	var total int
+	var windowIDs []uint64
+	emit := func(page arrow.RecordBatch, n int) error {
+		return x.emitWindow(ctx, req, ta, page, n, &windowIDs)
+	}
+	if s, ok := chunker.(byteCapScanner); ok && len(x.w.KnownSchema(ta.TargetTable).Columns) > 0 {
+		total, err = x.readChunkPages(ctx, s, ch, ta, emit)
+	} else {
+		// No byte-cap surface: one window for the whole chunk, as before.
+		var rec arrow.RecordBatch
+		rec, total, err = x.readChunk(ctx, chunker, ch, ta)
+		if err == nil {
+			err = emit(rec, total)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("worker: chunk %d: %w", req.ChunkId, err)
 	}
-	dpb := &dataplane.Batch{Table: ta.TargetTable, Record: rec, Mode: dataplane.AppendMode}
-	// AddWindowRows takes ownership of the batch (the window stores it).
-	if err := x.w.AddWindowRows(ta.TargetTable, req.ChunkId, dpb); err != nil {
-		return err
-	}
+
 	return x.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_ChunkReady{ChunkReady: &pb.ChunkReady{
 		Table:           req.Table,
 		ChunkId:         req.ChunkId,
-		Rows:            uint64(rows),
+		Rows:            uint64(total),
 		DroppedByWindow: uint64(x.w.DroppedByWindow(ta.TargetTable)),
 		Epoch:           x.epoch,
+		WindowIds:       windowIDs,
 	}}})
+}
+
+// emitWindow turns one byte-capped page into an open window: it waits out the
+// in-flight backpressure, captures the source position AFTER the page was read
+// (the interleave invariant), assigns a window id, and announces it before
+// storing the page's rows. It takes ownership of page on success.
+func (x *chunkExecutor) emitWindow(ctx context.Context, req *pb.ChunkRequest, ta *pb.TableAssignment, page arrow.RecordBatch, n int, windowIDs *[]uint64) error {
+	for x.w.openWindows(ta.TargetTable) >= snapshotWindowInFlight() {
+		select {
+		case <-x.w.windowClosed(ta.TargetTable):
+		case <-ctx.Done():
+			page.Release()
+			return ctx.Err()
+		}
+	}
+	posStr := ""
+	if x.pos != nil {
+		pos, err := x.pos.InitialPosition(ctx)
+		if err != nil {
+			page.Release()
+			return fmt.Errorf("worker: window position: %w", err)
+		}
+		posStr = pos.String()
+	}
+	// The window's high key — the last row's PK tuple — is the cursor a
+	// mid-chunk redo resumes from (issue #646): the coordinator uses it to
+	// re-request the chunk from the last committed window, not its start.
+	var highKey []byte
+	if n > 0 && len(ta.PrimaryKey) > 0 {
+		reader, err := transport.NewBatchReader(page, ta.PrimaryKey)
+		if err != nil {
+			page.Release()
+			return fmt.Errorf("worker: window high key: %w", err)
+		}
+		highKey, err = transport.EncodeBounds(reader.Key(int(n)-1), nil)
+		if err != nil {
+			page.Release()
+			return fmt.Errorf("worker: window high key: %w", err)
+		}
+	}
+	seq := x.windowSeq.Add(1)
+	if err := x.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_WindowOpen{WindowOpen: &pb.WindowOpen{
+		Table:   req.Table,
+		ChunkId: req.ChunkId,
+		Attempt: x.epoch,
+		Seq:     seq,
+		Pos:     posStr,
+		HighKey: highKey,
+	}}}); err != nil {
+		page.Release()
+		return err
+	}
+	*windowIDs = append(*windowIDs, seq)
+	// AddWindowRows takes ownership of the batch (the window stores it).
+	return x.w.AddWindowRows(ta.TargetTable, seq, &dataplane.Batch{Table: ta.TargetTable, Record: page, Mode: dataplane.AppendMode})
 }

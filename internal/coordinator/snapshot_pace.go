@@ -28,19 +28,21 @@ const chunkCommitPoll = 20 * time.Millisecond
 // chunkMarker is a queued Closes marker: its in-flight batch id, and the
 // table and window it closes.
 type chunkMarker struct {
-	id     uint64
-	target string
-	window uint32
+	id       uint64
+	target   string
+	window   uint64
+	chunkRef uint32
+	highKey  []any // the window's last row's PK tuple (the redo cursor, #646)
 }
 
 // noteChunkMarker records a queued Closes marker of worker's snapshot.
-func (c *Coordinator) noteChunkMarker(worker string, id uint64, target string, window uint32) {
+func (c *Coordinator) noteChunkMarker(worker string, id uint64, target string, window uint64, chunkRef uint32, highKey []any) {
 	c.chunkMarkersMu.Lock()
 	defer c.chunkMarkersMu.Unlock()
 	if c.chunkMarkers == nil {
 		c.chunkMarkers = map[string][]chunkMarker{}
 	}
-	c.chunkMarkers[worker] = append(c.chunkMarkers[worker], chunkMarker{id: id, target: target, window: window})
+	c.chunkMarkers[worker] = append(c.chunkMarkers[worker], chunkMarker{id: id, target: target, window: window, chunkRef: chunkRef, highKey: highKey})
 }
 
 // errWorkerLost is a chunk round-trip cut short by its worker's loss.
@@ -135,6 +137,10 @@ func (c *Coordinator) onMarkerAck(worker string, id uint64) {
 	if idx == nil {
 		return
 	}
+	// Record the chunk's resume cursor BEFORE releasing the marker: a
+	// concurrent heldChunkMarkers prunes acked markers, so this must read the
+	// marker while it is still held (issue #646).
+	c.recordCursor(worker, id)
 	freed, freedOversized, popped := idx.releaseMarker(id)
 	if freed > 0 {
 		c.budget.release(worker, freed)
@@ -145,4 +151,32 @@ func (c *Coordinator) onMarkerAck(worker string, id uint64) {
 	if w := c.workerFor(worker); w != nil {
 		w.dropSent(popped)
 	}
+}
+
+// recordCursor stores a chunk's resume cursor — the high key of the last
+// window whose Closes marker this ack committed — so a mid-chunk redo resumes
+// the chunk from it instead of re-emitting already-committed windows (#646).
+// A window whose Closes marker was never sent has no marker here, so it is
+// never mistaken for committed.
+func (c *Coordinator) recordCursor(worker string, id uint64) {
+	c.chunkMarkersMu.Lock()
+	defer c.chunkMarkersMu.Unlock()
+	for _, m := range c.chunkMarkers[worker] {
+		if m.id == id && m.highKey != nil {
+			if c.chunkCursor == nil {
+				c.chunkCursor = map[uint32][]any{}
+			}
+			c.chunkCursor[m.chunkRef] = m.highKey
+			return
+		}
+	}
+}
+
+// takeCursor returns and forgets a chunk's resume cursor, or nil.
+func (c *Coordinator) takeCursor(chunkRef uint32) []any {
+	c.chunkMarkersMu.Lock()
+	defer c.chunkMarkersMu.Unlock()
+	cur := c.chunkCursor[chunkRef]
+	delete(c.chunkCursor, chunkRef)
+	return cur
 }

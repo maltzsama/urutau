@@ -13,25 +13,24 @@ import (
 	"github.com/maltzsama/urutau/source"
 )
 
-// slowCatchUpReader holds the high-watermark read until released: the reader
-// catching up to a window, which takes minutes while the stream replays.
+// slowCatchUpReader never catches up to the window's position: its synced
+// position stays behind, so the caught-up proof polls until the worker's loss
+// aborts it.
 type slowCatchUpReader struct {
 	source.SourceReader
-	entered, release chan struct{}
+	entered chan struct{} // closed on the first Synced: the caught-up wait started
 }
 
-func (r slowCatchUpReader) Master(ctx context.Context) (position.Position, error) {
-	close(r.entered) // the ChunkReady is consumed: the window is open
+func (r slowCatchUpReader) Synced() position.Position {
 	select {
-	case <-r.release:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case <-r.entered:
+	default:
+		close(r.entered)
 	}
-	return position.MustLSN("0/1"), nil
+	return position.MustLSN("0/100")
 }
-func (slowCatchUpReader) Synced() position.Position { return position.MustLSN("0/100") }
 
-// A worker lost after its ChunkReady but before the chunk's Closes marker
+// A worker lost after its WindowOpen but before the window's Closes marker
 // is sent takes the window's rows with it — and, the marker not being sent
 // yet, the chunk is not among the lost windows the loss records. The chunk
 // went on as done, its marker reached the restarted worker, which held no
@@ -49,31 +48,39 @@ func TestAWorkerLostBetweenChunkReadyAndClosesRedoesTheChunk(t *testing.T) {
 	w.out = make(chan *pb.CoordinatorMessage, 8)
 	w.queue = make(chan queuedBatch, 64)
 	c.chunkReady = make(chan *pb.ChunkReady, 8)
+	c.windowOpen = make(chan *pb.WindowOpen, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	defer c.releaseAllGates()
 
-	rdr := slowCatchUpReader{entered: make(chan struct{}), release: make(chan struct{})}
+	rdr := slowCatchUpReader{entered: make(chan struct{})}
+	// Capture the epoch once, before the loss: signalSessionEnd below bumps
+	// w.epoch under c.mu, so a goroutine reading w.epoch later races it.
+	c.mu.Lock()
+	epoch := w.epoch
+	c.mu.Unlock()
 	go func() {
 		m := <-w.out
 		req := m.GetChunk()
-		c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: w.epoch}
+		// The window's position is past the reader's synced position, so the
+		// caught-up proof blocks.
+		c.windowOpen <- &pb.WindowOpen{Table: req.Table, ChunkId: req.ChunkId, Attempt: epoch, Seq: 7, Pos: "0/200"}
+		c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: epoch, WindowIds: []uint64{7}}
 	}()
 	lost := c.lostSignal(w)
 	chunks := snapshot.Chunks([][]any{{int64(10)}})
 	done := make(chan error, 1)
 	go func() {
-		done <- c.snapshotChunk(ctx, rdr, c.refs[0], 0, w, snapshot.SnapshotConfig{}, chunks[0], 7, w.epoch, lost, nil)
+		done <- c.snapshotChunk(ctx, rdr, c.refs[0], 0, w, snapshot.SnapshotConfig{}, chunks[0], 7, 0, epoch, lost, nil, map[uint64]int{})
 	}()
 
-	// The chunk is ready; the worker is lost while the reader catches up.
+	// The window is open; the worker is lost while the reader catches up.
 	select {
 	case <-rdr.entered:
 	case <-ctx.Done():
-		t.Fatal("the chunk never became ready")
+		t.Fatal("the window never became ready")
 	}
 	c.signalSessionEnd(w.name, context.Canceled)
-	close(rdr.release)
 
 	if err := <-done; !errors.Is(err, errWorkerLost) {
 		t.Fatalf("snapshotChunk = %v, want errWorkerLost: the window died with the worker", err)

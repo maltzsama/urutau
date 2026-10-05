@@ -99,14 +99,14 @@ func (r *relay) Release(table string, chunkID uint32, at position.Position) {
 	r.ingest <- worker.Ingest{
 		Table:    table,
 		Position: at.String(),
-		Win:      &rowchange.Window{ChunkID: chunkID, Closes: true},
+		Win:      &rowchange.Window{WindowID: uint64(chunkID), Closes: true},
 	}
 }
 
 func (r *relay) AddWindowRows(target string, chunkID uint32, batch *dataplane.Batch) error {
 	// The batch is already Arrow (the chunk SELECT was encoded straight into
 	// builders, #584); the worker window takes ownership.
-	return r.window.AddWindowRows(target, chunkID, batch)
+	return r.window.AddWindowRows(target, uint64(chunkID), batch)
 }
 
 // GateOn starts buffering the table's live events for a chunk SELECT in
@@ -164,7 +164,7 @@ func (r *relay) drainGate(ctx context.Context) (bool, error) {
 
 	for _, b := range buf {
 		select {
-		case r.ingest <- worker.Ingest{Table: b.Table, Batch: b, Win: &rowchange.Window{ChunkID: chunkID, InWindow: true}}:
+		case r.ingest <- worker.Ingest{Table: b.Table, Batch: b, Win: &rowchange.Window{WindowID: uint64(chunkID), InWindow: true}}:
 		case <-ctx.Done():
 			return true, ctx.Err()
 		}

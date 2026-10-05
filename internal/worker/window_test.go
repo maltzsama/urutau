@@ -39,11 +39,11 @@ func TestWindowSnapshotSingleBatch(t *testing.T) {
 		Op: rowchange.OpUpdate, Table: "raw.orders", Key: []any{int64(1)},
 		After:    map[string]any{"id": int64(1), "v": "b"},
 		Position: "p1",
-	}, &rowchange.Window{ChunkID: 7, InWindow: true})
+	}, &rowchange.Window{WindowID: 7, InWindow: true})
 	// Closes: emits the remaining window rows (id=2, id=3) as inserts.
 	ingest <- toIngest(t, rowchange.Change{
 		Table: "raw.orders", Position: "p2",
-	}, &rowchange.Window{ChunkID: 7, Closes: true})
+	}, &rowchange.Window{WindowID: 7, Closes: true})
 	close(ingest)
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
@@ -88,10 +88,10 @@ func TestWindowLiveDeleteWins(t *testing.T) {
 
 	ingest <- toIngest(t, rowchange.Change{
 		Op: rowchange.OpDelete, Table: "t", Key: []any{int64(9)}, Position: "p1",
-	}, &rowchange.Window{ChunkID: 1, InWindow: true})
+	}, &rowchange.Window{WindowID: 1, InWindow: true})
 	ingest <- toIngest(t, rowchange.Change{
 		Table: "t", Position: "p2",
-	}, &rowchange.Window{ChunkID: 1, Closes: true})
+	}, &rowchange.Window{WindowID: 1, Closes: true})
 	close(ingest)
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)
@@ -122,7 +122,7 @@ func TestWindowNoEventsClosesEmitsAll(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- w.Run(context.Background(), ingest) }()
 
-	ingest <- toIngest(t, rowchange.Change{Table: "t", Position: "p5"}, &rowchange.Window{ChunkID: 1, Closes: true})
+	ingest <- toIngest(t, rowchange.Change{Table: "t", Position: "p5"}, &rowchange.Window{WindowID: 1, Closes: true})
 	close(ingest)
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)

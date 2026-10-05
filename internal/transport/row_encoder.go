@@ -117,6 +117,21 @@ func (e *RowEncoder) EndRow(m RowMeta) {
 // Rows is the number of rows ended so far.
 func (e *RowEncoder) Rows() int { return e.rows }
 
+// DataBytes is the total data bytes appended so far across every data column
+// (text/binary buffers only; fixed-width columns are counted by row count).
+// It is the byte-cap reader's cut measure: a page is emitted when this
+// crosses the byte cap, so the caller never holds a window larger than the
+// cap plus one row.
+func (e *RowEncoder) DataBytes() int {
+	total := 0
+	for col := range e.cs.Columns {
+		if b := bytesBuilder(e.bld.Field(col)); b != nil {
+			total += b.DataLen()
+		}
+	}
+	return total
+}
+
 // Sizing the builders once for the rows to come keeps their buffers from
 // growing by doubling, which holds up to twice the data plus a copy while
 // growing. The size comes from rows already encoded: the previous record of

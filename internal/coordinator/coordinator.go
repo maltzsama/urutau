@@ -317,7 +317,7 @@ type Coordinator struct {
 	// before the catch-up ends. A full gate then drains instead of blocking
 	// the pump — blocking it stalled the reader, and with it the very
 	// catch-up the window waited for.
-	gateReady map[string]uint32
+	gateReady map[string]uint64
 	// gateFlushMu serializes every drain of a gate, from taking its buffer
 	// to the last enqueue: the pump and the snapshot both drain, and the
 	// worker must receive the held batches in source order.
@@ -342,6 +342,8 @@ type Coordinator struct {
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
+	// windowOpen routes worker WindowOpen announcements to the snapshot loop.
+	windowOpen chan *pb.WindowOpen
 	// chunkMarkers are each worker's queued snapshot Closes markers, to pace
 	// chunks on commits (snapshot_pace.go).
 	chunkMarkersMu sync.Mutex
@@ -349,6 +351,8 @@ type Coordinator struct {
 	// lostWindows are the chunk windows each lost worker had not
 	// committed, taken at the loss (recovery.go); under chunkMarkersMu.
 	lostWindows map[string][]chunkMarker
+	// chunkCursor is, per chunkRef, the last acked window's high key (#646).
+	chunkCursor map[uint32][]any
 	// podTermination reads a worker's last container termination; nil
 	// reads it from Kubernetes (recovery.go). Set by tests.
 	podTermination func(worker string) (podTermination, bool)
@@ -499,6 +503,7 @@ func Run(ctx context.Context, cfg Config) error {
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
+		windowOpen:  make(chan *pb.WindowOpen, 1024),
 		gateOn:      map[string]bool{},
 		gateWin:     map[string]gateWindow{},
 		gateBuf:     map[string][]*dataplane.Batch{},
@@ -1491,7 +1496,7 @@ func (c *Coordinator) openWindow(target string, partition int) {
 // partition owners by PK range when the table is partitioned, so a
 // drained batch reaches only the rows' actual owning worker(s) even
 // though the gate held it at whole-table granularity.
-func (c *Coordinator) flushWindow(ctx context.Context, target string, partition int, chunkID uint32) error {
+func (c *Coordinator) flushWindow(ctx context.Context, target string, partition int, windowID uint64) error {
 	key := gateKey(target, partition)
 	c.gateFlushMu.Lock()
 	defer c.gateFlushMu.Unlock()
@@ -1503,7 +1508,7 @@ func (c *Coordinator) flushWindow(ctx context.Context, target string, partition 
 	close(c.gateDrain)
 	c.gateDrain = make(chan struct{})
 	c.gateMu.Unlock()
-	return c.enqueueWindowed(ctx, target, chunkID, buf)
+	return c.enqueueWindowed(ctx, target, windowID, buf)
 }
 
 // closeWindow releases any remaining gated batches (post-last-chunk) for
@@ -1701,12 +1706,11 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 	// A worker lost mid-snapshot takes its windows with it (issue #461): the
 	// rows of every chunk whose Closes marker it had not committed lived only
 	// in its memory. Once it is back, the partition redoes from the first
-	// such chunk. Every round-trip gets a window id of its own (attempt in the
-	// high bits), so a lost window's Closes marker, redelivered to the
+	// such chunk. Window ids are the worker's own (attempt, seq), announced in
+	// WindowOpen, so a lost window's Closes marker, redelivered to the
 	// reconnected worker, closes nothing it has open.
 	opened := false
-	var attempt uint32
-	windows := map[uint32]int{} // window id → chunk index, this partition
+	windows := map[uint64]int{} // window seq → chunk index, this partition
 	var epoch uint64
 	haveEpoch := false
 	todo := c.snapshotTodoFor(ref.Target)
@@ -1727,14 +1731,13 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		c.mu.Unlock()
 		if haveEpoch && cur != epoch {
 			// Lost (and back) since the previous round-trip.
-			i = c.redoFrom(w, ref.Target, windows, i)
-			attempt++
-			c.clearChunkReady(ref.Target, partition)
+			i = c.resumeChunkAfterLoss(chunks, w, ref, partition, windows, i)
 			c.log.Warn("coordinator: snapshot worker was lost; redoing its uncommitted chunks",
-				"table", ref.Source, "partition", partition, "worker", w.name, "from_chunk", i, "attempt", attempt)
+				"table", ref.Source, "partition", partition, "worker", w.name, "from_chunk", i)
 		}
 		// The epoch the ChunkRequests are sent under; the worker echoes it
-		// on ChunkReady so a reply from a superseded generation is ignored.
+		// on ChunkReady and WindowOpen so a reply from a superseded
+		// generation is ignored.
 		epoch, haveEpoch = cur, true
 		if !opened {
 			if err := c.openWindowFlushed(ctx, ref.Target, partition); err != nil {
@@ -1742,8 +1745,6 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 			}
 			opened = true
 		}
-		window := attempt<<20 | uint32(i)
-		windows[window] = i
 		// The snapshot watchdog: a worker that attaches but stops draining
 		// would otherwise block the chunk round-trip (send, wait, flush)
 		// forever — the supervisor does not run during the snapshot (issue
@@ -1756,7 +1757,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		chunkCtx, cancel := context.WithTimeout(ctx, timeout)
 		err := c.awaitChunkCommits(chunkCtx, w.name, maxUncommittedChunks, lost)
 		if err == nil {
-			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], window, epoch, lost, pendingAfter(todo, partition, i))
+			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], chunkRef(partition, i), i, epoch, lost, pendingAfter(todo, partition, i), windows)
 		}
 		if err == nil && i == len(chunks)-1 {
 			// The partition's last chunk: its windows must all be committed
@@ -1787,10 +1788,11 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 }
 
 // snapshotChunk runs one chunk's round-trip: send the ChunkRequest, wait for
-// the worker's ChunkReady, prove the reader caught up, then release the gated
-// live rows and the Closes marker. ctx carries the watchdog deadline, so a
-// worker that never acks the chunk fails the run instead of wedging it.
-func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, epoch uint64, lost <-chan struct{}, pending []uint32) error {
+// the worker's WindowOpen announcements and ChunkReady, proving the reader
+// caught up and releasing each window's gated live rows and Closes marker.
+// ctx carries the watchdog deadline, so a worker that never acks the chunk
+// fails the run instead of wedging it.
+func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, index int, epoch uint64, lost <-chan struct{}, pending []uint32, windows map[uint64]int) error {
 	boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
 	if err != nil {
 		return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
@@ -1808,55 +1810,37 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 		return ctx.Err()
 	}
 
-	rows, err := c.waitChunkReadyOr(ctx, ref.Source, chunkID, epoch, lost)
-	if err != nil {
-		return err
-	}
-	c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID, "rows", rows)
-	c.markChunkReady(ref.Target, partition, chunkID)
-
-	// The worker has the chunk rows in its window; prove the reader is
-	// caught up before releasing anything that touches this window. The
-	// high watermark is the source's FIXED position after the SELECT —
-	// never a live master — so a busy source cannot keep the window open
-	// forever.
-	high, err := rdr.Master(ctx)
-	if err != nil {
-		return fmt.Errorf("dblog: chunk %d: master: %w", chunkID, err)
-	}
-	// A worker lost while the reader catches up takes its window with it, and
-	// its full queue blocks the shared pump so the reader never reaches high;
-	// waiting out the window timeout would end the run (issue #526) instead of
-	// redoing the chunk, so the wait aborts on the loss.
-	if err := c.waitCaughtUpOrLost(ctx, rdr, high, cfg, chunkID, lost); err != nil {
-		return err
-	}
-	// The marker's position is the reader's, past every batch sent before
-	// it, so only a commit that includes the window's rows (or a later one)
-	// releases it from the worker's index. At the last position sent, the
-	// ack of the batch sent just before it released it too, with the rows
-	// still in the worker's memory (#468).
-	at := rdr.Synced()
-
-	// Release this chunk's gated live events (InWindow-tagged) ahead of
-	// the Closes marker — FIFO keeps them before it. The gate stays
-	// open: the next chunk's backlog must not race ahead of these.
-	if err := c.flushWindow(ctx, ref.Target, partition, chunkID); err != nil {
-		return err
-	}
-	if err := c.sendClosesPending(ctx, w, ref.Target, at, chunkID, pending); err != nil {
-		return err
-	}
-	// A worker lost since its ChunkReady took the window's rows with it, and
-	// a loss before the marker was sent does not record this chunk among its
-	// lost windows: the marker would reach a worker holding no such window,
-	// and the chunk would pass for done. Report the loss so the partition
-	// redoes it. A loss from here on finds the marker held and records it.
-	select {
-	case <-lost:
-		return errWorkerLost
-	default:
-		return nil
+	// The worker streams WindowOpen as it reads the chunk (byte-cap), then
+	// ChunkReady. Close each window as it opens, in order: prove caught up to
+	// that window's position, release its gated live rows, send its Closes.
+	for {
+		select {
+		case wo := <-c.windowOpen:
+			if wo.Table != ref.Source || wo.ChunkId != chunkID || wo.Attempt != epoch {
+				c.log.Warn("coordinator: ignoring stale/unexpected WindowOpen",
+					"table", wo.Table, "chunk", wo.ChunkId, "attempt", wo.Attempt, "want_epoch", epoch)
+				continue
+			}
+			windows[wo.Seq] = index
+			highKey, err := decodeWindowHighKey(wo.HighKey)
+			if err != nil {
+				return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
+			}
+			if err := c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending, chunkID, highKey); err != nil {
+				return err
+			}
+		case cr := <-c.chunkReady:
+			if cr.Table == ref.Source && cr.ChunkId == chunkID && cr.Epoch == epoch {
+				c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID, "rows", cr.Rows)
+				return nil
+			}
+			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
+				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
+		case <-lost:
+			return errWorkerLost
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -2910,6 +2894,13 @@ func (s *controlServer) Session(stream pb.UrutauControl_SessionServer) (retErr e
 				// goroutine; it aborts on session cancellation instead.
 				select {
 				case c.chunkReady <- m.ChunkReady:
+				case <-sessCtx.Done():
+					sess.done <- context.Canceled
+					return
+				}
+			case *pb.WorkerMessage_WindowOpen:
+				select {
+				case c.windowOpen <- m.WindowOpen:
 				case <-sessCtx.Done():
 					sess.done <- context.Canceled
 					return

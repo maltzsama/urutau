@@ -29,7 +29,7 @@ func TestWindowCommitsTheSnapshotPendingItsMarkerNames(t *testing.T) {
 	if err := w.AddWindowRows("raw.orders", 7, toWindow(t, "raw.orders", []rowchange.Change{windowRow(1, "a"), windowRow(2, "b")})); err != nil {
 		t.Fatalf("AddWindowRows: %v", err)
 	}
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{WindowID: 7, Closes: true})
 	closes.SnapshotPending = []uint32{3, 4}
 	ingest := make(chan Ingest, 1)
 	ingest <- closes
@@ -59,7 +59,7 @@ func TestReceiverCarriesTheClosesMarkersPending(t *testing.T) {
 		parsePos:  parsePosition("postgres"),
 		log:       slog.New(slog.DiscardHandler),
 	}
-	meta := &pb.BatchMeta{Table: "raw.orders", LowPos: "0/10", Window: &pb.WindowTag{Closes: true, ChunkId: 7, SnapshotPending: []uint32{3, 4}}}
+	meta := &pb.BatchMeta{Table: "raw.orders", LowPos: "0/10", Window: &pb.WindowTag{Closes: true, WindowId: 7, SnapshotPending: []uint32{3, 4}}}
 	body, metaBytes, err := transport.EncodeBatch(nil, testSchema(), meta, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +89,7 @@ func TestWindowMarkerProgressWinsOverThePipelineState(t *testing.T) {
 	if err := w.AddWindowRows("raw.orders", 7, toWindow(t, "raw.orders", []rowchange.Change{windowRow(1, "a")})); err != nil {
 		t.Fatalf("AddWindowRows: %v", err)
 	}
-	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{ChunkID: 7, Closes: true})
+	closes := toIngest(t, rowchange.Change{Table: "raw.orders", Position: "p9"}, &rowchange.Window{WindowID: 7, Closes: true})
 	closes.SnapshotPending = []uint32{3, 4}
 	ingest := make(chan Ingest, 1)
 	ingest <- closes

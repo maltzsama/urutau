@@ -58,27 +58,30 @@ func TestChunkReadHoldsLittleMoreThanTheChunk(t *testing.T) {
 	const rows, size = 4000, 6 << 10 // ~24 MiB of payload
 	defer debug.SetGCPercent(debug.SetGCPercent(5))
 
-	w := New(Config{})
-	regTable(t, w, "dst.t", &fakeCommitter{}, 0)
-	w.SetKnownSchema("dst.t", core.Schema{
-		Columns: []core.Column{
-			{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
-			{Name: "payload", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
-		},
-		PrimaryKey: []string{"id"},
-	})
-	x := &chunkExecutor{
-		chunkSz:  rows,
-		bySource: map[string]*pb.TableAssignment{"src.t": {SourceTable: "src.t", TargetTable: "dst.t", PrimaryKey: []string{"id"}}},
-		w:        w,
-		send:     func(*pb.WorkerMessage) error { return nil },
-		qsrc:     payloadQuerySource{&payloadChunkSource{n: rows, size: size}},
-	}
-
-	// The live-heap metric is process-wide: goroutines other tests left
-	// running allocate too. The smallest of a few reads is the chunk's own.
+	// A fresh worker per read: the byte-cap reader's backpressure holds open
+	// windows until their Closes marker, so a reused worker would accumulate
+	// windows across attempts and block on the in-flight cap.
 	var held uint64
 	for attempt := uint32(1); attempt <= 3; attempt++ {
+		w := New(Config{})
+		regTable(t, w, "dst.t", &fakeCommitter{}, 0)
+		w.SetKnownSchema("dst.t", core.Schema{
+			Columns: []core.Column{
+				{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
+				{Name: "payload", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
+			},
+			PrimaryKey: []string{"id"},
+		})
+		x := &chunkExecutor{
+			chunkSz:  rows,
+			bySource: map[string]*pb.TableAssignment{"src.t": {SourceTable: "src.t", TargetTable: "dst.t", PrimaryKey: []string{"id"}}},
+			w:        w,
+			send:     func(*pb.WorkerMessage) error { return nil },
+			qsrc:     payloadQuerySource{&payloadChunkSource{n: rows, size: size}},
+		}
+
+		// The live-heap metric is process-wide: goroutines other tests left
+		// running allocate too. The smallest of a few reads is the chunk's own.
 		h := peakDuring(t, func() error {
 			return x.run(context.Background(), &pb.ChunkRequest{Table: "src.t", ChunkId: attempt})
 		})

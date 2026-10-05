@@ -105,8 +105,9 @@ before live streaming resumes.
 
 - Snapshot rows whose key a live event also touched take the upsert path, so
   they are not duplicated; untouched keys are appended.
-- A worker session lost during the snapshot fails the run, so it restarts
-  and re-snapshots cleanly. A partially applied snapshot is never trusted.
+- A worker session lost mid-snapshot does not fail the run: the partition
+  redoes, under fresh window ids, every chunk whose Closes marker the worker
+  had not committed. A partially applied snapshot is never trusted.
 
 ## Position and resume
 

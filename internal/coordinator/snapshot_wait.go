@@ -15,7 +15,7 @@ import (
 // shared source pump and stalls the reader, so the reader can never reach high.
 // Without this the wait burns the whole window timeout and ends the run
 // (issue #526) instead of replaying, the way #461 recovers a lost worker.
-func (c *Coordinator) waitCaughtUpOrLost(ctx context.Context, rdr source.SourceReader, high position.Position, cfg snapshot.SnapshotConfig, chunkID uint32, lost <-chan struct{}) error {
+func (c *Coordinator) waitCaughtUpOrLost(ctx context.Context, rdr source.SourceReader, high position.Position, cfg snapshot.SnapshotConfig, windowID uint64, lost <-chan struct{}) error {
 	waitCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -37,7 +37,7 @@ func (c *Coordinator) waitCaughtUpOrLost(ctx context.Context, rdr source.SourceR
 			return errWorkerLost
 		default:
 		}
-		return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+		return fmt.Errorf("dblog: window %d: %w", windowID, err)
 	}
 	return nil
 }
