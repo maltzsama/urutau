@@ -1842,29 +1842,49 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 		return ctx.Err()
 	}
 
+	// handleWindowOpen closes one announced window: prove caught up to its
+	// position, release its gated live rows, send its Closes.
+	handleWindowOpen := func(wo *pb.WindowOpen) error {
+		if wo.Table != ref.Source || wo.ChunkId != chunkID || wo.Attempt != epoch {
+			c.log.Warn("coordinator: ignoring stale/unexpected WindowOpen",
+				"table", wo.Table, "chunk", wo.ChunkId, "attempt", wo.Attempt, "want_epoch", epoch)
+			return nil
+		}
+		windows[wo.Seq] = index
+		highKey, err := decodeWindowHighKey(wo.HighKey)
+		if err != nil {
+			return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
+		}
+		return c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending, chunkID, highKey)
+	}
+
 	// The worker streams WindowOpen as it reads the chunk (byte-cap), then
-	// ChunkReady. Close each window as it opens, in order: prove caught up to
-	// that window's position, release its gated live rows, send its Closes.
+	// ChunkReady. Close each window as it opens, in order.
 	for {
 		select {
 		case wo := <-c.windowOpen:
-			if wo.Table != ref.Source || wo.ChunkId != chunkID || wo.Attempt != epoch {
-				c.log.Warn("coordinator: ignoring stale/unexpected WindowOpen",
-					"table", wo.Table, "chunk", wo.ChunkId, "attempt", wo.Attempt, "want_epoch", epoch)
-				continue
-			}
-			windows[wo.Seq] = index
-			highKey, err := decodeWindowHighKey(wo.HighKey)
-			if err != nil {
-				return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
-			}
-			if err := c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending, chunkID, highKey); err != nil {
+			if err := handleWindowOpen(wo); err != nil {
 				return err
 			}
 		case cr := <-c.chunkReady:
 			if cr.Table == ref.Source && cr.ChunkId == chunkID && cr.Epoch == epoch {
 				c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID, "rows", cr.Rows)
-				return nil
+				// WindowOpen and ChunkReady arrive on SEPARATE channels, so
+				// the select above can receive ChunkReady while earlier
+				// WindowOpen messages are still buffered. The worker sends
+				// every WindowOpen before ChunkReady, so drain and close the
+				// buffered ones now — otherwise their gated live rows are
+				// never released and their windows never commit.
+				for {
+					select {
+					case wo := <-c.windowOpen:
+						if err := handleWindowOpen(wo); err != nil {
+							return err
+						}
+					default:
+						return nil
+					}
+				}
 			}
 			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
 				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
