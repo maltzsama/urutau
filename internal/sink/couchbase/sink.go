@@ -357,11 +357,12 @@ func (s *Sink) Properties(ctx context.Context, ref core.TableRef) (map[string]st
 func (s *Sink) Close() error { return s.cluster.Close(nil) }
 
 // SupportsConcurrentWriters reports whether N workers may commit to one
-// table. Concurrent writers are safe ONLY in commitMode: atomic — the
-// control document read-modify-write in commitFast (writer.go) has no
-// protection, so two workers lose each other's position and snapshot
-// properties (WK-001 §2.4); commitAtomic runs that RMW inside a gocb
-// transaction, which serializes across pods.
+// table. Concurrent writers are safe ONLY in commitMode: atomic — only that
+// mode runs the data mutations and the control document inside one gocb
+// transaction, so the position can never separate from its data. The fast
+// path's control read-modify-write is otherwise safe (a CAS loop, issue #566),
+// but it commits data and position separately, so it is not advertised as
+// ordering concurrent writers (WK-001 §2.4).
 //
 // True only in commitMode: atomic — and only since WK-001 C7, which keeps
 // one position per partition in the control document and reads their
@@ -404,6 +405,43 @@ func (k *realKV) get(ctx context.Context, id string, out any) (bool, error) {
 		return false, fmt.Errorf("couchbase: decode %s: %w", id, err)
 	}
 	return true, nil
+}
+
+// realKV is also the optimistic-concurrency store the control document needs
+// in fast mode (issue #566).
+var _ casStore = (*realKV)(nil)
+
+func (k *realKV) getCAS(ctx context.Context, id string, out any) (bool, uint64, error) {
+	res, err := k.coll.Get(id, &gocb.GetOptions{Context: ctx})
+	if err != nil {
+		if errors.Is(err, gocb.ErrDocumentNotFound) {
+			return false, 0, nil
+		}
+		return false, 0, translateKVErr(err)
+	}
+	if err := res.Content(out); err != nil {
+		return false, 0, fmt.Errorf("couchbase: decode %s: %w", id, err)
+	}
+	return true, uint64(res.Cas()), nil
+}
+
+func (k *realKV) replaceCAS(ctx context.Context, id string, doc any, cas uint64) error {
+	if cas == 0 {
+		if _, err := k.coll.Insert(id, doc, &gocb.InsertOptions{DurabilityLevel: k.dur, Context: ctx}); err != nil {
+			if errors.Is(err, gocb.ErrDocumentExists) {
+				return errCASMismatch
+			}
+			return translateKVErr(err)
+		}
+		return nil
+	}
+	if _, err := k.coll.Replace(id, doc, &gocb.ReplaceOptions{Cas: gocb.Cas(cas), DurabilityLevel: k.dur, Context: ctx}); err != nil {
+		if errors.Is(err, gocb.ErrCasMismatch) {
+			return errCASMismatch
+		}
+		return translateKVErr(err)
+	}
+	return nil
 }
 
 func translateKVErr(err error) error {
