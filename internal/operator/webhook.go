@@ -134,6 +134,11 @@ func (v *pipelineValidator) validate(ctx context.Context, obj runtime.Object) er
 	if cr.Spec.Coordinator.Snapshot.MaxParallelChunks < 0 {
 		return fmt.Errorf("coordinator.snapshot.maxParallelChunks must be >= 0")
 	}
+	// A bad resource quantity must be an apply-time rejection, not a panic on
+	// every reconcile (issue #575).
+	if err := validateResourceQuantities(cr); err != nil {
+		return err
+	}
 	return nil
 }
 
