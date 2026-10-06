@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -147,13 +148,14 @@ func (s Source) Open(_ context.Context, refs []source.TableRef) (source.Reader, 
 	}
 
 	r := &Reader{
-		src:         s,
-		topics:      topics,
-		dec:         dec,
-		out:         make(chan rowchange.Change, 1024),
-		logger:      s.Rt.Logger,
-		refBySource: refBySource,
-		synced:      &position.Offsets{},
+		src:              s,
+		topics:           topics,
+		dec:              dec,
+		out:              make(chan rowchange.Change, 1024),
+		logger:           s.Rt.Logger,
+		refBySource:      refBySource,
+		synced:           &position.Offsets{},
+		skipDecodeErrors: s.Spec.Source.OnDecodeError == "skip",
 	}
 	// The puller wraps the reader's own out channel. (A nil puller would
 	// panic in Start — the reader must not be handed out half-wired.)
@@ -252,6 +254,12 @@ type Reader struct {
 	// the worker routes on target names.
 	refBySource map[string]source.TableRef
 
+	// skipDecodeErrors is source.onDecodeError=="skip": a record the decoder
+	// rejects is dropped (and counted) instead of ending the run. decodeErrs
+	// counts them for the caller's metric.
+	skipDecodeErrors bool
+	decodeErrs       atomic.Int64
+
 	mu     sync.Mutex
 	synced *position.Offsets
 }
@@ -268,6 +276,21 @@ func (r *Reader) Synced() position.Position {
 // Master returns the high-watermark position (the latest offset across
 // all partitions). For the caught-up proof, the consumer is caught up
 // when its synced position contains the master.
+// DecodeErrors reports how many records the decoder rejected — and, under
+// source.onDecodeError=skip, the reader dropped. The caller publishes it as
+// urutau_decode_errors_total (issue #558).
+func (r *Reader) DecodeErrors() int64 { return r.decodeErrs.Load() }
+
+// noteDecodeError counts one decoder rejection and reports whether it must
+// end the run. A fundamentally-broken decoder (bad wire format, unknown
+// schema, not JSON, a missing field, not an envelope) always does. A single
+// malformed record does under the default onDecodeError=fail, but is skipped
+// under skip — never a silent drop either way (issue #558).
+func (r *Reader) noteDecodeError(err error) bool {
+	r.decodeErrs.Add(1)
+	return !r.skipDecodeErrors || decodeIsFatal(err)
+}
+
 func (r *Reader) Master(_ context.Context) (position.Position, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -556,12 +579,13 @@ func (r *Reader) consume(ctx context.Context) error {
 			rec.Context = ctx
 			changes, err := r.dec.Decode(rec)
 			if err != nil {
-				if decodeIsFatal(err) {
+				if r.noteDecodeError(err) {
 					fatal = fmt.Errorf("kafka: decode topic %s partition %d offset %d: %w",
 						rec.Topic, rec.Partition, rec.Offset, err)
 					return
 				}
-				r.logger.Error("kafka: decode", "topic", rec.Topic, "err", err)
+				r.logger.Error("kafka: decode skipped", "topic", rec.Topic,
+					"partition", rec.Partition, "offset", rec.Offset, "err", err)
 				return
 			}
 			for _, c := range changes {
@@ -570,11 +594,12 @@ func (r *Reader) consume(ctx context.Context) error {
 				// message-queue envelope for transport metadata. A debezium
 				// topic→target mapping names the TARGET here; the routing
 				// table is keyed by the source/topic, so fall back to it
-				// (issue #482).
+				// (issue #482). An unmapped source skips THIS change, not the
+				// rest of the record's changes (issue #558).
 				ref, ok := r.resolveRef(c.Table, rec.Topic)
 				if !ok {
 					r.logger.Warn("kafka: record for unmapped source", "topic", rec.Topic, "source", c.Table)
-					return
+					continue
 				}
 				c.Table = ref.Target
 				c.Position = position.NewOffsets(rec.Topic,

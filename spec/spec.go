@@ -116,6 +116,12 @@ type Source struct {
 	// SchemaRegistry is the Confluent-compatible schema registry base URL
 	// (e.g. http://registry:8081), required when format is avro.
 	SchemaRegistry string `json:"schemaRegistry,omitempty"`
+	// OnDecodeError is the Kafka source's policy for a record its decoder
+	// rejects. "fail" (default) ends the run at the offending record, with
+	// its topic/partition/offset; "skip" drops just that record and counts it
+	// (urutau_decode_errors_total{topic}), so the stream carries on. Only
+	// meaningful for kind kafka.
+	OnDecodeError string `json:"onDecodeError,omitempty"`
 	// Postgres configures a PostgreSQL source via structured fields instead
 	// of a URI. When present, uri is ignored for connection building (but
 	// slotName and snapshotUri remain flat). Nil means the source uses uri.
