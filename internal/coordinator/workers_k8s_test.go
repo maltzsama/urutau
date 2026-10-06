@@ -248,3 +248,75 @@ func TestReconcileReplicasBacksOffAfterFailure(t *testing.T) {
 		t.Fatalf("owners = %d, want the untouched 1 (reconcile suppressed)", len(got))
 	}
 }
+
+// The kubelet sorts containerStatuses by name, so an injected sidecar can
+// precede the worker; crash detection must read the worker's status by name,
+// not by index (issue #553).
+func TestK8sTerminationReadsWorkerContainerNotSidecar(t *testing.T) {
+	cs := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "ns", UID: types.UID("uid-1")},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+			{
+				Name:         "istio-proxy",
+				RestartCount: 7,
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason: "Completed", ExitCode: 0,
+				}},
+			},
+			{
+				Name:         "worker",
+				RestartCount: 2,
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason: "OOMKilled", ExitCode: 137,
+				}},
+			},
+		}},
+	})
+	c := &Coordinator{k8sClient: cs, k8sNS: "ns"}
+
+	term, ok := c.k8sTermination("w")
+	if !ok {
+		t.Fatal("termination not read")
+	}
+	if term.restarts != 2 || term.reason != "OOMKilled" || term.exitCode != 137 {
+		t.Fatalf("read the wrong container: %+v", term)
+	}
+	if term.podUID != "uid-1" {
+		t.Fatalf("podUID = %q, want uid-1", term.podUID)
+	}
+}
+
+// The maintenance flags belong to the worker container only; an injected
+// sidecar must not receive them (issue #553).
+func TestMaintenanceWorkerPodFlagsOnlyWorkerContainer(t *testing.T) {
+	tmpl := corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: "istio-proxy", Image: "proxy:v1", Args: []string{"proxy", "sidecar"}},
+				{Name: "worker", Image: "urutau:test", Command: []string{"urutau-worker"}},
+			},
+		},
+	}
+	pod := maintenanceWorkerPod("maint", "ns", metav1.OwnerReference{Name: "c", Kind: "Pod"}, tmpl)
+
+	var worker, sidecar *corev1.Container
+	for i := range pod.Spec.Containers {
+		switch pod.Spec.Containers[i].Name {
+		case "worker":
+			worker = &pod.Spec.Containers[i]
+		case "istio-proxy":
+			sidecar = &pod.Spec.Containers[i]
+		}
+	}
+	if worker == nil || sidecar == nil {
+		t.Fatalf("containers = %+v", pod.Spec.Containers)
+	}
+	if !hasArg(worker.Args, "--maintenance") || !hasArgPair(worker.Args, "--name", "maint") {
+		t.Fatalf("worker args = %v, want --maintenance --name maint", worker.Args)
+	}
+	for _, a := range sidecar.Args {
+		if a == "--maintenance" || a == "--name" {
+			t.Fatalf("sidecar args = %v, must not carry worker flags", sidecar.Args)
+		}
+	}
+}
