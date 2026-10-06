@@ -2869,7 +2869,20 @@ func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr e
 	}
 	defer func() {
 		c.mu.Lock()
-		w.control = nil
+		// Only act on the stream this handler installed: a worker that
+		// reconnected before the server noticed this stream died has already
+		// replaced w.control with a new stream, and niling it would make
+		// gracefulShutdown skip the worker (issue #552).
+		if w.control == stream {
+			w.control = nil
+			// The Control stream is gone while this handler still owned it:
+			// end the Session too, so the worker reconnects and re-establishes
+			// both streams. A Session left alive with no Control never gets a
+			// shutdown drain and never reattaches (issue #552).
+			if w.cancel != nil {
+				w.cancel()
+			}
+		}
 		c.mu.Unlock()
 		// A worker mid-reset suicides and closes this stream too; only a
 		// non-reset death is a real session failure (signalSessionEnd owns
