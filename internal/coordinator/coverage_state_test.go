@@ -226,16 +226,6 @@ func TestEnqueueBatchSplitsByPartition(t *testing.T) {
 
 type plainChunker struct{ source.ChunkSource }
 
-type partitionChunker struct {
-	source.ChunkSource
-	ranges []source.Chunk
-	err    error
-}
-
-func (p partitionChunker) Partitions(context.Context, int) ([]source.Chunk, error) {
-	return p.ranges, p.err
-}
-
 type fakeQSource struct {
 	source.QuerySource
 	chunker source.ChunkSource
@@ -253,20 +243,19 @@ func TestResolvePartitionRanges(t *testing.T) {
 	ref := source.TableRef{Source: "s", PrimaryKey: []string{"id"}}
 	two := spec.Table{Workers: &spec.WorkerSpec{Number: 2}}
 
-	ranges := []source.Chunk{{Low: nil, High: []any{int64(5)}}, {Low: []any{int64(5)}, High: nil}}
-	c := &Coordinator{qsrc: fakeQSource{chunker: partitionChunker{ranges: ranges}}}
-	got, _, err := c.resolvePartitionRanges(ctx, two, ref)
+	// A partitioned table gets one unbounded range and its chunker. Ownership
+	// is the rendezvous hash, so no Partitions sampling is issued and the
+	// chunker need not be a PartitionSource — only a ChunkSource.
+	c := &Coordinator{qsrc: fakeQSource{chunker: plainChunker{}}, cfg: Config{Spec: &spec.Spec{}}}
+	got, chunker, err := c.resolvePartitionRanges(ctx, two, ref)
 	if err != nil {
 		t.Fatalf("resolvePartitionRanges: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("ranges = %d, want 2", len(got))
+	if len(got) != 1 || got[0].Low != nil || got[0].High != nil {
+		t.Fatalf("ranges = %v, want the single unbounded {}", got)
 	}
-
-	// A chunker that is not a PartitionSource fails loudly.
-	c.qsrc = fakeQSource{chunker: plainChunker{}}
-	if _, _, err := c.resolvePartitionRanges(ctx, two, ref); err == nil {
-		t.Fatal("a non-partitioning chunker must fail")
+	if chunker == nil {
+		t.Fatal("a partitioned table must get its chunker for the snapshot read")
 	}
 
 	// NewChunker error propagates.
@@ -276,10 +265,10 @@ func TestResolvePartitionRanges(t *testing.T) {
 		t.Fatalf("resolvePartitionRanges(newchunker err) = %v, want boom", err)
 	}
 
-	// Partitions error propagates.
-	c.qsrc = fakeQSource{chunker: partitionChunker{err: boom}}
-	if _, _, err := c.resolvePartitionRanges(ctx, two, ref); !errors.Is(err, boom) {
-		t.Fatalf("resolvePartitionRanges(partitions err) = %v, want boom", err)
+	// No query surface for a partitioned table is a config error.
+	c.qsrc = nil
+	if _, _, err := c.resolvePartitionRanges(ctx, two, ref); err == nil {
+		t.Fatal("a partitioned table with no query surface must error")
 	}
 }
 
