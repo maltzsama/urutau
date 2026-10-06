@@ -792,6 +792,12 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 				if err != nil {
 					return err
 				}
+				// The window holds the snapshot rows: enrich them too, or the
+				// whole backfill lands with NULL reference columns (issue #564).
+				cb, err = p.enrichWindowRows(ctx, cb, bufferEmpty)
+				if err != nil {
+					return err
+				}
 				if cb == nil {
 					// No rows to commit: the marker is done now.
 					w.markerCommitted(p.target, ing.MarkerID)
@@ -837,37 +843,19 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 			// the known schema lacks is a spec violation — report once and
 			// go terminal. Runs on the SOURCE batch before enrich (enrich
 			// adds reference columns that must not trip drift).
-			if len(p.knownSchema.Columns) > 0 {
-				d, hit, err := schemaDrift(batch, p.knownSchema)
-				if err != nil {
-					batch.Release()
-					return fmt.Errorf("worker: table %s: %w", p.target, err)
-				}
-				if hit {
-					p.snapshotMu.Lock()
-					first := !p.driftReported[d.Column]
-					p.driftReported[d.Column] = true
-					p.snapshotMu.Unlock()
-					if first && w.schemaDrift != nil {
-						w.schemaDrift(SchemaDrift{Table: p.target, Column: d.Column, Kind: d.Kind})
-					}
-					batch.Release()
-					return fmt.Errorf("worker: table %s: schema drift: column %q is not in the spec — declare it and resume", p.target, d.Column)
-				}
+			if err := w.checkSchemaDrift(p, batch); err != nil {
+				return err
 			}
 			// Enrich the whole batch (columnar seam). Deletes bypass the
 			// join, so no single-row special case is needed.
-			origRows := int(batch.Record.NumRows())
-			if p.enricher != nil {
-				enriched, dropped, err := p.applyEnrich(ctx, batch, origRows, bufferEmpty)
-				if err != nil {
-					return err
-				}
-				if dropped {
-					continue
-				}
-				batch = enriched
+			enriched, dropped, err := p.enrichStreamBatch(ctx, batch, bufferEmpty)
+			if err != nil {
+				return err
 			}
+			if dropped {
+				continue
+			}
+			batch = enriched
 
 			// Per-row side effects, read columnar: bootstrap marking for
 			// live keys, InWindow dedup against the open windows.
