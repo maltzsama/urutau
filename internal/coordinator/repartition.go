@@ -246,8 +246,8 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	if err != nil {
 		return fmt.Errorf("coordinator: scale %s: %w", target, err)
 	}
-	if len(ranges) != n {
-		return fmt.Errorf("coordinator: scale %s: resolved %d ranges for %d partitions", target, len(ranges), n)
+	if len(ranges) == 0 {
+		return fmt.Errorf("coordinator: scale %s: no partition range resolved", target)
 	}
 
 	next, removed, created, err := c.reslicedOwners(target, owners, n, ref)
@@ -542,38 +542,30 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	}
 }
 
-// rangesFor resolves n contiguous key ranges for target from the table's
-// chunker. n == 1 is the unpartitioned single unbounded range, matching
-// boot behavior byte for byte.
-func (c *Coordinator) rangesFor(ctx context.Context, target string, n int, ref source.TableRef) ([]source.Chunk, error) {
+// rangesFor ensures the table's chunker exists and returns the single
+// unbounded range. Ownership is the rendezvous hash, so a re-slice no longer
+// samples key ranges — the chunker only powers the index range scan the
+// snapshot fan-out reads by. A table booted with one worker has no chunker
+// yet, so it is built on demand here and kept for the next re-slice.
+func (c *Coordinator) rangesFor(_ context.Context, target string, n int, ref source.TableRef) ([]source.Chunk, error) {
 	if n <= 1 {
 		return []source.Chunk{{}}, nil
 	}
-	// A table booted with one worker has no chunker: resolvePartitionRanges
-	// short-circuits before building one. Scaling such a table out is the
-	// main case this feature exists for, so build it on demand here the same
-	// way boot does, and keep it for the next re-slice.
-	chunker := c.lookupChunker(target)
-	if chunker == nil {
+	if c.lookupChunker(target) == nil {
 		if c.qsrc == nil {
 			// A source with no SQL query surface (Kafka: coordinator.go's
 			// boot makes QuerySource optional, issue #394) has no chunker at
 			// all — scaling it out to n>1 is a config error, not a nil-qsrc
 			// panic on the line below.
-			return nil, fmt.Errorf("coordinator: scale %s: source %q has no SQL query surface to partition by", target, c.cfg.Spec.Source.Kind)
+			return nil, fmt.Errorf("coordinator: scale %s: source %q has no SQL query surface to read chunks by", target, c.cfg.Spec.Source.Kind)
 		}
 		built, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 		if err != nil {
 			return nil, fmt.Errorf("chunker: %w", err)
 		}
 		c.storeChunker(target, built)
-		chunker = built
 	}
-	ps, ok := chunker.(source.PartitionSource)
-	if !ok {
-		return nil, fmt.Errorf("this source does not support range partitioning")
-	}
-	return ps.Partitions(ctx, n)
+	return []source.Chunk{{}}, nil
 }
 
 // tableRef returns the resolved TableRef for target.

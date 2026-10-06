@@ -728,15 +728,15 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return err
 		}
 		names := t.WorkerGroupNames(c.cfg.Spec.Pipeline)
+		// Ranges are no longer sampled: ownership is the rendezvous hash
+		// (route.OwnerOfKey), so resolvePartitionRanges returns the single
+		// unbounded range the DBLog read covers and only builds the chunker.
 		ranges, chunker, err := c.resolvePartitionRanges(ctx, t, refs[i])
 		if err != nil {
 			return fmt.Errorf("coordinator: %s: %w", t.Source, err)
 		}
-		if err := requireOrderableRanges(t, canonical[t.Source], refs[i].PrimaryKey, ranges); err != nil {
-			return err
-		}
-		if len(ranges) != len(names) {
-			return fmt.Errorf("coordinator: %s: resolved %d partition ranges for %d worker groups", t.Source, len(ranges), len(names))
+		if len(ranges) == 0 {
+			return fmt.Errorf("coordinator: %s: no partition range resolved", t.Source)
 		}
 		bootRanges[t.Target] = ranges
 		c.chunkers[t.Target] = chunker
@@ -1128,64 +1128,6 @@ func requireSnapshotBootstrap(t spec.Table) error {
 	return nil
 }
 
-// requireOrderableRanges rejects a partitioned table whose key, as the wire
-// carries it, cannot be ordered against the partition bounds the chunker
-// built from the source column. It happens when a cast gives an unsigned
-// MySQL key (KindUnknown at the source) a kind the bounds do not share, e.g.
-// cast: {id: string}: the snapshot splits by SQL numeric order, and live
-// routing has no order to match it (issue #406). Failing here beats failing
-// on the first live batch.
-func requireOrderableRanges(t spec.Table, wire core.Schema, pk []string, ranges []source.Chunk) error {
-	for j, name := range pk {
-		col, ok := wire.Column(name)
-		if !ok {
-			return fmt.Errorf("coordinator: %s: partition key %q is not in the table schema", t.Target, name)
-		}
-		sample, ok := keySample(col.Type.Kind)
-		if !ok {
-			if len(ranges) <= 1 {
-				continue // unpartitioned: the key is never compared
-			}
-			return fmt.Errorf("coordinator: %s: partition key %q has type %s, which cannot be range-partitioned; set workers.number to 1", t.Target, name, col.Type.Kind)
-		}
-		for _, r := range ranges {
-			for _, bound := range [][]any{r.Low, r.High} {
-				if j >= len(bound) {
-					continue
-				}
-				if _, err := compareScalar(sample, bound[j]); err != nil {
-					return fmt.Errorf("coordinator: %s: partition key %q is %s on the wire but the partition bounds are %T: "+
-						"a cast on a partition key must keep its ordering (e.g. cast an unsigned integer key to int64 or uint64, not string or decimal), "+
-						"or set workers.number to 1", t.Target, name, col.Type.Kind, bound[j])
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// keySample returns a value of the Go type transport.BatchReader.Key yields
-// for kind, or false for a kind partition routing has no order for (a
-// decimal travels as its text form, which does not order numerically).
-func keySample(kind core.Kind) (any, bool) {
-	switch kind {
-	case core.KindInt32:
-		return int32(0), true
-	case core.KindInt64:
-		return int64(0), true
-	case core.KindUInt64:
-		return uint64(0), true
-	case core.KindFloat32, core.KindFloat64:
-		return float64(0), true
-	case core.KindString:
-		return "", true
-	case core.KindBinary, core.KindUUID, core.KindFixedBinary:
-		return []byte{}, true
-	default:
-		return nil, false
-	}
-}
-
 // requireConcurrentSink rejects workers>1 when the sink does not declare the
 // ConcurrentWriter capability (or declares it false). snk is taken as any so
 // the check is a pure capability probe — the coordinator never reaches into a
@@ -1204,7 +1146,7 @@ func requireConcurrentSink(t spec.Table, snk any) error {
 	return nil
 }
 
-func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, source.ChunkSource, error) {
+func (c *Coordinator) resolvePartitionRanges(_ context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, source.ChunkSource, error) {
 	n := t.WorkerCount()
 	if n <= 1 {
 		// Unpartitioned: no chunker needed at boot; the snapshot builds it
@@ -1214,23 +1156,19 @@ func (c *Coordinator) resolvePartitionRanges(ctx context.Context, t spec.Table, 
 	if c.qsrc == nil {
 		// A source with no SQL query surface (Kafka: coordinator.go's boot
 		// makes QuerySource optional, issue #394) has no chunker at all —
-		// range-partitioning it is a config error the operator must fix, not
-		// a nil-qsrc panic on the line below.
-		return nil, nil, fmt.Errorf("workers: %d: source %q has no SQL query surface to partition by; set workers.number to 1", n, c.cfg.Spec.Source.Kind)
+		// partitioning it is a config error the operator must fix, not a
+		// nil-qsrc panic on the line below.
+		return nil, nil, fmt.Errorf("workers: %d: source %q has no SQL query surface to read chunks by; set workers.number to 1", n, c.cfg.Spec.Source.Kind)
 	}
 	chunker, err := c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
 	if err != nil {
 		return nil, nil, fmt.Errorf("workers: %d: chunker: %w", n, err)
 	}
-	ps, ok := chunker.(source.PartitionSource)
-	if !ok {
-		return nil, nil, fmt.Errorf("workers: %d: this source does not support range partitioning yet", n)
-	}
-	ranges, err := ps.Partitions(ctx, n)
-	if err != nil {
-		return nil, nil, fmt.Errorf("workers: %d: %w", n, err)
-	}
-	return ranges, chunker, nil
+	// Ownership is the rendezvous hash, decided from the key, not a sampled
+	// key range: no Partitions query is issued. The chunker only powers the
+	// index range scan the fan-out reads by (snapshot_hash.go), so the source
+	// no longer needs PartitionSource — just ChunkSource.
+	return []source.Chunk{{}}, chunker, nil
 }
 
 // supervisionConfig maps the Config knobs to the supervisor defaults.

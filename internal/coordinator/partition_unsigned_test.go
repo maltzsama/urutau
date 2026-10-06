@@ -4,9 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/source"
-	"github.com/maltzsama/urutau/spec"
 )
 
 // A BIGINT UNSIGNED key arrives from transport.BatchReader as uint64
@@ -78,38 +76,6 @@ func TestComparePKRejectsUnorderedTypes(t *testing.T) {
 	for _, c := range cases {
 		if _, err := comparePK([]any{c.a}, []any{c.b}); err == nil {
 			t.Errorf("comparePK(%T, %T): want an error", c.a, c.b)
-		}
-	}
-}
-
-func TestRequireOrderableRanges(t *testing.T) {
-	intRanges := []source.Chunk{{High: []any{int64(50)}}, {Low: []any{int64(50)}}}
-	uintRanges := []source.Chunk{{High: []any{uint64(50)}}, {Low: []any{uint64(50)}}}
-	strRanges := []source.Chunk{{High: []any{"m"}}, {Low: []any{"m"}}}
-	schema := func(k core.Kind) core.Schema {
-		return core.Schema{Columns: []core.Column{{Name: "id", Type: core.ColumnType{Kind: k}}}, PrimaryKey: []string{"id"}}
-	}
-	cases := []struct {
-		name    string
-		kind    core.Kind
-		ranges  []source.Chunk
-		wantErr bool
-	}{
-		{"int64 key, int64 bounds", core.KindInt64, intRanges, false},
-		{"uint64 key (cast), int64 bounds", core.KindUInt64, intRanges, false},
-		{"int64 key (cast), uint64 bounds", core.KindInt64, uintRanges, false},
-		{"float key, int64 bounds", core.KindFloat64, intRanges, false},
-		{"string key, string bounds", core.KindString, strRanges, false},
-		{"string key (cast), int64 bounds", core.KindString, intRanges, true},
-		{"decimal key (cast), int64 bounds", core.KindDecimal, intRanges, true},
-		{"int64 key, string bounds", core.KindInt64, strRanges, true},
-		{"timestamp key, unpartitioned", core.KindTimestamp, []source.Chunk{{}}, false},
-	}
-	tbl := spec.Table{Target: "t"}
-	for _, c := range cases {
-		err := requireOrderableRanges(tbl, schema(c.kind), []string{"id"}, c.ranges)
-		if (err != nil) != c.wantErr {
-			t.Errorf("%s: err = %v, wantErr %v", c.name, err, c.wantErr)
 		}
 	}
 }

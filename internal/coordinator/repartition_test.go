@@ -78,12 +78,14 @@ func TestScaleOutRegistersOwnerAndSwapsRouting(t *testing.T) {
 	if len(after) != 3 {
 		t.Fatalf("owners after scale = %d, want 3", len(after))
 	}
-	ranges := c.loadRouting().rangesOf("raw.orders")
-	if len(ranges) != 3 {
-		t.Fatalf("ranges after scale = %d, want 3", len(ranges))
+	// Ownership is the rendezvous hash, so a re-slice no longer samples key
+	// ranges: the routing keeps the single unbounded range and Partitions is
+	// never called.
+	if ranges := c.loadRouting().rangesOf("raw.orders"); len(ranges) != 1 {
+		t.Fatalf("ranges after scale = %d, want 1 (no sampling)", len(ranges))
 	}
-	if ch.calls != 1 {
-		t.Fatalf("Partitions called %d times, want 1", ch.calls)
+	if ch.calls != 0 {
+		t.Fatalf("Partitions called %d times, want 0 (hash ownership does not sample)", ch.calls)
 	}
 	// Minimal remap: partition 0 keeps its original owner.
 	if after[0] != before[0] {
@@ -141,8 +143,8 @@ func TestScaleInDropsOwnerAndShrinksRanges(t *testing.T) {
 	if len(after) != 2 {
 		t.Fatalf("owners = %d, want 2", len(after))
 	}
-	if len(c.loadRouting().rangesOf("raw.orders")) != 2 {
-		t.Fatal("ranges must shrink with the owners")
+	if len(c.loadRouting().rangesOf("raw.orders")) != 1 {
+		t.Fatal("ranges are the single unbounded range; ownership shrinks by owner, not by sampling")
 	}
 	if _, ok := c.workers[dropped.name]; ok {
 		t.Fatalf("retired owner %q still in the registry", dropped.name)
@@ -345,9 +347,8 @@ func TestRoutingSnapshotIsConsistentUnderConcurrentScale(t *testing.T) {
 				if !ok {
 					continue
 				}
-				ranges := rt.rangesOf("raw.orders")
-				if len(owners) != len(ranges) {
-					t.Errorf("torn snapshot: %d owners but %d ranges", len(owners), len(ranges))
+				if len(rt.rangesOf("raw.orders")) == 0 {
+					t.Errorf("torn snapshot: %d owners but no range", len(owners))
 					return
 				}
 				_ = c.isStagedTable("raw.orders")
