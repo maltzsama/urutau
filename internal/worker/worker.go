@@ -1177,12 +1177,15 @@ func schemaDrift(b *dataplane.Batch, schema core.Schema) (SchemaDrift, bool, err
 // The null rule matches the top level: an all-null extra field is padding,
 // not a source value.
 //
-// The leading null-struct check is defensive. A builder nulls a struct's
-// children along with the parent, so the per-field check below already
-// covers that case; but Arrow permits a null parent over populated child
-// buffers, and those values belong to no row.
+// The leading check skips only a struct column that is null in EVERY row: a
+// builder nulls a struct's children along with the parent, but nullness is
+// per row, so a struct null in row 0 and populated later must still be
+// inspected or a field added inside it passes unnoticed (issue #557).
 func nestedDrift(path string, st *array.Struct, declared []core.Column) (SchemaDrift, bool) {
-	if st.IsNull(0) {
+	// Nullness is PER ROW: a struct null in row 0 but populated later must
+	// still be inspected. Only an entirely-null array has no value to check
+	// (issue #557).
+	if st.NullN() == st.Len() {
 		return SchemaDrift{}, false
 	}
 	stType, ok := st.DataType().(*arrow.StructType)

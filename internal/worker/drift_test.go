@@ -237,3 +237,31 @@ func TestSchemaDriftNullFirstRowIsStillDrift(t *testing.T) {
 		t.Fatalf("drift = %+v, want late (null first row, value later)", d)
 	}
 }
+
+// #557: nullness is per row, so a struct column null in row 0 but populated
+// in row 1 must still be inspected — a field added inside it was otherwise
+// missed because nestedDrift returned on row 0.
+func TestSchemaDriftNullStructFirstRowIsStillDrift(t *testing.T) {
+	b := driftBatch(t,
+		[]arrow.Field{idField, addressOf(geoOf(), arrow.Field{Name: "complement", Type: arrow.BinaryTypes.String, Nullable: true})},
+		func(rb *array.RecordBuilder) {
+			rb.Field(0).(*array.Int64Builder).Append(1)
+			addr := rb.Field(1).(*array.StructBuilder)
+			addr.AppendNull() // row 0: the struct is null
+			rb.Field(0).(*array.Int64Builder).Append(2)
+			addr.Append(true) // row 1: populated, carrying an undeclared field
+			addr.FieldBuilder(0).(*array.StringBuilder).Append("sp")
+			addr.FieldBuilder(1).(*array.StringBuilder).Append("apto 4")
+			geo := addr.FieldBuilder(2).(*array.StructBuilder)
+			geo.Append(true)
+			geo.FieldBuilder(0).(*array.Float64Builder).Append(-23.5)
+		})
+
+	d, hit, err := schemaDrift(b, nestedSchema())
+	if err != nil {
+		t.Fatalf("schemaDrift: %v", err)
+	}
+	if !hit || d.Column != "address.complement" {
+		t.Fatalf("drift = %+v, want address.complement (struct null in row 0, populated in row 1)", d)
+	}
+}
