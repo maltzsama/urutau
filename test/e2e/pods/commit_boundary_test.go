@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -62,28 +61,42 @@ type logFollower struct {
 	done chan struct{}
 }
 
-// followLogs starts streaming pod's current container logs (new lines only)
-// until the container exits or the test ends.
+// followLogs streams pod's container logs until the Pod stops running or the
+// test ends. A `kubectl logs -f` stream can drop while the container is still
+// alive (a transient kubectl/API hiccup): dismissing it as "the container
+// died" fails waitFaultFired before the armed fault is even reached, so the
+// follower reconnects while the Pod is Running and re-reads the whole log
+// (--tail=-1) to not lose a line written during the gap. Duplicates are
+// harmless: line() matches by substring.
 func followLogs(t *testing.T, ns, pod string) *logFollower {
 	t.Helper()
 	f := &logFollower{done: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "logs", "-f", "--tail=0", pod)
-	cmd.Stdout = f
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		cancel()
-		t.Fatalf("follow logs of %s: %v", pod, err)
-	}
 	go func() {
-		_ = cmd.Wait()
-		close(f.done)
+		defer close(f.done)
+		for ctx.Err() == nil {
+			cmd := exec.CommandContext(ctx, "kubectl", "-n", ns, "logs", "-f", "--tail=-1", pod)
+			cmd.Stdout = f
+			cmd.Stderr = f // surface why a stream ended instead of discarding it
+			_ = cmd.Run()
+			if ctx.Err() != nil || !podRunning(ns, pod) {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
 	}()
 	t.Cleanup(func() {
 		cancel()
 		<-f.done
 	})
 	return f
+}
+
+// podRunning reports whether pod is still in the Running phase (a restarted
+// container keeps the Pod Running; only a real teardown changes the phase).
+func podRunning(ns, pod string) bool {
+	out, err := exec.Command("kubectl", "-n", ns, "get", "pod", pod, "-o", "jsonpath={.status.phase}").Output()
+	return err == nil && strings.TrimSpace(string(out)) == "Running"
 }
 
 func (f *logFollower) Write(p []byte) (int, error) {
