@@ -231,15 +231,27 @@ func (c *URI) Addr() string { return c.Host + ":" + c.Port }
 // normalizeCol). That keeps TIMESTAMP's instant exact and interprets DATETIME
 // in the operator's zone without depending on the server's timezone tables or
 // freezing a DST offset (issue #139).
+//
+// The DSN is rendered by the driver's own Config.FormatDSN (as the enrich
+// loader already does) rather than by string interpolation, so a user,
+// password or database name carrying DSN metacharacters no longer has to be
+// escaped by hand (issue #573).
 func (c *URI) QueryDSN() (string, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&time_zone=%s",
-		c.User, c.Password, c.Addr(), c.DB,
-		url.QueryEscape("'+00:00'"))
+	cfg := mysql.NewConfig()
+	cfg.User = c.User
+	cfg.Passwd = c.Password
+	cfg.Net = "tcp"
+	cfg.Addr = c.Addr()
+	cfg.DBName = c.DB
+	cfg.ParseTime = true
+	cfg.Loc = time.UTC
+	cfg.Params = map[string]string{"time_zone": "'+00:00'"}
+
 	if c.tlsConfig != nil {
 		if err := mysql.RegisterTLSConfig(c.tlsName, c.tlsConfig); err != nil {
 			return "", fmt.Errorf("mysql: register tls config: %w", err)
 		}
-		dsn += "&tls=" + url.QueryEscape(c.tlsName)
+		cfg.TLSConfig = c.tlsName
 	}
-	return dsn, nil
+	return cfg.FormatDSN(), nil
 }
