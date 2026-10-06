@@ -133,7 +133,7 @@ func TestCoordinatorClusterAddr(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pipe", Namespace: "ns"},
 	}
 	got := coordinatorClusterAddr(cr)
-	want := "pipe-coordinator.ns.svc.cluster.local:50051"
+	want := "pipe-coordinator.ns:50051"
 	if got != want {
 		t.Errorf("coordinatorClusterAddr = %q, want %q", got, want)
 	}

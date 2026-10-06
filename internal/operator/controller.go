@@ -20,7 +20,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -267,6 +266,9 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 func (r *CoordinatorReconciler) validateSpec(cr *urutauv1alpha1.CDCPipeline) error {
 	if len(cr.Spec.Definition.Inline) == 0 {
 		return fmt.Errorf("definition.inline is required (image/s3 planner not implemented)")
+	}
+	if err := validateResourceQuantities(cr); err != nil {
+		return err
 	}
 	return nil
 }
@@ -691,7 +693,11 @@ func inlineSinkWarehouse(cr *urutauv1alpha1.CDCPipeline) string {
 // coordinatorClusterAddr is the in-cluster address a worker Pod dials —
 // the coordinator's own headless Service DNS name.
 func coordinatorClusterAddr(cr *urutauv1alpha1.CDCPipeline) string {
-	return fmt.Sprintf("%s.%s.svc.cluster.local:50051", coordinatorName(cr), cr.Namespace)
+	// <service>.<namespace> resolves through the pod's DNS search domains, so
+	// it does not hard-code the cluster domain (a cluster with a custom
+	// cluster.local would not resolve the old FQDN). The port is the shared
+	// constant (issue #575).
+	return fmt.Sprintf("%s.%s:%d", coordinatorName(cr), cr.Namespace, coordinatorGRPCPort)
 }
 
 // resolveImage returns the CR's own Image when declared, else the
@@ -900,62 +906,6 @@ const (
 	defaultCPU    = "500m"
 	defaultMemory = "1Gi"
 )
-
-// resourceRequirements builds a container's resource request/limit from
-// Kubernetes quantity strings. cpu/memory become the request; cpu+overhead/
-// memory+overhead become the limit — the request alone when no overhead is
-// given (limit == request), matching CoordinatorSpec, which has no
-// overhead knob. Empty cpu/memory fall back to defaultCPU/defaultMemory, so
-// the result is never empty (a pod is never BestEffort); overhead still adds
-// only to the limit.
-func resourceRequirements(cpu, cpuOverhead, memory, memOverhead string) corev1.ResourceRequirements {
-	if cpu == "" {
-		cpu = defaultCPU
-	}
-	if memory == "" {
-		memory = defaultMemory
-	}
-	req := corev1.ResourceList{}
-	lim := corev1.ResourceList{}
-	req[corev1.ResourceCPU] = resource.MustParse(cpu)
-	lim[corev1.ResourceCPU] = addQuantity(cpu, cpuOverhead)
-	req[corev1.ResourceMemory] = resource.MustParse(memory)
-	lim[corev1.ResourceMemory] = addQuantity(memory, memOverhead)
-	return corev1.ResourceRequirements{Requests: req, Limits: lim}
-}
-
-// addQuantity adds an optional overhead quantity to a base quantity;
-// overhead=="" returns base unchanged (limit == request).
-func addQuantity(base, overhead string) resource.Quantity {
-	b := resource.MustParse(base)
-	if overhead == "" {
-		return b
-	}
-	o := resource.MustParse(overhead)
-	b.Add(o)
-	return b
-}
-
-// workerResources resolves one table's effective worker resources: the
-// table's own spec.Table.Workers.CPU/Memory when set, else the
-// pipeline-wide spec.worker default — matching CoordinatorSpec.CPU/Memory,
-// a table-level override always wins over the fallback. The default
-// carries WorkerDefaults' overhead; a table override does not declare its
-// own overhead (spec.WorkerSpec has no overhead field), so it inherits the
-// pipeline default's overhead too.
-func workerResources(cr *urutauv1alpha1.CDCPipeline, t urutauspec.Table) corev1.ResourceRequirements {
-	wd := cr.Spec.Worker
-	cpu, memory := wd.CPU, wd.Memory
-	if t.Workers != nil {
-		if t.Workers.CPU != "" {
-			cpu = t.Workers.CPU
-		}
-		if t.Workers.Memory != "" {
-			memory = t.Workers.Memory
-		}
-	}
-	return resourceRequirements(cpu, wd.CPUOverhead, memory, wd.MemoryOverhead)
-}
 
 func int32Ptr(v int32) *int32 { return &v }
 

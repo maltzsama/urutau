@@ -112,13 +112,30 @@ func scaledObject(cr *urutauv1alpha1.CDCPipeline, pipeline string, t urutauspec.
 				"metadata": map[string]any{
 					"serverAddress": promAddr,
 					"metricName":    kedaMetricName,
-					"query":         fmt.Sprintf("%s{table=\"%s\"}", kedaMetricName, t.Target),
+					"query":         kedaQuery(cr, t.Target),
 					"threshold":     threshold,
 				},
 			},
 		},
 	}
 	return obj
+}
+
+// kedaQuery scopes the backlog gauge to ONE pipeline. The metric carries only
+// a `table` label, so two pipelines writing to the same Prometheus with the
+// same target produce two series and KEDA fails with "query returned multiple
+// elements"; the coordinator's Pods are selected by name prefix and sum()
+// collapses any duplicate scrape series. The target is PromQL-quoted so a name
+// with a quote or backslash cannot inject into the query (issue #575).
+func kedaQuery(cr *urutauv1alpha1.CDCPipeline, target string) string {
+	return fmt.Sprintf("sum(%s{table=%s, pod=~%s})",
+		kedaMetricName, promQuote(target), promQuote(coordinatorName(cr)+"-.*"))
+}
+
+// promQuote renders s as a PromQL double-quoted string literal.
+func promQuote(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+	return `"` + r.Replace(s) + `"`
 }
 
 // applyScaledObject creates the ScaledObject if absent, or updates it in
