@@ -8,12 +8,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 func TestParseURI(t *testing.T) {
@@ -84,14 +85,38 @@ func TestURIAddr(t *testing.T) {
 
 func TestURIQueryDSN(t *testing.T) {
 	u := &URI{User: "root", Password: "secret", Host: "localhost", Port: "3306", DB: "mydb"}
-	want := "root:secret@tcp(localhost:3306)/mydb?parseTime=true&loc=UTC&time_zone=" +
-		url.QueryEscape("'+00:00'")
 	got, err := u.QueryDSN()
 	if err != nil {
 		t.Fatalf("QueryDSN: %v", err)
 	}
-	if got != want {
-		t.Fatalf("QueryDSN() = %q, want %q", got, want)
+	cfg, err := mysql.ParseDSN(got)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", got, err)
+	}
+	if cfg.User != "root" || cfg.Passwd != "secret" || cfg.DBName != "mydb" || cfg.Addr != "localhost:3306" {
+		t.Fatalf("round-trip = user:%q pass:%q db:%q addr:%q", cfg.User, cfg.Passwd, cfg.DBName, cfg.Addr)
+	}
+	if !cfg.ParseTime || cfg.Loc != time.UTC || cfg.Params["time_zone"] != "'+00:00'" {
+		t.Fatalf("session = parseTime:%v loc:%v params:%v", cfg.ParseTime, cfg.Loc, cfg.Params)
+	}
+}
+
+// A password carrying DSN metacharacters must survive the QueryDSN round-trip
+// (issue #573).
+func TestURIQueryDSNSpecialCharPassword(t *testing.T) {
+	for _, pw := range []string{"p@ss", "p/ss", "p:ss", "p?ss", "p@ss:/?w0rd", "p%ss"} {
+		u := &URI{User: "root", Password: pw, Host: "localhost", Port: "3306", DB: "mydb"}
+		dsn, err := u.QueryDSN()
+		if err != nil {
+			t.Fatalf("QueryDSN(%q): %v", pw, err)
+		}
+		cfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			t.Fatalf("ParseDSN(%q) = %q: %v", pw, dsn, err)
+		}
+		if cfg.Passwd != pw {
+			t.Fatalf("password round-trip = %q, want %q (dsn %q)", cfg.Passwd, pw, dsn)
+		}
 	}
 }
 
@@ -239,7 +264,11 @@ func TestParseURITimezone(t *testing.T) {
 	}
 	// The session is pinned to UTC; the operator's zone is applied in Go, so
 	// it must NOT leak into the DSN.
-	if !strings.Contains(dsn, "loc=UTC") || !strings.Contains(dsn, "time_zone=") {
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("ParseDSN(%q): %v", dsn, err)
+	}
+	if parsed.Loc != time.UTC || parsed.Params["time_zone"] != "'+00:00'" {
 		t.Fatalf("QueryDSN = %q, want a UTC-pinned session", dsn)
 	}
 	if strings.Contains(dsn, "Sao_Paulo") {
