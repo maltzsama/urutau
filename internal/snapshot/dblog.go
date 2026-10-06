@@ -39,8 +39,10 @@ func Chunks(bounds [][]any) []source.Chunk {
 type Relay interface {
 	// Release sends the Closes marker for the chunk at the given position.
 	// Must be called after caught-up; the marker's position is the safe
-	// resume point.
-	Release(table string, chunkID uint32, at position.Position)
+	// resume point. It observes ctx: if the relay or the worker has already
+	// died, the blocking handshake must unblock with ctx.Err() rather than
+	// wedge the snapshot forever (issue #551).
+	Release(ctx context.Context, table string, chunkID uint32, at position.Position) error
 	// AddWindowRows feeds the chunk SELECT result into the worker's window.
 	// The batch is already Arrow (built straight from the chunk SELECT), so no
 	// []rowchange.Change or map[string]any is materialized (#584).
@@ -50,9 +52,10 @@ type Relay interface {
 	// after AddWindowRows has populated the window. This is the ordering the
 	// window proof needs — a live event must never be deduplicated against
 	// an empty window. The distributed coordinator implements the same gate
-	// over its pump; the collapsed runner over its relay.
+	// over its pump; the collapsed runner over its relay. GateFlush observes
+	// ctx for the same reason Release does (#551).
 	GateOn(table string, chunkID uint32)
-	GateFlush()
+	GateFlush(ctx context.Context) error
 }
 
 // ChunkSource is the chunk SELECT surface the orchestrator consumes. The
@@ -177,7 +180,10 @@ func SnapshotTable(
 		}
 		// The window now holds the chunk rows: release the gated live events
 		// InWindow-tagged so they deduplicate against them.
-		relay.GateFlush()
+		if err := relay.GateFlush(ctx); err != nil {
+			reader.ClearWindow()
+			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+		}
 
 		// The caught-up proof: the reader must have provably consumed
 		// everything the source had committed by the end of the SELECT. High
@@ -194,7 +200,9 @@ func SnapshotTable(
 		}
 		at := reader.Synced()
 		reader.ClearWindow()
-		relay.Release(target, chunkID, at)
+		if err := relay.Release(ctx, target, chunkID, at); err != nil {
+			return fmt.Errorf("dblog: chunk %d: %w", chunkID, err)
+		}
 
 		// Notify caller of completed chunk so progress is persisted.
 		if cb != nil {

@@ -152,8 +152,12 @@ func TestRelayGateLiveEventsAfterWindowRows(t *testing.T) {
 	if r.gatedCount() == 0 {
 		t.Fatal("live event never reached the gate")
 	}
-	r.GateFlush()
-	r.Release("raw.orders", 0, at)
+	if err := r.GateFlush(context.Background()); err != nil {
+		t.Fatalf("GateFlush: %v", err)
+	}
+	if err := r.Release(context.Background(), "raw.orders", 0, at); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
 
 	// Wait for the pump to fully exit (it drains the gate buffer first), so
 	// closing ingest can never race an in-flight write.

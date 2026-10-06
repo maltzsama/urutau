@@ -35,9 +35,12 @@ func runSnapshotInterrupted(t *testing.T, mysql, trino *sql.DB, pipeline, server
 	t.Helper()
 	sfx := uniqueTarget("")[1:]
 	srcA, srcB := "snapint_a_"+sfx, "snapint_b_"+sfx
-	// A is large enough, with the small chunk size below, that its snapshot
-	// outlasts B's first stream commits.
-	createOrdersLike(t, mysql, srcA, 100000)
+	// A only needs a snapshot that outlasts B's first stream commits (which
+	// land within seconds), so B holds a cdc.position when its own snapshot
+	// starts. 20000 rows at the chunk size below (200 chunks, a few minutes on
+	// the race image) is ample; 100000 made A's snapshot rival the fault wait
+	// itself on a slow runner, so the fault never fired.
+	createOrdersLike(t, mysql, srcA, 20000)
 	createOrdersLike(t, mysql, srcB, 500)
 	t.Cleanup(func() {
 		if !t.Failed() {

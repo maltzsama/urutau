@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -96,14 +95,30 @@ func newRelay(ingest chan<- worker.Ingest, window *worker.Worker, onDeliver func
 	}
 }
 
-func (r *relay) Release(table string, chunkID uint32, at position.Position) {
+func (r *relay) Release(ctx context.Context, table string, chunkID uint32, at position.Position) error {
 	req := make(chan struct{})
-	r.flushReq <- req
-	<-req
-	r.ingest <- worker.Ingest{
+	// Every handshake observes ctx: if the relay goroutine has already
+	// exited, nobody closes req and the send below would block forever,
+	// wedging the boot snapshot with no error (issue #551).
+	select {
+	case r.flushReq <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-req:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case r.ingest <- worker.Ingest{
 		Table:    table,
 		Position: at.String(),
 		Win:      &rowchange.Window{WindowID: uint64(chunkID), Closes: true},
+	}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -128,13 +143,22 @@ func (r *relay) GateOn(table string, chunkID uint32) {
 // before returning, so a gated event can never be overtaken by the Closes
 // marker that Release sends afterwards. This makes the window deduplication
 // (and the droppedByWindow evidence) deterministic.
-func (r *relay) GateFlush() {
+func (r *relay) GateFlush(ctx context.Context) error {
 	r.gateMu.Lock()
 	r.flushGate = true
 	r.gateMu.Unlock()
 	req := make(chan struct{})
-	r.gateFlushReq <- req
-	<-req
+	select {
+	case r.gateFlushReq <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-req:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // deliverNote reports a batch's last position to the runner as it is read
@@ -982,99 +1006,29 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	// Snapshot phase: DBLog for tables with no committed position, or whose
 	// snapshot an earlier run left unfinished. Skip when the source does not
 	// support snapshot (e.g. Kafka).
-	if caps.Snapshot {
+	if caps.Snapshot && len(needsSnapshot) > 0 {
+		// A worker or relay failure must abort the snapshot: its blocking
+		// handshakes only observe a context, and newRunner has not yet handed
+		// workerErr/routerDone to Runner.run (issue #551).
+		sw := newSnapshotWatch(ctx, workerErr, routerDone)
+		defer sw.cancel()
 		for _, ref := range needsSnapshot {
 			bootstrapMode := spec.BootstrapSnapshot
 			if b, ok := bootstrapByTarget[ref.Target]; ok {
 				bootstrapMode = b.Mode
 			}
-
-			switch bootstrapMode {
-			case spec.Adopt, spec.AdoptVerify:
-				// Adopt: mark snapshot complete without reading data.
-				log.Info("adopt", "table", ref.Source, "mode", bootstrapMode)
-				r.emit(eventlog.KindSnapshotStarted, map[string]any{
-					"table": ref.Source, "target": ref.Target, "mode": bootstrapMode,
-				})
-				// Write complete state to Iceberg properties.
-				props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
-					State: snapshot.StateComplete,
-				})
-				if err := snk.SetProperties(ctx, ref, props); err != nil {
-					rdr.Close()
-					closeQuery()
-					closeStages()
-					closeStages()
-					closeStages()
-					return nil, fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
-				}
-				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
-				log.Info("adopt done", "table", ref.Source)
-				r.emit(eventlog.KindSnapshotDone, map[string]any{
-					"table": ref.Source, "target": ref.Target, "mode": bootstrapMode,
-				})
-			default:
-				// Snapshot: load all data from source.
-				log.Info("snapshot", "table", ref.Source)
-				r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
-				chunker, err := qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
-				if err != nil {
-					rdr.Close()
-					closeQuery()
-					closeStages()
-					closeStages()
-					closeStages()
-					return nil, err
-				}
-				// Read existing snapshot progress for resumable backfill.
-				progress, err := readSnapshotProgress(ctx, snk, ref)
-				if err != nil {
-					rdr.Close()
-					closeQuery()
-					closeStages()
-					closeStages()
-					closeStages()
-					return nil, fmt.Errorf("runner: snapshot progress %s: %w", ref.Target, err)
-				}
-				if progress.State == snapshot.StateInProgress {
-					log.Info("snapshot resuming", "table", ref.Source,
-						"pending", snapshot.PendingIDs(progress.Pending))
-				}
-				// Set initial snapshot state on the worker so batches carry it.
-				w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), progress.Pending)
-				if progress.State == snapshot.StateInProgress || heldRows[ref.Target] {
-					// The bloom guard was recreated empty: keys live events
-					// touched before the crash are unknown, so pure appends
-					// could duplicate committed rows. Every snapshot row goes
-					// through the upsert path on a resumed snapshot — and on
-					// one an earlier run left not_started after committing
-					// stream rows to the table (#428).
-					w.MarkSnapshotResumed(ref.Target)
-				}
-				if err := snapshot.SnapshotTable(ctx, chunker, rdr, router, ref.Target, snapshot.SnapshotConfig{
-					WindowTimeout: cfg.WindowTimeout,
-					CaughtUpPoll:  cfg.CaughtUpPoll,
-					Progress:      progress,
-					Schema:        w.KnownSchema(ref.Target),
-					ChunkSize:     cfg.ChunkSize,
-					Persist: func(sp snapshot.SnapshotProgress) error {
-						return snk.SetProperties(ctx, ref, snapshot.EncodeSnapshotProgress(&sp))
-					},
-				}, func(table string, completedChunkID uint32, remaining []uint32) {
-					w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)
-				}); err != nil {
-					rdr.Close()
-					closeQuery()
-					closeStages()
-					closeStages()
-					closeStages()
-					return nil, fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
-				}
-				// Snapshot complete: mark on the worker.
-				w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
-				log.Info("snapshot done", "table", ref.Source)
-				r.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source, "target": ref.Target})
+			if err := r.runSnapshot(sw.ctx, ref, bootstrapMode, qsrc, snk, rdr, router, w, cfg, heldRows, closeQuery, closeStages, log); err != nil {
+				return nil, err
 			}
+		}
+		// The snapshot phase finished: stop the failure watch and surface a
+		// worker/relay death it caught (Runner.run would otherwise block on a
+		// channel the watch already drained).
+		if err := sw.stop(); err != nil {
+			rdr.Close()
+			closeQuery()
+			closeStages()
+			return nil, err
 		}
 	}
 

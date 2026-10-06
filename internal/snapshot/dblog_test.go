@@ -60,9 +60,10 @@ type fakeRelay struct {
 	relPos  map[uint32]string
 }
 
-func (r *fakeRelay) Release(table string, id uint32, at position.Position) {
+func (r *fakeRelay) Release(_ context.Context, table string, id uint32, at position.Position) error {
 	r.ops = append(r.ops, fmt.Sprintf("release:%d", id))
 	r.relPos[id] = at.String()
+	return nil
 }
 func (r *fakeRelay) AddWindowRows(target string, id uint32, batch *dataplane.Batch) error {
 	r.ops = append(r.ops, fmt.Sprintf("add:%d:%d", id, batch.Record.NumRows()))
@@ -72,8 +73,9 @@ func (r *fakeRelay) AddWindowRows(target string, id uint32, batch *dataplane.Bat
 func (r *fakeRelay) GateOn(table string, id uint32) {
 	r.ops = append(r.ops, fmt.Sprintf("gateon:%d", id))
 }
-func (r *fakeRelay) GateFlush() {
+func (r *fakeRelay) GateFlush(_ context.Context) error {
 	r.ops = append(r.ops, "gateflush")
+	return nil
 }
 
 // ordersSchema is the canonical shape of the fake rows (id bigint, v text).
