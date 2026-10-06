@@ -54,14 +54,15 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 	tref := core.TableRef{Source: ref.Source, Target: ref.Target}
 	relay := &distributedRelay{c: c, ctx: ctx, ref: ref, owners: owners}
 	// Resume: reuse recorded bounds and pending when the previous run was
-	// interrupted mid-snapshot. The partition-layout guard of the range path
-	// is irrelevant here — chunks are not clipped per worker.
+	// interrupted mid-snapshot. Only progress THIS path recorded is safe: the
+	// range path also stamped propSnapshotPartitions and packed its pending
+	// ids (partition<<20 | index), which this path would misread as plain
+	// chunk indices, skip every chunk and mark an empty snapshot complete.
+	// resumableProgress rejects that stale shape so the snapshot runs afresh
+	// (idempotent upserts).
 	if c.snk != nil {
 		if props, err := c.snk.Properties(ctx, tref); err == nil {
-			if sp, perr := snapshot.ReadSnapshotProgress(props); perr == nil &&
-				sp.State == snapshot.StateInProgress && len(sp.Bounds) > 0 {
-				cfg.Progress = sp
-			}
+			cfg.Progress = resumableProgress(props)
 		}
 		// Persist is called once, at cold start, with the full chunk set. The
 		// list is captured here so Release can name the chunks still to do
@@ -90,6 +91,26 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 	// Seal the table's gate and release the trailing live events (ordinary
 	// changes, no window tag).
 	return c.closeWindow(ctx, ref.Target, 0)
+}
+
+// resumableProgress returns the snapshot progress this fan-out path may
+// resume, or nil when there is none or it was written by the range path.
+//
+// The range path persists pending chunk ids packed as partition<<20 | index
+// (chunkRef) and stamps propSnapshotPartitions; the fan-out uses plain chunk
+// indices, so resuming a pack-format list would make every id out of range,
+// skip every chunk, and complete a snapshot that copied nothing. Presence of
+// propSnapshotPartitions is the discriminator: it is only ever written by the
+// range path, so its absence means the progress is the fan-out's own.
+func resumableProgress(props map[string]string) *snapshot.SnapshotProgress {
+	if props[propSnapshotPartitions] != "" {
+		return nil
+	}
+	sp, err := snapshot.ReadSnapshotProgress(props)
+	if err != nil || sp.State != snapshot.StateInProgress || len(sp.Bounds) == 0 {
+		return nil
+	}
+	return sp
 }
 
 // distributedRelay adapts snapshot.SnapshotTable to the distributed
