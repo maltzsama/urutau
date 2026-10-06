@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -165,18 +166,7 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 			return nil, err
 		}
 
-		// Resolve the dest set and their types.
-		var dests []dest
-		typeOf := func(string) arrow.DataType { return arrow.BinaryTypes.String }
-		if snap != nil && len(snap.dests) > 0 {
-			dests = snap.dests
-			typeOf = snap.refType
-		} else if names := rj.refDestNames(); len(names) > 0 {
-			dests = make([]dest, len(names))
-			for i, name := range names {
-				dests[i] = dest{as: name}
-			}
-		}
+		dests, typeOf := resolveDests(rj, snap, schema, fieldIdx)
 
 		// effHit and the gathered ref columns.
 		var effHit *array.Boolean
@@ -348,6 +338,36 @@ func (s *Stage) ColumnarJoin(ctx context.Context, b *dataplane.Batch) (*dataplan
 	return b.WithRecord(filtered), nil
 }
 
+// resolveDests returns the destination columns a reference injects and a
+// function giving each one's Arrow type. A destination's type is what the
+// batch schema declares for it (AddColumns pre-declares the column so cold and
+// hot batches share one shape; a mismatch would make the worker's pending
+// concat fail, issue #564). The reference's own type is only a fallback for a
+// destination the batch does not pre-declare.
+func resolveDests(rj *refJoin, snap *snapshot, schema *arrow.Schema, fieldIdx map[string]int) ([]dest, func(string) arrow.DataType) {
+	typeOf := func(as string) arrow.DataType {
+		if k, exists := fieldIdx[as]; exists {
+			return schema.Field(k).Type
+		}
+		if snap != nil {
+			if t := snap.refType(as); t != nil {
+				return t
+			}
+		}
+		return arrow.BinaryTypes.String
+	}
+	var dests []dest
+	if snap != nil && len(snap.dests) > 0 {
+		dests = snap.dests
+	} else if names := rj.refDestNames(); len(names) > 0 {
+		dests = make([]dest, len(names))
+		for i, name := range names {
+			dests[i] = dest{as: name}
+		}
+	}
+	return dests, typeOf
+}
+
 // gatherRefColumns builds one Arrow array per destination: where effHit is
 // true, the value from the reference row keyIndex points at; elsewhere
 // null. arrow-go v18.7.0 has no index_in kernel, so this is one Go pass —
@@ -379,7 +399,7 @@ func gatherRefColumns(alloc memory.Allocator, keyArr arrow.Array, effHit *array.
 			// dest bi is refTable column bi+1.
 			col := snap.refTable.Column(bi + 1)
 			_ = d
-			if err := appendArrowValue(builders[bi], col, int(idx)); err != nil {
+			if err := appendRefValue(builders[bi], col, int(idx)); err != nil {
 				release()
 				return nil, err
 			}
@@ -392,6 +412,30 @@ func gatherRefColumns(alloc memory.Allocator, keyArr arrow.Array, effHit *array.
 		builders[i] = nil
 	}
 	return out, nil
+}
+
+// appendRefValue appends the reference's value at row into bld, which was
+// built for the destination's DECLARED type. When the reference column shares
+// that type it is copied; when it differs — the registered string contract
+// holding a non-string reference — the canonical value is rendered into the
+// declared builder (issue #564).
+func appendRefValue(bld array.Builder, src arrow.Array, row int) error {
+	if src.IsNull(row) {
+		bld.AppendNull()
+		return nil
+	}
+	if arrow.TypeEqual(bld.Type(), src.DataType()) {
+		return appendArrowValue(bld, src, row)
+	}
+	if sb, ok := bld.(*array.StringBuilder); ok {
+		s, err := core.StringifyScalar(readArrowValue(src, row))
+		if err != nil {
+			return err
+		}
+		sb.Append(s)
+		return nil
+	}
+	return fmt.Errorf("enrich: destination column %s cannot hold reference column %s", bld.Type(), src.DataType())
 }
 
 // appendArrowValue copies row `row` of `src` into `bld` — same type on both

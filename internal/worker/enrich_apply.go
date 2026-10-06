@@ -7,6 +7,24 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 )
 
+// enrichWindowRows runs a snapshot window's batch through the enricher before
+// it is buffered, so the backfill carries the same reference columns the live
+// stream does (issue #564). It owns cb; a nil result means the join dropped
+// every row.
+func (p *tablePipeline) enrichWindowRows(ctx context.Context, cb *dataplane.Batch, bufferEmpty func(*dataplane.Batch) error) (*dataplane.Batch, error) {
+	if cb == nil || p.enricher == nil {
+		return cb, nil
+	}
+	enriched, dropped, err := p.applyEnrich(ctx, cb, int(cb.Record.NumRows()), bufferEmpty)
+	if err != nil {
+		return nil, err
+	}
+	if dropped {
+		return nil, nil
+	}
+	return enriched, nil
+}
+
 // applyEnrich runs a batch through the pipeline's enricher. It owns the input
 // batch: it releases it, returning the enriched batch, or nil with
 // dropped=true when the join dropped every row. In that case it first calls
