@@ -154,13 +154,15 @@ func (r *distributedRelay) GateOn(table string, chunkID uint32) {
 
 // GateFlush releases the events held since GateOn, InWindow-tagged for the
 // window, after the window's rows were enqueued by AddWindowRows.
-func (r *distributedRelay) GateFlush() {
+func (r *distributedRelay) GateFlush(ctx context.Context) error {
 	if r.err != nil {
-		return
+		return r.err
 	}
-	if err := r.c.flushWindow(r.ctx, r.ref.Target, 0, r.windowID); err != nil {
+	if err := r.c.flushWindow(ctx, r.ref.Target, 0, r.windowID); err != nil {
 		r.fail(err)
+		return err
 	}
+	return nil
 }
 
 // AddWindowRows splits the chunk's rows by owner and queues each owner's
@@ -228,18 +230,20 @@ func (r *distributedRelay) fanOut(target string, chunkID uint32, batch *dataplan
 // as one staged cycle spanning the owners (a table with no rows for an owner
 // still delivers an empty cycle member), so the coordinator commits them in
 // the table's send order.
-func (r *distributedRelay) Release(table string, chunkID uint32, at position.Position) {
+func (r *distributedRelay) Release(ctx context.Context, table string, chunkID uint32, at position.Position) error {
 	if r.err != nil {
-		return
+		return r.err
 	}
 	// The chunks still to do AFTER this one: the worker commits this list
 	// with the window's rows, so a crash cannot resume past a chunk whose
 	// rows were never committed.
 	remaining := snapshot.RemoveFromPending(r.pending, chunkID)
 	r.pending = remaining
-	if err := r.c.closeFanoutChunk(r.ctx, r.ref, r.owners, at, uint64(chunkID), remaining); err != nil {
+	if err := r.c.closeFanoutChunk(ctx, r.ref, r.owners, at, uint64(chunkID), remaining); err != nil {
 		r.fail(err)
+		return err
 	}
+	return nil
 }
 
 // closeFanoutChunk queues a Closes marker for one chunk on every owner. The
