@@ -25,7 +25,7 @@ func newCASKV() *casKV {
 }
 
 func (c *casKV) getCAS(ctx context.Context, id string, out any) (bool, uint64, error) {
-	ok, err := c.fakeKV.get(ctx, id, out)
+	ok, err := c.get(ctx, id, out)
 	if err != nil || !ok {
 		return ok, 0, err
 	}
@@ -40,7 +40,7 @@ func (c *casKV) replaceCAS(ctx context.Context, id string, doc any, cas uint64) 
 	if c.cas[id] != cas {
 		return errCASMismatch
 	}
-	if err := c.fakeKV.upsert(ctx, id, doc); err != nil {
+	if err := c.upsert(ctx, id, doc); err != nil {
 		return err
 	}
 	c.cas[id]++
@@ -48,7 +48,7 @@ func (c *casKV) replaceCAS(ctx context.Context, id string, doc any, cas uint64) 
 }
 
 func concurrentControlWrite(kv *casKV, props map[string]string) {
-	_ = kv.fakeKV.upsert(context.Background(), controlKey, &controlDoc{Properties: props})
+	_ = kv.upsert(context.Background(), controlKey, &controlDoc{Properties: props})
 	kv.cas[controlKey]++
 }
 
@@ -86,7 +86,7 @@ func TestSetPropertiesCASKeepsConcurrentPosition(t *testing.T) {
 	kv := newCASKV()
 	kv.onFirstWrite = func() {
 		concurrentControlWrite(kv, nil) // a bare concurrent write bumps the CAS
-		_ = kv.fakeKV.upsert(context.Background(), controlKey,
+		_ = kv.upsert(context.Background(), controlKey,
 			&controlDoc{Position: "g1:99"})
 	}
 	if err := setProperties(context.Background(), kv, core.TableRef{Target: "raw.t"},
