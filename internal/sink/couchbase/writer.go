@@ -41,6 +41,67 @@ type txRunner interface {
 	run(ctx context.Context, fn func(tx kvStore) error) error
 }
 
+// errCASMismatch is a lost optimistic-concurrency race: the control document
+// changed between the read and the write, so the caller retries.
+var errCASMismatch = errors.New("couchbase: control document changed concurrently")
+
+// maxControlCASRetries bounds the optimistic retry loop.
+const maxControlCASRetries = 16
+
+// casStore is the optimistic-concurrency surface the control document needs
+// in fast mode. It is optional: a transaction (txAttempt) serializes its own
+// read-modify-write, so it does not implement it.
+type casStore interface {
+	// getCAS reads id and returns its CAS token; found=false when the
+	// document does not exist (cas is then 0).
+	getCAS(ctx context.Context, id string, out any) (found bool, cas uint64, err error)
+	// replaceCAS writes doc only if the document still has the given CAS
+	// (0 = insert); a concurrent change returns errCASMismatch.
+	replaceCAS(ctx context.Context, id string, doc any, cas uint64) error
+}
+
+// mergeControl read-modify-writes the control document. When the store
+// supports CAS (fast mode) it retries a lost race, so the worker's commit and
+// the coordinator's snapshot bookkeeping cannot overwrite each other (issue
+// #566). Otherwise (a transaction) the read-modify-write is already
+// serialized. A nil result from apply writes nothing.
+func mergeControl(ctx context.Context, kv kvStore, apply func(prev *controlDoc) *controlDoc) error {
+	if cs, ok := kv.(casStore); ok {
+		for attempt := 0; attempt < maxControlCASRetries; attempt++ {
+			var prev controlDoc
+			found, cas, err := cs.getCAS(ctx, controlKey, &prev)
+			if err != nil {
+				return err
+			}
+			var p *controlDoc
+			if found {
+				p = &prev
+			}
+			next := apply(p)
+			if next == nil {
+				return nil
+			}
+			if err := cs.replaceCAS(ctx, controlKey, next, cas); err != nil {
+				if errors.Is(err, errCASMismatch) {
+					continue // someone else wrote; re-read and re-merge
+				}
+				return err
+			}
+			return nil
+		}
+		return fmt.Errorf("couchbase: control document: %d CAS retries exhausted (heavy contention)", maxControlCASRetries)
+	}
+	prev, err := readControl(ctx, kv)
+	if err != nil {
+		return err
+	}
+	next := apply(prev)
+	if next == nil {
+		return nil
+	}
+	return kv.upsert(ctx, controlKey, next)
+}
+
 // tablePlan is a table's resolved write plan: the schema EnsureTable
 // resolved (metadata columns included — the writer walks it to know WHAT
 // to project, the meta map tells it WHERE each lands), plus the cast plan
@@ -138,11 +199,12 @@ func (w *tableWriter) commitFast(ctx context.Context, r *transport.BatchReader, 
 	if err := applyData(ctx, w.kv, w.plan, r); err != nil {
 		return err
 	}
-	prev, err := readControl(ctx, w.kv)
-	if err != nil {
-		return err
-	}
-	return w.kv.upsert(ctx, controlKey, controlWrite(prev, info, w.now()))
+	// The commit path and the coordinator's snapshot bookkeeping both write
+	// this document; the CAS loop keeps one from discarding the other's
+	// position or snapshot fields (issue #566).
+	return mergeControl(ctx, w.kv, func(prev *controlDoc) *controlDoc {
+		return controlWrite(prev, info, w.now())
+	})
 }
 
 // commitAtomic runs the whole batch — data documents AND the control

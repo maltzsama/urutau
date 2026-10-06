@@ -154,44 +154,48 @@ func seedPositions(ctx context.Context, kv kvStore, sourceKind string, owners []
 	if len(owners) < 2 {
 		return nil
 	}
-	doc, err := readControl(ctx, kv)
+	var seedErr error
+	err := mergeControl(ctx, kv, func(doc *controlDoc) *controlDoc {
+		if doc == nil || len(doc.Positions) == 0 {
+			return nil // fresh table: nothing to seed
+		}
+		parsed := make([]position.Position, 0, len(doc.Positions))
+		for _, p := range doc.Positions {
+			pp, perr := position.Parse(sourceKind, p)
+			if perr != nil {
+				seedErr = fmt.Errorf("couchbase: seed: %w", perr)
+				return nil
+			}
+			parsed = append(parsed, pp)
+		}
+		best, merr := position.MinSafe(parsed)
+		if merr != nil {
+			seedErr = merr
+			return nil
+		}
+		baseline := best.String()
+		merged := make(map[string]string, len(doc.Positions)+len(owners))
+		for o, p := range doc.Positions {
+			merged[o] = p
+		}
+		changed := false
+		for _, owner := range owners {
+			if _, ok := merged[owner]; ok {
+				continue
+			}
+			merged[owner] = baseline
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		doc.Positions = merged
+		return doc
+	})
 	if err != nil {
 		return err
 	}
-	if doc == nil || len(doc.Positions) == 0 {
-		return nil // fresh table: nothing to seed
-	}
-	parsed := make([]position.Position, 0, len(doc.Positions))
-	for _, p := range doc.Positions {
-		pp, err := position.Parse(sourceKind, p)
-		if err != nil {
-			return fmt.Errorf("couchbase: seed: %w", err)
-		}
-		parsed = append(parsed, pp)
-	}
-	best, err := position.MinSafe(parsed)
-	if err != nil {
-		return err
-	}
-	baseline := best.String()
-
-	merged := make(map[string]string, len(doc.Positions)+len(owners))
-	for o, p := range doc.Positions {
-		merged[o] = p
-	}
-	changed := false
-	for _, owner := range owners {
-		if _, ok := merged[owner]; ok {
-			continue
-		}
-		merged[owner] = baseline
-		changed = true
-	}
-	if !changed {
-		return nil
-	}
-	doc.Positions = merged
-	return kv.upsert(ctx, controlKey, doc)
+	return seedErr
 }
 
 // propertiesOf reads the property map (snapshot progress resume). Missing
@@ -208,10 +212,12 @@ func propertiesOf(ctx context.Context, kv kvStore) (map[string]string, error) {
 	return doc.Properties, nil
 }
 
-// setProperties merges orchestrator bookkeeping into the control document
-// (read-modify-write). The snapshot orchestrator is the single writer of
-// properties per table, so no CAS loop is needed; the writes are durable
-// at the sink's configured durability level.
+// setProperties merges orchestrator bookkeeping into the control document.
+// The control document is shared with the commit path, so this merges with
+// mergeControl's CAS loop when the store supports it — the comment that
+// "the snapshot orchestrator is the single writer" does not hold: a worker
+// commit and a snapshot bookkeeping call race on the same document in fast
+// mode (issue #566).
 func setProperties(ctx context.Context, kv kvStore, ref core.TableRef, props map[string]string, now func() time.Time) error {
 	if len(props) == 0 {
 		return nil
@@ -219,20 +225,18 @@ func setProperties(ctx context.Context, kv kvStore, ref core.TableRef, props map
 	if ref.Target == "" {
 		return errors.New("couchbase: properties: target is required")
 	}
-	prev, err := readControl(ctx, kv)
-	if err != nil {
-		return err
-	}
-	ctrl := &controlDoc{Properties: map[string]string{}}
-	if prev != nil {
-		ctrl = prev
-		if ctrl.Properties == nil {
-			ctrl.Properties = map[string]string{}
+	return mergeControl(ctx, kv, func(prev *controlDoc) *controlDoc {
+		ctrl := &controlDoc{Properties: map[string]string{}}
+		if prev != nil {
+			ctrl = prev
+			if ctrl.Properties == nil {
+				ctrl.Properties = map[string]string{}
+			}
 		}
-	}
-	for k, v := range props {
-		ctrl.Properties[k] = v
-	}
-	ctrl.UpdatedAt = now()
-	return kv.upsert(ctx, controlKey, ctrl)
+		for k, v := range props {
+			ctrl.Properties[k] = v
+		}
+		ctrl.UpdatedAt = now()
+		return ctrl
+	})
 }
