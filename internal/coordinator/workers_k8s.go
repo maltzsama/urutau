@@ -329,7 +329,12 @@ func maintenanceWorkerPod(name, namespace string, owner metav1.OwnerReference, t
 	}
 	tmpl.Labels["urutau.io/worker"] = name
 	tmpl.Spec.RestartPolicy = corev1.RestartPolicyNever
+	// Only the worker container runs urutau-worker; an injected sidecar must
+	// not receive the worker flags (issue #553).
 	for i := range tmpl.Spec.Containers {
+		if tmpl.Spec.Containers[i].Name != workerContainerName {
+			continue
+		}
 		tmpl.Spec.Containers[i].Args = append(tmpl.Spec.Containers[i].Args, "--maintenance", "--name", name)
 	}
 

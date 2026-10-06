@@ -155,6 +155,13 @@ type podTermination struct {
 	message  string
 }
 
+// workerContainerName is the worker container's name in the Pod template the
+// operator renders (internal/operator). The kubelet sorts containerStatuses
+// by container name, so an injected sidecar (istio-proxy, linkerd-proxy) can
+// precede the worker; crash detection must select the worker's status by name,
+// never by index (issue #553).
+const workerContainerName = "worker"
+
 // networkExitPrefix starts the termination message of a worker that exited
 // because it lost the coordinator (cmd/worker writes it): not a crash.
 const networkExitPrefix = "network: "
@@ -188,10 +195,19 @@ func (c *Coordinator) k8sTermination(worker string) (podTermination, bool) {
 		return podTermination{}, false
 	}
 	pod, err := cs.CoreV1().Pods(ns).Get(ctx, worker, metav1.GetOptions{})
-	if err != nil || len(pod.Status.ContainerStatuses) == 0 {
+	if err != nil {
 		return podTermination{}, false
 	}
-	st := pod.Status.ContainerStatuses[0]
+	var st *corev1.ContainerStatus
+	for i := range pod.Status.ContainerStatuses {
+		if pod.Status.ContainerStatuses[i].Name == workerContainerName {
+			st = &pod.Status.ContainerStatuses[i]
+			break
+		}
+	}
+	if st == nil {
+		return podTermination{}, false
+	}
 	t := podTermination{podUID: string(pod.UID), restarts: st.RestartCount}
 	if last := st.LastTerminationState.Terminated; last != nil {
 		t.reason, t.exitCode, t.message = last.Reason, last.ExitCode, last.Message
