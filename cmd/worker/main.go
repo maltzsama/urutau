@@ -150,7 +150,7 @@ func runCmd() *cobra.Command {
 	fl.Int64Var(&f.maxBytesMi, "max-bytes-mi", 32, "flush the batch once its buffered rows hold this many MiB")
 	fl.DurationVar(&f.maxInterval, "max-interval", 2*time.Second, "flush cadence")
 	fl.StringVar(&f.metricsAddr, "metrics-addr", "", "serve /metrics on this address (optional)")
-	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
+	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so, CGO build only); can be repeated for multiple plugins")
 	fl.StringVar(&f.tlsCert, "tls-cert", "", "client certificate for the control plane (mTLS; all three TLS flags required)")
 	fl.StringVar(&f.tlsKey, "tls-key", "", "client private key for the control plane (mTLS)")
 	fl.StringVar(&f.tlsCA, "tls-ca", "", "CA that signs the coordinator's server cert (mTLS)")

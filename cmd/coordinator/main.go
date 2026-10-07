@@ -155,7 +155,7 @@ func runCmd() *cobra.Command {
 	fl.StringVar(&f.checkpointURI, "checkpoint", "", "s3://<bucket>/<prefix> async position manifests (optional)")
 	fl.IntVar(&f.checkpointSec, "checkpoint-interval", 10, "checkpoint write interval (seconds)")
 	// process
-	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
+	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so, CGO build only); can be repeated for multiple plugins")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log level: debug|info|warn|error")
 	fl.StringVar(&f.logFormat, "log-format", "text", "log format: text|json")
 	return cmd

@@ -72,7 +72,7 @@ func TestWriterCacheIsConcurrencySafe(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 
-			w, err := cache.writerFor(context.Background(), opener, "raw.orders")
+			w, err := cache.writerFor(context.Background(), opener, core.TableRef{Target: "raw.orders"})
 			if err != nil {
 				t.Errorf("writerFor: %v", err)
 
@@ -112,7 +112,7 @@ func TestWriterCacheCloseAllRacesWriterFor(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 
-			w, err := cache.writerFor(context.Background(), opener, "raw.orders")
+			w, err := cache.writerFor(context.Background(), opener, core.TableRef{Target: "raw.orders"})
 			if err != nil {
 				if !errors.Is(err, errWriterCacheClosed) {
 					t.Errorf("writerFor: %v", err)
@@ -157,7 +157,7 @@ func TestWriterCacheCloseAllRacesWriterFor(t *testing.T) {
 func TestWriterCacheSerializesPerTableCommits(t *testing.T) {
 	cache := newCache()
 
-	w, err := cache.writerFor(context.Background(), &fakeOpener{}, "raw.orders")
+	w, err := cache.writerFor(context.Background(), &fakeOpener{}, core.TableRef{Target: "raw.orders"})
 	if err != nil {
 		t.Fatalf("writerFor: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestWriterCacheSerializesPerTableCommits(t *testing.T) {
 func TestWriterCacheClosesAndRejectsAfterShutdown(t *testing.T) {
 	cache := newCache()
 
-	w, err := cache.writerFor(context.Background(), &fakeOpener{}, "raw.orders")
+	w, err := cache.writerFor(context.Background(), &fakeOpener{}, core.TableRef{Target: "raw.orders"})
 	if err != nil {
 		t.Fatalf("writerFor: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestWriterCacheClosesAndRejectsAfterShutdown(t *testing.T) {
 	cache.closeAll()
 	cache.closeAll() // idempotent
 
-	if _, err := cache.writerFor(context.Background(), &fakeOpener{}, "raw.orders"); !errors.Is(err, errWriterCacheClosed) {
+	if _, err := cache.writerFor(context.Background(), &fakeOpener{}, core.TableRef{Target: "raw.orders"}); !errors.Is(err, errWriterCacheClosed) {
 		t.Fatalf("writerFor after shutdown = %v, want errWriterCacheClosed", err)
 	}
 

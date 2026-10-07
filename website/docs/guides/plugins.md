@@ -58,6 +58,13 @@ exists for one case: a driver you're building **in Go**, deployed
 another language and don't need the process-level crash containment a
 subprocess plugin buys you.
 
+> **This path needs a CGO-enabled build.** Go's `plugin` package is
+> `CGO_ENABLED=1` only; the released static binaries are built with
+> `CGO_ENABLED=0`, where `plugin.Open` fails with `plugin.Open: not
+> implemented`. On a stock deployment use a **subprocess** plugin (the
+> shape at the top of this page). `--plugin` works only when you build
+> Urutau yourself with CGO enabled.
+
 It is not a second, lighter contract. Every `.so`-registered driver is
 wrapped in an **in-process Arrow Flight server** (`internal/plugin/
 flightwrap`) and served back through the same Flight client adapter a
@@ -98,7 +105,7 @@ unloading once loaded.
 
 | Error | Cause | Fix |
 |---|---|---|
-| `plugin.Open: not implemented` | platform not supported | use Linux or macOS |
+| `plugin.Open: not implemented` | no CGO, or an unsupported platform | build Urutau with `CGO_ENABLED=1` on Linux or macOS, or use a subprocess plugin |
 | `plugin: version mismatch` | Go version differs | recompile with the same Go version as Urutau |
 | `plugin: not a plugin file` | missing `-buildmode=plugin` | rebuild with that flag |
 | `missing exported Init` | no `Init()` func | add `func Init() error` |

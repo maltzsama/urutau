@@ -36,6 +36,12 @@ type SinkServer struct {
 	snk     sink.Sink
 	alloc   memory.Allocator
 	writers writerCache
+
+	// refs holds the schema/key each table was announced with via
+	// urutau.ensure_table, so a DoPut opens its writer with the primary key
+	// instead of a bare target (issue #569).
+	refsMu sync.Mutex
+	refs   map[string]core.TableRef
 }
 
 // NewSinkServer wraps snk for in-process Flight serving.
@@ -44,7 +50,18 @@ func NewSinkServer(snk sink.Sink) *SinkServer {
 		snk:     snk,
 		alloc:   memory.NewGoAllocator(),
 		writers: writerCache{tables: map[string]*tableWriter{}},
+		refs:    map[string]core.TableRef{},
 	}
+}
+
+// refFor returns the ref a table was announced with, or a bare target.
+func (s *SinkServer) refFor(table string) core.TableRef {
+	s.refsMu.Lock()
+	defer s.refsMu.Unlock()
+	if ref, ok := s.refs[table]; ok {
+		return ref
+	}
+	return core.TableRef{Target: table}
 }
 
 func (s *SinkServer) Handshake(stream flight.FlightService_HandshakeServer) error {
@@ -55,7 +72,7 @@ func (s *SinkServer) Handshake(stream flight.FlightService_HandshakeServer) erro
 }
 
 func (s *SinkServer) ListActions(_ *flight.Empty, stream flight.FlightService_ListActionsServer) error {
-	for _, t := range []string{"urutau.heartbeat", "urutau.status", "urutau.list_tables", "urutau.flush", "urutau.shutdown"} {
+	for _, t := range []string{"urutau.heartbeat", "urutau.status", "urutau.list_tables", "urutau.flush", "urutau.shutdown", "urutau.ensure_table", "urutau.position"} {
 		if err := stream.Send(&flight.ActionType{Type: t}); err != nil {
 			return err
 		}
@@ -77,6 +94,34 @@ func (s *SinkServer) DoAction(action *flight.Action, stream flight.FlightService
 		// The wrapped sink.Sink commits durably inside TableWriter.Commit
 		// (Iceberg and friends have no separate flush step); nothing to do.
 		return stream.Send(&flight.Result{})
+	case "urutau.ensure_table":
+		var req contract.EnsureTableRequest
+		if err := json.Unmarshal(action.Body, &req); err != nil {
+			return status.Errorf(codes.InvalidArgument, "flightserver: ensure_table: %v", err)
+		}
+		mode := dataplane.UpsertMode
+		if req.Mode == "append" {
+			mode = dataplane.AppendMode
+		}
+		ref := core.TableRef{Target: req.Table, PrimaryKey: req.PrimaryKey}
+		if err := s.snk.EnsureTable(stream.Context(), ref, req.Schema, req.PartitionBy, core.CastPolicy{}, mode); err != nil {
+			return status.Errorf(codes.Internal, "flightserver: ensure_table %s: %v", req.Table, err)
+		}
+		s.refsMu.Lock()
+		s.refs[req.Table] = ref
+		s.refsMu.Unlock()
+		return stream.Send(&flight.Result{})
+	case "urutau.position":
+		var req contract.PositionRequest
+		if err := json.Unmarshal(action.Body, &req); err != nil {
+			return status.Errorf(codes.InvalidArgument, "flightserver: position: %v", err)
+		}
+		pos, err := s.snk.Position(stream.Context(), s.refFor(req.Table))
+		if err != nil {
+			return status.Errorf(codes.Internal, "flightserver: position %s: %v", req.Table, err)
+		}
+		b, _ := json.Marshal(contract.PositionResponse{Position: pos})
+		return stream.Send(&flight.Result{Body: b})
 	case "urutau.shutdown":
 		s.writers.closeAll()
 		return stream.Send(&flight.Result{})
@@ -107,7 +152,7 @@ func (s *SinkServer) DoPut(stream flight.FlightService_DoPutServer) error {
 		return status.Error(codes.InvalidArgument, "flightserver: doput descriptor missing table")
 	}
 
-	w, err := s.writers.writerFor(stream.Context(), s.snk, req.Table)
+	w, err := s.writers.writerFor(stream.Context(), s.snk, s.refFor(req.Table))
 	if err != nil {
 		return status.Errorf(codes.Internal, "flightserver: writer %s: %v", req.Table, err)
 	}
@@ -186,21 +231,19 @@ type tableOpener interface {
 // across it would stall every other table's writerFor (and closeAll) behind
 // one slow open. A lost open race is closed and the winner returned, so every
 // caller still observes exactly one committer per table.
-func (c *writerCache) writerFor(ctx context.Context, opener tableOpener, table string) (sink.TableWriter, error) {
+func (c *writerCache) writerFor(ctx context.Context, opener tableOpener, ref core.TableRef) (sink.TableWriter, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 
 		return nil, errWriterCacheClosed
 	}
-	if tw, ok := c.tables[table]; ok {
+	if tw, ok := c.tables[ref.Target]; ok {
 		c.mu.Unlock()
 
 		return tw, nil
 	}
 	c.mu.Unlock()
-
-	ref := core.TableRef{Target: table}
 
 	created, err := opener.Writer(ctx, ref, core.CastPolicy{}, nil)
 	if err != nil {
@@ -216,13 +259,13 @@ func (c *writerCache) writerFor(ctx context.Context, opener tableOpener, table s
 
 		return nil, errWriterCacheClosed
 	}
-	if existing, ok := c.tables[table]; ok {
+	if existing, ok := c.tables[ref.Target]; ok {
 		c.mu.Unlock()
 		_ = tw.Close()
 
 		return existing, nil
 	}
-	c.tables[table] = tw
+	c.tables[ref.Target] = tw
 	c.mu.Unlock()
 
 	return tw, nil

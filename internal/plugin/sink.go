@@ -11,6 +11,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/plugin/client"
@@ -61,11 +64,31 @@ func (a *SinkAdapter) use() *client.Client {
 	return a.clients()
 }
 
-// EnsureTable delegates to the plugin via Flight action. The plugin
-// manages its own schema internally.
-func (a *SinkAdapter) EnsureTable(ctx context.Context, ref core.TableRef, _ core.Schema, _ []string, _ core.CastPolicy, _ dataplane.WriteMode) error {
-	// No-op for now — the plugin handles its own schema.
-	return nil
+// EnsureTable hands the plugin sink the table's canonical schema, primary key
+// and write mode, so it stores the real type shape and dedup key instead of
+// re-inferring them from stringified rows (issue #569). A plugin that does not
+// implement the action (an older binary) is left to manage its own schema.
+func (a *SinkAdapter) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, _ core.CastPolicy, mode dataplane.WriteMode) error {
+	c := a.use()
+	if c == nil {
+		return errors.New("plugin sink: not connected")
+	}
+	modeStr := "upsert"
+	if mode == dataplane.AppendMode {
+		modeStr = "append"
+	}
+	err := c.EnsureTable(ctx, contract.EnsureTableRequest{
+		Table:       ref.Target,
+		Schema:      schema,
+		PrimaryKey:  ref.PrimaryKey,
+		PartitionBy: partitionBy,
+		Mode:        modeStr,
+	})
+	if err != nil && status.Code(err) == codes.Unimplemented {
+		a.logger.Warn("plugin sink does not implement urutau.ensure_table; schema not sent", "table", ref.Target)
+		return nil
+	}
+	return err
 }
 
 // Writer returns a table writer that streams records via DoPut.
@@ -79,9 +102,23 @@ func (a *SinkAdapter) Writer(_ context.Context, ref core.TableRef, _ core.CastPo
 	}, nil
 }
 
-// Position returns empty — external plugins manage their own positions.
-func (a *SinkAdapter) Position(_ context.Context, _ core.TableRef) (string, error) {
-	return "", nil
+// Position reads the plugin sink's committed position for a table, so a
+// restart resumes instead of re-reading from the beginning (issue #569). A
+// plugin that does not implement the action, or one not connected yet, reads as
+// empty.
+func (a *SinkAdapter) Position(ctx context.Context, ref core.TableRef) (string, error) {
+	c := a.use()
+	if c == nil {
+		return "", nil
+	}
+	pos, err := c.Position(ctx, ref.Target)
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return "", nil
+		}
+		return "", err
+	}
+	return pos, nil
 }
 
 // SetProperties is a no-op for external plugins.
@@ -216,8 +253,11 @@ func recordsFromReader(r *transport.BatchReader, alloc memory.Allocator) []arrow
 
 	for i := range n {
 		op := "c"
-		if r.Op(i) == rowchange.OpDelete {
+		switch r.Op(i) {
+		case rowchange.OpDelete:
 			op = "d"
+		case rowchange.OpUpdate:
+			op = "u"
 		}
 		bb.Field(0).(*array.StringBuilder).Append(op)
 		for ci, name := range colNames {
