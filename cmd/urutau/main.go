@@ -195,12 +195,12 @@ func runExternalPlugins(ctx context.Context, s *spec.Spec, cfg runner.Config, so
 		// A plugin source owns its chunking; the registry ceiling (which
 		// bounds built-in chunk SELECTs) does not apply.
 		cfg.MaxParallelChunks = 0
-		stage, err := spawnPluginStage(ctx, sourceBin, token, pipeline.StageSource, logger)
+		sup, stopSource, err := spawnPluginStage(ctx, sourceBin, token, pipeline.StageSource, logger)
 		if err != nil {
 			return err
 		}
-		closers = append(closers, func() { _ = stage.Stop(context.Background()) })
-		src = plugin.NewSourceAdapter(stage.Client, s.Source, logger)
+		closers = append(closers, stopSource)
+		src = plugin.NewSourceAdapter(sup.Client, s.Source, logger)
 	} else {
 		if err := driver.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
 			return fmt.Errorf("runner: %w", err)
@@ -219,12 +219,12 @@ func runExternalPlugins(ctx context.Context, s *spec.Spec, cfg runner.Config, so
 
 	// Sink side: plugin adapter or registry driver.
 	if sinkBin != "" {
-		stage, err := spawnPluginStage(ctx, sinkBin, token, pipeline.StageSink, logger)
+		sup, stopSink, err := spawnPluginStage(ctx, sinkBin, token, pipeline.StageSink, logger)
 		if err != nil {
 			return err
 		}
-		closers = append(closers, func() { _ = stage.Stop(context.Background()) })
-		snk = plugin.NewSinkAdapter(stage.Client, logger)
+		closers = append(closers, stopSink)
+		snk = plugin.NewSinkAdapter(sup.Client, logger)
 	} else {
 		regSnk, err := driver.OpenSink(ctx, s)
 		if err != nil {
@@ -249,17 +249,21 @@ func runExternalPlugins(ctx context.Context, s *spec.Spec, cfg runner.Config, so
 
 // spawnPluginStage runs one plugin stage via its supervisor and waits for
 // the Flight client to be connected. The supervisor keeps the process alive
-// (restart with backoff) until ctx ends.
-func spawnPluginStage(ctx context.Context, bin, token string, kind pipeline.StageKind, logger *slog.Logger) (*pipeline.Stage, error) {
+// (restart with backoff) until the returned stop func cancels its context. It
+// returns the supervisor, not its current stage, so the caller's adapter can
+// resolve the CLIENT through sup.Client and follow a restart instead of
+// pinning a dead one (issue #570). WorkDir is left empty: each stage gets its
+// own temp socket, so an external source and sink never collide.
+func spawnPluginStage(ctx context.Context, bin, token string, kind pipeline.StageKind, logger *slog.Logger) (*supervisor.StageSupervisor, context.CancelFunc, error) {
+	stageCtx, cancel := context.WithCancel(ctx)
 	sup := supervisor.NewStageSupervisor(pipeline.StageConfig{
-		Kind:    kind,
-		Bin:     bin,
-		Token:   token,
-		WorkDir: ".", // the plugin inherits the parent process's working directory
-		Logger:  logger,
+		Kind:   kind,
+		Bin:    bin,
+		Token:  token,
+		Logger: logger,
 	}, logger)
 	go func() {
-		if err := sup.Run(ctx); err != nil {
+		if err := sup.Run(stageCtx); err != nil {
 			logger.Error("plugin stage stopped", "err", err)
 		}
 	}()
@@ -270,16 +274,19 @@ func spawnPluginStage(ctx context.Context, bin, token string, kind pipeline.Stag
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			cancel()
+			return nil, cancel, ctx.Err()
 		case <-sup.Dead():
-			return nil, fmt.Errorf("plugin stage %s: died: %v", bin, sup.DeadErr())
+			cancel()
+			return nil, cancel, fmt.Errorf("plugin stage %s: died: %v", bin, sup.DeadErr())
 		case <-ticker.C:
 		}
 		if st := sup.Stage(); st != nil && st.Client != nil {
-			return st, nil
+			return sup, cancel, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("plugin stage %s: not ready within 30s", bin)
+			cancel()
+			return nil, cancel, fmt.Errorf("plugin stage %s: not ready within 30s", bin)
 		}
 	}
 }

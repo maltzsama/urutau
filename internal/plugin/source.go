@@ -6,7 +6,6 @@ package plugin
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +34,13 @@ import (
 // when it closes. flightwrap passes one; the subprocess path passes none — the
 // stage supervisor owns that process (issue #496).
 type ServerStopper interface{ Stop() }
+
+// ClientFunc resolves the plugin's CURRENT Flight client, or nil when it is
+// not connected. A subprocess plugin can be restarted by its supervisor, so an
+// adapter must resolve the client per use instead of pinning the one that was
+// live when it was built; an in-process plugin (flightwrap) passes a constant
+// (issue #570).
+type ClientFunc func() *client.Client
 
 // StringPosition is an opaque position backed by a base64 offset string.
 // External plugins use opaque offsets; the runner never inspects them.
@@ -70,10 +76,10 @@ func (p StringPosition) Contains(other position.Position) bool {
 // Arrow CDC record stream (contract §8.1) straight into the flat urutau wire
 // schema.
 type SourceAdapter struct {
-	client *client.Client
-	spec   spec.Source
-	logger *slog.Logger
-	alloc  memory.Allocator
+	clients ClientFunc
+	spec    spec.Source
+	logger  *slog.Logger
+	alloc   memory.Allocator
 	// server is the in-process Flight server this adapter owns (flightwrap);
 	// nil for a subprocess plugin, whose supervisor owns the process.
 	server    ServerStopper
@@ -84,15 +90,15 @@ type SourceAdapter struct {
 // NewSourceAdapter creates a source adapter over a connected Flight client.
 // An optional ServerStopper is the in-process server flightwrap started, which
 // Close stops (issue #496).
-func NewSourceAdapter(c *client.Client, src spec.Source, logger *slog.Logger, servers ...ServerStopper) *SourceAdapter {
+func NewSourceAdapter(clients ClientFunc, src spec.Source, logger *slog.Logger, servers ...ServerStopper) *SourceAdapter {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	a := &SourceAdapter{
-		client: c,
-		spec:   src,
-		logger: logger,
-		alloc:  memory.NewGoAllocator(),
+		clients: clients,
+		spec:    src,
+		logger:  logger,
+		alloc:   memory.NewGoAllocator(),
 	}
 	if len(servers) > 0 {
 		a.server = servers[0]
@@ -100,12 +106,22 @@ func NewSourceAdapter(c *client.Client, src spec.Source, logger *slog.Logger, se
 	return a
 }
 
+// use resolves the adapter's current client, or nil when the plugin is down.
+func (a *SourceAdapter) use() *client.Client {
+	if a.clients == nil {
+		return nil
+	}
+	return a.clients()
+}
+
 // Close releases the adapter: it closes the Flight client and stops the
 // in-process server flightwrap started. Idempotent, so a reader's Close and a
 // direct caller may both call it (issue #496).
 func (a *SourceAdapter) Close() error {
 	a.closeOnce.Do(func() {
-		a.closeErr = a.client.Close()
+		if c := a.use(); c != nil {
+			a.closeErr = c.Close()
+		}
 		if a.server != nil {
 			a.server.Stop()
 		}
@@ -117,7 +133,11 @@ func (a *SourceAdapter) Close() error {
 // For external plugins, schema comes from GetFlightInfo in snapshot mode.
 // Validates that declared primary key columns exist in the returned schema.
 func (a *SourceAdapter) Introspect(ctx context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
-	info, err := a.client.GetFlightInfo(ctx, contract.GetFlightInfoRequest{
+	c := a.use()
+	if c == nil {
+		return core.TableRef{}, core.Schema{}, nil, errors.New("plugin source: not connected")
+	}
+	info, err := c.GetFlightInfo(ctx, contract.GetFlightInfoRequest{
 		Table: t.Source,
 		Mode:  "snapshot",
 	})
@@ -177,7 +197,7 @@ func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.
 		closeAdapter = a.Close
 	}
 	r := &sourceReader{
-		client:       a.client,
+		clients:      a.clients,
 		alloc:        a.alloc,
 		refs:         refs,
 		ctx:          ctx,
@@ -202,7 +222,7 @@ type sourceResult struct {
 // shaped); the reader projects it straight into the flat urutau wire schema
 // — no rowchange round-trip.
 type sourceReader struct {
-	client    *client.Client
+	clients   ClientFunc
 	alloc     memory.Allocator
 	refs      []core.TableRef
 	ctx       context.Context
@@ -317,13 +337,25 @@ func (r *sourceReader) Next(ctx context.Context) (*dataplane.Batch, error) {
 	}
 }
 
+// use resolves the reader's current client (see SourceAdapter.use).
+func (r *sourceReader) use() *client.Client {
+	if r.clients == nil {
+		return nil
+	}
+	return r.clients()
+}
+
 func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from position.Position) error {
+	c := r.use()
+	if c == nil {
+		return errors.New("plugin source: not connected")
+	}
 	var fromOffset string
 	if from != nil {
 		fromOffset = from.String()
 	}
 
-	info, err := r.client.GetFlightInfo(ctx, contract.GetFlightInfoRequest{
+	info, err := c.GetFlightInfo(ctx, contract.GetFlightInfoRequest{
 		Table:      ref.Source,
 		Mode:       "changes",
 		FromOffset: fromOffset,
@@ -338,7 +370,7 @@ func (r *sourceReader) streamTable(ctx context.Context, ref core.TableRef, from 
 
 	// Consume all endpoints (contract allows partitioned data).
 	for _, ep := range info.Endpoint {
-		stream, err := r.client.DoGet(ctx, &flight.Ticket{Ticket: ep.Ticket.Ticket})
+		stream, err := c.DoGet(ctx, &flight.Ticket{Ticket: ep.Ticket.Ticket})
 		if err != nil {
 			return err
 		}
@@ -547,53 +579,6 @@ func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref co
 	return changes, nil
 }
 
-// arrowToCoreSchema converts an Arrow schema to a core schema.
-func arrowToCoreSchema(s *arrow.Schema) core.Schema {
-	cols := make([]core.Column, 0, s.NumFields())
-	for i := range s.NumFields() {
-		f := s.Field(i)
-		cols = append(cols, core.Column{
-			Name: f.Name,
-			Type: arrowTypeToCore(f.Type, f.Nullable),
-		})
-	}
-	return core.Schema{Columns: cols}
-}
-
-func arrowTypeToCore(t arrow.DataType, nullable bool) core.ColumnType {
-	switch t.ID() {
-	case arrow.BOOL:
-		return core.ColumnType{Kind: core.KindBool, Nullable: nullable}
-	case arrow.INT8, arrow.INT16, arrow.INT32:
-		return core.ColumnType{Kind: core.KindInt32, Nullable: nullable}
-	case arrow.INT64:
-		return core.ColumnType{Kind: core.KindInt64, Nullable: nullable}
-	case arrow.UINT64:
-		return core.ColumnType{Kind: core.KindUInt64, Nullable: nullable}
-	case arrow.FLOAT32:
-		return core.ColumnType{Kind: core.KindFloat32, Nullable: nullable}
-	case arrow.FLOAT64:
-		return core.ColumnType{Kind: core.KindFloat64, Nullable: nullable}
-	case arrow.STRING, arrow.LARGE_STRING:
-		return core.ColumnType{Kind: core.KindString, Nullable: nullable}
-	case arrow.BINARY, arrow.LARGE_BINARY:
-		return core.ColumnType{Kind: core.KindBinary, Nullable: nullable}
-	case arrow.TIMESTAMP:
-		return core.ColumnType{Kind: core.KindTimestampTZ, Nullable: nullable}
-	default:
-		return core.ColumnType{Kind: core.KindUnknown, Nullable: nullable}
-	}
-}
-
-func columnIndex(s *arrow.Schema, name string) int {
-	for i := range s.NumFields() {
-		if s.Field(i).Name == name {
-			return i
-		}
-	}
-	return -1
-}
-
 // validateChangeSchema enforces contract §8.1 (change record, v1, fixed) on
 // the plugin's announced schema — BEFORE any record is consumed (the
 // sink-side §10 rule applied symmetrically: rejection at the first batch,
@@ -669,107 +654,4 @@ func recordMatchesAnnouncedSchema(recSchema, announced *arrow.Schema) error {
 		}
 	}
 	return nil
-}
-
-func readStringCol(rec arrow.RecordBatch, idx, row int) string {
-	if idx < 0 || rec.Column(idx).IsNull(row) {
-		return ""
-	}
-	col := rec.Column(idx).(*array.String)
-	return col.Value(row)
-}
-
-func readBinaryCol(rec arrow.RecordBatch, idx, row int) string {
-	if idx < 0 || rec.Column(idx).IsNull(row) {
-		return ""
-	}
-	col := rec.Column(idx).(*array.Binary)
-	return base64.StdEncoding.EncodeToString(col.Value(row))
-}
-
-func structToMap(col arrow.Array, row int) (map[string]any, error) {
-	if col == nil {
-		return nil, nil
-	}
-	structArr, ok := col.(*array.Struct)
-	if !ok {
-		return nil, nil
-	}
-	fields := structArr.DataType().(*arrow.StructType)
-	m := make(map[string]any, fields.NumFields())
-	for i := range fields.NumFields() {
-		field := fields.Field(i)
-		// A null field is written explicitly rather than skipped: skipping it
-		// drops the column from the schema inferred over the rows, so a column
-		// null on every row vanished from the wire schema (issue #568).
-		if structArr.Field(i).IsNull(row) {
-			m[field.Name] = nil
-			continue
-		}
-		val, err := readValue(structArr.Field(i), row)
-		if err != nil {
-			return nil, fmt.Errorf("plugin: column %s: %w", field.Name, err)
-		}
-		m[field.Name] = val
-	}
-	return m, nil
-}
-
-func readValue(col arrow.Array, row int) (any, error) {
-	if col.IsNull(row) {
-		return nil, nil
-	}
-	switch c := col.(type) {
-	case *array.Boolean:
-		return c.Value(row), nil
-	case *array.Int8:
-		return int32(c.Value(row)), nil
-	case *array.Int16:
-		return int32(c.Value(row)), nil
-	case *array.Int32:
-		return c.Value(row), nil
-	case *array.Int64:
-		return c.Value(row), nil
-	case *array.Uint8:
-		return c.Value(row), nil
-	case *array.Uint16:
-		return c.Value(row), nil
-	case *array.Uint32:
-		return c.Value(row), nil
-	case *array.Uint64:
-		return c.Value(row), nil
-	case *array.Float32:
-		return c.Value(row), nil
-	case *array.Float64:
-		return c.Value(row), nil
-	case *array.String:
-		return c.Value(row), nil
-	case *array.Binary:
-		return c.Value(row), nil
-	case *array.Timestamp:
-		// Honour the column's unit: the previous UnixMicro read flattened
-		// every timestamp to microseconds and misread ns/ms/s by powers of
-		// 1000 (issue #568).
-		ts := c.DataType().(*arrow.TimestampType)
-		return c.Value(row).ToTime(ts.Unit).UTC(), nil
-	default:
-		// An unmapped type used to become a silent NULL; fail the stream
-		// instead, so the plugin author sees it (issue #568).
-		return nil, fmt.Errorf("unsupported Arrow type %s", col.DataType())
-	}
-}
-
-func extractPK(pkCols []string, row map[string]any) []any {
-	if row == nil || len(pkCols) == 0 {
-		return nil
-	}
-	keys := make([]any, 0, len(pkCols))
-	for _, name := range pkCols {
-		v, ok := row[name]
-		if !ok {
-			return nil
-		}
-		keys = append(keys, v)
-	}
-	return keys
 }

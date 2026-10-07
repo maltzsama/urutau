@@ -5,6 +5,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/pipeline"
+	"github.com/maltzsama/urutau/internal/plugin/client"
 )
 
 const (
@@ -80,6 +82,17 @@ func (s *StageSupervisor) Stage() *pipeline.Stage {
 	return s.stage
 }
 
+// Client returns the current stage's Flight client, or nil before the first
+// start / after a stop. An adapter given this as its client provider follows a
+// plugin restart instead of pinning the dead client (issue #570).
+func (s *StageSupervisor) Client() *client.Client {
+	st := s.Stage()
+	if st == nil {
+		return nil
+	}
+	return st.Client
+}
+
 // Run starts the plugin and keeps it alive. It blocks until the context
 // is cancelled, the circuit breaker trips, or a non-recoverable error
 // occurs. On each failure, it applies exponential backoff with jitter
@@ -112,19 +125,31 @@ func (s *StageSupervisor) Run(ctx context.Context) error {
 			continue
 		}
 
-		// Stage is running. Wait for it to die or be stopped.
+		// Stage is running. Wait for it to die or be stopped. Death is either
+		// the process exiting OR the Flight client going unhealthy (a lost
+		// heartbeat with the process still alive), which used to trigger
+		// nothing (issue #570).
 		s.resetBackoff()
+		stage := s.stage
 		select {
 		case <-ctx.Done():
 			return s.stopStage()
-		case <-s.stage.Exited():
-			err := fmt.Errorf("plugin exited unexpectedly")
+		case <-stage.Exited():
 			s.recordFailure()
-			s.logger.Error("plugin exited", "err", err, "bin", s.cfg.Bin)
+			s.logger.Error("plugin exited unexpectedly", "bin", s.cfg.Bin)
 			s.advanceBackoff()
 			// Release the dead stage's Flight client and heartbeat before
 			// startOnce replaces it, or a crash-loop leaks one client per
 			// restart cycle (issue #498).
+			_ = s.stopStage()
+		case <-stage.Dead:
+			err := stage.DeadErr()
+			if err == nil {
+				err = errors.New("plugin client became unhealthy")
+			}
+			s.recordFailure()
+			s.logger.Error("plugin client unhealthy", "err", err, "bin", s.cfg.Bin)
+			s.advanceBackoff()
 			_ = s.stopStage()
 		}
 	}
