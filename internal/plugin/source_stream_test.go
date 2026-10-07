@@ -74,13 +74,13 @@ func newFakeReader(t *testing.T, f *fakeFlight, refs []core.TableRef) *sourceRea
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	return &sourceReader{
-		client: cl,
-		alloc:  memory.NewGoAllocator(),
-		refs:   refs,
-		ctx:    ctx,
-		cancel: cancel,
-		logger: slog.New(slog.DiscardHandler),
-		out:    make(chan sourceResult, 16),
+		clients: func() *client.Client { return cl },
+		alloc:   memory.NewGoAllocator(),
+		refs:    refs,
+		ctx:     ctx,
+		cancel:  cancel,
+		logger:  slog.New(slog.DiscardHandler),
+		out:     make(chan sourceResult, 16),
 	}
 }
 
@@ -161,5 +161,39 @@ func TestSourceReaderPerTablePositions(t *testing.T) {
 	// A bare offset is never mistaken for the envelope.
 	if env := decodePositions(StringPosition{Offset: "b2ZmLTE="}); env != nil {
 		t.Fatalf("a bare offset decoded as an envelope: %v", env)
+	}
+}
+
+// An adapter must resolve the plugin client per use, so a supervisor restart
+// that swaps the stage does not leave it pinned to the dead client (issue
+// #570).
+func TestAdapterFollowsClientProvider(t *testing.T) {
+	first := &client.Client{}
+	second := &client.Client{}
+
+	cur := first
+	src := &SourceAdapter{clients: func() *client.Client { return cur }}
+	if src.use() != first {
+		t.Fatal("source adapter must resolve the first client")
+	}
+	cur = second
+	if src.use() != second {
+		t.Fatal("source adapter must follow the provider after a restart")
+	}
+
+	cur = first
+	snk := &SinkAdapter{clients: func() *client.Client { return cur }}
+	if snk.use() != first {
+		t.Fatal("sink adapter must resolve the first client")
+	}
+	cur = second
+	if snk.use() != second {
+		t.Fatal("sink adapter must follow the provider after a restart")
+	}
+
+	// A nil provider (in-process with no client yet) resolves to nil, never a
+	// panic.
+	if (&SourceAdapter{}).use() != nil || (&SinkAdapter{}).use() != nil {
+		t.Fatal("a nil provider must resolve to nil")
 	}
 }

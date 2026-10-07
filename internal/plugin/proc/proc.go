@@ -79,6 +79,14 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 	if !useTCP && len(socketPath) > 100 {
 		return nil, fmt.Errorf("socket path too long (%d bytes): %s", len(socketPath), socketPath)
 	}
+	// A socket left behind by a dead process would make the plugin's bind
+	// fail with "address already in use"; remove it before starting
+	// (issue #570).
+	if !useTCP {
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("remove stale plugin socket: %w", err)
+		}
+	}
 
 	env := append(os.Environ(),
 		fmt.Sprintf("URUTAU_STAGE=%s", cfg.Role),

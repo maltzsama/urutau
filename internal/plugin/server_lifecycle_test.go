@@ -24,7 +24,7 @@ func TestSourceAdapterCloseStopsOwnedServer(t *testing.T) {
 		srv.Stop()
 		t.Fatalf("Connect: %v", err)
 	}
-	a := NewSourceAdapter(c, spec.Source{}, slog.New(slog.DiscardHandler), srv)
+	a := NewSourceAdapter(func() *client.Client { return c }, spec.Source{}, slog.New(slog.DiscardHandler), srv)
 	if err := a.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -321,4 +322,37 @@ func writeConfig(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// A socket left behind by a dead process must be removed before the plugin
+// binds, or the new process fails with "address already in use" (issue #570).
+func TestSpawnRemovesStaleSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket cleanup is not used on windows")
+	}
+	workDir := t.TempDir()
+	socket := filepath.Join(workDir, "plugin.sock")
+	if err := os.WriteFile(socket, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := writeScript(t, "echo '{\"ready\":true,\"protocolVersion\":1}'\nsleep 5")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p, err := proc.Spawn(ctx, proc.Config{
+		Bin:        bin,
+		Role:       contract.RoleSource,
+		Token:      "dGVzdA==",
+		ConfigPath: writeConfig(t),
+		PluginDir:  t.TempDir(),
+		WorkDir:    workDir,
+	})
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	defer func() { _ = p.Stop() }()
+
+	if _, err := os.Stat(socket); !os.IsNotExist(err) {
+		t.Fatalf("the stale socket survived Spawn: err=%v", err)
+	}
 }

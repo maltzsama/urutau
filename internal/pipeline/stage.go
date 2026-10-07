@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/maltzsama/urutau/internal/plugin/client"
 	"github.com/maltzsama/urutau/internal/plugin/contract"
@@ -31,8 +32,11 @@ type StageConfig struct {
 	Token      string // auth token
 	ConfigPath string // plugin config file
 	PluginDir  string // plugin data directory
-	WorkDir    string // working directory (sockets live here)
-	Logger     *slog.Logger
+	// WorkDir is the directory the plugin's socket lives in. Empty asks Spawn
+	// for a private temp dir (removed on Stop), so two stages — e.g. an
+	// external source AND sink — never collide on one socket (issue #570).
+	WorkDir string
+	Logger  *slog.Logger
 }
 
 // Stage couples a plugin process to its Flight client. It is the
@@ -61,6 +65,9 @@ type Stage struct {
 	// Connect. DeadErr returns its reason. Both are nil until Connect.
 	Dead    <-chan struct{}
 	DeadErr func() error
+	// tempWorkDir, when set, is the private directory Spawn created for the
+	// plugin's socket; Stop removes it (issue #570).
+	tempWorkDir string
 }
 
 // Spawn starts the plugin subprocess and waits for readiness. The returned
@@ -74,23 +81,39 @@ func Spawn(ctx context.Context, cfg StageConfig) (*Stage, error) {
 	if err != nil {
 		return nil, err
 	}
+	workDir := cfg.WorkDir
+	private := false
+	if workDir == "" {
+		workDir, err = os.MkdirTemp("", "urutau-plugin-")
+		if err != nil {
+			return nil, fmt.Errorf("plugin work dir: %w", err)
+		}
+		private = true
+	}
 	p, err := proc.Spawn(ctx, proc.Config{
 		Bin:        cfg.Bin,
 		Role:       role,
 		Token:      cfg.Token,
 		ConfigPath: cfg.ConfigPath,
 		PluginDir:  cfg.PluginDir,
-		WorkDir:    cfg.WorkDir,
+		WorkDir:    workDir,
 		Logger:     cfg.Logger,
 	})
 	if err != nil {
+		if private {
+			_ = os.RemoveAll(workDir)
+		}
 		return nil, err
 	}
-	return &Stage{
+	s := &Stage{
 		Cfg:    cfg,
 		Proc:   p,
 		Logger: cfg.Logger,
-	}, nil
+	}
+	if private {
+		s.tempWorkDir = workDir
+	}
+	return s, nil
 }
 
 // Connect dials the Flight service on the running process.
@@ -122,7 +145,11 @@ func (s *Stage) Stop(ctx context.Context) error {
 		shutdownErr = s.Client.Shutdown(ctx)
 		_ = s.Client.Close()
 	}
-	return errors.Join(shutdownErr, s.Proc.Stop())
+	err := errors.Join(shutdownErr, s.Proc.Stop())
+	if s.tempWorkDir != "" {
+		_ = os.RemoveAll(s.tempWorkDir)
+	}
+	return err
 }
 
 // Exited returns a channel closed when the plugin process exits. It is valid

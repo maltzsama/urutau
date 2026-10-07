@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/pipeline"
+	"github.com/maltzsama/urutau/internal/plugin/client"
 )
 
 func TestStageSupervisorBackoff(t *testing.T) {
@@ -89,3 +90,17 @@ func TestStageSupervisorDead(t *testing.T) {
 type someError struct{}
 
 func (someError) Error() string { return "test error" }
+
+// Client resolves the CURRENT stage's Flight client, so an adapter built from
+// it follows a restart instead of pinning the dead client (issue #570).
+func TestStageSupervisorClientResolvesCurrentStage(t *testing.T) {
+	s := NewStageSupervisor(pipeline.StageConfig{}, slog.Default())
+	if s.Client() != nil {
+		t.Fatal("no stage yet: Client must be nil")
+	}
+	c := &client.Client{}
+	s.stage = &pipeline.Stage{Client: c}
+	if s.Client() != c {
+		t.Fatal("Client must return the current stage's client")
+	}
+}

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -23,9 +24,9 @@ import (
 // internal rowchange.Batch into Arrow records and writes them via DoPut,
 // then calls Flush to guarantee durability.
 type SinkAdapter struct {
-	client *client.Client
-	alloc  memory.Allocator
-	logger *slog.Logger
+	clients ClientFunc
+	alloc   memory.Allocator
+	logger  *slog.Logger
 	// server is the in-process Flight server this adapter owns (flightwrap);
 	// nil for a subprocess plugin, whose supervisor owns the process.
 	server ServerStopper
@@ -37,19 +38,27 @@ type SinkAdapter struct {
 // NewSinkAdapter creates a sink adapter over a connected Flight client. An
 // optional ServerStopper is the in-process server flightwrap started, which
 // Close stops (issue #496).
-func NewSinkAdapter(c *client.Client, logger *slog.Logger, servers ...ServerStopper) *SinkAdapter {
+func NewSinkAdapter(clients ClientFunc, logger *slog.Logger, servers ...ServerStopper) *SinkAdapter {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	a := &SinkAdapter{
-		client: c,
-		alloc:  memory.NewGoAllocator(),
-		logger: logger,
+		clients: clients,
+		alloc:   memory.NewGoAllocator(),
+		logger:  logger,
 	}
 	if len(servers) > 0 {
 		a.server = servers[0]
 	}
 	return a
+}
+
+// use resolves the adapter's current client, or nil when the plugin is down.
+func (a *SinkAdapter) use() *client.Client {
+	if a.clients == nil {
+		return nil
+	}
+	return a.clients()
 }
 
 // EnsureTable delegates to the plugin via Flight action. The plugin
@@ -62,11 +71,11 @@ func (a *SinkAdapter) EnsureTable(ctx context.Context, ref core.TableRef, _ core
 // Writer returns a table writer that streams records via DoPut.
 func (a *SinkAdapter) Writer(_ context.Context, ref core.TableRef, _ core.CastPolicy, _ []core.MetadataColumn) (sink.TableWriter, error) {
 	return &sinkWriter{
-		client: a.client,
-		alloc:  a.alloc,
-		table:  ref.Target,
-		logger: a.logger,
-		wg:     &a.wg,
+		clients: a.clients,
+		alloc:   a.alloc,
+		table:   ref.Target,
+		logger:  a.logger,
+		wg:      &a.wg,
 	}, nil
 }
 
@@ -95,7 +104,10 @@ func (a *SinkAdapter) Close() error {
 	}
 	a.closed = true
 	a.wg.Wait()
-	err := a.client.Close()
+	var err error
+	if c := a.use(); c != nil {
+		err = c.Close()
+	}
 	if a.server != nil {
 		a.server.Stop()
 	}
@@ -104,13 +116,21 @@ func (a *SinkAdapter) Close() error {
 
 // sinkWriter implements sink.TableWriter over Flight DoPut.
 type sinkWriter struct {
-	client *client.Client
-	alloc  memory.Allocator
-	table  string
-	logger *slog.Logger
-	mu     sync.Mutex
-	closed bool
-	wg     *sync.WaitGroup
+	clients ClientFunc
+	alloc   memory.Allocator
+	table   string
+	logger  *slog.Logger
+	mu      sync.Mutex
+	closed  bool
+	wg      *sync.WaitGroup
+}
+
+// use resolves the writer's current client (see SinkAdapter.use).
+func (w *sinkWriter) use() *client.Client {
+	if w.clients == nil {
+		return nil
+	}
+	return w.clients()
 }
 
 // Commit re-projects the batch's RecordBatch into the plugin's record
@@ -142,15 +162,20 @@ func (w *sinkWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 		Table: w.table,
 	}
 
+	c := w.use()
+	if c == nil {
+		return errors.New("plugin sink: not connected")
+	}
+
 	w.wg.Add(1)
 	defer w.wg.Done()
 
-	if err := w.client.DoPut(ctx, desc, schema, records); err != nil {
+	if err := c.DoPut(ctx, desc, schema, records); err != nil {
 		return fmt.Errorf("doPut: %w", err)
 	}
 
 	// Flush to guarantee durability (contract §10).
-	if err := w.client.Flush(ctx); err != nil {
+	if err := c.Flush(ctx); err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}
 	return nil
