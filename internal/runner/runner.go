@@ -377,10 +377,11 @@ func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []co
 	return best, needsSnapshot, recovery, nil
 }
 
-// runIncremental reads each incremental table once (#157) and pushes the rows
-// through the worker's ingest path — the same path a snapshot uses, minus the
-// window. The cursor is read from cdc.cursor and persisted post-commit by the
-// OnCommit callback, so the data and the cursor advance together.
+// runIncremental drains each incremental table in bounded pages (#572),
+// pushing the rows through the worker's ingest path — the same path a snapshot
+// uses, minus the window. The cursor is read from cdc.cursor and persisted
+// post-commit by the OnCommit callback, so the data and the cursor advance
+// together.
 func (r *Runner) runIncremental(ctx context.Context, src source.Source, snk sink.Sink, refs []core.TableRef, specBySource map[string]spec.Table, w *worker.Worker, ingest chan worker.Ingest) error {
 	inc, ok := src.(source.IncrementalSource)
 	if !ok {
@@ -394,41 +395,50 @@ func (r *Runner) runIncremental(ctx context.Context, src source.Source, snk sink
 		if err != nil {
 			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
 		}
-		next, rows, err := inc.Incremental(ctx, ref, t.Cursor, after)
-		if err != nil {
-			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
-		}
-		if len(rows) == 0 {
-			continue
-		}
-		changes := make([]rowchange.Change, len(rows))
-		for i, row := range rows {
-			key := make([]any, 0, len(ref.PrimaryKey))
-			for _, pk := range ref.PrimaryKey {
-				key = append(key, row[pk])
+		// Drain the table a page at a time: the source returns one bounded page
+		// and says whether more is already available, so a large table never
+		// loads entirely into memory (issue #572).
+		for {
+			next, rows, more, err := inc.Incremental(ctx, ref, t.Cursor, after)
+			if err != nil {
+				return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
 			}
-			changes[i] = rowchange.Change{
-				Op:       rowchange.OpInsert,
-				Table:    ref.Target,
-				Key:      key,
-				After:    row,
-				Position: next,
-				Snapshot: false,
-				Phase:    core.PhaseIncremental,
-				IngestTS: time.Now(),
+			if len(rows) == 0 {
+				break
+			}
+			changes := make([]rowchange.Change, len(rows))
+			for i, row := range rows {
+				key := make([]any, 0, len(ref.PrimaryKey))
+				for _, pk := range ref.PrimaryKey {
+					key = append(key, row[pk])
+				}
+				changes[i] = rowchange.Change{
+					Op:       rowchange.OpInsert,
+					Table:    ref.Target,
+					Key:      key,
+					After:    row,
+					Position: next,
+					Snapshot: false,
+					Phase:    core.PhaseIncremental,
+					IngestTS: time.Now(),
+				}
+			}
+			rec, err := transport.RecordFromChanges(changes, transport.MergeSchema(changes, w.KnownSchema(ref.Target)), nil)
+			if err != nil {
+				return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
+			}
+			dpb := &dataplane.Batch{Table: ref.Target, Record: rec, Mode: dataplane.UpsertMode, Watermark: []byte(next)}
+			select {
+			case ingest <- worker.Ingest{Table: ref.Target, Batch: dpb}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			r.log.Info("incremental read", "table", ref.Source, "rows", len(rows), "cursor", next)
+			after = next
+			if !more {
+				break
 			}
 		}
-		rec, err := transport.RecordFromChanges(changes, transport.MergeSchema(changes, w.KnownSchema(ref.Target)), nil)
-		if err != nil {
-			return fmt.Errorf("runner: incremental %s: %w", ref.Target, err)
-		}
-		dpb := &dataplane.Batch{Table: ref.Target, Record: rec, Mode: dataplane.UpsertMode, Watermark: []byte(next)}
-		select {
-		case ingest <- worker.Ingest{Table: ref.Target, Batch: dpb}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		r.log.Info("incremental read", "table", ref.Source, "rows", len(rows), "cursor", next)
 	}
 	return nil
 }
@@ -1032,8 +1042,8 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		}
 	}
 
-	// Incremental pass (#157): one cursor read per incremental table, through
-	// the same worker/ingest path as a snapshot. No slot, no window.
+	// Incremental pass (#157/#572): page each incremental table to exhaustion,
+	// through the same worker/ingest path as a snapshot. No slot, no window.
 	if len(incrRefs) > 0 {
 		if err := r.runIncremental(ctx, src, snk, incrRefs, specBySource, w, ingest); err != nil {
 			if r.rdr != nil {

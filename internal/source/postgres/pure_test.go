@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/source"
@@ -270,5 +271,30 @@ func TestEnsureSetupValidSlotName(t *testing.T) {
 func TestEnsureReplicaIdentityKeepSkipsDB(t *testing.T) {
 	if err := ensureReplicaIdentity(t.Context(), nil, "public.t", "public", "t", "keep"); err != nil {
 		t.Fatalf("keep must not touch the DB: %v", err)
+	}
+}
+
+// A timestamptz cursor must render as a string the next query casts back with
+// ?::timestamptz — Go's default layout does not round-trip (issue #572).
+func TestIncrementalCursorFormatRoundTrips(t *testing.T) {
+	ts := time.Date(2026, 10, 7, 12, 0, 0, 123456789, time.UTC)
+	got := formatIncrementalCursor(ts)
+	back, err := time.Parse(time.RFC3339Nano, got)
+	if err != nil || !back.Equal(ts) {
+		t.Fatalf("cursor %q did not round-trip: %v", got, err)
+	}
+	if formatIncrementalCursor(int64(42)) != "42" {
+		t.Fatalf("int cursor = %q", formatIncrementalCursor(int64(42)))
+	}
+}
+
+func TestIncrementalPosEncodeDecode(t *testing.T) {
+	pos := encodeIncrementalPos("2026-10-07T12:00:00Z", []string{"42", "abc"})
+	cur, pk := decodeIncrementalPos(pos)
+	if cur != "2026-10-07T12:00:00Z" || len(pk) != 2 || pk[0] != "42" || pk[1] != "abc" {
+		t.Fatalf("decode = %q %v", cur, pk)
+	}
+	if cur, pk := decodeIncrementalPos("plain-cursor"); cur != "plain-cursor" || pk != nil {
+		t.Fatalf("plain decode = %q %v", cur, pk)
 	}
 }
