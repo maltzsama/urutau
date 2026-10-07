@@ -49,116 +49,128 @@ func TestArrowTypeToCoreMatrix(t *testing.T) {
 }
 
 func TestReadValueMatrix(t *testing.T) {
+	mustRead := func(col arrow.Array, row int) any {
+		t.Helper()
+		v, err := readValue(col, row)
+		if err != nil {
+			t.Fatalf("readValue: %v", err)
+		}
+		return v
+	}
 
 	boolB := array.NewBooleanBuilder(memory.DefaultAllocator)
 	boolB.Append(true)
 	defer boolB.Release()
-	if readValue(boolB.NewBooleanArray(), 0) != true {
+	if mustRead(boolB.NewBooleanArray(), 0) != true {
 		t.Fatal("bool")
 	}
 
 	int8B := array.NewInt8Builder(memory.DefaultAllocator)
 	int8B.Append(8)
 	defer int8B.Release()
-	if readValue(int8B.NewInt8Array(), 0) != int32(8) {
+	if mustRead(int8B.NewInt8Array(), 0) != int32(8) {
 		t.Fatal("int8")
 	}
 
 	int16B := array.NewInt16Builder(memory.DefaultAllocator)
 	int16B.Append(16)
 	defer int16B.Release()
-	if readValue(int16B.NewInt16Array(), 0) != int32(16) {
+	if mustRead(int16B.NewInt16Array(), 0) != int32(16) {
 		t.Fatal("int16")
 	}
 
 	int32B := array.NewInt32Builder(memory.DefaultAllocator)
 	int32B.Append(32)
 	defer int32B.Release()
-	if readValue(int32B.NewInt32Array(), 0) != int32(32) {
+	if mustRead(int32B.NewInt32Array(), 0) != int32(32) {
 		t.Fatal("int32")
 	}
 
 	int64B := array.NewInt64Builder(memory.DefaultAllocator)
 	int64B.Append(64)
 	defer int64B.Release()
-	if readValue(int64B.NewInt64Array(), 0) != int64(64) {
+	if mustRead(int64B.NewInt64Array(), 0) != int64(64) {
 		t.Fatal("int64")
 	}
 
 	uint8B := array.NewUint8Builder(memory.DefaultAllocator)
 	uint8B.Append(8)
 	defer uint8B.Release()
-	if readValue(uint8B.NewUint8Array(), 0) != uint8(8) {
+	if mustRead(uint8B.NewUint8Array(), 0) != uint8(8) {
 		t.Fatal("uint8")
 	}
 
 	uint16B := array.NewUint16Builder(memory.DefaultAllocator)
 	uint16B.Append(16)
 	defer uint16B.Release()
-	if readValue(uint16B.NewUint16Array(), 0) != uint16(16) {
+	if mustRead(uint16B.NewUint16Array(), 0) != uint16(16) {
 		t.Fatal("uint16")
 	}
 
 	uint32B := array.NewUint32Builder(memory.DefaultAllocator)
 	uint32B.Append(32)
 	defer uint32B.Release()
-	if readValue(uint32B.NewUint32Array(), 0) != uint32(32) {
+	if mustRead(uint32B.NewUint32Array(), 0) != uint32(32) {
 		t.Fatal("uint32")
 	}
 
 	uint64B := array.NewUint64Builder(memory.DefaultAllocator)
 	uint64B.Append(64)
 	defer uint64B.Release()
-	if readValue(uint64B.NewUint64Array(), 0) != uint64(64) {
+	if mustRead(uint64B.NewUint64Array(), 0) != uint64(64) {
 		t.Fatal("uint64")
 	}
 
 	f32B := array.NewFloat32Builder(memory.DefaultAllocator)
 	f32B.Append(1.5)
 	defer f32B.Release()
-	if readValue(f32B.NewFloat32Array(), 0) != float32(1.5) {
+	if mustRead(f32B.NewFloat32Array(), 0) != float32(1.5) {
 		t.Fatal("float32")
 	}
 
 	f64B := array.NewFloat64Builder(memory.DefaultAllocator)
 	f64B.Append(2.5)
 	defer f64B.Release()
-	if readValue(f64B.NewFloat64Array(), 0) != float64(2.5) {
+	if mustRead(f64B.NewFloat64Array(), 0) != float64(2.5) {
 		t.Fatal("float64")
 	}
 
 	strB := array.NewStringBuilder(memory.DefaultAllocator)
 	strB.Append("x")
 	defer strB.Release()
-	if readValue(strB.NewStringArray(), 0) != "x" {
+	if mustRead(strB.NewStringArray(), 0) != "x" {
 		t.Fatal("string")
 	}
 
 	binB := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
 	binB.Append([]byte{0x1})
 	defer binB.Release()
-	if string(readValue(binB.NewBinaryArray(), 0).([]byte)) != "\x01" {
+	if string(mustRead(binB.NewBinaryArray(), 0).([]byte)) != "\x01" {
 		t.Fatal("binary")
 	}
 
-	tsB := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Microsecond})
-	tsB.Append(arrow.Timestamp(time.Unix(1, 0).UnixMicro()))
+	// A timestamp honours its column unit, not a fixed microsecond read.
+	tsB := array.NewTimestampBuilder(memory.DefaultAllocator, &arrow.TimestampType{Unit: arrow.Second})
+	tsB.Append(arrow.Timestamp(1))
 	defer tsB.Release()
-	if _, ok := readValue(tsB.NewTimestampArray(), 0).(time.Time); !ok {
-		t.Fatal("timestamp")
+	tsVal := mustRead(tsB.NewTimestampArray(), 0)
+	got, ok := tsVal.(time.Time)
+	if !ok || !got.Equal(time.Unix(1, 0).UTC()) {
+		t.Fatalf("timestamp = %v (%T), want the unit-1 second instant", tsVal, tsVal)
 	}
 
+	// An unmapped type is an error, not a silent NULL (issue #568).
 	durB := array.NewDurationBuilder(memory.DefaultAllocator, arrow.FixedWidthTypes.Duration_s.(*arrow.DurationType))
 	durB.Append(1)
 	defer durB.Release()
-	if readValue(durB.NewDurationArray(), 0) != nil {
-		t.Fatal("unmapped types must read as nil")
+	if _, err := readValue(durB.NewDurationArray(), 0); err == nil {
+		t.Fatal("an unmapped Arrow type must be reported, not read as nil")
 	}
 
 	nullB := array.NewInt64Builder(memory.DefaultAllocator)
 	nullB.AppendNull()
 	defer nullB.Release()
-	if readValue(nullB.NewInt64Array(), 0) != nil {
+	if v, err := readValue(nullB.NewInt64Array(), 0); err != nil || v != nil {
 		t.Fatal("null must read as nil")
 	}
 }
@@ -194,7 +206,7 @@ func TestReadStringAndBinaryCol(t *testing.T) {
 }
 
 func TestStructToMap(t *testing.T) {
-	if structToMap(nil, 0) != nil {
+	if m, err := structToMap(nil, 0); err != nil || m != nil {
 		t.Fatal("nil column must map to nil")
 	}
 
@@ -210,19 +222,24 @@ func TestStructToMap(t *testing.T) {
 	arr := sb.NewStructArray()
 	defer arr.Release()
 
-	m := structToMap(arr, 0)
+	m, err := structToMap(arr, 0)
+	if err != nil {
+		t.Fatalf("structToMap: %v", err)
+	}
 	if m["a"] != int64(7) {
 		t.Fatalf("struct map = %v", m)
 	}
-	if _, ok := m["b"]; ok {
-		t.Fatalf("a null field must be omitted: %v", m)
+	// A null field is kept as an explicit nil, so the column is not dropped
+	// from the schema inferred over the rows (issue #568).
+	if v, ok := m["b"]; !ok || v != nil {
+		t.Fatalf("a null field must be kept as nil: %v", m)
 	}
 
 	// A non-struct column maps to nil.
 	ib := array.NewInt64Builder(memory.DefaultAllocator)
 	ib.Append(1)
 	defer ib.Release()
-	if structToMap(ib.NewInt64Array(), 0) != nil {
+	if m, err := structToMap(ib.NewInt64Array(), 0); err != nil || m != nil {
 		t.Fatal("non-struct must map to nil")
 	}
 }
