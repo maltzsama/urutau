@@ -147,8 +147,10 @@ func TestSourceBatchesForwardsThenEnds(t *testing.T) {
 	if got != 2 {
 		t.Fatalf("forwarded = %d, want 2", got)
 	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("errCh = %v, want nil", err)
+	// A clean end is signalled with the sentinel, not nil, so the consumer
+	// can tell it from a failure without rendering %!w(<nil>) (issue #559).
+	if err := <-errCh; !errors.Is(err, errStreamEnd) {
+		t.Fatalf("errCh = %v, want errStreamEnd", err)
 	}
 }
 

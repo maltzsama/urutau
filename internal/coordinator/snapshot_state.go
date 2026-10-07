@@ -156,7 +156,9 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 				todo[id] = true
 			}
 			if len(todo) == 0 {
-				todo = allChunkRefs(all, ranges)
+				if todo, err = allChunkRefs(all, ranges); err != nil {
+					return nil, nil, err
+				}
 			}
 			c.log.Info("coordinator: resuming the snapshot from its recorded progress",
 				"table", ref.Target, "chunks_pending", len(todo))
@@ -168,7 +170,10 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 		return nil, nil, err
 	}
 	all := snapshot.Chunks(bounds)
-	todo := allChunkRefs(all, ranges)
+	todo, err := allChunkRefs(all, ranges)
+	if err != nil {
+		return nil, nil, err
+	}
 	if c.snk != nil {
 		props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
 			State: snapshot.StateInProgress, Bounds: bounds, Pending: sortedRefs(todo),
@@ -182,19 +187,24 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 	return all, todo, nil
 }
 
-// allChunkRefs is every chunk of every partition.
-func allChunkRefs(all []source.Chunk, ranges []source.Chunk) map[uint32]bool {
+// allChunkRefs is every chunk of every partition. A clip failure or a chunk
+// index that overflows the 20 bits a chunk id addresses is an error, not a
+// silently dropped chunk (issue #559).
+func allChunkRefs(all []source.Chunk, ranges []source.Chunk) (map[uint32]bool, error) {
 	todo := map[uint32]bool{}
 	for p, r := range ranges {
 		clipped, err := clipChunksToRange(all, r)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("coordinator: clip partition %d: %w", p, err)
+		}
+		if len(clipped) > 1<<20 {
+			return nil, fmt.Errorf("coordinator: partition %d has %d chunks, over the %d a chunk id can address", p, len(clipped), 1<<20)
 		}
 		for i := range clipped {
 			todo[chunkRef(p, i)] = true
 		}
 	}
-	return todo
+	return todo, nil
 }
 
 // sortedRefs lists chunk ids in order.

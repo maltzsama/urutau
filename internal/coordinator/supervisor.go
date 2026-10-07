@@ -333,15 +333,18 @@ func (s *supervisor) recordReset(worker string, now time.Time, window time.Durat
 func (c *Coordinator) resetWorker(w *workerState) {
 	c.mu.Lock()
 	w.epoch++
+	// Copy under the lock: loseWorker writes w.epoch under c.mu, so reading it
+	// after Unlock races (issue #559).
+	epoch := w.epoch
 	c.mu.Unlock()
 	c.supervisor.pendingSet(w.name)
-	c.log.Warn("coordinator: reset worker", "worker", w.name, "epoch", w.epoch)
+	c.log.Warn("coordinator: reset worker", "worker", w.name, "epoch", epoch)
 	if c.metrics != nil {
 		c.metrics.WorkerResets.WithLabelValues(w.name, "ack_timeout").Inc()
 	}
 	c.emitLog(eventlog.KindWorkerReset, map[string]any{
 		"worker": w.name,
-		"epoch":  w.epoch,
+		"epoch":  epoch,
 		"reason": "ack_timeout",
 	})
 

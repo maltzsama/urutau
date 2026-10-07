@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,9 @@ type Worker struct {
 	schemaDrift     func(SchemaDrift)
 	tables          map[string]*tablePipeline
 	metrics         *observability.Metrics
+	// metricsSrv is the /metrics server when MetricsAddr is set; stopped on
+	// shutdown instead of leaked (issue #559).
+	metricsSrv *http.Server
 }
 
 type tablePipeline struct {
@@ -187,6 +191,11 @@ func New(cfg Config) *Worker {
 	if cfg.MaxBytes <= 0 {
 		cfg.MaxBytes = 32 << 20
 	}
+	// A non-positive interval would panic time.NewTicker in runPipeline
+	// (issue #559).
+	if cfg.MaxInterval <= 0 {
+		cfg.MaxInterval = 2 * time.Second
+	}
 	w := &Worker{
 		cfg:    cfg,
 		tables: make(map[string]*tablePipeline),
@@ -194,9 +203,7 @@ func New(cfg Config) *Worker {
 	// The registry always exists: the coordinator records the worker's series
 	// via the metrics report, even when this worker serves no /metrics endpoint.
 	w.metrics = observability.New()
-	if cfg.MetricsAddr != "" {
-		go func() { _ = w.metrics.Serve(cfg.MetricsAddr, nil) }()
-	}
+	w.startMetrics()
 	return w
 }
 
@@ -417,6 +424,7 @@ func (w *Worker) OnSchemaDrift(f func(SchemaDrift)) {
 func (w *Worker) Run(ctx context.Context, ingest <-chan Ingest) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer w.stopMetrics()
 
 	errCh := make(chan error, len(w.tables))
 	var wg sync.WaitGroup
@@ -429,6 +437,7 @@ func (w *Worker) Run(ctx context.Context, ingest <-chan Ingest) error {
 	}
 
 	// Router: dispatch by target table, then close pipelines so they flush.
+	routerErr := make(chan error, 1)
 	go func() {
 		for ing := range ingest {
 			table := ing.Table
@@ -437,9 +446,14 @@ func (w *Worker) Run(ctx context.Context, ingest <-chan Ingest) error {
 			}
 			p, ok := w.tables[table]
 			if !ok {
-				// A change for an unregistered table is a routing bug
-				// upstream; dropping it silently would lose data. Cancel the
-				// world — the pipelines surface their errors.
+				// A change for an unregistered table is a routing bug upstream;
+				// dropping it silently would lose data. Fail with the table
+				// named (not a bare context canceled) and release the batch
+				// (issue #559).
+				if ing.Batch != nil {
+					ing.Batch.Release()
+				}
+				routerErr <- fmt.Errorf("worker: change for unregistered table %q", table)
 				cancel()
 				return
 			}
@@ -460,6 +474,11 @@ func (w *Worker) Run(ctx context.Context, ingest <-chan Ingest) error {
 			errs = append(errs, err)
 			cancel()
 		}
+	}
+	select {
+	case err := <-routerErr:
+		errs = append(errs, err)
+	default:
 	}
 	return errors.Join(errs...)
 }
@@ -682,6 +701,12 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 
 		// Snapshot partition: untouched snapshot PKs are pure-appended (no
 		// equality delete); everything else collapses columnar.
+		//
+		// This emits TWO ready deliveries with the same Seq (append then
+		// upsert). It relies on the collapsed runner's per-batch send order;
+		// the distributed coordinator's snapshot path must NOT set
+		// SetSnapshotState until the two deliveries are unified into one, or
+		// it drops the second (issue #559).
 		if inSnapshot && !resumed && p.mode == dataplane.UpsertMode {
 			untouchedIdx, restIdx, err := partitionSnapshotRows(merged, guard, p.knownSchema.PrimaryKey)
 			if err != nil {
