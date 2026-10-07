@@ -121,10 +121,12 @@ func TestKgoLogger(t *testing.T) {
 	if l.l == nil {
 		t.Fatal("nil logger must default to slog.Default()")
 	}
-	if l.Level() != kgo.LogLevelInfo {
-		t.Fatalf("Level = %v", l.Level())
+	if l.Level() != kgo.LogLevelWarn {
+		t.Fatalf("Level = %v, want Warn (kgo's Info chatter is dropped)", l.Level())
 	}
-	l.Log(kgo.LogLevelInfo, "hello", "k", "v") // must not panic
+	l.Log(kgo.LogLevelWarn, "hello", "k", "v")  // must not panic
+	l.Log(kgo.LogLevelError, "boom", "k", "v")  // must not panic
+	l.Log(kgo.LogLevelDebug, "trace", "k", "v") // must not panic
 }
 
 // extractionByTopic builds one entry per table that declares columns, and

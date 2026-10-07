@@ -684,7 +684,18 @@ func newKgoLogger(l *slog.Logger) *kgoLogger {
 	return &kgoLogger{l: l}
 }
 
-func (l *kgoLogger) Level() kgo.LogLevel { return kgo.LogLevelInfo }
-func (l *kgoLogger) Log(_ kgo.LogLevel, msg string, keyvals ...any) {
-	l.l.Info(msg, keyvals...)
+// Level returns Warn: kgo's per-request Info chatter is dropped unless the
+// pipeline runs at debug, while warnings and errors still surface
+// (issue #606).
+func (l *kgoLogger) Level() kgo.LogLevel { return kgo.LogLevelWarn }
+
+func (l *kgoLogger) Log(level kgo.LogLevel, msg string, keyvals ...any) {
+	switch level {
+	case kgo.LogLevelError:
+		l.l.Error(msg, keyvals...)
+	case kgo.LogLevelWarn:
+		l.l.Warn(msg, keyvals...)
+	default:
+		l.l.Debug(msg, keyvals...)
+	}
 }
