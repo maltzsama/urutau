@@ -200,6 +200,10 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	if err != nil {
 		return fmt.Errorf("worker: catalog: %w", err)
 	}
+	// The worker owns the sink and its per-table writers; both must be
+	// released when RunRemote returns, success or failure (issue #555). The
+	// writers close first (registered later, deferred LIFO), then the sink.
+	defer func() { _ = snk.Close() }()
 	w := New(Config{MaxRows: cfg.MaxRows, MaxBytes: cfg.MaxBytes, MaxInterval: cfg.MaxInterval, MetricsAddr: cfg.MetricsAddr})
 	// Installed BEFORE the assignment loop: SetStaged below refuses a staged
 	// table whose delivery callback is unset, so installing this afterwards
@@ -221,6 +225,18 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}}})
 	})
 	var stages []*enrich.Stage
+	var writers []sink.TableWriter
+	// Registered BEFORE the loop: an EnsureTable/Writer/SetStaged failure
+	// mid-way must still stop the stages built for earlier tables and close
+	// their writers, or the boot leaks them (issue #555).
+	defer func() {
+		for _, st := range stages {
+			st.Stop()
+		}
+		for _, wr := range writers {
+			_ = wr.Close()
+		}
+	}()
 	pkByTable := make(map[string][]string, len(assign.Tables))
 	for _, ta := range assign.Tables {
 		// The assignment schema arrives as Arrow IPC derived from the
@@ -297,6 +313,7 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		if err != nil {
 			return fmt.Errorf("worker: writer %s: %w", ta.TargetTable, err)
 		}
+		writers = append(writers, writer)
 		w.Register(ta.TargetTable, writer, mode)
 		if len(knownSchema.Columns) > 0 {
 			w.SetKnownSchema(ta.TargetTable, knownSchema)
@@ -321,12 +338,8 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 		}
 	}
 	// The stages' refresh loops live on sessCtx: they die with the session.
-	// Close, though, is deterministic — after the pipelines drain.
-	defer func() {
-		for _, st := range stages {
-			st.Stop()
-		}
-	}()
+	// Their deterministic Stop runs in the defer registered before the
+	// assignment loop, after the pipelines drain.
 	w.OnSchemaDrift(func(d SchemaDrift) {
 		cfg.Logger.Error("schema drift: pipeline paused", "table", d.Table, "column", d.Column,
 			"action", "coordinator must assign a schema with the column; declare it in the spec")
