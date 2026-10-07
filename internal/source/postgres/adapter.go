@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -118,83 +119,172 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 // SELECT <projection> FROM <table> WHERE [filter AND] <cursor> > $1
 // ORDER BY <cursor>. It returns the new cursor — the last row's cursor value,
 // or "" when no rows — and the decoded rows. No slot, no publication.
-func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, after string) (string, []map[string]any, error) {
+// incrementalPageSize bounds one Incremental page, so a large table never
+// loads entirely into memory (issue #572).
+const incrementalPageSize = 1000
+
+// incrementalPosSep separates a cursor from its PK tie-break in a stored
+// position; a cursor's text form never contains NUL.
+const incrementalPosSep = "\x00"
+
+func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, after string) (string, []map[string]any, bool, error) {
 	if a.db == nil {
-		return "", nil, fmt.Errorf("postgres: incremental requires a query connection")
+		return "", nil, false, fmt.Errorf("postgres: incremental requires a query connection")
 	}
 	schema, table, ok := strings.Cut(t.Source, ".")
 	if !ok {
-		return "", nil, fmt.Errorf("postgres: incremental: source %q must be schema.table", t.Source)
+		return "", nil, false, fmt.Errorf("postgres: incremental: source %q must be schema.table", t.Source)
 	}
 	st, err := QueryTable(ctx, a.db, schema, table)
 	if err != nil {
-		return "", nil, fmt.Errorf("postgres: incremental: introspect %s: %w", t.Source, err)
+		return "", nil, false, fmt.Errorf("postgres: incremental: introspect %s: %w", t.Source, err)
 	}
 	ci := st.FindColumn(cursor)
 	if ci < 0 {
-		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q not found in %s", cursor, t.Source)
+		return "", nil, false, fmt.Errorf("postgres: incremental: cursor column %q not found in %s", cursor, t.Source)
 	}
 	if !st.Columns[ci].NotNull {
-		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q is nullable — NULL cursors are excluded from the predicate", cursor)
+		return "", nil, false, fmt.Errorf("postgres: incremental: cursor column %q is nullable — NULL cursors are excluded from the predicate", cursor)
 	}
 
 	specTable, _ := a.tableFor(t.Source)
 	// The cursor must be read to checkpoint it: a projection that omits it
 	// would leave the cursor empty and break the next resume.
 	if len(specTable.ColumnFilter) > 0 && !slices.Contains(specTable.ColumnFilter, cursor) {
-		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
+		return "", nil, false, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
 	}
 	q := psql.Select("*").From(quotePgIdent(schema) + "." + quotePgIdent(table))
 	if len(specTable.ColumnFilter) > 0 {
 		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quotePgIdent(schema) + "." + quotePgIdent(table))
 	}
-	if after != "" {
-		// >=, not >: a non-unique cursor (updated_at) can have new rows at the
-		// same value as the last checkpoint. Re-reading the boundary is
-		// idempotent under upsert and never drops a row.
-		q = q.Where(sq.Expr(quotePgIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, after))
+
+	afterCursor, afterPK := decodeIncrementalPos(after)
+	q, err = incrementalResume(q, st, t.Source, cursor, afterCursor, afterPK, t.PrimaryKey)
+	if err != nil {
+		return "", nil, false, err
 	}
 	if specTable.Filter != nil {
 		f, err := filterToSquirrel(specTable.Filter)
 		if err != nil {
-			return "", nil, fmt.Errorf("postgres: incremental: %s: %w", t.Source, err)
+			return "", nil, false, fmt.Errorf("postgres: incremental: %s: %w", t.Source, err)
 		}
 		q = q.Where(f)
 	}
-	q = q.OrderBy(quotePgIdent(cursor))
+	order := append([]string{quotePgIdent(cursor)}, quotedIdents(t.PrimaryKey)...)
+	q = q.OrderBy(order...).Limit(incrementalPageSize + 1)
 	query, args, err := q.ToSql()
 	if err != nil {
-		return "", nil, fmt.Errorf("postgres: incremental sql: %w", err)
+		return "", nil, false, fmt.Errorf("postgres: incremental sql: %w", err)
 	}
 
 	rows, err := a.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return "", nil, fmt.Errorf("postgres: incremental: %w", err)
+		return "", nil, false, fmt.Errorf("postgres: incremental: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	colsMeta, err := rows.Columns()
 	if err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
-	var out []map[string]any
-	var next string
-	for {
+	raw := make([]map[string]any, 0, incrementalPageSize+1)
+	for len(raw) <= incrementalPageSize {
 		vals, err := scanRow(rows)
 		if errors.Is(err, sql.ErrNoRows) {
 			break
 		}
 		if err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
-		m := normalizeRow(colsMeta, vals)
-		next = fmt.Sprint(m[cursor])
-		out = append(out, m)
+		raw = append(raw, normalizeRow(colsMeta, vals))
 	}
 	if err := rows.Err(); err != nil {
-		return "", nil, err
+		return "", nil, false, err
 	}
-	return next, out, nil
+	if len(raw) == 0 {
+		return "", nil, false, nil
+	}
+	more := len(raw) > incrementalPageSize
+	page := raw
+	if more {
+		page = page[:incrementalPageSize]
+	}
+	last := page[len(page)-1]
+	nextCursor := formatIncrementalCursor(last[cursor])
+	next := nextCursor
+	if more && formatIncrementalCursor(raw[incrementalPageSize][cursor]) == nextCursor {
+		// The boundary cursor group spills into the next page: carry the PK
+		// tie-break so the next call advances past it.
+		pk := make([]string, 0, len(t.PrimaryKey))
+		for _, name := range t.PrimaryKey {
+			pk = append(pk, formatIncrementalCursor(last[name]))
+		}
+		next = encodeIncrementalPos(nextCursor, pk)
+	}
+	return next, page, more, nil
+}
+
+// incrementalResume applies the resume predicate to an incremental page
+// query. A plain cursor re-reads its whole boundary group (>=, idempotent under
+// upsert, so a non-unique cursor is never dropped); a cursor carrying a PK
+// tie-break advances the keyset on (cursor, pk) so a boundary group larger than
+// a page is not re-read forever (issue #572).
+func incrementalResume(q sq.SelectBuilder, st *TableState, source, cursor, afterCursor string, afterPK, primaryKey []string) (sq.SelectBuilder, error) {
+	if afterCursor == "" {
+		return q, nil
+	}
+	ci := st.FindColumn(cursor)
+	if len(afterPK) == 0 {
+		return q.Where(sq.Expr(quotePgIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, afterCursor)), nil
+	}
+	pkCols := make([]string, 0, len(primaryKey))
+	ph := make([]string, 0, len(primaryKey))
+	args := []any{afterCursor, afterCursor}
+	for i, name := range primaryKey {
+		kci := st.FindColumn(name)
+		if kci < 0 {
+			return q, fmt.Errorf("postgres: incremental: key column %q not found in %s", name, source)
+		}
+		pkCols = append(pkCols, quotePgIdent(name))
+		ph = append(ph, "?::"+st.Columns[kci].DataType)
+		args = append(args, afterPK[i])
+	}
+	expr := fmt.Sprintf("%s > ?::%s OR (%s = ?::%s AND (%s) > (%s))",
+		quotePgIdent(cursor), st.Columns[ci].DataType,
+		quotePgIdent(cursor), st.Columns[ci].DataType,
+		strings.Join(pkCols, ", "), strings.Join(ph, ", "))
+	return q.Where(sq.Expr(expr, args...)), nil
+}
+
+// formatIncrementalCursor renders a cursor value as the string the next query
+// casts back with `?::<type>`. A time.Time uses RFC3339Nano, not Go's default
+// layout, which Postgres cannot parse (issue #572).
+func formatIncrementalCursor(v any) string {
+	if ts, ok := v.(time.Time); ok {
+		return ts.UTC().Format(time.RFC3339Nano)
+	}
+	return fmt.Sprint(v)
+}
+
+// encodeIncrementalPos appends the PK tie-break to a cursor position.
+func encodeIncrementalPos(cursor string, pk []string) string {
+	b, err := json.Marshal(pk)
+	if err != nil {
+		return cursor
+	}
+	return cursor + incrementalPosSep + string(b)
+}
+
+// decodeIncrementalPos splits a stored position into its cursor and optional
+// PK tie-break (nil for a plain cursor or a legacy position).
+func decodeIncrementalPos(pos string) (string, []string) {
+	if i := strings.IndexByte(pos, 0); i >= 0 {
+		var pk []string
+		if json.Unmarshal([]byte(pos[i+1:]), &pk) == nil {
+			return pos[:i], pk
+		}
+	}
+	return pos, nil
 }
 
 // Discover implements source.Discoverer (#152): every table the connected
