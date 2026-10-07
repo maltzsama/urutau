@@ -314,16 +314,18 @@ func (w *Worker) DroppedDeletes(target string) int64 {
 }
 
 func newTablePipeline(target string, c sink.TableWriter, mode dataplane.WriteMode) *tablePipeline {
+	// bootstrapGuard is created lazily by SetSnapshotState(in_progress): a
+	// discovery pipeline with a thousand tables would otherwise allocate
+	// ~120 MB of bloom filters no snapshot ever uses (issue #578).
 	return &tablePipeline{
-		target:         target,
-		committer:      c,
-		mode:           mode,
-		ch:             make(chan Ingest, 1024),
-		readyCh:        make(chan readyBatch, 1),
-		windows:        map[uint64]*snapshotWindow{},
-		winClosed:      make(chan struct{}, 1),
-		bootstrapGuard: bloom.NewWithEstimates(100_000, 0.01),
-		driftReported:  map[string]bool{},
+		target:        target,
+		committer:     c,
+		mode:          mode,
+		ch:            make(chan Ingest, 1024),
+		readyCh:       make(chan readyBatch, 1),
+		windows:       map[uint64]*snapshotWindow{},
+		winClosed:     make(chan struct{}, 1),
+		driftReported: map[string]bool{},
 	}
 }
 

@@ -27,6 +27,9 @@ type flowBudget struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 	used map[string]int64
+	// usedTotal is the running sum of used, maintained on acquire/release so
+	// the hot path does not scan the map (issue #582).
+	usedTotal int64
 	// oversizedOwner is the worker holding the single oversized batch the
 	// budget admits at once. A batch larger than the whole ceiling can never
 	// fit it, so waiting for room would deadlock (nothing can free the budget
@@ -55,12 +58,9 @@ func (b *flowBudget) underWorkerMax(worker string, n int64) bool {
 	return b.perWorkerMax <= 0 || used == 0 || used+n <= b.perWorkerMax
 }
 
+// sum reports the total bytes in flight. Caller holds b.mu.
 func (b *flowBudget) sum() int64 {
-	var s int64
-	for _, v := range b.used {
-		s += v
-	}
-	return s
+	return b.usedTotal
 }
 
 // acquire reserves n bytes for one worker, blocking while the process is
@@ -99,6 +99,7 @@ func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error 
 		b.cond.Wait()
 	}
 	b.used[worker] += n
+	b.usedTotal += n
 	if oversized {
 		b.oversizedOwner = worker
 	}
@@ -109,6 +110,7 @@ func (b *flowBudget) acquire(ctx context.Context, worker string, n int64) error 
 func (b *flowBudget) release(worker string, n int64) {
 	b.mu.Lock()
 	b.used[worker] -= n
+	b.usedTotal -= n
 	if b.used[worker] <= 0 {
 		delete(b.used, worker)
 		if b.oversizedOwner == worker {

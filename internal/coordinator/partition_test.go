@@ -279,3 +279,30 @@ func TestEnqueueBatchErrorReleasesRemainingSubBatches(t *testing.T) {
 		t.Fatal("a cancelled context must fail the enqueue")
 	}
 }
+
+// When one partition owns every row, splitByOwner retains the input instead
+// of materializing an identity Take (issue #580).
+func TestSplitByOwnerAllRowsToOnePartitionRetainsInput(t *testing.T) {
+	changes := []rowchange.Change{testChange(5, "t"), testChange(50, "t")}
+	cs := transport.InferSchemaFromChanges(changes)
+	rec, err := transport.RecordFromChanges(changes, cs, nil)
+	if err != nil {
+		t.Fatalf("RecordFromChanges: %v", err)
+	}
+	defer rec.Release()
+
+	subs, err := splitByOwner(context.Background(), rec, []int{0, 0}, 1)
+	if err != nil {
+		t.Fatalf("splitByOwner: %v", err)
+	}
+	defer func() {
+		for _, s := range subs {
+			if s != nil {
+				s.Release()
+			}
+		}
+	}()
+	if subs[0] != rec {
+		t.Fatal("a single owner must retain the input record, not Take a copy")
+	}
+}
