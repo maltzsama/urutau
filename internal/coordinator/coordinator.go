@@ -3056,14 +3056,19 @@ func (w *workerState) dropSent(ids []uint64) {
 	if len(ids) == 0 {
 		return
 	}
-	drop := make(map[uint64]struct{}, len(ids))
-	for _, id := range ids {
-		drop[id] = struct{}{}
-	}
+	// ids is almost always 1-2 (an ack pops a couple of batches), so a nested
+	// scan beats allocating a map per ack (issue #605).
 	w.sentMu.Lock()
 	kept := w.sent[:0]
 	for _, qb := range w.sent {
-		if _, ok := drop[qb.id]; !ok {
+		dropped := false
+		for _, id := range ids {
+			if qb.id == id {
+				dropped = true
+				break
+			}
+		}
+		if !dropped {
 			kept = append(kept, qb)
 		}
 	}
