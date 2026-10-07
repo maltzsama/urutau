@@ -87,6 +87,7 @@ func (c *Coordinator) heldChunkMarkers(worker string) []chunkMarker {
 		delete(c.chunkMarkers, worker)
 		return nil
 	}
+	clear(c.chunkMarkers[worker][len(kept):])
 	c.chunkMarkers[worker] = kept
 	return append([]chunkMarker(nil), kept...)
 }

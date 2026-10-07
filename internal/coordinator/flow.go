@@ -190,6 +190,23 @@ func (p *positionIndex) add(b inflightBatch) {
 	p.gen++
 }
 
+// remove drops the entry for id if present and reports whether it was found:
+// it undoes an add for a batch whose send was cancelled before the worker
+// ever saw it (issue #559).
+func (p *positionIndex) remove(id uint64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.head {
+		if p.head[i].id == id {
+			p.head = append(p.head[:i], p.head[i+1:]...)
+			p.dirty = true
+			p.gen++
+			return true
+		}
+	}
+	return false
+}
+
 // Dirty reports whether the manifest changed since the last MarkClean.
 func (p *positionIndex) Dirty() bool {
 	p.mu.Lock()

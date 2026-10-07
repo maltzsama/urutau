@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -413,5 +414,35 @@ func TestDialOptsRejectsBadTLS(t *testing.T) {
 	_, err := dialOpts(grpctls.Config{CertFile: "/nonexistent", KeyFile: "/nonexistent", ClientCAFile: "/nonexistent"})
 	if err == nil {
 		t.Fatal("dialOpts must error on invalid TLS credentials, not fall back to plaintext")
+	}
+}
+
+// A change for an unregistered table must fail with the table named, not a
+// bare context canceled (issue #559).
+func TestRunUnregisteredTableNamesTheTable(t *testing.T) {
+	w := New(Config{})
+	w.RegisterCommitter("t", CommitterFunc(func(context.Context, *dataplane.Batch) error { return nil }), dataplane.UpsertMode)
+	w.SetKnownSchema("t", testSchema())
+
+	changes := []rowchange.Change{{
+		Op: rowchange.OpInsert, Table: "other", Key: []any{int64(1)},
+		After: map[string]any{"id": int64(1), "v": "x"}, Position: "p",
+	}}
+	ing := make(chan Ingest, 2)
+	for _, in := range ingestFromChanges(t, changes) {
+		ing <- in
+	}
+	close(ing)
+
+	err := w.Run(context.Background(), ing)
+	if err == nil || !strings.Contains(err.Error(), `unregistered table "other"`) {
+		t.Fatalf("Run err = %v, want the table named", err)
+	}
+}
+
+// A non-positive MaxInterval must not reach time.NewTicker (issue #559).
+func TestNewDefaultsMaxInterval(t *testing.T) {
+	if w := New(Config{MaxInterval: 0}); w.cfg.MaxInterval <= 0 {
+		t.Fatalf("MaxInterval = %v, want a positive default", w.cfg.MaxInterval)
 	}
 }

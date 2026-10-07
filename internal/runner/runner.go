@@ -548,6 +548,9 @@ type Runner struct {
 	closeQuery            func()
 	cancel                context.CancelFunc // stops the worker/relay goroutines (issue #487)
 	workerErr, routerDone <-chan error
+	// workerDone closes when the worker goroutine has returned, so Run waits
+	// for an in-flight commit before releasing the sink (issue #559).
+	workerDone <-chan struct{}
 
 	// committedPositions tracks the latest durably-committed position per
 	// target table. The minimum across tables is the confirmed position
@@ -902,7 +905,8 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 		r.updateCommitted(b.Table, p)
 	})
 	workerErr := make(chan error, 1)
-	go func() { workerErr <- w.Run(runCtx, ingest) }()
+	workerDone := make(chan struct{})
+	go func() { defer close(workerDone); workerErr <- w.Run(runCtx, ingest) }()
 
 	resume, needsSnapshot, recovery, err := resumeFrom(ctx, src, snk, cdcRefs)
 	if err != nil {
@@ -1059,6 +1063,7 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 
 	r.workerErr = workerErr
 	r.routerDone = routerDone
+	r.workerDone = workerDone
 
 	return r, nil
 }
@@ -1072,6 +1077,17 @@ func (r *Runner) Run(ctx context.Context) error {
 	// from one of them would otherwise leave the peers running (issue #487).
 	if r.cancel != nil {
 		r.cancel()
+	}
+	// Wait for the worker goroutine to return before releasing the sink: a
+	// commit in flight would otherwise use a closed sink (issue #559).
+	if r.workerDone != nil {
+		select {
+		case <-r.workerDone:
+		case <-time.After(10 * time.Second):
+			if r.log != nil {
+				r.log.Warn("runner: worker did not stop before releasing resources")
+			}
+		}
 	}
 
 	if r.ev != nil {

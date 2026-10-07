@@ -1033,9 +1033,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 		c.emitLog(eventlog.KindJobStopped, terminalFields("session", err))
 		return fmt.Errorf("coordinator: worker session: %w", err)
 	case err := <-streamErr:
-		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobStopped, terminalFields("stream", err))
-		return fmt.Errorf("coordinator: stream: %w", err)
+		return c.streamTerminal(err)
 	case err := <-c.terminate:
 		c.gracefulShutdown()
 		c.emitLog(eventlog.KindJobTerminated, terminalFields(terminateReason(err), err))
@@ -1065,13 +1063,13 @@ func (c *Coordinator) run(ctx context.Context) error {
 			return err
 		case err := <-streamErr:
 			if ctx.Err() != nil {
+				c.gracefulShutdown()
 				return ctx.Err()
 			}
-			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobStopped, terminalFields("stream", err))
-			return fmt.Errorf("coordinator: stream: %w", err)
+			return c.streamTerminal(err)
 		case err := <-c.sessionErrs:
 			if ctx.Err() != nil {
+				c.gracefulShutdown()
 				return ctx.Err()
 			}
 			c.gracefulShutdown()
@@ -2166,28 +2164,43 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	if posStr == "" {
 		posStr = meta.LowPos
 	}
+	return c.deliverBatch(ctx, w, meta, body, metaBytes, n, snapshotRows, posStr)
+}
+
+// deliverBatch queues one batch to its worker. It registers the batch in the
+// in-flight index BEFORE the send — a fast ack can arrive as soon as the batch
+// reaches the worker — and undoes that registration if the send is cancelled
+// (issue #559).
+func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb.BatchMeta, body, metaBytes []byte, n int64, snapshotRows bool, posStr string) error {
 	var high position.Position
 	if posStr != "" {
-		high, err = c.src.ParsePosition(posStr)
-		if err != nil {
+		var err error
+		if high, err = c.src.ParsePosition(posStr); err != nil {
 			if !snapshotRows {
 				c.budget.release(w.name, n)
 			}
 			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
 		}
 	}
+	var idx *positionIndex
+	if !snapshotRows {
+		if idx = c.indexOf(w.name); idx != nil {
+			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
+				marker: meta.Window != nil && meta.Window.Closes})
+		}
+	}
 	select {
 	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes}:
 		if !snapshotRows {
-			if idx := c.indexOf(w.name); idx != nil {
-				idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
-					marker: meta.Window != nil && meta.Window.Closes})
-			}
 			c.noteSent(meta.Table, posStr)
 		}
 		return nil
 	case <-ctx.Done():
 		if !snapshotRows {
+			// The batch never reached the worker: undo the registration.
+			if idx != nil {
+				idx.remove(meta.BatchId)
+			}
 			c.budget.release(w.name, n)
 		}
 		return ctx.Err()
@@ -2998,6 +3011,10 @@ func (w *workerState) dropSent(ids []uint64) {
 			kept = append(kept, qb)
 		}
 	}
+	// Zero the removed tail: it shares the backing array and each queuedBatch
+	// holds a multi-MiB body, so leaving it referenced leaks the batch
+	// (issue #559).
+	clear(w.sent[len(kept):])
 	w.sent = kept
 	w.sentMu.Unlock()
 }
@@ -3040,6 +3057,21 @@ func tableNames(refs []source.TableRef) []string {
 // sourceBatches forwards the reader's columnar batches to the pump — no
 // decode, no per-row hop (G0/M4). Ownership: each batch moves to the pump,
 // which gates, serializes and releases it.
+// errStreamEnd is sent on the coordinator's stream error channel for a clean
+// source-stream end, so the consumer can tell it from a failure (issue #559).
+var errStreamEnd = errors.New("coordinator: source stream ended")
+
+// streamTerminal runs the common teardown for a source-stream terminal signal:
+// a clean end is a normal return, anything else is wrapped (issue #559).
+func (c *Coordinator) streamTerminal(err error) error {
+	c.gracefulShutdown()
+	c.emitLog(eventlog.KindJobStopped, terminalFields("stream", err))
+	if errors.Is(err, errStreamEnd) {
+		return nil
+	}
+	return fmt.Errorf("coordinator: stream: %w", err)
+}
+
 func sourceBatches(ctx context.Context, rdr source.Reader) (<-chan *dataplane.Batch, <-chan error) {
 	out := make(chan *dataplane.Batch, 16)
 	errCh := make(chan error, 1)
@@ -3052,7 +3084,9 @@ func sourceBatches(ctx context.Context, rdr source.Reader) (<-chan *dataplane.Ba
 				return
 			}
 			if b == nil {
-				errCh <- nil
+				// A clean end, not an error: sending nil and wrapping it
+				// with %w rendered "stream: %!w(<nil>)" (issue #559).
+				errCh <- errStreamEnd
 				return
 			}
 			select {
