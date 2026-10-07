@@ -16,9 +16,16 @@ import (
 
 // Column is one introspected source column.
 type Column struct {
-	Name     string
-	DataType string // pg_type native name ("int8", "text", "timestamptz", …)
-	NotNull  bool   // attnotnull: the column cannot hold NULL
+	Name string
+	// DataType is the SQL-standard BASE type WITHOUT a modifier
+	// ("character varying", "numeric", "timestamp with time zone") — the form
+	// every switch compares against and every `?::<type>` cast accepts.
+	DataType string
+	// RawType is format_type with the modifier ("character varying(64)",
+	// "numeric(10,2)"), kept only so decimal precision/scale can be parsed
+	// (issue #561).
+	RawType string
+	NotNull bool // attnotnull: the column cannot hold NULL
 }
 
 // TableState is the introspection result for one source table: the ordered
@@ -65,8 +72,15 @@ func QueryTable(ctx context.Context, db *sql.DB, schemaName, tableName string) (
 }
 
 func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]Column, error) {
+	// format_type(atttypid, NULL) is the base name WITHOUT the modifier, so
+	// "character varying(64)" becomes "character varying" and the equality
+	// switches match; format_type(atttypid, atttypmod) keeps the modifier for
+	// decimal precision/scale (issue #561).
 	rows, err := db.QueryContext(ctx, `
-		SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull
+		SELECT a.attname,
+		       pg_catalog.format_type(a.atttypid, NULL),
+		       pg_catalog.format_type(a.atttypid, a.atttypmod),
+		       a.attnotnull
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -80,12 +94,12 @@ func queryColumns(ctx context.Context, db *sql.DB, s, t string) ([]Column, error
 
 	var out []Column
 	for rows.Next() {
-		var name, dataType string
+		var name, dataType, rawType string
 		var notNull bool
-		if err := rows.Scan(&name, &dataType, &notNull); err != nil {
+		if err := rows.Scan(&name, &dataType, &rawType, &notNull); err != nil {
 			return nil, err
 		}
-		out = append(out, Column{Name: name, DataType: dataType, NotNull: notNull})
+		out = append(out, Column{Name: name, DataType: dataType, RawType: rawType, NotNull: notNull})
 	}
 	return out, rows.Err()
 }
@@ -123,7 +137,7 @@ func queryPK(ctx context.Context, db *sql.DB, s, t string) ([]string, error) {
 func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 	cols := make([]core.Column, 0, len(tbl.Columns))
 	for _, col := range tbl.Columns {
-		ct, err := mapColumnType(col.DataType, col.DataType)
+		ct, err := mapColumnType(col.DataType, col.RawType)
 		if err != nil {
 			return core.Schema{}, fmt.Errorf("postgres: column %q: %w", col.Name, err)
 		}
@@ -144,6 +158,11 @@ func CanonicalSchema(tbl *TableState) (core.Schema, error) {
 // the snapshot chunker produces the same text). Unmappable types become
 // KindUnknown so a declared cast is the only way to land them.
 func mapColumnType(dataType, rawType string) (core.ColumnType, error) {
+	// Callers that have only one string (older callers, tests) pass the
+	// modifier-bearing form as dataType; treat it as the raw form too.
+	if rawType == "" {
+		rawType = dataType
+	}
 	switch {
 	case dataType == "smallint", dataType == "integer", dataType == "bigint":
 		return core.ColumnType{Kind: core.KindInt64}, nil
