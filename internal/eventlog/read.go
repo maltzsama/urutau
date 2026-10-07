@@ -133,6 +133,52 @@ func ReadRunTrail(ctx context.Context, cfg RootConfig, pipeline, runID string) (
 	return readRunTrail(ctx, l, cfg, pipeline, runID)
 }
 
+// ReadRunOutcome reads only the run's LAST trail object and derives its
+// outcome, instead of reading every object (issue #592): the terminal event
+// (job_stopped/job_terminated/the run_sealed marker) is always in the last
+// object the writer sealed.
+func ReadRunOutcome(ctx context.Context, cfg RootConfig, pipeline, runID string) (Outcome, error) {
+	l, err := newLister(ctx, cfg)
+	if err != nil {
+		return OutcomeUnknown, err
+	}
+	return readRunOutcome(ctx, l, cfg, pipeline, runID)
+}
+
+func readRunOutcome(ctx context.Context, l lister, cfg RootConfig, pipeline, runID string) (Outcome, error) {
+	if !ValidSegment(pipeline) {
+		return OutcomeUnknown, fmt.Errorf("%w: pipeline %q", ErrInvalidID, pipeline)
+	}
+	if !ValidSegment(runID) {
+		return OutcomeUnknown, fmt.Errorf("%w: run %q", ErrInvalidID, runID)
+	}
+	prefix := pipelinePrefix(cfg.Prefix, pipeline) + "run-" + runID + "/"
+	objects, _, err := l.List(ctx, cfg.Bucket, prefix, "")
+	if err != nil {
+		return OutcomeUnknown, err
+	}
+	keys := make([]string, 0, len(objects))
+	for _, key := range objects {
+		if strings.HasSuffix(key, ".jsonl") {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return OutcomeUnknown, fmt.Errorf("%w: run %q of pipeline %q", ErrNotFound, runID, pipeline)
+	}
+	sort.Strings(keys)
+	last := keys[len(keys)-1]
+	body, err := l.Get(ctx, cfg.Bucket, last)
+	if err != nil {
+		return OutcomeUnknown, fmt.Errorf("eventlog: get %s: %w", last, err)
+	}
+	events, err := parseEvents(body)
+	if err != nil {
+		return OutcomeUnknown, fmt.Errorf("eventlog: parse %s: %w", last, err)
+	}
+	return outcomeOf(events), nil
+}
+
 func listPipelines(ctx context.Context, l lister, cfg RootConfig) ([]PipelineSummary, error) {
 	root := rootPrefix(cfg.Prefix)
 	_, prefixes, err := l.List(ctx, cfg.Bucket, root, "/")

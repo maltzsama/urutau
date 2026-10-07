@@ -173,3 +173,34 @@ func TestReadRejectsUnsafeSegment(t *testing.T) {
 		}
 	}
 }
+
+type getCountingLister struct {
+	*fakeLister
+	gets []string
+}
+
+func (g *getCountingLister) Get(ctx context.Context, bucket, key string) ([]byte, error) {
+	g.gets = append(g.gets, key)
+	return g.fakeLister.Get(ctx, bucket, key)
+}
+
+// ReadRunOutcome reads only the run's last object, not the whole trail
+// (issue #592).
+func TestReadRunOutcomeReadsOnlyLastObject(t *testing.T) {
+	base := &fakeLister{objects: map[string]string{
+		"urutau/shop/run-20260101T000000-aa/events-000000.jsonl": `{"kind":"job_started","seq":1}` + "\n",
+		"urutau/shop/run-20260101T000000-aa/events-000001.jsonl": `{"kind":"job_terminated","reason":"cancelled","seq":2}` + "\n",
+	}}
+	l := &getCountingLister{fakeLister: base}
+
+	o, err := readRunOutcome(context.Background(), l, RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "20260101T000000-aa")
+	if err != nil {
+		t.Fatalf("readRunOutcome: %v", err)
+	}
+	if o != OutcomeCancelled {
+		t.Fatalf("outcome = %q, want %q", o, OutcomeCancelled)
+	}
+	if len(l.gets) != 1 || !strings.HasSuffix(l.gets[0], "events-000001.jsonl") {
+		t.Fatalf("gets = %v, want only the last object", l.gets)
+	}
+}

@@ -99,6 +99,16 @@ func (s *cachedStore) ListRuns(ctx context.Context, pipeline string) ([]eventlog
 	return s.inner.ListRuns(ctx, pipeline)
 }
 
+// ReadRunOutcome reuses a cached sealed trail's outcome when present, else
+// delegates: the listing does not read the whole trail just to classify a run
+// (issue #592).
+func (s *cachedStore) ReadRunOutcome(ctx context.Context, pipeline, runID string) (eventlog.Outcome, error) {
+	if t, ok := s.cache.get(pipeline + "/" + runID); ok {
+		return t.Outcome, nil
+	}
+	return s.inner.ReadRunOutcome(ctx, pipeline, runID)
+}
+
 func (s *cachedStore) ReadRunTrail(ctx context.Context, pipeline, runID string) (eventlog.Trail, error) {
 	key := pipeline + "/" + runID
 	if t, ok := s.cache.get(key); ok {
