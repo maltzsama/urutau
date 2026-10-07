@@ -97,6 +97,9 @@ type Reader struct {
 	// curCommitTS is the transaction's commit time, captured on the GTID
 	// event and stamped onto every row of the transaction (issue #137).
 	curCommitTS time.Time
+	// debug caches URUTAU_DEBUG_READER once at construction: reading the
+	// environment per row event was a hot-path cost (issue #585).
+	debug bool
 
 	// done is closed once by StartFromGTID on the way out. OnRow and the txn
 	// close select on it alongside every send: without it a stalled consumer
@@ -148,6 +151,7 @@ func New(ctx context.Context, cfg Config, batchOut chan<- *dataplane.Batch) (*Re
 		projections: cfg.Projections,
 		encoders:    make(map[string]*tableEncoder, len(cfg.Tables)),
 		done:        make(chan struct{}),
+		debug:       os.Getenv("URUTAU_DEBUG_READER") != "",
 	}
 	c.SetEventHandler(r)
 	return r, nil
@@ -360,7 +364,7 @@ func (r *Reader) OnRow(e *canal.RowsEvent) error {
 	commitTS := r.curCommitTS
 	r.mu.Unlock()
 
-	if dbg := r.cfg.Logger; dbg != nil && os.Getenv("URUTAU_DEBUG_READER") != "" {
+	if dbg := r.cfg.Logger; dbg != nil && r.debug {
 		dbg.Info("row", "table", ref.Source, "action", e.Action, "pos", pos, "nrows", len(e.Rows))
 	}
 

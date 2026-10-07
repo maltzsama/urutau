@@ -197,3 +197,29 @@ func TestChunkExecutorRejectsEmptyPrimaryKey(t *testing.T) {
 		t.Fatal("run accepted an assignment with no primary key")
 	}
 }
+
+type countingQuerySource struct {
+	fakeQuerySource
+	calls int
+}
+
+func (q *countingQuerySource) NewChunker(_, _ string, _ int) (source.ChunkSource, error) {
+	q.calls++
+	return q.cs, nil
+}
+
+// The chunker is built once per table, not once per ChunkRequest (issue #586).
+func TestChunkExecutorCachesChunkerPerTable(t *testing.T) {
+	q := &countingQuerySource{fakeQuerySource: fakeQuerySource{cs: &fakeChunkSource{pk: []string{"id"}}}}
+	x := &chunkExecutor{chunkSz: 10, qsrc: q}
+	ta := &pb.TableAssignment{PrimaryKey: []string{"id"}}
+
+	for i := 0; i < 3; i++ {
+		if _, err := x.chunkerFor(q, "src.t", ta); err != nil {
+			t.Fatalf("chunkerFor %d: %v", i, err)
+		}
+	}
+	if q.calls != 1 {
+		t.Fatalf("NewChunker calls = %d, want 1 (cached per table)", q.calls)
+	}
+}

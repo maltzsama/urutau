@@ -29,7 +29,12 @@ type chunkExecutor struct {
 	chunkSz  int
 	// perRow is each target's last chunk's bytes per row per column: the
 	// next chunk's buffers are sized from it (readChunk).
-	perRow    map[string][]int
+	perRow map[string][]int
+	// chunkers caches one ChunkSource per table, so NewChunker (which may
+	// consult source metadata) runs once per table, not once per chunk
+	// (issue #586). run is called from a single chunk-work goroutine, so the
+	// map needs no lock.
+	chunkers  map[string]source.ChunkSource
 	epoch     uint64                         // the Assignment epoch; echoed on ChunkReady so a stale reply is ignored
 	bySource  map[string]*pb.TableAssignment // source table → target/PK
 	qsrc      source.QuerySource
@@ -175,7 +180,7 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		high = boundRows[1]
 	}
 
-	chunker, err := q.NewChunker(req.Table, strings.Join(ta.PrimaryKey, ","), x.chunkSz)
+	chunker, err := x.chunkerFor(q, req.Table, ta)
 	if err != nil {
 		return err
 	}
@@ -208,6 +213,25 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 		Epoch:           x.epoch,
 		WindowIds:       windowIDs,
 	}}})
+}
+
+// chunkerFor returns the table's cached ChunkSource, building it once — the
+// chunker depends only on the table's PK and projection, both fixed for the
+// assignment, so rebuilding it per ChunkRequest is wasted metadata work
+// (issue #586).
+func (x *chunkExecutor) chunkerFor(q source.QuerySource, table string, ta *pb.TableAssignment) (source.ChunkSource, error) {
+	if c, ok := x.chunkers[table]; ok {
+		return c, nil
+	}
+	c, err := q.NewChunker(table, strings.Join(ta.PrimaryKey, ","), x.chunkSz)
+	if err != nil {
+		return nil, err
+	}
+	if x.chunkers == nil {
+		x.chunkers = map[string]source.ChunkSource{}
+	}
+	x.chunkers[table] = c
+	return c, nil
 }
 
 // emitWindow turns one byte-capped page into an open window: it waits out the
