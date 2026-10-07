@@ -61,6 +61,10 @@ type Config struct {
 	// Plugin is the logical decoding plugin: "pgoutput" (default) or
 	// "wal2json".
 	Plugin string
+	// ReplicaIdentity is "full" (default) or "keep" (issue #571): FULL is set
+	// only when the table is not already, and keep leaves the table's
+	// identity untouched.
+	ReplicaIdentity string
 	// Filters and Columns are the per-source read projection (#162/#163),
 	// keyed by "schema.table". The reader compiles the filter with the
 	// introspected column types, so numeric columns compare numerically.
@@ -242,7 +246,7 @@ func New(ctx context.Context, cfg Config, batchOut chan<- *dataplane.Batch) (*Re
 	if cfg.Plugin == "" {
 		cfg.Plugin = "pgoutput"
 	}
-	if err := EnsureSetup(ctx, cfg.DB, cfg.SlotName, cfg.Tables, cfg.Plugin); err != nil {
+	if err := EnsureSetup(ctx, cfg.DB, cfg.SlotName, cfg.Tables, cfg.Plugin, cfg.ReplicaIdentity); err != nil {
 		return nil, err
 	}
 

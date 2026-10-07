@@ -61,7 +61,7 @@ func isPartitionedParent(ctx context.Context, db *sql.DB, schema, table string) 
 // The slot is the consistency anchor: created before the snapshot starts,
 // it guarantees no transaction between slot creation and the stream start
 // is ever lost.
-func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []source.TableRef, plugin string) error {
+func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []source.TableRef, plugin, replicaIdentity string) error {
 	if !slotNameRe.MatchString(slotName) {
 		return fmt.Errorf("postgres: slot name %q must match %s", slotName, slotNameRe)
 	}
@@ -79,10 +79,8 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 
 	for _, ref := range tables {
 		schema, table, _ := strings.Cut(ref.Source, ".")
-		if _, err := db.ExecContext(ctx,
-			fmt.Sprintf(`ALTER TABLE %s.%s REPLICA IDENTITY FULL`,
-				quotePgIdent(schema), quotePgIdent(table))); err != nil {
-			return fmt.Errorf("postgres: replica identity %s: %w", ref.Source, err)
+		if err := ensureReplicaIdentity(ctx, db, ref.Source, schema, table, replicaIdentity); err != nil {
+			return err
 		}
 	}
 
@@ -126,6 +124,62 @@ func EnsureSetup(ctx context.Context, db *sql.DB, slotName string, tables []sour
 		}
 	}
 	return nil
+}
+
+// ensureReplicaIdentity makes schema.table's REPLICA IDENTITY FULL when the
+// spec asks for it (mode "" or "full") and the table is not already full.
+// Reading relreplident first means a boot over an already-FULL table issues no
+// ALTER at all — no ACCESS EXCLUSIVE lock, no permanent WAL growth, and no
+// table ownership required. "keep" leaves the identity untouched (issue #571).
+func ensureReplicaIdentity(ctx context.Context, db *sql.DB, source, schema, table, mode string) error {
+	if mode == "keep" {
+		return nil
+	}
+	current, err := replicaIdentityOf(ctx, db, schema, table)
+	if err != nil {
+		return fmt.Errorf("postgres: replica identity %s: %w", source, err)
+	}
+	if current == 'f' {
+		return nil
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: replica identity %s: %w", source, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Bound the ACCESS EXCLUSIVE lock the ALTER needs: fail with a clear
+	// lock_timeout instead of queueing behind a long transaction and
+	// blocking every arrival behind us.
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+		return fmt.Errorf("postgres: replica identity %s: set lock_timeout: %w", source, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		fmt.Sprintf(`ALTER TABLE %s.%s REPLICA IDENTITY FULL`,
+			quotePgIdent(schema), quotePgIdent(table))); err != nil {
+		return fmt.Errorf("postgres: replica identity %s: %w", source, err)
+	}
+	return tx.Commit()
+}
+
+// replicaIdentityOf returns pg_class.relreplident for schema.table: 'd'
+// default, 'n' nothing, 'f' full, 'i' index.
+func replicaIdentityOf(ctx context.Context, db *sql.DB, schema, table string) (byte, error) {
+	var r string
+	err := db.QueryRowContext(ctx, `
+		SELECT c.relreplident::text
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, schema, table).Scan(&r)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("table %s.%s not found", schema, table)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if r == "" {
+		return 0, nil
+	}
+	return r[0], nil
 }
 
 // ensurePublication creates or syncs the pgoutput publication, with

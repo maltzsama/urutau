@@ -421,23 +421,28 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	// returned stream pulls from it. Creating it per attempt would orphan
 	// the reader's output on the attempt that succeeds.
 	batches := make(chan *dataplane.Batch, 256)
+	replicaIdentity := ""
+	if a.spec.Source.Postgres != nil {
+		replicaIdentity = a.spec.Source.Postgres.ReplicaIdentity
+	}
 	var rdr *Reader
 	var err error
 	for attempt := 0; ; attempt++ {
 		rdr, err = New(ctx, Config{
-			URI:           uri,
-			ConnCfg:       a.connCfg,
-			DB:            a.db,
-			SlotName:      slot,
-			Tables:        refs,
-			Logger:        a.rt.Logger,
-			RetryCount:    maxRetries,
-			InitialWait:   initialWait,
-			Plugin:        plugin,
-			Filters:       filters,
-			Columns:       columns,
-			UpsertTargets: upsertTargets,
-			Schemas:       schemas,
+			URI:             uri,
+			ConnCfg:         a.connCfg,
+			DB:              a.db,
+			SlotName:        slot,
+			Tables:          refs,
+			Logger:          a.rt.Logger,
+			RetryCount:      maxRetries,
+			InitialWait:     initialWait,
+			Plugin:          plugin,
+			ReplicaIdentity: replicaIdentity,
+			Filters:         filters,
+			Columns:         columns,
+			UpsertTargets:   upsertTargets,
+			Schemas:         schemas,
 		}, batches)
 		if err == nil {
 			break
