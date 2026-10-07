@@ -750,47 +750,6 @@ func castToJSON(v any) (any, error) {
 	}
 }
 
-// dateLayout, naiveTimestampLayout and timeOfDayLayout are the source-native
-// temporal renderings. The naive layout's trailing .999999999 makes the
-// fraction optional and strips trailing zeros, so it alone covers a naive
-// timestamp with or without a fraction — there is no separate layout for
-// "no fraction".
-//
-// naiveTimestampTextLayout is the canonical OUTPUT for a naive timestamp:
-// fixed nine-digit fraction, no zone (the zone does not exist in the data).
-const (
-	dateLayout               = "2006-01-02"
-	naiveTimestampLayout     = "2006-01-02 15:04:05.999999999"
-	naiveTimestampTextLayout = "2006-01-02 15:04:05.000000000"
-	timeOfDayLayout          = "15:04:05.999999999"
-)
-
-// ParseTimestampText parses a temporal text into a time.Time: an RFC3339
-// instant (zone preserved), a bare date (midnight), or a naive timestamp
-// with an optional fraction.
-func ParseTimestampText(s string) (time.Time, error) {
-	if tm, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return tm, nil
-	}
-	if tm, err := time.Parse(dateLayout, s); err == nil {
-		return tm, nil
-	}
-	if tm, err := time.Parse(naiveTimestampLayout, s); err == nil {
-		return tm, nil
-	}
-	return time.Time{}, fmt.Errorf("core: %q is not a temporal value", s)
-}
-
-// ParseTimeOfDayText parses "HH:MM:SS[.fraction]" into micros since midnight.
-func ParseTimeOfDayText(s string) (int64, error) {
-	tm, err := time.Parse(timeOfDayLayout, s)
-	if err != nil {
-		return 0, fmt.Errorf("core: %q is not a time-of-day value", s)
-	}
-	return int64(tm.Hour())*3_600_000_000 + int64(tm.Minute())*60_000_000 +
-		int64(tm.Second())*1_000_000 + int64(tm.Nanosecond())/1_000, nil
-}
-
 // castToTimestamp reinterprets a naive temporal value: date becomes midnight,
 // timestamptz drops its zone. Never parses a free-form string.
 func castToTimestamp(from Kind, v any) (any, error) {

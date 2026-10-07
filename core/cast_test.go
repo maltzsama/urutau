@@ -698,3 +698,25 @@ func TestResolveSchemaRejectsFloatPrimaryKey(t *testing.T) {
 		t.Fatalf("a float column with no primary key must validate: %v", err)
 	}
 }
+
+// PostgreSQL's own temporal text forms must parse: the CDC path delivers them
+// as text, and a rejection failed the first stream event forever (issue #560).
+func TestParseTemporalTextPostgres(t *testing.T) {
+	for _, s := range []string{
+		"2026-10-02 13:00:00.123456+00",
+		"2026-10-02 13:00:00-03",
+		"2026-10-02 13:00:00.123456+05:30",
+		"2026-10-02 13:00:00.123456-03:00:00",
+		"2026-10-02 13:00:00",
+	} {
+		if _, err := ParseTimestampText(s); err != nil {
+			t.Errorf("ParseTimestampText(%q): %v", s, err)
+		}
+	}
+	// timetz: the zone is dropped; the wall time is kept.
+	for _, s := range []string{"12:00:00+02", "12:00:00.5-03:30", "12:00:00Z"} {
+		if _, err := ParseTimeOfDayText(s); err != nil {
+			t.Errorf("ParseTimeOfDayText(%q): %v", s, err)
+		}
+	}
+}
