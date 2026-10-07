@@ -23,8 +23,6 @@ import (
 )
 
 func main() {
-	// The Pod's memory limit, given to the garbage collector (#437).
-	memlimit.Apply(slog.Default())
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "urutau-worker:", err)
 		writeTerminationMessage(err)
@@ -187,6 +185,9 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 		return worker.RemoteConfig{}, err
 	}
 	slog.SetDefault(logger)
+	// The Pod's memory limit, given to the garbage collector (#437).
+	// Applied AFTER the logger so the first line honours --log-format.
+	memlimit.Apply(logger)
 	// The secret defaults to the environment, but only HERE — as a flag
 	// default it would be printed by --help and by a mistyped flag's usage,
 	// leaking the credential into logs (#597).

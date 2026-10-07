@@ -8,6 +8,8 @@ package maintenance
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"strings"
 	"sync"
@@ -247,8 +249,9 @@ func durationOrDefault(s string, def time.Duration) time.Duration {
 // Role and the Pods drift apart, and the failure mode is a coordinator that
 // cannot clean up after itself.
 func WorkerName(pipeline, table string) string {
+	full := strings.ToLower(pipeline + "-" + table)
 	var b strings.Builder
-	for _, r := range strings.ToLower(pipeline + "-" + table + "-maint") {
+	for _, r := range full {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
 			b.WriteRune(r)
 		} else {
@@ -257,10 +260,16 @@ func WorkerName(pipeline, table string) string {
 	}
 	s := strings.Trim(b.String(), "-")
 	if s == "" {
-		s = "urutau-maintenance"
+		s = "urutau"
 	}
-	if len(s) > 63 {
-		s = strings.Trim(s[:63], "-")
+	// A short hash of the FULL name disambiguates names that sanitize to the
+	// same string (db.a_b vs db.a-b) or collide after truncation, and makes
+	// the suffix survive truncation instead of being what gets cut
+	// (issue #576).
+	sum := sha256.Sum256([]byte(full))
+	suffix := "-" + hex.EncodeToString(sum[:4])
+	if len(s) > 63-len(suffix) {
+		s = strings.Trim(s[:63-len(suffix)], "-")
 	}
-	return s
+	return s + suffix
 }

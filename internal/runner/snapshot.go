@@ -82,9 +82,13 @@ func (r *Runner) runSnapshot(
 			"table": ref.Source, "target": ref.Target, "mode": bootstrapMode,
 		})
 		// Write complete state to Iceberg properties.
-		props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
+		props, err := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
 			State: snapshot.StateComplete,
 		})
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
+		}
 		if err := snk.SetProperties(ctx, ref, props); err != nil {
 			cleanup()
 			return fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
@@ -130,7 +134,11 @@ func (r *Runner) runSnapshot(
 			Schema:        w.KnownSchema(ref.Target),
 			ChunkSize:     cfg.ChunkSize,
 			Persist: func(sp snapshot.SnapshotProgress) error {
-				return snk.SetProperties(ctx, ref, snapshot.EncodeSnapshotProgress(&sp))
+				props, err := snapshot.EncodeSnapshotProgress(&sp)
+				if err != nil {
+					return err
+				}
+				return snk.SetProperties(ctx, ref, props)
 			},
 		}, func(table string, completedChunkID uint32, remaining []uint32) {
 			w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)

@@ -17,6 +17,7 @@ import (
 	_ "github.com/maltzsama/urutau/internal/builtin" // register built-in drivers via init()
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/logging"
+	"github.com/maltzsama/urutau/internal/memlimit"
 	"github.com/maltzsama/urutau/internal/pipeline"
 	"github.com/maltzsama/urutau/internal/plugin"
 	"github.com/maltzsama/urutau/internal/plugin/flightwrap"
@@ -148,6 +149,9 @@ func (f *pipelineFlags) config() (runner.Config, error) {
 		return runner.Config{}, err
 	}
 	slog.SetDefault(logger)
+	// The Pod's memory limit, given to the garbage collector (#437). The
+	// collapsed binary was missing this (issue #576).
+	memlimit.Apply(logger)
 	cfg := runner.Config{
 		ServerID:          f.serverID,
 		Heartbeat:         5 * time.Second, // control-plane liveness cadence (protocol constant)

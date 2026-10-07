@@ -255,3 +255,12 @@ func TestDNSLabel(t *testing.T) {
 		t.Errorf("dnsLabel(long) = %d chars, want <= 52", len(got))
 	}
 }
+
+// A typo in a field name must fail the load, not be silently ignored
+// (issue #576).
+func TestLoadYAMLRejectsUnknownField(t *testing.T) {
+	y := "tables:\n  - source: shop.orders\n    target: raw.orders\n    primaryKey: [id]\n    wirteMode: upsert\n"
+	if _, err := LoadYAML(strings.NewReader(y)); err == nil {
+		t.Fatal("LoadYAML accepted an unknown field (wirteMode)")
+	}
+}

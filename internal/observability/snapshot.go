@@ -15,9 +15,10 @@ type WorkerSnapshot struct {
 	Enrich           map[string]EnrichCounts // key: table + "\x00" + reference
 }
 
-// EnrichCounts is one reference's enrich counters.
+// EnrichCounts is one reference's enrich counters. InnerDropped carries the
+// inner-join misses (the urutau_enrich_inner_dropped_total series); there is
+// no separate, never-populated Misses field (issue #576).
 type EnrichCounts struct {
-	Misses       int64
 	InnerDropped int64
 	Evicted      int64
 }

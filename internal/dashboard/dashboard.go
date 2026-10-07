@@ -7,6 +7,8 @@
 // vendored, no CDN) served from the same HTTP server as /metrics and /statusz.
 package dashboard
 
+import "errors"
+
 // PipelineSummary is the header/overview data.
 type PipelineSummary struct {
 	Pipeline           string `json:"pipeline"`
@@ -92,3 +94,11 @@ type State interface {
 	// RestartWorker resets one worker's session (epoch bump + supervisor reset).
 	RestartWorker(name string) error
 }
+
+// ErrUnknownWorker marks a restart for a worker the coordinator does not know;
+// the HTTP handler maps it to 404.
+var ErrUnknownWorker = errors.New("unknown worker")
+
+// ErrRestartConflict marks a restart the coordinator refuses (an append table
+// with in-flight batches); the HTTP handler maps it to 409.
+var ErrRestartConflict = errors.New("restart conflict")

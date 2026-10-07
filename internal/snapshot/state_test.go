@@ -20,7 +20,10 @@ func TestSnapshotProgressRoundTrip(t *testing.T) {
 		Pending: []uint32{2, 3, 7},
 		Started: at.Format(time.RFC3339),
 	}
-	props := EncodeSnapshotProgress(in)
+	props, err := EncodeSnapshotProgress(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
 	got, err := ReadSnapshotProgress(props)
 	if err != nil {
 		t.Fatalf("read: %v", err)
@@ -55,21 +58,16 @@ func TestSnapshotProgressRoundTrip(t *testing.T) {
 	}
 }
 
-// Unsupported bound types must not silently corrupt the stored state:
-// encoding leaves bounds absent and resume recalculates, which is the
-// documented (conservative) behavior.
+// An unsupported bound type must FAIL the encode, never write `pending`
+// without `bounds` (issue #576).
 func TestEncodeSnapshotProgressUnsupportedType(t *testing.T) {
 	in := &SnapshotProgress{
 		State:   StateInProgress,
 		Bounds:  [][]any{{complex(1, 2)}},
 		Pending: []uint32{0},
 	}
-	props := EncodeSnapshotProgress(in)
-	if _, ok := props[PropSnapshotBounds]; ok {
-		t.Fatal("bounds property present for an unsupported bound type")
-	}
-	if _, err := ReadSnapshotProgress(props); err != nil {
-		t.Fatalf("read with absent bounds: %v", err)
+	if props, err := EncodeSnapshotProgress(in); err == nil {
+		t.Fatalf("EncodeSnapshotProgress = %v, want an error for an unsupported bound type", props)
 	}
 }
 
@@ -85,7 +83,10 @@ func TestBoundsRoundTripNativeTypes(t *testing.T) {
 		},
 		Pending: []uint32{0},
 	}
-	props := EncodeSnapshotProgress(in)
+	props, err := EncodeSnapshotProgress(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
 	got, err := ReadSnapshotProgress(props)
 	if err != nil {
 		t.Fatalf("read: %v", err)
