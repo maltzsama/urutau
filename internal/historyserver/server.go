@@ -48,6 +48,9 @@ type Store interface {
 	ListPipelines(ctx context.Context) ([]eventlog.PipelineSummary, error)
 	ListRuns(ctx context.Context, pipeline string) ([]eventlog.RunSummary, error)
 	ReadRunTrail(ctx context.Context, pipeline, runID string) (eventlog.Trail, error)
+	// ReadRunOutcome reads only the run's last object, for the listing page
+	// (issue #592).
+	ReadRunOutcome(ctx context.Context, pipeline, runID string) (eventlog.Outcome, error)
 }
 
 const defaultPageLimit = 1000
@@ -161,9 +164,10 @@ func (s *server) listRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		// Classify the run's outcome from its terminal event (issue #350). A
 		// read failure — a run that vanished mid-list — leaves it unknown
-		// rather than failing the whole list.
-		if trail, err := s.store.ReadRunTrail(r.Context(), name, run.ID); err == nil && trail.Outcome != "" {
-			rj.Outcome = string(trail.Outcome)
+		// rather than failing the whole list. ReadRunOutcome reads only the
+		// run's last object, not the whole trail (issue #592).
+		if o, err := s.store.ReadRunOutcome(r.Context(), name, run.ID); err == nil && o != "" {
+			rj.Outcome = string(o)
 		}
 		out = append(out, rj)
 	}
@@ -300,4 +304,8 @@ func (s *eventlogStore) ListRuns(ctx context.Context, pipeline string) ([]eventl
 
 func (s *eventlogStore) ReadRunTrail(ctx context.Context, pipeline, runID string) (eventlog.Trail, error) {
 	return eventlog.ReadRunTrail(ctx, s.root, pipeline, runID)
+}
+
+func (s *eventlogStore) ReadRunOutcome(ctx context.Context, pipeline, runID string) (eventlog.Outcome, error) {
+	return eventlog.ReadRunOutcome(ctx, s.root, pipeline, runID)
 }

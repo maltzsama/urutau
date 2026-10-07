@@ -50,6 +50,12 @@ func (f fakeStore) ReadRunTrail(context.Context, string, string) (eventlog.Trail
 		Outcome: f.outcome,
 	}, nil
 }
+func (f fakeStore) ReadRunOutcome(context.Context, string, string) (eventlog.Outcome, error) {
+	if f.readErr != nil {
+		return eventlog.OutcomeUnknown, f.readErr
+	}
+	return f.outcome, nil
+}
 
 func testServer(store Store, limit int) *httptest.Server {
 	if limit <= 0 {
