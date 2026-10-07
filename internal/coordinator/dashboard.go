@@ -249,12 +249,33 @@ func (s dashState) RestartWorker(name string) error {
 	return nil
 }
 
-// pushDashState pushes the current pipeline/tables/workers to the dashboard's
-// SSE subscribers. Call it after a state mutation, OUTSIDE any statsMu lock:
-// PublishState reads back through State, which takes that lock.
+// pushDashState marks the dashboard state dirty. The actual snapshot + publish
+// runs on dashPushLoop's ticker, so the per-ack hot path never builds the
+// state (issue #591). Call it after a state mutation, OUTSIDE any statsMu
+// lock.
 func (c *Coordinator) pushDashState() {
 	if c.dash != nil {
-		c.dash.PublishState()
+		c.dashDirty.Store(true)
+	}
+}
+
+// dashPushLoop publishes the dashboard state at most ~4 Hz, coalescing the
+// per-ack dirty marks into one build (issue #591).
+func (c *Coordinator) dashPushLoop(ctx context.Context) {
+	if c.dash == nil {
+		return
+	}
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if c.dashDirty.Swap(false) {
+				c.dash.PublishState()
+			}
+		}
 	}
 }
 

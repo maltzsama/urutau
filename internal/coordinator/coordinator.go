@@ -418,7 +418,11 @@ type Coordinator struct {
 	// the run's start time, and the per-table/worker aggregates the API serves.
 	dashEvents *dashboard.Events
 	dash       *dashboard.Handler
-	startedAt  time.Time
+	// dashDirty coalesces dashboard state changes: pushDashState marks it and
+	// a ~4 Hz loop publishes, so a per-ack snapshot does not serialize the
+	// whole state on the hot path (issue #591).
+	dashDirty atomic.Bool
+	startedAt time.Time
 
 	statsMu    sync.Mutex
 	tableStats map[string]*tableStats
@@ -972,6 +976,7 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// coordinator on it). Before the pump runs there is no lag to report.
 	if c.metrics != nil {
 		go c.lagLoop(ctx)
+		go c.dashPushLoop(ctx)
 	}
 	go c.pump(ctx, out)
 
