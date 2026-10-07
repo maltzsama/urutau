@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -182,11 +183,18 @@ func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       a.logger,
-		out:          make(chan *dataplane.Batch, 16),
-		errCh:        make(chan error, 1),
+		out:          make(chan sourceResult, 16),
 		closeAdapter: closeAdapter,
 	}
 	return r, nil
+}
+
+// sourceResult is one outcome of a table stream: a batch, or the error that
+// ended it. Batches and errors share ONE channel so an error can never race
+// the channel close and surface as a clean end (issue #568).
+type sourceResult struct {
+	batch *dataplane.Batch
+	err   error
 }
 
 // sourceReader implements source.Reader over a Flight DoGet stream. The
@@ -194,47 +202,116 @@ func (a *SourceAdapter) Open(ctx context.Context, refs []core.TableRef) (source.
 // shaped); the reader projects it straight into the flat urutau wire schema
 // — no rowchange round-trip.
 type sourceReader struct {
-	client   *client.Client
-	alloc    memory.Allocator
-	refs     []core.TableRef
-	ctx      context.Context
-	cancel   context.CancelFunc
-	logger   *slog.Logger
-	out      chan *dataplane.Batch
-	errCh    chan error
-	position StringPosition
-	mu       sync.Mutex
-	setConf  func() position.Position
+	client    *client.Client
+	alloc     memory.Allocator
+	refs      []core.TableRef
+	ctx       context.Context
+	cancel    context.CancelFunc
+	logger    *slog.Logger
+	out       chan sourceResult
+	wg        sync.WaitGroup
+	positions map[string]string // target table → its last opaque offset
+	mu        sync.Mutex
+	setConf   func() position.Position
 	// closeAdapter releases the owning adapter (client + in-process server) on
 	// Close; nil for a subprocess source (issue #496).
 	closeAdapter func() error
 }
 
-func (r *sourceReader) Start(ctx context.Context, from position.Position) error {
-	go func() {
-		defer close(r.out)
-		for _, ref := range r.refs {
-			if err := r.streamTable(ctx, ref, from); err != nil {
-				select {
-				case r.errCh <- fmt.Errorf("stream %s: %w", ref.Source, err):
-				case <-ctx.Done():
-				}
-				return
+func (r *sourceReader) Start(_ context.Context, from position.Position) error {
+	// One goroutine per table: CDC streams are continuous, so streaming them
+	// one after another meant the second table's stream never started until
+	// the first ended — which, for a live source, is never (issue #568).
+	// Streams run on the reader's own context (Open's), so Close stops them.
+	//
+	// Each table resumes from ITS OWN offset: the stored position is a
+	// per-table envelope for a multi-table source, a bare offset for a
+	// single-table one (which is also the legacy format) (issue #568).
+	perTable := decodePositions(from)
+	r.wg.Add(len(r.refs))
+	for _, ref := range r.refs {
+		go func(ref core.TableRef) {
+			defer r.wg.Done()
+			start := from
+			if perTable != nil {
+				start = StringPosition{Offset: perTable[ref.Target]}
+			} else if from != nil {
+				start = StringPosition{Offset: from.String()}
 			}
-		}
+			if err := r.streamTable(r.ctx, ref, start); err != nil {
+				r.emit(sourceResult{err: fmt.Errorf("stream %s: %w", ref.Source, err)})
+			}
+		}(ref)
+	}
+	go func() {
+		r.wg.Wait()
+		close(r.out)
 	}()
 	return nil
 }
 
+// decodePositions returns the per-table envelope a stored position carries, or
+// nil when it is a bare (single-table/legacy) offset. A base64 opaque offset
+// never starts with '{', so it cannot be mistaken for the JSON envelope.
+func decodePositions(p position.Position) map[string]string {
+	if p == nil {
+		return nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(p.String()), &env); err != nil || env == nil {
+		return nil
+	}
+	return env
+}
+
+// recordPosition remembers one table's last offset. A multi-table source keeps
+// them separate instead of one table overwriting another's resume point
+// (issue #568).
+func (r *sourceReader) recordPosition(target, offset string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.positions == nil {
+		r.positions = map[string]string{}
+	}
+	r.positions[target] = offset
+}
+
+// positionSnapshot returns the resume position: the bare offset for a single
+// table (backward compatible), a deterministic per-table envelope for several.
+func (r *sourceReader) positionSnapshot() StringPosition {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.positions) == 1 {
+		for _, off := range r.positions {
+			return StringPosition{Offset: off}
+		}
+	}
+	if len(r.positions) == 0 {
+		return StringPosition{}
+	}
+	b, err := json.Marshal(r.positions)
+	if err != nil {
+		return StringPosition{}
+	}
+	return StringPosition{Offset: string(b)}
+}
+
+// emit delivers a result unless the reader was closed: a full buffer is drained
+// by Next, and a cancelled context means nobody is reading anymore.
+func (r *sourceReader) emit(res sourceResult) {
+	select {
+	case r.out <- res:
+	case <-r.ctx.Done():
+	}
+}
+
 func (r *sourceReader) Next(ctx context.Context) (*dataplane.Batch, error) {
 	select {
-	case b, ok := <-r.out:
+	case res, ok := <-r.out:
 		if !ok {
 			return nil, nil
 		}
-		return b, nil
-	case err := <-r.errCh:
-		return nil, err
+		return res.batch, res.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -340,12 +417,9 @@ func (r *sourceReader) readBatches(ctx context.Context, stream flight.FlightServ
 			if wire == nil {
 				continue // every row had an unknown op
 			}
-			r.mu.Lock()
-			r.position = StringPosition{Offset: lastOffset}
-			r.mu.Unlock()
-			select {
-			case r.out <- &dataplane.Batch{Table: ref.Target, Record: wire, Mode: dataplane.UpsertMode}:
-			case <-ctx.Done():
+			r.recordPosition(ref.Target, lastOffset)
+			r.emit(sourceResult{batch: &dataplane.Batch{Table: ref.Target, Record: wire, Mode: dataplane.UpsertMode}})
+			if ctx.Err() != nil {
 				reader.Release()
 				return ctx.Err()
 			}
@@ -372,15 +446,11 @@ func (r *sourceReader) SetConfirmed(f func() position.Position) {
 }
 
 func (r *sourceReader) Synced() position.Position {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.position
+	return r.positionSnapshot()
 }
 
 func (r *sourceReader) Master(_ context.Context) (position.Position, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.position, nil
+	return r.positionSnapshot(), nil
 }
 
 func (r *sourceReader) OpenWindow(_ context.Context, _ uint32) {}
@@ -394,7 +464,10 @@ func (r *sourceReader) ClearWindow() {}
 // record (nil if every row had an unknown op) and the last row's offset for
 // the reader's position.
 func cdcRecordToWire(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.TableRef, alloc memory.Allocator) (arrow.RecordBatch, string, error) {
-	changes := cdcRecordToChanges(rec, arrowSchema, ref)
+	changes, err := cdcRecordToChanges(rec, arrowSchema, ref)
+	if err != nil {
+		return nil, "", err
+	}
 	if len(changes) == 0 {
 		return nil, "", nil
 	}
@@ -410,7 +483,7 @@ func cdcRecordToWire(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.
 }
 
 // cdcRecordToChanges translates one Arrow CDC record batch into change events.
-func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.TableRef) []rowchange.Change {
+func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref core.TableRef) ([]rowchange.Change, error) {
 	nrows := int(rec.NumRows())
 	changes := make([]rowchange.Change, 0, nrows)
 
@@ -450,10 +523,18 @@ func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref co
 		chg.IngestTS = time.Now().UTC()
 
 		if beforeIdx >= 0 && !rec.Column(beforeIdx).IsNull(i) {
-			chg.Before = structToMap(rec.Column(beforeIdx), i)
+			before, err := structToMap(rec.Column(beforeIdx), i)
+			if err != nil {
+				return nil, err
+			}
+			chg.Before = before
 		}
 		if afterIdx >= 0 && !rec.Column(afterIdx).IsNull(i) {
-			chg.After = structToMap(rec.Column(afterIdx), i)
+			after, err := structToMap(rec.Column(afterIdx), i)
+			if err != nil {
+				return nil, err
+			}
+			chg.After = after
 			chg.Key = extractPK(ref.PrimaryKey, chg.After)
 		}
 
@@ -463,7 +544,7 @@ func cdcRecordToChanges(rec arrow.RecordBatch, arrowSchema *arrow.Schema, ref co
 
 		changes = append(changes, chg)
 	}
-	return changes
+	return changes, nil
 }
 
 // arrowToCoreSchema converts an Arrow schema to a core schema.
@@ -606,62 +687,75 @@ func readBinaryCol(rec arrow.RecordBatch, idx, row int) string {
 	return base64.StdEncoding.EncodeToString(col.Value(row))
 }
 
-func structToMap(col arrow.Array, row int) map[string]any {
+func structToMap(col arrow.Array, row int) (map[string]any, error) {
 	if col == nil {
-		return nil
+		return nil, nil
 	}
 	structArr, ok := col.(*array.Struct)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	fields := structArr.DataType().(*arrow.StructType)
 	m := make(map[string]any, fields.NumFields())
 	for i := range fields.NumFields() {
+		field := fields.Field(i)
+		// A null field is written explicitly rather than skipped: skipping it
+		// drops the column from the schema inferred over the rows, so a column
+		// null on every row vanished from the wire schema (issue #568).
 		if structArr.Field(i).IsNull(row) {
+			m[field.Name] = nil
 			continue
 		}
-		field := fields.Field(i)
-		val := readValue(structArr.Field(i), row)
+		val, err := readValue(structArr.Field(i), row)
+		if err != nil {
+			return nil, fmt.Errorf("plugin: column %s: %w", field.Name, err)
+		}
 		m[field.Name] = val
 	}
-	return m
+	return m, nil
 }
 
-func readValue(col arrow.Array, row int) any {
+func readValue(col arrow.Array, row int) (any, error) {
 	if col.IsNull(row) {
-		return nil
+		return nil, nil
 	}
 	switch c := col.(type) {
 	case *array.Boolean:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Int8:
-		return int32(c.Value(row))
+		return int32(c.Value(row)), nil
 	case *array.Int16:
-		return int32(c.Value(row))
+		return int32(c.Value(row)), nil
 	case *array.Int32:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Int64:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Uint8:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Uint16:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Uint32:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Uint64:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Float32:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Float64:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.String:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Binary:
-		return c.Value(row)
+		return c.Value(row), nil
 	case *array.Timestamp:
-		return time.UnixMicro(int64(c.Value(row))).UTC()
+		// Honour the column's unit: the previous UnixMicro read flattened
+		// every timestamp to microseconds and misread ns/ms/s by powers of
+		// 1000 (issue #568).
+		ts := c.DataType().(*arrow.TimestampType)
+		return c.Value(row).ToTime(ts.Unit).UTC(), nil
 	default:
-		return nil
+		// An unmapped type used to become a silent NULL; fail the stream
+		// instead, so the plugin author sees it (issue #568).
+		return nil, fmt.Errorf("unsupported Arrow type %s", col.DataType())
 	}
 }
 
