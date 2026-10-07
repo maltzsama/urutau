@@ -642,7 +642,11 @@ func (c *Coordinator) drainTimeout() time.Duration {
 // spec.Table.Workers.Max when set, else the pipeline-wide Config.MaxWorkers,
 // else the default. A table that declares its own cap ignores the global one.
 func (c *Coordinator) maxWorkersFor(target string) int {
-	if c.cfg.Spec != nil {
+	if c.specByTarget != nil {
+		if t, ok := c.specByTarget[target]; ok && t.Workers != nil && t.Workers.Max > 0 {
+			return t.Workers.Max
+		}
+	} else if c.cfg.Spec != nil {
 		for _, t := range c.tablesOrSpec() {
 			if t.Target != target {
 				continue

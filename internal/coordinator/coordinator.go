@@ -192,6 +192,12 @@ type Coordinator struct {
 	snk       sink.Sink
 	canonical map[string]core.Schema // per-source canonical schema for typed wire format
 
+	// Per-batch hot paths index refs/tables by key instead of scanning the
+	// slices (issue #582). Built once at boot; never mutated after.
+	refByTarget  map[string]core.TableRef
+	specBySource map[string]spec.Table
+	specByTarget map[string]spec.Table
+
 	// maint schedules the ephemeral maintenance workers (issue #96). Nil
 	// unless maintenance is enabled in the spec.
 	maint *maintenanceScheduler
@@ -684,6 +690,18 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 	c.refs = refs
 	c.canonical = canonical
+	// Index the boot lists so the per-batch lookups do not scan them
+	// (issue #582).
+	c.refByTarget = make(map[string]core.TableRef, len(refs))
+	for _, ref := range refs {
+		c.refByTarget[ref.Target] = ref
+	}
+	c.specBySource = make(map[string]spec.Table, len(tables))
+	c.specByTarget = make(map[string]spec.Table, len(tables))
+	for _, t := range tables {
+		c.specBySource[t.Source] = t
+		c.specByTarget[t.Target] = t
+	}
 
 	// Incremental mode (#157) is implemented in the collapsed runner only.
 	// Reject it here rather than treat an incremental table as CDC and open a
@@ -2210,6 +2228,13 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 // primaryKeyFor returns the primary key columns for the table targeted
 // by target (a TARGET table name, matching c.refs' shape).
 func (c *Coordinator) primaryKeyFor(target string) []string {
+	if c.refByTarget != nil {
+		if ref, ok := c.refByTarget[target]; ok {
+			return ref.PrimaryKey
+		}
+		return nil
+	}
+	// Pre-boot (a bare Coordinator in tests): scan the slice.
 	for _, ref := range c.refs {
 		if ref.Target == target {
 			return ref.PrimaryKey
@@ -2232,25 +2257,51 @@ func cloneBatchMeta(meta *pb.BatchMeta) *pb.BatchMeta {
 // caller) rather than an empty-but-non-nil record — enqueueTo's
 // zero-row marker path is for markers only, not empty data batches.
 func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwners int) ([]arrow.RecordBatch, error) {
-	out := make([]arrow.RecordBatch, nOwners)
-	for p := 0; p < nOwners; p++ {
-		idxBuilder := array.NewInt64Builder(memory.DefaultAllocator)
-		for i, o := range owner {
-			if o == p {
-				idxBuilder.Append(int64(i))
-			}
-		}
-		if idxBuilder.Len() == 0 {
-			idxBuilder.Release()
+	nRows := int(rec.NumRows())
+	// One pass bucketing the row indices by owner (was one full scan per
+	// partition, O(owners × rows)).
+	builders := make([]*array.Int64Builder, nOwners)
+	for i, o := range owner {
+		if o < 0 || o >= nOwners {
 			continue
 		}
-		idxArr := idxBuilder.NewInt64Array()
-		idxBuilder.Release()
+		if builders[o] == nil {
+			builders[o] = array.NewInt64Builder(memory.DefaultAllocator)
+		}
+		builders[o].Append(int64(i))
+	}
+	releaseBuilders := func(from int) {
+		for j := from; j < nOwners; j++ {
+			if builders[j] != nil {
+				builders[j].Release()
+				builders[j] = nil
+			}
+		}
+	}
+
+	out := make([]arrow.RecordBatch, nOwners)
+	for p := 0; p < nOwners; p++ {
+		b := builders[p]
+		if b == nil {
+			continue
+		}
+		builders[p] = nil
+		// Every row belongs to this one partition: retain the record instead
+		// of materializing an identity Take.
+		if len(owner) == nRows && b.Len() == nRows {
+			b.Release()
+			rec.Retain()
+			out[p] = rec
+			continue
+		}
+		idxArr := b.NewInt64Array()
+		b.Release()
 		datum, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
 			&compute.RecordDatum{Value: rec}, &compute.ArrayDatum{Value: idxArr.Data()})
 		idxArr.Release()
 		if err != nil {
 			releaseRecords(out)
+			releaseBuilders(p + 1)
 			return nil, fmt.Errorf("partition %d: %w", p, err)
 		}
 		// Take returns a *RecordDatum for a record input; guard the assertion
@@ -2259,6 +2310,7 @@ func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwne
 		if !ok {
 			datum.Release()
 			releaseRecords(out)
+			releaseBuilders(p + 1)
 			return nil, fmt.Errorf("partition %d: unexpected Take datum %T", p, datum)
 		}
 		out[p] = rd.Value
@@ -2516,6 +2568,10 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 
 // specForSource finds the spec table for a source name.
 func (c *Coordinator) specForSource(src string) (spec.Table, bool) {
+	if c.specBySource != nil {
+		t, ok := c.specBySource[src]
+		return t, ok
+	}
 	for _, t := range c.tablesOrSpec() {
 		if t.Source == src {
 			return t, true

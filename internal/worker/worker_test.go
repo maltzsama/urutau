@@ -13,6 +13,7 @@ import (
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 )
@@ -444,5 +445,24 @@ func TestRunUnregisteredTableNamesTheTable(t *testing.T) {
 func TestNewDefaultsMaxInterval(t *testing.T) {
 	if w := New(Config{MaxInterval: 0}); w.cfg.MaxInterval <= 0 {
 		t.Fatalf("MaxInterval = %v, want a positive default", w.cfg.MaxInterval)
+	}
+}
+
+// The per-table snapshot bloom guard is allocated only when a snapshot runs,
+// so a discovery pipeline with many tables does not allocate it unused
+// (issue #578).
+func TestBootstrapGuardAllocatedLazily(t *testing.T) {
+	w := New(Config{})
+	w.RegisterCommitter("t", CommitterFunc(func(context.Context, *dataplane.Batch) error { return nil }), dataplane.UpsertMode)
+	if p := w.tables["t"]; p.bootstrapGuard != nil {
+		t.Fatal("bootstrapGuard allocated before any snapshot")
+	}
+	w.SetSnapshotState("t", string(snapshot.StateInProgress), nil)
+	if p := w.tables["t"]; p.bootstrapGuard == nil {
+		t.Fatal("bootstrapGuard not created for an in-progress snapshot")
+	}
+	w.SetSnapshotState("t", string(snapshot.StateComplete), nil)
+	if p := w.tables["t"]; p.bootstrapGuard != nil {
+		t.Fatal("bootstrapGuard not released on completion")
 	}
 }

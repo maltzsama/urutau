@@ -6,6 +6,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/bits-and-blooms/bloom/v3"
 
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -25,11 +26,16 @@ func TestMarkBatchSideEffectsSteadyStateAndSnapshot(t *testing.T) {
 	if err := markBatchSideEffects(p, batch, Ingest{Table: "t", Batch: batch}); err != nil {
 		t.Fatalf("steady state: %v", err)
 	}
-	if p.bootstrapGuard.TestString(rowchange.KeyString([]any{int64(7)})) {
+	// The guard is allocated lazily per snapshot (issue #578), so it is nil
+	// here.
+	if p.bootstrapGuard != nil && p.bootstrapGuard.TestString(rowchange.KeyString([]any{int64(7)})) {
 		t.Fatal("steady state marked a key with no snapshot in progress")
 	}
 
+	// Enter the snapshot: SetSnapshotState(in_progress) is what allocates the
+	// guard the marking path uses.
 	p.snapshotState = string(snapshot.StateInProgress)
+	p.bootstrapGuard = bloom.NewWithEstimates(100_000, 0.01)
 	if err := markBatchSideEffects(p, batch, Ingest{Table: "t", Batch: batch}); err != nil {
 		t.Fatalf("snapshot in progress: %v", err)
 	}
