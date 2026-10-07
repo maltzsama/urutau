@@ -157,6 +157,12 @@ type PostgresSource struct {
 	Discover bool `json:"discover,omitempty"`
 	// CDC holds the logical-decoding knobs for the replication reader.
 	CDC *CDCConfig `json:"cdc,omitempty"`
+	// ReplicaIdentity controls REPLICA IDENTITY on the replicated tables:
+	// "full" (default) sets it to FULL only when the table is not already —
+	// so updates and deletes carry the full old row without an unnecessary
+	// ACCESS EXCLUSIVE lock or WAL growth on every boot — and "keep" leaves
+	// whatever identity the table already has (issue #571).
+	ReplicaIdentity string `json:"replicaIdentity,omitempty"`
 }
 
 // CDCConfig holds the PostgreSQL logical-decoding knobs.

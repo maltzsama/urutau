@@ -1029,3 +1029,23 @@ func TestValidateRejectsEmptyPathComponent(t *testing.T) {
 		t.Fatalf("a non-Iceberg sink must not get the Iceberg path rule: %v", err)
 	}
 }
+
+func TestValidatePostgresReplicaIdentityOption(t *testing.T) {
+	s := &Spec{
+		Pipeline: "pg",
+		Source: Source{
+			Kind:     "postgres",
+			SlotName: "test_slot",
+			Postgres: &PostgresSource{Host: "localhost", Database: "mydb", ReplicaIdentity: "bogus"},
+		},
+		Sink:   Sink{URI: "polaris://localhost:8181/api/catalog", Namespace: "raw"},
+		Tables: []Table{{Source: "public.users", Target: "raw.users", PrimaryKey: []string{"id"}}},
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "replicaIdentity") {
+		t.Fatalf("want a replicaIdentity problem, got %v", err)
+	}
+	s.Source.Postgres.ReplicaIdentity = "keep"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("keep must be accepted: %v", err)
+	}
+}

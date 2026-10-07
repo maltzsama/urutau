@@ -851,6 +851,12 @@ func validatePostgresSource(pg *PostgresSource, problems *[]string) {
 	if pg.CDC != nil {
 		validateCDCConfig(pg.CDC, problems)
 	}
+	switch pg.ReplicaIdentity {
+	case "", "full", "keep":
+	default:
+		*problems = append(*problems, fmt.Sprintf(
+			"source.postgres.replicaIdentity: unsupported %q (want full | keep)", pg.ReplicaIdentity))
+	}
 	if pg.SSL != nil {
 		validateSSLConfig(pg.SSL, problems)
 	}
