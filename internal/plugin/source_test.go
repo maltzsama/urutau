@@ -162,8 +162,8 @@ func TestRecordsFromReader(t *testing.T) {
 		t.Errorf("expected 5 cols, got %d", records[0].NumCols())
 	}
 	ops := records[0].Column(0).(*array.String)
-	if ops.Value(0) != "c" || ops.Value(1) != "c" || ops.Value(2) != "d" {
-		t.Errorf("op column = %q,%q,%q, want c,c,d", ops.Value(0), ops.Value(1), ops.Value(2))
+	if ops.Value(0) != "c" || ops.Value(1) != "u" || ops.Value(2) != "d" {
+		t.Errorf("op column = %q,%q,%q, want c,u,d (an update must not collapse to an insert)", ops.Value(0), ops.Value(1), ops.Value(2))
 	}
 	names := records[0].Column(2).(*array.String)
 	if names.Value(0) != "alice" {

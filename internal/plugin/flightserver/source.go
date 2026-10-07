@@ -20,6 +20,7 @@ import (
 	"github.com/maltzsama/urutau/internal/plugin/contract"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 
@@ -94,6 +95,10 @@ func (s *SourceServer) DoAction(action *flight.Action, stream flight.FlightServi
 type ticketPayload struct {
 	Table string `json:"table"`
 	Mode  string `json:"mode"`
+	// FromOffset resumes a changes stream from the stored opaque offset; it
+	// was dropped between GetFlightInfo and DoGet, so a plugin source never
+	// resumed (issue #569).
+	FromOffset string `json:"fromOffset,omitempty"`
 }
 
 // GetFlightInfo resolves the schema for one table via source.Source's
@@ -132,7 +137,7 @@ func (s *SourceServer) GetFlightInfo(ctx context.Context, desc *flight.FlightDes
 		wireSchema = arrow.NewSchema(tableFields, nil)
 	}
 
-	tkt, err := json.Marshal(ticketPayload{Table: req.Table, Mode: req.Mode})
+	tkt, err := json.Marshal(ticketPayload{Table: req.Table, Mode: req.Mode, FromOffset: req.FromOffset})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "flightserver: encode ticket: %v", err)
 	}
@@ -198,7 +203,17 @@ func (s *SourceServer) DoGet(tkt *flight.Ticket, stream flight.FlightService_DoG
 		return status.Errorf(codes.Internal, "flightserver: open %s: %v", tp.Table, err)
 	}
 	defer rdr.Close()
-	if err := rdr.Start(ctx, nil); err != nil {
+
+	// Resume from the ticket's offset when present, so a restarted plugin
+	// source continues instead of replaying from the beginning (issue #569).
+	var from position.Position
+	if tp.FromOffset != "" {
+		from, err = s.src.ParsePosition(tp.FromOffset)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "flightserver: resume %s %q: %v", tp.Table, tp.FromOffset, err)
+		}
+	}
+	if err := rdr.Start(ctx, from); err != nil {
 		return status.Errorf(codes.Internal, "flightserver: start %s: %v", tp.Table, err)
 	}
 

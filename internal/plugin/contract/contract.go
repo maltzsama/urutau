@@ -1,5 +1,7 @@
 package contract
 
+import "github.com/maltzsama/urutau/core"
+
 const ProtocolVersion = 1
 
 type Role string
@@ -43,4 +45,27 @@ type TableStatus struct {
 type DoPutRequest struct {
 	Mode  string `json:"mode"`
 	Table string `json:"table"`
+}
+
+// EnsureTableRequest is the body of the "urutau.ensure_table" action: the
+// table's canonical schema, primary key and write mode, so an external sink has
+// the type shape and the dedup key instead of re-inferring them from
+// stringified rows (issue #569).
+type EnsureTableRequest struct {
+	Table       string      `json:"table"`
+	Schema      core.Schema `json:"schema"`
+	PrimaryKey  []string    `json:"primaryKey,omitempty"`
+	PartitionBy []string    `json:"partitionBy,omitempty"`
+	Mode        string      `json:"mode"` // "upsert" | "append"
+}
+
+// PositionRequest is the body of the "urutau.position" action.
+type PositionRequest struct {
+	Table string `json:"table"`
+}
+
+// PositionResponse is that action's result: the table's committed position, or
+// empty when it has never been written (issue #569).
+type PositionResponse struct {
+	Position string `json:"position"`
 }

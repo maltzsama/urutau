@@ -39,7 +39,7 @@ streaming, writing straight to the sink. This is what the
 | `--max-parallel-chunks` | `0` | Concurrent chunk `SELECT`s during snapshot (`0` = serial) |
 | `--window-timeout` | `5m` | DBLog window timeout (pathology detector) |
 | `--eventlog` | _(off)_ | `s3://bucket/prefix` JSONL audit trail |
-| `--plugin` | _(none)_ | Path to a Go plugin (`.so`); repeatable |
+| `--plugin` | _(none)_ | Path to a Go plugin (`.so`); repeatable (CGO build only — not in the released static binaries) |
 | `--source-plugin` | _(none)_ | External source plugin binary (Arrow Flight) |
 | `--sink-plugin` | _(none)_ | External sink plugin binary (Arrow Flight) |
 
@@ -81,7 +81,7 @@ server, not a one-shot.
 | `--eventlog-endpoint` | _(AWS)_ | S3 API endpoint of the audit trail store (MinIO/RustFS, path-style) |
 | `--checkpoint` | _(off)_ | `s3://bucket/prefix` async position manifests |
 | `--checkpoint-interval` | `10` | Checkpoint write interval (seconds) |
-| `--plugin` | _(none)_ | Go plugin path; repeatable |
+| `--plugin` | _(none)_ | Go plugin path; repeatable (CGO build only — not in the released static binaries) |
 
 **mTLS:** set all three of `--tls-cert`, `--tls-key`, `--tls-ca`, or none.
 With none the control plane is **plaintext**, and the coordinator **refuses
@@ -113,7 +113,7 @@ the sink for its partition.
 | `--max-bytes-mi` | `32` | Flush the batch once its buffered rows hold this many MiB: rows carry payloads, and a row count alone does not bound memory |
 | `--max-interval` | `2s` | Flush cadence |
 | `--metrics-addr` | _(off)_ | Serve `/metrics` on this address |
-| `--plugin` | _(none)_ | Go plugin path; repeatable |
+| `--plugin` | _(none)_ | Go plugin path; repeatable (CGO build only — not in the released static binaries) |
 | `--tls-cert` / `--tls-key` / `--tls-ca` | _(off)_ | Client cert for the control plane (mTLS) |
 | `--maintenance` | `false` | Run as an ephemeral maintenance worker: connect, run the coordinator's maintenance assignment once, then exit |
 

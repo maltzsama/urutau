@@ -193,10 +193,16 @@ func (c *Client) Healthy() bool         { return c.healthy.Load() }
 // ---- actions (contract §11) ----
 
 func (c *Client) doAction(ctx context.Context, name string, result any) error {
+	return c.doActionBody(ctx, name, nil, result)
+}
+
+// doActionBody is doAction with a request body (contract §11 actions that
+// carry a payload, e.g. urutau.ensure_table / urutau.position).
+func (c *Client) doActionBody(ctx context.Context, name string, body []byte, result any) error {
 	ctx, cancel := withTimeout(ctx, actionTimeout)
 	defer cancel()
 
-	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{Type: name})
+	stream, err := c.flight.DoAction(c.bearerCtx(ctx), &flight.Action{Type: name, Body: body})
 	if err != nil {
 		return fmt.Errorf("%s: %w", name, err)
 	}
@@ -246,6 +252,31 @@ func (c *Client) Status(ctx context.Context) (*contract.StatusResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// EnsureTable hands the plugin sink the table's schema, primary key and write
+// mode (issue #569). An older plugin that does not implement the action
+// returns Unimplemented, which the caller treats as "nothing to do".
+func (c *Client) EnsureTable(ctx context.Context, req contract.EnsureTableRequest) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("urutau.ensure_table: marshal: %w", err)
+	}
+	return c.doActionBody(ctx, "urutau.ensure_table", body, nil)
+}
+
+// Position reads the plugin sink's committed position for a table (issue
+// #569). Empty means never written.
+func (c *Client) Position(ctx context.Context, table string) (string, error) {
+	body, err := json.Marshal(contract.PositionRequest{Table: table})
+	if err != nil {
+		return "", fmt.Errorf("urutau.position: marshal: %w", err)
+	}
+	var resp contract.PositionResponse
+	if err := c.doActionBody(ctx, "urutau.position", body, &resp); err != nil {
+		return "", err
+	}
+	return resp.Position, nil
 }
 
 func (c *Client) Flush(ctx context.Context) error {

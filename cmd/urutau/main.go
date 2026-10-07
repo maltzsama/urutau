@@ -91,7 +91,7 @@ func runCmd() *cobra.Command {
 	fl.IntVar(&f.maxParallelChunks, "max-parallel-chunks", 0, "max concurrent chunk SELECTs during snapshot (0 = serial; must not exceed the source driver ceiling)")
 	fl.DurationVar(&f.windowTimeout, "window-timeout", 5*time.Minute, "DBLog window timeout (pathology detector)")
 	fl.StringVar(&f.eventlogURI, "eventlog", "", "S3 URI for the run's JSONL audit trail (s3://bucket/prefix); AWS env supplies credentials/endpoint")
-	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so); can be repeated for multiple plugins")
+	fl.StringSliceVar(&f.pluginPaths, "plugin", nil, "path to a Go plugin (.so, CGO build only); can be repeated for multiple plugins")
 	fl.StringVar(&f.sourcePlugin, "source-plugin", "", "path to an external source plugin binary (Arrow Flight)")
 	fl.StringVar(&f.sinkPlugin, "sink-plugin", "", "path to an external sink plugin binary (Arrow Flight)")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log level: debug|info|warn|error")
