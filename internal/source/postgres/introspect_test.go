@@ -72,3 +72,35 @@ func TestParseNumericPrecisionErrors(t *testing.T) {
 		t.Fatalf("numeric(10,2) = %d,%d err=%v", p, s, err)
 	}
 }
+
+// A modified type (varchar(n), char(n), timestamp(p), numeric(p,s)) must map
+// from its BASE name, not fall to KindUnknown (issue #561).
+func TestMapColumnTypeModifiedTypes(t *testing.T) {
+	cases := []struct {
+		base, raw string
+		want      core.Kind
+	}{
+		{"character varying", "character varying(64)", core.KindString},
+		{"character", "character(10)", core.KindString},
+		{"timestamp without time zone", "timestamp(3) without time zone", core.KindTimestamp},
+		{"timestamp with time zone", "timestamp(6) with time zone", core.KindTimestampTZ},
+		{"time without time zone", "time(3) without time zone", core.KindTime},
+		{"numeric", "numeric(10,2)", core.KindDecimal},
+	}
+	for _, c := range cases {
+		ct, err := mapColumnType(c.base, c.raw)
+		if err != nil {
+			t.Fatalf("%s: %v", c.base, err)
+		}
+		if ct.Kind != c.want {
+			t.Errorf("%s -> %v, want %v", c.base, ct.Kind, c.want)
+		}
+	}
+	nc, _ := mapColumnType("numeric", "numeric(10,2)")
+	if nc.Precision != 10 || nc.Scale != 2 {
+		t.Errorf("numeric(10,2) = (%d,%d), want (10,2)", nc.Precision, nc.Scale)
+	}
+	if !isStringType("character varying") {
+		t.Error("isStringType(character varying) must be true so a varchar(n) PK can partition")
+	}
+}
