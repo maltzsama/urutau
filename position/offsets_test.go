@@ -167,3 +167,14 @@ func TestOffsetsUnmarshalJSONCanonicalFormat(t *testing.T) {
 		t.Errorf("orders:p0 = %d, want 10", o.Topics["orders"][0])
 	}
 }
+
+// Parse must error on an unknown source kind instead of mis-decoding the
+// opaque offset as a GTID set (issue #576).
+func TestParseUnknownKindErrors(t *testing.T) {
+	if _, err := Parse("some-plugin", "opaque-cookie"); err == nil {
+		t.Fatal("Parse(unknown kind) = nil error, want an error")
+	}
+	if _, err := Parse("", "3d3b4a6a-2f4b-11e9-9c9b-0242ac110002:1"); err != nil {
+		t.Fatalf("Parse(empty kind) must default to GTID: %v", err)
+	}
+}

@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,8 +48,12 @@ func LoadYAML(r io.Reader) (*Spec, error) {
 		return nil, fmt.Errorf("spec: encode: %w", err)
 	}
 
+	// DisallowUnknownFields: a typo (wirteMode) must fail, not be silently
+	// ignored (issue #576).
 	var s Spec
-	if err := json.Unmarshal(b, &s); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&s); err != nil {
 		return nil, fmt.Errorf("spec: decode: %w", err)
 	}
 	applyEnvFallback(&s)

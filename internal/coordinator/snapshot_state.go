@@ -175,10 +175,13 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 		return nil, nil, err
 	}
 	if c.snk != nil {
-		props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
+		props, err := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
 			State: snapshot.StateInProgress, Bounds: bounds, Pending: sortedRefs(todo),
 			Started: time.Now().UTC().Format(time.RFC3339),
 		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("coordinator: %s: record snapshot progress: %w", ref.Target, err)
+		}
 		props[propSnapshotPartitions] = layout
 		if err := c.snk.SetProperties(ctx, tref, props); err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: record snapshot progress: %w", ref.Target, err)

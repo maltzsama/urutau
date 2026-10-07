@@ -161,7 +161,11 @@ func Parse(kind, s string) (Position, error) {
 		return ParseLSN(s)
 	case "kafka":
 		return ParseOffsets(s)
-	default:
+	case "", "mysql":
 		return ParseGTID(s)
+	default:
+		// An unknown kind (a plugin's) must not be silently parsed as a GTID
+		// set: the opaque offset would decode as garbage (issue #576).
+		return nil, fmt.Errorf("position: unknown source kind %q", kind)
 	}
 }

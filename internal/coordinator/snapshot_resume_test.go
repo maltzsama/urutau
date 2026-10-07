@@ -159,9 +159,12 @@ func TestSnapshotRecordsItsProgress(t *testing.T) {
 // and the source's bounds are not recomputed.
 func TestSnapshotResumesFromItsRecordedProgress(t *testing.T) {
 	h := newResumeHarness(t)
-	props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
+	props, err := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
 		State: snapshot.StateInProgress, Bounds: resumeBounds, Pending: []uint32{1, 2},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	props[propSnapshotPartitions] = partitionLayout([]source.Chunk{{}})
 	_ = h.snk.SetProperties(context.Background(), core.TableRef{Target: "raw.orders"}, props)
 
@@ -190,9 +193,12 @@ func TestSnapshotResumesFromItsRecordedProgress(t *testing.T) {
 // rows never read: the snapshot starts over.
 func TestSnapshotStartsOverWhenThePartitionsChanged(t *testing.T) {
 	h := newResumeHarness(t)
-	props := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
+	props, err := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
 		State: snapshot.StateInProgress, Bounds: resumeBounds, Pending: []uint32{2},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	props[propSnapshotPartitions] = partitionLayout([]source.Chunk{{High: []any{int64(15)}}, {Low: []any{int64(15)}}})
 	_ = h.snk.SetProperties(context.Background(), core.TableRef{Target: "raw.orders"}, props)
 

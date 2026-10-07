@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -303,7 +304,14 @@ func (h *Handler) cancel(w http.ResponseWriter, _ *http.Request) {
 
 func (h *Handler) restart(w http.ResponseWriter, r *http.Request) {
 	if err := h.state.RestartWorker(r.PathValue("worker")); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		code := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, ErrUnknownWorker):
+			code = http.StatusNotFound
+		case errors.Is(err, ErrRestartConflict):
+			code = http.StatusConflict
+		}
+		http.Error(w, err.Error(), code)
 		return
 	}
 	writeJSON(w, map[string]bool{"ok": true})

@@ -108,12 +108,16 @@ func ReadSnapshotProgress(props map[string]string) (*SnapshotProgress, error) {
 
 // EncodeSnapshotProgress serializes snapshot progress into table
 // properties (the caller passes it to the sink's property writer).
-func EncodeSnapshotProgress(sp *SnapshotProgress) map[string]string {
+// EncodeSnapshotProgress serializes a snapshot's progress. A bound value with
+// no wire encoding is an ERROR, not a half-written state: writing `pending`
+// without `bounds` would point the pending ids at ranges recalculated on
+// resume (issue #576).
+func EncodeSnapshotProgress(sp *SnapshotProgress) (map[string]string, error) {
 	props := map[string]string{
 		PropSnapshotState: string(sp.State),
 	}
 	if sp.State == StateComplete || sp.State == StateNotStarted {
-		return props
+		return props, nil
 	}
 	if len(sp.Bounds) > 0 {
 		tagged := make([][]any, len(sp.Bounds))
@@ -122,7 +126,7 @@ func EncodeSnapshotProgress(sp *SnapshotProgress) map[string]string {
 			for j, cell := range b {
 				v, ok := encodeBoundCell(cell)
 				if !ok {
-					return props // unsupported type: bounds stay absent, resume recalculates
+					return nil, fmt.Errorf("snapshot: bound value %T has no wire encoding", cell)
 				}
 				row[j] = v
 			}
@@ -130,21 +134,21 @@ func EncodeSnapshotProgress(sp *SnapshotProgress) map[string]string {
 		}
 		boundsJSON, err := json.Marshal(tagged)
 		if err != nil {
-			return props
+			return nil, fmt.Errorf("snapshot: encode bounds: %w", err)
 		}
 		props[PropSnapshotBounds] = string(boundsJSON)
 	}
 	if len(sp.Pending) > 0 {
 		pendingJSON, err := json.Marshal(sp.Pending)
 		if err != nil {
-			return props
+			return nil, fmt.Errorf("snapshot: encode pending: %w", err)
 		}
 		props[PropSnapshotPending] = string(pendingJSON)
 	}
 	if sp.Started != "" {
 		props[PropSnapshotStarted] = sp.Started
 	}
-	return props
+	return props, nil
 }
 
 // EncodePending serializes only the pending list — for atomic commit

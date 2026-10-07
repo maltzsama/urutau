@@ -156,15 +156,24 @@ func ParseGTID(s string) (*GTID, error) {
 		if !validUUID(uuid) {
 			return nil, fmt.Errorf("position: parse gtid %q: invalid uuid %q", s, uuid)
 		}
+		// MySQL 8.4 tagged form is uuid:tag:interval[,interval...]; the tag is
+		// not an interval. Keep it in the key so a tagged set stays distinct
+		// from the untagged one instead of being rejected (issue #576).
+		key := uuid
+		ivSegs := segs[1:]
+		if len(segs) >= 3 {
+			key = uuid + ":" + segs[1]
+			ivSegs = segs[2:]
+		}
 		var ivs []interval
-		for _, iv := range segs[1:] {
+		for _, iv := range ivSegs {
 			it, err := parseInterval(iv)
 			if err != nil {
 				return nil, fmt.Errorf("position: parse gtid %q: %w", s, err)
 			}
 			ivs = append(ivs, it)
 		}
-		g.sets[uuid] = normalize(append(g.sets[uuid], ivs...))
+		g.sets[key] = normalize(append(g.sets[key], ivs...))
 	}
 	return g, nil
 }
@@ -210,7 +219,9 @@ func (g *GTID) String() string {
 func (g *GTID) Compare(other Position) int {
 	o, ok := other.(*GTID)
 	if !ok {
-		panic(fmt.Sprintf("position: cannot compare GTID to %T", other))
+		// A position of another kind has no defined order against a GTID;
+		// return Incomparable instead of panicking (issue #576).
+		return Incomparable
 	}
 	switch fwd, rev := g.Contains(o), o.Contains(g); {
 	case fwd && rev:
@@ -228,7 +239,9 @@ func (g *GTID) Compare(other Position) int {
 func (g *GTID) Contains(other Position) bool {
 	o, ok := other.(*GTID)
 	if !ok {
-		panic(fmt.Sprintf("position: cannot contain-check GTID against %T", other))
+		// Another kind's position is not contained in a GTID; false, never a
+		// panic (issue #576).
+		return false
 	}
 	for u, oivs := range o.sets {
 		ivs, ok := g.sets[u]

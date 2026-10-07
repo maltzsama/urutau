@@ -101,16 +101,16 @@ func testScheduler(t *testing.T) (*maintenanceScheduler, *fake.Clientset) {
 }
 
 func TestMaintenanceWorkerNameSanitizes(t *testing.T) {
-	cases := []struct {
-		pipeline, table, want string
-	}{
-		{"shop", "raw.orders", "shop-raw-orders-maint"},
-		{"Shop_Prod", "Raw.Orders", "shop-prod-raw-orders-maint"},
+	// The sanitized prefix, with a hash suffix that disambiguates names that
+	// sanitize the same or collide after truncation (issue #576).
+	if got := maintenanceWorkerName("shop", "raw.orders"); !strings.HasPrefix(got, "shop-raw-orders-") {
+		t.Errorf("maintenanceWorkerName = %q, want prefix shop-raw-orders-", got)
 	}
-	for _, c := range cases {
-		if got := maintenanceWorkerName(c.pipeline, c.table); got != c.want {
-			t.Errorf("maintenanceWorkerName(%q, %q) = %q, want %q", c.pipeline, c.table, got, c.want)
-		}
+	if got := maintenanceWorkerName("Shop_Prod", "Raw.Orders"); !strings.HasPrefix(got, "shop-prod-raw-orders-") {
+		t.Errorf("maintenanceWorkerName = %q, want prefix shop-prod-raw-orders-", got)
+	}
+	if a, b := maintenanceWorkerName("db", "a_b"), maintenanceWorkerName("db", "a-b"); a == b {
+		t.Errorf("a_b and a-b collide on %q", a)
 	}
 	long := maintenanceWorkerName(strings.Repeat("p", 80), "orders")
 	if len(long) > 63 {

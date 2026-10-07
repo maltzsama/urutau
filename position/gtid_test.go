@@ -92,3 +92,36 @@ func TestMinDisjointGTIDIsIncomparable(t *testing.T) {
 		t.Fatal("MinSafe of disjoint GTID sets must error, not pick a side")
 	}
 }
+
+// A MySQL 8.4 tagged GTID (uuid:tag:interval) is accepted and stays distinct
+// from its untagged form (issue #576).
+func TestParseGTIDTagged(t *testing.T) {
+	const uuid = "3d3b4a6a-2f4b-11e9-9c9b-0242ac110002"
+	g, err := ParseGTID(uuid + ":mytag:1-5")
+	if err != nil {
+		t.Fatalf("ParseGTID(tagged): %v", err)
+	}
+	if got := g.String(); got != uuid+":mytag:1-5" {
+		t.Fatalf("tagged String() = %q", got)
+	}
+	if g.Contains(MustGTID(uuid + ":1-5")) {
+		t.Fatal("a tagged set must not equal its untagged form")
+	}
+}
+
+// Compare/Contains must not panic on a position of another kind (issue #576).
+func TestGTIDCompareAndContainsOtherKind(t *testing.T) {
+	g := MustGTID("3d3b4a6a-2f4b-11e9-9c9b-0242ac110002:1")
+	if c := g.Compare(offsetsPosition{}); c != Incomparable {
+		t.Fatalf("Compare(other) = %d, want Incomparable", c)
+	}
+	if g.Contains(offsetsPosition{}) {
+		t.Fatal("Contains(other) = true, want false")
+	}
+}
+
+type offsetsPosition struct{}
+
+func (offsetsPosition) String() string         { return "" }
+func (offsetsPosition) Compare(Position) int   { return Incomparable }
+func (offsetsPosition) Contains(Position) bool { return false }

@@ -11,6 +11,7 @@ import (
 	"github.com/maltzsama/urutau/internal/dashboard"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/internal/version"
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -233,7 +234,7 @@ func (s dashState) RestartWorker(name string) error {
 	w, ok := c.workers[name]
 	c.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("no worker %q", name)
+		return fmt.Errorf("no worker %q: %w", name, dashboard.ErrUnknownWorker)
 	}
 	// A reset cancels the session and bumps the epoch. The in-flight batches
 	// are redelivered on reconnect (issue #235): re-applied idempotently on
@@ -241,7 +242,7 @@ func (s dashState) RestartWorker(name string) error {
 	// committed before its ack was lost. The supervisor refuses the same
 	// reset there, so the dashboard must too (issues #205, #461).
 	if n := c.inFlight(name); n > 0 && c.workerAppends(name) {
-		return fmt.Errorf("coordinator: worker %s has %d in-flight batch(es) on an append table — a restart would append them twice; wait for it to drain", name, n)
+		return fmt.Errorf("coordinator: worker %s has %d in-flight batch(es) on an append table — a restart would append them twice; wait for it to drain: %w", name, n, dashboard.ErrRestartConflict)
 	}
 	c.supervisor.recordReset(name, time.Now(), supervisionConfig(c.cfg).ResetWindow)
 	c.resetWorker(w)
@@ -468,22 +469,36 @@ func maintenanceView(m map[string]*maintStats) *dashboard.Maintenance {
 // looking up the worker that serves it (one worker serves exactly one table).
 // Empty where nothing is committed yet. Never holds two locks at once.
 func (c *Coordinator) tablePositions() map[string]string {
-	workerTables := make(map[string]string)
+	tableWorkers := make(map[string][]string)
 	c.mu.Lock()
 	for name, w := range c.workers {
 		for _, ref := range w.refs {
-			workerTables[name] = ref.Target
+			tableWorkers[ref.Target] = append(tableWorkers[ref.Target], name)
 		}
 	}
 	c.mu.Unlock()
 
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
-	out := make(map[string]string, len(workerTables))
-	for worker, table := range workerTables {
-		if pos := c.confirmed[worker]; pos != nil {
-			out[table] = pos.String()
+	out := make(map[string]string, len(tableWorkers))
+	for table, workers := range tableWorkers {
+		positions := make([]position.Position, 0, len(workers))
+		for _, worker := range workers {
+			if pos := c.confirmed[worker]; pos != nil {
+				positions = append(positions, pos)
+			}
 		}
+		if len(positions) == 0 {
+			continue
+		}
+		// Several owners of one table: report the MINIMUM committed position —
+		// the point every owner has passed — not one owner at random
+		// (issue #576).
+		best, err := position.MinSafe(positions)
+		if err != nil || best == nil {
+			continue
+		}
+		out[table] = best.String()
 	}
 	return out
 }

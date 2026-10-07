@@ -88,7 +88,6 @@ func (w *Worker) MetricsSnapshot() *pb.WorkerMetricsReport {
 		tm := get(t)
 		tm.Enrich = append(tm.Enrich, &pb.EnrichMetrics{
 			Reference:    ref,
-			Misses:       ec.Misses,
 			InnerDropped: ec.InnerDropped,
 			Evicted:      ec.Evicted,
 		})

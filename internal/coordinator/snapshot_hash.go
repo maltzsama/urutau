@@ -75,7 +75,11 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 			if sp.Pending != nil {
 				relay.pending = append([]uint32(nil), sp.Pending...)
 			}
-			return c.snk.SetProperties(ctx, tref, snapshot.EncodeSnapshotProgress(&sp))
+			props, err := snapshot.EncodeSnapshotProgress(&sp)
+			if err != nil {
+				return err
+			}
+			return c.snk.SetProperties(ctx, tref, props)
 		}
 		if cfg.Progress != nil {
 			relay.pending = append([]uint32(nil), cfg.Progress.Pending...)

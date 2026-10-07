@@ -235,9 +235,27 @@ func parseReady(line string) readyResult {
 	return readyResult{ready: r}
 }
 
+// maxLineBytes caps one output line. ReadString would grow a newline-less line
+// until OOM (issue #576).
+const maxLineBytes = 1 << 20
+
 func readLine(br *bufio.Reader) (string, error) {
-	s, err := br.ReadString('\n')
-	return strings.TrimRight(s, "\r\n"), err
+	var sb strings.Builder
+	for {
+		chunk, err := br.ReadSlice('\n')
+		sb.Write(chunk)
+		switch {
+		case err == bufio.ErrBufferFull:
+			if sb.Len() > maxLineBytes {
+				return strings.TrimRight(sb.String(), "\r\n"), fmt.Errorf("plugin: output line exceeds %d bytes", maxLineBytes)
+			}
+			continue
+		case err != nil:
+			return strings.TrimRight(sb.String(), "\r\n"), err
+		default:
+			return strings.TrimRight(sb.String(), "\r\n"), nil
+		}
+	}
 }
 
 func (p *Process) Addr() string     { return p.addr }

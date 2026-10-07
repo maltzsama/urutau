@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -217,5 +218,40 @@ func TestJSONSafeValueCyclicTerminates(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("jsonSafeAttrs on a cyclic map did not terminate")
+	}
+}
+
+type restartErrState struct {
+	fakeState
+	err error
+}
+
+func (s *restartErrState) RestartWorker(string) error { return s.err }
+
+// A restart for an unknown worker is 404 and a refused restart is 409, not a
+// blanket 500 (issue #576).
+func TestRestartMapsErrorsToStatus(t *testing.T) {
+	logger, logBuf, err := logging.NewBuffered("info", "text", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = logger
+	cases := []struct {
+		err  error
+		want int
+	}{
+		{fmt.Errorf("no worker %q: %w", "w-0", ErrUnknownWorker), http.StatusNotFound},
+		{fmt.Errorf("in flight: %w", ErrRestartConflict), http.StatusConflict},
+		{errors.New("boom"), http.StatusInternalServerError},
+	}
+	for _, c := range cases {
+		h := New(&restartErrState{err: c.err}, NewEvents(1), logBuf, slog.Default())
+		mux := http.NewServeMux()
+		h.Register(mux)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/actions/restart/w-0", nil))
+		if rec.Code != c.want {
+			t.Errorf("restart %v: code = %d, want %d", c.err, rec.Code, c.want)
+		}
 	}
 }

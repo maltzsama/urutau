@@ -500,7 +500,7 @@ func validateEnrich(tbl Table, path string, problems *[]string) {
 		if e.Table == "" {
 			*problems = append(*problems, ep+".table: required")
 		} else if seen[e.Table] {
-			*problems = append(*problems, ep+".table: duplicated %q", e.Table)
+			*problems = append(*problems, fmt.Sprintf("%s.table: duplicated %q", ep, e.Table))
 		}
 		seen[e.Table] = true
 		if e.Source.URI == "" {
