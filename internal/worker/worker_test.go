@@ -466,3 +466,16 @@ func TestBootstrapGuardAllocatedLazily(t *testing.T) {
 		t.Fatal("bootstrapGuard not released on completion")
 	}
 }
+
+// The worker's metadata-name check must agree with transport's single source
+// of truth (issue #509).
+func TestMetadataNamesAgreeWithTransport(t *testing.T) {
+	for _, f := range transport.WireMetadataFields() {
+		if !isMetadataName(f.Name) {
+			t.Errorf("isMetadataName(%q) = false, but transport lists it as metadata", f.Name)
+		}
+	}
+	if isMetadataName("id") {
+		t.Error("isMetadataName(id) = true, want false")
+	}
+}

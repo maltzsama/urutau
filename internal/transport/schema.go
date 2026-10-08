@@ -198,8 +198,11 @@ func kindToArrowScalar(ct core.ColumnType) (arrow.DataType, error) {
 	}
 }
 
-// isMetadataColumn returns true for the fixed metadata column names.
-func isMetadataColumn(name string) bool {
+// IsWireMetadata reports whether name is one of the fixed wire metadata
+// columns. It is the single source of truth for the metadata name set that
+// isMetadataColumn/isReservedColumnName and the worker's drift check share
+// (issue #509).
+func IsWireMetadata(name string) bool {
 	switch name {
 	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot", "__phase":
 		return true
@@ -207,15 +210,12 @@ func isMetadataColumn(name string) bool {
 	return false
 }
 
+// isMetadataColumn returns true for the fixed metadata column names.
+func isMetadataColumn(name string) bool { return IsWireMetadata(name) }
+
 // isReservedColumnName returns true for column names that travel on the
 // wire as system columns. User data columns must not use these names.
-func isReservedColumnName(name string) bool {
-	switch name {
-	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot", "__phase":
-		return true
-	}
-	return false
-}
+func isReservedColumnName(name string) bool { return IsWireMetadata(name) }
 
 // numWireMetadataFields is the count of trailing metadata columns on every
 // wire-schema record. The single source of truth for the "- N" arithmetic
