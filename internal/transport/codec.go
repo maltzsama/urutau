@@ -296,16 +296,15 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		case uint8, uint16, uint32, uint, uint64:
 			// An unsigned source column cast to int64: go-mysql delivers
 			// it as a Go unsigned type. Above MaxInt64 it cannot land.
-			u := unsignedOf(t)
+			u, _ := core.AsUint64(t)
 			if u > math.MaxInt64 {
 				return fmt.Errorf("value %d out of int64 range", u)
 			}
 			bld.(*array.Int64Builder).Append(int64(u))
 		case float64:
-			// RV-04: math.MaxInt64 as an untyped constant converts to
-			// float64 as exactly 2^63 (float64 cannot represent 2^63-1
-			// and rounds UP). The exclusive bound is therefore >=: t = 2^63
-			// must be REJECTED even though `t > math.MaxInt64` reads false.
+			// RV-04: MaxInt64 as an untyped constant converts to exactly
+			// 2^63 in float64, so the exclusive bound is >=: t = 2^63 must
+			// be REJECTED even though `t > math.MaxInt64` reads false.
 			if !isIntegralFloat(t) || t < math.MinInt64 || t >= math.MaxInt64 {
 				return fmt.Errorf("value %v is not an integer representable in int64", t)
 			}
@@ -318,7 +317,8 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 		case uint64:
 			bld.(*array.Uint64Builder).Append(t)
 		case uint8, uint16, uint32, uint:
-			bld.(*array.Uint64Builder).Append(unsignedOf(t))
+			u, _ := core.AsUint64(t)
+			bld.(*array.Uint64Builder).Append(u)
 		case int:
 			if t < 0 {
 				return fmt.Errorf("negative value %d is not representable in uint64", t)
@@ -372,7 +372,7 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			// An unsigned source column cast to float64. Above 2^53 a
 			// float64 no longer holds every integer; reject a value it
 			// would round (2^64 itself is out of uint64 range).
-			u := unsignedOf(t)
+			u, _ := core.AsUint64(t)
 			if f := float64(u); f >= 1<<64 || uint64(f) != u {
 				return fmt.Errorf("value %d loses precision in float64", u)
 			}
@@ -757,21 +757,4 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 // isIntegralFloat reports whether f is an integer representable without loss.
 func isIntegralFloat(f float64) bool {
 	return f == math.Trunc(f) && !math.IsInf(f, 0) && !math.IsNaN(f)
-}
-
-// unsignedOf widens a Go unsigned integer to uint64 (0 for any other type).
-func unsignedOf(v any) uint64 {
-	switch t := v.(type) {
-	case uint8:
-		return uint64(t)
-	case uint16:
-		return uint64(t)
-	case uint32:
-		return uint64(t)
-	case uint:
-		return uint64(t)
-	case uint64:
-		return t
-	}
-	return 0
 }

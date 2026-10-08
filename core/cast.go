@@ -336,7 +336,7 @@ func StringifyScalar(v any) (string, error) {
 	case uint64:
 		return strconv.FormatUint(t, 10), nil
 	case uint8, uint16, uint32, uint:
-		u, _ := unsignedValue(t)
+		u, _ := asUnsigned(t)
 		return strconv.FormatUint(u, 10), nil
 	case float32:
 		return strconv.FormatFloat(float64(t), 'f', -1, 32), nil
@@ -504,7 +504,7 @@ func castToInt64(v any) (any, error) {
 		return nil, nil
 	}
 	// A uint64 above MaxInt64 has no exact int64 form; report the overflow.
-	if u, ok := unsignedValue(v); ok && u > math.MaxInt64 {
+	if u, ok := asUnsigned(v); ok && u > math.MaxInt64 {
 		return nil, fmt.Errorf("core: %d overflows int64", u)
 	}
 	// AsInt64 covers every signed integer width (issue #502).
@@ -520,44 +520,11 @@ func castToUInt64(v any) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
-	if u, ok := unsignedValue(v); ok {
+	// AsUint64 covers every integer width and rejects a negative value.
+	if u, ok := AsUint64(v); ok {
 		return u, nil
 	}
-	var n int64
-	switch t := v.(type) {
-	case int:
-		n = int64(t)
-	case int32:
-		n = int64(t)
-	case int64:
-		n = t
-	default:
-		return nil, fmt.Errorf("core: cannot cast %T to uint64", v)
-	}
-	if n < 0 {
-		return nil, fmt.Errorf("core: negative value %d cannot be cast to uint64", n)
-	}
-	return uint64(n), nil
-}
-
-// unsignedValue widens the unsigned integer types a source decoder hands
-// over (go-mysql's canal delivers an unsigned column as uint8, uint16,
-// uint32 or uint64) to uint64.
-func unsignedValue(v any) (uint64, bool) {
-	switch t := v.(type) {
-	case uint8:
-		return uint64(t), true
-	case uint16:
-		return uint64(t), true
-	case uint32:
-		return uint64(t), true
-	case uint:
-		return uint64(t), true
-	case uint64:
-		return t, true
-	default:
-		return 0, false
-	}
+	return nil, fmt.Errorf("core: cannot cast %T to uint64", v)
 }
 
 func castToFloat64(v any) (any, error) {
@@ -603,7 +570,7 @@ func castToDecimal(v any, precision, scale int) (any, error) {
 		}
 		return t, nil
 	}
-	if u, ok := unsignedValue(v); ok {
+	if u, ok := asUnsigned(v); ok {
 		return decimalChecked(new(big.Int).SetUint64(u), precision, scale)
 	}
 	return nil, fmt.Errorf("core: cannot cast %T to decimal", v)
