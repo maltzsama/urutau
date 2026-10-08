@@ -1250,13 +1250,10 @@ func nestedDrift(path string, st *array.Struct, declared []core.Column) (SchemaD
 }
 
 // isMetadataName reports the reserved wire metadata columns.
-func isMetadataName(name string) bool {
-	switch name {
-	case "__op", "__pos", "__commit_ts", "__ingest_ts", "__snapshot", "__phase":
-		return true
-	}
-	return false
-}
+// isMetadataName reports whether name is a wire metadata column. It defers to
+// transport so a seventh metadata column cannot drift the worker's drift check
+// out of sync (issue #509).
+func isMetadataName(name string) bool { return transport.IsWireMetadata(name) }
 
 // lastRowPos returns the __pos of the batch's last row (its commit
 // coordinate), or "" for an empty batch.
