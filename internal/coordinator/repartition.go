@@ -666,22 +666,6 @@ func (c *Coordinator) maxWorkersFor(target string) int {
 	return defaultMaxWorkers
 }
 
-// setRouteForTest publishes one table's owners into the routing snapshot.
-// Tests only: production routing is published by boot and by ScaleTable.
-func (c *Coordinator) setRouteForTest(target string, owners []*workerState) {
-	snap := c.loadRouting().clone()
-	snap.owners[target] = owners
-	c.publishRouting(snap)
-}
-
-// setRangesForTest replaces the whole ranges map in the routing snapshot,
-// matching the old c.partitionRanges = map[...] assignment. Tests only.
-func (c *Coordinator) setRangesForTest(ranges map[string][]source.Chunk) {
-	snap := c.loadRouting().clone()
-	snap.ranges = ranges
-	c.publishRouting(snap)
-}
-
 // lookupChunker returns target's chunker, or nil when none is built yet.
 func (c *Coordinator) lookupChunker(target string) source.ChunkSource {
 	c.chunkersMu.Lock()

@@ -591,11 +591,6 @@ func quotedIdents(cols []string) []string {
 	return out
 }
 
-// quotedList joins the quoted identifiers with ", ".
-func quotedList(cols []string) string {
-	return strings.Join(quotedIdents(cols), ", ")
-}
-
 // normalize maps driver values into the scalar subset shared with the
 // stream decoder.
 func normalize(v any) any {

@@ -239,3 +239,8 @@ func TestQuoteIdent(t *testing.T) {
 		t.Fatalf("quotePgIdent = %q", quotePgIdent("orders"))
 	}
 }
+
+// quotedList joins the quoted identifiers with ", " (test-only helper).
+func quotedList(cols []string) string {
+	return strings.Join(quotedIdents(cols), ", ")
+}
