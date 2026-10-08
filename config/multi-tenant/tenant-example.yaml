@@ -5,8 +5,8 @@
 #
 # Size the ResourceQuota against the CDCPipeline's own requests: the
 # coordinator container uses coordinator.cpu/memory, and every worker
-# Deployment uses worker.cpu+worker.cpu_overhead / worker.memory+
-# worker.memory_overhead (a table's own workers.cpu/memory overrides worker).
+# Deployment uses worker.cpu+worker.cpuOverhead / worker.memory+
+# worker.memoryOverhead (a table's own workers.cpu/memory overrides worker).
 # A pipeline's footprint is the coordinator plus the SUM over tables of
 # workers.number × the per-worker request.
 apiVersion: v1
