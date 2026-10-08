@@ -249,17 +249,17 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		coordinator["cpu"] = opts.CoordinatorCPU
 	}
 	worker := map[string]any{
-		"cpu": "500m", "cpu_overhead": "250m",
-		"memory": "1Gi", "memory_overhead": "512Mi",
+		"cpu": "500m", "cpuOverhead": "250m",
+		"memory": "1Gi", "memoryOverhead": "512Mi",
 		// /metrics, and in the race image the Go profiler, so a
 		// run can read a worker's live heap.
 		"metricsAddr": ":8080",
 	}
 	if opts.WorkerMemoryOverhead != "" {
-		worker["memory_overhead"] = opts.WorkerMemoryOverhead
+		worker["memoryOverhead"] = opts.WorkerMemoryOverhead
 	}
 	if opts.WorkerCPUOverhead != "" {
-		worker["cpu_overhead"] = opts.WorkerCPUOverhead
+		worker["cpuOverhead"] = opts.WorkerCPUOverhead
 	}
 	if opts.SnapshotChunkSize > 0 {
 		coordinator["snapshot"] = map[string]any{"chunkSize": opts.SnapshotChunkSize}
@@ -344,8 +344,8 @@ func buildKafkaCR(name, ns, image, sourceSecret, catalogSecret string, tables []
 			},
 			"coordinator": map[string]any{"cpu": "1", "memory": "2Gi", "metricsAddr": ":8080", "eventlog": e2eEventlog},
 			"worker": map[string]any{
-				"cpu": "500m", "cpu_overhead": "500m",
-				"memory": "2Gi", "memory_overhead": "1Gi",
+				"cpu": "500m", "cpuOverhead": "500m",
+				"memory": "2Gi", "memoryOverhead": "1Gi",
 			},
 			"definition": map[string]any{
 				"inline": map[string]any{

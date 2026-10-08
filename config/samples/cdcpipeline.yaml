@@ -45,13 +45,13 @@ spec:
       workerDeliveryTimeout: 5m
 
   # The resource default for every worker; a table's own workers.cpu/memory
-  # overrides it. cpu/memory are the request, cpu+cpu_overhead /
-  # memory+memory_overhead the limit.
+  # overrides it. cpu/memory are the request, cpu+cpuOverhead /
+  # memory+memoryOverhead the limit.
   worker:
     cpu: "500m"
-    cpu_overhead: "100m"
+    cpuOverhead: "100m"
     memory: "1Gi"
-    memory_overhead: "256Mi"
+    memoryOverhead: "256Mi"
 
   # The inline pipeline spec. source.uri and sink.uri are deliberately
   # absent — the Secrets above fill them at coordinator boot. Everything

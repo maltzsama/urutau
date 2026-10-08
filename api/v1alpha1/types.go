@@ -146,9 +146,9 @@ type SupervisionSpec struct {
 // off-heap buffers).
 type WorkerDefaults struct {
 	CPU            string `json:"cpu,omitempty"`
-	CPUOverhead    string `json:"cpu_overhead,omitempty"`
+	CPUOverhead    string `json:"cpuOverhead,omitempty"`
 	Memory         string `json:"memory,omitempty"`
-	MemoryOverhead string `json:"memory_overhead,omitempty"`
+	MemoryOverhead string `json:"memoryOverhead,omitempty"`
 	// MetricsAddr is the address every worker Pod serves Prometheus metrics
 	// on (`--metrics-addr`), e.g. ":9091". Empty disables the endpoint.
 	// Separate from Coordinator.MetricsAddr because coordinator and workers

@@ -73,9 +73,9 @@ spec:
                   type: object
                   properties:
                     cpu: {type: string}
-                    cpu_overhead: {type: string}
+                    cpuOverhead: {type: string}
                     memory: {type: string}
-                    memory_overhead: {type: string}
+                    memoryOverhead: {type: string}
                     metricsAddr: {type: string}
             status:
               type: object
