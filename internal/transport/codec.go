@@ -493,7 +493,7 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			bld.(*array.FixedSizeBinaryBuilder).Append(t)
 		case string:
 			// Parse hex UUID.
-			raw, err := parseUUIDBytes(t)
+			raw, err := core.ParseUUIDBytes(t)
 			if err != nil {
 				return err
 			}
@@ -751,43 +751,6 @@ func readTypedValue(col arrow.Array, ct core.ColumnType, i int) (any, error) {
 		return out, nil
 	default:
 		return nil, fmt.Errorf("unsupported kind %s", ct.Kind)
-	}
-}
-
-// parseUUIDBytes parses a hyphenated or compact UUID string into 16 bytes.
-func parseUUIDBytes(s string) ([]byte, error) {
-	compact := make([]byte, 0, 32)
-	for _, c := range s {
-		if c == '-' {
-			continue
-		}
-		compact = append(compact, byte(c))
-	}
-	if len(compact) != 32 {
-		return nil, fmt.Errorf("uuid: want 32 hex chars, got %d", len(compact))
-	}
-	raw := make([]byte, 16)
-	for i := 0; i < 16; i++ {
-		hi := hexDigit(compact[i*2])
-		lo := hexDigit(compact[i*2+1])
-		if hi < 0 || lo < 0 {
-			return nil, fmt.Errorf("uuid: invalid hex char")
-		}
-		raw[i] = byte(hi<<4 | lo)
-	}
-	return raw, nil
-}
-
-func hexDigit(c byte) int {
-	switch {
-	case c >= '0' && c <= '9':
-		return int(c - '0')
-	case c >= 'a' && c <= 'f':
-		return int(c-'a') + 10
-	case c >= 'A' && c <= 'F':
-		return int(c-'A') + 10
-	default:
-		return -1
 	}
 }
 

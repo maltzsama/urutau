@@ -2,7 +2,6 @@ package iceberg
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -817,7 +816,7 @@ func appendColumn(builder array.Builder, field arrow.Field, values []any) error 
 			case time.Time:
 				b.AppendTime(t)
 			case string:
-				tm, err := parseTimestampText(t)
+				tm, err := core.ParseTimestampText(t)
 				if err != nil {
 					return fmt.Errorf("iceberg: column %q: %w", name, err)
 				}
@@ -841,7 +840,7 @@ func appendColumn(builder array.Builder, field arrow.Field, values []any) error 
 				}
 				b.Append(t)
 			case string:
-				raw, err := uuidToBytes(t)
+				raw, err := core.ParseUUIDBytes(t)
 				if err != nil {
 					return fmt.Errorf("iceberg: column %q: %w", name, err)
 				}
@@ -889,36 +888,6 @@ func timeToMicros(s string) (int64, error) {
 		}
 	}
 	return 0, fmt.Errorf("time %q: not a valid time of day", s)
-}
-
-var tsLayouts = []string{
-	"2006-01-02 15:04:05.999999999",
-	"2006-01-02 15:04:05.999999",
-	"2006-01-02 15:04:05",
-}
-
-// parseTimestampText parses a naive or RFC3339 timestamp. Naive values are
-// anchored at UTC so the wall clock survives round-tripping.
-func parseTimestampText(s string) (time.Time, error) {
-	for _, layout := range tsLayouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t, nil
-		}
-	}
-	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t, nil
-	}
-	return time.Time{}, fmt.Errorf("timestamp %q: not a valid timestamp", s)
-}
-
-// uuidToBytes parses a hyphenated uuid text into its 16 raw bytes.
-func uuidToBytes(s string) ([]byte, error) {
-	compact := strings.ReplaceAll(strings.ToLower(s), "-", "")
-	raw, err := hex.DecodeString(compact)
-	if err != nil || len(raw) != 16 {
-		return nil, fmt.Errorf("uuid %q: not a valid uuid", s)
-	}
-	return raw, nil
 }
 
 // ── partition spec builder ──────────────────────────────────────────
