@@ -17,11 +17,6 @@ type GetFlightInfoRequest struct {
 	FromOffset string `json:"fromOffset,omitempty"`
 }
 
-type FlightInfoResponse struct {
-	EndOffset    string `json:"endOffset,omitempty"`
-	EstimatedLag *int64 `json:"estimatedLag,omitempty"`
-}
-
 type ListTablesResponse struct {
 	Tables []TableInfo `json:"tables"`
 }
