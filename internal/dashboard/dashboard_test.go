@@ -212,7 +212,7 @@ func TestJSONSafeValueCyclicTerminates(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = jsonSafeAttrs(map[string]any{"m": m})
+		_ = logging.JSONSafeAttrs(map[string]any{"m": m})
 	}()
 	select {
 	case <-done:

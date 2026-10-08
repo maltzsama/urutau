@@ -176,7 +176,7 @@ func logEntryOf(rec logging.Record) logEntry {
 		TS:    rec.Time.UTC().Format(time.RFC3339Nano),
 		Level: rec.Level.String(),
 		Msg:   rec.Message,
-		Attrs: jsonSafeAttrs(rec.Attrs),
+		Attrs: logging.JSONSafeAttrs(rec.Attrs),
 	}
 }
 
@@ -236,62 +236,6 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 func writeSSE(w io.Writer, event string, data []byte) error {
 	_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
 	return err
-}
-
-// jsonSafeAttrs recursively replaces values json.Marshal cannot encode (maps
-// with non-string keys, channels, funcs, …) with their text form, so one odd
-// attr can never 500 the whole logs endpoint. The log buffer already stores
-// JSON-safe values; this is defense in depth.
-// maxJSONDepth bounds jsonSafeValue's recursion. A cyclic map logged as an attr
-// would otherwise recurse until stack overflow — a fatal error the net/http
-// recover cannot catch (issue #227). The terminal branch returns a fixed
-// marker, NOT fmt.Sprint: fmt does not detect map cycles and would itself
-// overflow.
-const maxJSONDepth = 8
-
-const maxDepthMarker = "<max-depth>"
-
-func jsonSafeAttrs(m map[string]any) map[string]any {
-	if m == nil {
-		return nil
-	}
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = jsonSafeValue(v, 1)
-	}
-	return out
-}
-
-func jsonSafeValue(v any, depth int) any {
-	switch t := v.(type) {
-	case nil, bool, string,
-		int, int8, int16, int32, int64,
-		uint, uint8, uint16, uint32, uint64,
-		float32, float64, json.Number:
-		return v
-	case map[string]any:
-		if depth >= maxJSONDepth {
-			return maxDepthMarker
-		}
-		out := make(map[string]any, len(t))
-		for k, vv := range t {
-			out[k] = jsonSafeValue(vv, depth+1)
-		}
-		return out
-	case []any:
-		if depth >= maxJSONDepth {
-			return maxDepthMarker
-		}
-		out := make([]any, len(t))
-		for i, vv := range t {
-			out[i] = jsonSafeValue(vv, depth+1)
-		}
-		return out
-	default:
-		// Channels, funcs, errors and flat maps — no map[string]any/[]any
-		// recursion, so fmt.Sprint cannot cycle here.
-		return fmt.Sprint(v)
-	}
 }
 
 func (h *Handler) cancel(w http.ResponseWriter, _ *http.Request) {
