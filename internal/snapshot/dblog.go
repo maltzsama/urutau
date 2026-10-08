@@ -1,4 +1,4 @@
-// Package dblog holds the source-agnostic DBLog snapshot orchestrator:
+// Package snapshot holds the source-agnostic DBLog snapshot orchestrator:
 // chunking by primary key, low/high watermarks, and the caught-up proof
 // that closes each window — never a timer. Sources implement the three
 // interfaces (ChunkSource, SourceReader, Relay) on top of their own
@@ -57,14 +57,6 @@ type Relay interface {
 	GateOn(table string, chunkID uint32)
 	GateFlush(ctx context.Context) error
 }
-
-// ChunkSource is the chunk SELECT surface the orchestrator consumes. The
-// SQL-backed chunkers implement it; unit tests drive SnapshotTable with a
-// fake.
-
-// SourceReader is the reader surface the orchestrator needs: positions for
-// the watermarks, and the window that tags events InWindow at decode time —
-// so no event can escape the window by racing a channel pull.
 
 // SnapshotConfig tunes the DBLog snapshot phase.
 type SnapshotConfig struct {

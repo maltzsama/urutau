@@ -38,8 +38,8 @@ func NewSchedule() *Schedule {
 }
 
 // Due returns the enabled operations whose interval has elapsed since they
-// last ran, in execution order (compaction, snapshot expiry, orphan
-// cleanup). An operation that has never run is due immediately. A disabled
+// last ran, in execution order (snapshot expiry, orphan cleanup, then
+// compaction). An operation that has never run is due immediately. A disabled
 // operation — its sub-config nil, or maintenance off entirely — is never
 // returned.
 func (s *Schedule) Due(table string, cfg *spec.Maintenance, now time.Time) []sink.MaintenanceOp {

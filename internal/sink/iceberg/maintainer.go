@@ -467,8 +467,6 @@ func compactionConfigFrom(c *spec.CompactionConfig, log *slog.Logger) compaction
 // unset: it is replaced by the default and logged, so a configuration mistake
 // is visible. Validate already rejects malformed strings before a spec reaches
 // here, so this is defense, not the primary path.
-// durationOr resolves a maintenance duration with the shared spec rule,
-// warning on an invalid value (the iceberg maintainer has a logger).
 func durationOr(s string, def time.Duration, log *slog.Logger, field string) time.Duration {
 	return spec.ParseDurationOrDefault(s, def, log, field)
 }

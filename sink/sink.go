@@ -1,5 +1,5 @@
 // Package sink defines the destination catalog contract. A sink consumes
-// core.Schema and commits rowchange.Batch; it knows nothing about any source.
+// core.Schema and commits dataplane.Batch; it knows nothing about any source.
 // The contract is composed of small capability interfaces; the driver
 // registry resolves a spec's sink into a concrete Sink.
 package sink

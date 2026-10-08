@@ -97,9 +97,10 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 }
 
 // onAttach records a worker's session attaching, outside c.mu: noteAttach
-// takes the supervisor lock, and calling it under c.mu would invert the order
-// supervisor.tick uses (supervisor.mu → c.mu) and deadlock the two (audit #3).
-// A worker back from a crash loop ends the run here, with its Pod's reason.
+// takes the supervisor lock, and the supervisor's lock order is c.mu then
+// supervisor.mu (supervisor.tick). Acquiring supervisor.mu first would invert
+// that order and deadlock the two (audit #3). A worker back from a crash loop
+// ends the run here, with its Pod's reason.
 func (c *Coordinator) onAttach(worker string) error {
 	c.supervisor.noteAttach(worker)
 	c.pushDashState() // the worker attached

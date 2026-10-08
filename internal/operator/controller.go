@@ -387,7 +387,7 @@ func coordinatorServiceAccount(cr *urutauv1alpha1.CDCPipeline) *corev1.ServiceAc
 // namespace. The contract is that the coordinator, not the operator, writes
 // its status.
 //
-// It also grants Deployment management for the long-lived data workers and
+// It also grants StatefulSet management for the long-lived data workers and
 // reading its own Pod, to set the ownerReference that cascades GC of
 // everything it provisions when the coordinator dies. Those are
 // namespace-wide (no resourceNames) because a worker Deployment does not

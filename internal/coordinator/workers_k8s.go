@@ -1,5 +1,5 @@
 // Kubernetes worker provisioning: the coordinator, not the operator,
-// creates the worker Deployments it needs — the same driver→executor
+// creates the worker StatefulSets it needs — the same driver→executor
 // relationship Spark uses (the driver clones the executor pod template
 // and creates the Pod; it never assembles a PodSpec field by field). The
 // operator (see internal/operator) renders one worker Pod template per
@@ -196,7 +196,7 @@ func loadWorkerPodTemplate(target string) (corev1.PodTemplateSpec, error) {
 
 // coordinatorPodOwner identifies this coordinator's own Pod, found by its
 // hostname (Kubernetes sets a Pod's hostname to its own name by default)
-// — every worker Deployment this coordinator creates carries an
+// — every worker StatefulSet this coordinator creates carries an
 // ownerReference to it, so the Pod dying (or the StatefulSet scaling to
 // zero) cascades to GC every worker it provisioned.
 func coordinatorPodOwner(ctx context.Context, cs kubernetes.Interface, namespace string) (metav1.OwnerReference, error) {
