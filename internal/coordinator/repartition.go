@@ -481,6 +481,7 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 		case <-deadline.C:
 			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s (in-flight=%d queued=%d staged-cycles=%d open=%d done=%d open-seqs=%v)",
 				pending, c.drainTimeout(), inflight, queued, cycles, cyclesOpen, cyclesDone, c.staged.openSeqs(core.TableRef{Target: target}))
+		case <-c.ackNotify: // an ack may have drained in-flight (issue #587)
 		case <-tick.C:
 		}
 	}
@@ -509,6 +510,8 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 		case <-deadline.C:
 			c.log.Warn("coordinator: owner drain timed out; forcing removal",
 				"worker", w.name, "inflight", c.inFlight(w.name), "timeout", c.drainTimeout())
+		case <-c.ackNotify: // an ack may have drained in-flight (issue #587)
+			continue
 		case <-tick.C:
 			continue
 		}

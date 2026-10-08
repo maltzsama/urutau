@@ -22,7 +22,9 @@ import (
 // is not yet committed.
 const maxUncommittedChunks = 2
 
-// chunkCommitPoll is how often a waiting chunk re-checks the index.
+// chunkCommitPoll is the FALLBACK re-check cadence: the pacer now wakes on the
+// ack notification (issue #587), and this bounds how long a missed signal
+// could stall it.
 const chunkCommitPoll = 20 * time.Millisecond
 
 // chunkMarker is a queued Closes marker: its in-flight batch id, and the
@@ -56,13 +58,28 @@ func (c *Coordinator) awaitChunkCommits(ctx context.Context, worker string, belo
 		if c.uncommittedChunks(worker) < below {
 			return nil
 		}
+		// Wait on the ack notification (issue #587): an ack that drops a
+		// marker sends a coalesced signal, so the pacer wakes on the event
+		// instead of polling. The buffered channel means a signal sent between
+		// the check above and the select below is never lost; the slow ticker
+		// is only a safety net.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-lost:
 			return errWorkerLost
+		case <-c.ackNotify:
 		case <-time.After(chunkCommitPoll):
 		}
+	}
+}
+
+// notifyAck wakes awaitChunkCommits waiters without blocking the ack path
+// (issue #587). Buffered 1: coalesced, a burst of acks is one wake.
+func (c *Coordinator) notifyAck() {
+	select {
+	case c.ackNotify <- struct{}{}:
+	default:
 	}
 }
 
@@ -143,6 +160,7 @@ func (c *Coordinator) onMarkerAck(worker string, id uint64) {
 	// marker while it is still held (issue #646).
 	c.recordCursor(worker, id)
 	freed, freedOversized, popped := idx.releaseMarker(id)
+	c.notifyAck()
 	if freed > 0 {
 		c.budget.release(worker, freed)
 	}

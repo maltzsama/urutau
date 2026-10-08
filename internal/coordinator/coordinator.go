@@ -265,6 +265,11 @@ type Coordinator struct {
 
 	ready       chan struct{} // one send per attached session
 	sessionErrs chan error    // first exit wins
+	// ackNotify wakes awaitChunkCommits waiters when an ack may have dropped
+	// in-flight markers, so the snapshot pacer waits on an event instead of
+	// polling (issue #587). Buffered 1 + non-blocking send: coalesced, never
+	// blocks the ack path.
+	ackNotify chan struct{}
 	// snapshotActive is true while the snapshot phase runs. A worker
 	// session lost during it (reset OR death) must fail the run fast: the
 	// worker's in-memory window died with it, so the protocol would either
@@ -524,6 +529,7 @@ func Run(ctx context.Context, cfg Config) error {
 		index:       map[string]*positionIndex{},
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
+		ackNotify:   make(chan struct{}, 1),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
 		gateOn:      map[string]bool{},
@@ -2393,6 +2399,7 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		return
 	}
 	freed, freedOversized, popped := idx.truncate(ack.Table, pos)
+	c.notifyAck()
 	if freed > 0 {
 		c.budget.release(worker, freed)
 	}
