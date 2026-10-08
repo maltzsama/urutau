@@ -249,9 +249,9 @@ func TestParseTimestampText(t *testing.T) {
 		{"not-a-timestamp", true},
 	}
 	for _, tt := range tests {
-		_, err := parseTimestampText(tt.input)
+		_, err := core.ParseTimestampText(tt.input)
 		if (err != nil) != tt.err {
-			t.Errorf("parseTimestampText(%q) error = %v, wantErr %v", tt.input, err, tt.err)
+			t.Errorf("core.ParseTimestampText(%q) error = %v, wantErr %v", tt.input, err, tt.err)
 		}
 	}
 }
@@ -313,20 +313,20 @@ func TestTimeToMicros(t *testing.T) {
 
 func TestUuidToBytes(t *testing.T) {
 	input := "550e8400-e29b-41d4-a716-446655440000"
-	got, err := uuidToBytes(input)
+	got, err := core.ParseUUIDBytes(input)
 	if err != nil {
-		t.Fatalf("uuidToBytes(%q): %v", input, err)
+		t.Fatalf("core.ParseUUIDBytes(%q): %v", input, err)
 	}
 	if len(got) != 16 {
-		t.Fatalf("uuidToBytes(%q) len = %d, want 16", input, len(got))
+		t.Fatalf("core.ParseUUIDBytes(%q) len = %d, want 16", input, len(got))
 	}
 	if got[0] != 0x55 {
 		t.Fatalf("uuidToBytes first byte = %x, want 55", got[0])
 	}
-	if _, err := uuidToBytes("not-a-uuid"); err == nil {
+	if _, err := core.ParseUUIDBytes("not-a-uuid"); err == nil {
 		t.Error("uuidToBytes should error on invalid UUID")
 	}
-	if _, err := uuidToBytes("550e8400-e29b-41d4-a716"); err == nil {
+	if _, err := core.ParseUUIDBytes("550e8400-e29b-41d4-a716"); err == nil {
 		t.Error("uuidToBytes should error on short UUID")
 	}
 }

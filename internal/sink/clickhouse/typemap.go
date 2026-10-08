@@ -169,7 +169,7 @@ func coerce(base string, v any) (any, error) {
 		case string:
 			return t, nil
 		case []byte:
-			return uuidText(t)
+			return core.UUIDText(t)
 		}
 	case strings.HasPrefix(base, "Decimal"):
 		switch t := v.(type) {
@@ -462,14 +462,6 @@ func timeOfDayText(micros int64) (string, error) {
 		return fmt.Sprintf("%02d:%02d:%02d", h, m, s), nil
 	}
 	return fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, ns/1000), nil
-}
-
-// uuidText renders 16 raw bytes as the canonical hyphenated UUID text.
-func uuidText(b []byte) (string, error) {
-	if len(b) != 16 {
-		return "", fmt.Errorf("uuid bytes must be 16 long, got %d", len(b))
-	}
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
 // coerceArray coerces each element of a wire []any by the Array's element
