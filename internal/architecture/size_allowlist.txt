@@ -16,7 +16,7 @@ internal/coordinator/coordinator.go:Coordinator.enqueueBatch 147 # baseline (#39
 internal/coordinator/coordinator.go:Coordinator.run 543 # baseline (#398)
 internal/coordinator/coordinator.go:controlServer.Session 130 # baseline (#398)
 internal/dataplane/collapse.go:Collapse 163 # baseline (#398)
-internal/dataplane/generator.go:EncodeKey 139 # baseline (#398)
+internal/dataplane/key.go:EncodeKey 139 # baseline (#398)
 internal/enrich/columnar.go:Stage.ColumnarJoin 289 # baseline (#398)
 internal/enrich/enrich.go 906 # baseline (#398)
 internal/enrich/enrich.go:New 150 # baseline (#398)
