@@ -1108,15 +1108,6 @@ func (c *Coordinator) run(ctx context.Context) error {
 	}
 }
 
-// resolvePartitionRanges returns the ordered, contiguous PK ranges one
-// table's Workers count requires — the SAME ranges the DBLog snapshot
-// (each chunk aligned within its owning range) and live-stream routing
-// both use, so a key never switches partition ownership between the two
-// phases. Workers<=1 returns a single unbounded range without touching
-// the database at all — the common, unpartitioned case pays no extra
-// cost. Workers>1 requires the source's chunker to implement
-// source.PartitionSource; a source that doesn't (Postgres, today) fails
-// the boot loudly rather than silently running unpartitioned.
 // requirePartitionKey rejects workers>1 for a table with no primary key:
 // partitioning splits the key range, and a table without one has no way to
 // divide it. Checked before resolvePartitionRanges so the error names the
@@ -1173,6 +1164,15 @@ func requireConcurrentSink(t spec.Table, snk any) error {
 	return nil
 }
 
+// resolvePartitionRanges returns the ordered, contiguous PK ranges one
+// table's Workers count requires — the SAME ranges the DBLog snapshot
+// (each chunk aligned within its owning range) and live-stream routing
+// both use, so a key never switches partition ownership between the two
+// phases. Workers<=1 returns a single unbounded range without touching
+// the database at all — the common, unpartitioned case pays no extra
+// cost. Workers>1 requires the source's chunker to implement
+// source.PartitionSource; a source that doesn't (Postgres, today) fails
+// the boot loudly rather than silently running unpartitioned.
 func (c *Coordinator) resolvePartitionRanges(_ context.Context, t spec.Table, ref source.TableRef) ([]source.Chunk, source.ChunkSource, error) {
 	n := t.WorkerCount()
 	if n <= 1 {
@@ -2600,10 +2600,6 @@ func writeModeToPB(m dataplane.WriteMode) pb.WriteMode {
 	return pb.WriteMode_WRITE_MODE_UPSERT
 }
 
-// coreCastOf parses the spec's cast map into the policy the coordinator's
-// DDL and the worker's writes must both apply. Parse errors are ignored the
-// same way the collapsed runner ignores them (the cast is re-validated on
-// the write path); the coordinator must not diverge from the runner.
 // snapshotDSN returns the connection string the WORKER uses for the snapshot
 // chunk SELECT: the scoped read-only SnapshotURI when set, else the full
 // source URI (pre-scoping behavior). When the source is configured with the

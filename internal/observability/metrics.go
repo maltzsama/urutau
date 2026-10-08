@@ -84,11 +84,11 @@ func New() *Metrics {
 		[]string{"table", "op"})
 	m.CommitDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "urutau_worker_commit_duration_seconds",
-		Help:    "Iceberg commit latency per table.",
+		Help:    "commit latency per table.",
 		Buckets: prometheus.DefBuckets},
 		[]string{"table"})
 	m.CommitLatencyMs = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "urutau_worker_commit_latency_ms", Help: "last Iceberg commit latency per table."},
+		Name: "urutau_worker_commit_latency_ms", Help: "last commit latency per table."},
 		[]string{"table"})
 	m.CommitFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_worker_commit_failures_total", Help: "failed commits per table."},

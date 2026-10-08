@@ -1366,7 +1366,7 @@ func emptyBatch(b *dataplane.Batch, mode dataplane.WriteMode) *dataplane.Batch {
 	}
 }
 
-// countOps returns the number of upsert and delete rows in a batch by
+// CountOps returns the number of upsert and delete rows in a batch by
 // scanning its __op column. Used by OnCommit observers for bookkeeping.
 func CountOps(b *dataplane.Batch) (upserts, deletes int) {
 	if b == nil || b.Record == nil {

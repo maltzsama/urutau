@@ -37,11 +37,10 @@ type Mode uint8
 const (
 	// ModeCDC is log-based change data capture — the only mode implemented.
 	ModeCDC Mode = iota
-	// ModeIncremental is cursor-column incremental (e.g. updated_at). It
-	// exists in the contract now so adding it later does not change
-	// signatures. Not implemented: it misses deletes and needs a cursor
-	// column; it serves sources without replication access (RDS without
-	// grants, replicas without binlog).
+	// ModeIncremental is cursor-column incremental (e.g. updated_at): a
+	// cursor-bounded read with no replication slot, serving sources without
+	// replication access (RDS without grants, replicas without binlog). It
+	// misses deletes and needs a cursor column. Implemented by Postgres.
 	ModeIncremental
 	// ModeBackfillOnly is a single snapshot with no stream. Declared in the
 	// contract; not implemented.

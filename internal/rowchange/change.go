@@ -1,4 +1,4 @@
-// Package change defines the change event that flows from source decoding
+// Package rowchange defines the change event that flows from source decoding
 // to sink writing: one row-level operation with its before/after images,
 // primary key, and source position.
 package rowchange

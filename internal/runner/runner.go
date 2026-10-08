@@ -571,9 +571,9 @@ type Runner struct {
 // reader) and runs the DBLog snapshot phase for tables without a committed
 // position. It returns once snapshots are done and the stream is live; Run
 // then blocks until cancellation or a terminal error. Resources are owned
-// by the Runner and released when Run returns.
-// NewRunner opens the source and sink through the driver registry — the
-// runner consumes only the contracts, never a concrete implementation.
+// by the Runner and released when Run returns. It opens the source and sink
+// through the driver registry — the runner consumes only the contracts,
+// never a concrete implementation.
 func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -1125,7 +1125,3 @@ func (r *Runner) run(ctx context.Context) error {
 func (r *Runner) DroppedByWindow(target string) int64 {
 	return r.w.DroppedByWindow(target)
 }
-
-// updateCommitted is called from the OnCommit callback. It stores the
-// latest committed position for a target table and recomputes the minimum
-// across all tables.

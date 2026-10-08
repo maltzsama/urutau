@@ -273,9 +273,9 @@ func (r *Reader) Synced() position.Position {
 	return r.synced.Clone()
 }
 
-// Master returns the high-watermark position (the latest offset across
-// all partitions). For the caught-up proof, the consumer is caught up
-// when its synced position contains the master.
+// Master returns the consumer's OWN committed position (the synced offset
+// per partition), not a broker high-watermark. For the caught-up proof the
+// consumer is caught up when its synced position contains the master.
 // DecodeErrors reports how many records the decoder rejected — and, under
 // source.onDecodeError=skip, the reader dropped. The caller publishes it as
 // urutau_decode_errors_total (issue #558).

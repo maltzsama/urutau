@@ -396,8 +396,9 @@ func appendStructRow(sb *array.StructBuilder, fields []arrow.Field, br *transpor
 }
 
 // appendScalar appends one value to its column builder. An integer column
-// takes any Go integer that fits it, a float64 column any number; a value of
-// the wrong type is an error, never a silent zero or a panic (issue #403).
+// takes any Go integer that fits it, a float64 column any number. A missing
+// value (!ok or nil) appends a NULL — the one silent case; a value of the
+// wrong type is an error, never a silent zero or a panic (issue #403).
 func appendScalar(b array.Builder, v any, ok bool) error {
 	if !ok || v == nil {
 		b.AppendNull()

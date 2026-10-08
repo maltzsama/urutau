@@ -502,8 +502,8 @@ func appendTypedValue(bld array.Builder, ct core.ColumnType, v any) error {
 			return fmt.Errorf("want []byte or string for uuid, got %T", v)
 		}
 	case core.KindFixedBinary:
-		// The builder validates the byte width against the field's declared
-		// size, surfacing a truncated/oversized value instead of writing it.
+		// NOTE: FixedSizeBinaryBuilder.Append panics on a wrong-width value;
+		// it does not return an error, so callers must size it exactly.
 		switch t := v.(type) {
 		case []byte:
 			bld.(*array.FixedSizeBinaryBuilder).Append(t)
