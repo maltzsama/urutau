@@ -6,7 +6,29 @@ import (
 
 	"github.com/maltzsama/urutau/internal/eventlog"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/source"
 )
+
+// reportDestructiveDDL records a TRUNCATE/destructive DDL the source stream
+// carried but the engine did not propagate: the sink diverges from the source
+// until an operator reconciles it. It increments the metric and emits a run
+// event so the divergence is visible instead of only a lost log line
+// (issue #671). Called from the source reader goroutine.
+func (c *Coordinator) reportDestructiveDDL(d source.DestructiveDDL) {
+	if c.metrics != nil {
+		if d.Kind == "truncate" {
+			c.metrics.SourceTruncates.WithLabelValues(d.Source, d.Table).Inc()
+		} else {
+			c.metrics.SourceDestructiveDDL.WithLabelValues(d.Source, d.Kind, d.Table).Inc()
+		}
+	}
+	_ = c.emit(eventlog.KindDestructiveDDL, map[string]any{
+		"source": d.Source,
+		"kind":   d.Kind,
+		"table":  d.Table,
+		"detail": d.Detail,
+	})
+}
 
 // emit writes one event to the audit trail when configured; best-effort by
 // contract (a lost trail must never fail the pipeline). The dashboard's

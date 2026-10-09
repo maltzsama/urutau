@@ -586,7 +586,7 @@ func TestCollapsedRejectsPartitionedTable(t *testing.T) {
 	s := &spec.Spec{Tables: []spec.Table{
 		{Target: "raw.orders", Workers: &spec.WorkerSpec{Number: 3}},
 	}}
-	_, err := newRunner(context.Background(), s, Config{}, nil, nil)
+	_, err := newRunner(context.Background(), s, Config{}, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "distributed") {
 		t.Fatalf("collapsed run with workers>1 must fail citing distributed mode, got: %v", err)
 	}

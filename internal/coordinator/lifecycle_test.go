@@ -8,9 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/observability"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/source"
 )
 
 // #493: once boot is done nothing drains ready, so a re-attach must not block
@@ -138,4 +141,25 @@ func TestShutdownMetricsStopsServer(t *testing.T) {
 func TestShutdownMetricsNilIsNoOp(t *testing.T) {
 	c := &Coordinator{log: slog.New(slog.DiscardHandler)}
 	c.shutdownMetrics()
+}
+
+// #671: a destructive DDL the source carried but the engine did not propagate
+// increments the metric and records a dashboard/run event.
+func TestReportDestructiveDDLRecordsMetricAndEvent(t *testing.T) {
+	c := &Coordinator{
+		log:        slog.New(slog.DiscardHandler),
+		metrics:    observability.New(),
+		dashEvents: dashboard.NewEvents(10),
+	}
+	c.reportDestructiveDDL(source.DestructiveDDL{Source: "postgres", Kind: "truncate", Table: "public.orders"})
+	if got := testutil.ToFloat64(c.metrics.SourceTruncates.WithLabelValues("postgres", "public.orders")); got != 1 {
+		t.Fatalf("truncate metric = %v, want 1", got)
+	}
+	c.reportDestructiveDDL(source.DestructiveDDL{Source: "mysql", Kind: "ddl", Table: "orders"})
+	if got := testutil.ToFloat64(c.metrics.SourceDestructiveDDL.WithLabelValues("mysql", "ddl", "orders")); got != 1 {
+		t.Fatalf("ddl metric = %v, want 1", got)
+	}
+	if got := c.dashEvents.List("", "", 10); len(got) != 2 {
+		t.Fatalf("dashboard events = %d, want 2", len(got))
+	}
 }

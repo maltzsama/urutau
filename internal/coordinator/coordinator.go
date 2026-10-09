@@ -607,9 +607,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 	// Source adapter, query connection, introspection — identical to the
 	// collapsed runner; only the worker side differs.
 	src, err := driver.OpenSource(c.cfg.Spec, source.Runtime{
-		ServerID:  c.cfg.ServerID,
-		Heartbeat: c.cfg.Heartbeat,
-		Logger:    c.log,
+		ServerID:         c.cfg.ServerID,
+		Heartbeat:        c.cfg.Heartbeat,
+		Logger:           c.log,
+		OnDestructiveDDL: c.reportDestructiveDDL,
 	})
 	if err != nil {
 		return err

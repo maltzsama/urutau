@@ -229,6 +229,8 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		Projections:          projections,
 		UpsertTargets:        upsertTargets,
 		Schemas:              schemas,
+		OnTruncate:           a.spec.Source.OnTruncate,
+		OnDestructiveDDL:     a.rt.OnDestructiveDDL,
 	}, batches)
 	if err != nil {
 		return nil, err

@@ -519,20 +519,22 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	var err error
 	for attempt := 0; ; attempt++ {
 		rdr, err = New(ctx, Config{
-			URI:             uri,
-			ConnCfg:         a.connCfg,
-			DB:              a.db,
-			SlotName:        slot,
-			Tables:          refs,
-			Logger:          a.rt.Logger,
-			RetryCount:      maxRetries,
-			InitialWait:     initialWait,
-			Plugin:          plugin,
-			ReplicaIdentity: replicaIdentity,
-			Filters:         filters,
-			Columns:         columns,
-			UpsertTargets:   upsertTargets,
-			Schemas:         schemas,
+			URI:              uri,
+			ConnCfg:          a.connCfg,
+			DB:               a.db,
+			SlotName:         slot,
+			Tables:           refs,
+			Logger:           a.rt.Logger,
+			RetryCount:       maxRetries,
+			InitialWait:      initialWait,
+			Plugin:           plugin,
+			ReplicaIdentity:  replicaIdentity,
+			Filters:          filters,
+			Columns:          columns,
+			UpsertTargets:    upsertTargets,
+			Schemas:          schemas,
+			OnTruncate:       a.spec.Source.OnTruncate,
+			OnDestructiveDDL: a.rt.OnDestructiveDDL,
 		}, batches)
 		if err == nil {
 			break

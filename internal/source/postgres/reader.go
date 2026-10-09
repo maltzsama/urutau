@@ -78,6 +78,12 @@ type Config struct {
 	// the direct encoder builds. The engine's SetSourceSchemas replaces
 	// KindUnknown with the cast-resolved type before Start (#455).
 	Schemas map[string]core.Schema
+	// OnTruncate is "ignore" (default) or "fail": whether a TRUNCATE on a
+	// replicated table ends the stream (#671).
+	OnTruncate string
+	// OnDestructiveDDL, when non-nil, is called for every TRUNCATE seen on the
+	// stream so the engine can record a metric and a run event (#671).
+	OnDestructiveDDL func(source.DestructiveDDL)
 }
 
 // Projection is a table's source-side read filter: the compiled filter a row
@@ -658,7 +664,7 @@ func (r *Reader) handleXLogData(ctx context.Context, xld pglogrepl.XLogData) err
 		// caught-up proof compares against.
 		return r.handleCommit(ctx, commit.CommitLSN)
 	case msgTruncate:
-		r.cfg.Logger.Warn("postgres: truncate received; ignored (not part of the scalar milestone)")
+		return r.handleTruncate(body)
 	default:
 		// Type, Origin, LogicalMessage and friends: not row data.
 	}

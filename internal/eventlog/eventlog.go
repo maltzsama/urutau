@@ -134,6 +134,10 @@ const (
 	KindJobTerminated   = "job_terminated"
 	KindSchemaDrift     = "schema_drift"
 	KindDeleteDropped   = "delete_dropped"
+	// KindDestructiveDDL records a TRUNCATE or destructive DDL the source
+	// stream carried but the engine did not propagate to the sink: the sink
+	// diverges from the source until an operator reconciles it (issue #671).
+	KindDestructiveDDL = "destructive_ddl"
 	// KindLog is one structured process log record (a slog line) the
 	// coordinator's log trail appends. It carries level/msg/attrs — the
 	// run's operational log, distinct from the lifecycle events above, so a
