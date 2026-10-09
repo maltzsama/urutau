@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Go modules.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # The Kubernetes libraries and controller-runtime must move together.
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+      # The AWS SDK modules share a release train.
+      aws:
+        patterns:
+          - "github.com/aws/aws-sdk-go-v2*"
+  # GitHub Actions.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # The images the e2e stack and release build from.
+  - package-ecosystem: docker
+    directory: /build
+    schedule:
+      interval: weekly
