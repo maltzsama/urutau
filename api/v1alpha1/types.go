@@ -78,6 +78,16 @@ type Secrets struct {
 	// /etc/urutau/ssh/privateKey — the path the inline spec's
 	// source.postgres.ssh.privateKey must name.
 	SSH string `json:"ssh,omitempty"`
+	// KafkaTLS names a Secret mounted read-only at /etc/urutau/kafka-tls in
+	// the coordinator Pod, for the Kafka source's TLS/SASL (issue #598): the
+	// inline spec's source.kafka.tls.{ca,cert,key} name files under that
+	// path.
+	KafkaTLS string `json:"kafkaTLS,omitempty"`
+	// SchemaRegistryTLS names a Secret mounted read-only at
+	// /etc/urutau/schema-registry-tls in the coordinator Pod, for the schema
+	// registry's TLS (issue #598): source.schemaRegistryAuth.{ca,cert,key}
+	// name files under that path.
+	SchemaRegistryTLS string `json:"schemaRegistryTLS,omitempty"`
 }
 
 // CoordinatorSpec tunes the coordinator deployment. CPU/Memory are

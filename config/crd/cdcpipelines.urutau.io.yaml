@@ -40,6 +40,9 @@ spec:
                   properties:
                     source: {type: string}
                     catalog: {type: string}
+                    ssh: {type: string}
+                    kafkaTLS: {type: string}
+                    schemaRegistryTLS: {type: string}
                 coordinator:
                   type: object
                   properties:

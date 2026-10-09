@@ -155,3 +155,24 @@ func podSpecHasSecretVolume(spec corev1.PodSpec, name, secret string) bool {
 	}
 	return false
 }
+
+// #598: the Kafka and schema-registry TLS Secrets are mounted read-only into
+// the coordinator at the fixed paths the inline spec names.
+func TestSourceTLSMounts(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Secrets.KafkaTLS = "kafka-tls-secret"
+	cr.Spec.Secrets.SchemaRegistryTLS = "sr-tls-secret"
+
+	sts := coordinatorStatefulSet(cr, "urutau:v1")
+	if !podSpecHasSecretVolume(sts.Spec.Template.Spec, "kafka-tls", "kafka-tls-secret") {
+		t.Fatalf("coordinator must mount the Kafka TLS secret: %+v", sts.Spec.Template.Spec.Volumes)
+	}
+	if !podSpecHasSecretVolume(sts.Spec.Template.Spec, "schema-registry-tls", "sr-tls-secret") {
+		t.Fatalf("coordinator must mount the schema-registry TLS secret: %+v", sts.Spec.Template.Spec.Volumes)
+	}
+
+	plain := pipelineCR("orders", "ns")
+	if v, m := sourceTLSMounts(plain); len(v) != 0 || len(m) != 0 {
+		t.Fatalf("no TLS secrets must produce no mounts, got %v / %v", v, m)
+	}
+}

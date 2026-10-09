@@ -229,6 +229,16 @@ CA signs both):
 The operator mounts them and passes `--tls-cert/--tls-key/--tls-ca` to both
 binaries; without `tls`, it keeps the explicit plaintext opt-in.
 
+### Source and schema-registry TLS (Kafka)
+
+Set `secrets.kafkaTLS` / `secrets.schemaRegistryTLS` to Secrets holding the
+PEM files (`ca.crt`, `tls.crt`, `tls.key`). The operator mounts them read-only
+at `/etc/urutau/kafka-tls` and `/etc/urutau/schema-registry-tls`; the inline
+spec's `source.kafka.tls.{ca,cert,key}` and
+`source.schemaRegistryAuth.{ca,cert,key}` name files under those paths. (AWS
+MSK IAM is not supported; use TLS + SASL PLAIN/SCRAM, or SCRAM with an
+IAM-derived token emplacement.)
+
 ### SSH-tunneled Postgres sources
 
 When the database is reachable only through a bastion, the worker Pods need
