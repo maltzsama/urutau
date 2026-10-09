@@ -31,7 +31,6 @@ spec:
                   type: object
                   properties:
                     image: {type: string}
-                    entrypoint: {type: string}
                     s3: {type: string}
                     inline:
                       type: object
@@ -57,7 +56,6 @@ spec:
                         window: {type: string}
                         maxConsecutiveCrashes: {type: integer}
                         workerDeliveryTimeout: {type: string}
-                    statusInterval: {type: string}
                     metricsAddr: {type: string}
                     cpu: {type: string}
                     memory: {type: string}

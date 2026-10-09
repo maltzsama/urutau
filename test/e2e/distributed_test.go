@@ -360,10 +360,9 @@ func TestDistributedMultiWorker(t *testing.T) {
 	// get their own single-partition group (no explicit worker: name —
 	// that field is gone; a worker group name is always derived).
 	s.Tables = append(s.Tables, spec.Table{
-		Source:            "shop.order_items",
-		Target:            "raw.order_items",
-		PrimaryKey:        []string{"order_id", "line_no"},
-		CreateIfNotExists: true,
+		Source:     "shop.order_items",
+		Target:     "raw.order_items",
+		PrimaryKey: []string{"order_id", "line_no"},
 	})
 	if err := s.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)

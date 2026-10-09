@@ -54,9 +54,8 @@ type CDCPipelineSpec struct {
 type Definition struct {
 	// Image is the user image (FROM urutau-runtime) whose entrypoint runs
 	// `urutau plan`. Mutually exclusive with s3 and inline.
-	Image      string `json:"image,omitempty"`
-	Entrypoint string `json:"entrypoint,omitempty"`
-	S3         string `json:"s3,omitempty"`
+	Image string `json:"image,omitempty"`
+	S3    string `json:"s3,omitempty"`
 	// Inline is the full pipeline spec (source, sink, tables) verbatim —
 	// the same artifact the planner would render from image/s3. Credentials
 	// stay out: URI and credential fields left empty are filled from the
@@ -87,12 +86,11 @@ type Secrets struct {
 // coordinator is a single long-lived process, not a pool sized like the
 // workers, so it has no overhead knob.
 type CoordinatorSpec struct {
-	Snapshot       SnapshotSpec    `json:"snapshot,omitempty"`
-	Supervision    SupervisionSpec `json:"supervision,omitempty"`
-	StatusInterval string          `json:"statusInterval,omitempty"`
-	CPU            string          `json:"cpu,omitempty"`
-	Memory         string          `json:"memory,omitempty"`
-	MetricsAddr    string          `json:"metricsAddr,omitempty"`
+	Snapshot    SnapshotSpec    `json:"snapshot,omitempty"`
+	Supervision SupervisionSpec `json:"supervision,omitempty"`
+	CPU         string          `json:"cpu,omitempty"`
+	Memory      string          `json:"memory,omitempty"`
+	MetricsAddr string          `json:"metricsAddr,omitempty"`
 	// Eventlog, when set, is where the coordinator writes its per-run audit
 	// trail. The operator renders it as --eventlog s3://<bucket>/<rootPrefix>;
 	// the durable JSONL trail is what a history server reads back.

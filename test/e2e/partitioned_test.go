@@ -375,11 +375,10 @@ func TestDistributedStringKeyCollation(t *testing.T) {
 	addr := reserveAddr(t)
 	s := loadPipeline(t)
 	s.Tables = []spec.Table{{
-		Source:            "shop.collated",
-		Target:            "raw.collated",
-		PrimaryKey:        []string{"id"},
-		CreateIfNotExists: true,
-		Workers:           &spec.WorkerSpec{Number: 3},
+		Source:     "shop.collated",
+		Target:     "raw.collated",
+		PrimaryKey: []string{"id"},
+		Workers:    &spec.WorkerSpec{Number: 3},
 	}}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)

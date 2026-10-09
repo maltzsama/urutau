@@ -459,9 +459,13 @@ type Table struct {
 	// operator-chosen worker name. CPU/Memory are Kubernetes resource
 	// quantities (e.g. "2", "4Gi") applied to every worker Deployment
 	// this table provisions; ignored outside Kubernetes provisioning.
-	Workers           *WorkerSpec `json:"workers,omitempty"`
-	CreateIfNotExists bool        `json:"createIfNotExists,omitempty"`
-	FilterImmutable   bool        `json:"filterImmutable,omitempty"`
+	Workers *WorkerSpec `json:"workers,omitempty"`
+	// CreateIfNotExists creates the target table when it is absent. A nil
+	// pointer means the default (true): every existing pipeline relies on the
+	// engine creating its table, so an omitted field must not disable it. Set
+	// it explicitly to false only to require an operator-provisioned table.
+	CreateIfNotExists *bool `json:"createIfNotExists,omitempty"`
+	FilterImmutable   bool  `json:"filterImmutable,omitempty"`
 	// Metadata lands pipeline metadata columns (op, commit_ts, position, ...)
 	// in the target table. The destination name is explicit via As.
 	Metadata []core.MetadataColumn `json:"metadata,omitempty"`
@@ -527,6 +531,14 @@ func (t Table) WorkerCount() int {
 		return 1
 	}
 	return t.Workers.Number
+}
+
+// CreatesTargetTable reports whether the engine should create the target table
+// when it is absent. The default (CreateIfNotExists unset) is true: omitting
+// the field must not stop the engine creating the table, which every existing
+// spec relies on.
+func (t Table) CreatesTargetTable() bool {
+	return t.CreateIfNotExists == nil || *t.CreateIfNotExists
 }
 
 // WorkerGroupPrefix is the shared prefix of a table's worker group names,

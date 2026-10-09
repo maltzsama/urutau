@@ -1096,3 +1096,17 @@ func TestValidateOnTruncate(t *testing.T) {
 		t.Fatalf("onTruncate bogus: problems = %v, want 1", problems)
 	}
 }
+
+func TestCreatesTargetTableDefaultsTrue(t *testing.T) {
+	if !(Table{}).CreatesTargetTable() {
+		t.Fatal("unset createIfNotExists must default to true")
+	}
+	yes := true
+	if !(Table{CreateIfNotExists: &yes}).CreatesTargetTable() {
+		t.Fatal("createIfNotExists: true must be true")
+	}
+	no := false
+	if (Table{CreateIfNotExists: &no}).CreatesTargetTable() {
+		t.Fatal("createIfNotExists: false must be false")
+	}
+}

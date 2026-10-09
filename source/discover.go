@@ -47,9 +47,8 @@ func ExpandTables(ctx context.Context, src Source, s *spec.Spec) ([]spec.Table, 
 		}
 		seen[target] = r.Source
 		tables = append(tables, spec.Table{
-			Source:            r.Source,
-			Target:            target,
-			CreateIfNotExists: true,
+			Source: r.Source,
+			Target: target,
 		})
 	}
 	sort.Slice(tables, func(i, j int) bool { return tables[i].Source < tables[j].Source })
