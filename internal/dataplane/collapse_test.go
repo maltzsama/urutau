@@ -7,11 +7,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
 )
 
 func TestCollapseBasic(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -41,7 +42,7 @@ func TestCollapseBasic(t *testing.T) {
 
 func TestCollapseDeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialDeleteLast(alloc)
+	b := dataplanetest.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -67,7 +68,7 @@ func TestCollapseDeleteLast(t *testing.T) {
 
 func TestCollapseInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInsertAfterDelete(alloc)
+	b := dataplanetest.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -93,7 +94,7 @@ func TestCollapseInsertAfterDelete(t *testing.T) {
 
 func TestCollapseCompositeKey(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(alloc)
+	b := dataplanetest.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
@@ -123,7 +124,7 @@ func TestCollapseCompositeKey(t *testing.T) {
 
 func TestCollapseNullPK(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{
+	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{
 		NumRows:       3,
 		IncludeNullPK: true,
 		Allocator:     alloc,
@@ -138,7 +139,7 @@ func TestCollapseNullPK(t *testing.T) {
 
 func TestCollapsePreservesWatermark(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 10, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
 	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -158,7 +159,7 @@ func TestCollapsePreservesWatermark(t *testing.T) {
 
 func TestCollapseEmptyBatch(t *testing.T) {
 	alloc := checkedAlloc(t)
-	rb := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 1, Allocator: alloc})
+	rb := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 1, Allocator: alloc})
 	defer rb.Release()
 	empty := rb.Record.NewSlice(0, 0)
 	defer empty.Release()
@@ -181,7 +182,7 @@ func TestCollapseEmptyBatch(t *testing.T) {
 
 func TestCollapseInt64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInt64Overflow(alloc)
+	b := dataplanetest.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
@@ -231,7 +232,7 @@ func TestCollapseMissingOpColumn(t *testing.T) {
 // returns a nil key for each) and silently drop all but the last.
 func TestCollapseRejectsEmptyPrimaryKey(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
 	if _, _, err := dataplane.Collapse(context.Background(), alloc, b, nil); err == nil {

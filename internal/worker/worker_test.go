@@ -10,7 +10,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
@@ -326,7 +326,7 @@ func (f CommitterFunc) Commit(ctx context.Context, b *dataplane.Batch) error { r
 // guard existed (audit #5). This is the exact trap the enum shift exposed.
 func TestMergeBatchesPropagatesMode(t *testing.T) {
 	mk := func(mode dataplane.WriteMode) *dataplane.Batch {
-		b := dpint.GenerateBatch(1, dpint.GeneratorOpts{NumRows: 1, Allocator: nil})
+		b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 1, Allocator: nil})
 		b.Mode = mode
 		return b
 	}
