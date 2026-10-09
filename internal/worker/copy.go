@@ -7,8 +7,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-
-	"github.com/maltzsama/urutau/dataplane"
 )
 
 // A snapshot chunk travels the worker's commit path as Arrow, and every step
@@ -63,56 +61,4 @@ func everyRow(idx []int32, n int64) bool {
 		}
 	}
 	return true
-}
-
-// concatAll concatenates the non-empty batches of bs, in order, into one
-// owned batch: one concatenation per column, each batch copied once. The
-// metadata is the first non-empty batch's, as merging pairwise kept it, and
-// Staged is set when any batch is staged. One non-empty batch is returned
-// retained, not copied; none returns nil.
-func concatAll(bs []*dataplane.Batch) (*dataplane.Batch, error) {
-	var parts []*dataplane.Batch
-	staged := false
-	for _, b := range bs {
-		if b != nil && b.Record != nil && b.Record.NumRows() > 0 {
-			parts = append(parts, b)
-			staged = staged || b.Staged
-		}
-	}
-	if len(parts) == 0 {
-		return nil, nil
-	}
-	first := parts[0]
-	out := &dataplane.Batch{Table: first.Table, Watermark: first.Watermark, Mode: first.Mode,
-		SnapshotState: first.SnapshotState, SnapshotPending: first.SnapshotPending, Seq: first.Seq, Staged: staged}
-	if len(parts) == 1 {
-		first.Record.Retain()
-		out.Record = first.Record
-		return out, nil
-	}
-	schema := first.Record.Schema()
-	var rows int64
-	for _, p := range parts {
-		rows += p.Record.NumRows()
-	}
-	cols := make([]arrow.Array, schema.NumFields())
-	arrs := make([]arrow.Array, len(parts))
-	for i := range cols {
-		for j, p := range parts {
-			arrs[j] = p.Record.Column(i)
-		}
-		col, err := array.Concatenate(arrs, memory.DefaultAllocator)
-		if err != nil {
-			for _, done := range cols[:i] {
-				done.Release()
-			}
-			return nil, err
-		}
-		cols[i] = col
-	}
-	out.Record = array.NewRecordBatch(schema, cols, rows)
-	for _, c := range cols {
-		c.Release()
-	}
-	return out, nil
 }
