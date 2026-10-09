@@ -11,8 +11,16 @@ import (
 	"github.com/go-mysql-org/go-mysql/schema"
 	"github.com/shopspring/decimal"
 
+	"github.com/maltzsama/urutau/internal/source/filterexpr"
 	"github.com/maltzsama/urutau/spec"
 )
+
+// myPredicate adapts the MySQL leaf builder to filterexpr.PredicateBuilder.
+type myPredicate struct{ tbl *schema.Table }
+
+func (b myPredicate) Predicate(p *spec.Predicate) (string, error) {
+	return filterExprPredicate(p, b.tbl)
+}
 
 // projection is a table's CDC read filter: the compiled filter a row must
 // satisfy. The emitted column set is the canonical schema (the adapter filters
@@ -111,10 +119,10 @@ func compileFilterExpr(f *spec.Filter, tbl *schema.Table) (*vm.Program, error) {
 	if f == nil {
 		return nil, nil
 	}
-	if err := checkFilterColumns(tbl, f); err != nil {
+	if err := filterexpr.CheckColumns(f, tbl); err != nil {
 		return nil, err
 	}
-	src, err := filterExprSource(f, tbl)
+	src, err := filterexpr.Source(f, "mysql", myPredicate{tbl})
 	if err != nil {
 		return nil, err
 	}
@@ -132,35 +140,6 @@ func compileFilterExpr(f *spec.Filter, tbl *schema.Table) (*vm.Program, error) {
 		return nil, fmt.Errorf("mysql: filter: compile: %w", err)
 	}
 	return prog, nil
-}
-
-func filterExprSource(f *spec.Filter, tbl *schema.Table) (string, error) {
-	switch {
-	case f == nil:
-		return "", fmt.Errorf("mysql: filter: empty node")
-	case len(f.All) > 0:
-		return filterExprGroup(f.All, tbl, "&&")
-	case len(f.Any) > 0:
-		return filterExprGroup(f.Any, tbl, "||")
-	case f.Not != nil:
-		return filterExprSource(f.Not.Negate(), tbl)
-	case f.Predicate != nil:
-		return filterExprPredicate(f.Predicate, tbl)
-	default:
-		return "", fmt.Errorf("mysql: filter: node carries no all/any/not/where")
-	}
-}
-
-func filterExprGroup(nodes []spec.Filter, tbl *schema.Table, op string) (string, error) {
-	parts := make([]string, 0, len(nodes))
-	for i := range nodes {
-		p, err := filterExprSource(&nodes[i], tbl)
-		if err != nil {
-			return "", err
-		}
-		parts = append(parts, "("+p+")")
-	}
-	return strings.Join(parts, " "+op+" "), nil
 }
 
 func filterExprPredicate(p *spec.Predicate, tbl *schema.Table) (string, error) {
@@ -184,7 +163,7 @@ func filterExprPredicate(p *spec.Predicate, tbl *schema.Table) (string, error) {
 	}
 	// literal renders a filter value, matching the LHS collation when needed.
 	literal := func(v any) (string, error) {
-		l, err := exprLiteral(v)
+		l, err := filterexpr.Literal("mysql", v)
 		if err != nil {
 			return "", err
 		}
@@ -199,7 +178,7 @@ func filterExprPredicate(p *spec.Predicate, tbl *schema.Table) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("(%s != nil) && (%s %s %s)", raw, lhs, exprOperator(p.Op), lit), nil
+		return fmt.Sprintf("(%s != nil) && (%s %s %s)", raw, lhs, filterexpr.Operator(p.Op), lit), nil
 	case spec.OpIn, spec.OpNotIn:
 		vals, ok := p.Value.([]any)
 		if !ok {
@@ -230,11 +209,11 @@ func filterExprDecimal(p *spec.Predicate, raw string) (string, error) {
 	guard := "(" + raw + " != nil)"
 	switch p.Op {
 	case spec.OpEq, spec.OpNeq, spec.OpLt, spec.OpLte, spec.OpGt, spec.OpGte:
-		lit, err := exprLiteral(p.Value)
+		lit, err := filterexpr.Literal("mysql", p.Value)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s && (mysql_decimal_cmp(%s, %s) %s 0)", guard, raw, lit, exprOperator(p.Op)), nil
+		return fmt.Sprintf("%s && (mysql_decimal_cmp(%s, %s) %s 0)", guard, raw, lit, filterexpr.Operator(p.Op)), nil
 	case spec.OpIn, spec.OpNotIn:
 		vals, ok := p.Value.([]any)
 		if !ok {
@@ -242,7 +221,7 @@ func filterExprDecimal(p *spec.Predicate, raw string) (string, error) {
 		}
 		parts := make([]string, 0, len(vals))
 		for _, v := range vals {
-			lit, err := exprLiteral(v)
+			lit, err := filterexpr.Literal("mysql", v)
 			if err != nil {
 				return "", err
 			}
@@ -259,36 +238,6 @@ func filterExprDecimal(p *spec.Predicate, raw string) (string, error) {
 	default:
 		return "", fmt.Errorf("mysql: filter: unsupported operator %q", p.Op)
 	}
-}
-
-// checkFilterColumns reports an error when a filter references a column that
-// is not in the introspected table — a typo would otherwise evaluate a missing
-// map key as nil.
-func checkFilterColumns(tbl *schema.Table, f *spec.Filter) error {
-	if f == nil || tbl == nil {
-		return nil
-	}
-	switch {
-	case len(f.All) > 0:
-		for i := range f.All {
-			if err := checkFilterColumns(tbl, &f.All[i]); err != nil {
-				return err
-			}
-		}
-	case len(f.Any) > 0:
-		for i := range f.Any {
-			if err := checkFilterColumns(tbl, &f.Any[i]); err != nil {
-				return err
-			}
-		}
-	case f.Not != nil:
-		return checkFilterColumns(tbl, f.Not)
-	case f.Predicate != nil:
-		if tbl.FindColumn(f.Predicate.Column) < 0 {
-			return fmt.Errorf("filter column %q not found in the source table", f.Predicate.Column)
-		}
-	}
-	return nil
 }
 
 // columnIsNumeric reports whether the column is an integer or float type,
@@ -368,55 +317,5 @@ func toDecimal(v any) (decimal.Decimal, error) {
 		return decimal.NewFromFloat(t), nil
 	default:
 		return decimal.Decimal{}, fmt.Errorf("mysql_decimal_cmp: unsupported type %T", v)
-	}
-}
-
-func exprOperator(op spec.Operator) string {
-	switch op {
-	case spec.OpEq:
-		return "=="
-	case spec.OpNeq:
-		return "!="
-	case spec.OpLt:
-		return "<"
-	case spec.OpLte:
-		return "<="
-	case spec.OpGt:
-		return ">"
-	case spec.OpGte:
-		return ">="
-	default:
-		return ""
-	}
-}
-
-// exprLiteral renders a filter value as an expr literal. JSON numbers are
-// rendered as floats so a numeric column (compared through float()) sees a
-// float operand; a DECIMAL column compares the literal exactly through
-// mysql_decimal_cmp (a float64 literal is parsed back to its shortest decimal,
-// and a string literal is exact).
-func exprLiteral(v any) (string, error) {
-	switch t := v.(type) {
-	case nil:
-		return "nil", nil
-	case bool:
-		if t {
-			return "true", nil
-		}
-		return "false", nil
-	case float64:
-		s := strconv.FormatFloat(t, 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		return s, nil
-	case int64:
-		return strconv.FormatInt(t, 10), nil
-	case int:
-		return strconv.Itoa(t), nil
-	case string:
-		return strconv.Quote(t), nil
-	default:
-		return "", fmt.Errorf("mysql: filter: unsupported value type %T", v)
 	}
 }

@@ -10,8 +10,16 @@ import (
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
 
+	"github.com/maltzsama/urutau/internal/source/filterexpr"
 	"github.com/maltzsama/urutau/spec"
 )
+
+// pgPredicate adapts the Postgres leaf builder to filterexpr.PredicateBuilder.
+type pgPredicate struct{ st *TableState }
+
+func (b pgPredicate) Predicate(p *spec.Predicate) (string, error) {
+	return filterExprPredicate(p, b.st)
+}
 
 // compileFilterExpr compiles the structured filter into an expr program,
 // evaluated against each decoded row at the source boundary — before the
@@ -38,10 +46,10 @@ func compileFilterExpr(f *spec.Filter, st *TableState) (*vm.Program, error) {
 	if f == nil {
 		return nil, nil
 	}
-	if err := checkFilterColumns(st, f); err != nil {
+	if err := filterexpr.CheckColumns(f, st); err != nil {
 		return nil, err
 	}
-	src, err := filterExprSource(f, st)
+	src, err := filterexpr.Source(f, "postgres", pgPredicate{st})
 	if err != nil {
 		return nil, err
 	}
@@ -61,37 +69,6 @@ func compileFilterExpr(f *spec.Filter, st *TableState) (*vm.Program, error) {
 	return prog, nil
 }
 
-func filterExprSource(f *spec.Filter, st *TableState) (string, error) {
-	switch {
-	case f == nil:
-		return "", fmt.Errorf("postgres: filter: empty node")
-	case len(f.All) > 0:
-		return filterExprGroup(f.All, st, "&&")
-	case len(f.Any) > 0:
-		return filterExprGroup(f.Any, st, "||")
-	case f.Not != nil:
-		// Push the negation to the leaves so no `!` wraps an unknown-valued
-		// comparison.
-		return filterExprSource(f.Not.Negate(), st)
-	case f.Predicate != nil:
-		return filterExprPredicate(f.Predicate, st)
-	default:
-		return "", fmt.Errorf("postgres: filter: node carries no all/any/not/where")
-	}
-}
-
-func filterExprGroup(nodes []spec.Filter, st *TableState, op string) (string, error) {
-	parts := make([]string, 0, len(nodes))
-	for i := range nodes {
-		p, err := filterExprSource(&nodes[i], st)
-		if err != nil {
-			return "", err
-		}
-		parts = append(parts, "("+p+")")
-	}
-	return strings.Join(parts, " "+op+" "), nil
-}
-
 func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
 	raw := "row[" + strconv.Quote(p.Column) + "]"
 	switch p.Op {
@@ -109,13 +86,13 @@ func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
 	}
 	switch p.Op {
 	case spec.OpEq, spec.OpNeq, spec.OpLt, spec.OpLte, spec.OpGt, spec.OpGte:
-		lit, err := exprLiteral(p.Value)
+		lit, err := filterexpr.Literal("postgres", p.Value)
 		if err != nil {
 			return "", err
 		}
 		// The NULL guard is SQL three-valued logic: a NULL column never
 		// satisfies a comparison, so the leaf is false, not true.
-		return fmt.Sprintf("(%s != nil) && (%s %s %s)", raw, lhs, exprOperator(p.Op), lit), nil
+		return fmt.Sprintf("(%s != nil) && (%s %s %s)", raw, lhs, filterexpr.Operator(p.Op), lit), nil
 	case spec.OpIn, spec.OpNotIn:
 		vals, ok := p.Value.([]any)
 		if !ok {
@@ -123,7 +100,7 @@ func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
 		}
 		lits := make([]string, 0, len(vals))
 		for _, v := range vals {
-			l, err := exprLiteral(v)
+			l, err := filterexpr.Literal("postgres", v)
 			if err != nil {
 				return "", err
 			}
@@ -148,11 +125,11 @@ func filterExprPgNumeric(p *spec.Predicate, raw string) (string, error) {
 	guard := "(" + raw + " != nil)"
 	switch p.Op {
 	case spec.OpEq, spec.OpNeq, spec.OpLt, spec.OpLte, spec.OpGt, spec.OpGte:
-		lit, err := exprLiteral(p.Value)
+		lit, err := filterexpr.Literal("postgres", p.Value)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s && (pg_numeric_cmp(%s, %s) %s 0)", guard, raw, lit, exprOperator(p.Op)), nil
+		return fmt.Sprintf("%s && (pg_numeric_cmp(%s, %s) %s 0)", guard, raw, lit, filterexpr.Operator(p.Op)), nil
 	case spec.OpIn, spec.OpNotIn:
 		vals, ok := p.Value.([]any)
 		if !ok {
@@ -160,7 +137,7 @@ func filterExprPgNumeric(p *spec.Predicate, raw string) (string, error) {
 		}
 		parts := make([]string, 0, len(vals))
 		for _, v := range vals {
-			lit, err := exprLiteral(v)
+			lit, err := filterexpr.Literal("postgres", v)
 			if err != nil {
 				return "", err
 			}
@@ -180,34 +157,9 @@ func filterExprPgNumeric(p *spec.Predicate, raw string) (string, error) {
 }
 
 // checkFilterColumns reports an error when a filter references a column that
-// is not in the introspected table. A typo would otherwise emit an unknown
-// identifier into the snapshot SQL, and in CDC evaluate a missing map key as
-// nil (so is_null matches every row and other predicates reject every row).
+// is not in the introspected table (see filterexpr.CheckColumns).
 func checkFilterColumns(st *TableState, f *spec.Filter) error {
-	if f == nil || st == nil {
-		return nil
-	}
-	switch {
-	case len(f.All) > 0:
-		for i := range f.All {
-			if err := checkFilterColumns(st, &f.All[i]); err != nil {
-				return err
-			}
-		}
-	case len(f.Any) > 0:
-		for i := range f.Any {
-			if err := checkFilterColumns(st, &f.Any[i]); err != nil {
-				return err
-			}
-		}
-	case f.Not != nil:
-		return checkFilterColumns(st, f.Not)
-	case f.Predicate != nil:
-		if st.FindColumn(f.Predicate.Column) < 0 {
-			return fmt.Errorf("filter column %q not found in the source table", f.Predicate.Column)
-		}
-	}
-	return nil
+	return filterexpr.CheckColumns(f, st)
 }
 
 // columnIsPgNumeric reports whether the column is compared through the exact
@@ -345,52 +297,4 @@ func columnIsInteger(st *TableState, name string) bool {
 		return true
 	}
 	return false
-}
-
-func exprOperator(op spec.Operator) string {
-	switch op {
-	case spec.OpEq:
-		return "=="
-	case spec.OpNeq:
-		return "!="
-	case spec.OpLt:
-		return "<"
-	case spec.OpLte:
-		return "<="
-	case spec.OpGt:
-		return ">"
-	case spec.OpGte:
-		return ">="
-	default:
-		return ""
-	}
-}
-
-// exprLiteral renders a filter value as an expr literal. JSON numbers are
-// rendered as floats so a numeric column (compared through float()) sees a
-// float operand.
-func exprLiteral(v any) (string, error) {
-	switch t := v.(type) {
-	case nil:
-		return "nil", nil
-	case bool:
-		if t {
-			return "true", nil
-		}
-		return "false", nil
-	case float64: // JSON numbers decode to float64
-		s := strconv.FormatFloat(t, 'g', -1, 64)
-		if !strings.ContainsAny(s, ".eE") {
-			s += ".0"
-		}
-		return s, nil
-	case int64:
-		return strconv.FormatInt(t, 10), nil
-	case int:
-		return strconv.Itoa(t), nil
-	case string:
-		return strconv.Quote(t), nil
-	default:
-		return "", fmt.Errorf("postgres: filter: unsupported value type %T", v)
-	}
 }
