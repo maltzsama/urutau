@@ -107,8 +107,8 @@ func TestServerTLSRequiresAndVerifiesClientCert(t *testing.T) {
 	if cfg.ClientCAs == nil {
 		t.Fatal("ClientCAs must be set to verify worker client certs")
 	}
-	if len(cfg.Certificates) != 1 {
-		t.Fatal("server must present exactly one certificate")
+	if cfg.GetCertificate == nil {
+		t.Fatal("server must serve its certificate via GetCertificate (reload on rotation, issue #604)")
 	}
 	if cfg.MinVersion != tls.VersionTLS13 {
 		t.Fatalf("MinVersion = %x, want TLS 1.3", cfg.MinVersion)
@@ -121,8 +121,8 @@ func TestClientTLSPresentsCertAndVerifiesServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClientTLS: %v", err)
 	}
-	if len(cfg.Certificates) != 1 {
-		t.Fatal("client must present a certificate")
+	if cfg.GetClientCertificate == nil {
+		t.Fatal("client must present a certificate via GetClientCertificate (reload on rotation, issue #604)")
 	}
 	if cfg.RootCAs == nil {
 		t.Fatal("client must verify the server against the CA")
@@ -175,5 +175,40 @@ func TestRequireTLS(t *testing.T) {
 	}
 	if err := (Config{CertFile: "c", KeyFile: "k", ClientCAFile: "ca"}).RequireTLS(); err != nil {
 		t.Fatalf("mTLS config must pass: %v", err)
+	}
+}
+
+// #604: a rotated certificate file is re-read on the next handshake, so a
+// cert-manager rotation takes effect without a process restart.
+func TestServerTLSReloadsRotatedCertificate(t *testing.T) {
+	serverCfg, _ := testMaterial(t)
+	cfg, err := serverCfg.ServerTLS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialOf := func(c *tls.Certificate) string {
+		leaf, err := x509.ParseCertificate(c.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return leaf.SerialNumber.String()
+	}
+	first, err := cfg.GetCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := serialOf(first)
+
+	// Overwrite the certificate with a fresh self-signed one. The reloader
+	// only loads the pair (it does not verify the chain), so a matching CA is
+	// irrelevant here.
+	genCert(t, filepath.Dir(serverCfg.CertFile), "server", nil, nil, false, true)
+
+	second, err := cfg.GetCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serialOf(second) == before {
+		t.Fatal("GetCertificate did not reload the rotated certificate")
 	}
 }
