@@ -330,9 +330,13 @@ func (r *Reader) ClearWindow() {}
 // topic appears in both ConsumePartitions and ConsumeTopics, so this cannot
 // be patched up after construction either).
 func (r *Reader) Start(ctx context.Context, resume position.Position) error {
+	sec, err := securityOpts(r.src.Spec.Source)
+	if err != nil {
+		return err
+	}
 	parts, wholeTopics := splitConsumeOpts(r.topics, resume)
 	if len(parts) > 0 {
-		discovered, err := discoverPartitions(ctx, r.src.Spec.Source.URI, r.logger, mapKeys(parts))
+		discovered, err := discoverPartitions(ctx, r.src.Spec.Source.URI, sec, r.logger, mapKeys(parts))
 		if err != nil {
 			return fmt.Errorf("kafka: discover partitions: %w", err)
 		}
@@ -343,6 +347,7 @@ func (r *Reader) Start(ctx context.Context, resume position.Position) error {
 		kgo.SeedBrokers(r.src.Spec.Source.URI),
 		kgo.WithLogger(newKgoLogger(r.logger)),
 	}
+	opts = append(opts, sec...)
 	if len(wholeTopics) > 0 {
 		opts = append(opts, kgo.ConsumeTopics(wholeTopics...))
 	}
@@ -413,8 +418,9 @@ func mapKeys[K comparable, V any](m map[K]V) []K {
 // discoverPartitions returns every partition Kafka currently reports for
 // each of topics, via a short-lived metadata-only client (no consume options
 // — Request works without them) closed before this returns.
-func discoverPartitions(ctx context.Context, uri string, logger *slog.Logger, topics []string) (map[string][]int32, error) {
-	client, err := kgo.NewClient(kgo.SeedBrokers(uri), kgo.WithLogger(newKgoLogger(logger)))
+func discoverPartitions(ctx context.Context, uri string, sec []kgo.Opt, logger *slog.Logger, topics []string) (map[string][]int32, error) {
+	opts := append([]kgo.Opt{kgo.SeedBrokers(uri), kgo.WithLogger(newKgoLogger(logger))}, sec...)
+	client, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("new client: %w", err)
 	}

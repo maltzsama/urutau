@@ -1110,3 +1110,30 @@ func TestCreatesTargetTableDefaultsTrue(t *testing.T) {
 		t.Fatal("createIfNotExists: false must be false")
 	}
 }
+
+func TestValidateKafkaSecurity(t *testing.T) {
+	check := func(src Source, want string) {
+		t.Helper()
+		var p []string
+		validateKafkaSecurity(src, &p)
+		joined := strings.Join(p, "\n")
+		if want == "" {
+			if len(p) != 0 {
+				t.Fatalf("unexpected problems: %v", p)
+			}
+			return
+		}
+		if !strings.Contains(joined, want) {
+			t.Fatalf("problems = %v, want one containing %q", p, want)
+		}
+	}
+
+	check(Source{Kind: "kafka", Kafka: &KafkaSource{SASL: &KafkaSASL{Mechanism: "scram-sha-256"}}}, "username and password")
+	check(Source{Kind: "kafka", Kafka: &KafkaSource{SASL: &KafkaSASL{Mechanism: "bogus", Username: "u", Password: "p"}}}, "sasl.mechanism")
+	check(Source{Kind: "kafka", Kafka: &KafkaSource{TLS: &KafkaTLS{Cert: "/c"}}}, "cert and key")
+	check(Source{Kind: "kafka", Kafka: &KafkaSource{
+		SASL: &KafkaSASL{Mechanism: "plain", Username: "u", Password: "p"},
+		TLS:  &KafkaTLS{CA: "/ca"},
+	}}, "")
+	check(Source{Kind: "mysql", Kafka: &KafkaSource{}}, "only valid for kind kafka")
+}

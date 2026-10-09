@@ -120,6 +120,9 @@ type Source struct {
 	// (urutau_decode_errors_total{topic}), so the stream carries on. Only
 	// meaningful for kind kafka.
 	OnDecodeError string `json:"onDecodeError,omitempty"`
+	// Kafka configures the Kafka source's TLS/SASL transport security. It is
+	// only valid for kind kafka. Nil means plaintext and unauthenticated.
+	Kafka *KafkaSource `json:"kafka,omitempty"`
 	// OnTruncate is how a relational source reacts to a destructive statement
 	// on the stream that the engine does not propagate (Postgres TRUNCATE,
 	// MySQL TRUNCATE/DROP/ALTER/RENAME). "ignore" (default) surfaces it as a

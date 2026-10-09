@@ -33,4 +33,32 @@ func validateKafkaSource(src Source, problems *[]string) {
 	if src.OnDecodeError != "" && src.Kind != "kafka" {
 		*problems = append(*problems, "source.onDecodeError: only valid for kind kafka")
 	}
+	validateKafkaSecurity(src, problems)
+}
+
+// validateKafkaSecurity checks the Kafka source's TLS/SASL block (issue #598).
+// Both are optional; a broken block (a SASL mechanism with no credentials, or
+// half a client certificate) is rejected here rather than failing at dial time.
+func validateKafkaSecurity(src Source, problems *[]string) {
+	if src.Kafka == nil {
+		return
+	}
+	if src.Kind != "kafka" {
+		*problems = append(*problems, "source.kafka: only valid for kind kafka")
+	}
+	if t := src.Kafka.TLS; t != nil {
+		if (t.Cert == "") != (t.Key == "") {
+			*problems = append(*problems, "source.kafka.tls: cert and key must be set together (client authentication needs both)")
+		}
+	}
+	if s := src.Kafka.SASL; s != nil {
+		switch s.Mechanism {
+		case "", "plain", "scram-sha-256", "scram-sha-512":
+		default:
+			*problems = append(*problems, fmt.Sprintf("source.kafka.sasl.mechanism: unsupported %q (want plain | scram-sha-256 | scram-sha-512; AWS MSK IAM is not supported yet)", s.Mechanism))
+		}
+		if s.Username == "" || s.Password == "" {
+			*problems = append(*problems, "source.kafka.sasl: username and password are required")
+		}
+	}
 }
