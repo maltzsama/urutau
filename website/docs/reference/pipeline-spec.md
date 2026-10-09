@@ -31,7 +31,6 @@ tables: [ … ]               # required; at least one — unless source.postgre
 | `maxReconnectAttempts` | no | MySQL binlog reader reconnect budget (default 3). Without a bound a permanently broken stream retries forever |
 | `slotName` | postgres | Logical replication slot; required for Postgres |
 | `snapshotMode` | no | `none` disables the snapshot. Must be `none` for Kafka |
-| `groupId` | kafka | Consumer group |
 | `partitionedByPrimaryKey` | kafka | Assert the topics are key-partitioned; required for `upsert` |
 | `format` | kafka | `debezium` (default), `raw`, `avro` |
 | `schemaRegistry` | avro | Confluent-compatible registry base URL |

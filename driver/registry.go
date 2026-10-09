@@ -243,6 +243,9 @@ func OpenSource(s *spec.Spec, rt source.Runtime) (source.Source, error) {
 	if !ok {
 		return nil, unknownSourceErr(s.Source.Kind)
 	}
+	if err := validateOnDeleteImage(s, entry.caps); err != nil {
+		return nil, err
+	}
 	return entry.factory(s, rt)
 }
 
