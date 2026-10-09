@@ -302,6 +302,10 @@ func (r *Run) Emitted() int {
 	return r.emitted
 }
 
+// QueueLen reports how many events are waiting for the flusher. Exposed for a
+// metric: a growing queue means the flusher (S3) is slower than the emit rate.
+func (r *Run) QueueLen() int { return len(r.ch) }
+
 // Dropped reports how many events were not enqueued because the queue was
 // full. A non-zero count means the trail is missing events by contract.
 func (r *Run) Dropped() int64 { return r.dropped.Load() }

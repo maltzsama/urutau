@@ -60,6 +60,9 @@ func (c *Coordinator) emitTrail(kind string, fields map[string]any) error {
 	if c.ev == nil {
 		return nil
 	}
+	if c.metrics != nil {
+		c.metrics.EventlogQueue.Set(float64(c.ev.QueueLen()))
+	}
 	return c.ev.Emit(context.Background(), kind, fields)
 }
 
