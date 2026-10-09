@@ -6,10 +6,10 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/core"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -96,7 +96,7 @@ func scanChunkRecord(ctx context.Context, chunker source.ChunkSource, ch source.
 	if len(parts) == 1 {
 		return parts[0], total, nil
 	}
-	rec, err := concatRecords(parts)
+	rec, err := dpint.ConcatRecords(memory.DefaultAllocator, parts)
 	release()
 	if err != nil {
 		return nil, 0, fmt.Errorf("encode: %w", err)
@@ -119,34 +119,4 @@ func rowBytes(row map[string]any) int {
 		}
 	}
 	return n
-}
-
-// concatRecords concatenates same-schema records, in order, into one. The
-// inputs stay the caller's.
-func concatRecords(parts []arrow.RecordBatch) (arrow.RecordBatch, error) {
-	schema := parts[0].Schema()
-	var rows int64
-	for _, p := range parts {
-		rows += p.NumRows()
-	}
-	cols := make([]arrow.Array, schema.NumFields())
-	for i := range cols {
-		arrs := make([]arrow.Array, len(parts))
-		for j, p := range parts {
-			arrs[j] = p.Column(i)
-		}
-		col, err := array.Concatenate(arrs, memory.DefaultAllocator)
-		if err != nil {
-			for _, done := range cols[:i] {
-				done.Release()
-			}
-			return nil, err
-		}
-		cols[i] = col
-	}
-	rec := array.NewRecordBatch(schema, cols, rows)
-	for _, col := range cols {
-		col.Release()
-	}
-	return rec, nil
 }

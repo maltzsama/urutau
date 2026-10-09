@@ -332,19 +332,19 @@ func TestMergeBatchesPropagatesMode(t *testing.T) {
 	}
 	for _, mode := range []dataplane.WriteMode{dataplane.UpsertMode, dataplane.AppendMode} {
 		// a-only
-		got, err := mergeBatches(mk(mode), nil, nil)
+		got, err := dpint.MergeBatches(nil, mk(mode), nil)
 		if err != nil || got.Mode != mode {
 			t.Fatalf("a-only mode = %v, want %v (err %v)", got.Mode, mode, err)
 		}
 		got.Release()
 		// b-only
-		got, err = mergeBatches(nil, mk(mode), nil)
+		got, err = dpint.MergeBatches(nil, nil, mk(mode))
 		if err != nil || got.Mode != mode {
 			t.Fatalf("b-only mode = %v, want %v (err %v)", got.Mode, mode, err)
 		}
 		got.Release()
 		// concat
-		got, err = mergeBatches(mk(mode), mk(mode), nil)
+		got, err = dpint.MergeBatches(nil, mk(mode), mk(mode))
 		if err != nil || got.Mode != mode {
 			t.Fatalf("concat mode = %v, want %v (err %v)", got.Mode, mode, err)
 		}

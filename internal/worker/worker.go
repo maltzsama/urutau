@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -680,7 +679,7 @@ func (w *Worker) runBatcher(ctx context.Context, p *tablePipeline) error {
 		if len(pending) == 0 {
 			return nil
 		}
-		merged, err := concatBatches(pending)
+		merged, err := dpint.ConcatBatches(memory.DefaultAllocator, pending)
 		if err != nil {
 			freePending()
 			return fmt.Errorf("worker: table %s: concat: %w", p.target, err)
@@ -965,7 +964,7 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	if deletes != nil {
 		delCount = int(deletes.Record.NumRows())
 	}
-	combined, err := mergeBatches(upserts, deletes, nil)
+	combined, err := dpint.MergeBatches(nil, upserts, deletes)
 	if err != nil {
 		return 0, 0, fmt.Errorf("worker: table %s: merge: %w", p.target, err)
 	}
@@ -1275,47 +1274,6 @@ func lastRowPos(b *dataplane.Batch) string {
 	return ""
 }
 
-// concatBatches concatenates the row lists of the given batches, in order,
-// into one owned batch. The input batches are NOT released. All batches must
-// share the same record schema (columns in the same order) — a source that
-// emits schema-varying batches (per-drain inference) fails loud here instead
-// of corrupting column alignment.
-func concatBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
-	if len(bs) == 0 {
-		return nil, nil
-	}
-	first := bs[0].Record.Schema()
-	for _, b := range bs[1:] {
-		sch := b.Record.Schema()
-		if !sameSchema(sch, first) {
-			return nil, fmt.Errorf("worker: concat: schema mismatch: %s vs %s (source batches must share a stable schema)", colsOf(sch), colsOf(first))
-		}
-	}
-	return concatAll(bs)
-}
-
-// sameSchema reports field-for-field equality (names, types, order).
-func sameSchema(a, b *arrow.Schema) bool {
-	if a.NumFields() != b.NumFields() {
-		return false
-	}
-	for i := range a.NumFields() {
-		af, bf := a.Field(i), b.Field(i)
-		if af.Name != bf.Name || !arrow.TypeEqual(af.Type, bf.Type) {
-			return false
-		}
-	}
-	return true
-}
-
-func colsOf(s *arrow.Schema) string {
-	names := make([]string, s.NumFields())
-	for i := range s.NumFields() {
-		names[i] = s.Field(i).Name
-	}
-	return strings.Join(names, ",")
-}
-
 // selectRows returns a new owned batch holding the rows at the given
 // indices, with the given mode and position. The input is NOT released.
 func selectRows(b *dataplane.Batch, idx []int32, pos string, mode dataplane.WriteMode, snapState string, snapPending []uint32) (*dataplane.Batch, error) {
@@ -1395,58 +1353,4 @@ func CountOps(b *dataplane.Batch) (upserts, deletes int) {
 		}
 	}
 	return upserts, deletes
-}
-
-// mergeBatches concatenates two same-schema batches (upserts + deletes)
-// into a single batch. Returns nil when both inputs are empty. The caller
-// owns the input batches; they are NOT released here.
-func mergeBatches(a, b *dataplane.Batch, alloc memory.Allocator) (*dataplane.Batch, error) {
-	// Ownership: the returned batch ALWAYS holds its own retained refs.
-	// The caller owns a and b and releases them after this call. Never
-	// return an input pointer directly — the caller's Release would free
-	// the returned batch's record.
-	if a == nil || a.Record == nil || a.Record.NumRows() == 0 {
-		if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
-			return nil, nil
-		}
-		b.Record.Retain()
-		return &dataplane.Batch{Table: b.Table, Record: b.Record, Watermark: b.Watermark,
-			Mode: b.Mode, SnapshotState: b.SnapshotState, SnapshotPending: b.SnapshotPending, Seq: b.Seq, Staged: b.Staged}, nil
-	}
-	if b == nil || b.Record == nil || b.Record.NumRows() == 0 {
-		a.Record.Retain()
-		return &dataplane.Batch{Table: a.Table, Record: a.Record, Watermark: a.Watermark,
-			Mode: a.Mode, SnapshotState: a.SnapshotState, SnapshotPending: a.SnapshotPending, Seq: a.Seq, Staged: a.Staged}, nil
-	}
-	if alloc == nil {
-		alloc = memory.NewGoAllocator()
-	}
-	schema := a.Record.Schema()
-	ncols := int(schema.NumFields())
-	nrows := a.Record.NumRows() + b.Record.NumRows()
-	cols := make([]arrow.Array, ncols)
-	for i := range ncols {
-		cat, err := array.Concatenate([]arrow.Array{a.Record.Column(i), b.Record.Column(i)}, alloc)
-		if err != nil {
-			for j := range i {
-				cols[j].Release()
-			}
-			return nil, err
-		}
-		cols[i] = cat
-	}
-	rec := array.NewRecordBatch(schema, cols, nrows)
-	for _, c := range cols {
-		c.Release()
-	}
-	return &dataplane.Batch{
-		Table:           a.Table,
-		Record:          rec,
-		Watermark:       a.Watermark,
-		Mode:            a.Mode,
-		SnapshotState:   a.SnapshotState,
-		SnapshotPending: a.SnapshotPending,
-		Seq:             a.Seq,
-		Staged:          a.Staged || b.Staged,
-	}, nil
 }
