@@ -35,6 +35,24 @@ tables: [ … ]               # required; at least one — unless source.postgre
 | `format` | kafka | `debezium` (default), `raw`, `avro` |
 | `schemaRegistry` | avro | Confluent-compatible registry base URL |
 | `postgres` | postgres | Structured connection fields (alternative to `uri`). See below |
+| `kafka` | kafka | TLS/SASL transport security. See below |
+
+### `source.kafka`
+
+Kafka transport security (optional). Absent means plaintext and
+unauthenticated.
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `tls.ca` | no | CA certificate PEM **path** (server verification) |
+| `tls.cert` | no | Client certificate PEM path (mutual TLS; needs `tls.key`) |
+| `tls.key` | no | Client private key PEM path (mutual TLS; needs `tls.cert`) |
+| `tls.insecureSkipVerify` | no | Disable server verification (test brokers only) |
+| `sasl.mechanism` | no | `plain` (default), `scram-sha-256`, `scram-sha-512` |
+| `sasl.username` | sasl | SASL user |
+| `sasl.password` | sasl | SASL password |
+
+AWS MSK IAM is not supported yet.
 
 ### `source.postgres`
 
