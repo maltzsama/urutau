@@ -377,77 +377,48 @@ func coordinatorServiceAccount(cr *urutauv1alpha1.CDCPipeline) *corev1.ServiceAc
 	}
 }
 
-// coordinatorRole grants the coordinator access to ITS OWN pipeline CR and
-// status subresource only (resourceNames) — not every pipeline in the
-// namespace. The contract is that the coordinator, not the operator, writes
-// its status.
+// coordinatorRole grants the coordinator the least privilege it needs:
 //
-// It also grants StatefulSet management for the long-lived data workers and
-// reading its own Pod, to set the ownerReference that cascades GC of
-// everything it provisions when the coordinator dies. Those are
-// namespace-wide (no resourceNames) because a worker Deployment does not
-// exist yet when the coordinator boots and needs to create it — matching
-// the pattern the operator's own ClusterRole already uses for
-// statefulsets/configmaps/services.
+//   - the worker StatefulSets/Services it provisions (issue #298). create
+//     cannot be name-scoped (RBAC matches resourceNames against an existing
+//     object), so it stays namespace-wide; get/update are scoped to the worker
+//     names when the operator can enumerate them (a declared table list). A
+//     discovery pipeline's targets are unknown until boot, so its get/update
+//     stay namespace-wide.
+//   - reading its own Pod, to derive the ownerReference its worker workloads
+//     carry.
+//   - the ephemeral maintenance Pods it creates and deletes (issue #105),
+//     name-scoped, only when maintenance is on.
 //
-// Deleting Pods is granted separately and narrowly. The ephemeral
-// maintenance workers (issue #105) are bare Pods the coordinator creates
-// when a turn is due and deletes once the pass ends, so it needs delete —
-// but only ever on those names, which are derivable here. A pipeline with
-// maintenance off gets no Pod create/delete at all.
+// It grants nothing on the CDCPipeline CR: the coordinator does not write
+// status (issue #595).
 func coordinatorRole(cr *urutauv1alpha1.CDCPipeline) *rbacv1.Role {
 	rules := []rbacv1.PolicyRule{
-		{
-			APIGroups:     []string{"urutau.io"},
-			Resources:     []string{"cdcpipelines"},
-			ResourceNames: []string{cr.Name},
-			Verbs:         []string{"get", "update", "patch"},
-		},
-		{
-			// The status subresource is its own rule without resourceNames:
-			// some authorizers ignore resourceNames on a subresource, so
-			// scoping it to cr.Name would silently deny the coordinator its
-			// own status (issue #257). It stays in the pipeline's namespace.
-			APIGroups: []string{"urutau.io"},
-			Resources: []string{"cdcpipelines/status"},
-			Verbs:     []string{"get", "update", "patch"},
-		},
-		{
-			// The coordinator provisions one worker StatefulSet per table
-			// (issue #298); the replica count itself is owned by KEDA, so the
-			// coordinator only ever reads it.
-			APIGroups: []string{"apps"},
-			Resources: []string{"statefulsets"},
-			Verbs:     []string{"get", "create", "update"},
-		},
-		{
-			// The governing headless Service each worker StatefulSet requires
-			// for its pods' stable network identity.
-			APIGroups: []string{""},
-			Resources: []string{"services"},
-			Verbs:     []string{"get", "create", "update"},
-		},
-		{
-			APIGroups: []string{""},
-			Resources: []string{"pods"},
-			Verbs:     []string{"get"},
-		},
+		// create cannot be name-scoped: RBAC matches resourceNames against an
+		// existing object, and the worker does not exist yet.
+		{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, Verbs: []string{"create"}},
+		{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"create"}},
+		// Reading its own Pod (by hostname) derives the ownerReference its
+		// worker workloads carry (a stable StatefulSet, issue #599).
+		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get"}},
+	}
+	if names := workerWorkloadNames(cr); len(names) > 0 {
+		// get/update scoped to THIS pipeline's worker names, so a compromised
+		// coordinator cannot touch another pipeline's workloads.
+		rules = append(rules,
+			rbacv1.PolicyRule{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, ResourceNames: names, Verbs: []string{"get", "update"}},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, ResourceNames: names, Verbs: []string{"get", "update"}},
+		)
+	} else {
+		rules = append(rules,
+			rbacv1.PolicyRule{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"}, Verbs: []string{"get", "update"}},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "update"}},
+		)
 	}
 	if names := maintenanceWorkerNames(cr); len(names) > 0 {
 		rules = append(rules,
-			// create cannot be scoped by name: RBAC matches resourceNames
-			// against an existing object, and the Pod does not exist yet.
-			rbacv1.PolicyRule{
-				APIGroups: []string{""},
-				Resources: []string{"pods"},
-				Verbs:     []string{"create"},
-			},
-			rbacv1.PolicyRule{
-				APIGroups:     []string{""},
-				Resources:     []string{"pods"},
-				ResourceNames: names,
-				Verbs:         []string{"delete"},
-			},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"create"}},
+			rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: names, Verbs: []string{"delete"}},
 		)
 	}
 	return &rbacv1.Role{
