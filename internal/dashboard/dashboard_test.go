@@ -255,3 +255,41 @@ func TestRestartMapsErrorsToStatus(t *testing.T) {
 		}
 	}
 }
+
+// probedState adds the optional Prober capability to the fake state.
+type probedState struct {
+	*fakeState
+	ready, healthy bool
+}
+
+func (p probedState) Ready() bool   { return p.ready }
+func (p probedState) Healthy() bool { return p.healthy }
+
+// #601: /readyz and /healthz reflect the coordinator's readiness and liveness,
+// not merely that the HTTP server is up.
+func TestProbesReflectCoordinatorState(t *testing.T) {
+	status := func(state State, path string) int {
+		h := New(state, NewEvents(4), nil, slog.Default())
+		mux := http.NewServeMux()
+		h.Register(mux)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec.Code
+	}
+
+	booting := probedState{fakeState: &fakeState{}, ready: false, healthy: false}
+	if got := status(booting, "/readyz"); got != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz while booting = %d, want 503", got)
+	}
+	if got := status(booting, "/healthz"); got != http.StatusServiceUnavailable {
+		t.Fatalf("/healthz with a stalled pump = %d, want 503", got)
+	}
+
+	live := probedState{fakeState: &fakeState{}, ready: true, healthy: true}
+	if got := status(live, "/readyz"); got != http.StatusOK {
+		t.Fatalf("/readyz live = %d, want 200", got)
+	}
+	if got := status(live, "/healthz"); got != http.StatusOK {
+		t.Fatalf("/healthz live = %d, want 200", got)
+	}
+}

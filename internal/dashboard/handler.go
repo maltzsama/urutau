@@ -59,9 +59,18 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/stream", h.stream)
 	mux.HandleFunc("POST /api/v1/actions/cancel", h.cancel)
 	mux.HandleFunc("POST /api/v1/actions/restart/{worker}", h.restart)
-	mux.HandleFunc("GET /healthz", h.ok)
-	mux.HandleFunc("GET /readyz", h.ok)
+	mux.HandleFunc("GET /healthz", h.healthy)
+	mux.HandleFunc("GET /readyz", h.ready)
 	mux.Handle("/", spaHandler())
+}
+
+// Prober is an optional State capability: the coordinator's readiness (routing
+// published and the stream running) and liveness (the pump signalled life
+// recently). A State without it reports ok for both — a test fake, or a caller
+// that serves no pipeline probes (issue #601).
+type Prober interface {
+	Ready() bool
+	Healthy() bool
 }
 
 // PublishState pushes the current pipeline/tables/workers snapshot to every
@@ -261,7 +270,26 @@ func (h *Handler) restart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-func (h *Handler) ok(w http.ResponseWriter, _ *http.Request) {
+// ready answers the readiness probe: not ready until routing is published and
+// the stream pump is running (issue #601). A bounded boot keeps answering 503,
+// so the probe fails rather than the coordinator claiming readiness early.
+func (h *Handler) ready(w http.ResponseWriter, _ *http.Request) {
+	if p, ok := h.state.(Prober); ok && !p.Ready() {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+// healthy answers the liveness probe: unhealthy once the pump has not
+// signalled life within the window, so a wedged coordinator is restarted
+// instead of staying "live" but doing nothing (issue #601).
+func (h *Handler) healthy(w http.ResponseWriter, _ *http.Request) {
+	if p, ok := h.state.(Prober); ok && !p.Healthy() {
+		http.Error(w, "not healthy", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
