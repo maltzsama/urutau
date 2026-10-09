@@ -66,6 +66,23 @@ type maintStats struct {
 // dashboard's method names never collide with the coordinator's own.
 type dashState struct{ c *Coordinator }
 
+// pumpHealthWindow is how long with no pump heartbeat is treated as wedged for
+// the liveness probe. The pump ticks every cycleCheckEvery (20ms), so this is
+// generous (issue #601).
+const pumpHealthWindow = 30 * time.Second
+
+// Ready implements dashboard.Prober: routing is published and the stream pump
+// is running (issue #601).
+func (s dashState) Ready() bool { return s.c.readiness.Load() }
+
+// Healthy implements dashboard.Prober: the pump signalled life within the
+// window. A coordinator wedged before the pump starts (lastPump==0) or with a
+// stalled pump reads unhealthy, so the liveness probe restarts it (issue #601).
+func (s dashState) Healthy() bool {
+	ns := s.c.lastPump.Load()
+	return ns != 0 && time.Since(time.Unix(0, ns)) < pumpHealthWindow
+}
+
 // Summary implements dashboard.State.
 func (s dashState) Summary() dashboard.PipelineSummary {
 	c := s.c

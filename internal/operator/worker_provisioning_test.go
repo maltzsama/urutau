@@ -344,9 +344,11 @@ func TestCoordinatorStatefulSetAppliesResources(t *testing.T) {
 	}
 }
 
-// The coordinator Pod declares its ports and carries probes against /statusz.
-// The operator must guarantee a metrics address even when the CR leaves it
-// empty, or the probe has no endpoint to hit.
+// The coordinator Pod declares its ports and carries distinct probes: startup
+// and readiness against /readyz (routing published + stream running), liveness
+// against /healthz (the pump is alive) — issue #601. The operator must
+// guarantee a metrics address even when the CR leaves it empty, or the probe
+// has no endpoint to hit.
 func TestCoordinatorStatefulSetProbesAndPorts(t *testing.T) {
 	cr := pipelineCR("orders", "ns") // no Coordinator.MetricsAddr
 	sts := coordinatorStatefulSet(cr, "urutau:v1")
@@ -355,8 +357,14 @@ func TestCoordinatorStatefulSetProbesAndPorts(t *testing.T) {
 	if c.StartupProbe == nil || c.LivenessProbe == nil || c.ReadinessProbe == nil {
 		t.Fatalf("coordinator must carry startup/liveness/readiness probes, got %+v", c)
 	}
-	if got := c.LivenessProbe.HTTPGet.Path; got != "/statusz" {
-		t.Fatalf("liveness path = %q, want /statusz", got)
+	if got := c.StartupProbe.HTTPGet.Path; got != "/readyz" {
+		t.Fatalf("startup path = %q, want /readyz", got)
+	}
+	if got := c.ReadinessProbe.HTTPGet.Path; got != "/readyz" {
+		t.Fatalf("readiness path = %q, want /readyz", got)
+	}
+	if got := c.LivenessProbe.HTTPGet.Path; got != "/healthz" {
+		t.Fatalf("liveness path = %q, want /healthz", got)
 	}
 	if !strings.Contains(strings.Join(c.Command, " "), "--metrics-addr :9090") {
 		t.Fatalf("command = %v, want the operator default --metrics-addr :9090", c.Command)

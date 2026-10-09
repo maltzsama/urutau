@@ -711,28 +711,32 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 					{Name: "grpc", ContainerPort: coordinatorGRPCPort},
 					{Name: "metrics", ContainerPort: metricsPort},
 				},
-				// /statusz is the coordinator's live-state endpoint, served
-				// alongside /metrics on the (operator-guaranteed) metrics
-				// address. The startup probe gives a slow boot — source open,
-				// resume, a large initial snapshot — room to finish without
-				// the liveness probe restarting the pod mid-snapshot.
+				// /readyz answers only once routing is published and the
+				// stream is running, so the startup probe gives a slow boot
+				// (source open, resume, a large initial snapshot) room to
+				// finish without liveness restarting the pod mid-snapshot,
+				// and the readiness probe keeps a coordinator that is still
+				// booting out of service (issue #601).
 				StartupProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-						Path: "/statusz", Port: intstr.FromInt(int(metricsPort)),
+						Path: "/readyz", Port: intstr.FromInt(int(metricsPort)),
 					}},
 					PeriodSeconds:    10,
 					FailureThreshold: 60, // up to 10m of boot before liveness kicks in
 				},
+				// /healthz answers unhealthy once the pump stops signalling
+				// life, so a wedged coordinator is restarted instead of
+				// staying "live" but doing nothing (issue #601).
 				LivenessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-						Path: "/statusz", Port: intstr.FromInt(int(metricsPort)),
+						Path: "/healthz", Port: intstr.FromInt(int(metricsPort)),
 					}},
 					PeriodSeconds:    20,
 					FailureThreshold: 3,
 				},
 				ReadinessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-						Path: "/statusz", Port: intstr.FromInt(int(metricsPort)),
+						Path: "/readyz", Port: intstr.FromInt(int(metricsPort)),
 					}},
 					PeriodSeconds:    10,
 					FailureThreshold: 3,

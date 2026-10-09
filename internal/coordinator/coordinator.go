@@ -276,6 +276,13 @@ type Coordinator struct {
 	// silently incomplete snapshot.
 	snapshotActive atomic.Bool
 	batchSeq       atomic.Uint64 // monotonic BatchMeta.batch_id
+	// readiness is set once routing is published and the stream pump is
+	// running: the signal the readiness probe reads (issue #601).
+	readiness atomic.Bool
+	// lastPump is the unix-nano time of the pump's last loop iteration: the
+	// liveness signal a probe reads, so a wedged pump (which would otherwise
+	// leave the process "live" but doing nothing) is restarted (issue #601).
+	lastPump atomic.Int64
 	// booted closes once waitWorkers has seen every group attach. Before that,
 	// Session blocks on ready to wake waitWorkers; after, nothing drains it,
 	// so signalReady also selects on booted and never wedges (#493). Closing
@@ -954,6 +961,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 		go c.dashPushLoop(ctx)
 	}
 	go c.pump(ctx, out)
+	// Routing is published and the pump is draining the stream: ready (issue
+	// #601). Set before the snapshot so a coordinator mid-snapshot is ready —
+	// it serves workers and commits; only a coordinator still booting is not.
+	c.readiness.Store(true)
 
 	// The snapshot runs in its own goroutine: run's terminal select must
 	// stay live underneath it. A worker dying mid-snapshot otherwise wedges
@@ -1292,6 +1303,10 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 	defer tick.Stop()
 	defer c.releaseAccums()
 	for {
+		// Liveness heartbeat: the pump's select wakes at least every
+		// cycleCheckEvery (the tick), so a stale lastPump means the loop is
+		// wedged (issue #601).
+		c.lastPump.Store(time.Now().UnixNano())
 		select {
 		case <-tick.C:
 			if err := c.flushDueAccums(ctx); err != nil {

@@ -37,3 +37,30 @@ func TestStartControlServerSurfacesServeError(t *testing.T) {
 		t.Fatal("a Serve failure was not surfaced as a fatal run error")
 	}
 }
+
+// #601: dashState exposes readiness (routing + stream) and liveness (a recent
+// pump heartbeat) to the dashboard probes.
+func TestDashStateReadinessAndHealth(t *testing.T) {
+	c := &Coordinator{}
+	s := dashState{c}
+	if s.Ready() {
+		t.Fatal("ready before the stream pump starts")
+	}
+	if s.Healthy() {
+		t.Fatal("healthy with no pump heartbeat")
+	}
+
+	c.readiness.Store(true)
+	c.lastPump.Store(time.Now().UnixNano())
+	if !s.Ready() {
+		t.Fatal("not ready after routing published and the pump started")
+	}
+	if !s.Healthy() {
+		t.Fatal("not healthy right after a heartbeat")
+	}
+
+	c.lastPump.Store(time.Now().Add(-time.Minute).UnixNano())
+	if s.Healthy() {
+		t.Fatal("healthy after the heartbeat went stale")
+	}
+}
