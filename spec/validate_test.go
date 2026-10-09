@@ -1068,3 +1068,31 @@ func TestValidateEvolveSchema(t *testing.T) {
 		t.Fatalf("evolveSchema off must be accepted on any sink: %v", err)
 	}
 }
+
+func TestValidateOnTruncate(t *testing.T) {
+	for _, ok := range []string{"", "ignore", "fail"} {
+		s := validSpec()
+		s.Source.OnTruncate = ok
+		if err := s.Validate(); err != nil {
+			t.Fatalf("onTruncate %q must be accepted: %v", ok, err)
+		}
+	}
+
+	s := validSpec()
+	s.Source.OnTruncate = "propagate"
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "onTruncate") {
+		t.Fatalf("onTruncate propagate must be rejected, got %v", err)
+	}
+
+	// The cross-kind guard: the option only applies to relational sources.
+	var problems []string
+	validateOnTruncate("kafka", "ignore", &problems)
+	if len(problems) != 1 {
+		t.Fatalf("onTruncate on kafka: problems = %v, want 1", problems)
+	}
+	problems = nil
+	validateOnTruncate("mysql", "bogus", &problems)
+	if len(problems) != 1 {
+		t.Fatalf("onTruncate bogus: problems = %v, want 1", problems)
+	}
+}

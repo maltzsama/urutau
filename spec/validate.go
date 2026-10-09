@@ -81,6 +81,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	// Decoder format and the kafka-only source fields (format, schema
 	// registry, decode-error policy).
 	validateKafkaSource(s.Source, &problems)
+	validateOnTruncate(s.Source.Kind, s.Source.OnTruncate, &problems)
 	if s.Source.Postgres != nil && s.Source.Kind != "postgres" {
 		problems = append(problems, "source.postgres: only valid for kind postgres")
 	}

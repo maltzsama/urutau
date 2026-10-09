@@ -21,6 +21,12 @@ type Metrics struct {
 	WorkerResets   *prometheus.CounterVec
 	CommitsTotal   *prometheus.CounterVec
 	EventsDecoded  prometheus.Counter
+	// SourceTruncates counts TRUNCATEs the source stream carried but the
+	// engine did not propagate to the sink (issue #671).
+	SourceTruncates *prometheus.CounterVec
+	// SourceDestructiveDDL counts other destructive DDL (DROP/ALTER/RENAME)
+	// the source carried but the engine did not propagate (issue #671).
+	SourceDestructiveDDL *prometheus.CounterVec
 
 	// Worker.
 	RowsWritten      *prometheus.CounterVec
@@ -78,6 +84,12 @@ func New() *Metrics {
 		[]string{"table"})
 	m.EventsDecoded = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "urutau_coordinator_events_decoded_total", Help: "decoded source events."})
+	m.SourceTruncates = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_source_truncates_total", Help: "TRUNCATEs seen on the stream and not propagated to the sink, per source and table."},
+		[]string{"source", "table"})
+	m.SourceDestructiveDDL = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_source_destructive_ddl_total", Help: "destructive DDL (DROP/ALTER/RENAME) seen on the stream and not propagated, per source, kind and table."},
+		[]string{"source", "kind", "table"})
 
 	m.RowsWritten = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_worker_rows_written_total", Help: "rows written per table and op."},
@@ -145,6 +157,7 @@ func New() *Metrics {
 		[]string{"table"})
 
 	reg.MustRegister(m.LagSeconds, m.PendingBatches, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
+	reg.MustRegister(m.SourceTruncates, m.SourceDestructiveDDL)
 	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitLatencyMs, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	reg.MustRegister(m.EnrichDropped, m.EnrichEvicted)
 	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,

@@ -120,6 +120,13 @@ type Source struct {
 	// (urutau_decode_errors_total{topic}), so the stream carries on. Only
 	// meaningful for kind kafka.
 	OnDecodeError string `json:"onDecodeError,omitempty"`
+	// OnTruncate is how a relational source reacts to a destructive statement
+	// on the stream that the engine does not propagate (Postgres TRUNCATE,
+	// MySQL TRUNCATE/DROP/ALTER/RENAME). "ignore" (default) surfaces it as a
+	// metric and a run event and carries on; "fail" ends the run with a clear
+	// error naming the table, so the operator reconciles the sink by hand.
+	// "propagate" (apply the truncate to the sink) is not implemented yet.
+	OnTruncate string `json:"onTruncate,omitempty"`
 	// Postgres configures a PostgreSQL source via structured fields instead
 	// of a URI. When present, uri is ignored for connection building (but
 	// slotName and snapshotUri remain flat). Nil means the source uses uri.

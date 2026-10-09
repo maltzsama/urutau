@@ -82,6 +82,27 @@ type Runtime struct {
 	ServerID  uint32
 	Heartbeat time.Duration
 	Logger    *slog.Logger
+	// OnDestructiveDDL, when non-nil, is called for every TRUNCATE or other
+	// destructive DDL the reader sees on the stream. The engine owns what
+	// happens next — a metric and a run event under the default policy, or a
+	// failed run under onTruncate: fail. The reader does not decide. Nil is a
+	// no-op.
+	OnDestructiveDDL func(DestructiveDDL)
+}
+
+// DestructiveDDL is a TRUNCATE or other destructive DDL statement the source
+// stream carried that the engine does not propagate to the sink. Reporting it
+// lets the engine surface the divergence (a metric and a run event) or fail
+// the run, instead of leaving the sink silently out of sync.
+type DestructiveDDL struct {
+	// Source is the driver kind, e.g. "postgres" or "mysql".
+	Source string
+	// Kind classifies the statement: "truncate" or "ddl".
+	Kind string
+	// Table is the affected table ("schema.table" when known; "" otherwise).
+	Table string
+	// Detail is the statement text or the affected-relation list.
+	Detail string
 }
 
 // Chunk is a half-open primary-key range [Low, High). Low/High are tuples in

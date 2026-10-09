@@ -26,6 +26,7 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 )
 
 // TableRef is the source-agnostic table mapping (kept here as an alias for
@@ -65,6 +66,13 @@ type Config struct {
 	// the direct encoder builds. The engine's SetSourceSchemas replaces
 	// KindUnknown with the cast-resolved type before Start (#455).
 	Schemas map[string]core.Schema
+	// OnTruncate is "ignore" (default) or "fail": whether a destructive DDL
+	// (TRUNCATE/DROP/ALTER/RENAME) on a replicated table ends the stream
+	// (#671).
+	OnTruncate string
+	// OnDestructiveDDL, when non-nil, is called for every destructive DDL seen
+	// on the stream so the engine can record a metric and a run event (#671).
+	OnDestructiveDDL func(source.DestructiveDDL)
 }
 
 // Reader wraps a canal instance and decodes its row events.
@@ -622,16 +630,6 @@ func (r *Reader) OnPosSynced(header *replication.EventHeader, _ gomysql.Position
 // errReaderStopped is emit's sentinel for "the reader is shutting down" —
 // not a stream failure, so callers must not treat it as one.
 var errReaderStopped = fmt.Errorf("mysql: reader stopped")
-
-// OnDDL surfaces DDL statements seen on the stream. The query is the
-// authoritative statement. Row data is not produced here — schema drift on
-// the data path (ADD COLUMN etc.) is caught by the worker's drift check
-// comparing each change against the introspected schema, which is what
-// pauses the pipeline. This hook logs for operator visibility.
-func (r *Reader) OnDDL(_ *replication.EventHeader, _ gomysql.Position, q *replication.QueryEvent) error {
-	r.cfg.Logger.Warn("mysql: DDL detected", "query", string(q.Query))
-	return nil
-}
 
 // loc returns the operator's temporal location, defaulting to UTC.
 func (r *Reader) loc() *time.Location {

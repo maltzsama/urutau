@@ -595,10 +595,12 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 		return nil, err
 	}
 	cfg.ServerID = serverID
+	rep := &ddlReporter{}
 	src, err := driver.OpenSource(s, source.Runtime{
-		ServerID:  cfg.ServerID,
-		Heartbeat: cfg.Heartbeat,
-		Logger:    cfg.Logger,
+		ServerID:         cfg.ServerID,
+		Heartbeat:        cfg.Heartbeat,
+		Logger:           cfg.Logger,
+		OnDestructiveDDL: rep.ReportDestructiveDDL,
 	})
 	if err != nil {
 		return nil, err
@@ -612,7 +614,7 @@ func NewRunner(ctx context.Context, s *spec.Spec, cfg Config) (*Runner, error) {
 	if err := driver.ValidateParallelism(s.Source.Kind, cfg.MaxParallelChunks); err != nil {
 		return nil, fmt.Errorf("runner: %w", err)
 	}
-	return newRunner(ctx, s, cfg, src, snk)
+	return newRunner(ctx, s, cfg, src, snk, rep)
 }
 
 // NewRunnerWithAdapters runs the pipeline over already-open source/sink
@@ -623,7 +625,7 @@ func NewRunnerWithAdapters(ctx context.Context, s *spec.Spec, cfg Config, src so
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return newRunner(ctx, s, cfg, src, snk)
+	return newRunner(ctx, s, cfg, src, snk, nil)
 }
 
 // rejectCollapsedPartitioning refuses workers>1 in the collapsed runner: it
@@ -642,7 +644,7 @@ func rejectCollapsedPartitioning(s *spec.Spec) error {
 	return nil
 }
 
-func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source, snk sink.Sink) (r *Runner, err error) {
+func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source, snk sink.Sink, ddlRep *ddlReporter) (r *Runner, err error) {
 	log := cfg.Logger
 
 	// A discovery pipeline lists no tables: the source enumerates them now.
@@ -677,6 +679,22 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 				onFail()
 			}
 		}()
+	}
+	// The source reader reports destructive DDL through the reporter captured
+	// at OpenSource time; from here it lands in the audit trail (issue #671).
+	if ddlRep != nil {
+		ddlRep.set(func(d source.DestructiveDDL) {
+			if ev != nil {
+				_ = ev.Emit(context.Background(), eventlog.KindDestructiveDDL, map[string]any{
+					"source": d.Source,
+					"kind":   d.Kind,
+					"table":  d.Table,
+					"detail": d.Detail,
+				})
+			}
+			log.Warn("runner: destructive DDL on the source; not propagated to the sink",
+				"source", d.Source, "kind", d.Kind, "table", d.Table)
+		})
 	}
 
 	// A startup failure must release the sink (the adapters path owns it).
