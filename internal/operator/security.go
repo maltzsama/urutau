@@ -167,3 +167,56 @@ func (r *CoordinatorReconciler) ensureDisruptionBudget(ctx context.Context, cr *
 	}
 	return r.ensure(ctx, pdb, "coordinator pod disruption budget")
 }
+
+// controlPlaneTLSMountPath is where a control-plane TLS Secret is mounted:
+// tls.crt, tls.key, ca.crt (the shape a cert-manager Certificate produces).
+const controlPlaneTLSMountPath = "/etc/urutau/tls"
+
+// tlsFlagArgs are the control-plane TLS flags both binaries accept.
+func tlsFlagArgs() []string {
+	return []string{
+		"--tls-cert", controlPlaneTLSMountPath + "/tls.crt",
+		"--tls-key", controlPlaneTLSMountPath + "/tls.key",
+		"--tls-ca", controlPlaneTLSMountPath + "/ca.crt",
+	}
+}
+
+// coordinatorTLSArgs returns the coordinator's control-plane flags: the mounted
+// TLS material when the CR sets it, else the explicit plaintext opt-in (issue
+// #594).
+func coordinatorTLSArgs(cr *urutauv1alpha1.CDCPipeline) []string {
+	if cr.Spec.Coordinator.TLS == nil {
+		return []string{"--allow-insecure-control-plane"}
+	}
+	return tlsFlagArgs()
+}
+
+// workerTLSArgs returns the worker's control-plane flags: the mounted TLS
+// material when the CR sets it, else none (the worker follows the
+// coordinator's mode).
+func workerTLSArgs(cr *urutauv1alpha1.CDCPipeline) []string {
+	if cr.Spec.Coordinator.TLS == nil {
+		return nil
+	}
+	return tlsFlagArgs()
+}
+
+// controlPlaneTLSVolume returns the volume + mount for one side's TLS Secret
+// (server=true → the coordinator's, false → the workers'), or ok=false when
+// the CR sets no TLS.
+func controlPlaneTLSVolume(cr *urutauv1alpha1.CDCPipeline, server bool) (corev1.Volume, corev1.VolumeMount, bool) {
+	if cr.Spec.Coordinator.TLS == nil {
+		return corev1.Volume{}, corev1.VolumeMount{}, false
+	}
+	name := cr.Spec.Coordinator.TLS.ClientSecret
+	if server {
+		name = cr.Spec.Coordinator.TLS.ServerSecret
+	}
+	mode := int32(0o400)
+	return corev1.Volume{
+			Name:         "control-plane-tls",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: name, DefaultMode: &mode}},
+		},
+		corev1.VolumeMount{Name: "control-plane-tls", MountPath: controlPlaneTLSMountPath, ReadOnly: true},
+		true
+}

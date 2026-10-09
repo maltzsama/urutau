@@ -14,6 +14,10 @@ func (in *CDCPipelineSpec) DeepCopyInto(out *CDCPipelineSpec) {
 		e := *in.Coordinator.Eventlog
 		out.Coordinator.Eventlog = &e
 	}
+	if in.Coordinator.TLS != nil {
+		t := *in.Coordinator.TLS
+		out.Coordinator.TLS = &t
+	}
 }
 
 // DeepCopy copies the spec.

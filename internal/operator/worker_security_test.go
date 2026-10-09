@@ -1,10 +1,12 @@
 package operator
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 
+	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
 	urutauspec "github.com/maltzsama/urutau/spec"
 )
 
@@ -98,4 +100,58 @@ func TestCoordinatorPDBAndGrace(t *testing.T) {
 	if pdb.Spec.Selector == nil || pdb.Spec.Selector.MatchLabels["urutau.io/pipeline"] != "orders" {
 		t.Fatalf("pdb selector = %+v, want the pipeline labels", pdb.Spec.Selector)
 	}
+}
+
+// #594: a CR with coordinator.tls mounts the server/client TLS Secrets and
+// passes the TLS flags, dropping the plaintext opt-in.
+func TestControlPlaneTLSWiring(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	cr.Spec.Coordinator.TLS = &urutauv1alpha1.CoordinatorTLS{ServerSecret: "srv-tls", ClientSecret: "cli-tls"}
+
+	cmd := strings.Join(coordinatorCommand(cr), " ")
+	if strings.Contains(cmd, "allow-insecure-control-plane") {
+		t.Fatal("TLS set must not opt into plaintext")
+	}
+	for _, want := range []string{
+		"--tls-cert /etc/urutau/tls/tls.crt",
+		"--tls-key /etc/urutau/tls/tls.key",
+		"--tls-ca /etc/urutau/tls/ca.crt",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("coordinator command missing %q: %s", want, cmd)
+		}
+	}
+
+	sts := coordinatorStatefulSet(cr, "urutau:v1")
+	if !podSpecHasSecretVolume(sts.Spec.Template.Spec, "control-plane-tls", "srv-tls") {
+		t.Fatalf("coordinator must mount the server TLS secret: %+v", sts.Spec.Template.Spec.Volumes)
+	}
+
+	tmpl := workerPodTemplate(cr, "urutau:v1", urutauspec.Table{Source: "shop.orders", Target: "raw.orders"})
+	if !podSpecHasSecretVolume(tmpl.Spec, "control-plane-tls", "cli-tls") {
+		t.Fatalf("worker must mount the client TLS secret: %+v", tmpl.Spec.Volumes)
+	}
+	wcmd := strings.Join(tmpl.Spec.Containers[0].Command, " ")
+	if !strings.Contains(wcmd, "--tls-cert /etc/urutau/tls/tls.crt") {
+		t.Fatalf("worker command missing TLS flags: %s", wcmd)
+	}
+
+	// Without TLS: the coordinator opts into plaintext explicitly and no TLS
+	// volume is mounted.
+	plain := pipelineCR("orders", "ns")
+	if cmd := strings.Join(coordinatorCommand(plain), " "); !strings.Contains(cmd, "--allow-insecure-control-plane") {
+		t.Fatalf("a plaintext coordinator must opt in explicitly: %s", cmd)
+	}
+	if _, _, ok := controlPlaneTLSVolume(plain, true); ok {
+		t.Fatal("no coordinator.tls must produce no volume")
+	}
+}
+
+func podSpecHasSecretVolume(spec corev1.PodSpec, name, secret string) bool {
+	for _, v := range spec.Volumes {
+		if v.Name == name && v.Secret != nil && v.Secret.SecretName == secret {
+			return true
+		}
+	}
+	return false
 }

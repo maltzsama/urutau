@@ -269,6 +269,9 @@ func (r *CoordinatorReconciler) validateSpec(cr *urutauv1alpha1.CDCPipeline) err
 	if err := validateResourceQuantities(cr); err != nil {
 		return err
 	}
+	if tls := cr.Spec.Coordinator.TLS; tls != nil && (tls.ServerSecret == "" || tls.ClientSecret == "") {
+		return fmt.Errorf("coordinator.tls: serverSecret and clientSecret are both required")
+	}
 	return nil
 }
 
@@ -576,6 +579,8 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 	if cr.Spec.LogLevel != "" {
 		cmd = append(cmd, "--log-level", cr.Spec.LogLevel)
 	}
+	// Control-plane mTLS (issue #594): the worker presents its client cert.
+	cmd = append(cmd, workerTLSArgs(cr)...)
 	pod := corev1.PodSpec{
 		ServiceAccountName:           workerSAName(cr),
 		AutomountServiceAccountToken: boolPtr(false),
@@ -610,6 +615,11 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 				DefaultMode: &mode,
 			}},
 		})
+	}
+	// Control-plane mTLS (issue #594): mount the worker's client cert.
+	if v, m, ok := controlPlaneTLSVolume(cr, false); ok {
+		pod.Volumes = append(pod.Volumes, v)
+		pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, m)
 	}
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: labels},
@@ -781,6 +791,12 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 		})
 	}
 
+	// Control-plane mTLS (issue #594): mount the coordinator's server cert.
+	if v, m, ok := controlPlaneTLSVolume(cr, true); ok {
+		tmpl.Spec.Volumes = append(tmpl.Spec.Volumes, v)
+		tmpl.Spec.Containers[0].VolumeMounts = append(tmpl.Spec.Containers[0].VolumeMounts, m)
+	}
+
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{
@@ -813,12 +829,10 @@ func coordinatorCommand(cr *urutauv1alpha1.CDCPipeline) []string {
 	// /statusz probes have a stable endpoint, instead of leaving it to the
 	// CR author (an empty value disables /statusz entirely).
 	args = append(args, "--metrics-addr", coordinatorMetricsAddr(cr))
-	// The operator does not wire control-plane TLS yet (coordinator and
-	// workers run in-cluster, but the source DSN still rides the wire in the
-	// assignment). Opt into plaintext explicitly so the coordinator's
-	// fail-closed default does not crash-loop every managed pipeline;
-	// wiring real mTLS is future work.
-	args = append(args, "--allow-insecure-control-plane")
+	// Control-plane TLS (issue #594): when the CR references TLS Secrets, pass
+	// the mounted material; otherwise opt into plaintext explicitly so the
+	// coordinator's fail-closed default does not crash-loop the pipeline.
+	args = append(args, coordinatorTLSArgs(cr)...)
 	return args
 }
 

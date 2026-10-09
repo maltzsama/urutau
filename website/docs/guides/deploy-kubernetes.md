@@ -181,6 +181,9 @@ spec:
       ackTimeout: 30s
       maxConsecutiveCrashes: 3
       workerDeliveryTimeout: 5m
+    tls:                              # optional control-plane mTLS (issue #594)
+      serverSecret: shop-cp-server-tls
+      clientSecret: shop-cp-client-tls
   worker:
     cpu: "500m"
     cpu_overhead: "100m"
@@ -209,6 +212,22 @@ Note what is **absent** from `definition.inline`: no `source.uri`, no
 `sink.uri`, no catalog credentials. The Secrets fill those. Everything
 else — tables, `serverId`, namespace, warehouse, worker counts — lives in
 the spec and travels with the CR.
+
+### Control-plane TLS
+
+By default the coordinator/worker control plane runs plaintext in-cluster
+(the `Assignment` still carries the source DSN). To enforce mutual TLS, set
+`spec.coordinator.tls` to two Secrets, each holding `tls.crt`, `tls.key` and
+`ca.crt` (the shape a cert-manager `Certificate` produces; typically the same
+CA signs both):
+
+- `serverSecret` — the coordinator's server certificate (its `ca.crt` is the
+  CA that signs each worker's client certificate).
+- `clientSecret` — the workers' client certificate (its `ca.crt` is the CA
+  that signs the coordinator's server certificate).
+
+The operator mounts them and passes `--tls-cert/--tls-key/--tls-ca` to both
+binaries; without `tls`, it keeps the explicit plaintext opt-in.
 
 ### SSH-tunneled Postgres sources
 
