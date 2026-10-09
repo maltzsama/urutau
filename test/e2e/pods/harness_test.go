@@ -98,42 +98,69 @@ func applyCR(t *testing.T, manifest string) {
 }
 
 // applyPipeline applies a CR and registers a cleanup that deletes it. The
-// cleanup waits for the CR and its Pods to be gone: the scenarios share the
-// shop.orders source, so a lingering pipeline would consume the next test's
-// writes and contaminate its sink.
+// cleanup waits for the CR, its StatefulSets and its Pods to be gone: the
+// scenarios share the shop.orders source and the cluster, so a lingering
+// pipeline would consume the next test's writes and contaminate its sink, or
+// race its crash/convergence (issue #691).
 func applyPipeline(t *testing.T, ns, name, manifest string) {
 	t.Helper()
 	applyCR(t, manifest)
 	t.Cleanup(func() {
 		_ = exec.Command("kubectl", "-n", ns, "delete", "cdcpipelines", name,
 			"--ignore-not-found", "--wait=true").Run()
-		waitPodsGone(t, ns, name+"-", 2*time.Minute)
+		waitPipelineGone(t, ns, name, 5*time.Minute)
 	})
 }
 
-// waitPodsGone polls until no Pod with the prefix remains, best effort — a
-// cleanup must not fail an already-finished test.
-func waitPodsGone(t *testing.T, ns, prefix string, timeout time.Duration) {
+// waitPipelineGone polls until the pipeline's CR, StatefulSets and Pods are
+// all absent, best effort — a cleanup must not fail an already-finished test.
+func waitPipelineGone(t *testing.T, ns, name string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		out, _ := exec.Command("kubectl", "-n", ns, "get", "pods", "-o",
-			`jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`).Output()
-		remaining := 0
-		for _, line := range strings.Split(string(out), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), prefix) {
-				remaining++
-			}
-		}
-		if remaining == 0 {
+		if pipelineResourcesGone(ns, name) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Logf("pods with prefix %q still present after %s", prefix, timeout)
+			t.Logf("pipeline %q still present after %s", name, timeout)
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// pipelineResourcesGone reports whether the named CR and every resource whose
+// name starts with "<name>-" (StatefulSets, Pods) are absent. A kubectl
+// failure returns false so the caller keeps waiting: concluding absence from a
+// failed call is exactly how a lingering Pod slips into the next scenario
+// (issue #691). --ignore-not-found makes a genuinely missing CR exit 0 with
+// empty output, distinct from a transient error.
+func pipelineResourcesGone(ns, name string) bool {
+	cr, err := exec.Command("kubectl", "-n", ns, "get", "cdcpipelines", name,
+		"--ignore-not-found", "-o", "name").Output()
+	if err != nil {
+		return false
+	}
+	if strings.TrimSpace(string(cr)) != "" {
+		return false
+	}
+	out, err := exec.Command("kubectl", "-n", ns, "get", "statefulsets,pods", "-o",
+		`jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`).Output()
+	if err != nil {
+		return false
+	}
+	return !hasResourceWithPrefix(string(out), name+"-")
+}
+
+// hasResourceWithPrefix reports whether a newline-separated resource listing
+// contains a name with the given prefix.
+func hasResourceWithPrefix(listing, prefix string) bool {
+	for _, line := range strings.Split(listing, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureNamespace creates the namespace if it is absent (idempotent).
