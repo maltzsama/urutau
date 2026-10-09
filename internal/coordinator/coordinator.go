@@ -283,6 +283,10 @@ type Coordinator struct {
 	// liveness signal a probe reads, so a wedged pump (which would otherwise
 	// leave the process "live" but doing nothing) is restarted (issue #601).
 	lastPump atomic.Int64
+	// decodeErrors, when the source reports it, returns the running count of
+	// records its decoder dropped (Kafka onDecodeError: skip); polled for the
+	// skipped gauge (issue #602). Written at boot before the lag loop starts.
+	decodeErrors func() int64
 	// booted closes once waitWorkers has seen every group attach. Before that,
 	// Session blocks on ready to wake waitWorkers; after, nothing drains it,
 	// so signalReady also selects on booted and never wedges (#493). Closing
@@ -402,6 +406,11 @@ type Coordinator struct {
 	// into one minimum. See TestWorkerGroupNamesEmbedTarget.
 	confirmedMu sync.Mutex
 	confirmed   map[string]position.Position
+	// lastConfirmedPos/At track when the confirmed (minimum committed)
+	// position last changed, for the confirmed-position age gauge (issue
+	// #602). Guarded by confirmedMu.
+	lastConfirmedPos string
+	lastConfirmedAt  time.Time
 
 	// bootCommitted is each table's committed cdc.position read at boot
 	// (resumeFrom). A crash recovery replays every table from the minimum
@@ -916,6 +925,11 @@ func (c *Coordinator) run(ctx context.Context) error {
 		return err
 	}
 	defer rdr.Close()
+	// A source that reports decoder drops (Kafka onDecodeError: skip) exposes
+	// the running count; the lag loop polls it for the skipped gauge (#602).
+	if de, ok := rdr.(interface{ DecodeErrors() int64 }); ok {
+		c.decodeErrors = de.DecodeErrors
+	}
 	// A source that can take the resolved schema (optional interface) gets
 	// it now: the source boundary then gates on drift against the native
 	// shape and encodes stable batches. Keyed by the TARGET the changes are

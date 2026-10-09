@@ -254,3 +254,15 @@ func (s *stagedCycles) openSeqs(ref core.TableRef) []uint64 {
 	}
 	return out
 }
+
+// totalOpen reports how many staged cycles are still accumulating or waiting
+// to commit. Exposed for the urutau_coordinator_staged_cycles gauge: a growing
+// count is a staged backlog (issue #602).
+func (s *stagedCycles) totalOpen() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.open) + len(s.done)
+}
