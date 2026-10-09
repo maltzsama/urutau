@@ -240,12 +240,6 @@ func filterExprDecimal(p *spec.Predicate, raw string) (string, error) {
 	}
 }
 
-// checkFilterColumns reports an error when a filter references a column that
-// is not in the introspected table (see filterexpr.CheckColumns).
-func checkFilterColumns(tbl *schema.Table, f *spec.Filter) error {
-	return filterexpr.CheckColumns(f, tbl)
-}
-
 // columnIsNumeric reports whether the column is an integer or float type,
 // compared through float() (matching the snapshot).
 func columnIsNumeric(tbl *schema.Table, name string) bool {
