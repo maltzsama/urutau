@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,6 +20,7 @@ import (
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/memlimit"
+	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/internal/plugin/flightwrap"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -51,6 +54,7 @@ type coordinatorFlags struct {
 	file            string
 	listen          string
 	metricsAddr     string
+	debugAddr       string
 	tlsCert         string
 	tlsKey          string
 	tlsCA           string
@@ -121,6 +125,10 @@ func runCmd() *cobra.Command {
 				"eventlog", f.eventlogURI != "",
 				"checkpoint", f.checkpointURI != "",
 			)
+			if f.debugAddr != "" {
+				go serveDebug(f.debugAddr, cfg.Logger)
+				cfg.Logger.Info("coordinator: pprof debug server", "addr", f.debugAddr)
+			}
 			return coordinator.Run(cmd.Context(), cfg)
 		},
 	}
@@ -130,6 +138,7 @@ func runCmd() *cobra.Command {
 	// listener / control plane
 	fl.StringVar(&f.listen, "listen", ":50051", "gRPC + Flight listen address")
 	fl.StringVar(&f.metricsAddr, "metrics-addr", "", "serve /metrics and /statusz on this address (optional)")
+	fl.StringVar(&f.debugAddr, "debug-addr", "", "serve /debug/pprof on this loopback address for diagnostics (optional; e.g. 127.0.0.1:6060)")
 	fl.StringVar(&f.tlsCert, "tls-cert", "", "server certificate for the control plane (mTLS; all three TLS flags required)")
 	fl.StringVar(&f.tlsKey, "tls-key", "", "server private key for the control plane (mTLS)")
 	fl.StringVar(&f.tlsCA, "tls-ca", "", "CA that signs worker client certs (mTLS)")
@@ -190,7 +199,32 @@ func (f *coordinatorFlags) validate() error {
 	if f.checkpointURI != "" && f.checkpointSec <= 0 {
 		return fmt.Errorf("checkpoint-interval must be > 0 when --checkpoint is set")
 	}
+	// The profiler exposes process internals, so it is loopback-only.
+	if f.debugAddr != "" && !loopbackAddr(f.debugAddr) {
+		return fmt.Errorf("--debug-addr %q must be a loopback address (127.0.0.1, ::1 or localhost)", f.debugAddr)
+	}
 	return nil
+}
+
+// loopbackAddr reports whether a host:port address binds a loopback interface.
+func loopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// serveDebug runs the loopback-only profiler. Best-effort: a bind failure is
+// logged, not fatal — the pipeline must run without it.
+func serveDebug(addr string, logger *slog.Logger) {
+	if err := http.ListenAndServe(addr, observability.PprofHandler()); err != nil {
+		logger.Warn("coordinator: pprof debug server stopped", "addr", addr, "err", err)
+	}
 }
 
 func (f *coordinatorFlags) config(s *spec.Spec, logger *slog.Logger, logBuffer *logging.Buffer) coordinator.Config {
