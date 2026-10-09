@@ -204,3 +204,26 @@ func TestReadRunOutcomeReadsOnlyLastObject(t *testing.T) {
 		t.Fatalf("gets = %v, want only the last object", l.gets)
 	}
 }
+
+// When the final object is the marker-only seal (the writer flushes the
+// terminal event in an earlier object), readRunOutcome walks back to it
+// instead of reporting unknown (issue #548).
+func TestReadRunOutcomeWalksBackToTerminalEvent(t *testing.T) {
+	base := &fakeLister{objects: map[string]string{
+		"urutau/shop/run-20260101T000000-aa/events-000000.jsonl": `{"kind":"job_started","seq":1}` + "\n",
+		"urutau/shop/run-20260101T000000-aa/events-000001.jsonl": `{"kind":"job_stopped","reason":"shutdown","seq":2}` + "\n",
+		"urutau/shop/run-20260101T000000-aa/events-000002.jsonl": `{"kind":"run_sealed","emitted":2}` + "\n",
+	}}
+	l := &getCountingLister{fakeLister: base}
+
+	o, err := readRunOutcome(context.Background(), l, RootConfig{Bucket: "b", Prefix: "urutau"}, "shop", "20260101T000000-aa")
+	if err != nil {
+		t.Fatalf("readRunOutcome: %v", err)
+	}
+	if o != OutcomeSucceeded {
+		t.Fatalf("outcome = %q, want %q", o, OutcomeSucceeded)
+	}
+	if len(l.gets) != 2 {
+		t.Fatalf("gets = %v, want the seal and the terminal event", l.gets)
+	}
+}

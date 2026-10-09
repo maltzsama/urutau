@@ -415,9 +415,6 @@ type Coordinator struct {
 	// metricsDone closes when the metrics goroutine returns, so Run never
 	// returns before the listener is fully stopped (#495).
 	metricsDone chan struct{}
-	// emitSem bounds the concurrent audit-trail uploads fired by onAck, so a
-	// slow S3 endpoint cannot spawn unbounded goroutines (#494).
-	emitSem chan struct{}
 
 	// Dashboard (issue #97): the recent-events ring, the read-only API handler,
 	// the run's start time, and the per-table/worker aggregates the API serves.
@@ -543,7 +540,6 @@ func Run(ctx context.Context, cfg Config) error {
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},
 		booted:      make(chan struct{}),
-		emitSem:     make(chan struct{}, maxConcurrentEmits),
 	}
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	c.budget.perWorkerMax = cfg.FlowPerWorkerMax

@@ -202,6 +202,11 @@ func (c *Coordinator) startEventlog(ctx context.Context, cfg eventlog.Config) (f
 	}); err != nil {
 		c.log.Warn("coordinator: eventlog emit", "err", err)
 	}
+	// Seal the run's first event now: Emit only enqueues, and a crash before
+	// the flusher's next tick must still leave job_started in the trail.
+	if err := ev.Flush(ctx); err != nil {
+		c.log.Warn("coordinator: eventlog flush", "err", err)
+	}
 	return func() {
 		if trail != nil {
 			trail.stop()

@@ -25,9 +25,10 @@ func decodeLines(t *testing.T, body string) []map[string]any {
 	return out
 }
 
-// EmitBatch appends every record of the batch with consecutive seqs, in one
-// upload, and a caller-supplied ts wins over the flush time — the log trail
-// stamps each record itself, so a batch flushed later keeps the log's time.
+// EmitBatch enqueues every record of the batch with consecutive seqs; a Flush
+// uploads them together, and a caller-supplied ts wins over the flush time —
+// the log trail stamps each record itself, so a batch flushed later keeps the
+// log's time.
 func TestEmitBatch(t *testing.T) {
 	p := &fakePutter{}
 	r := NewWithPutter("bucket", "prefix", 0, p)
@@ -40,8 +41,11 @@ func TestEmitBatch(t *testing.T) {
 	if err := r.EmitBatch(context.Background(), KindLog, batch); err != nil {
 		t.Fatalf("EmitBatch: %v", err)
 	}
+	if err := r.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 	if got := p.Calls(); got != 1 {
-		t.Fatalf("PUTs = %d, want 1 — a batch is one upload", got)
+		t.Fatalf("PUTs = %d, want 1 — a batch flushes as one upload", got)
 	}
 	lines := decodeLines(t, string(p.lastBody))
 	if len(lines) != 2 {
@@ -74,15 +78,21 @@ func TestEmitBatch(t *testing.T) {
 	if err := r.Emit(context.Background(), KindCommit, map[string]any{"table": "t"}); err != nil {
 		t.Fatalf("Emit: %v", err)
 	}
-	lines = decodeLines(t, string(p.lastBody))
-	if len(lines) != 3 {
-		t.Fatalf("lines = %d, want 3 (the object grows)", len(lines))
+	if err := r.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
-	if got := lines[2]["seq"]; got != float64(3) {
+	if got := p.Calls(); got != 2 {
+		t.Fatalf("PUTs = %d, want 2 — the flushed object is sealed once", got)
+	}
+	lines = decodeLines(t, string(p.lastBody))
+	if len(lines) != 1 {
+		t.Fatalf("lines = %d, want 1 (a new object)", len(lines))
+	}
+	if got := lines[0]["seq"]; got != float64(3) {
 		t.Errorf("seq after batch = %v, want 3", got)
 	}
 	// An Emit without a caller ts still gets the writer's own.
-	if lines[2]["ts"] == "" {
+	if lines[0]["ts"] == "" {
 		t.Error("Emit did not stamp ts")
 	}
 }

@@ -79,13 +79,14 @@ func TestSignalReadyUnblocksOnBootWithFullReady(t *testing.T) {
 	}
 }
 
-// #494: a saturated emit queue drops the event instead of blocking the ack path.
-func TestEmitCommitDropsWhenSaturated(t *testing.T) {
+// #548: emitCommit is non-blocking — it records the dashboard event and hands
+// the trail write to the eventlog's own bounded queue, so the ack path never
+// waits on S3.
+func TestEmitCommitIsNonBlocking(t *testing.T) {
 	c := &Coordinator{
-		log:     slog.New(slog.DiscardHandler),
-		emitSem: make(chan struct{}, 1),
+		log:        slog.New(slog.DiscardHandler),
+		dashEvents: dashboard.NewEvents(10),
 	}
-	c.emitSem <- struct{}{} // saturate the single slot
 
 	done := make(chan struct{})
 	go func() {
@@ -95,26 +96,10 @@ func TestEmitCommitDropsWhenSaturated(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("emitCommit blocked on a saturated queue (issue #494)")
+		t.Fatal("emitCommit blocked (issue #548)")
 	}
-	if len(c.emitSem) != 1 {
-		t.Fatalf("emitSem len = %d, want 1: a dropped event must not enqueue", len(c.emitSem))
-	}
-}
-
-// #494: the in-memory dashboard event must survive a saturated upload queue.
-func TestEmitCommitRecordsDashboardWhenSaturated(t *testing.T) {
-	c := &Coordinator{
-		log:        slog.New(slog.DiscardHandler),
-		emitSem:    make(chan struct{}, 1),
-		dashEvents: dashboard.NewEvents(10),
-	}
-	c.emitSem <- struct{}{} // saturate the single slot
-
-	c.emitCommit("w", &pb.Ack{Table: "t"})
-
 	if got := c.dashEvents.List("", "", 10); len(got) != 1 {
-		t.Fatalf("dashboard events = %d, want 1: a saturated trail queue must not drop the dashboard event", len(got))
+		t.Fatalf("dashboard events = %d, want 1", len(got))
 	}
 }
 
