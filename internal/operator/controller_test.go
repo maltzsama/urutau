@@ -527,14 +527,33 @@ func TestCoordinatorIdentityPerPipeline(t *testing.T) {
 		t.Fatalf("per-pipeline SA not created: %v", err)
 	}
 
-	// The role grants access only to this CR.
+	// The role grants nothing on the CR and scopes worker get/update to this
+	// pipeline's worker names (#595).
 	role := &rbacv1.Role{}
 	if err := cli.Get(testCtx, types.NamespacedName{Name: "orders-coordinator", Namespace: nsName}, role); err != nil {
 		t.Fatalf("role not created: %v", err)
 	}
-	names := role.Rules[0].ResourceNames
-	if len(names) != 1 || names[0] != "orders" {
-		t.Fatalf("role resourceNames = %v, want [orders]", names)
+	const wantWorker = "e2e-raw-orders"
+	found := false
+	for _, rule := range role.Rules {
+		if rule.APIGroups[0] == "urutau.io" {
+			t.Fatalf("role must not grant the CR, got %+v", rule)
+		}
+		if rule.APIGroups[0] == "apps" && len(rule.ResourceNames) == 1 && rule.ResourceNames[0] == wantWorker {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("role must scope statefulsets to %q, got %+v", wantWorker, role.Rules)
+	}
+
+	// The worker's dedicated, tokenless ServiceAccount is created too (#603).
+	workerSA := &corev1.ServiceAccount{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "orders-worker", Namespace: nsName}, workerSA); err != nil {
+		t.Fatalf("worker SA not created: %v", err)
+	}
+	if workerSA.AutomountServiceAccountToken == nil || *workerSA.AutomountServiceAccountToken {
+		t.Fatal("worker SA must set automountServiceAccountToken=false")
 	}
 }
 

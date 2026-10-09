@@ -2,13 +2,17 @@ package operator
 
 import (
 	"context"
+	"sort"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/yaml"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
+	urutauspec "github.com/maltzsama/urutau/spec"
 )
 
 // This file carries the operator's Pod identity and hardening: the two
@@ -90,4 +94,39 @@ func tmpVolume() (corev1.Volume, corev1.VolumeMount) {
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 		},
 		corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"}
+}
+
+// workerWorkloadNames returns the StatefulSet/Service names the coordinator
+// provisions for this pipeline — one per declared table — or nil when they
+// cannot be enumerated. A discovery pipeline lists its tables at boot, and an
+// unparseable spec yields nil (the operator surfaces the real error elsewhere);
+// in both cases the role grants get/update namespace-wide instead.
+//
+// The names must match coordinator.workers_k8s.go's
+// spec.WorkerGroupPrefix(pipeline, target) exactly, or the coordinator would be
+// denied get/update on its own workers.
+func workerWorkloadNames(cr *urutauv1alpha1.CDCPipeline) []string {
+	if len(cr.Spec.Definition.Inline) == 0 {
+		return nil
+	}
+	payload, err := yaml.Marshal(cr.Spec.Definition.Inline)
+	if err != nil {
+		return nil
+	}
+	s, err := urutauspec.LoadYAML(strings.NewReader(string(payload)))
+	if err != nil {
+		return nil
+	}
+	if s.Source.Postgres != nil && s.Source.Postgres.Discover {
+		return nil // targets are discovered at boot; they cannot be name-scoped
+	}
+	if len(s.Tables) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(s.Tables))
+	for _, t := range s.Tables {
+		names = append(names, urutauspec.WorkerGroupPrefix(s.Pipeline, t.Target))
+	}
+	sort.Strings(names) // stable Role content, so ensure() sees no spurious drift
+	return names
 }
