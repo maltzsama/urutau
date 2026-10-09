@@ -194,11 +194,13 @@ func loadWorkerPodTemplate(target string) (corev1.PodTemplateSpec, error) {
 	return corev1.PodTemplateSpec{}, lastErr
 }
 
-// coordinatorPodOwner identifies this coordinator's own Pod, found by its
-// hostname (Kubernetes sets a Pod's hostname to its own name by default)
-// — every worker StatefulSet this coordinator creates carries an
-// ownerReference to it, so the Pod dying (or the StatefulSet scaling to
-// zero) cascades to GC every worker it provisioned.
+// coordinatorPodOwner identifies this coordinator's own Pod by its hostname
+// (Kubernetes sets a Pod's hostname to its own name by default) and returns the
+// ownerReference the worker workloads should carry: the Pod's CONTROLLING owner
+// — its StatefulSet — whose UID is stable across Pod replacements (issue #599).
+// An ownerReference to the Pod itself would make any Pod replacement (a node
+// drain, an eviction, a rolling update) change the UID and garbage-collect
+// every worker the coordinator provisioned.
 func coordinatorPodOwner(ctx context.Context, cs kubernetes.Interface, namespace string) (metav1.OwnerReference, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -208,12 +210,25 @@ func coordinatorPodOwner(ctx context.Context, cs kubernetes.Interface, namespace
 	if err != nil {
 		return metav1.OwnerReference{}, fmt.Errorf("get own pod %s/%s: %w", namespace, hostname, err)
 	}
-	return metav1.OwnerReference{
-		APIVersion: "v1",
-		Kind:       "Pod",
-		Name:       pod.Name,
-		UID:        pod.UID,
-	}, nil
+	return ownerFromPod(pod), nil
+}
+
+// ownerFromPod returns the coordinator's stable ownerReference: the Pod's
+// controlling owner (the coordinator StatefulSet) so a worker survives a Pod
+// replacement (issue #599). A Pod with no controlling owner (a bare Pod, e.g.
+// in a test or a non-StatefulSet deployment) falls back to the Pod itself.
+func ownerFromPod(pod *corev1.Pod) metav1.OwnerReference {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Controller != nil && *ref.Controller {
+			return metav1.OwnerReference{
+				APIVersion: ref.APIVersion,
+				Kind:       ref.Kind,
+				Name:       ref.Name,
+				UID:        ref.UID,
+			}
+		}
+	}
+	return metav1.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: pod.Name, UID: pod.UID}
 }
 
 // workerStatefulSet clones the table's own Pod template into the workload

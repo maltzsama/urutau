@@ -320,3 +320,37 @@ func TestMaintenanceWorkerPodFlagsOnlyWorkerContainer(t *testing.T) {
 		}
 	}
 }
+
+// #599: worker workloads are owned by the coordinator STATEFULSET (stable UID),
+// not the coordinator Pod, so a Pod replacement never garbage-collects them.
+func TestOwnerFromPodUsesTheControllingOwner(t *testing.T) {
+	ctrl := true
+	sts := metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: "StatefulSet", Name: "orders-coordinator",
+		UID: types.UID("sts-uid"), Controller: &ctrl,
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "orders-coordinator-0", UID: types.UID("pod-uid"),
+		OwnerReferences: []metav1.OwnerReference{sts},
+	}}
+	got := ownerFromPod(pod)
+	if got.Kind != "StatefulSet" || got.UID != "sts-uid" || got.Name != "orders-coordinator" {
+		t.Fatalf("owner = %+v, want the controlling StatefulSet", got)
+	}
+	if got.Controller != nil || got.BlockOwnerDeletion != nil {
+		t.Fatalf("owner must not set controller/blockOwnerDeletion: %+v", got)
+	}
+
+	// A bare Pod (no controlling owner) falls back to the Pod itself.
+	bare := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "solo", UID: types.UID("solo-uid")}}
+	if got := ownerFromPod(bare); got.Kind != "Pod" || got.UID != "solo-uid" {
+		t.Fatalf("bare pod owner = %+v, want the Pod itself", got)
+	}
+
+	// A non-controller owner reference is ignored.
+	cm := metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: "cm", UID: types.UID("cm-uid")}
+	pod2 := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", UID: types.UID("p-uid"), OwnerReferences: []metav1.OwnerReference{cm}}}
+	if got := ownerFromPod(pod2); got.Kind != "Pod" {
+		t.Fatalf("non-controller owner = %+v, want the Pod fallback", got)
+	}
+}
