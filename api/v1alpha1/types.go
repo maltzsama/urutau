@@ -95,6 +95,23 @@ type CoordinatorSpec struct {
 	// trail. The operator renders it as --eventlog s3://<bucket>/<rootPrefix>;
 	// the durable JSONL trail is what a history server reads back.
 	Eventlog *EventlogSpec `json:"eventlog,omitempty"`
+	// TLS, when set, wires control-plane mutual TLS from existing Secrets. The
+	// operator mounts them and passes --tls-cert/--tls-key/--tls-ca to the
+	// coordinator and workers, instead of --allow-insecure-control-plane
+	// (issue #594). Without it the control plane stays plaintext.
+	TLS *CoordinatorTLS `json:"tls,omitempty"`
+}
+
+// CoordinatorTLS references the Secrets that carry the control plane's mTLS
+// material. Each Secret must hold tls.crt, tls.key and ca.crt (the shape a
+// cert-manager Certificate produces).
+type CoordinatorTLS struct {
+	// ServerSecret is the coordinator's server certificate; its ca.crt is the
+	// CA that signs the worker client certificates.
+	ServerSecret string `json:"serverSecret"`
+	// ClientSecret is the workers' client certificate; its ca.crt is the CA
+	// that signs the coordinator server certificate (usually the same CA).
+	ClientSecret string `json:"clientSecret"`
 }
 
 // EventlogSpec points the coordinator's audit trail at an S3 store. It is a

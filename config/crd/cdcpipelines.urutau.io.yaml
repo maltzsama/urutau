@@ -57,6 +57,12 @@ spec:
                         maxConsecutiveCrashes: {type: integer}
                         workerDeliveryTimeout: {type: string}
                     metricsAddr: {type: string}
+                    tls:
+                      type: object
+                      required: [serverSecret, clientSecret]
+                      properties:
+                        serverSecret: {type: string}
+                        clientSecret: {type: string}
                     cpu: {type: string}
                     memory: {type: string}
                     eventlog:
