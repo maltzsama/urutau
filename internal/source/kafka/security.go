@@ -11,6 +11,7 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 
+	"github.com/maltzsama/urutau/internal/source/kafka/decoder"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -43,24 +44,31 @@ func securityOpts(src spec.Source) ([]kgo.Opt, error) {
 // for server verification, and — when cert and key are both set — a client
 // certificate for mutual TLS.
 func tlsConfig(t *spec.KafkaTLS) (*tls.Config, error) {
-	cfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: t.InsecureSkipVerify} //nolint:gosec // opt-in via the spec
-	if t.CA != "" {
-		pemBytes, err := os.ReadFile(t.CA)
+	return tlsConfigFromFiles(t.CA, t.Cert, t.Key, t.InsecureSkipVerify)
+}
+
+// tlsConfigFromFiles builds a *tls.Config from PEM file paths: a CA pool for
+// server verification and, when cert and key are both set, a client
+// certificate for mutual TLS.
+func tlsConfigFromFiles(ca, cert, key string, insecure bool) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: insecure} //nolint:gosec // opt-in via the spec
+	if ca != "" {
+		pemBytes, err := os.ReadFile(ca)
 		if err != nil {
 			return nil, fmt.Errorf("kafka: tls ca: %w", err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pemBytes) {
-			return nil, fmt.Errorf("kafka: tls ca %s: no certificates parsed", t.CA)
+			return nil, fmt.Errorf("kafka: tls ca %s: no certificates parsed", ca)
 		}
 		cfg.RootCAs = pool
 	}
-	if t.Cert != "" && t.Key != "" {
-		cert, err := tls.LoadX509KeyPair(t.Cert, t.Key)
+	if cert != "" && key != "" {
+		pair, err := tls.LoadX509KeyPair(cert, key)
 		if err != nil {
 			return nil, fmt.Errorf("kafka: tls client cert: %w", err)
 		}
-		cfg.Certificates = []tls.Certificate{cert}
+		cfg.Certificates = []tls.Certificate{pair}
 	}
 	return cfg, nil
 }
@@ -78,4 +86,24 @@ func saslMechanism(s *spec.KafkaSASL) (sasl.Mechanism, error) {
 	default:
 		return nil, fmt.Errorf("kafka: sasl mechanism %q is not supported", s.Mechanism)
 	}
+}
+
+// registryFor builds the schema-registry client from the source spec,
+// applying the optional basic auth and TLS (issue #604).
+func registryFor(src spec.Source) (*decoder.HTTPRegistry, error) {
+	a := src.SchemaRegistryAuth
+	if a == nil {
+		return decoder.NewHTTPRegistry(src.SchemaRegistry), nil
+	}
+	// Only install a custom transport when there is TLS material, so plain
+	// basic-auth keeps the default transport (proxy env, pooling).
+	var tlsCfg *tls.Config
+	if a.CA != "" || a.Cert != "" || a.InsecureSkipVerify {
+		cfg, err := tlsConfigFromFiles(a.CA, a.Cert, a.Key, a.InsecureSkipVerify)
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg = cfg
+	}
+	return decoder.NewHTTPRegistryWithAuth(src.SchemaRegistry, a.Username, a.Password, tlsCfg), nil
 }

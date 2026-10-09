@@ -2,6 +2,7 @@ package decoder
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,9 +38,11 @@ func (e *ErrUnknownSchema) Error() string {
 // HTTPRegistry is a Confluent-compatible schema registry client. Schemas are
 // cached by id for the life of the process (immutable per id).
 type HTTPRegistry struct {
-	base   string
-	client *http.Client
-	cache  sync.Map // int -> avro.Schema
+	base     string
+	client   *http.Client
+	username string
+	password string
+	cache    sync.Map // int -> avro.Schema
 }
 
 // NewHTTPRegistry dials the registry at base (no leading path requirement).
@@ -48,6 +51,17 @@ func NewHTTPRegistry(base string) *HTTPRegistry {
 		base:   base,
 		client: &http.Client{Timeout: 10 * time.Second},
 	}
+}
+
+// NewHTTPRegistryWithAuth dials the registry with HTTP basic auth and an
+// optional TLS config (issue #604). An empty username means no auth; a nil
+// tlsCfg means the default transport.
+func NewHTTPRegistryWithAuth(base, username, password string, tlsCfg *tls.Config) *HTTPRegistry {
+	client := &http.Client{Timeout: 10 * time.Second}
+	if tlsCfg != nil {
+		client.Transport = &http.Transport{TLSClientConfig: tlsCfg}
+	}
+	return &HTTPRegistry{base: base, client: client, username: username, password: password}
 }
 
 // Get resolves a schema by id, hitting the registry on a cache miss.
@@ -73,6 +87,9 @@ func (r *HTTPRegistry) fetch(ctx context.Context, id int) (avro.Schema, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
+	}
+	if r.username != "" {
+		req.SetBasicAuth(r.username, r.password)
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {

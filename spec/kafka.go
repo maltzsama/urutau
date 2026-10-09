@@ -27,3 +27,16 @@ type KafkaSASL struct {
 	Username  string `json:"username,omitempty"`
 	Password  string `json:"password,omitempty"`
 }
+
+// SchemaRegistryAuth configures the Confluent-compatible schema-registry
+// client's HTTP authentication and TLS (issue #604). Both are optional:
+// Confluent Cloud uses basic auth (an API key/secret) over TLS. CA, Cert and
+// Key are file paths, like the broker's TLS material.
+type SchemaRegistryAuth struct {
+	Username           string `json:"username,omitempty"`
+	Password           string `json:"password,omitempty"`
+	CA                 string `json:"ca,omitempty"`
+	Cert               string `json:"cert,omitempty"`
+	Key                string `json:"key,omitempty"`
+	InsecureSkipVerify bool   `json:"insecureSkipVerify,omitempty"`
+}

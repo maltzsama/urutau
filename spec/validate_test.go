@@ -1137,3 +1137,26 @@ func TestValidateKafkaSecurity(t *testing.T) {
 	}}, "")
 	check(Source{Kind: "mysql", Kafka: &KafkaSource{}}, "only valid for kind kafka")
 }
+
+func TestValidateSchemaRegistryAuth(t *testing.T) {
+	check := func(a *SchemaRegistryAuth, want string) {
+		t.Helper()
+		var p []string
+		validateSchemaRegistryAuth(Source{Kind: "kafka", SchemaRegistryAuth: a}, &p)
+		joined := strings.Join(p, "\n")
+		if want == "" {
+			if len(p) != 0 {
+				t.Fatalf("unexpected problems: %v", p)
+			}
+			return
+		}
+		if !strings.Contains(joined, want) {
+			t.Fatalf("problems = %v, want one containing %q", p, want)
+		}
+	}
+
+	check(&SchemaRegistryAuth{Username: "u"}, "username and password")
+	check(&SchemaRegistryAuth{Username: "u", Password: "p", Cert: "/c"}, "cert and key")
+	check(&SchemaRegistryAuth{Username: "u", Password: "p"}, "")
+	check(nil, "")
+}

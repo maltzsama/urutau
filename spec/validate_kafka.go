@@ -34,6 +34,7 @@ func validateKafkaSource(src Source, problems *[]string) {
 		*problems = append(*problems, "source.onDecodeError: only valid for kind kafka")
 	}
 	validateKafkaSecurity(src, problems)
+	validateSchemaRegistryAuth(src, problems)
 }
 
 // validateKafkaSecurity checks the Kafka source's TLS/SASL block (issue #598).
@@ -60,5 +61,21 @@ func validateKafkaSecurity(src Source, problems *[]string) {
 		if s.Username == "" || s.Password == "" {
 			*problems = append(*problems, "source.kafka.sasl: username and password are required")
 		}
+	}
+}
+
+// validateSchemaRegistryAuth checks the optional schema-registry client auth
+// (issue #604): basic auth needs both username and password, and a client
+// certificate needs both cert and key.
+func validateSchemaRegistryAuth(src Source, problems *[]string) {
+	a := src.SchemaRegistryAuth
+	if a == nil {
+		return
+	}
+	if a.Username == "" || a.Password == "" {
+		*problems = append(*problems, "source.schemaRegistryAuth: username and password are required")
+	}
+	if (a.Cert == "") != (a.Key == "") {
+		*problems = append(*problems, "source.schemaRegistryAuth: cert and key must be set together")
 	}
 }
