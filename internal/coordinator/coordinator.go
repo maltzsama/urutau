@@ -285,8 +285,11 @@ type Coordinator struct {
 	lastPump atomic.Int64
 	// decodeErrors, when the source reports it, returns the running count of
 	// records its decoder dropped (Kafka onDecodeError: skip); polled for the
-	// skipped gauge (issue #602). Written at boot before the lag loop starts.
-	decodeErrors func() int64
+	// skipped counter (issue #602). Written at boot before the lag loop starts;
+	// lastDecodeErrors is the value at the previous poll (lag-loop goroutine
+	// only), so the counter is advanced by the delta.
+	decodeErrors     func() int64
+	lastDecodeErrors int64
 	// booted closes once waitWorkers has seen every group attach. Before that,
 	// Session blocks on ready to wake waitWorkers; after, nothing drains it,
 	// so signalReady also selects on booted and never wedges (#493). Closing
@@ -407,9 +410,9 @@ type Coordinator struct {
 	confirmedMu sync.Mutex
 	confirmed   map[string]position.Position
 	// lastConfirmedPos/At track when the confirmed (minimum committed)
-	// position last changed, for the confirmed-position age gauge (issue
+	// position last advanced, for the confirmed-position age gauge (issue
 	// #602). Guarded by confirmedMu.
-	lastConfirmedPos string
+	lastConfirmedPos position.Position
 	lastConfirmedAt  time.Time
 
 	// bootCommitted is each table's committed cdc.position read at boot

@@ -397,28 +397,48 @@ func (c *Coordinator) publishLag() {
 	}
 	c.metrics.StagedCycles.Set(float64(c.staged.totalOpen()))
 	if c.decodeErrors != nil {
-		c.metrics.KafkaRecordsSkipped.Set(float64(c.decodeErrors()))
+		if cur := c.decodeErrors(); cur > c.lastDecodeErrors {
+			c.metrics.KafkaRecordsSkipped.Add(float64(cur - c.lastDecodeErrors))
+			c.lastDecodeErrors = cur
+		}
 	}
 }
 
 // publishConfirmedAge sets the confirmed-position age gauge: how long the
-// minimum committed position has been stuck. A rising age with a live pump is
-// a silent stall (issue #602). No series until the first confirmation.
+// minimum committed position has been stuck WHILE work is pending. A rising
+// age with a live pump is a silent stall; a caught-up pipeline reports zero
+// (nothing is pending, so nothing can stall). The clock resets only on forward
+// progress — the confirmed position can move BACKWARDS when a previously idle
+// worker begins owing work and constrains the minimum, and a mere change is
+// not progress. It starts when work first awaits a first confirmation, so a
+// commit that never arrives is a growing age rather than a gauge pinned at
+// zero (issue #602 review).
 func (c *Coordinator) publishConfirmedAge(now time.Time) {
+	owing := len(c.workersOwing()) > 0
 	pos := c.confirmedPosition()
-	s := ""
-	if pos != nil {
-		s = pos.String()
-	}
+
 	c.confirmedMu.Lock()
-	if s != c.lastConfirmedPos {
-		c.lastConfirmedPos = s
+	if pos != nil {
+		if c.lastConfirmedPos == nil {
+			c.lastConfirmedPos = pos // first confirmed position
+			c.lastConfirmedAt = now
+		} else if cmp := pos.Compare(c.lastConfirmedPos); cmp != position.Incomparable && cmp > 0 {
+			c.lastConfirmedPos = pos // forward progress
+			c.lastConfirmedAt = now
+		}
+	}
+	if !owing {
+		// Caught up: reset so a later stall is measured from its onset.
+		c.lastConfirmedAt = now
+	} else if c.lastConfirmedAt.IsZero() {
+		// Work is pending and nothing has committed yet: start the clock.
 		c.lastConfirmedAt = now
 	}
 	at := c.lastConfirmedAt
 	c.confirmedMu.Unlock()
+
 	if at.IsZero() {
-		return
+		return // nothing pending and nothing confirmed: leave the gauge at 0.
 	}
 	c.metrics.ConfirmedPositionAge.Set(now.Sub(at).Seconds())
 }
