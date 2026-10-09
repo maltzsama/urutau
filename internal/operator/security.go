@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/yaml"
@@ -129,4 +131,39 @@ func workerWorkloadNames(cr *urutauv1alpha1.CDCPipeline) []string {
 	}
 	sort.Strings(names) // stable Role content, so ensure() sees no spurious drift
 	return names
+}
+
+// int64Ptr returns a pointer to v (Kubernetes grace periods are *int64).
+func int64Ptr(v int64) *int64 { return &v }
+
+// intstrPtr returns a pointer to an IntOrString built from v.
+func intstrPtr(v int) *intstr.IntOrString {
+	x := intstr.FromInt(v)
+	return &x
+}
+
+// coordinatorPodDisruptionBudget bounds voluntary disruption of the (single)
+// coordinator so a node drain evicts it at most one at a time and waits for
+// its graceful shutdown. maxUnavailable=1, not minAvailable=1: on a
+// 1-replica StatefulSet minAvailable=1 would block every voluntary eviction
+// and wedge the drain (issue #604).
+func coordinatorPodDisruptionBudget(cr *urutauv1alpha1.CDCPipeline) *policyv1.PodDisruptionBudget {
+	labels := selectorLabels(cr)
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: coordinatorName(cr), Namespace: cr.Namespace, Labels: labels},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: intstrPtr(1),
+			Selector:       &metav1.LabelSelector{MatchLabels: labels},
+		},
+	}
+}
+
+// ensureDisruptionBudget applies the coordinator's PodDisruptionBudget, owned
+// by the CR so deletion cascades.
+func (r *CoordinatorReconciler) ensureDisruptionBudget(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) error {
+	pdb := coordinatorPodDisruptionBudget(cr)
+	if err := controllerutil.SetControllerReference(cr, pdb, r.Scheme()); err != nil {
+		return err
+	}
+	return r.ensure(ctx, pdb, "coordinator pod disruption budget")
 }
