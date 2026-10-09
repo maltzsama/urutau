@@ -375,6 +375,9 @@ func (c *Coordinator) publishLag() {
 	for _, t := range tables {
 		pending[t.Target] = c.tablePending(t.Target)
 	}
+	// The confirmed-position age is computed before statsMu: confirmedPosition
+	// takes the coordinator's own locks and must not nest under statsMu.
+	c.publishConfirmedAge(now)
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	for table, ts := range c.tableStats {
@@ -392,6 +395,32 @@ func (c *Coordinator) publishLag() {
 	for table, n := range pending {
 		c.metrics.PendingBatches.WithLabelValues(table).Set(float64(n))
 	}
+	c.metrics.StagedCycles.Set(float64(c.staged.totalOpen()))
+	if c.decodeErrors != nil {
+		c.metrics.KafkaRecordsSkipped.Set(float64(c.decodeErrors()))
+	}
+}
+
+// publishConfirmedAge sets the confirmed-position age gauge: how long the
+// minimum committed position has been stuck. A rising age with a live pump is
+// a silent stall (issue #602). No series until the first confirmation.
+func (c *Coordinator) publishConfirmedAge(now time.Time) {
+	pos := c.confirmedPosition()
+	s := ""
+	if pos != nil {
+		s = pos.String()
+	}
+	c.confirmedMu.Lock()
+	if s != c.lastConfirmedPos {
+		c.lastConfirmedPos = s
+		c.lastConfirmedAt = now
+	}
+	at := c.lastConfirmedAt
+	c.confirmedMu.Unlock()
+	if at.IsZero() {
+		return
+	}
+	c.metrics.ConfirmedPositionAge.Set(now.Sub(at).Seconds())
 }
 
 // tablePending reports the table's outstanding work: batches queued for or

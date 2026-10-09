@@ -30,6 +30,16 @@ type Metrics struct {
 	// EventlogQueue is the run-trail queue depth: a growing queue means the
 	// flusher is slower than the emit rate (issue #602).
 	EventlogQueue prometheus.Gauge
+	// ConfirmedPositionAge is how long the minimum committed position has been
+	// stuck: a rising age with a live pump is a silent stall (issue #602).
+	ConfirmedPositionAge prometheus.Gauge
+	// StagedCycles is the number of staged cycles still accumulating or
+	// waiting to commit: a growing count is a staged backlog (issue #602).
+	StagedCycles prometheus.Gauge
+	// KafkaRecordsSkipped is the running count of records a Kafka decoder
+	// rejected and onDecodeError: skip dropped (issue #602). Monotonic, hence
+	// the _total name.
+	KafkaRecordsSkipped prometheus.Gauge
 
 	// Worker.
 	RowsWritten      *prometheus.CounterVec
@@ -95,6 +105,12 @@ func New() *Metrics {
 		[]string{"source", "kind", "table"})
 	m.EventlogQueue = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "urutau_coordinator_eventlog_queue", Help: "events waiting for the run-trail flusher."})
+	m.ConfirmedPositionAge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "urutau_coordinator_confirmed_position_age_seconds", Help: "seconds since the confirmed (minimum committed) position last advanced."})
+	m.StagedCycles = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "urutau_coordinator_staged_cycles", Help: "staged cycles accumulating or waiting to commit."})
+	m.KafkaRecordsSkipped = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "urutau_kafka_records_skipped_total", Help: "Kafka records a decoder rejected and onDecodeError: skip dropped."})
 
 	m.RowsWritten = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_worker_rows_written_total", Help: "rows written per table and op."},
@@ -162,7 +178,7 @@ func New() *Metrics {
 		[]string{"table"})
 
 	reg.MustRegister(m.LagSeconds, m.PendingBatches, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
-	reg.MustRegister(m.SourceTruncates, m.SourceDestructiveDDL, m.EventlogQueue)
+	reg.MustRegister(m.SourceTruncates, m.SourceDestructiveDDL, m.EventlogQueue, m.ConfirmedPositionAge, m.StagedCycles, m.KafkaRecordsSkipped)
 	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitLatencyMs, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	reg.MustRegister(m.EnrichDropped, m.EnrichEvicted)
 	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,

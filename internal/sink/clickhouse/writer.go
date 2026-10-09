@@ -149,6 +149,18 @@ func (w *tableWriter) nextSeq() uint64 {
 // on a first boot — so without taking the max a coordinator batch could
 // land BELOW the snapshot batch that preceded it, and ReplacingMergeTree
 // would resurrect the snapshot row over the live one.
+//
+// Ordering guarantee (decided explicitly for issue #602): the primary
+// coordinate is the WALL CLOCK, guarded strictly increasing per writer via
+// lastSeq. seed+batchSeq only lifts a candidate above the seed; it is not the
+// primary coordinate, because mixing it with the clock is what caused the
+// scale mismatch above. Consequently, two DIFFERENT workers writing the same
+// table (the old owner's last write vs the new owner's first after a
+// re-slice) are ordered by their pods' clocks, which therefore must be
+// NTP-synchronized to within the commit interval — the same assumption the
+// cluster makes everywhere (etcd, logs). A clock step larger than a commit
+// interval across pods could let a stale row win; alerting on unsynchronized
+// clocks is the operator's responsibility, not something this writer can see.
 func (w *tableWriter) versionSeq(batchSeq uint64) uint64 {
 	seq := w.nextSeq()
 	if batchSeq != 0 {
