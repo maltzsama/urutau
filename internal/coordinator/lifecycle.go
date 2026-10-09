@@ -8,11 +8,6 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
-// maxConcurrentEmits bounds the audit-trail uploads in flight at once. A slow
-// S3 endpoint must not turn the ack hot path into an unbounded goroutine herd
-// (issue #494).
-const maxConcurrentEmits = 8
-
 // emit writes one event to the audit trail when configured; best-effort by
 // contract (a lost trail must never fail the pipeline). The dashboard's
 // recent-events ring is fed here too, unconditionally, so the UI shows events
@@ -35,21 +30,15 @@ func (c *Coordinator) dashRecord(kind string, fields map[string]any) {
 	}
 }
 
-// emitTrail writes an event to the audit trail (S3), bounded by its own
-// timeout. Callers on the ack hot path gate it behind emitSem.
+// emitTrail enqueues an event for the audit trail (S3). It is non-blocking:
+// the eventlog's own bounded queue absorbs bursts and drops (with a counter)
+// when saturated, so the ack hot path never stalls and no caller-side
+// semaphore is needed (issue #548).
 func (c *Coordinator) emitTrail(kind string, fields map[string]any) error {
 	if c.ev == nil {
 		return nil
 	}
-	// Bounded: the audit-trail upload must not hang the caller (the ack hot
-	// path already fires-and-forgets, but emit is also called synchronously
-	// on boot/terminal paths).
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := c.ev.Emit(ctx, kind, fields); err != nil {
-		return err
-	}
-	return nil
+	return c.ev.Emit(context.Background(), kind, fields)
 }
 
 // signalReady wakes waitWorkers on an attach without ever wedging a session.
@@ -66,11 +55,10 @@ func (c *Coordinator) signalReady(sessCtx, streamCtx context.Context) {
 	}
 }
 
-// emitCommit records a commit event in the dashboard and writes it to the
-// audit trail off the ack hot path, bounded to maxConcurrentEmits in-flight
-// uploads. The dashboard is in-memory, so it records every commit even when
-// the upload queue is saturated; a saturated queue drops only the best-effort
-// S3 upload rather than stalling acks (issue #494).
+// emitCommit records a commit event in the dashboard and enqueues it for the
+// audit trail. Both are cheap and non-blocking — the dashboard is in-memory
+// and the trail enqueue is bounded — so the ack hot path never stalls
+// (issues #494, #548).
 func (c *Coordinator) emitCommit(worker string, ack *pb.Ack) {
 	fields := map[string]any{
 		"worker":   worker,
@@ -80,19 +68,9 @@ func (c *Coordinator) emitCommit(worker string, ack *pb.Ack) {
 		"position": ack.Position,
 	}
 	c.dashRecord(eventlog.KindCommit, fields)
-	select {
-	case c.emitSem <- struct{}{}:
-	default:
-		c.log.Warn("coordinator: eventlog emit queue full; dropping commit event",
-			"worker", worker, "table", ack.Table)
-		return
+	if err := c.emitTrail(eventlog.KindCommit, fields); err != nil {
+		c.log.Warn("coordinator: eventlog emit", "err", err)
 	}
-	go func() {
-		defer func() { <-c.emitSem }()
-		if err := c.emitTrail(eventlog.KindCommit, fields); err != nil {
-			c.log.Warn("coordinator: eventlog emit", "err", err)
-		}
-	}()
 }
 
 // shutdownMetrics stops the metrics/dashboard HTTP server, if one was started,

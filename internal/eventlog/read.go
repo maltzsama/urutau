@@ -133,10 +133,11 @@ func ReadRunTrail(ctx context.Context, cfg RootConfig, pipeline, runID string) (
 	return readRunTrail(ctx, l, cfg, pipeline, runID)
 }
 
-// ReadRunOutcome reads only the run's LAST trail object and derives its
-// outcome, instead of reading every object (issue #592): the terminal event
-// (job_stopped/job_terminated/the run_sealed marker) is always in the last
-// object the writer sealed.
+// ReadRunOutcome derives a run's outcome without reading every object
+// (issue #592): the flusher seals one immutable object per flush, so the
+// terminal event (job_stopped/job_terminated) is in the tail. It scans
+// objects newest-first and stops at the first terminal event; a sealed run
+// whose final object is the marker-only seal costs a single object.
 func ReadRunOutcome(ctx context.Context, cfg RootConfig, pipeline, runID string) (Outcome, error) {
 	l, err := newLister(ctx, cfg)
 	if err != nil {
@@ -167,16 +168,23 @@ func readRunOutcome(ctx context.Context, l lister, cfg RootConfig, pipeline, run
 		return OutcomeUnknown, fmt.Errorf("%w: run %q of pipeline %q", ErrNotFound, runID, pipeline)
 	}
 	sort.Strings(keys)
-	last := keys[len(keys)-1]
-	body, err := l.Get(ctx, cfg.Bucket, last)
-	if err != nil {
-		return OutcomeUnknown, fmt.Errorf("eventlog: get %s: %w", last, err)
+	// Newest-first: the terminal event may sit in an earlier object than the
+	// marker-only final one, so stop at the first object that classifies.
+	// An abandoned run has no terminal event and scans the whole tail.
+	for i := len(keys) - 1; i >= 0; i-- {
+		body, err := l.Get(ctx, cfg.Bucket, keys[i])
+		if err != nil {
+			return OutcomeUnknown, fmt.Errorf("eventlog: get %s: %w", keys[i], err)
+		}
+		events, err := parseEvents(body)
+		if err != nil {
+			return OutcomeUnknown, fmt.Errorf("eventlog: parse %s: %w", keys[i], err)
+		}
+		if out := outcomeOf(events); out != OutcomeUnknown {
+			return out, nil
+		}
 	}
-	events, err := parseEvents(body)
-	if err != nil {
-		return OutcomeUnknown, fmt.Errorf("eventlog: parse %s: %w", last, err)
-	}
-	return outcomeOf(events), nil
+	return OutcomeUnknown, nil
 }
 
 func listPipelines(ctx context.Context, l lister, cfg RootConfig) ([]PipelineSummary, error) {

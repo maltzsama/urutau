@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -156,30 +157,38 @@ func readTrail(t *testing.T, cfg eventlog.Config) [][]byte {
 	if err != nil {
 		t.Fatalf("list trail objects: %v", err)
 	}
-	if len(lst.Contents) != 1 {
-		var keys []string
-		for _, o := range lst.Contents {
-			keys = append(keys, aws.ToString(o.Key))
-		}
-		t.Fatalf("trail prefix holds %d objects, want 1: %v", len(lst.Contents), keys)
+	if len(lst.Contents) == 0 {
+		t.Fatalf("trail prefix holds no objects")
 	}
-
-	obj, err := client.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    lst.Contents[0].Key,
-	})
-	if err != nil {
-		t.Fatalf("get trail object: %v", err)
+	// The flusher seals one immutable object per flush, so a run's trail is
+	// several objects. Fixed-width names sort in creation order; concatenate
+	// them to read the run's lines in order.
+	keys := make([]string, 0, len(lst.Contents))
+	for _, o := range lst.Contents {
+		keys = append(keys, aws.ToString(o.Key))
 	}
-	defer func() { _ = obj.Body.Close() }()
-	body, err := io.ReadAll(obj.Body)
-	if err != nil {
-		t.Fatalf("read trail object: %v", err)
-	}
+	sort.Strings(keys)
 
 	var lines [][]byte
-	for _, line := range strings.Split(strings.TrimSuffix(string(body), "\n"), "\n") {
-		lines = append(lines, []byte(line))
+	for _, key := range keys {
+		obj, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("get trail object %s: %v", key, err)
+		}
+		body, err := io.ReadAll(obj.Body)
+		_ = obj.Body.Close()
+		if err != nil {
+			t.Fatalf("read trail object %s: %v", key, err)
+		}
+		for _, line := range strings.Split(strings.TrimSuffix(string(body), "\n"), "\n") {
+			if line == "" {
+				continue
+			}
+			lines = append(lines, []byte(line))
+		}
 	}
 	return lines
 }

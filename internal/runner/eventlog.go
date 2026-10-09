@@ -28,6 +28,9 @@ func openEventlog(ctx context.Context, s *spec.Spec, cfg Config) (*eventlog.Run,
 	_ = ev.Emit(ctx, eventlog.KindJobStarted, map[string]any{
 		"pipeline": s.Pipeline, "source": s.Source.Kind, "tables": len(s.Tables),
 	})
+	// Seal the run's first event now: Emit only enqueues, and a crash before
+	// the flusher's next tick must still leave job_started in the trail.
+	_ = ev.Flush(ctx)
 	onFail := func() {
 		_ = ev.Emit(ctx, eventlog.KindJobStopped, map[string]any{"reason": "startup_failed"})
 		_ = ev.Close()

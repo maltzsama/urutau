@@ -48,8 +48,8 @@ type Store interface {
 	ListPipelines(ctx context.Context) ([]eventlog.PipelineSummary, error)
 	ListRuns(ctx context.Context, pipeline string) ([]eventlog.RunSummary, error)
 	ReadRunTrail(ctx context.Context, pipeline, runID string) (eventlog.Trail, error)
-	// ReadRunOutcome reads only the run's last object, for the listing page
-	// (issue #592).
+	// ReadRunOutcome scans the run's tail objects for the terminal event
+	// instead of reading the whole trail, for the listing page (issue #592).
 	ReadRunOutcome(ctx context.Context, pipeline, runID string) (eventlog.Outcome, error)
 }
 
