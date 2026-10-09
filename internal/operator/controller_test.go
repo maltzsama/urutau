@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -554,6 +555,16 @@ func TestCoordinatorIdentityPerPipeline(t *testing.T) {
 	}
 	if workerSA.AutomountServiceAccountToken == nil || *workerSA.AutomountServiceAccountToken {
 		t.Fatal("worker SA must set automountServiceAccountToken=false")
+	}
+
+	// The coordinator PodDisruptionBudget is created and owned by the CR
+	// (issue #604).
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := cli.Get(testCtx, types.NamespacedName{Name: "orders-coordinator", Namespace: nsName}, pdb); err != nil {
+		t.Fatalf("pod disruption budget not created: %v", err)
+	}
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Fatalf("pdb maxUnavailable = %v, want 1", pdb.Spec.MaxUnavailable)
 	}
 }
 

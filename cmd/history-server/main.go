@@ -42,8 +42,6 @@ type serveFlags struct {
 	listen       string
 	region       string
 	endpoint     string
-	accessKey    string
-	secretKey    string
 	pageLimit    int
 	retainedRuns int
 	logLevel     string
@@ -69,12 +67,13 @@ func serveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Connection knobs come from flags; credentials otherwise follow
-			// the standard AWS chain.
+			// Connection knobs come from flags; credentials come from the
+			// environment only (never a flag — flags appear in `ps`), else the
+			// standard AWS chain (issue #604).
 			root.Region = f.region
 			root.Endpoint = f.endpoint
-			root.AccessKey = f.accessKey
-			root.SecretKey = f.secretKey
+			root.AccessKey = os.Getenv("URUTAU_S3_ACCESS_KEY")
+			root.SecretKey = os.Getenv("URUTAU_S3_SECRET_KEY")
 			return historyserver.Run(cmd.Context(), historyserver.Config{
 				Root:         root,
 				Listen:       f.listen,
@@ -89,8 +88,6 @@ func serveCmd() *cobra.Command {
 	fl.StringVar(&f.listen, "listen", ":8080", "HTTP listen address")
 	fl.StringVar(&f.region, "region", "", "S3 region (default us-east-1)")
 	fl.StringVar(&f.endpoint, "endpoint", "", "S3 API endpoint override (MinIO-style path addressing)")
-	fl.StringVar(&f.accessKey, "access-key", "", "S3 access key (else the standard AWS chain)")
-	fl.StringVar(&f.secretKey, "secret-key", "", "S3 secret key")
 	fl.IntVar(&f.pageLimit, "page-limit", 1000, "max events per page")
 	fl.IntVar(&f.retainedRuns, "retained-runs", 32, "how many terminated runs' trails stay cached in memory")
 	fl.StringVar(&f.logLevel, "log-level", "info", "log level: debug|info|warn|error")

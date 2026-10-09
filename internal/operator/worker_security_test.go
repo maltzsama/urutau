@@ -75,3 +75,27 @@ func assertHardened(t *testing.T, pod corev1.PodSpec, who string) {
 		t.Fatalf("%s must mount a writable /tmp", who)
 	}
 }
+
+// #604: the coordinator gets an explicit termination grace period and a
+// bounded PodDisruptionBudget (maxUnavailable=1, not minAvailable — a
+// 1-replica singleton with minAvailable=1 would wedge a node drain).
+func TestCoordinatorPDBAndGrace(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	if got := coordinatorStatefulSet(cr, "urutau:v1").Spec.Template.Spec.TerminationGracePeriodSeconds; got == nil || *got != 60 {
+		t.Fatalf("terminationGracePeriodSeconds = %v, want 60", got)
+	}
+
+	pdb := coordinatorPodDisruptionBudget(cr)
+	if pdb.Name != "orders-coordinator" || pdb.Namespace != "ns" {
+		t.Fatalf("pdb identity = %s/%s, want ns/orders-coordinator", pdb.Namespace, pdb.Name)
+	}
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Fatalf("maxUnavailable = %v, want 1", pdb.Spec.MaxUnavailable)
+	}
+	if pdb.Spec.MinAvailable != nil {
+		t.Fatalf("minAvailable must be unset: %v", pdb.Spec.MinAvailable)
+	}
+	if pdb.Spec.Selector == nil || pdb.Spec.Selector.MatchLabels["urutau.io/pipeline"] != "orders" {
+		t.Fatalf("pdb selector = %+v, want the pipeline labels", pdb.Spec.Selector)
+	}
+}

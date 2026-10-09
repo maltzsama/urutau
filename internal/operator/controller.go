@@ -100,6 +100,7 @@ func (r *CoordinatorReconciler) fieldManager() string {
 // +kubebuilder:rbac:groups=core,resources=configmaps;services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
@@ -179,6 +180,9 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Ensure the coordinator and worker identities (service accounts). The
 	// coordinator also gets a Role and binding (below); the worker gets none.
 	if err := r.ensureIdentity(ctx, cr); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureDisruptionBudget(ctx, cr); err != nil {
 		return ctrl.Result{}, err
 	}
 	role := coordinatorRole(cr)
@@ -700,6 +704,10 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 		Spec: corev1.PodSpec{
 			ServiceAccountName: coordinatorSAName(cr),
 			SecurityContext:    podSecurityContext(),
+			// The graceful drain (coordinator gracefulShutdown) relies on the
+			// termination grace period; the 30s default can cut a large drain
+			// short, so give it 60s (issue #604).
+			TerminationGracePeriodSeconds: int64Ptr(60),
 			Containers: []corev1.Container{{
 				Name:            "coordinator",
 				Image:           image,
