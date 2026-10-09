@@ -78,23 +78,28 @@ func (c Config) pool() (*x509.CertPool, error) {
 
 // ServerTLS builds the server *tls.Config: present the server cert and
 // REQUIRE + verify a client certificate (mutual TLS). TLS 1.3 floor.
+//
+// The certificate is served through GetCertificate reading from disk, so a
+// cert-manager rotation takes effect on the next handshake without a restart
+// (issue #604). The CA pool is read at boot; a CA rotation still needs a
+// restart (rare next to leaf rotation).
 func (c Config) ServerTLS() (*tls.Config, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
-	}
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("grpctls: load keypair: %w", err)
 	}
 	pool, err := c.pool()
 	if err != nil {
 		return nil, err
 	}
+	rel := &certReloader{certFile: c.CertFile, keyFile: c.KeyFile}
+	if _, err := rel.get(); err != nil { // fail fast on a bad cert at boot
+		return nil, fmt.Errorf("grpctls: load keypair: %w", err)
+	}
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    pool,
-		MinVersion:   tls.VersionTLS13,
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return rel.get() },
+		ClientAuth:     tls.RequireAndVerifyClientCert,
+		ClientCAs:      pool,
+		MinVersion:     tls.VersionTLS13,
 	}, nil
 }
 
@@ -109,22 +114,26 @@ func (c Config) ServerOption() (grpc.ServerOption, error) {
 
 // ClientTLS builds the client *tls.Config: present the client cert and
 // verify the server against the CA. TLS 1.3 floor.
+//
+// The client certificate is served through GetClientCertificate reading from
+// disk, so a cert-manager rotation takes effect without a restart (issue
+// #604).
 func (c Config) ClientTLS() (*tls.Config, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
-	}
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("grpctls: load keypair: %w", err)
 	}
 	pool, err := c.pool()
 	if err != nil {
 		return nil, err
 	}
+	rel := &certReloader{certFile: c.CertFile, keyFile: c.KeyFile}
+	if _, err := rel.get(); err != nil { // fail fast on a bad cert at boot
+		return nil, fmt.Errorf("grpctls: load keypair: %w", err)
+	}
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      pool,
-		MinVersion:   tls.VersionTLS13,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return rel.get() },
+		RootCAs:              pool,
+		MinVersion:           tls.VersionTLS13,
 	}, nil
 }
 

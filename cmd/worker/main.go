@@ -134,15 +134,17 @@ func runCmd() *cobra.Command {
 	fl := cmd.Flags()
 	fl.StringVar(&f.coordinator, "coordinator", "127.0.0.1:50051", "coordinator address (host:port)")
 	fl.StringVar(&f.name, "name", os.Getenv("HOSTNAME"), "worker name (Hello); defaults to $HOSTNAME")
-	// The catalog settings fall back to the URUTAU_SINK_* environment the
+	// The catalog settings come from the URUTAU_SINK_* environment the
 	// operator mounts from the CDCPipeline's Secrets (see
 	// internal/operator.coordinatorEnv): in-cluster the worker never sees a
-	// flag, only env. A flag always wins over the environment.
-	fl.StringVar(&f.catalogURI, "catalog-uri", envOr("URUTAU_SINK_URI", "http://localhost:8181/api/catalog"), "Iceberg REST catalog URI")
-	fl.StringVar(&f.warehouse, "warehouse", envOr("URUTAU_SINK_WAREHOUSE", "quickstart_catalog"), "catalog warehouse name")
+	// flag, only env. A flag always wins over the environment. There is NO
+	// insecure default (a localhost catalog with full scope): a worker without
+	// configuration fails instead (issue #604).
+	fl.StringVar(&f.catalogURI, "catalog-uri", os.Getenv("URUTAU_SINK_URI"), "Iceberg REST catalog URI")
+	fl.StringVar(&f.warehouse, "warehouse", os.Getenv("URUTAU_SINK_WAREHOUSE"), "catalog warehouse name")
 	fl.StringVar(&f.clientID, "client-id", os.Getenv("URUTAU_SINK_CLIENT_ID"), "catalog OAuth2 client id")
 	fl.StringVar(&f.clientSecret, "client-secret", "", "catalog OAuth2 client secret (default: $URUTAU_SINK_CLIENT_SECRET)")
-	fl.StringVar(&f.scope, "scope", envOr("URUTAU_SINK_SCOPE", "PRINCIPAL_ROLE:ALL"), "catalog OAuth2 scope")
+	fl.StringVar(&f.scope, "scope", os.Getenv("URUTAU_SINK_SCOPE"), "catalog OAuth2 scope")
 	fl.StringVar(&f.namespace, "namespace", "raw", "fallback namespace for bare targets")
 	fl.IntVar(&f.maxRows, "max-rows", 10000, "flush the batch once this many rows are buffered (one Iceberg commit)")
 	fl.Int64Var(&f.maxBytesMi, "max-bytes-mi", 32, "flush the batch once its buffered rows hold this many MiB")
@@ -158,14 +160,6 @@ func runCmd() *cobra.Command {
 	return cmd
 }
 
-// envOr returns the environment value, or fallback when it is unset or empty.
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
 func (f *workerFlags) config() (worker.RemoteConfig, error) {
 	tlsCfg := grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA}
 	if err := tlsCfg.Validate(); err != nil {
@@ -178,7 +172,7 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 		return worker.RemoteConfig{}, fmt.Errorf("--name must not be empty (set $HOSTNAME or pass --name)")
 	}
 	if f.catalogURI == "" {
-		return worker.RemoteConfig{}, fmt.Errorf("--catalog-uri must not be empty")
+		return worker.RemoteConfig{}, fmt.Errorf("--catalog-uri must not be empty (set $URUTAU_SINK_URI or pass --catalog-uri)")
 	}
 	logger, logBuffer, err := logging.NewBuffered(f.logLevel, f.logFormat, 2000)
 	if err != nil {
