@@ -10,6 +10,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
