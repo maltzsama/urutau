@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
 )
 
 // opCol extracts the __op column as []uint8 from a batch.
@@ -44,7 +45,7 @@ func fieldIndex(t *testing.T, b *dataplane.Batch, name string) int {
 
 func TestGeneratorWatermarkIsLastRowPos(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 20, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 20, Allocator: alloc})
 	defer b.Release()
 
 	posIdx := fieldIndex(t, b, "__pos")
@@ -57,7 +58,7 @@ func TestGeneratorWatermarkIsLastRowPos(t *testing.T) {
 
 func TestGeneratorSchemaCoherent(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 5, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
 	schema := b.Record.Schema()
@@ -82,7 +83,7 @@ func TestGeneratorSchemaCoherent(t *testing.T) {
 
 func TestGeneratorPKNotNull(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{
+	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{
 		NumRows:       10,
 		IncludeNullPK: false,
 		Allocator:     alloc,
@@ -99,7 +100,7 @@ func TestGeneratorPKNotNull(t *testing.T) {
 
 func TestGeneratorPosMonotonic(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(99, dataplane.GeneratorOpts{NumRows: 30, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(99, dataplanetest.GeneratorOpts{NumRows: 30, Allocator: alloc})
 	defer b.Release()
 
 	posIdx := fieldIndex(t, b, "__pos")
@@ -114,7 +115,7 @@ func TestGeneratorPosMonotonic(t *testing.T) {
 
 func TestGeneratorInt64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInt64Overflow(alloc)
+	b := dataplanetest.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	idCol := b.Record.Column(0).(*array.Int64)
@@ -130,7 +131,7 @@ func TestGeneratorInt64Overflow(t *testing.T) {
 
 func TestGeneratorDeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialDeleteLast(alloc)
+	b := dataplanetest.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
 	opIdx := fieldIndex(t, b, "__op")
@@ -142,7 +143,7 @@ func TestGeneratorDeleteLast(t *testing.T) {
 
 func TestGeneratorInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialInsertAfterDelete(alloc)
+	b := dataplanetest.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
 	opIdx := fieldIndex(t, b, "__op")
@@ -157,7 +158,7 @@ func TestGeneratorInsertAfterDelete(t *testing.T) {
 
 func TestGeneratorCompositeKeyDistinct(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(alloc)
+	b := dataplanetest.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	pk1 := b.Record.Column(0).(*array.String)
@@ -176,7 +177,7 @@ func TestGeneratorCompositeKeyDistinct(t *testing.T) {
 
 func TestGeneratorNullBefore(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialNullBefore(alloc)
+	b := dataplanetest.AdversarialNullBefore(alloc)
 	defer b.Release()
 
 	valCol := b.Record.Column(1).(*array.String)
@@ -196,7 +197,7 @@ func TestGeneratorNullBefore(t *testing.T) {
 
 func TestEncodeKeyDistinct(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.AdversarialCompositeKey(alloc)
+	b := dataplanetest.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	key0, err := dataplane.EncodeKey(b.Record, 0, []int{0, 1}, []string{"pk1", "pk2"})
@@ -215,7 +216,7 @@ func TestEncodeKeyDistinct(t *testing.T) {
 
 func TestGeneratorNullPK(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{
+	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{
 		NumRows:       3,
 		IncludeNullPK: true,
 		Allocator:     alloc,
@@ -235,7 +236,7 @@ func TestGeneratorDeletesMidBatch(t *testing.T) {
 	found := false
 	for seed := range 50 {
 		alloc := checkedAlloc(t)
-		b := dataplane.GenerateBatch(int64(seed), dataplane.GeneratorOpts{NumRows: 30, Allocator: alloc})
+		b := dataplanetest.GenerateBatch(int64(seed), dataplanetest.GeneratorOpts{NumRows: 30, Allocator: alloc})
 		ops := opCol(b)
 		for i := 0; i < len(ops)-1; i++ { // exclude last row
 			if ops[i] == 2 {
@@ -251,7 +252,7 @@ func TestGeneratorDeletesMidBatch(t *testing.T) {
 
 func TestGeneratorDuplicatePKDomain(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{
+	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{
 		NumRows:   20,
 		PKDomain:  5,
 		Allocator: alloc,
@@ -274,7 +275,7 @@ func TestGeneratorDuplicatePKDomain(t *testing.T) {
 
 func TestGeneratorDefaultPKDomain(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(1, dataplane.GeneratorOpts{NumRows: 9, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 9, Allocator: alloc})
 	defer b.Release()
 
 	// Default PKDomain = max(1, 9/3) = 3 → IDs 1..3 repeating
@@ -291,7 +292,7 @@ func TestGeneratorDefaultPKDomain(t *testing.T) {
 func TestGeneratorBeforeValReal(t *testing.T) {
 	alloc := checkedAlloc(t)
 	// Use DeletesOnlyAtEnd=true so we get predictable inserts/updates
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{
+	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{
 		NumRows:          10,
 		DeletesOnlyAtEnd: true,
 		PKDomain:         3, // 3 distinct PKs → updates after first occurrence

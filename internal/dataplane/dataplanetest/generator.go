@@ -1,4 +1,7 @@
-package dataplane
+// Package dataplanetest holds the batch fixtures the engine's tests build
+// their inputs from. It lives outside the production dataplane package so the
+// fixtures do not ship in the engine (issue #608).
+package dataplanetest
 
 import (
 	"fmt"
@@ -6,12 +9,12 @@ import (
 	"math/rand/v2"
 	"time"
 
-	publicdp "github.com/maltzsama/urutau/dataplane"
-
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
+	publicdp "github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
@@ -39,7 +42,7 @@ func baseSchema() *arrow.Schema {
 }
 
 // GenerateBatch creates a batch with controlled data for property tests.
-func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
+func GenerateBatch(seed int64, opts GeneratorOpts) *publicdp.Batch {
 	if opts.NumRows <= 0 {
 		opts.NumRows = 10
 	}
@@ -60,12 +63,12 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 	// Metadata columns looked up by name: a reorder of WireMetadataFields()
 	// then fails on the builder type assertion here, rather than writing to
 	// the wrong field silently (issue #222).
-	opCol := colIndex(schema, "__op")
-	posCol := colIndex(schema, "__pos")
-	commitCol := colIndex(schema, "__commit_ts")
-	ingestCol := colIndex(schema, "__ingest_ts")
-	snapshotCol := colIndex(schema, "__snapshot")
-	phaseCol := colIndex(schema, "__phase")
+	opCol := fieldIndex(schema, "__op")
+	posCol := fieldIndex(schema, "__pos")
+	commitCol := fieldIndex(schema, "__commit_ts")
+	ingestCol := fieldIndex(schema, "__ingest_ts")
+	snapshotCol := fieldIndex(schema, "__snapshot")
+	phaseCol := fieldIndex(schema, "__phase")
 
 	// Track last value per PK for __before_val (real before-image).
 	lastVal := make(map[int64]string)
@@ -86,18 +89,18 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 		bb.Field(1).(*array.StringBuilder).Append(val)
 
 		// __op: mix of inserts, updates, and deletes
-		op := uint8(OpInsert)
+		op := uint8(dataplane.OpInsert)
 		if opts.DeletesOnlyAtEnd {
 			if i == opts.NumRows-1 && rng.IntN(3) == 0 {
-				op = OpDelete
+				op = dataplane.OpDelete
 			} else if i > 0 && rng.IntN(4) == 0 {
-				op = OpUpdate
+				op = dataplane.OpUpdate
 			}
 		} else {
 			if rng.IntN(5) == 0 {
-				op = OpDelete
+				op = dataplane.OpDelete
 			} else if i > 0 && rng.IntN(3) == 0 {
-				op = OpUpdate
+				op = dataplane.OpUpdate
 			}
 		}
 		bb.Field(opCol).(*array.Uint8Builder).Append(op)
@@ -105,7 +108,7 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 		// __before_val: last known val for this PK (real before-image for
 		// updates/deletes), null for inserts.
 		if id >= 0 {
-			if before, ok := lastVal[id]; ok && op != OpInsert {
+			if before, ok := lastVal[id]; ok && op != dataplane.OpInsert {
 				bb.Field(2).(*array.StringBuilder).Append(before)
 			} else {
 				bb.Field(2).(*array.StringBuilder).AppendNull()
@@ -147,7 +150,7 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *Batch {
 	posArr := rec.Column(6).(*array.String)
 	watermark := []byte(posArr.Value(lastIdx))
 
-	return &Batch{
+	return &publicdp.Batch{
 		Table:     "test_table",
 		Record:    rec,
 		Watermark: watermark,
@@ -166,7 +169,7 @@ func timeFromNsOffset(ns int64) time.Time {
 
 // AdversarialCompositeKey produces a batch where naive key concatenation
 // would collide: ("ab","c") vs ("a","bc").
-func AdversarialCompositeKey(alloc memory.Allocator) *Batch {
+func AdversarialCompositeKey(alloc memory.Allocator) *publicdp.Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -199,11 +202,11 @@ func AdversarialCompositeKey(alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_composite_key", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
+	return &publicdp.Batch{Table: "adv_composite_key", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // AdversarialDeleteLast produces a batch whose last row is a DELETE.
-func AdversarialDeleteLast(alloc memory.Allocator) *Batch {
+func AdversarialDeleteLast(alloc memory.Allocator) *publicdp.Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -230,12 +233,12 @@ func AdversarialDeleteLast(alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_delete_last", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
+	return &publicdp.Batch{Table: "adv_delete_last", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // AdversarialInsertAfterDelete produces a batch where a row is inserted
 // after being deleted in the same batch.
-func AdversarialInsertAfterDelete(alloc memory.Allocator) *Batch {
+func AdversarialInsertAfterDelete(alloc memory.Allocator) *publicdp.Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -262,12 +265,12 @@ func AdversarialInsertAfterDelete(alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_insert_after_delete", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
+	return &publicdp.Batch{Table: "adv_insert_after_delete", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // AdversarialInt64Overflow produces a batch with int64 values > 2^53
 // that would be corrupted by JSON float64 (CR-021 regression test).
-func AdversarialInt64Overflow(alloc memory.Allocator) *Batch {
+func AdversarialInt64Overflow(alloc memory.Allocator) *publicdp.Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -298,13 +301,13 @@ func AdversarialInt64Overflow(alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_int64_overflow", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
+	return &publicdp.Batch{Table: "adv_int64_overflow", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
 }
 
 // AdversarialNullBefore produces a batch with null val/__before_val cells.
 // Predicate evaluation over these nulls COALESCES to false — the point is
 // the coalesce rule, not Kleene logic: a null never passes a predicate.
-func AdversarialNullBefore(alloc memory.Allocator) *Batch {
+func AdversarialNullBefore(alloc memory.Allocator) *publicdp.Batch {
 	if alloc == nil {
 		alloc = memory.NewGoAllocator()
 	}
@@ -337,5 +340,15 @@ func AdversarialNullBefore(alloc memory.Allocator) *Batch {
 
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	return &Batch{Table: "adv_null_before", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
+	return &publicdp.Batch{Table: "adv_null_before", Record: rec, Watermark: []byte("pos-0002"), Mode: publicdp.UpsertMode}
+}
+
+// fieldIndex returns the position of a schema field by name, or -1.
+func fieldIndex(schema *arrow.Schema, name string) int {
+	for i, f := range schema.Fields() {
+		if f.Name == name {
+			return i
+		}
+	}
+	return -1
 }

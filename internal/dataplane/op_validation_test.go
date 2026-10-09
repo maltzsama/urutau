@@ -17,11 +17,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 
 	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
 )
 
 func TestCollapseRejectsUnknownOp(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 2, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 2, Allocator: alloc})
 	defer b.Release()
 
 	bad := withOpValues(t, b, 0, 3)
@@ -37,7 +38,7 @@ func TestCollapseRejectsUnknownOp(t *testing.T) {
 // either way.
 func TestCollapseRejectsUnknownOpInLosingRow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 2, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 2, Allocator: alloc})
 	defer b.Release()
 
 	bad := withOpValues(t, b, 3, 0)
@@ -51,7 +52,7 @@ func TestCollapseRejectsUnknownOpInLosingRow(t *testing.T) {
 // Every valid op must still pass — the guard rejects the unknown, not the known.
 func TestCollapseAcceptsEveryValidOp(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplane.GenerateBatch(42, dataplane.GeneratorOpts{NumRows: 3, Allocator: alloc})
+	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 3, Allocator: alloc})
 	defer b.Release()
 
 	ok := withOpValues(t, b, 0, 1, 2) // insert, update, delete
