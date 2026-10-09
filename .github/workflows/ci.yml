@@ -64,6 +64,23 @@ jobs:
       - name: Lint
         run: make lint
 
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      # Scan the module tree for known vulnerabilities (issue #600). Pinned so
+      # a new scanner release cannot turn CI red on its own.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
   helm:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -196,6 +213,12 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.out
+
+      # The profile above is uploaded; `make cover` additionally enforces the
+      # coverage FLOORS (iceberg ≥ 50%, coordinator ≥ 65%) — the minimum, not a
+      # proof (issue #600).
+      - name: Coverage floors
+        run: make cover
 
       - name: Build (host)
         run: make build
