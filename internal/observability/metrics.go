@@ -36,10 +36,10 @@ type Metrics struct {
 	// StagedCycles is the number of staged cycles still accumulating or
 	// waiting to commit: a growing count is a staged backlog (issue #602).
 	StagedCycles prometheus.Gauge
-	// KafkaRecordsSkipped is the running count of records a Kafka decoder
-	// rejected and onDecodeError: skip dropped (issue #602). Monotonic, hence
-	// the _total name.
-	KafkaRecordsSkipped prometheus.Gauge
+	// KafkaRecordsSkipped counts records a Kafka decoder rejected and
+	// onDecodeError: skip dropped (issue #602). A Counter: the coordinator
+	// adds the delta of the reader's DecodeErrors() on each poll.
+	KafkaRecordsSkipped prometheus.Counter
 
 	// Worker.
 	RowsWritten      *prometheus.CounterVec
@@ -109,7 +109,7 @@ func New() *Metrics {
 		Name: "urutau_coordinator_confirmed_position_age_seconds", Help: "seconds since the confirmed (minimum committed) position last advanced."})
 	m.StagedCycles = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "urutau_coordinator_staged_cycles", Help: "staged cycles accumulating or waiting to commit."})
-	m.KafkaRecordsSkipped = prometheus.NewGauge(prometheus.GaugeOpts{
+	m.KafkaRecordsSkipped = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "urutau_kafka_records_skipped_total", Help: "Kafka records a decoder rejected and onDecodeError: skip dropped."})
 
 	m.RowsWritten = prometheus.NewCounterVec(prometheus.CounterOpts{
