@@ -90,11 +90,9 @@ type Source struct {
 	// sharing one server_id fight over the same replication stream and
 	// corrupt it. The operator's admission webhook rejects a duplicate
 	// serverId within a namespace.
-	ServerID      string `json:"serverId,omitempty"`
-	SlotName      string `json:"slotName,omitempty"`
-	SnapshotMode  string `json:"snapshotMode,omitempty"`
-	BootstrapAdds string `json:"bootstrapServers,omitempty"`
-	GroupID       string `json:"groupId,omitempty"`
+	ServerID     string `json:"serverId,omitempty"`
+	SlotName     string `json:"slotName,omitempty"`
+	SnapshotMode string `json:"snapshotMode,omitempty"`
 	// MaxReconnectAttempts bounds the MySQL binlog reader's reconnect budget
 	// (go-mysql canal's max_reconnect_attempts). 0 (omitted) resolves to the
 	// default 3. Without a bound a permanently broken stream — purged binlog,

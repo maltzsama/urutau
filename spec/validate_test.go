@@ -1049,3 +1049,22 @@ func TestValidatePostgresReplicaIdentityOption(t *testing.T) {
 		t.Fatalf("keep must be accepted: %v", err)
 	}
 }
+
+func TestValidateEvolveSchema(t *testing.T) {
+	s := validSpec()
+	s.Sink.Type = "couchbase"
+	s.Sink.EvolveSchema = true
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "evolveSchema") {
+		t.Fatalf("evolveSchema on a non-Iceberg sink must be rejected, got %v", err)
+	}
+	s.Sink.Type = "iceberg+rest"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("evolveSchema on Iceberg must be accepted: %v", err)
+	}
+	s = validSpec()
+	s.Sink.EvolveSchema = false
+	s.Sink.Type = "couchbase"
+	if err := s.Validate(); err != nil {
+		t.Fatalf("evolveSchema off must be accepted on any sink: %v", err)
+	}
+}
