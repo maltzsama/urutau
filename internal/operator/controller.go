@@ -176,14 +176,9 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, r.markTerminated(ctx, cr, "invalid_spec", err.Error())
 	}
 
-	// Ensure the coordinator identity (service account, Role, binding),
-	// the headless Service, the ConfigMap (the resolved spec payload), and
-	// the StatefulSet (ownerReference → cascade GC).
-	sa := coordinatorServiceAccount(cr)
-	if err := controllerutil.SetControllerReference(cr, sa, r.Scheme()); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.ensure(ctx, sa, "coordinator service account"); err != nil {
+	// Ensure the coordinator and worker identities (service accounts). The
+	// coordinator also gets a Role and binding (below); the worker gets none.
+	if err := r.ensureIdentity(ctx, cr); err != nil {
 		return ctrl.Result{}, err
 	}
 	role := coordinatorRole(cr)
@@ -607,15 +602,21 @@ func workerPodTemplate(cr *urutauv1alpha1.CDCPipeline, image string, t urutauspe
 		cmd = append(cmd, "--log-level", cr.Spec.LogLevel)
 	}
 	pod := corev1.PodSpec{
-		ServiceAccountName: coordinatorSAName(cr),
+		ServiceAccountName:           workerSAName(cr),
+		AutomountServiceAccountToken: boolPtr(false),
+		SecurityContext:              podSecurityContext(),
 		Containers: []corev1.Container{{
-			Name:      "worker",
-			Image:     image,
-			Command:   cmd,
-			Env:       env,
-			Resources: workerResources(cr, t),
+			Name:            "worker",
+			Image:           image,
+			Command:         cmd,
+			Env:             env,
+			Resources:       workerResources(cr, t),
+			SecurityContext: containerSecurityContext(),
 		}},
 	}
+	tmpVol, tmpMount := tmpVolume()
+	pod.Volumes = append(pod.Volumes, tmpVol)
+	pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, tmpMount)
 	// An SSH-tunneled source needs the private key on the worker host: the
 	// DSN cannot carry a DialFunc, so the coordinator ships the structured
 	// postgres block (issue #170) and the worker reads the key from this
@@ -727,12 +728,14 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: coordinatorSAName(cr),
+			SecurityContext:    podSecurityContext(),
 			Containers: []corev1.Container{{
-				Name:      "coordinator",
-				Image:     image,
-				Command:   coordinatorCommand(cr),
-				Env:       coordinatorContainerEnv(cr),
-				Resources: resourceRequirements(cr.Spec.Coordinator.CPU, "", cr.Spec.Coordinator.Memory, ""),
+				Name:            "coordinator",
+				Image:           image,
+				Command:         coordinatorCommand(cr),
+				Env:             coordinatorContainerEnv(cr),
+				Resources:       resourceRequirements(cr.Spec.Coordinator.CPU, "", cr.Spec.Coordinator.Memory, ""),
+				SecurityContext: containerSecurityContext(),
 				Ports: []corev1.ContainerPort{
 					{Name: "grpc", ContainerPort: coordinatorGRPCPort},
 					{Name: "metrics", ContainerPort: metricsPort},
@@ -763,13 +766,19 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 					PeriodSeconds:    10,
 					FailureThreshold: 3,
 				},
-				VolumeMounts: []corev1.VolumeMount{{Name: "spec", MountPath: "/etc/urutau"}},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "spec", MountPath: "/etc/urutau"},
+					{Name: "tmp", MountPath: "/tmp"},
+				},
 			}},
 			Volumes: []corev1.Volume{{
 				Name: "spec",
 				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{Name: name},
 				}},
+			}, {
+				Name:         "tmp",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 			}},
 		},
 	}

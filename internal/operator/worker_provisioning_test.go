@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 
 	urutauv1alpha1 "github.com/maltzsama/urutau/api/v1alpha1"
@@ -195,23 +196,33 @@ func TestWorkerPodTemplateMountsSSHKey(t *testing.T) {
 	}
 	tbl := urutauspec.Table{Source: "shop.orders", Target: "raw.orders"}
 
-	// No secret: no ssh volume/mount.
+	// No secret: no ssh volume/mount (the /tmp scratch volume is expected).
 	tmpl := workerPodTemplate(cr, "urutau:v1", tbl)
-	if len(tmpl.Spec.Volumes) != 0 || len(tmpl.Spec.Containers[0].VolumeMounts) != 0 {
-		t.Fatalf("no SSH secret must add no volume, got %+v / %+v",
+	if podHasVolume(tmpl, "ssh-key") || podHasMount(tmpl, sshMountPath) {
+		t.Fatalf("no SSH secret must add no ssh volume/mount, got %+v / %+v",
 			tmpl.Spec.Volumes, tmpl.Spec.Containers[0].VolumeMounts)
 	}
 
-	// Secret set: one read-only mount at sshMountPath.
+	// Secret set: one read-only ssh mount at sshMountPath.
 	cr.Spec.Secrets.SSH = "ssh-secret"
 	tmpl = workerPodTemplate(cr, "urutau:v1", tbl)
-	if len(tmpl.Spec.Volumes) != 1 || tmpl.Spec.Volumes[0].Secret == nil ||
-		tmpl.Spec.Volumes[0].Secret.SecretName != "ssh-secret" {
+	found := false
+	for _, v := range tmpl.Spec.Volumes {
+		if v.Name == "ssh-key" && v.Secret != nil && v.Secret.SecretName == "ssh-secret" {
+			found = true
+		}
+	}
+	if !found {
 		t.Fatalf("ssh volume = %+v, want a secret volume for ssh-secret", tmpl.Spec.Volumes)
 	}
-	mounts := tmpl.Spec.Containers[0].VolumeMounts
-	if len(mounts) != 1 || mounts[0].MountPath != sshMountPath || !mounts[0].ReadOnly {
-		t.Fatalf("ssh mount = %+v, want read-only at %s", mounts, sshMountPath)
+	mounted := false
+	for _, m := range tmpl.Spec.Containers[0].VolumeMounts {
+		if m.Name == "ssh-key" {
+			mounted = m.MountPath == sshMountPath && m.ReadOnly
+		}
+	}
+	if !mounted {
+		t.Fatalf("ssh mount = %+v, want a read-only mount at %s", tmpl.Spec.Containers[0].VolumeMounts, sshMountPath)
 	}
 }
 
@@ -230,9 +241,30 @@ func TestWorkerPodTemplateSuppressesSSHWithSnapshotURI(t *testing.T) {
 	}
 	cr.Spec.Secrets.SSH = "ssh-secret"
 	tmpl := workerPodTemplate(cr, "urutau:v1", urutauspec.Table{Source: "shop.orders", Target: "raw.orders"})
-	if len(tmpl.Spec.Volumes) != 0 {
+	if podHasVolume(tmpl, "ssh-key") {
 		t.Fatalf("a scoped snapshotUri must suppress the worker SSH mount, got %+v", tmpl.Spec.Volumes)
 	}
+}
+
+// podHasVolume reports whether the pod template declares a volume by name.
+func podHasVolume(pod corev1.PodTemplateSpec, name string) bool {
+	for _, v := range pod.Spec.Volumes {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// podHasMount reports whether the pod template's first container mounts a
+// volume at path.
+func podHasMount(pod corev1.PodTemplateSpec, path string) bool {
+	for _, m := range pod.Spec.Containers[0].VolumeMounts {
+		if m.MountPath == path {
+			return true
+		}
+	}
+	return false
 }
 
 // The coordinator opens the replication connection, so it needs the SSH key
