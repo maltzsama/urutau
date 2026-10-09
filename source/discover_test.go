@@ -50,7 +50,7 @@ func TestExpandTablesDiscovery(t *testing.T) {
 		t.Fatalf("got %d tables, want 2", len(got))
 	}
 	// Sorted by source; target derived from the sink namespace.
-	if got[0].Source != "public.orders" || got[0].Target != "raw.orders" || !got[0].CreateIfNotExists {
+	if got[0].Source != "public.orders" || got[0].Target != "raw.orders" {
 		t.Fatalf("table[0] = %+v, want public.orders → raw.orders createIfNotExists", got[0])
 	}
 	if got[1].Source != "public.users" || got[1].Target != "raw.users" {

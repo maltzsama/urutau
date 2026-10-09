@@ -109,7 +109,7 @@ See [Sinks](sinks.md) for each sink's semantics and limits.
 | `filter` | no | Structured row filter, applied at the source (snapshot WHERE + CDC). See [`filter`](#filter) |
 | `filterImmutable` | no | Required for `append` + `filter` |
 | `partitionBy` | no | Iceberg partition transform |
-| `createIfNotExists` | no | Create the target table |
+| `createIfNotExists` | no | Create the target table when absent (default `true`) |
 | `workers.number` | no | Partition the table across N workers by key range |
 | `workers.max` | no | Cap for runtime scaling: a re-slice may not exceed this. Zero uses the coordinator's default (32); a table that sets it ignores the global cap |
 | `workers.cpu` / `workers.memory` | no | Per-table Kubernetes resources |

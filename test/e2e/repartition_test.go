@@ -734,16 +734,14 @@ func TestLiveRepartitionMultiTable(t *testing.T) {
 	s.Tables[0].Workers = &spec.WorkerSpec{Number: 1, Max: 8}
 	s.Tables = append(s.Tables,
 		spec.Table{
-			Source:            "shop.order_items",
-			Target:            "raw.order_items",
-			PrimaryKey:        []string{"order_id", "line_no"},
-			CreateIfNotExists: true,
+			Source:     "shop.order_items",
+			Target:     "raw.order_items",
+			PrimaryKey: []string{"order_id", "line_no"},
 		},
 		spec.Table{
-			Source:            "shop.order_audit",
-			Target:            "raw.order_audit",
-			PrimaryKey:        []string{"id"},
-			CreateIfNotExists: true,
+			Source:     "shop.order_audit",
+			Target:     "raw.order_audit",
+			PrimaryKey: []string{"id"},
 		},
 	)
 	if err := s.Validate(); err != nil {

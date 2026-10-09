@@ -410,3 +410,36 @@ func TestWaitWorkersAcceptsAWorkerLostAfterItAttached(t *testing.T) {
 		t.Fatalf("waitWorkers = %v, want nil: a lost worker that attached once is recovered, not awaited at boot", err)
 	}
 }
+
+// #672: createIfNotExists travels with the assignment, and its default
+// (unset) is true.
+func TestAssignmentCarriesCreateIfNotExists(t *testing.T) {
+	no := false
+	build := func(tbl spec.Table) bool {
+		t.Helper()
+		c := &Coordinator{
+			cfg: Config{Spec: &spec.Spec{
+				Source: spec.Source{Kind: "mysql"},
+				Tables: []spec.Table{tbl},
+			}},
+			canonical: map[string]core.Schema{
+				"shop.a": {Columns: []core.Column{{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}}}},
+			},
+		}
+		w := &workerState{name: "w", refs: []source.TableRef{{Source: "shop.a", Target: "lake.a"}}}
+		msg, err := c.assignmentFor(w)
+		if err != nil {
+			t.Fatalf("assignmentFor: %v", err)
+		}
+		return msg.GetAssign().Tables[0].GetCreateIfNotExists()
+	}
+
+	base := spec.Table{Source: "shop.a", Target: "lake.a"}
+	if !build(base) {
+		t.Fatal("unset createIfNotExists must default to true")
+	}
+	base.CreateIfNotExists = &no
+	if build(base) {
+		t.Fatal("createIfNotExists: false must travel as false")
+	}
+}

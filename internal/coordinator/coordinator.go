@@ -2489,7 +2489,7 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			TargetTable:       ref.Target,
 			WriteMode:         pb.WriteMode_WRITE_MODE_UPSERT,
 			PrimaryKey:        ref.PrimaryKey,
-			CreateIfNotExists: true,
+			CreateIfNotExists: createIfNotExists(c, ref.Source),
 			SchemaArrow:       schemaB,
 			// A partitioned table on a staging sink: the worker stages its
 			// data files and the coordinator commits the cycle (WK-001 C5).
@@ -2587,6 +2587,15 @@ func (c *Coordinator) specForSource(src string) (spec.Table, bool) {
 		}
 	}
 	return spec.Table{}, false
+}
+
+// createIfNotExists reports whether the worker should create the target table
+// for a source table. The default is true: a table with no spec entry, or with
+// createIfNotExists unset, is created. The coordinator used to pass a
+// hard-coded true and ignore the declared field (issue #672).
+func createIfNotExists(c *Coordinator, source string) bool {
+	t, ok := c.specForSource(source)
+	return !ok || t.CreatesTargetTable()
 }
 
 // writeModeToPB maps the dataplane write mode onto the wire enum.
