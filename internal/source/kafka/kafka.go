@@ -141,7 +141,11 @@ func (s Source) Open(_ context.Context, refs []source.TableRef) (source.Reader, 
 		if s.Spec.Source.SchemaRegistry == "" {
 			return nil, fmt.Errorf("kafka: source.schemaRegistry required when format is avro")
 		}
-		avroDec := decoder.NewAvroDecoder(decoder.NewHTTPRegistry(s.Spec.Source.SchemaRegistry))
+		reg, err := registryFor(s.Spec.Source)
+		if err != nil {
+			return nil, err
+		}
+		avroDec := decoder.NewAvroDecoder(reg)
 		avroDec.ByTopic = extractionByTopic(s.Spec, "")
 		avroDec.Miss = s.missLogger()
 		dec = avroDec

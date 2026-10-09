@@ -34,8 +34,24 @@ tables: [ … ]               # required; at least one — unless source.postgre
 | `partitionedByPrimaryKey` | kafka | Assert the topics are key-partitioned; required for `upsert` |
 | `format` | kafka | `debezium` (default), `raw`, `avro` |
 | `schemaRegistry` | avro | Confluent-compatible registry base URL |
+| `schemaRegistryAuth` | avro | Basic auth + TLS for the registry. See below |
 | `postgres` | postgres | Structured connection fields (alternative to `uri`). See below |
 | `kafka` | kafka | TLS/SASL transport security. See below |
+
+### `source.schemaRegistryAuth`
+
+Optional auth/TLS for the Confluent-compatible schema-registry client (used by
+`format: avro`).
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `username` | auth | HTTP basic-auth user (e.g. a Confluent Cloud API key) |
+| `password` | auth | HTTP basic-auth password |
+| `ca` | no | CA certificate PEM **path** |
+| `cert` | no | Client certificate PEM path (mutual TLS; needs `key`) |
+| `key` | no | Client private key PEM path (mutual TLS; needs `cert`) |
+| `insecureSkipVerify` | no | Disable server verification (test registries only) |
+
 
 ### `source.kafka`
 

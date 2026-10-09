@@ -114,6 +114,9 @@ type Source struct {
 	// SchemaRegistry is the Confluent-compatible schema registry base URL
 	// (e.g. http://registry:8081), required when format is avro.
 	SchemaRegistry string `json:"schemaRegistry,omitempty"`
+	// SchemaRegistryAuth secures the schema-registry client. Nil means the
+	// registry is reached unauthenticated over plaintext.
+	SchemaRegistryAuth *SchemaRegistryAuth `json:"schemaRegistryAuth,omitempty"`
 	// OnDecodeError is the Kafka source's policy for a record its decoder
 	// rejects. "fail" (default) ends the run at the offending record, with
 	// its topic/partition/offset; "skip" drops just that record and counts it
