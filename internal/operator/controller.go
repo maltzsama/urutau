@@ -797,6 +797,11 @@ func coordinatorStatefulSet(cr *urutauv1alpha1.CDCPipeline, image string) *appsv
 		tmpl.Spec.Containers[0].VolumeMounts = append(tmpl.Spec.Containers[0].VolumeMounts, m)
 	}
 
+	// Kafka / schema-registry TLS (issue #598).
+	srcVols, srcMounts := sourceTLSMounts(cr)
+	tmpl.Spec.Volumes = append(tmpl.Spec.Volumes, srcVols...)
+	tmpl.Spec.Containers[0].VolumeMounts = append(tmpl.Spec.Containers[0].VolumeMounts, srcMounts...)
+
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{

@@ -220,3 +220,26 @@ func controlPlaneTLSVolume(cr *urutauv1alpha1.CDCPipeline, server bool) (corev1.
 		corev1.VolumeMount{Name: "control-plane-tls", MountPath: controlPlaneTLSMountPath, ReadOnly: true},
 		true
 }
+
+// sourceTLSMounts returns the read-only volumes and mounts for the Kafka and
+// schema-registry TLS Secrets (issue #598), each at a fixed path the inline
+// spec's source.kafka.tls.{ca,cert,key} / source.schemaRegistryAuth.{ca,cert,key}
+// name.
+func sourceTLSMounts(cr *urutauv1alpha1.CDCPipeline) ([]corev1.Volume, []corev1.VolumeMount) {
+	mode := int32(0o400)
+	var vols []corev1.Volume
+	var mounts []corev1.VolumeMount
+	add := func(name, secret, path string) {
+		if secret == "" {
+			return
+		}
+		vols = append(vols, corev1.Volume{
+			Name:         name,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secret, DefaultMode: &mode}},
+		})
+		mounts = append(mounts, corev1.VolumeMount{Name: name, MountPath: path, ReadOnly: true})
+	}
+	add("kafka-tls", cr.Spec.Secrets.KafkaTLS, "/etc/urutau/kafka-tls")
+	add("schema-registry-tls", cr.Spec.Secrets.SchemaRegistryTLS, "/etc/urutau/schema-registry-tls")
+	return vols, mounts
+}
