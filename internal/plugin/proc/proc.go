@@ -88,18 +88,7 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 		}
 	}
 
-	env := append(os.Environ(),
-		fmt.Sprintf("URUTAU_STAGE=%s", cfg.Role),
-		"URUTAU_TOKEN="+cfg.Token,
-		"URUTAU_CONFIG="+cfg.ConfigPath,
-		"URUTAU_PLUGIN_DIR="+cfg.PluginDir,
-		fmt.Sprintf("URUTAU_PROTOCOL_VERSION=%d", contract.ProtocolVersion),
-	)
-	if useTCP {
-		env = append(env, "URUTAU_BIND=127.0.0.1:0")
-	} else {
-		env = append(env, "URUTAU_SOCKET="+socketPath)
-	}
+	env := pluginEnv(cfg, socketPath, useTCP)
 
 	cmd := exec.Command(cfg.Bin)
 	cmd.Env = env
@@ -118,7 +107,31 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 
-	if err := cmd.Start(); err != nil {
+	p := &Process{cfg: cfg, cmd: cmd, exited: make(chan struct{})}
+
+	// Start from a dedicated OS thread that stays alive — blocked in Wait —
+	// until the child is reaped. Linux delivers Pdeathsig when the *thread*
+	// that created the child dies, and a goroutine's thread can terminate at
+	// any time once the goroutine moves on; starting and waiting on the same
+	// locked thread ties the child's lifetime to this process instead
+	// (issue #672). Running Wait elsewhere would let the thread return to the
+	// pool and die, killing the plugin prematurely.
+	started := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		if err := cmd.Start(); err != nil {
+			started <- err
+			return
+		}
+		started <- nil
+		waitErr := cmd.Wait()
+		p.mu.Lock()
+		p.reaped = true
+		p.mu.Unlock()
+		p.waitErr = waitErr
+		close(p.exited)
+	}()
+	if err := <-started; err != nil {
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
 		_ = stderrR.Close()
@@ -128,20 +141,9 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 
-	p := &Process{cfg: cfg, cmd: cmd, exited: make(chan struct{})}
-
 	readyCh := make(chan readyResult, 1)
 	go pump(stdoutR, cfg.Logger, "stdout", readyCh)
 	go pump(stderrR, cfg.Logger, "stderr", nil)
-
-	go func() {
-		err := cmd.Wait()
-		p.mu.Lock()
-		p.reaped = true
-		p.mu.Unlock()
-		p.waitErr = err
-		close(p.exited)
-	}()
 
 	if err := waitReady(ctx, readyCh, &p.ready); err != nil {
 		_ = p.Kill()
@@ -178,6 +180,34 @@ func Spawn(ctx context.Context, cfg Config) (*Process, error) {
 type readyResult struct {
 	ready Ready
 	err   error
+}
+
+// pluginEnv builds the child environment. It deliberately does NOT inherit
+// os.Environ(): the parent process carries source/sink DSNs and cloud
+// credentials the plugin does not need, and a plugin is third-party code
+// (issue #672). Only a small base allowlist plus the URUTAU_* contract
+// variables is forwarded.
+func pluginEnv(cfg Config, socketPath string, useTCP bool) []string {
+	base := []string{"PATH", "HOME", "TMPDIR", "TMP", "TEMP", "TZ", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+	env := make([]string, 0, len(base)+6)
+	for _, key := range base {
+		if v, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+v)
+		}
+	}
+	env = append(env,
+		"URUTAU_STAGE="+string(cfg.Role),
+		"URUTAU_TOKEN="+cfg.Token,
+		"URUTAU_CONFIG="+cfg.ConfigPath,
+		"URUTAU_PLUGIN_DIR="+cfg.PluginDir,
+		fmt.Sprintf("URUTAU_PROTOCOL_VERSION=%d", contract.ProtocolVersion),
+	)
+	if useTCP {
+		env = append(env, "URUTAU_BIND=127.0.0.1:0")
+	} else {
+		env = append(env, "URUTAU_SOCKET="+socketPath)
+	}
+	return env
 }
 
 func waitReady(ctx context.Context, ch <-chan readyResult, out *Ready) error {
