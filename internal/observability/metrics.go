@@ -27,6 +27,9 @@ type Metrics struct {
 	// SourceDestructiveDDL counts other destructive DDL (DROP/ALTER/RENAME)
 	// the source carried but the engine did not propagate (issue #671).
 	SourceDestructiveDDL *prometheus.CounterVec
+	// EventlogQueue is the run-trail queue depth: a growing queue means the
+	// flusher is slower than the emit rate (issue #602).
+	EventlogQueue prometheus.Gauge
 
 	// Worker.
 	RowsWritten      *prometheus.CounterVec
@@ -90,6 +93,8 @@ func New() *Metrics {
 	m.SourceDestructiveDDL = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_source_destructive_ddl_total", Help: "destructive DDL (DROP/ALTER/RENAME) seen on the stream and not propagated, per source, kind and table."},
 		[]string{"source", "kind", "table"})
+	m.EventlogQueue = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "urutau_coordinator_eventlog_queue", Help: "events waiting for the run-trail flusher."})
 
 	m.RowsWritten = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_worker_rows_written_total", Help: "rows written per table and op."},
@@ -157,7 +162,7 @@ func New() *Metrics {
 		[]string{"table"})
 
 	reg.MustRegister(m.LagSeconds, m.PendingBatches, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
-	reg.MustRegister(m.SourceTruncates, m.SourceDestructiveDDL)
+	reg.MustRegister(m.SourceTruncates, m.SourceDestructiveDDL, m.EventlogQueue)
 	reg.MustRegister(m.RowsWritten, m.CommitDuration, m.CommitLatencyMs, m.CommitFailures, m.EqualityDeletes, m.SnapshotProgress, m.DroppedByWindow, m.DeletesDropped)
 	reg.MustRegister(m.EnrichDropped, m.EnrichEvicted)
 	reg.MustRegister(m.IcebergCompactionRuns, m.IcebergCompactionFilesRemoved, m.IcebergCompactionFilesAdded,

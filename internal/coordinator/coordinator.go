@@ -29,7 +29,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -56,7 +55,6 @@ import (
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
-	"google.golang.org/grpc/keepalive"
 )
 
 // Config tunes the coordinator for one pipeline.
@@ -888,36 +886,10 @@ func (c *Coordinator) run(ctx context.Context) error {
 	defer func() { _ = lis.Close() }()
 	c.log.Info("coordinator listening", "addr", lis.Addr().String())
 
-	opts := []grpc.ServerOption{
-		// Keepalive agreement with the worker: MinTime ≤ client Time, else
-		// the server GOAWAYs a healthy worker for pinging too much.
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time:    10 * time.Second,
-			Timeout: 5 * time.Second,
-		}),
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             10 * time.Second,
-			PermitWithoutStream: false,
-		}),
-		// Flight batches can be a full snapshot chunk; 128Mi covers the
-		// default batching ceiling.
-		grpc.MaxRecvMsgSize(128 << 20),
-		grpc.MaxSendMsgSize(128 << 20),
+	grpcServer, err := c.startControlServer(lis)
+	if err != nil {
+		return err
 	}
-	if c.cfg.TLS.Enabled() {
-		tlsOpt, err := c.cfg.TLS.ServerOption()
-		if err != nil {
-			return fmt.Errorf("coordinator: tls: %w", err)
-		}
-		opts = append(opts, tlsOpt)
-		c.log.Info("coordinator: control plane mTLS enabled")
-	} else {
-		c.log.Warn("coordinator: control plane is PLAINTEXT — the Assignment carries the source DSN; set TLS cert/key/CA (running because --allow-insecure-control-plane was set)")
-	}
-	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterUrutauControlServer(grpcServer, &controlServer{c: c})
-	flight.RegisterFlightServiceServer(grpcServer, &flightServer{c: c})
-	go func() { _ = grpcServer.Serve(lis) }()
 	defer grpcServer.Stop()
 
 	// Wait for every expected worker session.
