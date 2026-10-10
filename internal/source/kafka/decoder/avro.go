@@ -9,6 +9,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // Avro decodes Confluent-Avro messages: a 1-byte magic (0x00), a 4-byte
@@ -56,10 +57,13 @@ func (e *ErrBadWireFormat) Error() string {
 	return "avro: message is missing the Confluent wire header (magic 0x00 + 4-byte schema id)"
 }
 
-func (d *Avro) Decode(rec *kgo.Record) ([]rowchange.Change, error) {
+// decodeValue strips the Confluent wire header, resolves the schema by id and
+// unmarshals the binary payload into the canonical value shape. The schema id
+// is returned so callers can name it in an error.
+func (d *Avro) decodeValue(rec *kgo.Record) (map[string]any, int, error) {
 	v := rec.Value
 	if len(v) < 5 || v[0] != 0x00 {
-		return nil, &ErrBadWireFormat{}
+		return nil, 0, &ErrBadWireFormat{}
 	}
 	id := int(binary.BigEndian.Uint32(v[1:5]))
 	payload := v[5:]
@@ -70,7 +74,7 @@ func (d *Avro) Decode(rec *kgo.Record) ([]rowchange.Change, error) {
 	} else {
 		s, err := d.registry.Get(rec.Context, id)
 		if err != nil {
-			return nil, err
+			return nil, id, err
 		}
 		d.cache.Store(id, s)
 		schema = s
@@ -78,7 +82,15 @@ func (d *Avro) Decode(rec *kgo.Record) ([]rowchange.Change, error) {
 
 	var after map[string]any
 	if err := avro.Unmarshal(schema, payload, &after); err != nil {
-		return nil, fmt.Errorf("avro: decode payload (schema id %d): %w", id, err)
+		return nil, id, fmt.Errorf("avro: decode payload (schema id %d): %w", id, err)
+	}
+	return after, id, nil
+}
+
+func (d *Avro) Decode(rec *kgo.Record) ([]rowchange.Change, error) {
+	after, id, err := d.decodeValue(rec)
+	if err != nil {
+		return nil, err
 	}
 
 	if spec, ok := d.ByTopic[rec.Topic]; ok && len(spec.Fields) > 0 {
@@ -93,4 +105,38 @@ func (d *Avro) Decode(rec *kgo.Record) ([]rowchange.Change, error) {
 		Op:    rowchange.OpInsert,
 		After: after,
 	}}, nil
+}
+
+// DecodeInto implements ColumnarDecoder: a projected record's declared fields
+// are written straight into the target's Arrow builders, no rowchange.Change
+// between. An unprojected topic keeps the whole registry record, whose shape
+// may exceed the canonical schema, so it returns ErrShapeDrift and the reader
+// re-encodes that record on the map path. Every message is an insert: the
+// record IS the row.
+func (d *Avro) DecodeInto(rec *kgo.Record, e Encoder, position string) (int, error) {
+	spec, ok := d.ByTopic[rec.Topic]
+	if !ok || len(spec.Fields) == 0 {
+		return 0, ErrShapeDrift
+	}
+	after, _, err := d.decodeValue(rec)
+	if err != nil {
+		return 0, err
+	}
+	enc, mapped, err := e("")
+	if err != nil {
+		return 0, err
+	}
+	if !mapped {
+		return 0, nil
+	}
+	if enc == nil {
+		return 0, ErrShapeDrift
+	}
+	filled := make([]bool, len(enc.Schema().Columns))
+	if err := appendProjected(enc, spec.Fields, after, d.Miss, filled); err != nil {
+		return 0, err
+	}
+	fillNulls(enc, filled)
+	enc.EndRow(transport.RowMeta{Op: rowchange.OpInsert, Position: position})
+	return 1, nil
 }

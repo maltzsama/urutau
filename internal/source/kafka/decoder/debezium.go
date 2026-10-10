@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -41,8 +42,20 @@ type DebeziumJSON struct {
 	TopicToTable map[string]string
 }
 
-// Decode implements Decoder.
-func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
+// debeziumEvent is one decoded Debezium envelope, shared by the row and
+// columnar paths so both resolve the op, table and images identically.
+type debeziumEvent struct {
+	op       rowchange.Op
+	after    map[string]any
+	before   map[string]any
+	target   string
+	commitTS time.Time
+	ingestTS time.Time
+}
+
+// parse decodes one record into a debeziumEvent. A nil event with a nil error
+// means "no row change" (a tombstone or a truncate/message op).
+func (d *DebeziumJSON) parse(record *kgo.Record) (*debeziumEvent, error) {
 	if record.Value == nil {
 		return nil, nil // null value is a Kafka tombstone: no row change
 	}
@@ -89,8 +102,6 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 	if env.Source.TsMs != nil {
 		tsMs = *env.Source.TsMs
 	}
-	commitTS := time.UnixMilli(tsMs)
-	ingestTS := time.Now()
 
 	after, err := decodeObject(env.After)
 	if err != nil {
@@ -101,24 +112,70 @@ func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
 		return nil, &ErrNotEnvelope{Err: fmt.Errorf("before: %w", err)}
 	}
 
+	return &debeziumEvent{
+		op:       op,
+		after:    after,
+		before:   before,
+		target:   target,
+		commitTS: time.UnixMilli(tsMs),
+		ingestTS: time.Now(),
+	}, nil
+}
+
+// Decode implements Decoder.
+func (d *DebeziumJSON) Decode(record *kgo.Record) ([]rowchange.Change, error) {
+	ev, err := d.parse(record)
+	if err != nil || ev == nil {
+		return nil, err
+	}
+
 	// Build key from the after image (create/update) or before image (delete).
-	keyImage := after
-	if op == rowchange.OpDelete {
-		keyImage = before
+	keyImage := ev.after
+	if ev.op == rowchange.OpDelete {
+		keyImage = ev.before
 	}
 
 	c := rowchange.Change{
-		Op:       op,
-		Table:    target,
-		After:    after,
-		Before:   before,
-		CommitTS: commitTS,
-		IngestTS: ingestTS,
+		Op:       ev.op,
+		Table:    ev.target,
+		After:    ev.after,
+		Before:   ev.before,
+		CommitTS: ev.commitTS,
+		IngestTS: ev.ingestTS,
 	}
 	if keyImage != nil {
 		c.Key = extractKey(keyImage)
 	}
 	return []rowchange.Change{c}, nil
+}
+
+// DecodeInto implements ColumnarDecoder: the decoded after image is written
+// straight into the target's Arrow builders, no rowchange.Change between.
+// Inserts and updates encode directly; a delete needs the map path's key
+// backfill and primary-key guard, so it returns ErrShapeDrift and the reader
+// re-encodes that record through the puller.
+func (d *DebeziumJSON) DecodeInto(record *kgo.Record, e Encoder, position string) (int, error) {
+	ev, err := d.parse(record)
+	if err != nil || ev == nil {
+		return 0, err
+	}
+	enc, mapped, err := e(ev.target)
+	if err != nil {
+		return 0, err
+	}
+	if !mapped {
+		return 0, nil
+	}
+	if enc == nil || ev.op == rowchange.OpDelete {
+		return 0, ErrShapeDrift
+	}
+	if err := appendImage(enc, ev.after); err != nil {
+		return 0, err
+	}
+	enc.EndRow(transport.RowMeta{
+		Op: ev.op, Position: position, CommitTS: ev.commitTS, IngestTS: ev.ingestTS,
+	})
+	return 1, nil
 }
 
 // ErrNotEnvelope marks a message that is not a Debezium envelope — an empty op,
