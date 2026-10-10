@@ -1,8 +1,6 @@
 package coordinator
 
 import (
-	"strings"
-
 	"github.com/maltzsama/urutau/position"
 )
 
@@ -39,20 +37,18 @@ func (c *Coordinator) workersOwing() map[string]bool {
 // snapshot gate, the re-slice pause buffer, or the staged accumulator.
 func (c *Coordinator) bufferedTables() []string {
 	seen := map[string]bool{}
-	c.gateMu.Lock()
-	for key, buf := range c.gateBuf {
-		if len(buf) > 0 {
-			if target, _, ok := strings.Cut(key, "#"); ok {
-				seen[target] = true
+	if c.gate != nil {
+		c.gate.Lock()
+		for _, target := range c.gate.BufferedTablesLocked() {
+			seen[target] = true
+		}
+		for table, acc := range c.accum {
+			if acc != nil && len(acc.batches) > 0 {
+				seen[table] = true
 			}
 		}
+		c.gate.Unlock()
 	}
-	for table, acc := range c.accum {
-		if acc != nil && len(acc.batches) > 0 {
-			seen[table] = true
-		}
-	}
-	c.gateMu.Unlock()
 	c.pausedMu.Lock()
 	for table, buf := range c.pauseBuf {
 		if len(buf) > 0 {

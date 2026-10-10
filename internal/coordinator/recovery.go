@@ -458,7 +458,5 @@ func (c *Coordinator) takeLostWindows(worker string) []chunkMarker {
 // worker's window: that window died, and the gate must hold the live batches
 // again until the redone chunk's ChunkReady.
 func (c *Coordinator) clearChunkReady(target string, partition int) {
-	c.gateMu.Lock()
-	delete(c.gateReady, gateKey(target, partition))
-	c.gateMu.Unlock()
+	c.gate.ClearReady(target, partition)
 }

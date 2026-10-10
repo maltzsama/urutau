@@ -14,8 +14,10 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
+	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/gate"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -59,6 +61,15 @@ func Run(ctx context.Context, s *spec.Spec, cfg Config) error {
 
 // ── Relay ────────────────────────────────────────────────────────────
 
+// relayGateMaxEvents and relayGateMaxBytes bound the relay's DBLog window,
+// the same structural backpressure the coordinator's gate has (#438, audit
+// #5): beyond it the relay blocks until the window's chunk is ready and
+// drains. The runner's gate is a single window, keyed by (target, 0).
+const (
+	relayGateMaxEvents = 1024
+	relayGateMaxBytes  = 64 << 20
+)
+
 // relay pumps reader events into the worker's ingest channel and releases
 // the DBLog chunk markers. Window tagging happens in the reader at decode
 // time; the marker's Release first drains the pump, so every event decoded
@@ -75,23 +86,62 @@ type relay struct {
 	// the runner can tell delivered (dispatched) from committed per table.
 	onDeliver func(table, pos string)
 
+	// gate is the shared DBLog window gate (design §3.1): while a chunk
+	// SELECT is in flight the table's live events are buffered and released
+	// InWindow-tagged only after AddWindowRows populates the worker window.
+	gate *gate.Gate[*dataplane.Batch]
+
 	gateMu       sync.Mutex
-	gateOn       bool
 	gateTgt      string
 	gateChk      uint32
-	gateBuf      []*dataplane.Batch
 	flushGate    bool
 	gateFlushReq chan chan struct{}
 }
 
+// relaySink delivers the relay's gate drains to the worker's ingest channel.
+type relaySink struct{ r *relay }
+
+func (s relaySink) Flush(ctx context.Context, _ gate.Window, windowID uint64, items []*dataplane.Batch) error {
+	return s.r.sendWindowed(ctx, uint32(windowID), items)
+}
+
+// Close releases the relay's window at seal. drainGate Flushes before it, so
+// the buffer is empty here; anything left is released defensively.
+func (s relaySink) Close(_ context.Context, _ gate.Window, items []*dataplane.Batch) error {
+	for _, b := range items {
+		b.Release()
+	}
+	return nil
+}
+
+func (s relaySink) Release(items []*dataplane.Batch) {
+	for _, b := range items {
+		b.Release()
+	}
+}
+
+// sendWindowed enqueues held batches InWindow-tagged for chunkID, in order.
+func (r *relay) sendWindowed(ctx context.Context, chunkID uint32, items []*dataplane.Batch) error {
+	for _, b := range items {
+		select {
+		case r.ingest <- worker.Ingest{Table: b.Table, Batch: b, Win: &rowchange.Window{WindowID: uint64(chunkID), InWindow: true}}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 func newRelay(ingest chan<- worker.Ingest, window *worker.Worker, onDeliver func(table, pos string)) *relay {
-	return &relay{
+	r := &relay{
 		ingest:       ingest,
 		window:       window,
 		onDeliver:    onDeliver,
 		flushReq:     make(chan chan struct{}, 1),
 		gateFlushReq: make(chan chan struct{}, 1),
 	}
+	r.gate = gate.New[*dataplane.Batch](relayGateMaxEvents, relayGateMaxBytes, dpint.BatchBytes, relaySink{r})
+	return r
 }
 
 func (r *relay) Release(ctx context.Context, table string, chunkID uint32, at position.Position) error {
@@ -124,17 +174,31 @@ func (r *relay) Release(ctx context.Context, table string, chunkID uint32, at po
 func (r *relay) AddWindowRows(target string, chunkID uint32, batch *dataplane.Batch) error {
 	// The batch is already Arrow (the chunk SELECT was encoded straight into
 	// builders, #584); the worker window takes ownership.
-	return r.window.AddWindowRows(target, uint64(chunkID), batch)
+	if err := r.window.AddWindowRows(target, uint64(chunkID), batch); err != nil {
+		return err
+	}
+	// The chunk's rows are in the window: a full gate may now drain early
+	// rather than block the relay, the coordinator's ChunkReady early drain.
+	r.gate.MarkReady(target, 0, uint64(chunkID))
+	return nil
 }
 
 // GateOn starts buffering the table's live events for a chunk SELECT in
 // flight. Called by the orchestrator before the SELECT.
 func (r *relay) GateOn(table string, chunkID uint32) {
+	// Open the window before publishing the chunk id: a batch the relay
+	// pulls concurrently is then held rather than routed untagged.
+	r.gate.Open(table, 0)
 	r.gateMu.Lock()
-	r.gateOn = true
 	r.gateTgt = table
 	r.gateChk = chunkID
 	r.gateMu.Unlock()
+}
+
+// holdGate buffers a live batch in the relay's open window, if any, blocking
+// while that bounded window is full. A drain failure surfaces to the relay.
+func (r *relay) holdGate(ctx context.Context, b *dataplane.Batch) (bool, error) {
+	return r.gate.Hold(ctx, b.Table, b)
 }
 
 // GateFlush releases the buffered events InWindow-tagged for the chunk. It
@@ -176,17 +240,6 @@ func (r *relay) deliverNote(b *dataplane.Batch) {
 	r.onDeliver(b.Table, reader.Position(reader.NumRows()-1))
 }
 
-// gate buffers an event when the gate is on for its table.
-func (r *relay) gate(b *dataplane.Batch) bool {
-	r.gateMu.Lock()
-	defer r.gateMu.Unlock()
-	if !r.gateOn || b.Table != r.gateTgt {
-		return false
-	}
-	r.gateBuf = append(r.gateBuf, b)
-	return true
-}
-
 // drainGate writes the pending gate buffer to ingest, InWindow-tagged, and
 // turns the gate off. Returns true if a flush was performed. The reader's own
 // window decision is preserved: an event it explicitly left untagged (at or
@@ -198,19 +251,18 @@ func (r *relay) drainGate(ctx context.Context) (bool, error) {
 		r.gateMu.Unlock()
 		return false, nil
 	}
-	buf := r.gateBuf
+	table := r.gateTgt
 	chunkID := r.gateChk
-	r.gateBuf = nil
-	r.gateOn = false
 	r.flushGate = false
 	r.gateMu.Unlock()
 
-	for _, b := range buf {
-		select {
-		case r.ingest <- worker.Ingest{Table: b.Table, Batch: b, Win: &rowchange.Window{WindowID: uint64(chunkID), InWindow: true}}:
-		case <-ctx.Done():
-			return true, ctx.Err()
-		}
+	// Flush tags the held events for the chunk; Close then seals the window
+	// (its buffer is empty here — the relay goroutine is the only producer).
+	if err := r.gate.Flush(ctx, table, 0, uint64(chunkID)); err != nil {
+		return true, err
+	}
+	if err := r.gate.Close(ctx, table, 0); err != nil {
+		return true, err
 	}
 	return true, nil
 }
@@ -300,7 +352,11 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 
 				return readErr // nil on a clean end of stream
 			}
-			if r.gate(b) {
+			held, err := r.holdGate(ctx, b)
+			if err != nil {
+				return err
+			}
+			if held {
 				continue
 			}
 			select {

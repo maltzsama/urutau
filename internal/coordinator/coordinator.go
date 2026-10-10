@@ -25,6 +25,7 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/gate"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
@@ -294,45 +295,23 @@ type Coordinator struct {
 	lastWindow map[string]*workerState
 
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight
-	// on the worker, live events of that table are held here instead of
-	// being shipped — a live event racing ahead of the chunk's rows would
-	// miss the window delete and duplicate the row. On ChunkReady the held
-	// events are released InWindow-tagged, then the Closes marker.
+	// on the worker, live events of that table are held in the shared
+	// internal/gate instead of being shipped — a live event racing ahead of
+	// the chunk's rows would miss the window delete and duplicate the row.
+	// On ChunkReady the held events are released InWindow-tagged, then the
+	// Closes marker.
 	//
-	// Keyed by gateKey(target, partition), not just target: a partitioned
-	// table's N workers each run their own independent DBLog pass over
-	// their own PK range concurrently, so N windows can be open on the
-	// same table at once — one worker's chunk boundary must never gate
-	// (or release) a live batch that belongs to a DIFFERENT partition of
-	// the same table. An unpartitioned table (the overwhelming common
-	// case) has exactly one key, gateKey(target, 0), and this collapses
-	// to the previous single-window-per-table behavior exactly.
-	gateMu  sync.Mutex
-	gateOn  map[string]bool
-	gateWin map[string]gateWindow // key -> target/partition, for gateHold's row->key routing
-	// gateBuf holds source batches (live changes) per open window. Raw
-	// pre-encode batches: released by flushWindow/closeWindow after they
-	// are queued.
-	gateBuf   map[string][]*dataplane.Batch
-	gateBytes map[string]int64 // gateBuf's size per window (gateMaxBytes)
-	// gateDrain wakes a pump blocked on a full gate when flushWindow/
-	// closeWindow drains it (audit #5: the gate was the only buffer without
-	// a structural bound). One shared channel: any drain (of any window)
-	// wakes every waiter, which re-checks its own window's state.
-	gateDrain chan struct{}
-	// gateReady is, per open window, the chunk whose ChunkReady arrived and
-	// whose catch-up is still under way: its rows are in the worker's
-	// window, so the gate's held batches may go out InWindow-tagged for it
-	// before the catch-up ends. A full gate then drains instead of blocking
-	// the pump — blocking it stalled the reader, and with it the very
-	// catch-up the window waited for.
-	gateReady map[string]uint64
-	// gateFlushMu serializes every drain of a gate, from taking its buffer
-	// to the last enqueue: the pump and the snapshot both drain, and the
-	// worker must receive the held batches in source order.
-	gateFlushMu sync.Mutex
+	// Keyed by (target, partition), not just target: a partitioned table's N
+	// workers each run their own independent DBLog pass over their own PK
+	// range concurrently, so N windows can be open on the same table at once
+	// — one worker's chunk boundary must never gate (or release) a live
+	// batch that belongs to a DIFFERENT partition of the same table. An
+	// unpartitioned table (the overwhelming common case) has exactly one
+	// key, (target, 0), and this collapses to the previous
+	// single-window-per-table behavior exactly.
+	gate *gate.Gate[*dataplane.Batch]
 	// accum holds each staged table's batches not sent yet (coalesce.go),
-	// guarded by gateMu; sent under gateFlushMu.
+	// guarded by the gate's lock; sent under the gate's flush lock.
 	accum map[string]*cycleAccum
 
 	// paused holds a table whose re-slice is draining. The flip waits for the
@@ -528,18 +507,15 @@ func Run(ctx context.Context, cfg Config) error {
 		ackNotify:   make(chan struct{}, 1),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
-		gateOn:      map[string]bool{},
-		gateWin:     map[string]gateWindow{},
-		gateBuf:     map[string][]*dataplane.Batch{},
 		paused:      map[string]chan struct{}{},
 		pauseBuf:    map[string][]*dataplane.Batch{},
 		pauseWake:   make(chan struct{}, 1),
-		gateDrain:   make(chan struct{}),
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},
 		booted:      make(chan struct{}),
 	}
+	c.gate = gate.New[*dataplane.Batch](gateMaxEvents, gateMaxBytes, batchBytes, batchSink{c})
 	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
 	c.budget.perWorkerMax = cfg.FlowPerWorkerMax
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)

@@ -102,10 +102,10 @@ func (c *Coordinator) accumulate(ctx context.Context, b *dataplane.Batch) (bool,
 	}
 	rows, bytes := b.Record.NumRows(), batchBytes(b)
 	for {
-		c.gateMu.Lock()
-		if key, held := c.openKeyForTableLocked(b.Table); held {
-			c.gateAppendLocked(key, b)
-			c.gateMu.Unlock()
+		c.gate.Lock()
+		if key, held := c.gate.OpenKeyLocked(b.Table); held {
+			c.gate.AppendLocked(key, b)
+			c.gate.Unlock()
 			return true, nil
 		}
 		if c.accum == nil {
@@ -120,10 +120,10 @@ func (c *Coordinator) accumulate(ctx context.Context, b *dataplane.Batch) (bool,
 			a.batches = append(a.batches, b)
 			a.rows += rows
 			a.bytes += bytes
-			c.gateMu.Unlock()
+			c.gate.Unlock()
 			return true, c.flushAccumIfDue(ctx, b.Table)
 		}
-		c.gateMu.Unlock()
+		c.gate.Unlock()
 		// The batch would take the cycle past a bound: send what is held
 		// first, so no cycle outgrows it, then take the batch.
 		if err := c.flushAccum(ctx, b.Table); err != nil {
@@ -146,9 +146,9 @@ func (c *Coordinator) accumDue(table string, a *cycleAccum) bool {
 }
 
 func (c *Coordinator) flushAccumIfDue(ctx context.Context, table string) error {
-	c.gateMu.Lock()
+	c.gate.Lock()
 	due := c.accumDue(table, c.accum[table])
-	c.gateMu.Unlock()
+	c.gate.Unlock()
 	if !due {
 		return nil
 	}
@@ -158,14 +158,14 @@ func (c *Coordinator) flushAccumIfDue(ctx context.Context, table string) error {
 // flushDueAccums sends every accumulator that is due; the pump calls it on
 // its tick.
 func (c *Coordinator) flushDueAccums(ctx context.Context) error {
-	c.gateMu.Lock()
+	c.gate.Lock()
 	var due []string
 	for table, a := range c.accum {
 		if c.accumDue(table, a) {
 			due = append(due, table)
 		}
 	}
-	c.gateMu.Unlock()
+	c.gate.Unlock()
 	for _, table := range due {
 		if err := c.flushAccum(ctx, table); err != nil {
 			return err
@@ -176,18 +176,20 @@ func (c *Coordinator) flushDueAccums(ctx context.Context) error {
 
 // flushAccum sends a table's accumulated batches as one cycle.
 func (c *Coordinator) flushAccum(ctx context.Context, table string) error {
-	c.gateFlushMu.Lock()
-	defer c.gateFlushMu.Unlock()
-	return c.sendAccumLocked(ctx, table)
+	var err error
+	c.gate.WithFlush(func() {
+		err = c.sendAccumLocked(ctx, table)
+	})
+	return err
 }
 
-// sendAccumLocked takes and sends a table's accumulator. Caller holds
-// gateFlushMu.
+// sendAccumLocked takes and sends a table's accumulator. Caller holds the
+// gate's flush lock.
 func (c *Coordinator) sendAccumLocked(ctx context.Context, table string) error {
-	c.gateMu.Lock()
+	c.gate.Lock()
 	a := c.accum[table]
 	delete(c.accum, table)
-	c.gateMu.Unlock()
+	c.gate.Unlock()
 	if a == nil || len(a.batches) == 0 {
 		return nil
 	}
@@ -199,18 +201,6 @@ func (c *Coordinator) sendAccumLocked(ctx context.Context, table string) error {
 		return fmt.Errorf("coordinator: %s: coalesce %d batches: %w", table, len(a.batches), err)
 	}
 	return c.enqueueBatch(ctx, merged, nil)
-}
-
-// openWindowFlushed opens a DBLog window after sending the table's
-// accumulated batches, which predate it: sent later, they would reach the
-// worker after the window's own events. The window opens first, under
-// gateFlushMu, so no new batch joins the accumulator in between and no gate
-// drain overtakes the send.
-func (c *Coordinator) openWindowFlushed(ctx context.Context, target string, partition int) error {
-	c.gateFlushMu.Lock()
-	defer c.gateFlushMu.Unlock()
-	c.openWindow(target, partition)
-	return c.sendAccumLocked(ctx, target)
 }
 
 // flushAccumBeforePause sends a table's accumulated batches when the table is
@@ -230,8 +220,8 @@ func (c *Coordinator) flushAccumBeforePause(ctx context.Context, table string) e
 // sends them any more, and the stream replays them from the committed
 // position.
 func (c *Coordinator) releaseAccums() {
-	c.gateMu.Lock()
-	defer c.gateMu.Unlock()
+	c.gate.Lock()
+	defer c.gate.Unlock()
 	for table, a := range c.accum {
 		for _, b := range a.batches {
 			b.Release()

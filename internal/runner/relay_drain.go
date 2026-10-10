@@ -55,26 +55,30 @@ func (r *relay) serviceDrain(ctx context.Context, req *drainRequest, drainer sou
 // draining them after the marker is harmless. A failed drain is returned so
 // the Closes marker is never emitted past it.
 func (r *relay) flushDecoded(ctx context.Context, drainer source.Drainer, drainReq chan *drainRequest, batchCh <-chan *dataplane.Batch) error {
-	drainBatchCh := func() bool {
+	drainBatchCh := func() (bool, error) {
 		drained := false
 		for {
 			select {
 			case b, ok := <-batchCh:
 				if !ok {
-					return drained
+					return drained, nil
 				}
-				if r.gate(b) {
+				held, err := r.holdGate(ctx, b)
+				if err != nil {
+					return drained, err
+				}
+				if held {
 					drained = true
 					continue
 				}
 				select {
 				case r.ingest <- worker.Ingest{Table: b.Table, Batch: b}:
 				case <-ctx.Done():
-					return drained
+					return drained, nil
 				}
 				drained = true
 			default:
-				return drained
+				return drained, nil
 			}
 		}
 	}
@@ -84,10 +88,12 @@ func (r *relay) flushDecoded(ctx context.Context, drainer source.Drainer, drainR
 	// scheduling opportunity between two passes, as the pre-#488 code did, so
 	// a batch already being pulled is not overtaken.
 	if drainer == nil {
-		drainBatchCh()
+		if _, err := drainBatchCh(); err != nil {
+			return err
+		}
 		runtime.Gosched()
-		drainBatchCh()
-		return nil
+		_, err := drainBatchCh()
+		return err
 	}
 	req := &drainRequest{accepted: make(chan struct{}), err: make(chan error, 1)}
 	// Drop a stale request left by a previous Release whose acceptance wait
@@ -119,12 +125,18 @@ func (r *relay) flushDecoded(ctx context.Context, drainer source.Drainer, drainR
 	// Accepted: drain batchCh interleaved with waiting for the flush to
 	// finish, so a full batchCh never blocks the puller's pushes.
 	for {
-		if drainBatchCh() {
+		drained, err := drainBatchCh()
+		if err != nil {
+			return err
+		}
+		if drained {
 			continue
 		}
 		select {
 		case err := <-req.err:
-			drainBatchCh()
+			if _, derr := drainBatchCh(); derr != nil {
+				return derr
+			}
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
