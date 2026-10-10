@@ -4,9 +4,8 @@ sidebar_position: 6
 
 # One orchestration for collapsed and distributed mode (design)
 
-Status: **accepted and implemented** (issue #404; part of the #397 restructure).
-Steps 1–4 (the shared core) are merged; step 5 (the Option A re-evaluation) is
-recorded below. This is a design record.
+Status: **accepted and implemented**. Steps 1–4 (the shared core) are merged;
+step 5 (the Option A re-evaluation) is recorded below. This is a design record.
 
 ## The problem
 
@@ -21,7 +20,7 @@ once the two modes diverge silently.
 | Concern | Collapsed runner | Distributed coordinator | Verdict |
 |---|---|---|---|
 | Incremental mode | yes (`runIncremental`) | rejected at boot | **intended** — a coordinator-mode incremental pass is future work; the boot error is explicit |
-| `tables[].bootstrap` (adopt / adopt-verify / `startAt: explicit`) | yes | silently ignored (#405) | **resolved** — shared `internal/resume` (step 3) |
+| `tables[].bootstrap` (adopt / adopt-verify / `startAt: explicit`) | yes | silently ignored | **resolved** — shared `internal/resume` (step 3) |
 | Resumable snapshot progress (`snapshot.ReadSnapshotProgress`/`Persist`) | yes | not read/written by the coordinator (staged cycles cover it) | **intended** — staged cycles are the distributed equivalent; document it |
 | Partitioning (`workers > 1`) | rejected (`rejectCollapsedPartitioning`) | yes | **intended** — collapsed mode is single-worker by construction; the boot error is explicit |
 | DBLog gate | one global gate (`relay`), unbounded buffer | keyed by `(target, partition)`, bounded (`gateDrain`) | **resolved** — one shared `internal/gate` (step 1) |
@@ -46,18 +45,18 @@ bootstrap and snapshot-progress twice.
 
 1. `internal/gate` — one gate implementation with the coordinator's semantics
    (keyed windows, bounded buffer). The runner's `relay` becomes a user with a
-   single key. **Done** (#736).
+   single key. **Done.**
 2. `internal/plan` — introspection → `{refs, wire, resolved, casts, bySource}`,
-   including enrich wildcard expansion (one algorithm, not two). **Done** (#738).
+   including enrich wildcard expansion (one algorithm, not two). **Done.**
 3. Resume + bootstrap resolution as one function returning `{start position,
-   tables to snapshot, tables to adopt}`. **Done** — `internal/resume` (#739).
+   tables to snapshot, tables to adopt}`. **Done** — `internal/resume`.
 4. The snapshot/adopt loop as one driver over a small interface
    (`OpenWindow`, `AddWindowRows`, `Release`, `Persist`). **Partially done.**
    `snapshot.SnapshotTable` already IS the shared per-chunk driver: the
    collapsed runner and the coordinator's rendezvous fan-out both run it. The
    still-duplicated *prelude* (progress read, resume-cursor decision, adopt /
    complete) is now shared too — `snapshot.Resumable`/`ReadProgress`/
-   `MarkComplete` (#741). The coordinator's **single-owner range loop** is not
+   `MarkComplete`. The coordinator's **single-owner range loop** is not
    fused into the driver: it is structurally inverted (N byte-capped windows
    per chunk with per-window proof/markers, asynchronous `WindowOpen`/
    `ChunkReady`, worker loss/redo, and a packed `partition<<20|index` durable
@@ -88,8 +87,8 @@ id/name/amount batch, ~252 KB record, on the author's 16-core machine):
 So Option A would add ~186 µs + ~966 KB of transient allocation per 2000-row
 batch (~93 ns/row) to the collapsed path, purely to move data between two
 objects living in the same process. That is the opposite of what a "collapsed"
-mode exists for. (The same evidence retired the zero-copy transport frontier
-in #455: Arrow Flight's wire format IS Arrow IPC, so there is no second copy to
+mode exists for. (The same evidence retired the zero-copy transport frontier:
+Arrow Flight's wire format IS Arrow IPC, so there is no second copy to
 remove.)
 
 The other reasons A is unattractive hold regardless of the benchmark:
