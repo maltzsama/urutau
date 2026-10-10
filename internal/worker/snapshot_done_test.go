@@ -2,19 +2,13 @@ package worker
 
 import (
 	"context"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow/flight"
-
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/transport"
-	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
-	"github.com/maltzsama/urutau/position"
 )
 
 // commitLog records each commit's row count, watermark and snapshot state.
@@ -123,35 +117,5 @@ func TestSnapshotDoneOnAStagedTableIsDeliveredAsItsCycle(t *testing.T) {
 	defer mu.Unlock()
 	if len(got) != 1 || got[0].seq != 43 || got[0].state != string(snapshot.StateComplete) || got[0].pos != "" {
 		t.Fatalf("staged deliveries %+v, want one under seq 43, state complete, no position", got)
-	}
-}
-
-// The receiver turns a snapshot-done marker into a SnapshotDone ingest,
-// carrying the marker's position and, on a staged table, its cycle. It is
-// never skipped as covered: it carries no high position.
-func TestReceiverRoutesTheSnapshotDoneMarker(t *testing.T) {
-	ingest := make(chan Ingest, 1)
-	recv := &batchReceiver{
-		ctx:       context.Background(),
-		ingest:    ingest,
-		committed: map[string]position.Position{"raw.orders": position.MustLSN("0/99")},
-		parsePos:  parsePosition("postgres"),
-		log:       slog.New(slog.DiscardHandler),
-	}
-	meta := &pb.BatchMeta{Table: "raw.orders", LowPos: "0/10", BatchId: 43, Staged: true, Window: &pb.WindowTag{SnapshotDone: true}}
-	body, metaBytes, err := transport.EncodeBatch(nil, testSchema(), meta, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := recv.apply(&flight.FlightData{DataBody: body, AppMetadata: metaBytes}); err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-	select {
-	case ing := <-ingest:
-		if !ing.SnapshotDone || ing.Position != "0/10" || ing.Seq != 43 || !ing.Staged || ing.Batch != nil {
-			t.Fatalf("ingest %+v, want the done marker at 0/10 as cycle 43", ing)
-		}
-	default:
-		t.Fatal("the done marker was not ingested")
 	}
 }

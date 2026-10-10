@@ -12,7 +12,6 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	dpint "github.com/maltzsama/urutau/internal/dataplane"
 	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
-	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -407,15 +406,6 @@ func TestFailedCommitDoesNotAck(t *testing.T) {
 	}
 	if acked {
 		t.Fatal("the ack fired without a successful commit")
-	}
-}
-
-// #265: dialOpts must return an error when TLS is enabled but the client
-// credentials are invalid, not silently dial plaintext.
-func TestDialOptsRejectsBadTLS(t *testing.T) {
-	_, err := dialOpts(grpctls.Config{CertFile: "/nonexistent", KeyFile: "/nonexistent", ClientCAFile: "/nonexistent"})
-	if err == nil {
-		t.Fatal("dialOpts must error on invalid TLS credentials, not fall back to plaintext")
 	}
 }
 

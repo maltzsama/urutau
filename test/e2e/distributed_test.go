@@ -19,7 +19,7 @@ import (
 	"github.com/maltzsama/urutau/internal/coordinator"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/worker"
+	remote "github.com/maltzsama/urutau/internal/worker/remote"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -158,7 +158,7 @@ func TestWorkerSuicide(t *testing.T) {
 	wErr := make(chan error, 1)
 	cErr := make(chan error, 1)
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second})
+		wErr <- remote.RunRemote(wCtx, remote.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second})
 	}()
 	go func() {
 		cErr <- coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true}, Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute})
@@ -226,7 +226,7 @@ func TestWorkerGracefulShutdown(t *testing.T) {
 	// buffer (not committed by a timer) when the shutdown signal arrives;
 	// the drain must commit it.
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 10000, MaxInterval: 30 * time.Second})
+		wErr <- remote.RunRemote(wCtx, remote.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 10000, MaxInterval: 30 * time.Second})
 	}()
 	go func() {
 		// AckTimeout generous: this test exercises the drain, not
@@ -285,7 +285,7 @@ func bootPipelineLogged(t *testing.T, ctx context.Context, addr string, s *spec.
 		wCtx, wStop := context.WithCancel(ctx)
 		wStops = append(wStops, wStop)
 		go func(name string) {
-			done <- worker.RunRemote(wCtx, worker.RemoteConfig{
+			done <- remote.RunRemote(wCtx, remote.RemoteConfig{
 				Coordinator: addr,
 				Name:        name,
 				Namespace:   "raw",
@@ -553,7 +553,7 @@ func TestCrashloopKillsJob(t *testing.T) {
 	cErr := make(chan error, 1)
 	wErr := make(chan error, 1)
 	go func() {
-		wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultAckGate: gate})
+		wErr <- remote.RunRemote(wCtx, remote.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultAckGate: gate})
 	}()
 	// Aggressive supervision: stale after 5s, only 2 resets allowed, 1m window.
 	go func() {
@@ -618,7 +618,7 @@ func TestObservabilityEndpoints(t *testing.T) {
 	defer wStop()
 	cCtx, cStop := context.WithCancel(ctx)
 	go func() {
-		_ = worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
+		_ = remote.RunRemote(wCtx, remote.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, MetricsAddr: workerMetricsAddr})
 	}()
 	go func() {
 		_ = coordinator.Run(cCtx, coordinator.Config{TLS: grpctls.Config{AllowInsecure: true}, Spec: s, ListenAddr: addr, ServerID: 1102, Heartbeat: 5 * time.Second, ChunkSize: 10, WindowTimeout: 2 * time.Minute, CaughtUpPoll: 300 * time.Millisecond, WaitWorker: 2 * time.Minute, MetricsAddr: metricsAddr, AckTimeout: 2 * time.Minute})
@@ -759,7 +759,7 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 		t.Cleanup(wStop)
 		wErr := make(chan error, 1)
 		go func() {
-			wErr <- worker.RunRemote(wCtx, worker.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultAckGate: gate})
+			wErr <- remote.RunRemote(wCtx, remote.RemoteConfig{Coordinator: addr, Name: w1, Namespace: "raw", Sink: workerSink(), MaxRows: 100, MaxInterval: time.Second, FaultAckGate: gate})
 		}()
 		return wErr
 	}
