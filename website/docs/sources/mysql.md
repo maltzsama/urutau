@@ -33,7 +33,7 @@ so a SELECT-only user and the same TLS/timezone settings reach it too.
   where it stopped.
 - A user with `REPLICATION SLAVE` and `REPLICATION CLIENT`.
 
-The runner **validates these at boot** ([#182](https://github.com/maltzsama/urutau/issues/182)):
+The runner **validates these at boot**:
 `log_bin`, `binlog_format`, `gtid_mode`, `enforce_gtid_consistency` and
 `binlog_row_image` are read in one query and a wrong value fails loud, before
 the replication connection opens. A `binlog_row_image` other than `FULL` fails
@@ -68,14 +68,13 @@ than skipping the gap.
   `ENUM`/`SET` are decoded to their member text.
 - **Temporal** — `DATETIME`/`TIMESTAMP`/`DATE` are normalized to the
   `timezone` above on both paths, so snapshot and CDC agree (see the
-  [temporal timezone](https://github.com/maltzsama/urutau/issues/139) fix).
+  temporal timezone fix).
 - **`commit_ts`** — the `commit_ts` metadata column is populated from the
   transaction's commit time (microsecond precision on MySQL 8.0.1+).
 - **Unsigned / unmappable columns** — `BIGINT UNSIGNED` and other types with
   no lossless canonical form are carried as `unknown`; declare a
-  [`cast`](../reference/pipeline-spec.md#tables) to land them. Before
-  [#180](https://github.com/maltzsama/urutau/issues/180) the introspection
-  path did not read a column's unsignedness, so an unsigned column was
+  [`cast`](../reference/pipeline-spec.md#tables) to land them. Previously
+  the introspection path did not read a column's unsignedness, so an unsigned column was
   declared `int64` and wrapped negative above 2^63 instead of asking for the
   cast; `BINARY(n)` similarly kept its declared length only on the CDC path.
   A cast to `uint64` lands as `decimal(20,0)` in Iceberg, which has no
@@ -97,7 +96,7 @@ than skipping the gap.
   `0.10000000149011612`. Use `DOUBLE` for the 8-byte value. Rounding the
   widened result back to the shortest representation would make the paths
   disagree with each other and with the stored bits, so the source does not
-  do it ([#181](https://github.com/maltzsama/urutau/issues/181)).
+  do it.
 
 ## Example
 

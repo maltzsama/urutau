@@ -52,7 +52,7 @@ Expected recovery:
   When the Pod reconnects, the batch is redelivered. In D3 it is already
   durable, so the worker skips and acks it. The run ends only if the worker
   delivers nothing of what it owes for the delivery timeout, or crashes three
-  times in a row without delivering it (issue #461).
+  times in a row without delivering it.
 - **D4 (coordinator dies).** Nothing is lost: the ack's commit is already
   durable. The restarted coordinator resumes from `cdc.position`, and workers
   skip what they had committed.
@@ -94,7 +94,7 @@ happens when the sink's `maintenance.orphanCleanup` is configured.
 The live stream runs while the snapshot copies tables one at a time, so the
 stream commits to a table, and gives it a `cdc.position`, before that table's
 snapshot has run. A position therefore does not prove the snapshot finished;
-`cdc.snapshot.state` does (issue #428):
+`cdc.snapshot.state` does:
 
 - at boot, before the stream starts, every table about to be snapshotted is
   marked `not_started`;
@@ -108,20 +108,19 @@ snapshot has run. A position therefore does not prove the snapshot finished;
 
 A snapshot records its progress before its first chunk: the chunk bounds,
 the partition ranges, and every chunk pending. The chunk is the scheduling
-unit (its bounds come from a keyset seek, #588), but the reader cuts each
+unit (its bounds come from a keyset seek), but the reader cuts each
 chunk into **byte-capped windows** on the worker: the window size is derived
 from the worker's memory limit, never a flag. Each window's Closes marker
 names the chunks still to do after it, and the worker commits them as
 `cdc.snapshot.pending`, state `in_progress`, in the same commit as the
 window's rows. A restarted coordinator resumes an `in_progress` table from
 there, with the recorded bounds, when the partition ranges are unchanged; it
-starts the table over otherwise, since chunk ids are relative to the ranges
-(issue #461).
+starts the table over otherwise, since chunk ids are relative to the ranges.
 
 A window's rows commit **no position**. Its Closes marker is sent at the
 reader's position, which can be past stream batches of the table still on
 their way through the pump; committed as the table's `cdc.position`, it would
-cover them, and a crash would skip them on replay (issue #468). Only the
+cover them, and a crash would skip them on replay. Only the
 stream advances a table's position. After a crash the stream replays from it
 over the window's rows, which converges: every event carries its row's full
 image. The worker acks a Closes marker by its batch id once the window's rows
@@ -142,7 +141,7 @@ window ids, every chunk whose Closes marker the worker had not committed, and
 it waits for its last windows to commit before it is done. A chunk the earlier
 generation committed **partially** is resumed from the last committed window's
 high key, so already-committed windows are not re-emitted (an append-only
-table would otherwise duplicate them; issue #646).
+table would otherwise duplicate them).
 
 | # | Step | Process | Durable after this step | Fault point |
 |---|------|---------|-------------------------|-------------|

@@ -9,8 +9,7 @@ Released 2026-09-17. [Full changelog](https://github.com/maltzsama/urutau/releas
 ## Iceberg table maintenance
 
 Background compaction, snapshot expiry, and orphan file cleanup for Iceberg
-tables — the [issue #96](https://github.com/maltzsama/urutau/issues/96)
-feature. Enabled per-table via `sink.maintenance` in the pipeline spec:
+tables. Enabled per-table via `sink.maintenance` in the pipeline spec:
 
 ```yaml
 sink:
@@ -49,8 +48,8 @@ the full reference, including safety windows and conflict handling.
 
 ## Coordinator dashboard
 
-An embedded monitoring UI served from the coordinator's HTTP server —
-[issue #97](https://github.com/maltzsama/urutau/issues/97). No CDN, no
+An embedded monitoring UI served from the coordinator's HTTP server.
+No CDN, no
 external dependencies: Alpine.js + Chart.js compiled into the binary.
 
 ```sh
@@ -86,7 +85,7 @@ This is transparent — no spec changes needed. Worker Prometheus endpoints
 ## Commit mode validation
 
 `sink.commitMode` is now **rejected** on non-Couchbase sinks at validation
-time ([#99](https://github.com/maltzsama/urutau/issues/99)). Previously,
+time. Previously,
 setting `commitMode: atomic` on an Iceberg or ClickHouse sink was silently
 ignored, which could mislead operators into thinking they had stronger
 atomicity guarantees than the sink provides.

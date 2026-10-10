@@ -61,8 +61,8 @@ every place the kustomize base hardcodes `urutau-system` — the webhook
 
 ## Worker autoscaling (KEDA)
 
-Set `operator.keda.prometheusAddress` to turn on KEDA worker autoscaling
-(issue #298). The operator then renders one KEDA `ScaledObject` per table that
+Set `operator.keda.prometheusAddress` to turn on KEDA worker autoscaling.
+The operator then renders one KEDA `ScaledObject` per table that
 sets `spec.workers.max`, driven by the coordinator's per-table backlog metric.
 
 Prerequisite: **KEDA** installed in the cluster, and a **Prometheus** that

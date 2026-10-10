@@ -115,7 +115,7 @@ enrich:
 → `{..., client_name: "Ana", customers.tier: "gold"}` — `name` renamed,
 `tier` keeps its prefix. `as` keys must be the **table-prefixed** column
 name (`customers.name`, not `name`) and must name a column in `select`.
-`spec.Validate()` and `enrich.New()` agree on this rule (fixed by #78);
+`spec.Validate()` and `enrich.New()` agree on this rule;
 the example above boots and runs as shown.
 
 `joinType` is required on every reference — there is no default miss

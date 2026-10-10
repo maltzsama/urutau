@@ -199,7 +199,7 @@ stalls owing work is reset and redelivered what it owed.
 
 Pausing one table does **not** stall the others. The pump buffers the paused
 table's batches instead of parking on them, and keeps routing every other
-table's batches through the shared reader channel (issue #343). The drain is
+table's batches through the shared reader channel. The drain is
 bounded either way, so the held backlog is too.
 
 The commit mode travels **per batch** (`BatchMeta.staged`), decided by the
@@ -208,7 +208,7 @@ makes a table that *becomes* partitioned under a running worker safe: the
 surviving owner, which attached when the table was unpartitioned, stages the
 batches the coordinator now marks staged instead of committing them directly —
 a direct commit would leave its staged cycle open and block every cycle
-behind it in the table's send order (issue #312).
+behind it in the table's send order.
 
 A table's `workers.max` caps how far it may scale **up**; it never blocks a
 scale-down. A table that sets it ignores the coordinator's default (32).
