@@ -554,48 +554,6 @@ func canonicalForTarget(canonical map[string]core.Schema, refs []core.TableRef, 
 	return core.Schema{}
 }
 
-// introspectAll resolves each spec table through the source, producing both
-// the RESOLVED shape (cast types + metadata columns, the sink's target) and
-// the WIRE shape (the source types the worker encodes). Cast warnings surface
-// here, once, from the resolver.
-func introspectAll(ctx context.Context, src source.Source, s *spec.Spec, logger *slog.Logger) (refs []core.TableRef, resolved, wire, sourceSchemas map[string]core.Schema, casts map[string]core.CastPolicy, err error) {
-	refs = make([]core.TableRef, 0, len(s.Tables))
-	resolved = make(map[string]core.Schema, len(s.Tables))
-	wire = make(map[string]core.Schema, len(s.Tables))
-	casts = make(map[string]core.CastPolicy, len(s.Tables))
-	sourceSchemas = make(map[string]core.Schema, len(s.Tables))
-	for _, t := range s.Tables {
-		ref, srcSchema, warns, ierr := src.Introspect(ctx, t)
-		if ierr != nil {
-			return nil, nil, nil, nil, nil, ierr
-		}
-		cast, cerr := core.ParseCastPolicy(t.Cast)
-		if cerr != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("runner: %s: %w", t.Source, cerr)
-		}
-		res, rwarns, rerr := core.ResolveSchema(srcSchema, cast, t.Metadata)
-		if rerr != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("runner: table %s: %w", t.Target, rerr)
-		}
-		for _, w := range warns {
-			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
-		}
-		for _, w := range rwarns {
-			logger.Warn("schema", "table", ref.Source, "warning", w.Message)
-		}
-		refs = append(refs, ref)
-		resolved[t.Source] = res
-		// Event columns are captured BEFORE the enrich extension: the
-		// reference destinations ride the wire, but they are not event
-		// columns — New validates the event side against the source view.
-		sourceSchemas[t.Source] = srcSchema
-		wire[t.Source] = enrich.AddRefColumns(core.WireSchema(srcSchema, res), t.Enrich)
-		resolved[t.Source] = enrich.AddRefColumns(res, t.Enrich)
-		casts[t.Source] = cast
-	}
-	return refs, resolved, wire, sourceSchemas, casts, nil
-}
-
 // ── Collapsed pipeline ──────────────────────────────────────────────
 
 // markSnapshotsPending marks each table about to be snapshotted not_started,

@@ -12,6 +12,7 @@ import (
 	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/maintenance"
+	"github.com/maltzsama/urutau/internal/plan"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -82,7 +83,6 @@ type setup struct {
 	refs            []core.TableRef
 	resolved        map[string]core.Schema
 	wire            map[string]core.Schema
-	sourceSchemas   map[string]core.Schema
 	casts           map[string]core.CastPolicy
 	specBySource    map[string]spec.Table
 	specByTarget    map[string]spec.Table
@@ -149,9 +149,6 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 	if err := b.introspectPlan(); err != nil {
 		return nil, err
 	}
-	if err := b.buildEnrichStages(); err != nil {
-		return nil, err
-	}
 	if err := b.openWriters(); err != nil {
 		return nil, err
 	}
@@ -185,9 +182,10 @@ func newRunner(ctx context.Context, s *spec.Spec, cfg Config, src source.Source,
 // no tables and the source enumerates them now. Writing the expanded list back
 // into s.Tables makes every later loop (rejectCollapsedPartitioning,
 // introspection, enrich, plan lookups) see the discovered set without
-// threading a second list through each.
+// threading a second list through each. The expansion itself is the shared
+// plan.ExpandTables, so both modes agree on discovery (#718 step 2).
 func (b *setup) expandTables() error {
-	tables, err := source.ExpandTables(b.ctx, b.src, b.s)
+	tables, err := plan.ExpandTables(b.ctx, b.src, b.s)
 	if err != nil {
 		return fmt.Errorf("runner: %w", err)
 	}
@@ -250,16 +248,26 @@ func (b *setup) openEventlog() error {
 // introspectPlan resolves source tables into the SOURCE schema (what the
 // worker encodes and the wire carries) and the RESOLVED schema (the sink's
 // target shape), splits the tables by sync mode, and indexes the spec tables
-// for plan parameters.
+// for plan parameters. The resolution itself is the shared plan.Introspect —
+// the same introspection, cast policy, schema resolution and enrich wildcard
+// expansion the coordinator runs (#718 step 2).
 func (b *setup) introspectPlan() error {
+	// The enrich stages this runner owns are built as plan resolves each table
+	// (resolveEnrichColumns), so a wildcard reference's real columns are known
+	// before sink DDL and the stage is warmed with the ONE reference query it
+	// has always run — no separate wildcard pass.
+	b.enrichStageByTarget = make(map[string]*enrich.Stage, len(b.s.Tables))
 	// Cast warnings surface here, once, from the resolver. The source schemas
 	// also feed the schema-drift check.
-	refs, resolved, wire, sourceSchemas, casts, err := introspectAll(b.ctx, b.src, b.s, b.log)
+	p, err := plan.Introspect(b.ctx, b.src, b.s.Tables, plan.Options{
+		Logger:  b.log,
+		Resolve: b.resolveEnrichColumns,
+	})
 	if err != nil {
 		return err
 	}
-	b.refs, b.resolved, b.wire = refs, resolved, wire
-	b.sourceSchemas, b.casts = sourceSchemas, casts
+	b.refs, b.resolved, b.wire = p.Refs, p.Resolved, p.Wire
+	b.casts = p.Casts
 
 	// Lookup spec tables by source and target for plan parameters.
 	b.specBySource = make(map[string]spec.Table, len(b.s.Tables))
@@ -273,7 +281,7 @@ func (b *setup) introspectPlan() error {
 	// publication or CDC resume — they run a cursor pass below. Everything
 	// else stays on the CDC path.
 	b.incrRefByTarget = map[string]core.TableRef{}
-	for _, ref := range refs {
+	for _, ref := range p.Refs {
 		if b.specBySource[ref.Source].Mode == spec.ModeIncremental {
 			b.incrRefs = append(b.incrRefs, ref)
 			b.incrRefByTarget[ref.Target] = ref
@@ -284,32 +292,29 @@ func (b *setup) introspectPlan() error {
 	return nil
 }
 
-// buildEnrichStages builds each table's refresh stage and, for any wildcard
-// reference, loads it SYNCHRONOUSLY here — BEFORE EnsureTable — so a wildcard
-// select's real destination columns are known in time to correct resolved/wire
-// before the sink table is created (#56). Every stage is registered for
+// resolveEnrichColumns is the runner's plan.Resolver: it builds each table's
+// long-lived join stage and resolves the reference destination columns through
+// it — the explicit selects plus, for a wildcard select, the real names
+// LoadWildcards runs the query to discover (#56). Doing both here keeps ONE
+// reference query and warms the stage synchronously, exactly as before; plan
+// owns the schema extension and applies the returned destination names to the
+// wire and resolved shapes before EnsureTable. Every stage is registered for
 // release the moment it exists, so a later failure stops it.
-func (b *setup) buildEnrichStages() error {
-	b.enrichStageByTarget = make(map[string]*enrich.Stage, len(b.s.Tables))
-	for _, t := range b.s.Tables {
-		if len(t.Enrich) == 0 {
-			continue
-		}
-		st, serr := enrich.New(t.Enrich, b.sourceSchemas[t.Source], b.log)
-		if serr != nil {
-			return fmt.Errorf("runner: %s: %w", t.Target, serr)
-		}
-		b.st.add(st.Stop)
-		if serr := st.LoadWildcards(b.ctx); serr != nil {
-			return fmt.Errorf("runner: %s: enrich: %w", t.Target, serr)
-		}
-		dests := st.RefColumns()
-		b.wire[t.Source] = enrich.AddColumns(b.wire[t.Source], dests)
-		b.resolved[t.Source] = enrich.AddColumns(b.resolved[t.Source], dests)
-		b.enrichStageByTarget[t.Target] = st
-		b.enrichStages = append(b.enrichStages, st)
+func (b *setup) resolveEnrichColumns(_ context.Context, t spec.Table, sourceSchema core.Schema) ([]string, error) {
+	if len(t.Enrich) == 0 {
+		return nil, nil
 	}
-	return nil
+	st, serr := enrich.New(t.Enrich, sourceSchema, b.log)
+	if serr != nil {
+		return nil, fmt.Errorf("runner: %s: %w", t.Target, serr)
+	}
+	b.st.add(st.Stop)
+	if serr := st.LoadWildcards(b.ctx); serr != nil {
+		return nil, fmt.Errorf("runner: %s: enrich: %w", t.Target, serr)
+	}
+	b.enrichStageByTarget[t.Target] = st
+	b.enrichStages = append(b.enrichStages, st)
+	return st.RefColumns(), nil
 }
 
 // openWriters ensures every target table exists through the sink and opens its
