@@ -76,6 +76,7 @@ func init() {
 
 var _ source.Source = Source{}
 var _ source.QuerySource = Source{}
+var _ source.BatchIncrementalSource = Source{}
 
 // Introspect resolves one spec table into its ref and canonical schema.
 func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, core.Schema, []core.Warning, error) {
@@ -128,53 +129,9 @@ const incrementalPageSize = 1000
 const incrementalPosSep = "\x00"
 
 func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, after string) (string, []map[string]any, bool, error) {
-	if a.db == nil {
-		return "", nil, false, fmt.Errorf("postgres: incremental requires a query connection")
-	}
-	schema, table, ok := strings.Cut(t.Source, ".")
-	if !ok {
-		return "", nil, false, fmt.Errorf("postgres: incremental: source %q must be schema.table", t.Source)
-	}
-	st, err := QueryTable(ctx, a.db, schema, table)
-	if err != nil {
-		return "", nil, false, fmt.Errorf("postgres: incremental: introspect %s: %w", t.Source, err)
-	}
-	ci := st.FindColumn(cursor)
-	if ci < 0 {
-		return "", nil, false, fmt.Errorf("postgres: incremental: cursor column %q not found in %s", cursor, t.Source)
-	}
-	if !st.Columns[ci].NotNull {
-		return "", nil, false, fmt.Errorf("postgres: incremental: cursor column %q is nullable — NULL cursors are excluded from the predicate", cursor)
-	}
-
-	specTable, _ := a.tableFor(t.Source)
-	// The cursor must be read to checkpoint it: a projection that omits it
-	// would leave the cursor empty and break the next resume.
-	if len(specTable.ColumnFilter) > 0 && !slices.Contains(specTable.ColumnFilter, cursor) {
-		return "", nil, false, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
-	}
-	q := psql.Select("*").From(quotePgIdent(schema) + "." + quotePgIdent(table))
-	if len(specTable.ColumnFilter) > 0 {
-		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quotePgIdent(schema) + "." + quotePgIdent(table))
-	}
-
-	afterCursor, afterPK := decodeIncrementalPos(after)
-	q, err = incrementalResume(q, st, t.Source, cursor, afterCursor, afterPK, t.PrimaryKey)
+	query, args, err := a.incrementalQuery(ctx, t, cursor, after)
 	if err != nil {
 		return "", nil, false, err
-	}
-	if specTable.Filter != nil {
-		f, err := filterToSquirrel(specTable.Filter)
-		if err != nil {
-			return "", nil, false, fmt.Errorf("postgres: incremental: %s: %w", t.Source, err)
-		}
-		q = q.Where(f)
-	}
-	order := append([]string{quotePgIdent(cursor)}, quotedIdents(t.PrimaryKey)...)
-	q = q.OrderBy(order...).Limit(incrementalPageSize + 1)
-	query, args, err := q.ToSql()
-	if err != nil {
-		return "", nil, false, fmt.Errorf("postgres: incremental sql: %w", err)
 	}
 
 	rows, err := a.db.QueryContext(ctx, query, args...)
@@ -222,6 +179,62 @@ func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, afte
 		next = encodeIncrementalPos(nextCursor, pk)
 	}
 	return next, page, more, nil
+}
+
+// incrementalQuery builds the page SELECT both Incremental and IncrementalBatch
+// run: the projection, the cursor resume predicate, the spec filter, and the
+// ORDER BY (cursor, pk) LIMIT pageSize+1. Sharing it keeps the two paths'
+// cursor and tie-break semantics from drifting (#733).
+func (a Source) incrementalQuery(ctx context.Context, t source.TableRef, cursor, after string) (string, []any, error) {
+	if a.db == nil {
+		return "", nil, fmt.Errorf("postgres: incremental requires a query connection")
+	}
+	schema, table, ok := strings.Cut(t.Source, ".")
+	if !ok {
+		return "", nil, fmt.Errorf("postgres: incremental: source %q must be schema.table", t.Source)
+	}
+	st, err := QueryTable(ctx, a.db, schema, table)
+	if err != nil {
+		return "", nil, fmt.Errorf("postgres: incremental: introspect %s: %w", t.Source, err)
+	}
+	ci := st.FindColumn(cursor)
+	if ci < 0 {
+		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q not found in %s", cursor, t.Source)
+	}
+	if !st.Columns[ci].NotNull {
+		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q is nullable — NULL cursors are excluded from the predicate", cursor)
+	}
+
+	specTable, _ := a.tableFor(t.Source)
+	// The cursor must be read to checkpoint it: a projection that omits it
+	// would leave the cursor empty and break the next resume.
+	if len(specTable.ColumnFilter) > 0 && !slices.Contains(specTable.ColumnFilter, cursor) {
+		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
+	}
+	q := psql.Select("*").From(quotePgIdent(schema) + "." + quotePgIdent(table))
+	if len(specTable.ColumnFilter) > 0 {
+		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quotePgIdent(schema) + "." + quotePgIdent(table))
+	}
+
+	afterCursor, afterPK := decodeIncrementalPos(after)
+	q, err = incrementalResume(q, st, t.Source, cursor, afterCursor, afterPK, t.PrimaryKey)
+	if err != nil {
+		return "", nil, err
+	}
+	if specTable.Filter != nil {
+		f, err := filterToSquirrel(specTable.Filter)
+		if err != nil {
+			return "", nil, fmt.Errorf("postgres: incremental: %s: %w", t.Source, err)
+		}
+		q = q.Where(f)
+	}
+	order := append([]string{quotePgIdent(cursor)}, quotedIdents(t.PrimaryKey)...)
+	q = q.OrderBy(order...).Limit(incrementalPageSize + 1)
+	query, args, err := q.ToSql()
+	if err != nil {
+		return "", nil, fmt.Errorf("postgres: incremental sql: %w", err)
+	}
+	return query, args, nil
 }
 
 // incrementalResume applies the resume predicate to an incremental page

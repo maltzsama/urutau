@@ -257,8 +257,34 @@ type Discoverer interface {
 // The caller loops pages until more is false, then repeats on its interval.
 // The cursor travels as a string; the source coerces it against the cursor
 // column's type. The rows are the source's public row universe; the engine
-// encodes them at the boundary. (A columnar incremental pass would need a
-// public encoder type in this contract; tracked follow-up to #455.)
+// encodes them at the boundary. A source that can encode the page itself also
+// implements BatchIncrementalSource (#733), which the engine prefers.
 type IncrementalSource interface {
 	Incremental(ctx context.Context, t TableRef, cursor string, after string) (next string, rows []map[string]any, more bool, err error)
+}
+
+// BatchIncrementalSource is the optional COLUMNAR sibling of IncrementalSource
+// (#733). It runs the same cursor-bounded page read but encodes the page
+// straight into a wire-schema Arrow batch, so no per-row map[string]any exists
+// between the driver and the data plane.
+//
+// schema is the target table's canonical WIRE schema — the same shape the
+// engine installs on the worker (SetKnownSchema) and would encode the map path
+// against — so the returned batch is byte-for-byte what RecordFromChanges
+// would have produced from Incremental's rows. Without it the source would have
+// to infer a schema, which drifts from the engine's (order, types, enrichment
+// columns); the interface deliberately carries it so the two paths cannot
+// diverge.
+//
+// The cursor/tie-break semantics are identical to IncrementalSource: next is
+// the cursor to resume from, more reports whether another page is already
+// available, and the returned batch's Watermark is []byte(next). A source may
+// implement this and/or IncrementalSource; the engine prefers this one when
+// present, because it skips the row maps entirely, and falls back to
+// IncrementalSource otherwise.
+//
+// A source that returns an empty page returns (next, nil, false, nil); the
+// engine treats a nil batch as the end of the drain.
+type BatchIncrementalSource interface {
+	IncrementalBatch(ctx context.Context, t TableRef, cursor string, after string, schema core.Schema) (next string, batch *dataplane.Batch, more bool, err error)
 }
