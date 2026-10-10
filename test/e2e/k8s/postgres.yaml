@@ -1,0 +1,91 @@
+# PostgreSQL 17 with logical decoding: the source the commit-boundary matrix
+# reads from — the in-cluster twin of the compose `postgres` service. Same
+# image (postgres:17-alpine), same wal_level=logical, slot/sender limits and
+# wal_sender_timeout=5s, same user repl/replpass and db shop. The source
+# reader itself creates the logical replication slot and the publication (see
+# internal/source/postgres EnsureSetup), so neither is created here.
+#
+# The init SQL (the shop schema and seed) comes from ../postgres/init/01-init.sql
+# via configMapGenerator, exactly as mysql-init reuses ../mysql/init/init.sql:
+# the compose and the cluster stay in lockstep.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          # The image's entrypoint prepends `postgres` to a leading `-c`, so
+          # this is `postgres -c wal_level=logical ...` exactly as the compose
+          # command. wal_sender_timeout=5s tightens the keepalive cadence so
+          # the idle-source caught-up proof closes fast.
+          args:
+            - -c
+            - wal_level=logical
+            - -c
+            - max_replication_slots=20
+            - -c
+            - max_wal_senders=5
+            - -c
+            - wal_sender_timeout=5s
+          env:
+            - name: POSTGRES_USER
+              value: repl
+            - name: POSTGRES_PASSWORD
+              value: replpass
+            - name: POSTGRES_DB
+              value: shop
+          ports:
+            - name: pg
+              containerPort: 5432
+          volumeMounts:
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # pg_isready answers only once initdb, the init SQL and the final
+          # server are all up: Accepting connections is the readiness gate.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U repl -d shop"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: 5432

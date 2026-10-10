@@ -28,6 +28,15 @@ func TestBoundarySetCoversEveryFaultPoint(t *testing.T) {
 	for _, bc := range couchbaseFastBoundaries {
 		covered[bc.point] = true
 	}
+	// The PostgreSQL-source boundaries (direct and staged, on PostgreSQL →
+	// Iceberg) are exercised by TestCommitBoundaryPostgresSource, not the
+	// randomized Iceberg matrix.
+	for _, bc := range postgresDirectBoundaries {
+		covered[bc.point] = true
+	}
+	for _, bc := range postgresStagedBoundaries {
+		covered[bc.point] = true
+	}
 	for _, p := range faultinject.Points {
 		if !covered[p] {
 			t.Errorf("fault point %s has no end-to-end case in the boundary set", p)

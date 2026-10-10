@@ -62,6 +62,11 @@ say "fresh in-cluster data services (namespace e2e)"
 # The same for Couchbase: name its Deployment explicitly, and require the
 # bucket-init Job above to have completed.
 "$KUBECTL" -n e2e wait --for=condition=Available --timeout=300s deployment/couchbase
+# PostgreSQL is the logical-replication source the commit-boundary matrix
+# reads from. Its readiness probe is pg_isready, so Available means initdb,
+# the init SQL and the final server are all up and accepting connections. A
+# missing Service must fail the Postgres setup, never silently skip.
+"$KUBECTL" -n e2e wait --for=condition=Available --timeout=300s deployment/postgres
 
 say "operator ($RACE_IMAGE)"
 "$KUBECTL" apply -k test/e2e/pods/k8s/operator
