@@ -29,16 +29,6 @@ import (
 // A table with a position and no state predates this marking and keeps the
 // old reading: its snapshot is taken as done.
 
-// snapshotInterrupted reports whether a table with a committed position was
-// left mid-snapshot by an earlier run.
-func (c *Coordinator) snapshotInterrupted(ctx context.Context, ref core.TableRef) (bool, error) {
-	props, err := c.snk.Properties(ctx, ref)
-	if err != nil {
-		return false, fmt.Errorf("coordinator: %s: snapshot state: %w", ref.Target, err)
-	}
-	return snapshot.Unfinished(props), nil
-}
-
 // markSnapshotsPending records, before the stream can commit anything, that
 // each table's snapshot has not finished. A table already marked unfinished
 // keeps its state (a collapsed run's in_progress carries resumable bounds).
