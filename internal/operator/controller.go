@@ -488,6 +488,14 @@ func coordinatorService(cr *urutauv1alpha1.CDCPipeline) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "None",
 			Selector:  labels,
+			// The workers dial <coordinator>.<ns>:50051 before the coordinator
+			// is Ready (it only becomes Ready once the stream is up, which
+			// needs the workers). A headless Service publishes an endpoint —
+			// and DNS — only for Ready pods, so without this the coordinator's
+			// readiness probe would deadlock boot: not Ready → no endpoint →
+			// no worker → not Ready. Publish the not-ready address so the
+			// StatefulSet can bootstrap (issue #601 follow-up).
+			PublishNotReadyAddresses: true,
 			Ports: []corev1.ServicePort{{
 				Name: "grpc",
 				Port: 50051,
