@@ -14,6 +14,13 @@ func TestBoundarySetCoversEveryFaultPoint(t *testing.T) {
 	for _, d := range boundarySet() {
 		covered[d.bc.point] = true
 	}
+	// The ClickHouse boundaries are exercised by TestCommitBoundaryClickHouse
+	// (a MySQL→ClickHouse pipeline), not the randomized Iceberg matrix — the
+	// randomized runner is Trino/Iceberg-shaped — so fold them in here: every
+	// fault point must still have an end-to-end case.
+	for _, bc := range clickhouseBoundaries {
+		covered[bc.point] = true
+	}
 	for _, p := range faultinject.Points {
 		if !covered[p] {
 			t.Errorf("fault point %s has no end-to-end case in the boundary set", p)

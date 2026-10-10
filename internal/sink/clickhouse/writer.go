@@ -9,6 +9,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/sink/rowmeta"
 	"github.com/maltzsama/urutau/internal/snapshot"
@@ -34,6 +35,7 @@ type tableWriter struct {
 	conn        ch.Conn
 	ident       tableIdent
 	quoted      string
+	target      string // unquoted qualified target, e.g. "raw.orders"
 	pk          []string
 	cast        core.CastPolicy
 	metaByName  map[string]core.MetadataColumn
@@ -109,6 +111,7 @@ func openTableWriter(ctx context.Context, conn ch.Conn, ident tableIdent, ref co
 		conn:        conn,
 		ident:       ident,
 		quoted:      ident.quoted(),
+		target:      ref.Target,
 		pk:          ref.PrimaryKey,
 		cast:        cast,
 		metaByName:  metaByName,
@@ -212,6 +215,15 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	// by owner keeps the latest seq per partition. A batch with no position
 	// (a state-only commit) leaves it as it is.
 	if w.owner != "" && batchPos != "" {
+		// ClickHouse's only commit window: the data rows (each carrying the
+		// position) are durable, the per-partition control row is not. The
+		// fault point is armed by the commit-boundary matrix; in every other
+		// build it is empty. A crash here must replay, never lose: on restart
+		// Position() finds no control entry for the owner and folds the data
+		// rows' own position back in (see the ClickHouse section of
+		// website/docs/architecture/commit-boundaries.md).
+		faultinject.At(faultinject.WorkerClickHouseDataBeforePosition,
+			"table", w.target, "seq", b.Seq, "position", batchPos)
 		if err := w.conn.Exec(ctx,
 			"INSERT INTO "+w.posQuoted+" (owner, position, seq) VALUES (?, ?, ?)",
 			w.owner, batchPos, seq); err != nil {

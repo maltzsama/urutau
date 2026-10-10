@@ -152,6 +152,8 @@ travels in the data rows, so one `INSERT` carries both and a crash is atomic.
 A partitioned table (`workers: N`) commits the data and its per-owner
 position in two separate statements; a crash between them leaves the rows
 durable with the position un-advanced, and the restart replays the batch.
+This window is the `worker.clickhouse-data-before-position` boundary of the
+crash-recovery matrix ([Commit boundaries and crash windows](../architecture/commit-boundaries.md)).
 Upsert collapses the replay onto the same row (`ReplacingMergeTree(seq)`);
 append has no key to collapse on, so the rows land a second time. That is the
 at-least-once contract ([Delivery guarantees](guarantees.md): duplicates are possible, loss is not)
