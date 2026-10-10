@@ -51,9 +51,10 @@ func (w *snapshotWatch) stop() error {
 }
 
 // runSnapshot runs the boot snapshot (or adopt, which reads nothing) for one
-// table. On failure it tears the pipeline resources down and returns the
-// error; every wait inside it — the chunk scan, GateFlush, Release — observes
-// ctx, which newSnapshotWatch cancels if the worker or relay dies.
+// table. On failure it returns the error and lets the caller's cleanup path
+// release the pipeline resources; every wait inside it — the chunk scan,
+// GateFlush, Release — observes ctx, which newSnapshotWatch cancels if the
+// worker or relay dies.
 func (r *Runner) runSnapshot(
 	ctx context.Context,
 	ref core.TableRef,
@@ -65,15 +66,8 @@ func (r *Runner) runSnapshot(
 	w *worker.Worker,
 	cfg Config,
 	heldRows map[string]bool,
-	closeQuery, closeStages func(),
 	log *slog.Logger,
 ) error {
-	cleanup := func() {
-		rdr.Close()
-		closeQuery()
-		closeStages()
-	}
-
 	switch bootstrapMode {
 	case spec.Adopt, spec.AdoptVerify:
 		// Adopt: mark snapshot complete without reading data.
@@ -86,11 +80,9 @@ func (r *Runner) runSnapshot(
 			State: snapshot.StateComplete,
 		})
 		if err != nil {
-			cleanup()
 			return fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
 		}
 		if err := snk.SetProperties(ctx, ref, props); err != nil {
-			cleanup()
 			return fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
 		}
 		w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
@@ -104,13 +96,11 @@ func (r *Runner) runSnapshot(
 		r.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source, "target": ref.Target})
 		chunker, err := qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), cfg.ChunkSize)
 		if err != nil {
-			cleanup()
 			return err
 		}
 		// Read existing snapshot progress for resumable backfill.
 		progress, err := readSnapshotProgress(ctx, snk, ref)
 		if err != nil {
-			cleanup()
 			return fmt.Errorf("runner: snapshot progress %s: %w", ref.Target, err)
 		}
 		if progress.State == snapshot.StateInProgress {
@@ -143,7 +133,6 @@ func (r *Runner) runSnapshot(
 		}, func(table string, completedChunkID uint32, remaining []uint32) {
 			w.SetSnapshotState(ref.Target, string(snapshot.StateInProgress), remaining)
 		}); err != nil {
-			cleanup()
 			return fmt.Errorf("runner: snapshot %s: %w", ref.Source, err)
 		}
 		// Snapshot complete: mark on the worker.
