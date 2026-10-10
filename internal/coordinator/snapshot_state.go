@@ -91,8 +91,7 @@ func (c *Coordinator) sentState(table string) (pos string, w *workerState) {
 func (c *Coordinator) finishSnapshot(ctx context.Context, ref source.TableRef) error {
 	pos, w := c.sentState(ref.Target)
 	if pos == "" || w == nil {
-		props := map[string]string{snapshot.PropSnapshotState: string(snapshot.StateComplete)}
-		if err := c.snk.SetProperties(ctx, core.TableRef{Source: ref.Source, Target: ref.Target}, props); err != nil {
+		if err := snapshot.MarkComplete(ctx, c.snk, ref); err != nil {
 			return fmt.Errorf("coordinator: %s: mark snapshot complete: %w", ref.Target, err)
 		}
 		return nil
@@ -139,7 +138,7 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 			return nil, nil, fmt.Errorf("coordinator: %s: snapshot progress: %w", ref.Target, err)
 		}
 		sp, perr := snapshot.ReadSnapshotProgress(props)
-		if perr == nil && sp.State == snapshot.StateInProgress && len(sp.Bounds) > 0 && props[propSnapshotPartitions] == layout {
+		if perr == nil && snapshot.Resumable(sp) && props[propSnapshotPartitions] == layout {
 			all := snapshot.Chunks(sp.Bounds)
 			todo := map[uint32]bool{}
 			for _, id := range sp.Pending {
