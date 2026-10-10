@@ -17,6 +17,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/gate"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -57,9 +58,9 @@ func coordHarness() (*Coordinator, *workerState) {
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},
 		runID:       "run-1",
-		gateDrain:   make(chan struct{}),
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
 	}
+	c.gate = gate.New[*dataplane.Batch](gateMaxEvents, gateMaxBytes, batchBytes, batchSink{c})
 	c.supervisor = newSupervisor(c)
 	c.publishRouting(&routing{
 		owners: map[string][]*workerState{"raw.orders": {w}},
@@ -89,8 +90,8 @@ func testWireRecord(t *testing.T) *dataplane.Batch {
 // ── pure helpers ─────────────────────────────────────────────────────
 
 func TestGateKey(t *testing.T) {
-	if got := gateKey("raw.orders", 3); got != "raw.orders#3" {
-		t.Fatalf("gateKey = %q", got)
+	if got := (gate.Window{Target: "raw.orders", Partition: 3}).Key(); got != "raw.orders#3" {
+		t.Fatalf("gate key = %q", got)
 	}
 }
 
@@ -423,8 +424,8 @@ func TestGateWindowLifecycle(t *testing.T) {
 	if !c.gateHold(ctx, b) {
 		t.Fatal("an open window must gate")
 	}
-	if len(c.gateBuf["raw.orders#0"]) != 1 {
-		t.Fatalf("gate buffer = %d, want 1", len(c.gateBuf["raw.orders#0"]))
+	if c.gate.Len("raw.orders", 0) != 1 {
+		t.Fatalf("gate buffer = %d, want 1", c.gate.Len("raw.orders", 0))
 	}
 
 	// A second window on another table does not affect this one.
@@ -436,7 +437,7 @@ func TestGateWindowLifecycle(t *testing.T) {
 	if err := c.closeWindow(ctx, "raw.orders", 0); err != nil {
 		t.Fatalf("closeWindow: %v", err)
 	}
-	if _, ok := c.gateOn["raw.orders#0"]; ok {
+	if c.gate.IsOpen("raw.orders", 0) {
 		t.Fatal("closeWindow must delete the window")
 	}
 	if len(w.queue) != 1 {
@@ -453,11 +454,11 @@ func TestFlushWindowDrainsAndKeepsOpen(t *testing.T) {
 	if err := c.flushWindow(ctx, "raw.orders", 0, 7); err != nil {
 		t.Fatalf("flushWindow: %v", err)
 	}
-	if !c.gateOn["raw.orders#0"] {
+	if !c.gate.IsOpen("raw.orders", 0) {
 		t.Fatal("flushWindow must keep the window open")
 	}
-	if len(c.gateBuf["raw.orders#0"]) != 0 {
-		t.Fatalf("gate buffer = %d, want drained", len(c.gateBuf["raw.orders#0"]))
+	if c.gate.Len("raw.orders", 0) != 0 {
+		t.Fatalf("gate buffer = %d, want drained", c.gate.Len("raw.orders", 0))
 	}
 	if len(w.queue) != 1 {
 		t.Fatalf("queue = %d, want 1", len(w.queue))
@@ -467,7 +468,13 @@ func TestFlushWindowDrainsAndKeepsOpen(t *testing.T) {
 func TestGateHoldContextCancelReturnsLive(t *testing.T) {
 	c, _ := coordHarness()
 	c.openWindow("raw.orders", 0)
-	c.gateBuf["raw.orders#0"] = make([]*dataplane.Batch, gateMaxEvents)
+	c.gate.Lock()
+	if key, ok := c.gate.OpenKeyLocked("raw.orders"); ok {
+		for i := 0; i < gateMaxEvents; i++ {
+			c.gate.AppendLocked(key, nil)
+		}
+	}
+	c.gate.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if c.gateHold(ctx, &dataplane.Batch{Table: "raw.orders"}) {
@@ -514,11 +521,8 @@ func TestReleaseAllGatesDrainsHeldBatches(t *testing.T) {
 
 	c.releaseAllGates()
 
-	c.gateMu.Lock()
-	open := len(c.gateOn)
-	c.gateMu.Unlock()
-	if open != 0 {
-		t.Fatalf("releaseAllGates left %d open gate(s)", open)
+	if c.gate.IsOpen("raw.orders", 0) {
+		t.Fatal("releaseAllGates left an open gate")
 	}
 	if c.gateHold(ctx, &dataplane.Batch{Table: "raw.orders"}) {
 		t.Fatal("a cleared gate must not hold")

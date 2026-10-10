@@ -596,8 +596,9 @@ func TestCollapsedRejectsPartitionedTable(t *testing.T) {
 // it moved here from runner.go, whose production build has no caller for it.
 func (r *relay) gatedCount() int {
 	r.gateMu.Lock()
-	defer r.gateMu.Unlock()
-	return len(r.gateBuf)
+	tgt := r.gateTgt
+	r.gateMu.Unlock()
+	return r.gate.Len(tgt, 0)
 }
 
 // failingReader yields nBatches nil-free batches and then fails, modelling a

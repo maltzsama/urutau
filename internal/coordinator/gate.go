@@ -2,120 +2,17 @@ package coordinator
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/gate"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
-// gateKey renders a gateWindow into the map key gateOn/gateBuf/gateWin use.
-func gateKey(target string, partition int) string {
-	return fmt.Sprintf("%s#%d", target, partition)
-}
-
-// openKeyForTableLocked returns the first open gate key for target, if
-// any. Callers must hold gateMu. A table has at most as many
-// simultaneously-open keys as it has partitions actively snapshotting;
-// gateHold only needs to know "is ANY window for this table open" since
-// it gates conservatively at the whole-table (not per-row) level.
-func (c *Coordinator) openKeyForTableLocked(target string) (string, bool) {
-	for k, on := range c.gateOn {
-		if !on {
-			continue
-		}
-		if w, ok := c.gateWin[k]; ok && w.target == target {
-			return k, true
-		}
-	}
-	return "", false
-}
-
-// openWindow pauses the pump for one table's partition, tagging the
-// current chunk. The gate stays open for the WHOLE snapshot of that
-// partition (design §3.1: the coordinator pauses relaying while it works
-// the table); flushWindow drains per chunk without closing it, and
-// closeWindow seals it at the end. A gate that opened and closed per
-// chunk would let gap events (positioned AFTER the gate's backlog) flow
-// straight through, then release older backlog after them — a
-// reordering that resurrects old values.
-func (c *Coordinator) openWindow(target string, partition int) {
-	c.gateMu.Lock()
-	key := gateKey(target, partition)
-	if c.gateOn == nil {
-		c.gateOn = map[string]bool{}
-		c.gateWin = map[string]gateWindow{}
-		c.gateBuf = map[string][]*dataplane.Batch{}
-	}
-	c.gateOn[key] = true
-	c.gateWin[key] = gateWindow{target: target, partition: partition}
-	c.gateMu.Unlock()
-}
-
-// flushWindow drains the gated batches collected since the last drain for
-// one partition's window, each InWindow-tagged for the given chunk, then
-// returns (that window stays open). Batch ownership transfers to
-// enqueueBatch per drain. enqueueBatch itself splits a batch across
-// partition owners by PK range when the table is partitioned, so a
-// drained batch reaches only the rows' actual owning worker(s) even
-// though the gate held it at whole-table granularity.
-func (c *Coordinator) flushWindow(ctx context.Context, target string, partition int, windowID uint64) error {
-	key := gateKey(target, partition)
-	c.gateFlushMu.Lock()
-	defer c.gateFlushMu.Unlock()
-	c.gateMu.Lock()
-	buf := c.gateTakeLocked(key)
-	// The catch-up is over: the next chunk's batches wait for its own
-	// ChunkReady.
-	delete(c.gateReady, key)
-	close(c.gateDrain)
-	c.gateDrain = make(chan struct{})
-	c.gateMu.Unlock()
-	return c.enqueueWindowed(ctx, target, windowID, buf)
-}
-
-// closeWindow releases any remaining gated batches (post-last-chunk) for
-// one partition's window and closes just that window — other partitions
-// of the same table still snapshotting keep their own windows open. The
-// trailing events are ordinary live changes: no window tag.
-func (c *Coordinator) closeWindow(ctx context.Context, target string, partition int) error {
-	key := gateKey(target, partition)
-	c.gateFlushMu.Lock()
-	defer c.gateFlushMu.Unlock()
-	c.gateMu.Lock()
-	buf := c.gateTakeLocked(key)
-	delete(c.gateOn, key)
-	delete(c.gateWin, key)
-	delete(c.gateReady, key)
-	close(c.gateDrain)
-	c.gateDrain = make(chan struct{})
-	c.gateMu.Unlock()
-
-	return c.enqueueHeld(ctx, &pb.BatchMeta{Table: target}, buf)
-}
-
-// releaseAllGates closes every open gate and releases the batches held in it.
-// Called when the snapshot phase ends, so an aborted snapshot (ctx cancelled
-// before closeWindow) does not leak the gated batches (issue #212). gateHold
-// re-checks the window under gateMu before appending, so a gate cleared here
-// cannot be re-populated afterwards.
-func (c *Coordinator) releaseAllGates() {
-	c.gateMu.Lock()
-	var held []*dataplane.Batch
-	for k := range c.gateOn {
-		held = append(held, c.gateTakeLocked(k)...)
-		delete(c.gateOn, k)
-		delete(c.gateWin, k)
-		delete(c.gateReady, k)
-	}
-	// Wake any pump blocked on a full gate so it re-checks and sees the gate
-	// gone (gateHold returns false and the batch flows as live).
-	close(c.gateDrain)
-	c.gateDrain = make(chan struct{})
-	c.gateMu.Unlock()
-	for _, b := range held {
-		b.Release()
-	}
-}
+// The DBLog window gate is the shared internal/gate implementation (design:
+// one orchestration for collapsed and distributed mode, issue #404). This
+// file is the coordinator's thin adapter: it wires the gate's drains to the
+// coordinator's enqueue path and keeps the method names the rest of the
+// package (and its tests) already use.
 
 // gateMaxEvents bounds one snapshot window's held live batches. Beyond it
 // the pump blocks until flushWindow drains — the gate's structural
@@ -124,9 +21,96 @@ func (c *Coordinator) releaseAllGates() {
 // held is bounded by gateMaxEvents × batchTarget.
 const gateMaxEvents = 1024
 
-// gateWindow identifies one open DBLog window: a table's Nth partition.
-// An unpartitioned table's sole window is always {target, 0}.
-type gateWindow struct {
-	target    string
-	partition int
+// batchSink delivers a gate's drains to the coordinator's enqueue path.
+type batchSink struct{ c *Coordinator }
+
+// Flush sends a window's held batches InWindow-tagged for windowID.
+func (s batchSink) Flush(ctx context.Context, w gate.Window, windowID uint64, items []*dataplane.Batch) error {
+	return s.c.enqueueWindowed(ctx, w.Target, windowID, items)
+}
+
+// Close sends a window's trailing batches as ordinary live changes.
+func (s batchSink) Close(ctx context.Context, w gate.Window, items []*dataplane.Batch) error {
+	return s.c.enqueueHeld(ctx, &pb.BatchMeta{Table: w.Target}, items)
+}
+
+// Release discards a torn-down gate's held batches (release-on-cancel).
+func (s batchSink) Release(items []*dataplane.Batch) {
+	for _, b := range items {
+		b.Release()
+	}
+}
+
+// openWindow pauses the pump for one table's partition, tagging the current
+// chunk. The gate stays open for the WHOLE snapshot of that partition
+// (design §3.1): flushWindow drains per chunk without closing it, and
+// closeWindow seals it at the end.
+func (c *Coordinator) openWindow(target string, partition int) {
+	c.gate.Open(target, partition)
+}
+
+// openWindowFlushed opens a DBLog window after sending the table's
+// accumulated batches, which predate it: sent later, they would reach the
+// worker after the window's own events. The window opens first, under the
+// gate's flush lock, so no new batch joins the accumulator in between and no
+// gate drain overtakes the send.
+func (c *Coordinator) openWindowFlushed(ctx context.Context, target string, partition int) error {
+	var err error
+	c.gate.WithFlush(func() {
+		c.openWindow(target, partition)
+		err = c.sendAccumLocked(ctx, target)
+	})
+	return err
+}
+
+// flushWindow drains the gated batches collected since the last drain for one
+// partition's window, each InWindow-tagged for the given chunk, then returns
+// (that window stays open). Batch ownership transfers to enqueueBatch per
+// drain.
+func (c *Coordinator) flushWindow(ctx context.Context, target string, partition int, windowID uint64) error {
+	return c.gate.Flush(ctx, target, partition, windowID)
+}
+
+// closeWindow releases any remaining gated batches (post-last-chunk) for one
+// partition's window and closes just that window — other partitions of the
+// same table still snapshotting keep their own windows open. The trailing
+// events are ordinary live changes: no window tag.
+func (c *Coordinator) closeWindow(ctx context.Context, target string, partition int) error {
+	return c.gate.Close(ctx, target, partition)
+}
+
+// gateHold buffers a batch when a window is open for a partition its rows
+// could belong to (the gate implements the backpressure and early-drain
+// semantics). Ownership: when it returns true the batch is in the gate and
+// released by flushWindow/closeWindow; a failed early drain releases it here
+// and fails the pump.
+func (c *Coordinator) gateHold(ctx context.Context, b *dataplane.Batch) bool {
+	held, err := c.gate.Hold(ctx, b.Table, b)
+	if err != nil {
+		c.pumpFail(ctx, err)
+		b.Release() // the run is terminating; the batch goes nowhere
+		return true
+	}
+	return held
+}
+
+// markWindowReady records that windowID's rows are in the worker's window (a
+// WindowOpen/ChunkReady arrived), and wakes a pump blocked on the full gate
+// so it drains.
+func (c *Coordinator) markWindowReady(target string, partition int, windowID uint64) {
+	c.gate.MarkReady(target, partition, windowID)
+}
+
+// releaseAllGates closes every open gate and releases the batches held in it.
+// Called when the snapshot phase ends, so an aborted snapshot (ctx cancelled
+// before closeWindow) does not leak the gated batches (issue #212).
+func (c *Coordinator) releaseAllGates() {
+	c.gate.ReleaseAll()
+}
+
+// openKeyForTableLocked returns the first open gate key for target, if any.
+func (c *Coordinator) openKeyForTableLocked(target string) (string, bool) {
+	c.gate.Lock()
+	defer c.gate.Unlock()
+	return c.gate.OpenKeyLocked(target)
 }
