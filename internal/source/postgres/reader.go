@@ -20,6 +20,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	errs "github.com/maltzsama/urutau/internal/errors"
+	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -829,6 +830,16 @@ func (r *Reader) advanceSyncedFloor(lsn pglogrepl.LSN) {
 // events still in flight to the sink.
 func (r *Reader) sendStandby(ctx context.Context) error {
 	cur := r.confirmedLSN()
+	// The commit boundary this window names: the sink commit (the confirmed
+	// position) is already durable, the slot is not yet advanced. The
+	// crash-recovery matrix arms it to prove the slot's confirmed_flush_lsn
+	// never passes the sink's committed position (see commit-boundaries.md).
+	// Only when a commit exists — an uncommitted reader has nothing to
+	// confirm, and the point would fire on the idle status tick instead.
+	if cur != 0 {
+		faultinject.At(faultinject.PostgresSlotConfirmBefore,
+			"slot", r.cfg.SlotName, "lsn", cur.String())
+	}
 	return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn.PgConn(), pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: pglogrepl.LSN(cur),
 	})

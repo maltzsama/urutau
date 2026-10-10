@@ -156,6 +156,35 @@ loss boundary, and the Couchbase half of the matrix asserts exactly that: the
 sink converges to the source after each direct-path fault, in both commit
 modes.
 
+### PostgreSQL source: the slot never passes the committed position
+
+The PostgreSQL source does not change the commit paths — the sink is still
+Iceberg, so a table commits directly (one owner) or staged (several owners).
+It adds a **source-side retention boundary** instead. The logical replication
+slot is the server's anchor: `confirmed_flush_lsn` is the point up to which the
+server may recycle WAL, so it must never move past what the sink has durably
+committed. Advancing it too far would let the server discard WAL for events the
+sink never committed — the data would be unrecoverable on the next resume.
+
+The reader advances the slot by sending a standby status update
+(`sendStandby`), reporting the coordinator's confirmed position — the minimum
+`cdc.position` across the tables it feeds, never its own decoded position. So
+the slot lags the sink by construction; the crash window is between the two:
+
+| # | Step | Process | Durable after this step | Fault point |
+|---|------|---------|-------------------------|-------------|
+| PG1 | The sink commit (data and `cdc.position`) is durable; the reader has not yet reported the committed position back to the server | coordinator | the batch's data and position; the slot's `confirmed_flush_lsn` is unchanged | `source.postgres-slot-confirm-before` |
+
+Expected recovery: **PG1 (coordinator dies).** Nothing is lost — the sink
+commit is already durable, and the slot is *behind* it, the safe direction. On
+restart the coordinator resumes from the minimum `cdc.position` and reconciles
+the stored resume with the slot (`ValidateSlotState`): a resume ahead of the
+slot (the sink committed past the last confirmed point) is returned as the
+effective start and the slot is advanced to exactly that point (`AdvanceSlot`).
+The PostgreSQL half of the matrix asserts the invariant directly after every
+recovery, reading `pg_replication_slots.confirmed_flush_lsn` and the sink's
+committed `cdc.position`: the former never exceeds the latter.
+
 ## The snapshot phase
 
 The live stream runs while the snapshot copies tables one at a time, so the
@@ -227,6 +256,7 @@ even though it holds a position. Re-copied rows are upserts.
 | Sink commit completed, worker has not acked | D3, S3, S5 |
 | Sink data written, per-partition control position row not yet (ClickHouse) | C1 |
 | Sink data documents written, control/position document not yet (Couchbase fast mode) | CB1 |
+| Sink commit durable, PostgreSQL slot's confirmed position not yet reported to the server | PG1 |
 | Ack sent, coordinator has not recorded the next state | D4 |
 | Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss; recovered by redelivery) |
 | Coordinator killed during an active commit cycle | S4, S5 |

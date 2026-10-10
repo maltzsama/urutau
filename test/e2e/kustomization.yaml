@@ -5,12 +5,12 @@
 #   kubectl apply -k test/e2e
 #
 # It mirrors test/e2e/docker-compose.yml's data services — MySQL (source),
-# ClickHouse (the analytics sink), Couchbase (the key-document sink), RustFS +
-# Polaris (the Iceberg REST catalog and its S3 store) and Trino (to verify the
-# written table). The manifests live
-# in k8s/; the MySQL init SQL and the Trino catalog properties are reused
-# verbatim from this directory via configMapGenerator, so the compose and the
-# cluster stay in lockstep.
+# PostgreSQL (logical-replication source), ClickHouse (the analytics sink),
+# Couchbase (the key-document sink), RustFS + Polaris (the Iceberg REST
+# catalog and its S3 store) and Trino (to verify the written table). The
+# manifests live in k8s/; the MySQL and PostgreSQL init SQL and the Trino
+# catalog properties are reused verbatim from this directory via
+# configMapGenerator, so the compose and the cluster stay in lockstep.
 #
 # Tear down with:  kubectl delete -k test/e2e
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -20,6 +20,7 @@ namespace: e2e
 resources:
   - k8s/namespace.yaml
   - k8s/mysql.yaml
+  - k8s/postgres.yaml
   - k8s/clickhouse.yaml
   - k8s/couchbase.yaml
   - k8s/redpanda.yaml
@@ -32,6 +33,11 @@ configMapGenerator:
   - name: mysql-init
     files:
       - init.sql=mysql/init/init.sql
+  # The init SQL runs from /docker-entrypoint-initdb.d, so the key must keep
+  # its .sql extension (the image runs every *.sql in the directory).
+  - name: postgres-init
+    files:
+      - 01-init.sql=postgres/init/01-init.sql
   - name: trino-catalog
     files:
       - iceberg.properties=trino/catalog/iceberg.properties

@@ -73,6 +73,17 @@ const (
 	// one transaction, so this window does not exist there (see the
 	// Couchbase section of commit-boundaries.md).
 	WorkerCouchbaseDataBeforeControl Point = "worker.couchbase-data-before-control"
+	// PostgresSlotConfirmBefore: the PostgreSQL source reader is about to
+	// report the sink's committed position back to the server (a standby
+	// status update), advancing the logical replication slot's
+	// confirmed_flush_lsn. The sink commit is already durable; the slot has
+	// not moved yet. A crash here leaves the slot behind the sink's
+	// committed position, never ahead of it — the invariant the PostgreSQL
+	// half of the matrix checks. On restart the reader reconciles the stored
+	// resume with the slot (ValidateSlotState) and advances the slot to
+	// exactly the committed point (see the PostgreSQL source section of
+	// commit-boundaries.md).
+	PostgresSlotConfirmBefore Point = "source.postgres-slot-confirm-before"
 	// CoordinatorAckBeforeRecord: the coordinator received an ack and has
 	// not recorded it (D5).
 	CoordinatorAckBeforeRecord Point = "coordinator.ack-before-record"
@@ -100,6 +111,7 @@ var Points = []Point{
 	WorkerCommittedBeforeAck,
 	WorkerClickHouseDataBeforePosition,
 	WorkerCouchbaseDataBeforeControl,
+	PostgresSlotConfirmBefore,
 	CoordinatorAckBeforeRecord,
 	WorkerStagedBeforeShip,
 	WorkerStagedShippedBeforeAck,
