@@ -111,7 +111,7 @@ func SnapshotTable(
 	var bounds [][]any
 	var pending []uint32
 
-	if cfg.Progress != nil && cfg.Progress.State == StateInProgress && len(cfg.Progress.Bounds) > 0 {
+	if Resumable(cfg.Progress) {
 		// Resume: use persisted bounds and pending list.
 		bounds = cfg.Progress.Bounds
 		pending = cfg.Progress.Pending

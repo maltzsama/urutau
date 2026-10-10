@@ -490,16 +490,6 @@ func incrementalPage(ctx context.Context, inc source.IncrementalSource, batchInc
 	return next, dpb, more, nil
 }
 
-// readSnapshotProgress reads the snapshot state from the sink's table
-// properties.
-func readSnapshotProgress(ctx context.Context, snk sink.Sink, ref core.TableRef) (*snapshot.SnapshotProgress, error) {
-	props, err := snk.Properties(ctx, ref)
-	if err != nil {
-		return nil, err
-	}
-	return snapshot.ReadSnapshotProgress(props)
-}
-
 // canonicalForTarget returns the canonical schema for one target table (the
 // schema drift reference). Zero schema when the target has no source.
 func canonicalForTarget(canonical map[string]core.Schema, refs []core.TableRef, target string) core.Schema {

@@ -111,7 +111,7 @@ func resumableProgress(props map[string]string) *snapshot.SnapshotProgress {
 		return nil
 	}
 	sp, err := snapshot.ReadSnapshotProgress(props)
-	if err != nil || sp.State != snapshot.StateInProgress || len(sp.Bounds) == 0 {
+	if err != nil || !snapshot.Resumable(sp) {
 		return nil
 	}
 	return sp

@@ -76,13 +76,7 @@ func (r *Runner) runSnapshot(
 			"table": ref.Source, "target": ref.Target, "mode": bootstrapMode,
 		})
 		// Write complete state to Iceberg properties.
-		props, err := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
-			State: snapshot.StateComplete,
-		})
-		if err != nil {
-			return fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
-		}
-		if err := snk.SetProperties(ctx, ref, props); err != nil {
+		if err := snapshot.MarkComplete(ctx, snk, ref); err != nil {
 			return fmt.Errorf("runner: adopt %s: %w", ref.Target, err)
 		}
 		w.SetSnapshotState(ref.Target, string(snapshot.StateComplete), nil)
@@ -99,7 +93,7 @@ func (r *Runner) runSnapshot(
 			return err
 		}
 		// Read existing snapshot progress for resumable backfill.
-		progress, err := readSnapshotProgress(ctx, snk, ref)
+		progress, err := snapshot.ReadProgress(ctx, snk, ref)
 		if err != nil {
 			return fmt.Errorf("runner: snapshot progress %s: %w", ref.Target, err)
 		}
