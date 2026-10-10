@@ -156,20 +156,25 @@ loss boundary, and the Couchbase half of the matrix asserts exactly that: the
 sink converges to the source after each direct-path fault, in both commit
 modes.
 
-### PostgreSQL source: the slot never passes the committed position
+### PostgreSQL source: the slot never passes an in-flight table's committed position
 
 The PostgreSQL source does not change the commit paths — the sink is still
 Iceberg, so a table commits directly (one owner) or staged (several owners).
 It adds a **source-side retention boundary** instead. The logical replication
 slot is the server's anchor: `confirmed_flush_lsn` is the point up to which the
 server may recycle WAL, so it must never move past what the sink has durably
-committed. Advancing it too far would let the server discard WAL for events the
-sink never committed — the data would be unrecoverable on the next resume.
+committed for the tables still in flight. Advancing it too far would let the
+server discard WAL for events the sink never committed — the data would be
+unrecoverable on the next resume.
 
 The reader advances the slot by sending a standby status update
-(`sendStandby`), reporting the coordinator's confirmed position — the minimum
-`cdc.position` across the tables it feeds, never its own decoded position. So
-the slot lags the sink by construction; the crash window is between the two:
+(`sendStandby`), reporting the coordinator's confirmed position: the minimum
+`cdc.position` over the tables with **in-flight work**, never its own decoded
+position. A table with nothing dispatched — or whose dispatched work is fully
+committed — is excluded, since it has no delivered-but-uncommitted data to
+protect. So the slot lags the sink for every busy table; an idle table's
+committed position may trail the slot, which is intentional retention. The
+crash window is between a busy table's commit and the slot's advance:
 
 | # | Step | Process | Durable after this step | Fault point |
 |---|------|---------|-------------------------|-------------|
@@ -183,7 +188,10 @@ slot (the sink committed past the last confirmed point) is returned as the
 effective start and the slot is advanced to exactly that point (`AdvanceSlot`).
 The PostgreSQL half of the matrix asserts the invariant directly after every
 recovery, reading `pg_replication_slots.confirmed_flush_lsn` and the sink's
-committed `cdc.position`: the former never exceeds the latter.
+committed `cdc.position`: the slot never exceeds the committed position of a
+table that has in-flight work. An idle table's committed position may trail the
+slot (intentional retention, as above), so the bound is over the in-flight
+tables, not all tables the reader feeds.
 
 ## The snapshot phase
 
