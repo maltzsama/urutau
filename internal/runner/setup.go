@@ -13,6 +13,7 @@ import (
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/maintenance"
 	"github.com/maltzsama/urutau/internal/plan"
+	"github.com/maltzsama/urutau/internal/resume"
 	"github.com/maltzsama/urutau/internal/worker"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -100,12 +101,13 @@ type setup struct {
 	w      *worker.Worker
 	r      *Runner
 
-	resume            position.Position
+	start             position.Position
 	needsSnapshot     []core.TableRef
+	snapshotRefs      []core.TableRef
+	adoptRefs         []core.TableRef
 	caps              source.Capabilities
 	heldRows          map[string]bool
 	bootstrapByTarget map[string]spec.Bootstrap
-	explicitPositions []position.Position
 
 	rdr        source.Reader
 	router     *relay
@@ -466,53 +468,59 @@ func (b *setup) startWorker() {
 	go func() { defer close(b.workerDone); b.workerErr <- b.w.Run(b.runCtx, b.ingest) }()
 }
 
-// resolveResume computes the stream resume point and the snapshot set, marks
-// the pending snapshots before the stream can commit, and resolves the
-// per-table bootstrap configuration the stream start and snapshot loop both
-// consult.
+// resolveResume resolves the stream resume point and the snapshot/adopt set
+// through the shared resume resolver (internal/resume, the same one the
+// coordinator runs — #718 step 3), marks the pending snapshots before the
+// stream can commit, and resolves the per-table bootstrap configuration the
+// stream start and snapshot loop both consult.
 func (b *setup) resolveResume() error {
-	resume, needsSnapshot, recovery, err := resumeFrom(b.ctx, b.src, b.snk, b.cdcRefs)
-	if err != nil {
-		return err
+	// Per-table bootstrap config, resolved once: the shared resolver splits
+	// an adopt table out of the snapshot set (its snapshot is marked complete
+	// without reading), and the snapshot loop reads the mode back for logging.
+	b.bootstrapByTarget = make(map[string]spec.Bootstrap, len(b.s.Tables))
+	for _, t := range b.s.Tables {
+		if t.Bootstrap != nil {
+			b.bootstrapByTarget[t.Target] = *t.Bootstrap
+		}
 	}
-	b.resume, b.needsSnapshot = resume, needsSnapshot
-	b.log.Info("resume", "from", position.StringOrNone(resume), "snapshot_tables", len(needsSnapshot))
-	if len(recovery) > 0 {
+
+	// The source's snapshot capability gates the snapshot routing: a
+	// non-snapshotting source (Kafka) has no query connection and must never
+	// be routed into the snapshot phase (issue #394). An unregistered kind
+	// has no capabilities.
+	caps, _ := driver.CapsForKind(b.s.Source.Kind)
+	b.caps = caps
+
+	res, err := resume.Resolve(b.ctx, b.src, b.snk, b.cdcRefs, resume.Options{
+		Caps:      caps,
+		Bootstrap: b.bootstrapByTarget,
+	})
+	if err != nil {
+		return fmt.Errorf("runner: %w", err)
+	}
+	b.start = res.Start
+	b.snapshotRefs, b.adoptRefs = res.Snapshot, res.Adopt
+	// The union marks every table the snapshot phase will touch (snapshot or
+	// adopt) not_started before the stream can commit to it.
+	b.needsSnapshot = append(append([]core.TableRef{}, res.Snapshot...), res.Adopt...)
+	b.log.Info("resume", "from", position.StringOrNone(res.Resume), "snapshot_tables", len(b.needsSnapshot))
+	if len(res.Recovery) > 0 {
 		b.log.Info("crash recovery: streams ahead of the resume point replay from it",
-			"from", position.StringOrNone(resume), "streams", recovery)
+			"from", position.StringOrNone(res.Resume), "streams", res.Recovery)
 	}
 	b.r.emit(eventlog.KindResume, map[string]any{
-		"from": position.StringOrNone(resume), "snapshot_tables": len(needsSnapshot),
+		"from": position.StringOrNone(res.Resume), "snapshot_tables": len(b.needsSnapshot),
 	})
 
 	// Before the stream can commit anything: a crash from here on must find
 	// these tables unfinished, whatever positions the stream commits to them
 	// (#428). Skipped when the source does not snapshot (e.g. Kafka).
-	caps, _ := driver.CapsForKind(b.s.Source.Kind)
-	b.caps = caps
 	if caps.Snapshot {
-		heldRows, err := markSnapshotsPending(b.ctx, b.snk, needsSnapshot)
+		heldRows, err := markSnapshotsPending(b.ctx, b.snk, b.needsSnapshot)
 		if err != nil {
 			return err
 		}
 		b.heldRows = heldRows
-	}
-
-	// Per-table bootstrap config, resolved once: the stream start below and
-	// the snapshot loop both consult it.
-	b.bootstrapByTarget = make(map[string]spec.Bootstrap, len(b.s.Tables))
-	for _, t := range b.s.Tables {
-		if t.Bootstrap == nil {
-			continue
-		}
-		b.bootstrapByTarget[t.Target] = *t.Bootstrap
-		if t.Bootstrap.StartAt == spec.StartAtExplicit && t.Bootstrap.Position != "" {
-			p, err := b.src.ParsePosition(t.Bootstrap.Position)
-			if err != nil {
-				return fmt.Errorf("runner: %s bootstrap.position %q: %w", t.Target, t.Bootstrap.Position, err)
-			}
-			b.explicitPositions = append(b.explicitPositions, p)
-		}
 	}
 	return nil
 }
@@ -547,13 +555,10 @@ func (b *setup) openReaderAndRelay() error {
 	b.r.rdr = rdr
 	rdr.SetConfirmed(b.r.confirmedPosition)
 
-	start := b.resume
-	if start == nil && len(b.explicitPositions) > 0 {
-		// An adopted table with an explicit start position overrides the
-		// source default. The minimum across tables is the safe choice: the
-		// stream is one per source, and starting too late would skip data.
-		start = position.Min(b.explicitPositions)
-	}
+	// start is the resume point, or an adopted table's explicit bootstrap
+	// position when there is none (resolved by the shared resolver); a nil
+	// start falls back to the source's initial position.
+	start := b.start
 	if start == nil {
 		if m, err := b.src.InitialPosition(b.ctx); err != nil {
 			return fmt.Errorf("runner: initial position: %w", err)
@@ -578,21 +583,23 @@ func (b *setup) openReaderAndRelay() error {
 }
 
 // runSnapshotPhase runs the DBLog snapshot for tables with no committed
-// position (or one an earlier run left unfinished). A worker or relay failure
+// position (or one an earlier run left unfinished), and the adopt path for a
+// table whose bootstrap mode adopts existing data. A worker or relay failure
 // must abort the snapshot: its blocking handshakes only observe a context, and
 // newRunner has not yet handed workerErr/routerDone to Runner.run (#551).
 func (b *setup) runSnapshotPhase() error {
-	if !b.caps.Snapshot || len(b.needsSnapshot) == 0 {
+	if !b.caps.Snapshot || (len(b.snapshotRefs) == 0 && len(b.adoptRefs) == 0) {
 		return nil
 	}
 	sw := newSnapshotWatch(b.runCtx, b.workerErr, b.routerDone)
 	b.st.add(sw.cancel)
-	for _, ref := range b.needsSnapshot {
-		bootstrapMode := spec.BootstrapSnapshot
-		if bo, ok := b.bootstrapByTarget[ref.Target]; ok {
-			bootstrapMode = bo.Mode
+	for _, ref := range b.snapshotRefs {
+		if err := b.runSnapshotRef(sw.ctx, ref); err != nil {
+			return err
 		}
-		if err := b.r.runSnapshot(sw.ctx, ref, bootstrapMode, b.qsrc, b.snk, b.rdr, b.router, b.w, b.cfg, b.heldRows, b.log); err != nil {
+	}
+	for _, ref := range b.adoptRefs {
+		if err := b.runSnapshotRef(sw.ctx, ref); err != nil {
 			return err
 		}
 	}
@@ -600,6 +607,16 @@ func (b *setup) runSnapshotPhase() error {
 	// worker/relay death it caught (Runner.run would otherwise block on a
 	// channel the watch already drained).
 	return sw.stop()
+}
+
+// runSnapshotRef runs the boot snapshot or adopt for one table, taking the
+// mode from the table's bootstrap block (snapshot when absent).
+func (b *setup) runSnapshotRef(ctx context.Context, ref core.TableRef) error {
+	bootstrapMode := spec.BootstrapSnapshot
+	if bo, ok := b.bootstrapByTarget[ref.Target]; ok {
+		bootstrapMode = bo.Mode
+	}
+	return b.r.runSnapshot(ctx, ref, bootstrapMode, b.qsrc, b.snk, b.rdr, b.router, b.w, b.cfg, b.heldRows, b.log)
 }
 
 // runIncrementalPhase pages each incremental table to exhaustion (#157/#572),

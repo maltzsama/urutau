@@ -38,34 +38,6 @@ func (s *stateSink) SetProperties(_ context.Context, ref core.TableRef, p map[st
 	return nil
 }
 
-// A table the stream committed to while its snapshot was unfinished holds a
-// position; a crash there must not take it for a finished snapshot (#428).
-func TestResumeFromSnapshotsAnUnfinishedTable(t *testing.T) {
-	snk := &stateSink{
-		positions: map[string]string{"queued": "0/10", "left": "0/20", "done": "0/30", "legacy": "0/40"},
-		props: map[string]map[string]string{
-			"queued": {snapshot.PropSnapshotState: string(snapshot.StateNotStarted)},
-			"left":   {snapshot.PropSnapshotState: string(snapshot.StateInProgress)},
-			"done":   {snapshot.PropSnapshotState: string(snapshot.StateComplete)},
-		},
-	}
-	refs := []core.TableRef{{Target: "queued"}, {Target: "left"}, {Target: "done"}, {Target: "legacy"}, {Target: "fresh"}}
-	pos, needs, _, err := resumeFrom(context.Background(), resumeSource{}, snk, refs)
-	if err != nil {
-		t.Fatalf("resumeFrom: %v", err)
-	}
-	var got []string
-	for _, r := range needs {
-		got = append(got, r.Target)
-	}
-	if len(got) != 3 || got[0] != "queued" || got[1] != "left" || got[2] != "fresh" {
-		t.Fatalf("tables to snapshot = %v, want [queued left fresh]", got)
-	}
-	if pos == nil || pos.String() != "0/10" {
-		t.Fatalf("resume = %v, want 0/10", pos)
-	}
-}
-
 // Before the stream starts, every table about to be snapshotted is marked
 // not_started, except one an earlier run left in_progress (its bounds make
 // the snapshot resumable). The tables that already hold rows are reported:

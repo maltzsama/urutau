@@ -389,49 +389,6 @@ func (r *relay) run(ctx context.Context, rdr source.Reader) error {
 
 // ── Positions and catalog ────────────────────────────────────────────
 
-func resumeFrom(ctx context.Context, src source.Source, snk sink.Sink, refs []core.TableRef) (position.Position, []core.TableRef, []string, error) {
-	var positions []position.Position
-	var needsSnapshot []core.TableRef
-	byTarget := make(map[string]position.Position, len(refs))
-	for _, ref := range refs {
-		pos, err := snk.Position(ctx, ref)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("runner: %s: %w", ref.Target, err)
-		}
-		if pos != "" {
-			p, err := src.ParsePosition(pos)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("runner: %s cdc.position %q: %w", ref.Target, pos, err)
-			}
-			positions = append(positions, p)
-			byTarget[ref.Target] = p
-			// A position does not prove the snapshot finished: the stream
-			// commits to a table before and during its snapshot (#428).
-			props, err := snk.Properties(ctx, ref)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("runner: %s: snapshot state: %w", ref.Target, err)
-			}
-			if snapshot.Unfinished(props) {
-				needsSnapshot = append(needsSnapshot, ref)
-			}
-		} else {
-			needsSnapshot = append(needsSnapshot, ref)
-		}
-	}
-	if len(positions) == 0 {
-		return nil, needsSnapshot, nil, nil
-	}
-	best, err := position.MinSafe(positions)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("runner: %w", err)
-	}
-	// Streams ahead of the resume point hold already-committed data past it;
-	// they replay from best (idempotent under upsert). Naming them makes a
-	// crash-recovery replay observable (#155).
-	recovery := position.Ahead(best, byTarget)
-	return best, needsSnapshot, recovery, nil
-}
-
 // runIncremental drains each incremental table in bounded pages (#572),
 // pushing the rows through the worker's ingest path — the same path a snapshot
 // uses, minus the window. The cursor is read from cdc.cursor and persisted
