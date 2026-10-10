@@ -112,6 +112,34 @@ func TestOrchestrationConsumesContracts(t *testing.T) {
 	}
 }
 
+// TestWorkerCoreStaysFreeOfRemote: the worker core (internal/worker) must not
+// import gRPC, grpctls or the wire protobuf — only its remote subpackage may
+// (issue #401). Splitting the coordinator-facing code out keeps the
+// batcher/window/collapse core buildable and testable without the transport.
+func TestWorkerCoreStaysFreeOfRemote(t *testing.T) {
+	const core = "github.com/maltzsama/urutau/internal/worker"
+	for imp := range directImports(t, core) {
+		switch imp {
+		case "google.golang.org/grpc",
+			"github.com/maltzsama/urutau/internal/grpctls",
+			"github.com/maltzsama/urutau/internal/transport/pb/urutau/v1":
+			t.Errorf("%s imports %s — the remote layer owns the coordinator transport", core, imp)
+		}
+	}
+}
+
+// TestDataplaneNeverKnowsWorker: internal/dataplane is the shared columnar
+// batch library; it must not depend on the worker that consumes it (issue
+// #401).
+func TestDataplaneNeverKnowsWorker(t *testing.T) {
+	const dp = "github.com/maltzsama/urutau/internal/dataplane"
+	for imp := range directImports(t, dp) {
+		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/worker") {
+			t.Errorf("internal/dataplane imports %s — the batch library must stay independent of the worker", imp)
+		}
+	}
+}
+
 // TestContractsArePluginSafe: the public contract packages must not import
 // anything under internal/ — an external plugin imports these contracts and
 // must not transitively pull the engine internals. internal/rowchange is

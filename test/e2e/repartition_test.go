@@ -18,7 +18,7 @@ import (
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/maintenance"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
-	"github.com/maltzsama/urutau/internal/worker"
+	remote "github.com/maltzsama/urutau/internal/worker/remote"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -111,7 +111,7 @@ func (p *scalablePipeline) startWorker(name string) {
 	wCtx, wStop := context.WithCancel(p.ctx)
 	p.track(wStop)
 	go func() {
-		err := worker.RunRemote(wCtx, worker.RemoteConfig{
+		err := remote.RunRemote(wCtx, remote.RemoteConfig{
 			Coordinator: p.addr,
 			Name:        name,
 			Namespace:   "raw",
@@ -134,7 +134,7 @@ func (p *scalablePipeline) startMaintenanceWorker(name string) {
 	wCtx, wStop := context.WithCancel(p.ctx)
 	p.track(wStop)
 	go func() {
-		p.done <- worker.RunMaintenance(wCtx, worker.RemoteConfig{
+		p.done <- remote.RunMaintenance(wCtx, remote.RemoteConfig{
 			Coordinator: p.addr,
 			Name:        name,
 			Namespace:   "raw",

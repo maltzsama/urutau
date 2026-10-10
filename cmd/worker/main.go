@@ -18,7 +18,7 @@ import (
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/memlimit"
 	"github.com/maltzsama/urutau/internal/plugin/flightwrap"
-	"github.com/maltzsama/urutau/internal/worker"
+	remote "github.com/maltzsama/urutau/internal/worker/remote"
 	"github.com/maltzsama/urutau/sink"
 )
 
@@ -42,9 +42,9 @@ func writeTerminationMessage(err error) {
 }
 
 // terminationMessage is err, marked "network: " when the worker lost its
-// coordinator (see worker.ErrCoordinatorLost).
+// coordinator (see remote.ErrCoordinatorLost).
 func terminationMessage(err error) string {
-	if errors.Is(err, worker.ErrCoordinatorLost) {
+	if errors.Is(err, remote.ErrCoordinatorLost) {
 		return "network: " + err.Error()
 	}
 	return err.Error()
@@ -68,7 +68,7 @@ func run() error {
 }
 
 // workerFlags are the raw CLI values. config() turns them into a validated
-// worker.RemoteConfig, keeping the RunE a thin wrapper.
+// remote.RemoteConfig, keeping the RunE a thin wrapper.
 type workerFlags struct {
 	coordinator  string
 	name         string
@@ -115,7 +115,7 @@ func runCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				return worker.RunMaintenance(cmd.Context(), cfg)
+				return remote.RunMaintenance(cmd.Context(), cfg)
 			}
 			cfg, err := f.config()
 			if err != nil {
@@ -128,7 +128,7 @@ func runCmd() *cobra.Command {
 				"catalog", cfg.Sink.URI,
 				"metrics", cfg.MetricsAddr,
 			)
-			return worker.RunRemote(cmd.Context(), cfg)
+			return remote.RunRemote(cmd.Context(), cfg)
 		},
 	}
 	fl := cmd.Flags()
@@ -160,23 +160,23 @@ func runCmd() *cobra.Command {
 	return cmd
 }
 
-func (f *workerFlags) config() (worker.RemoteConfig, error) {
+func (f *workerFlags) config() (remote.RemoteConfig, error) {
 	tlsCfg := grpctls.Config{CertFile: f.tlsCert, KeyFile: f.tlsKey, ClientCAFile: f.tlsCA}
 	if err := tlsCfg.Validate(); err != nil {
-		return worker.RemoteConfig{}, err
+		return remote.RemoteConfig{}, err
 	}
 	if f.coordinator == "" {
-		return worker.RemoteConfig{}, fmt.Errorf("--coordinator must not be empty")
+		return remote.RemoteConfig{}, fmt.Errorf("--coordinator must not be empty")
 	}
 	if f.name == "" {
-		return worker.RemoteConfig{}, fmt.Errorf("--name must not be empty (set $HOSTNAME or pass --name)")
+		return remote.RemoteConfig{}, fmt.Errorf("--name must not be empty (set $HOSTNAME or pass --name)")
 	}
 	if f.catalogURI == "" {
-		return worker.RemoteConfig{}, fmt.Errorf("--catalog-uri must not be empty (set $URUTAU_SINK_URI or pass --catalog-uri)")
+		return remote.RemoteConfig{}, fmt.Errorf("--catalog-uri must not be empty (set $URUTAU_SINK_URI or pass --catalog-uri)")
 	}
 	logger, logBuffer, err := logging.NewBuffered(f.logLevel, f.logFormat, 2000)
 	if err != nil {
-		return worker.RemoteConfig{}, err
+		return remote.RemoteConfig{}, err
 	}
 	slog.SetDefault(logger)
 	// The Pod's memory limit, given to the garbage collector (#437).
@@ -189,7 +189,7 @@ func (f *workerFlags) config() (worker.RemoteConfig, error) {
 	if clientSecret == "" {
 		clientSecret = os.Getenv("URUTAU_SINK_CLIENT_SECRET")
 	}
-	return worker.RemoteConfig{
+	return remote.RemoteConfig{
 		Coordinator: f.coordinator,
 		Name:        f.name,
 		Namespace:   f.namespace,

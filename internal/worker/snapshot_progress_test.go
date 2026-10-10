@@ -2,19 +2,13 @@ package worker
 
 import (
 	"context"
-	"log/slog"
 	"slices"
 	"testing"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow/flight"
-
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/transport"
-	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
-	"github.com/maltzsama/urutau/position"
 )
 
 // Issue #461: a window's Closes marker names the table's snapshot chunks
@@ -46,34 +40,6 @@ func TestWindowCommitsTheSnapshotPendingItsMarkerNames(t *testing.T) {
 	got := cl.commits[0]
 	if got.rows != 2 || got.state != string(snapshot.StateInProgress) || !slices.Equal(got.pending, []uint32{3, 4}) {
 		t.Fatalf("window commit %+v, want its 2 rows with state in_progress and pending [3 4]", got)
-	}
-}
-
-// The receiver carries a Closes marker's pending chunks onto its ingest.
-func TestReceiverCarriesTheClosesMarkersPending(t *testing.T) {
-	ingest := make(chan Ingest, 1)
-	recv := &batchReceiver{
-		ctx:       context.Background(),
-		ingest:    ingest,
-		committed: map[string]position.Position{},
-		parsePos:  parsePosition("postgres"),
-		log:       slog.New(slog.DiscardHandler),
-	}
-	meta := &pb.BatchMeta{Table: "raw.orders", LowPos: "0/10", Window: &pb.WindowTag{Closes: true, WindowId: 7, SnapshotPending: []uint32{3, 4}}}
-	body, metaBytes, err := transport.EncodeBatch(nil, testSchema(), meta, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := recv.apply(&flight.FlightData{DataBody: body, AppMetadata: metaBytes}); err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-	select {
-	case ing := <-ingest:
-		if ing.Win == nil || !ing.Win.Closes || !slices.Equal(ing.SnapshotPending, []uint32{3, 4}) {
-			t.Fatalf("ingest %+v, want the Closes marker carrying pending [3 4]", ing)
-		}
-	default:
-		t.Fatal("the Closes marker was not ingested")
 	}
 }
 

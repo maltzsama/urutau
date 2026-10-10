@@ -15,7 +15,7 @@ import (
 
 	"github.com/maltzsama/urutau/internal/coordinator"
 	"github.com/maltzsama/urutau/internal/grpctls"
-	"github.com/maltzsama/urutau/internal/worker"
+	remote "github.com/maltzsama/urutau/internal/worker/remote"
 	"github.com/maltzsama/urutau/spec"
 )
 
@@ -224,7 +224,7 @@ func TestDistributedPartitionedWorkerKilled(t *testing.T) {
 			ch := make(chan error, 1)
 			wErrs[i] = ch
 			go func(name string, ch chan<- error) {
-				ch <- worker.RunRemote(wCtx, worker.RemoteConfig{
+				ch <- remote.RunRemote(wCtx, remote.RemoteConfig{
 					Coordinator: addr, Name: name, Namespace: "raw", Sink: workerSink(),
 					MaxRows: 100, MaxInterval: time.Second,
 				})

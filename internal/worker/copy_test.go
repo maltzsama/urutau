@@ -64,27 +64,6 @@ func TestUntouchedWindowClosesWithoutCopying(t *testing.T) {
 	}
 }
 
-// Keeping every row in order is the batch itself: selectRows must not copy it.
-func TestSelectingEveryRowDoesNotCopy(t *testing.T) {
-	b := toWindow(t, "raw.orders", payloadRows(1, 100, 1024))
-	defer b.Release()
-	idx := make([]int32, 100)
-	for i := range idx {
-		idx[i] = int32(i)
-	}
-	out, err := selectRows(b, idx, "p100", dataplane.AppendMode, "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer out.Release()
-	if vData(t, out.Record) != vData(t, b.Record) {
-		t.Fatal("selecting every row in order copied the batch")
-	}
-	if string(out.Watermark) != "p100" || out.Mode != dataplane.AppendMode {
-		t.Fatalf("watermark %q mode %v", out.Watermark, out.Mode)
-	}
-}
-
 // concatBatches merged pending batches pairwise: ((1+2)+3)+... copies the
 // growing prefix again for every batch, quadratic in their count. One
 // concatenation copies each batch once.
