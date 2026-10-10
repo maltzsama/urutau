@@ -181,7 +181,7 @@ spec:
       ackTimeout: 30s
       maxConsecutiveCrashes: 3
       workerDeliveryTimeout: 5m
-    tls:                              # optional control-plane mTLS (issue #594)
+    tls:                              # optional control-plane mTLS
       serverSecret: shop-cp-server-tls
       clientSecret: shop-cp-client-tls
   worker:

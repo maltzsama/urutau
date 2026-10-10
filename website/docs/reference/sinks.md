@@ -89,8 +89,7 @@ Two limits of the Iceberg library this release is built on, both upstream:
 
 Snapshot expiry and orphan cleanup are unaffected and keep running. Both
 limits are addressed in `iceberg-go` 0.7.0 (shared delete-key sets, lazy
-per-task delete loading), evaluated in
-[#464](https://github.com/maltzsama/urutau/issues/464).
+per-task delete loading).
 
 :::
 

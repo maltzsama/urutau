@@ -268,7 +268,7 @@ URUTAU_E2E_PODS=1 go test ./test/e2e/pods/ -run '^TestProductionReadinessMatrix$
   fault is active, the partition is recorded as skipped (with the reason)
   instead of failing to inject.
 - A longer live window (8 minutes) and settle (60 minutes): with four workers
-  per table and staged tables committing one cycle at a time (#414), the
+  per table and staged tables committing one cycle at a time, the
   backlog of a run took about 36 minutes to drain before converging exactly.
 
 Besides the workload's exact convergence, the run proves each item from
@@ -286,7 +286,7 @@ durable evidence, not from the coordinator's metrics (a restart resets them):
 That orphan cleanup removes a real orphan is proven where a file can be
 backdated, `TestOrphanCleanupRemovesAKnownOrphanOnly`
 (`internal/sink/iceberg`); an S3 object cannot be. The matrix found that a
-cleanup outlasting its window deleted concurrent commits (#423).
+cleanup outlasting its window deleted concurrent commits.
 
 ## Settling
 
@@ -298,7 +298,7 @@ the deadline.
 
 Partitioned tables are the slow ones to drain: with the race image a
 `workers: 2` table commits about one Iceberg snapshot per coordinator cycle,
-a median of 1–2 rows (#414), and took about 10 minutes to converge after a
+a median of 1–2 rows, and took about 10 minutes to converge after a
 3-minute smoke window. The smoke settle is 30 minutes for that reason.
 
 A failed run keeps its MySQL source tables (and, like every pod e2e run, its

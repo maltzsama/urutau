@@ -223,7 +223,7 @@ characters become `-`). `N <= 1` or absent means one worker, no
 partitioning. A sink that cannot handle concurrent writers rejects
 `N > 1` at boot. See [Distributed mode](../guides/distributed.md).
 
-`workers.max` caps runtime scaling (issues #312, #298): the coordinator may
+`workers.max` caps runtime scaling: the coordinator may
 re-slice the table up to that many workers, never beyond. Zero uses the
 coordinator's default (32); a table that sets `max` ignores the global. A
 scale-in ignores it (it is an upper bound, not a target). Under Kubernetes it
