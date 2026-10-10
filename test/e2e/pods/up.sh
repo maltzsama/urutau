@@ -49,11 +49,19 @@ say "fresh in-cluster data services (namespace e2e)"
 "$KUBECTL" apply -k test/e2e
 "$KUBECTL" -n e2e wait --for=condition=complete job/bucket-init --timeout=300s
 "$KUBECTL" -n e2e wait --for=condition=complete job/polaris-setup --timeout=300s
+# couchbase-setup replays the compose init (cluster-init, node-init to the
+# in-cluster Service DNS name, bucket-create lakehouse with replica 0). It
+# retries until the server answers, so its completion means the bucket exists
+# before any test runs.
+"$KUBECTL" -n e2e wait --for=condition=complete job/couchbase-setup --timeout=600s
 "$KUBECTL" -n e2e wait --for=condition=Available --timeout=300s deployment --all
 # The --all wait above already gates on ClickHouse's readiness probe (a
 # clickhouse-client SELECT 1), but name it so the gate survives a future
 # conversion to a StatefulSet, which --all would not cover.
 "$KUBECTL" -n e2e wait --for=condition=Available --timeout=300s deployment/clickhouse
+# The same for Couchbase: name its Deployment explicitly, and require the
+# bucket-init Job above to have completed.
+"$KUBECTL" -n e2e wait --for=condition=Available --timeout=300s deployment/couchbase
 
 say "operator ($RACE_IMAGE)"
 "$KUBECTL" apply -k test/e2e/pods/k8s/operator

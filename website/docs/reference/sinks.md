@@ -176,7 +176,7 @@ where nesting needs no special case.
 
 | `commitMode` | Behavior |
 | --- | --- |
-| `fast` (default) | data first, control document last. A crash in between leaves the position un-advanced; the restart replays the batch, which is idempotent (every mutation is keyed by primary key). |
+| `fast` (default) | data first, control document last. A crash in between leaves the position un-advanced; the restart replays the batch, which is idempotent (every mutation is keyed by primary key). This window is the `worker.couchbase-data-before-control` boundary of the crash-recovery matrix ([Commit boundaries and crash windows](../architecture/commit-boundaries.md)). |
 | `atomic` | data + control document in one distributed ACID transaction. Closes the crash window; costs transaction overhead per batch. |
 
 Every write acknowledges at synchronous-durability `majority`; on a single

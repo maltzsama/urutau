@@ -224,10 +224,20 @@ type crOptions struct {
 	// above their 500m request.
 	WorkerCPUOverhead string
 	// SinkType selects the sink implementation. Empty is the iceberg+rest
-	// default; "clickhouse" selects the ClickHouse sink. The URI and any
-	// credentials come from the catalog Secret, exactly as for Iceberg — only
-	// the type (and iceberg's warehouse) differ in the inline spec.
+	// default; "clickhouse" selects the ClickHouse sink, "couchbase" the
+	// key-document sink. The URI and any credentials come from the catalog
+	// Secret, exactly as for Iceberg — only the type (and iceberg's
+	// warehouse) differ in the inline spec.
 	SinkType string
+	// SinkNamespace is the sink's namespace as the sink itself reads it:
+	// Iceberg's catalog namespace and ClickHouse's database are both "raw";
+	// Couchbase's namespace is the bucket, "lakehouse". Empty defaults to
+	// "raw" so the existing scenarios are unchanged.
+	SinkNamespace string
+	// CommitMode is Couchbase's commit sequencing selector ("fast" | "atomic").
+	// Empty omits the field, letting the sink default to fast; every other
+	// sink type rejects a non-empty commitMode.
+	CommitMode string
 	// SourceKind selects the source driver. Empty is the mysql default;
 	// "postgres" selects the PostgreSQL source (its URI comes from the source
 	// Secret, and SlotName is required).
@@ -271,11 +281,18 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		}
 		rendered = append(rendered, t)
 	}
+	sinkNS := opts.SinkNamespace
+	if sinkNS == "" {
+		sinkNS = "raw"
+	}
 	sink := map[string]any{
-		"type": sinkKind, "namespace": "raw",
+		"type": sinkKind, "namespace": sinkNS,
 	}
 	if sinkKind == "iceberg+rest" {
 		sink["warehouse"] = "quickstart_catalog"
+	}
+	if opts.CommitMode != "" {
+		sink["commitMode"] = opts.CommitMode
 	}
 	if opts.MaintenanceBlock != nil {
 		sink["maintenance"] = opts.MaintenanceBlock

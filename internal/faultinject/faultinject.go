@@ -63,6 +63,16 @@ const (
 	// back in and resumes past the batch (see the ClickHouse section of
 	// commit-boundaries.md).
 	WorkerClickHouseDataBeforePosition Point = "worker.clickhouse-data-before-position"
+	// WorkerCouchbaseDataBeforeControl: the Couchbase sink's fast commit
+	// path wrote the batch's data documents durably (upsert-by-key, or
+	// remove-by-key) and has not yet written the control document carrying
+	// the committed position. A crash here leaves the data durable and the
+	// position un-advanced; the restart replays the batch, which rewrites
+	// the same key-addressed documents (no duplication possible) and then
+	// advances the position. In atomic mode the data and control writes are
+	// one transaction, so this window does not exist there (see the
+	// Couchbase section of commit-boundaries.md).
+	WorkerCouchbaseDataBeforeControl Point = "worker.couchbase-data-before-control"
 	// CoordinatorAckBeforeRecord: the coordinator received an ack and has
 	// not recorded it (D5).
 	CoordinatorAckBeforeRecord Point = "coordinator.ack-before-record"
@@ -89,6 +99,7 @@ var Points = []Point{
 	WorkerCommitBefore,
 	WorkerCommittedBeforeAck,
 	WorkerClickHouseDataBeforePosition,
+	WorkerCouchbaseDataBeforeControl,
 	CoordinatorAckBeforeRecord,
 	WorkerStagedBeforeShip,
 	WorkerStagedShippedBeforeAck,
