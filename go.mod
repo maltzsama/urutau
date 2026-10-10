@@ -24,7 +24,7 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	github.com/shopspring/decimal v1.5.0
 	github.com/spf13/cobra v1.10.2
-	github.com/trinodb/trino-go-client v0.337.0
+	github.com/trinodb/trino-go-client v1.0.0
 	github.com/twmb/franz-go v1.22.1
 	github.com/twmb/franz-go/pkg/kmsg v1.14.0
 	golang.org/x/crypto v0.58.0
