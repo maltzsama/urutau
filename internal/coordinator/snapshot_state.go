@@ -196,7 +196,7 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 func allChunkRefs(all []source.Chunk, ranges []source.Chunk) (map[uint32]bool, error) {
 	todo := map[uint32]bool{}
 	for p, r := range ranges {
-		clipped, err := clipChunksToRange(all, r)
+		clipped, err := snapshot.ClipChunksToRange(all, r)
 		if err != nil {
 			return nil, fmt.Errorf("coordinator: clip partition %d: %w", p, err)
 		}

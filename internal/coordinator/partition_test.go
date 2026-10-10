@@ -5,154 +5,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/partition"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
 )
 
-func TestComparePKOrdersInt64(t *testing.T) {
-	cases := []struct {
-		a, b []any
-		want int
-	}{
-		{[]any{int64(1)}, []any{int64(2)}, -1},
-		{[]any{int64(5)}, []any{int64(5)}, 0},
-		{[]any{int64(9)}, []any{int64(2)}, 1},
-	}
-	for _, c := range cases {
-		if got := sign(mustComparePK(t, c.a, c.b)); got != c.want {
-			t.Errorf("comparePK(%v, %v) sign = %d, want %d", c.a, c.b, got, c.want)
-		}
-	}
-}
-
-func TestComparePKOrdersStrings(t *testing.T) {
-	if mustComparePK(t, []any{"aaa"}, []any{"aab"}) >= 0 {
-		t.Fatal(`comparePK("aaa", "aab") should be < 0`)
-	}
-}
-
-func mustComparePK(t *testing.T, a, b []any) int {
-	t.Helper()
-	c, err := comparePK(a, b)
-	if err != nil {
-		t.Fatalf("comparePK(%v, %v): %v", a, b, err)
-	}
-	return c
-}
-
 func mustPartitionOwner(t *testing.T, ranges []source.Chunk, key []any) int {
 	t.Helper()
-	p, err := partitionOwner(ranges, key)
+	p, err := partition.Owner(ranges, key)
 	if err != nil {
-		t.Fatalf("partitionOwner(%v): %v", key, err)
+		t.Fatalf("partition.Owner(%v): %v", key, err)
 	}
 	return p
-}
-
-func mustClip(t *testing.T, chunks []source.Chunk, r source.Chunk) []source.Chunk {
-	t.Helper()
-	out, err := clipChunksToRange(chunks, r)
-	if err != nil {
-		t.Fatalf("clipChunksToRange: %v", err)
-	}
-	return out
-}
-
-func sign(n int) int {
-	switch {
-	case n < 0:
-		return -1
-	case n > 0:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func TestPartitionOwnerSingleRangeAlwaysZero(t *testing.T) {
-	ranges := []source.Chunk{{}}
-	if got := mustPartitionOwner(t, ranges, []any{int64(12345)}); got != 0 {
-		t.Fatalf("partitionOwner with one range = %d, want 0", got)
-	}
-}
-
-func TestPartitionOwnerThreeWayContiguous(t *testing.T) {
-	// [-, 100), [100, 200), [200, -)
-	ranges := []source.Chunk{
-		{Low: nil, High: []any{int64(100)}},
-		{Low: []any{int64(100)}, High: []any{int64(200)}},
-		{Low: []any{int64(200)}, High: nil},
-	}
-	cases := []struct {
-		key  int64
-		want int
-	}{
-		{0, 0}, {99, 0}, {100, 1}, {150, 1}, {199, 1}, {200, 2}, {1000, 2},
-	}
-	for _, c := range cases {
-		got := mustPartitionOwner(t, ranges, []any{c.key})
-		if got != c.want {
-			t.Errorf("partitionOwner(key=%d) = %d, want %d", c.key, got, c.want)
-		}
-	}
-}
-
-func TestPartitionOwnerNoMatchReturnsNegativeOne(t *testing.T) {
-	// A gap in the ranges (shouldn't happen from Partitions(), but the
-	// function must not silently misroute if it ever does).
-	ranges := []source.Chunk{
-		{Low: nil, High: []any{int64(10)}},
-		{Low: []any{int64(20)}, High: nil},
-	}
-	if got := mustPartitionOwner(t, ranges, []any{int64(15)}); got != -1 {
-		t.Fatalf("partitionOwner(key=15) = %d, want -1 (gap between ranges)", got)
-	}
-}
-
-func TestClipChunksToRangeUnpartitionedPassesThrough(t *testing.T) {
-	chunks := []source.Chunk{{Low: []any{int64(0)}, High: []any{int64(10)}}}
-	got := mustClip(t, chunks, source.Chunk{})
-	if len(got) != 1 || got[0].Low[0] != int64(0) {
-		t.Fatalf("clipChunksToRange with an empty range should pass chunks through unchanged: %+v", got)
-	}
-}
-
-func TestClipChunksToRangeDropsOutsideChunks(t *testing.T) {
-	chunks := []source.Chunk{
-		{Low: nil, High: []any{int64(50)}},
-		{Low: []any{int64(50)}, High: []any{int64(100)}},
-		{Low: []any{int64(100)}, High: nil},
-	}
-	// Partition range [50, 100) should keep only the middle chunk.
-	got := mustClip(t, chunks, source.Chunk{Low: []any{int64(50)}, High: []any{int64(100)}})
-	if len(got) != 1 {
-		t.Fatalf("clipChunksToRange = %+v, want exactly 1 chunk", got)
-	}
-	if mustComparePK(t, got[0].Low, []any{int64(50)}) != 0 || mustComparePK(t, got[0].High, []any{int64(100)}) != 0 {
-		t.Fatalf("clipped chunk = %+v, want [50,100)", got[0])
-	}
-}
-
-func TestClipChunksToRangeClampsStraddlingChunk(t *testing.T) {
-	// One big chunk [0, 1000) straddles a [200, 400) partition range —
-	// the clipped chunk must not leak rows outside [200,400).
-	chunks := []source.Chunk{{Low: []any{int64(0)}, High: []any{int64(1000)}}}
-	got := mustClip(t, chunks, source.Chunk{Low: []any{int64(200)}, High: []any{int64(400)}})
-	if len(got) != 1 {
-		t.Fatalf("clipChunksToRange = %+v, want 1 clamped chunk", got)
-	}
-	if mustComparePK(t, got[0].Low, []any{int64(200)}) != 0 || mustComparePK(t, got[0].High, []any{int64(400)}) != 0 {
-		t.Fatalf("clamped chunk = %+v, want [200,400)", got[0])
-	}
-}
-
-func TestClipChunksToRangeRejectsUnorderedBounds(t *testing.T) {
-	chunks := []source.Chunk{{Low: []any{"a"}, High: []any{"z"}}}
-	if _, err := clipChunksToRange(chunks, source.Chunk{Low: []any{int64(50)}}); err == nil {
-		t.Fatal("clipChunksToRange: want an error for string chunk bounds against an int64 partition range")
-	}
 }
 
 // testChange is a minimal insert row for building a wire-shape test record.

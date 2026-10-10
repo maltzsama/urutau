@@ -13,9 +13,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,15 +23,11 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/dashboard"
-	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
-	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
-	"github.com/maltzsama/urutau/internal/snapshot"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -247,6 +241,10 @@ type Coordinator struct {
 
 	ready       chan struct{} // one send per attached session
 	sessionErrs chan error    // first exit wins
+	// streamErrs carries the source stream's terminal signal (sourceBatches),
+	// set by phaseStream before the terminal wait and read only by
+	// awaitTerminal.
+	streamErrs <-chan error
 	// ackNotify wakes awaitChunkCommits waiters when an ack may have dropped
 	// in-flight markers, so the snapshot pacer waits on an event instead of
 	// polling (issue #587). Buffered 1 + non-blocking send: coalesced, never
@@ -581,512 +579,97 @@ func Run(ctx context.Context, cfg Config) error {
 	return c.run(ctx)
 }
 
+// run boots the pipeline as a short sequence of named phases and blocks until
+// ctx is cancelled or a terminal error occurs. Each phase is documented on its
+// own method; the deferred cleanups stay here, in acquisition order, so they
+// unwind LIFO exactly as the original single function did.
 func (c *Coordinator) run(ctx context.Context) error {
 	c.runCtx = ctx
 
-	if cfg := c.cfg.Eventlog; cfg != nil {
-		// startEventlog opens the trail and attaches the log trail, so the
-		// run's history (events AND logs) reaches S3; its stop func drains
-		// the log trail before sealing the run.
-		stop, err := c.startEventlog(ctx, *cfg)
-		if err != nil {
-			return err
-		}
-		defer stop()
+	stopEventlog, err := c.phaseEventlog(ctx)
+	if err != nil {
+		return err
 	}
+	defer stopEventlog()
 
 	// Reject a bootstrap block this mode ignores before touching the source:
 	// the error must not hide behind a connection or introspection failure.
-	// Discovered tables (source.ExpandTables) never carry one, so checking
-	// the declared list is enough.
+	// Discovered tables (source.ExpandTables) never carry one, so checking the
+	// declared list is enough.
 	for _, t := range c.cfg.Spec.Tables {
 		if err := requireSnapshotBootstrap(t); err != nil {
 			return err
 		}
 	}
 
-	// Source adapter, query connection, introspection — identical to the
-	// collapsed runner; only the worker side differs.
-	src, err := driver.OpenSource(c.cfg.Spec, source.Runtime{
-		ServerID:         c.cfg.ServerID,
-		Heartbeat:        c.cfg.Heartbeat,
-		Logger:           c.log,
-		OnDestructiveDDL: c.reportDestructiveDDL,
-	})
+	if err := c.phaseSource(); err != nil {
+		return err
+	}
+	defer c.closeQuery()
+
+	resolved, tableBySource, err := c.phaseResolveTables(ctx)
 	if err != nil {
 		return err
 	}
-	c.src = src
-	// QuerySource is optional: it backs NewChunker, the snapshot/re-slice
-	// chunking surface, which only a relational, snapshot-capable source
-	// (Capabilities.Snapshot or ChunkQuery) ever calls. A source with
-	// neither, like Kafka, has no SQL query connection at all (kafka.Source's
-	// own doc comment) and must boot with c.qsrc == nil; every call site
-	// gates on the source's capabilities before touching it (issue #394).
-	if qsrc, ok := src.(source.QuerySource); ok {
-		c.qsrc = qsrc
-		defer func() { _ = qsrc.CloseQuery() }()
-	}
-	// The parallel-chunk setting may not exceed the ceiling the source
-	// driver declares — fail fast at boot, not mid-snapshot.
-	if err := driver.ValidateParallelism(c.cfg.Spec.Source.Kind, c.cfg.MaxParallelChunks); err != nil {
-		return fmt.Errorf("coordinator: %w", err)
-	}
-
-	// A discovery pipeline lists no tables: the source enumerates them now.
-	// The write-back must land BEFORE the partition-range loop below, which
-	// indexes the expanded table list positionally against refs — a second list
-	// would desync the ranges from the tables.
-	tables, err := source.ExpandTables(ctx, src, c.cfg.Spec)
-	if err != nil {
-		return fmt.Errorf("coordinator: %w", err)
-	}
-	// The metrics server boots before run() and serves /statusz concurrently,
-	// so the expanded list is stored under the lock those handlers read it
-	// with — cfg.Spec is left untouched (issue #556).
-	c.mu.Lock()
-	c.tables = tables
-	c.mu.Unlock()
-
-	refs := make([]source.TableRef, 0, len(tables))
-	// canonical holds the WIRE shape (source types; the workers encode it
-	// and the sink casts). resolvedSchemas holds the sink's target shape
-	// (cast types + metadata columns) for DDL.
-	canonical := make(map[string]core.Schema, len(tables))
-	resolvedSchemas := make(map[string]core.Schema, len(tables))
-	tableBySource := make(map[string]spec.Table, len(tables))
-	for _, t := range tables {
-		ref, srcSchema, srcWarns, err := src.Introspect(ctx, t)
-		if err != nil {
-			return err
-		}
-		c.surfaceWarnings(ref.Source, srcWarns)
-		cast, err := coreCastOf(t)
-		if err != nil {
-			return err
-		}
-		res, warns, err := core.ResolveSchema(srcSchema, cast, t.Metadata)
-		if err != nil {
-			return fmt.Errorf("coordinator: table %s: %w", t.Target, err)
-		}
-		c.surfaceWarnings(ref.Source, warns)
-		refs = append(refs, ref)
-		// Reference columns join BOTH shapes: the assignment/wire schema
-		// the worker encodes against and the resolved schema EnsureTable
-		// creates the table from. Without it, the first enriched batch
-		// carries a column the table lacks and every sink silently drops
-		// it. Registered decision: nullable strings until CR-069 resolves
-		// real types.
-		//
-		// The coordinator has no Stage of its own (it forwards enrich
-		// declarations to the worker, which runs the real, long-lived
-		// join). For a wildcard select, the real column names are only
-		// known once the reference query runs — LoadWildcardColumns runs
-		// it synchronously here, at boot, so canonical/resolvedSchemas are
-		// correct before EnsureTable and before any worker session
-		// connects (#56). This is a second, short-lived query against the
-		// reference beyond the worker's own load — an accepted,
-		// disclosed cost of the coordinator/worker split (no shared
-		// connection between the two processes).
-		dests, err := enrich.LoadWildcardColumns(ctx, t.Enrich)
-		if err != nil {
-			return fmt.Errorf("coordinator: %s: enrich: %w", t.Source, err)
-		}
-		canonical[t.Source] = enrich.AddColumns(core.WireSchema(srcSchema, res), dests)
-		resolvedSchemas[t.Source] = enrich.AddColumns(res, dests)
-		tableBySource[t.Source] = t
-	}
-	c.refs = refs
-	c.canonical = canonical
-	// Index the boot lists so the per-batch lookups do not scan them
-	// (issue #582).
-	c.refByTarget = make(map[string]core.TableRef, len(refs))
-	for _, ref := range refs {
-		c.refByTarget[ref.Target] = ref
-	}
-	c.specBySource = make(map[string]spec.Table, len(tables))
-	c.specByTarget = make(map[string]spec.Table, len(tables))
-	for _, t := range tables {
-		c.specBySource[t.Source] = t
-		c.specByTarget[t.Target] = t
-	}
-
-	// Incremental mode (#157) is implemented in the collapsed runner only.
-	// Reject it here rather than treat an incremental table as CDC and open a
-	// slot for it.
-	for _, t := range tables {
-		if t.Mode == spec.ModeIncremental {
-			return fmt.Errorf("coordinator: %s: incremental mode is not supported in distributed mode yet — run this table in the collapsed runner", t.Target)
-		}
-	}
-
-	// Fail loud on an upsert table with no key BEFORE resolving or
-	// provisioning worker groups: a discovered keyless table would otherwise
-	// create worker Deployments and then abort, leaving orphaned resources
-	// across repeated boot failures.
-	for _, ref := range refs {
-		if err := dataplane.RequireUpsertKey(ref.Target, ref.PrimaryKey, tableBySource[ref.Source].WriteMode.ChangeMode()); err != nil {
-			return fmt.Errorf("coordinator: %w", err)
-		}
-	}
-
-	// Resolve worker groups: one per partition, derived
-	// "<pipeline>-<target>-<index>" name (spec.Table.WorkerGroupNames) —
-	// there is no operator-chosen worker name, so two tables can never
-	// collide on one (each name embeds its own unique target).
-	//
-	// A table's partition RANGES are computed here, at boot, for every
-	// table — not only the ones needing a snapshot — because live-stream
-	// routing (enqueueBatch) depends on them from the first batch, resume
-	// or not. Workers<=1 short-circuits to a single unbounded range with
-	// no chunker query at all, so this is a no-op for every unpartitioned
-	// table (the overwhelming common case today).
-	bootRanges := make(map[string][]source.Chunk, len(tables))
-	bootOwners := make(map[string][]*workerState, len(tables))
-	c.chunkers = make(map[string]source.ChunkSource, len(tables))
-	// workerTarget maps every derived worker group name back to the table
-	// target it belongs to — provisionWorkers uses it to pick that
-	// table's own worker Pod template (one per table, rendered by the
-	// operator into the coordinator's ConfigMap).
-	workerTarget := make(map[string]string, len(tables))
-	for i, t := range tables {
-		if err := requirePartitionKey(t, refs[i]); err != nil {
-			return err
-		}
-		names := t.WorkerGroupNames(c.cfg.Spec.Pipeline)
-		// Ranges are no longer sampled: ownership is the rendezvous hash
-		// (route.OwnerOfKey), so resolvePartitionRanges returns the single
-		// unbounded range the DBLog read covers and only builds the chunker.
-		ranges, chunker, err := c.resolvePartitionRanges(ctx, t, refs[i])
-		if err != nil {
-			return fmt.Errorf("coordinator: %s: %w", t.Source, err)
-		}
-		if len(ranges) == 0 {
-			return fmt.Errorf("coordinator: %s: no partition range resolved", t.Source)
-		}
-		bootRanges[t.Target] = ranges
-		c.chunkers[t.Target] = chunker
-
-		owners := make([]*workerState, len(names))
-		for p, name := range names {
-			owners[p] = c.bootWorker(name, refs[i])
-			workerTarget[name] = t.Target
-		}
-		bootOwners[t.Target] = owners
-	}
-	// Publish the boot layout once: every runtime reader loads this
-	// snapshot, and a re-slice swaps in a successor (issue #312).
-	c.publishRouting(&routing{owners: bootOwners, ranges: bootRanges})
-	if c.cfg.OnReady != nil {
-		c.cfg.OnReady(c)
-	}
-	c.workerK8s = workerPodTemplateAvailable(workerTarget)
-	if err := c.provisionWorkers(ctx, workerTarget); err != nil {
-		return fmt.Errorf("coordinator: %w", err)
-	}
-	for _, w := range c.workers {
-		c.log.Info("coordinator worker group", "worker", w.name, "tables", len(w.refs))
-		if err := c.emit(eventlog.KindWorkerCreated, map[string]any{
-			"worker": w.name,
-			"tables": tableNames(w.refs),
-		}); err != nil {
-			c.log.Warn("coordinator: eventlog emit", "err", err)
-		}
-	}
-	if cfg := c.cfg.Checkpoint; cfg != nil {
-		cp, err := newCheckpoint(ctx, *cfg)
-		if err != nil {
-			return fmt.Errorf("coordinator: checkpoint: %w", err)
-		}
-		c.cp = cp
-		go cp.run(ctx, c.runID, c.indexSnapshot, c.log)
-		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
-	}
-
-	// Sink + tables: the coordinator owns DDL.
-	snk, err := driver.OpenSink(ctx, c.cfg.Spec)
-	if err != nil {
-		return fmt.Errorf("coordinator: catalog: %w", err)
-	}
-	c.snk = snk
-	// The sink is opened on every error path between here and the defers;
-	// Close on every exit, not just the happy one (audit #14).
-	defer func() { _ = c.snk.Close() }()
-
-	// (2) A partitioned table needs a sink that can serve N concurrent
-	// writers. Checked by CAPABILITY, not by sink type name: a plugin
-	// registers whatever name it wants. The capability must be declared
-	// false until the sink's concurrent path is actually built, so this
-	// refuses the boot instead of letting N writers corrupt one table.
-	for _, t := range tables {
-		if err := requireConcurrentSink(t, c.snk); err != nil {
-			return err
-		}
-	}
-
-	for _, ref := range refs {
-		tbl := tableBySource[ref.Source]
-		// The cast policy must reach DDL: an empty policy here creates a
-		// table whose types diverge from the collapsed runner's (audit #8).
-		cast, err := coreCastOf(tbl)
-		if err != nil {
-			return err
-		}
-		mode := tbl.WriteMode.ChangeMode()
-		if err := snk.EnsureTable(ctx, ref, resolvedSchemas[ref.Source], tbl.PartitionBy, cast, mode); err != nil {
-			return fmt.Errorf("coordinator: ensure %s: %w", ref.Target, err)
-		}
-	}
-
-	// Iceberg table maintenance (issue #96): the coordinator SCHEDULES
-	// maintenance but does not run it in its own process. With Kubernetes
-	// worker provisioning available it provisions an ephemeral maintenance
-	// worker per table (from the table's own worker pod template) and pushes
-	// the due operations to it over the control stream; the worker dies when
-	// the pass is done, so no maintenance work competes with the
-	// coordinator's routing/commit path. Without Kubernetes there is no
-	// worker to launch — the collapsed runner's in-process schedule is the
-	// only path there. Checked against the NEUTRAL sink.Maintainable
-	// interface — never a concrete sink package, which internal/architecture's
-	// TestOrchestrationConsumesContracts forbids the coordinator from
-	// importing. Maintenance is Iceberg-only (spec.Validate rejects it on
-	// any other sink type), so a sink that does not implement the capability
-	// here is a bug, not a configuration to tolerate: fail loudly, exactly
-	// like requireConcurrentSink above. Skipped entirely when Maintenance is
-	// nil or disabled.
-	if err := c.startMaintenance(refs, workerTarget); err != nil {
+	if err := c.phaseValidateTables(tableBySource); err != nil {
 		return err
 	}
-
-	resume, needsSnapshot, err := c.resumeFrom(ctx, refs)
+	workerTarget, err := c.phaseResolveRouting(ctx)
 	if err != nil {
 		return err
 	}
-	c.log.Info("coordinator resume", "from", position.StringOrNone(resume), "snapshot_tables", len(needsSnapshot))
-	// Before any worker can commit: a crash from here on must find these
-	// tables unfinished, whatever positions the stream commits to them.
-	if err := c.markSnapshotsPending(ctx, needsSnapshot); err != nil {
+	if err := c.phaseProvisionWorkers(ctx, workerTarget); err != nil {
 		return err
 	}
-
-	// Baseline every worker's confirmed position to the run's resume point.
-	// confirmedPosition() takes the min over the map, so a worker that has
-	// not acked yet must be IN the map holding that min back — omitting it
-	// let the source slot advance past data a worker had not committed
-	// (WK-001 §2.2). resume is nil on a fresh boot, which correctly holds the
-	// slot until every worker has committed at least once.
-	c.confirmedMu.Lock()
-	for name := range c.workers {
-		c.confirmed[name] = resume
+	if err := c.phaseOpenSink(ctx, resolved, tableBySource); err != nil {
+		return err
 	}
-	c.confirmedMu.Unlock()
+	defer c.closeSink()
+
+	needsSnapshot, resume, err := c.phaseMaintenanceResumeBaseline(ctx, workerTarget)
+	if err != nil {
+		return err
+	}
 
 	// Serve gRPC (control) + Flight (data) on one listener.
-	lis, err := net.Listen("tcp", c.cfg.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("coordinator: listen: %w", err)
-	}
-	defer func() { _ = lis.Close() }()
-	c.log.Info("coordinator listening", "addr", lis.Addr().String())
-
-	grpcServer, err := c.startControlServer(lis)
+	cleanupServe, err := c.phaseServe()
 	if err != nil {
 		return err
 	}
-	defer grpcServer.Stop()
+	defer cleanupServe()
 
-	// Wait for every expected worker session.
-	wait := c.cfg.WaitWorker
-	if wait <= 0 {
-		wait = 2 * time.Minute
-	}
-	if err := c.waitWorkers(ctx, wait); err != nil {
-		return err
-	}
-	close(c.booted)
-
-	// Reader + stream, then snapshot — the DBLog loop the collapsed runner
-	// runs, routed over the wire instead of an in-process channel.
-	rdr, err := c.src.Open(ctx, refs)
+	rdr, err := c.phaseStream(ctx, resume)
 	if err != nil {
 		return err
 	}
 	defer rdr.Close()
-	// A source that reports decoder drops (Kafka onDecodeError: skip) exposes
-	// the running count; the lag loop polls it for the skipped gauge (#602).
-	if de, ok := rdr.(interface{ DecodeErrors() int64 }); ok {
-		c.decodeErrors = de.DecodeErrors
-	}
-	// A source that can take the resolved schema (optional interface) gets
-	// it now: the source boundary then gates on drift against the native
-	// shape and encodes stable batches. Keyed by the TARGET the changes are
-	// addressed to.
-	if si, ok := rdr.(source.SchemaSetter); ok {
-		byTarget := make(map[string]core.Schema, len(refs))
-		for _, ref := range refs {
-			if cs, ok := c.canonical[ref.Source]; ok {
-				byTarget[ref.Target] = cs
-			}
-		}
-		si.SetSourceSchemas(byTarget)
-	}
-	// The slot's confirmed point tracks the minimum position workers have
-	// durably committed (their Acks), never the decode position — otherwise
-	// a crash between decode and commit would lose the in-flight window.
-	rdr.SetConfirmed(c.confirmedPosition)
 
-	start := resume
-	if start == nil {
-		m, err := c.src.InitialPosition(ctx)
-		if err != nil {
-			return fmt.Errorf("coordinator: initial position: %w", err)
-		}
-		start = m
-	}
-	if err := rdr.Start(ctx, start); err != nil {
-		return fmt.Errorf("coordinator: start stream: %w", err)
-	}
-	// Batch-native pump (G0/M4): the reader's batches are forwarded whole
-	// and serialized once per batch — no decode back to changes, no
-	// per-change one-row Flight batch. The FIFO queue preserves the wire
-	// ordering the window protocol needs.
-	out, streamErr := sourceBatches(ctx, rdr)
-	// Lag grows between commits, so the gauge needs its own clock: setting it
-	// on the ack path would pin it near zero after every commit and never let
-	// it rise. Mirrors the dashboard's on-demand Tables(). Started only now:
-	// it reads c.snk and c.tables, which boot writes above, and a
-	// loop started earlier raced them (the race image aborted a restarting
-	// coordinator on it). Before the pump runs there is no lag to report.
-	if c.metrics != nil {
-		go c.lagLoop(ctx)
-		go c.dashPushLoop(ctx)
-	}
-	go c.pump(ctx, out)
-	// Routing is published and the pump is draining the stream: ready (issue
-	// #601). Set before the snapshot so a coordinator mid-snapshot is ready —
-	// it serves workers and commits; only a coordinator still booting is not.
-	c.readiness.Store(true)
-
-	// The snapshot runs in its own goroutine: run's terminal select must
-	// stay live underneath it. A worker dying mid-snapshot otherwise wedges
-	// the run forever — the snapshot loop blocks on waitChunkReadyOr, the
-	// session error lands in sessionErrs, and nobody reads it (audit #1).
-	snapCtx, snapCancel := context.WithCancel(ctx)
+	snapCancel, snapDone := c.phaseSnapshot(ctx, rdr, needsSnapshot)
 	defer snapCancel()
-	c.snapshotActive.Store(true)
-	// Supervision from the start: mid-snapshot only its delivery rule
-	// applies (a table's only worker delivering nothing for the delivery
-	// timeout ends the run); the ack-timeout reset waits for the stream.
-	go c.supervisor.run(ctx, supervisionConfig(c.cfg), c.terminate)
-	snapDone := make(chan error, 1)
-	go func() {
-		defer c.snapshotActive.Store(false)
-		defer snapCancel()
-		defer close(snapDone)
-		// A cancelled snapshot returns before closeWindow, leaving batches
-		// held in an open gate. Release them when the phase ends (normally a
-		// no-op — closeWindow already drained each partition) so shutdown does
-		// not leak Arrow batches (issue #212). gateHold re-checks the window
-		// under gateMu before appending, so clearing it here cannot race a
-		// late gate.
-		defer c.releaseAllGates()
-		snapCfg := snapshot.SnapshotConfig{
-			WindowTimeout: c.cfg.WindowTimeout,
-			CaughtUpPoll:  c.cfg.CaughtUpPoll,
-		}
-		for _, ref := range needsSnapshot {
-			c.log.Info("coordinator snapshot", "table", ref.Source)
-			faultinject.At(faultinject.CoordinatorSnapshotTableStart, "table", ref.Target)
-			if err := c.emit(eventlog.KindSnapshotStarted, map[string]any{"table": ref.Source}); err != nil {
-				c.log.Warn("coordinator: eventlog emit", "err", err)
-			}
-			chunker := c.lookupChunker(ref.Target)
-			if chunker == nil {
-				var cerr error
-				chunker, cerr = c.qsrc.NewChunker(ref.Source, strings.Join(ref.PrimaryKey, ","), c.cfg.ChunkSize)
-				if cerr != nil {
-					snapDone <- fmt.Errorf("coordinator: chunker %s: %w", ref.Source, cerr)
-					return
-				}
-			}
-			if err := c.snapshotTable(snapCtx, rdr, chunker, ref, snapCfg); err != nil {
-				snapDone <- fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
-				return
-			}
-			if err := c.finishSnapshot(snapCtx, ref); err != nil {
-				snapDone <- fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
-				return
-			}
-			c.log.Info("coordinator snapshot done", "table", ref.Source)
-			if err := c.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source}); err != nil {
-				c.log.Warn("coordinator: eventlog emit", "err", err)
-			}
-		}
-		snapDone <- nil
-	}()
 
 	// Wait for the snapshot, aborting on any terminal signal: the snapshot
 	// cannot progress without its worker, and a session or stream death
-	// mid-snapshot is a real run error — not a wedge to wait out.
-	select {
-	case err := <-snapDone:
-		if err != nil {
-			c.emitLog(eventlog.KindJobStopped, terminalFields("snapshot", err))
-			return err
-		}
-	case <-ctx.Done():
-		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobStopped, terminalFields("shutdown", ctx.Err()))
-		return ctx.Err()
-	case err := <-c.sessionErrs:
-		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobStopped, terminalFields("session", err))
-		return fmt.Errorf("coordinator: worker session: %w", err)
-	case err := <-streamErr:
-		return c.streamTerminal(err)
-	case err := <-c.terminate:
-		c.gracefulShutdown()
-		c.emitLog(eventlog.KindJobTerminated, terminalFields(terminateReason(err), err))
+	// mid-snapshot is a real run error — not a wedge to wait out. A snapshot
+	// failure (done == false with an error) ends the run; a clean snapshot
+	// completion (done == true) falls through to the steady-state wait.
+	if done, err := c.awaitTerminal(ctx, snapDone); !done {
 		return err
 	}
 
-	// Replica reconcile after the snapshot too: the snapshot assigns chunks
-	// by the boot routing, and a re-slice mid-snapshot would move a range
-	// out from under it. KEDA owns the worker replica count; this follows it
-	// (issue #298). A no-op unless Kubernetes worker provisioning is on.
+	// Replica reconcile after the snapshot too: the snapshot assigns chunks by
+	// the boot routing, and a re-slice mid-snapshot would move a range out from
+	// under it. KEDA owns the worker replica count; this follows it (issue
+	// #298). A no-op unless Kubernetes worker provisioning is on.
 	go c.scaleReconcileLoop(ctx)
 
-	// Block until the world ends. ctx.Done is checked first on every pass so
-	// a cancelled run never races a session defer's context.Canceled into
-	// the report as a spurious worker failure (audit #11); the ctx.Err()
-	// guard on the error cases closes the residual race. gracefulShutdown
-	// runs on every exit.
-	for {
-		select {
-		case <-ctx.Done():
-			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobStopped, terminalFields("shutdown", ctx.Err()))
-			return ctx.Err()
-		case err := <-c.terminate:
-			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobTerminated, terminalFields(terminateReason(err), err))
-			return err
-		case err := <-streamErr:
-			if ctx.Err() != nil {
-				c.gracefulShutdown()
-				return ctx.Err()
-			}
-			return c.streamTerminal(err)
-		case err := <-c.sessionErrs:
-			if ctx.Err() != nil {
-				c.gracefulShutdown()
-				return ctx.Err()
-			}
-			c.gracefulShutdown()
-			c.emitLog(eventlog.KindJobStopped, terminalFields("session", err))
-			return fmt.Errorf("coordinator: worker session: %w", err)
-		}
-	}
+	// Block until the world ends. ctx.Done is checked first on every pass so a
+	// cancelled run never races a session defer's context.Canceled into the
+	// report as a spurious worker failure (audit #11); the ctx.Err() guard on
+	// the error cases closes the residual race. gracefulShutdown runs on every
+	// exit. A nil extra never resolves, so this returns only on a terminal
+	// signal.
+	_, err = c.awaitTerminal(ctx, nil)
+	return err
 }
 
 // ── gRPC control plane ───────────────────────────────────────────────
