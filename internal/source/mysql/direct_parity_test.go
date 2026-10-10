@@ -73,6 +73,67 @@ func TestDirectPathMatchesRowEncoding(t *testing.T) {
 	}
 }
 
+// TestDirectPathNoPerRowMap pins the #455 memory bar: decoding binlog rows
+// straight into the Arrow builders allocates no per-row map[string]any. It
+// measures the direct path against the old row path (rowToMap per row, then
+// RecordFromChanges) for the same images; the row path's excess is exactly the
+// per-row map plus its interface boxing that #455 removes.
+//
+// The bar was set before the code existed: on the pinned toolchain the direct
+// path measures ~2.6 allocs/row and the row path ~4.6. The direct path must
+// stay strictly below the row path AND under a fixed 4.0/row ceiling, so a
+// future change that reintroduces a map on the hot path fails here.
+func TestDirectPathNoPerRowMap(t *testing.T) {
+	tbl := ordersTable()
+	cs := ordersSchema()
+	const n = 300
+	images := make([][]any, n)
+	for i := range images {
+		images[i] = []any{int64(i), []byte("value"), float64(i) + 0.5}
+	}
+
+	direct := testing.AllocsPerRun(20, func() {
+		te, err := newTableEncoder("raw.orders", cs, tbl, projection{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer te.enc.Release()
+		for _, row := range images {
+			if err := te.appendRow(row, tbl, time.UTC, transport.RowMeta{Op: rowchange.OpInsert}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if rec := te.materialize(); rec != nil {
+			rec.Release()
+		}
+	})
+
+	rowPath := testing.AllocsPerRun(20, func() {
+		changes := make([]rowchange.Change, 0, n)
+		for _, row := range images {
+			changes = append(changes, rowchange.Change{
+				Op:    rowchange.OpInsert,
+				Table: "raw.orders",
+				After: rowToMap(tbl, row, time.UTC),
+			})
+		}
+		rec, err := transport.RecordFromChanges(changes, cs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.Release()
+	})
+
+	directPerRow, rowPerRow := direct/n, rowPath/n
+	t.Logf("direct %.2f allocs/row, row path %.2f allocs/row", directPerRow, rowPerRow)
+	if directPerRow >= rowPerRow {
+		t.Fatalf("direct path allocates %.2f/row, row path %.2f/row — the per-row map was not removed (#455)", directPerRow, rowPerRow)
+	}
+	if directPerRow >= 4.0 {
+		t.Fatalf("direct path allocates %.2f/row, want < 4.0 (the #455 bar)", directPerRow)
+	}
+}
+
 // TestDirectPathAppliesProjection pins that a columnFilter narrows the wire
 // shape: the encoder writes only the projected columns.
 func TestDirectPathAppliesProjection(t *testing.T) {
