@@ -87,7 +87,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	defer c.setSnapshotTodo(ref.Target, nil)
 	var emptyOwners []string
 	for p, w := range owners {
-		clipped, err := clipChunksToRange(allChunks, ranges[p])
+		clipped, err := snapshot.ClipChunksToRange(allChunks, ranges[p])
 		if err != nil {
 			return fmt.Errorf("partition %d: %w", p, err)
 		}
@@ -116,7 +116,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 // allChunks is computed once by snapshotTable (one Bounds query per table,
 // not per partition — issue #216).
 func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, allChunks []source.Chunk, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
-	chunks, err := clipChunksToRange(allChunks, partitionRange)
+	chunks, err := snapshot.ClipChunksToRange(allChunks, partitionRange)
 	if err != nil {
 		return err
 	}
@@ -282,63 +282,4 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 			return ctx.Err()
 		}
 	}
-}
-
-// clipChunksToRange keeps only the chunks that intersect partitionRange,
-// clamping each kept chunk's own Low/High to the range's bounds so a
-// chunk straddling the partition boundary never sends rows outside it.
-// An empty partitionRange (the unpartitioned {} zero value) matches
-// everything unchanged.
-func clipChunksToRange(chunks []source.Chunk, partitionRange source.Chunk) ([]source.Chunk, error) {
-	if partitionRange.Low == nil && partitionRange.High == nil {
-		return chunks, nil
-	}
-	var out []source.Chunk
-	for _, ch := range chunks {
-		if partitionRange.High != nil && ch.Low != nil {
-			c, err := comparePK(ch.Low, partitionRange.High)
-			if err != nil {
-				return nil, err
-			}
-			if c >= 0 {
-				continue // chunk starts at/after the range ends
-			}
-		}
-		if partitionRange.Low != nil && ch.High != nil {
-			c, err := comparePK(ch.High, partitionRange.Low)
-			if err != nil {
-				return nil, err
-			}
-			if c <= 0 {
-				continue // chunk ends at/before the range starts — both are half-open [Low,High)
-			}
-		}
-		clipped := ch
-		if partitionRange.Low != nil {
-			c := -1
-			if ch.Low != nil {
-				var err error
-				if c, err = comparePK(ch.Low, partitionRange.Low); err != nil {
-					return nil, err
-				}
-			}
-			if c < 0 {
-				clipped.Low = partitionRange.Low
-			}
-		}
-		if partitionRange.High != nil {
-			c := 1
-			if ch.High != nil {
-				var err error
-				if c, err = comparePK(ch.High, partitionRange.High); err != nil {
-					return nil, err
-				}
-			}
-			if c > 0 {
-				clipped.High = partitionRange.High
-			}
-		}
-		out = append(out, clipped)
-	}
-	return out, nil
 }

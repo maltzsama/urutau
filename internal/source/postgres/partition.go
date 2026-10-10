@@ -300,7 +300,7 @@ func (c *Chunker) partitionString(ctx context.Context, col string, n int) ([]sou
 	out := rangesFromBoundaries(boundaries)
 	// A sparse table yields fewer distinct boundaries than workers. Pad with
 	// degenerate [low,low) ranges anchored at the last real boundary (they
-	// own nothing; clipChunksToRange excludes them from snapshot work), so
+	// own nothing; snapshot.ClipChunksToRange excludes them from snapshot work), so
 	// the count is exactly n and the final range stays the only open one.
 	low := boundaries[len(boundaries)-1]
 	for len(out) < n {

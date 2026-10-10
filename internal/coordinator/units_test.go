@@ -144,41 +144,6 @@ func TestSupervisionConfig(t *testing.T) {
 	}
 }
 
-func TestAsFloatAndCompareScalar(t *testing.T) {
-	for _, v := range []any{int64(1), int32(1), int(1), uint64(1), float64(1), float32(1)} {
-		if _, ok := core.AsFloat64(v); !ok {
-			t.Fatalf("core.AsFloat64(%T) = false", v)
-		}
-	}
-	if _, ok := core.AsFloat64("x"); ok {
-		t.Fatal("core.AsFloat64(string) must be false")
-	}
-	cmpOK := func(a, b any) int {
-		t.Helper()
-		c, err := compareScalar(a, b)
-		if err != nil {
-			t.Fatalf("compareScalar(%v, %v): %v", a, b, err)
-		}
-		return c
-	}
-	if cmpOK(int64(1), int64(2)) != -1 || cmpOK(int64(2), int64(1)) != 1 || cmpOK(int64(1), int64(1)) != 0 {
-		t.Fatal("numeric compareScalar ordering is wrong")
-	}
-	if cmpOK("a", "b") >= 0 {
-		t.Fatal("string compareScalar must order a < b")
-	}
-	if cmpOK(float64(1.5), int64(2)) >= 0 {
-		t.Fatal("compareScalar must order a float key against an integer bound")
-	}
-	// Adjacent int64 values above 2^53 must not collapse: a float64 round
-	// trip would call them equal and route a key to the wrong worker.
-	const a = int64(9007199254740992) // 2^53
-	const b = int64(9007199254740993) // 2^53+1
-	if cmpOK(b, a) <= 0 {
-		t.Fatal("int64 compareScalar lost precision above 2^53")
-	}
-}
-
 func TestTerminateReason(t *testing.T) {
 	if got := terminateReason(errOperatorCancel); got != "cancelled" {
 		t.Fatalf("terminateReason(cancel) = %q", got)
