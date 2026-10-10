@@ -26,6 +26,7 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/source/kafka/decoder"
 	"github.com/maltzsama/urutau/internal/sourcepull"
+	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
@@ -155,15 +156,24 @@ func (s Source) Open(_ context.Context, refs []source.TableRef) (source.Reader, 
 		src:              s,
 		topics:           topics,
 		dec:              dec,
-		out:              make(chan rowchange.Change, 1024),
 		logger:           s.Rt.Logger,
 		refBySource:      refBySource,
 		synced:           &position.Offsets{},
 		skipDecodeErrors: s.Spec.Source.OnDecodeError == "skip",
 	}
-	// The puller wraps the reader's own out channel. (A nil puller would
+	// The built-in decoders decode straight into Arrow (#733): records become
+	// ready wire batches, with no rowchange.Change on the live path. A decoder
+	// without the columnar surface keeps the row puller. (A nil puller would
 	// panic in Start — the reader must not be handed out half-wired.)
-	r.puller = sourcepull.New(r.out)
+	if _, ok := dec.(decoder.ColumnarDecoder); ok {
+		r.columnar = true
+		r.batchOut = make(chan *dataplane.Batch, 256)
+		r.encoders = make(map[string]*transport.RowEncoder)
+		r.puller = sourcepull.NewColumnar(r.batchOut)
+	} else {
+		r.out = make(chan rowchange.Change, 1024)
+		r.puller = sourcepull.New(r.out)
+	}
 	return r, nil
 }
 
@@ -172,6 +182,10 @@ func (s Source) Open(_ context.Context, refs []source.TableRef) (source.Reader, 
 // The coordinator/runner holds the resolved schema (spec-declared for
 // Kafka) and injects it after Open through this optional interface.
 func (r *Reader) SetSourceSchemas(schemas map[string]core.Schema) {
+	if r.columnar {
+		r.schemas = schemas
+		return
+	}
 	r.puller.SetSchemas(schemas)
 }
 
@@ -250,6 +264,7 @@ type Reader struct {
 	topics []string
 	client *kgo.Client
 	dec    decoder.Decoder
+	// out is the row-mode channel; columnar mode uses batchOut instead.
 	out    chan rowchange.Change
 	puller *sourcepull.Puller
 	logger *slog.Logger
@@ -257,6 +272,20 @@ type Reader struct {
 	// its full table mapping, so the change is addressed by its TARGET —
 	// the worker routes on target names.
 	refBySource map[string]source.TableRef
+
+	// columnar is set when dec implements decoder.ColumnarDecoder: records are
+	// decoded straight into Arrow and emitted as ready batches (#733).
+	columnar bool
+	batchOut chan *dataplane.Batch
+	// schemas is the canonical schema per target table (SetSourceSchemas),
+	// the shape each direct encoder is built from.
+	schemas map[string]core.Schema
+	// encoders holds one Arrow builder per target table, built lazily;
+	// encOrder preserves first-appearance order for deterministic flushes,
+	// and encTouched names the table the last decode resolved.
+	encoders   map[string]*transport.RowEncoder
+	encOrder   []string
+	encTouched string
 
 	// skipDecodeErrors is source.onDecodeError=="skip": a record the decoder
 	// rejects is dropped (and counted) instead of ending the run. decodeErrs
@@ -293,6 +322,19 @@ func (r *Reader) DecodeErrors() int64 { return r.decodeErrs.Load() }
 func (r *Reader) noteDecodeError(err error) bool {
 	r.decodeErrs.Add(1)
 	return !r.skipDecodeErrors || decodeIsFatal(err)
+}
+
+// decodeFailure applies source.onDecodeError to one record's decode error: it
+// returns the terminal error when the run must fail, or nil when the record is
+// dropped (and counted) under skip.
+func (r *Reader) decodeFailure(rec *kgo.Record, err error) error {
+	if r.noteDecodeError(err) {
+		return fmt.Errorf("kafka: decode topic %s partition %d offset %d: %w",
+			rec.Topic, rec.Partition, rec.Offset, err)
+	}
+	r.logger.Error("kafka: decode skipped", "topic", rec.Topic,
+		"partition", rec.Partition, "offset", rec.Offset, "err", err)
+	return nil
 }
 
 func (r *Reader) Master(_ context.Context) (position.Position, error) {
@@ -521,6 +563,11 @@ func (r *Reader) Next(ctx context.Context) (*dataplane.Batch, error) {
 // Drain flushes every decoded change still buffered in the puller into emit,
 // without blocking for new data (source.Drainer). The runner's relay uses it
 // to flush decoded events ahead of a Closes marker (issue #488).
+//
+// In columnar mode the reader's encoders are flushed at the end of every fetch,
+// so the puller's channel already holds every ready batch and Drain forwards
+// it; the encoders belong to the consume goroutine and must not be touched
+// here. Kafka has no DBLog window, so the runner never drains it.
 func (r *Reader) Drain(ctx context.Context, emit func(*dataplane.Batch) error) error {
 	return r.puller.Drain(ctx, emit)
 }
@@ -587,43 +634,43 @@ func (r *Reader) consume(ctx context.Context) error {
 			// would otherwise fail every record with "net/http: nil
 			// Context". Give it this loop's ctx explicitly.
 			rec.Context = ctx
-			changes, err := r.dec.Decode(rec)
-			if err != nil {
-				if r.noteDecodeError(err) {
-					fatal = fmt.Errorf("kafka: decode topic %s partition %d offset %d: %w",
-						rec.Topic, rec.Partition, rec.Offset, err)
+			if r.columnar {
+				if err := r.consumeDirect(ctx, rec); err != nil {
+					fatal = err
 					return
 				}
-				r.logger.Error("kafka: decode skipped", "topic", rec.Topic,
-					"partition", rec.Partition, "offset", rec.Offset, "err", err)
-				return
-			}
-			for _, c := range changes {
-				// Resolve the source (envelope source for debezium, topic for
-				// raw) to the target the worker routes on, and attach the
-				// message-queue envelope for transport metadata. A debezium
-				// topic→target mapping names the TARGET here; the routing
-				// table is keyed by the source/topic, so fall back to it
-				// (issue #482). An unmapped source skips THIS change, not the
-				// rest of the record's changes (issue #558).
-				ref, ok := r.resolveRef(c.Table, rec.Topic)
-				if !ok {
-					r.logger.Warn("kafka: record for unmapped source", "topic", rec.Topic, "source", c.Table)
-					continue
-				}
-				c.Table = ref.Target
-				c.Position = position.NewOffsets(rec.Topic,
-					map[int32]int64{rec.Partition: rec.Offset}).String()
-				c.Transport = transportOf(rec)
-				// The raw key tuple inherits JSON object disorder; rebuild
-				// it in the declared primary-key order so every downstream
-				// positional consumer (collapse, equality deletes) sees a
-				// stable tuple.
-				decoder.OrderKey(&c, ref.PrimaryKey)
-				select {
-				case r.out <- c:
-				case <-ctx.Done():
+			} else {
+				changes, err := r.dec.Decode(rec)
+				if err != nil {
+					fatal = r.decodeFailure(rec, err)
 					return
+				}
+				for _, c := range changes {
+					// Resolve the source (envelope source for debezium, topic
+					// for raw) to the target the worker routes on, and attach
+					// the message-queue envelope for transport metadata. A
+					// debezium topic→target mapping names the TARGET here; the
+					// routing table is keyed by the source/topic, so fall back
+					// to it (issue #482). An unmapped source skips THIS change,
+					// not the rest of the record's changes (issue #558).
+					ref, ok := r.resolveRef(c.Table, rec.Topic)
+					if !ok {
+						r.logger.Warn("kafka: record for unmapped source", "topic", rec.Topic, "source", c.Table)
+						continue
+					}
+					c.Table = ref.Target
+					c.Position = recordPosition(rec)
+					c.Transport = transportOf(rec)
+					// The raw key tuple inherits JSON object disorder; rebuild
+					// it in the declared primary-key order so every downstream
+					// positional consumer (collapse, equality deletes) sees a
+					// stable tuple.
+					decoder.OrderKey(&c, ref.PrimaryKey)
+					select {
+					case r.out <- c:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 
@@ -631,6 +678,13 @@ func (r *Reader) consume(ctx context.Context) error {
 			r.synced.Set(rec.Topic, rec.Partition, rec.Offset+1)
 			r.mu.Unlock()
 		})
+		if r.columnar && fatal == nil {
+			// Emit whatever the fetch buffered, so latency is bounded even
+			// below the size ceilings.
+			if err := r.flushAll(ctx); err != nil {
+				fatal = err
+			}
+		}
 		if fatal != nil {
 			return fatal
 		}

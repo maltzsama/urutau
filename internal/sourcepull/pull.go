@@ -15,6 +15,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/apache/arrow-go/v18/arrow"
+
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
@@ -504,20 +506,44 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	}
 
 	// Drift check at the SOURCE boundary, where the native row shape
-	// exists: encode against the canonical schema would silently DROP a
-	// field the schema does not know (top-level OR nested inside a struct),
-	// hiding source evolution from the downstream columnar worker. When the
-	// source installed canonical schemas, compare each buffered row's shape
-	// against it and fail loud — the operator declares the new column and
-	// resumes, exactly like the old worker-side drift contract. The same
-	// pass reports whether any row carries a key the schema lacks (including
-	// a nil value, which MergeSchema would materialize): only then is the
-	// merge — a whole extra pass over every row — needed (#581).
-	cs, known := p.schemas[table]
-	if known && len(cs.Columns) > 0 {
-		index := p.colIndex(table, cs)
+	// exists (#581); the shared EncodeChanges runs it against the puller's
+	// cached column index.
+	cs := p.schemas[table]
+	var index map[string]int
+	if len(cs.Columns) > 0 {
+		index = p.colIndex(table, cs)
+	}
+	rec, err := encodeChanges(p.buf, table, cs, index)
+	if err != nil {
+		return nil, err
+	}
+	return &dataplane.Batch{Table: table, Record: rec, Mode: dataplane.UpsertMode}, nil
+}
+
+// EncodeChanges encodes one table's changes into a wire record against its
+// canonical schema, applying the SOURCE-boundary drift gate and the
+// delete-with-no-PK guard exactly as Puller.makeBatch does. It is the shared
+// encode stage: the puller passes its cached column index, a caller that holds
+// ready changes (a columnar source re-encoding a drift record) passes nil and
+// gets one built. A zero schema is schema-less: the shape is inferred/merged
+// from the rows, as the puller's inference fallback does.
+func EncodeChanges(changes []rowchange.Change, table string, schema core.Schema) (arrow.RecordBatch, error) {
+	var index map[string]int
+	if len(schema.Columns) > 0 {
+		index = buildColIndex(schema)
+	}
+	return encodeChanges(changes, table, schema, index)
+}
+
+// encodeChanges is the shared body of EncodeChanges and Puller.makeBatch. The
+// drift pass fails loud on a field the schema lacks (top-level OR nested
+// inside a struct), hiding source evolution from the columnar worker;
+// MergeSchema materializes an all-nil unknown column. C-8: a delete with no PK
+// becomes an orphaned NULL tuple in the sink.
+func encodeChanges(changes []rowchange.Change, table string, cs core.Schema, index map[string]int) (arrow.RecordBatch, error) {
+	if len(cs.Columns) > 0 {
 		merge := false
-		for _, c := range p.buf {
+		for _, c := range changes {
 			src := c.After
 			if src == nil {
 				src = c.Before
@@ -531,29 +557,37 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 			}
 		}
 		if merge {
-			cs = transport.MergeSchema(p.buf, cs)
+			cs = transport.MergeSchema(changes, cs)
 		}
 	} else {
 		// Known schema plus any column a change carries that the schema lacks
 		// (schema-less producers, sparse rows). Empty cs → full inference.
-		cs = transport.MergeSchema(p.buf, p.schemas[table])
+		cs = transport.MergeSchema(changes, cs)
 	}
 
-	// C-8: a delete with no PK becomes an orphaned NULL tuple in the sink.
-	// The live CDC path carries deletes; the bridge used to guard this.
 	if len(cs.PrimaryKey) == 0 {
-		for _, c := range p.buf {
+		for _, c := range changes {
 			if c.Op == rowchange.OpDelete {
 				return nil, fmt.Errorf("sourcepull: batch %q carries a delete but the schema has no primary key — declare it and resume", table)
 			}
 		}
 	}
 
-	rec, err := transport.RecordFromChanges(p.buf, cs, nil)
+	rec, err := transport.RecordFromChanges(changes, cs, nil)
 	if err != nil {
 		return nil, fmt.Errorf("sourcepull: encode batch: %w", err)
 	}
-	return &dataplane.Batch{Table: table, Record: rec, Mode: dataplane.UpsertMode}, nil
+	return rec, nil
+}
+
+// buildColIndex builds the column-name -> position index for a canonical
+// schema.
+func buildColIndex(cs core.Schema) map[string]int {
+	idx := make(map[string]int, len(cs.Columns))
+	for i, c := range cs.Columns {
+		idx[c.Name] = i
+	}
+	return idx
 }
 
 // colIndex returns (building it once) the column-name -> position index for a
@@ -563,10 +597,7 @@ func (p *Puller) colIndex(table string, cs core.Schema) map[string]int {
 	if idx, ok := p.index[table]; ok {
 		return idx
 	}
-	idx := make(map[string]int, len(cs.Columns))
-	for i, c := range cs.Columns {
-		idx[c.Name] = i
-	}
+	idx := buildColIndex(cs)
 	if p.index == nil {
 		p.index = make(map[string]map[string]int)
 	}

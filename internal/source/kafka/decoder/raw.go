@@ -23,6 +23,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/transport"
 )
 
 // Raw is the passthrough decoder. Every message is an insert — raw landing
@@ -70,21 +71,10 @@ func (d *Raw) extract(value []byte, spec TopicExtraction) (map[string]any, error
 		return out, nil
 	}
 
-	var doc map[string]any
-	r := bytes.NewReader(value)
-	dec := json.NewDecoder(r)
-	dec.UseNumber()
-	if err := dec.Decode(&doc); err != nil {
-		return nil, &ErrNotJSON{Err: err}
+	doc, err := parseJSONDoc(value)
+	if err != nil {
+		return nil, err
 	}
-	// The decoder's buffer is not the whole remainder: a value ending exactly
-	// at a buffer boundary leaves trailing bytes only in the reader, so check
-	// both or `{"a":1}EXTRA` would slip through (issue #507).
-	remaining, _ := io.ReadAll(io.MultiReader(dec.Buffered(), r))
-	if len(bytes.TrimLeft(remaining, " \t\n\r")) > 0 {
-		return nil, &ErrNotJSON{Err: fmt.Errorf("raw: trailing data after JSON document")}
-	}
-
 	out, err := Extract(doc, spec.Fields, d.Miss)
 	if err != nil {
 		return nil, err
@@ -93,6 +83,95 @@ func (d *Raw) extract(value []byte, spec TopicExtraction) (map[string]any, error
 		out["payload"] = string(value)
 	}
 	return out, nil
+}
+
+// parseJSONDoc decodes one JSON object with json.Number preserved. A payload
+// ending exactly at a buffer boundary leaves trailing bytes only in the
+// reader, so both the decoder's buffer and the remainder are checked, or
+// `{"a":1}EXTRA` would slip through (issue #507).
+func parseJSONDoc(value []byte) (map[string]any, error) {
+	var doc map[string]any
+	r := bytes.NewReader(value)
+	dec := json.NewDecoder(r)
+	dec.UseNumber()
+	if err := dec.Decode(&doc); err != nil {
+		return nil, &ErrNotJSON{Err: err}
+	}
+	remaining, _ := io.ReadAll(io.MultiReader(dec.Buffered(), r))
+	if len(bytes.TrimLeft(remaining, " \t\n\r")) > 0 {
+		return nil, &ErrNotJSON{Err: fmt.Errorf("raw: trailing data after JSON document")}
+	}
+	return doc, nil
+}
+
+// DecodeInto implements ColumnarDecoder: the raw payload is written straight
+// into the target's Arrow builders, with no rowchange.Change between. An
+// opaque topic lands its single "payload" column; an extracting topic projects
+// the declared fields. Every message is an insert — raw landing has no update
+// or delete semantics.
+func (d *Raw) DecodeInto(rec *kgo.Record, e Encoder, position string) (int, error) {
+	enc, mapped, err := e("")
+	if err != nil {
+		return 0, err
+	}
+	if !mapped {
+		return 0, nil
+	}
+	if enc == nil {
+		return 0, ErrShapeDrift
+	}
+	meta := transport.RowMeta{Op: rowchange.OpInsert, Position: position}
+
+	spec, extracting := d.ByTopic[rec.Topic]
+	if !extracting {
+		// Opaque passthrough: the raw bytes are the "payload" column.
+		col, ok := enc.Column("payload")
+		if !ok {
+			return 0, ErrShapeDrift
+		}
+		filled := make([]bool, len(enc.Schema().Columns))
+		if rec.Value == nil {
+			enc.AppendNull(col)
+		} else {
+			enc.AppendBytes(col, rec.Value)
+		}
+		filled[col] = true
+		fillNulls(enc, filled)
+		enc.EndRow(meta)
+		return 1, nil
+	}
+
+	// Extraction: a tombstone lands every declared column (and payload) NULL.
+	if rec.Value == nil {
+		appendAllNull(enc)
+		enc.EndRow(meta)
+		return 1, nil
+	}
+	doc, err := parseJSONDoc(rec.Value)
+	if err != nil {
+		return 0, err
+	}
+	// Resolve every destination before appending anything, so a record the
+	// direct path declines never leaves a partial row in the encoder.
+	payloadCol := -1
+	if spec.KeepPayload {
+		col, ok := enc.Column("payload")
+		if !ok {
+			return 0, ErrShapeDrift
+		}
+		payloadCol = col
+	}
+	filled := make([]bool, len(enc.Schema().Columns))
+	if err := appendProjected(enc, spec.Fields, doc, d.Miss, filled); err != nil {
+		return 0, err
+	}
+	if payloadCol >= 0 {
+		enc.AppendBytes(payloadCol, rec.Value)
+		filled[payloadCol] = true
+	}
+	fillNulls(enc, filled)
+	enc.EndRow(meta)
+	return 1, nil
 }
 
 // ErrNotJSON marks a payload that could not be parsed as JSON when field
