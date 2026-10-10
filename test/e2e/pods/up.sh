@@ -50,6 +50,10 @@ say "fresh in-cluster data services (namespace e2e)"
 "$KUBECTL" -n e2e wait --for=condition=complete job/bucket-init --timeout=300s
 "$KUBECTL" -n e2e wait --for=condition=complete job/polaris-setup --timeout=300s
 "$KUBECTL" -n e2e wait --for=condition=Available --timeout=300s deployment --all
+# The --all wait above already gates on ClickHouse's readiness probe (a
+# clickhouse-client SELECT 1), but name it so the gate survives a future
+# conversion to a StatefulSet, which --all would not cover.
+"$KUBECTL" -n e2e wait --for=condition=Available --timeout=300s deployment/clickhouse
 
 say "operator ($RACE_IMAGE)"
 "$KUBECTL" apply -k test/e2e/pods/k8s/operator

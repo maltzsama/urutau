@@ -1,0 +1,72 @@
+# ClickHouse: the analytics sink the commit-boundary matrix writes to — the
+# in-cluster twin of the compose `clickhouse` service (same image 24.8, same
+# password, same native port 9000). A single replica with an emptyDir data
+# volume is enough: the sink container is stateless beyond the test run, and a
+# fresh Pod is a fresh database. ReplacingMergeTree's is_deleted version
+# parameter needs ClickHouse >= 24.2.
+#
+# The readiness probe runs the native client, so "Ready" means the native
+# protocol is accepting writes, not merely that the HTTP endpoint answers —
+# the pipeline connects on 9000 (native), while 8123 is only for humans.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+  labels:
+    app: clickhouse
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.8
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              value: clickpass
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "clickhouse-client --password clickpass --query 'SELECT 1'"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+spec:
+  selector:
+    app: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000

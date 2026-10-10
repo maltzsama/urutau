@@ -223,11 +223,31 @@ type crOptions struct {
 	// WorkerCPUOverhead, when set, replaces the workers' 250m of limit
 	// above their 500m request.
 	WorkerCPUOverhead string
+	// SinkType selects the sink implementation. Empty is the iceberg+rest
+	// default; "clickhouse" selects the ClickHouse sink. The URI and any
+	// credentials come from the catalog Secret, exactly as for Iceberg — only
+	// the type (and iceberg's warehouse) differ in the inline spec.
+	SinkType string
+	// SourceKind selects the source driver. Empty is the mysql default;
+	// "postgres" selects the PostgreSQL source (its URI comes from the source
+	// Secret, and SlotName is required).
+	SourceKind string
+	// SlotName is the source.slotName. Required for the postgres source (the
+	// logical replication slot); ignored by mysql.
+	SlotName string
 }
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
 // Secrets; everything else lives in definition.inline, exactly as the sample.
 func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tables []tableSpec, opts crOptions) string {
+	sourceKind := opts.SourceKind
+	if sourceKind == "" {
+		sourceKind = "mysql"
+	}
+	sinkKind := opts.SinkType
+	if sinkKind == "" {
+		sinkKind = "iceberg+rest"
+	}
 	rendered := make([]map[string]any, 0, len(tables))
 	for _, tbl := range tables {
 		t := map[string]any{
@@ -252,7 +272,10 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		rendered = append(rendered, t)
 	}
 	sink := map[string]any{
-		"type": "iceberg+rest", "namespace": "raw", "warehouse": "quickstart_catalog",
+		"type": sinkKind, "namespace": "raw",
+	}
+	if sinkKind == "iceberg+rest" {
+		sink["warehouse"] = "quickstart_catalog"
 	}
 	if opts.MaintenanceBlock != nil {
 		sink["maintenance"] = opts.MaintenanceBlock
@@ -308,7 +331,7 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			"definition": map[string]any{
 				"inline": map[string]any{
 					"pipeline": name,
-					"source":   map[string]any{"kind": "mysql", "serverId": serverID},
+					"source":   buildSource(sourceKind, serverID, opts.SlotName),
 					"sink":     sink,
 					"tables":   rendered,
 				},
@@ -323,6 +346,21 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		panic(fmt.Sprintf("marshal CR: %v", err))
 	}
 	return string(b)
+}
+
+// buildSource renders the inline source block for a source kind. MySQL carries
+// a serverId (unique per source server); PostgreSQL carries the logical
+// replication slotName the source creates and reads from. The connection URI
+// always comes from the source Secret, so it is never in the inline spec.
+func buildSource(kind, serverID, slotName string) map[string]any {
+	source := map[string]any{"kind": kind}
+	switch kind {
+	case "mysql":
+		source["serverId"] = serverID
+	case "postgres":
+		source["slotName"] = slotName
+	}
+	return source
 }
 
 // kafkaTableSpec is one append-only Kafka→Iceberg table: a topic (the

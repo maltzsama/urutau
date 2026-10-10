@@ -53,6 +53,16 @@ const (
 	// WorkerCommittedBeforeAck: the direct commit (data and position) is
 	// durable, the ack was not sent (D4).
 	WorkerCommittedBeforeAck Point = "worker.committed-before-ack"
+	// WorkerClickHouseDataBeforePosition: the ClickHouse sink's batch rows
+	// are committed in one INSERT (each row carries the position), but the
+	// per-partition control-table row that records the owner's coordinate is
+	// not yet written. ClickHouse has no staged cycle and no multi-statement
+	// transaction: this one window is its whole direct path. A crash here
+	// leaves the data (and its position on the rows) durable; the control
+	// table lacks the owner, so the sink's Position() folds the data rows
+	// back in and resumes past the batch (see the ClickHouse section of
+	// commit-boundaries.md).
+	WorkerClickHouseDataBeforePosition Point = "worker.clickhouse-data-before-position"
 	// CoordinatorAckBeforeRecord: the coordinator received an ack and has
 	// not recorded it (D5).
 	CoordinatorAckBeforeRecord Point = "coordinator.ack-before-record"
@@ -78,6 +88,7 @@ var Points = []Point{
 	WorkerBatchReceived,
 	WorkerCommitBefore,
 	WorkerCommittedBeforeAck,
+	WorkerClickHouseDataBeforePosition,
 	CoordinatorAckBeforeRecord,
 	WorkerStagedBeforeShip,
 	WorkerStagedShippedBeforeAck,

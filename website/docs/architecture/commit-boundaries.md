@@ -89,6 +89,38 @@ Orphan files left by S2–S4 are unreferenced, so readers never see them. They
 stay in storage until orphan-file maintenance removes them, which only
 happens when the sink's `maintenance.orphanCleanup` is configured.
 
+### ClickHouse: the position travels on the data
+
+ClickHouse is not a staging sink — it does not implement the staged writer —
+so it takes the direct path only, for every table: a single owner, or each
+partition owner, commits its own sub-batches. There is no coordinator cycle
+and no orphan-file step.
+
+The sink commits one batch as a **single INSERT** — upserts as rows, deletes
+as tombstone rows (`is_deleted=1`, key set, everything else zero) that
+`ReplacingMergeTree(seq, is_deleted)` resolves, newest `seq` per key wins.
+The batch's position travels on **every row** of that one insert, so it can
+never separate from the data. In addition, when the worker has an owner, the
+commit writes a per-partition control row (`<table>_urutau_position`, one row
+per owner holding `owner, position, seq`); `Position()` reads the MinSafe
+across the current owners from it (see [state and position](./state-position.md)).
+
+That leaves one window the worker-side boundary points do not name — they fire
+before and after the whole commit, not between its two writes:
+
+| # | Step | Process | Durable after this step | Fault point |
+|---|------|---------|-------------------------|-------------|
+| C1 | Data INSERT done (the position is on every row), the per-partition control row not yet written | worker | the batch's rows and their position | `worker.clickhouse-data-before-position` |
+
+Expected recovery: **C1 (worker dies).** The rows are durable. The control
+table has no entry for this owner, so `Position()` finds no per-owner minimum
+and falls back to `argMax(position, seq)` over the rows of the INSERT — the
+position never separated from the data. The restarted worker skips the batch;
+nothing is lost, and ReplacingMergeTree still picks the highest `seq` per key,
+so nothing stale wins. A crash here is thus a replay boundary, never a loss
+boundary, and the ClickHouse half of the matrix asserts exactly that: the
+sink converges to the source after each direct-path fault, including this one.
+
 ## The snapshot phase
 
 The live stream runs while the snapshot copies tables one at a time, so the
@@ -158,6 +190,7 @@ even though it holds a position. Re-copied rows are upserts.
 | Batch delivered to worker, before commit | D1, D2, S1 |
 | Sink write staged, before commit | S2, S4 |
 | Sink commit completed, worker has not acked | D3, S3, S5 |
+| Sink data written, per-partition control position row not yet (ClickHouse) | C1 |
 | Ack sent, coordinator has not recorded the next state | D4 |
 | Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss; recovered by redelivery) |
 | Coordinator killed during an active commit cycle | S4, S5 |
