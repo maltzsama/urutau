@@ -7,8 +7,8 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/driver"
-	"github.com/maltzsama/urutau/internal/enrich"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/plan"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
@@ -69,16 +69,16 @@ func (c *Coordinator) closeQuery() {
 }
 
 // phaseResolveTables expands the table list (a discovery pipeline enumerates it
-// now), introspects each table, applies the cast policy and resolves the sink
-// schema, registers enrichment columns, and indexes the boot lists for the
-// per-batch hot paths. It returns the DDL-time schemas and the spec table index
-// the later phases consume.
+// now) and resolves it through the shared introspection (internal/plan) — the
+// same one the collapsed runner uses (#718 step 2). It indexes the boot lists
+// for the per-batch hot paths and returns the DDL-time schemas and the spec
+// table index the later phases consume.
 func (c *Coordinator) phaseResolveTables(ctx context.Context) (map[string]core.Schema, map[string]spec.Table, error) {
-	// A discovery pipeline lists no tables: the source enumerates them now. The
-	// write-back must land BEFORE the partition-range loop, which indexes the
-	// expanded table list positionally against refs — a second list would
-	// desync the ranges from the tables.
-	tables, err := source.ExpandTables(ctx, c.src, c.cfg.Spec)
+	// plan.Build expands the table list, introspects each table, applies the
+	// cast policy, resolves the sink schema, and extends the wire (canonical)
+	// and resolved shapes with the enrich reference columns — wildcard included
+	// — matching the collapsed runner exactly.
+	p, err := plan.Build(ctx, c.src, c.cfg.Spec, plan.Options{Logger: c.log})
 	if err != nil {
 		return nil, nil, fmt.Errorf("coordinator: %w", err)
 	}
@@ -86,70 +86,24 @@ func (c *Coordinator) phaseResolveTables(ctx context.Context) (map[string]core.S
 	// so the expanded list is stored under the lock those handlers read it
 	// with — cfg.Spec is left untouched (issue #556).
 	c.mu.Lock()
-	c.tables = tables
+	c.tables = p.Tables
 	c.mu.Unlock()
 
-	refs := make([]source.TableRef, 0, len(tables))
-	// canonical holds the WIRE shape (source types; the workers encode it and
-	// the sink casts). resolvedSchemas holds the sink's target shape (cast
-	// types + metadata columns) for DDL.
-	canonical := make(map[string]core.Schema, len(tables))
-	resolvedSchemas := make(map[string]core.Schema, len(tables))
-	tableBySource := make(map[string]spec.Table, len(tables))
-	for _, t := range tables {
-		ref, srcSchema, srcWarns, err := c.src.Introspect(ctx, t)
-		if err != nil {
-			return nil, nil, err
-		}
-		c.surfaceWarnings(ref.Source, srcWarns)
-		cast, err := coreCastOf(t)
-		if err != nil {
-			return nil, nil, err
-		}
-		res, warns, err := core.ResolveSchema(srcSchema, cast, t.Metadata)
-		if err != nil {
-			return nil, nil, fmt.Errorf("coordinator: table %s: %w", t.Target, err)
-		}
-		c.surfaceWarnings(ref.Source, warns)
-		refs = append(refs, ref)
-		// Reference columns join BOTH shapes: the assignment/wire schema the
-		// worker encodes against and the resolved schema EnsureTable creates
-		// the table from. Without it, the first enriched batch carries a column
-		// the table lacks and every sink silently drops it. Registered
-		// decision: nullable strings until CR-069 resolves real types.
-		//
-		// The coordinator has no Stage of its own (it forwards enrich
-		// declarations to the worker, which runs the real, long-lived join).
-		// For a wildcard select, the real column names are only known once the
-		// reference query runs — LoadWildcardColumns runs it synchronously
-		// here, at boot, so canonical/resolvedSchemas are correct before
-		// EnsureTable and before any worker session connects (#56). This is a
-		// second, short-lived query against the reference beyond the worker's
-		// own load — an accepted, disclosed cost of the coordinator/worker
-		// split (no shared connection between the two processes).
-		dests, err := enrich.LoadWildcardColumns(ctx, t.Enrich)
-		if err != nil {
-			return nil, nil, fmt.Errorf("coordinator: %s: enrich: %w", t.Source, err)
-		}
-		canonical[t.Source] = enrich.AddColumns(core.WireSchema(srcSchema, res), dests)
-		resolvedSchemas[t.Source] = enrich.AddColumns(res, dests)
-		tableBySource[t.Source] = t
-	}
-	c.refs = refs
-	c.canonical = canonical
+	c.refs = p.Refs
+	c.canonical = p.Wire
 	// Index the boot lists so the per-batch lookups do not scan them
 	// (issue #582).
-	c.refByTarget = make(map[string]core.TableRef, len(refs))
-	for _, ref := range refs {
+	c.refByTarget = make(map[string]core.TableRef, len(p.Refs))
+	for _, ref := range p.Refs {
 		c.refByTarget[ref.Target] = ref
 	}
-	c.specBySource = make(map[string]spec.Table, len(tables))
-	c.specByTarget = make(map[string]spec.Table, len(tables))
-	for _, t := range tables {
+	c.specBySource = make(map[string]spec.Table, len(p.Tables))
+	c.specByTarget = make(map[string]spec.Table, len(p.Tables))
+	for _, t := range p.Tables {
 		c.specBySource[t.Source] = t
 		c.specByTarget[t.Target] = t
 	}
-	return resolvedSchemas, tableBySource, nil
+	return p.Resolved, p.BySource, nil
 }
 
 // phaseValidateTables rejects modes the coordinator cannot run before any
