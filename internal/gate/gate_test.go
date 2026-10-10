@@ -310,6 +310,14 @@ func TestWindowsAreIndependent(t *testing.T) {
 	if key, ok := g.OpenKeyLocked("orders"); !ok || key == "" {
 		t.Fatalf("OpenKeyLocked = %q, %v", key, ok)
 	}
+	// Hold buffers in ANY open window of the table (whole-table gating, see
+	// openKeyLocked), so which partition it lands in is not pinned by the
+	// public API — asserting on it would flake on map iteration order. Fill
+	// the {orders,0} window deterministically instead so Close(0) has
+	// something to drain and the "only partition 0 closes" assertion holds.
+	g.Lock()
+	g.AppendLocked(Window{Target: "orders", Partition: 0}.Key(), 1)
+	g.Unlock()
 
 	if err := g.Close(ctx, "orders", 0); err != nil {
 		t.Fatal(err)
