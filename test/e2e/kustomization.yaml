@@ -5,8 +5,9 @@
 #   kubectl apply -k test/e2e
 #
 # It mirrors test/e2e/docker-compose.yml's data services — MySQL (source),
-# ClickHouse (the analytics sink), RustFS + Polaris (the Iceberg REST catalog
-# and its S3 store) and Trino (to verify the written table). The manifests live
+# ClickHouse (the analytics sink), Couchbase (the key-document sink), RustFS +
+# Polaris (the Iceberg REST catalog and its S3 store) and Trino (to verify the
+# written table). The manifests live
 # in k8s/; the MySQL init SQL and the Trino catalog properties are reused
 # verbatim from this directory via configMapGenerator, so the compose and the
 # cluster stay in lockstep.
@@ -20,6 +21,7 @@ resources:
   - k8s/namespace.yaml
   - k8s/mysql.yaml
   - k8s/clickhouse.yaml
+  - k8s/couchbase.yaml
   - k8s/redpanda.yaml
   - k8s/rustfs.yaml
   - k8s/polaris.yaml

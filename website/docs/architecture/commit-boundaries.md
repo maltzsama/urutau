@@ -121,6 +121,41 @@ so nothing stale wins. A crash here is thus a replay boundary, never a loss
 boundary, and the ClickHouse half of the matrix asserts exactly that: the
 sink converges to the source after each direct-path fault, including this one.
 
+### Couchbase: one document per row, position in a control document
+
+Couchbase is not a staging sink either, so **both of its commit modes** take
+the direct path: the worker commits each sub-batch itself, there is no
+coordinator cycle, and the direct boundaries apply to both. The sink is
+key-addressed — one document per row, keyed by the primary-key tuple, upsert
+replaces in place, delete removes the document outright (no tombstone, no
+versioning, no merge) — so replaying a batch rewrites exactly the same keys and
+can never duplicate a row.
+
+The two modes differ only in how the commit's two writes are sequenced:
+
+- **fast** (default): the data documents are written first, the
+  position-carrying **control document** last. A crash in between leaves the
+  data durable and the position un-advanced; the restart replays the batch,
+  rewriting the same documents, then advances the position. This is the one
+  internal window the worker-side points do not name — they fire before and
+  after the whole commit, not between its two writes.
+- **atomic**: data documents and the control document are written inside one
+  gocb distributed transaction, so a failure mid-batch leaves no trace at all.
+  There is no data-before-control window to name; the direct boundaries D1–D4
+  cover it, and a crash before the commit leaves nothing durable.
+
+| # | Step | Process | Durable after this step | Fault point |
+|---|------|---------|-------------------------|-------------|
+| CB1 | Fast mode: data documents durably upserted/removed, the control document (position) not yet written | worker | the batch's documents | `worker.couchbase-data-before-control` |
+
+Expected recovery: **CB1 (worker dies).** The documents are durable; the
+control document still holds the *previous* position, so the restart resumes
+where it left off and replays the batch — idempotent by key. The position then
+advances exactly once. As with ClickHouse, this is a replay boundary, never a
+loss boundary, and the Couchbase half of the matrix asserts exactly that: the
+sink converges to the source after each direct-path fault, in both commit
+modes.
+
 ## The snapshot phase
 
 The live stream runs while the snapshot copies tables one at a time, so the
@@ -191,6 +226,7 @@ even though it holds a position. Re-copied rows are upserts.
 | Sink write staged, before commit | S2, S4 |
 | Sink commit completed, worker has not acked | D3, S3, S5 |
 | Sink data written, per-partition control position row not yet (ClickHouse) | C1 |
+| Sink data documents written, control/position document not yet (Couchbase fast mode) | CB1 |
 | Ack sent, coordinator has not recorded the next state | D4 |
 | Worker session lost with delivered-but-unacked batches | D1, D2, S1 (killing the worker is the session loss; recovered by redelivery) |
 | Coordinator killed during an active commit cycle | S4, S5 |

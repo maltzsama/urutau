@@ -280,6 +280,7 @@ func (s *Sink) Writer(ctx context.Context, ref core.TableRef, cast core.CastPoli
 		cast:        cast,
 		pk:          ref.PrimaryKey,
 		sourceTable: ref.Source,
+		target:      ref.Target,
 	}
 	kv := &realKV{coll: s.collection(scope, coll), dur: s.dur}
 	var txr txRunner

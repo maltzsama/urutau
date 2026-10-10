@@ -9,6 +9,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 )
@@ -112,6 +113,9 @@ type tablePlan struct {
 	cast        core.CastPolicy
 	pk          []string
 	sourceTable string
+	// target is the qualified sink target (scope.collection), used only to
+	// label the commit-boundary fault points with the table a crash hit.
+	target string
 }
 
 // tableWriter commits one table's batches. Two sequencing modes, one
@@ -171,6 +175,7 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 	}
 	info := batchInfo{
 		Position:        string(b.Watermark),
+		Seq:             b.Seq,
 		Owner:           w.owner,
 		SnapshotState:   b.SnapshotState,
 		SnapshotPending: b.SnapshotPending,
@@ -187,6 +192,7 @@ func (w *tableWriter) Commit(ctx context.Context, b *dataplane.Batch) error {
 // resumable-backfill state.
 type batchInfo struct {
 	Position        string
+	Seq             uint64
 	Owner           string
 	SnapshotState   string
 	SnapshotPending []uint32
@@ -199,6 +205,14 @@ func (w *tableWriter) commitFast(ctx context.Context, r *transport.BatchReader, 
 	if err := applyData(ctx, w.kv, w.plan, r); err != nil {
 		return err
 	}
+	// The fast path's only commit window: the data documents are durable, the
+	// control document that carries the position is not yet written. The
+	// fault point is armed by the commit-boundary matrix; in every other build
+	// it is empty. A crash here must replay, never lose: the restart re-applies
+	// the same key-addressed upserts/removes and then advances the position
+	// (see the Couchbase section of commit-boundaries.md).
+	faultinject.At(faultinject.WorkerCouchbaseDataBeforeControl,
+		"table", w.plan.target, "seq", info.Seq, "position", info.Position)
 	// The commit path and the coordinator's snapshot bookkeeping both write
 	// this document; the CAS loop keeps one from discarding the other's
 	// position or snapshot fields (issue #566).

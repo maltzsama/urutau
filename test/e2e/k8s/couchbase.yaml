@@ -1,0 +1,145 @@
+# Couchbase: the key-document sink the commit-boundary matrix writes to — the
+# in-cluster twin of the compose `couchbase` + `couchbase-setup` services
+# (same image community-7.6.2, same credentials urutau/urutaupass, same bucket
+# lakehouse, same services data,index,query, same 0 replicas). A single
+# replica with an emptyDir data volume is enough: the node is stateless across
+# the test run, and a fresh Pod is a fresh cluster.
+#
+# The one hard init rule is 0 replicas: a single-node bucket with replicas
+# makes every synchronous-durability write fail with DurabilityImpossible
+# (see the sink's durability note and the compose comments). The setup Job
+# reproduces the compose init verbatim.
+#
+# NODE DISCOVERY. gocb bootstraps against the management port, then reads the
+# cluster config and follows the node's advertised hostname to the KV port. In
+# the compose that hostname is 127.0.0.1 because host ports are 1:1 and the
+# setup shares the server's network namespace. In-cluster that would be wrong:
+# the pipeline and the harness connect from OTHER Pods, so the advertised name
+# must be one those Pods resolve — the Service's cluster DNS name
+# (couchbase.e2e.svc.cluster.local). node-init sets exactly that, so both the
+# pipeline (in pod-e2e) and the harness follow discovery to the Service.
+#
+# The Service exposes only management (8091) and KV (11210) — the two ports
+# the sink speaks; the query/index services are enabled but not routed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: couchbase
+  labels:
+    app: couchbase
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: couchbase
+  template:
+    metadata:
+      labels:
+        app: couchbase
+    spec:
+      containers:
+        - name: couchbase
+          image: couchbase/server:community-7.6.2
+          ports:
+            - name: mgmt
+              containerPort: 8091
+            - name: kv
+              containerPort: 11210
+          readinessProbe:
+            # The management endpoint answering is the precondition the setup
+            # Job's couchbase-cli calls need; the cluster is uninitialized on a
+            # first boot and the Job initializes it.
+            httpGet:
+              path: /ui/index.html
+              port: 8091
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /opt/couchbase/var
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: couchbase
+spec:
+  selector:
+    app: couchbase
+  ports:
+    - name: mgmt
+      port: 8091
+      targetPort: 8091
+    - name: kv
+      port: 11210
+      targetPort: 11210
+---
+# The in-cluster twin of the compose couchbase-setup container: cluster-init
+# (user urutau, password urutaupass, services data,index,query, the compose
+# ramsize), node-init to the in-cluster name the SDK's discovery resolves
+# (NOT 127.0.0.1), and bucket-create lakehouse with replica 0. Every step is
+# probed first (server-list / bucket-list), exactly as the compose, so a re-run
+# against an initialized cluster is a no-op.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: couchbase-setup
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: couchbase-setup
+          image: couchbase/server:community-7.6.2
+          env:
+            - name: CB_HOST
+              value: couchbase.e2e.svc.cluster.local
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              CC="$CB_HOST:8091"
+              # The image's HTTP endpoint lags the process start; wait for it so
+              # the first couchbase-cli call is against a listening server.
+              until curl -sf "http://$CB_HOST:8091/ui/index.html" >/dev/null 2>&1; do
+                echo waiting for couchbase...; sleep 2
+              done
+              # server-list succeeds only on an initialized cluster with these
+              # credentials — the idempotency probe.
+              if ! couchbase-cli server-list -c "$CC" -u urutau -p urutaupass >/dev/null 2>&1; then
+                couchbase-cli cluster-init -c "$CC" \
+                  --cluster-username urutau --cluster-password urutaupass \
+                  --services data,index,query \
+                  --cluster-ramsize 1024 --cluster-index-ramsize 512
+              fi
+              # node-init runs on every pass, not only the first: it is a no-op
+              # when the hostname already matches, and it repairs a node whose
+              # hostname a partial earlier run left at the Pod name (which no
+              # other Pod could resolve) instead of silently skipping it.
+              couchbase-cli node-init -c "$CC" -u urutau -p urutaupass \
+                --node-init-hostname "$CB_HOST"
+              if ! couchbase-cli bucket-list -c "$CC" -u urutau -p urutaupass | grep -q lakehouse; then
+                couchbase-cli bucket-create -c "$CC" -u urutau -p urutaupass \
+                  --bucket lakehouse --bucket-type couchbase \
+                  --bucket-ramsize 256 --bucket-replica 0
+              fi
+              echo couchbase ready
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
