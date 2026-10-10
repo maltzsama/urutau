@@ -176,3 +176,14 @@ func TestSourceTLSMounts(t *testing.T) {
 		t.Fatalf("no TLS secrets must produce no mounts, got %v / %v", v, m)
 	}
 }
+
+// The coordinator headless Service must publish not-ready addresses: the
+// workers dial it before the coordinator is Ready (readiness needs the stream,
+// which needs the workers), and a headless Service otherwise hides not-ready
+// pods from DNS, deadlocking boot.
+func TestCoordinatorServicePublishesNotReady(t *testing.T) {
+	cr := pipelineCR("orders", "ns")
+	if !coordinatorService(cr).Spec.PublishNotReadyAddresses {
+		t.Fatal("coordinator Service must set publishNotReadyAddresses=true")
+	}
+}
