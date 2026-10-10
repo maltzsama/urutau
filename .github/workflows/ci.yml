@@ -27,7 +27,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Cache golangci-lint
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         continue-on-error: true
         with:
           path: |
@@ -38,7 +38,7 @@ jobs:
             ${{ runner.os }}-golangci-lint-v1-
 
       - name: Cache buf
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         continue-on-error: true
         with:
           path: |
@@ -188,7 +188,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Cache envtest assets
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         continue-on-error: true
         with:
           path: ~/.cache/setup-envtest
