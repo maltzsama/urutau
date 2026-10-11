@@ -376,6 +376,11 @@ message BatchMeta {
   // batch after the flip: the surviving owner stages too, and its cycle is
   // not left open blocking the new owners' cycles.
   bool staged = 7;
+  // partial marks a batch that does not end its table's rows of the
+  // transaction its last row belongs to. It carries the previous
+  // transaction's position, so it is covered only by a position strictly
+  // beyond its own (issue #823).
+  bool partial = 8;
 }
 
 message WindowTag {
