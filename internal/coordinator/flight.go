@@ -53,9 +53,7 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 		case qb := <-w.queue:
 			// Record before sending: a batch that has left the queue must be
 			// redeliverable until its ack arrives.
-			w.sentMu.Lock()
-			w.sent = append(w.sent, qb)
-			w.sentMu.Unlock()
+			w.recordSent(qb)
 			if err := stream.Send(&flight.FlightData{
 				DataHeader:  []byte("urutau-batch"),
 				DataBody:    qb.body,
@@ -67,6 +65,21 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 			return stream.Context().Err()
 		}
 	}
+}
+
+// recordSent puts a batch that left the queue on the sent list, where it stays
+// redeliverable until an ack drops it. A snapshot window's rows are left out:
+// no ack ever names them, so nothing would drop them, and each holds a
+// multi-MiB body — the list would grow to the size of the whole snapshot and
+// keep it for the rest of the run. They need no redelivery: a window lost
+// with its worker is re-read from the source.
+func (w *workerState) recordSent(qb queuedBatch) {
+	if qb.snapshotRows {
+		return
+	}
+	w.sentMu.Lock()
+	w.sent = append(w.sent, qb)
+	w.sentMu.Unlock()
 }
 
 // dropSent removes the batches an ack covered from the worker's sent list.

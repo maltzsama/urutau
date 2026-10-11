@@ -160,6 +160,10 @@ type queuedBatch struct {
 	id   uint64 // the inflight batch id, to correlate an ack with the sent list
 	body []byte // complete Arrow IPC stream
 	meta []byte // BatchMeta proto
+	// snapshotRows marks a snapshot window's rows. They are not acked one by
+	// one and a lost window is re-read from the source, so they are never
+	// redelivered and never enter the sent list (recordSent).
+	snapshotRows bool
 }
 
 // Coordinator runs the source pipeline and serves workers.
