@@ -73,8 +73,41 @@ func (w *Worker) AddWindowRows(target string, windowID uint64, batch *dataplane.
 			keys[rowchange.KeyString(r.Key(i))] = struct{}{}
 		}
 	}
-	p.windows[windowID] = &snapshotWindow{batch: batch, keys: keys, touched: make(map[string]struct{})}
+	// A chunk is one SELECT read in pages: this page shows the table as it
+	// was when the SELECT began. A change received since is newer than its
+	// row, and it found no window to touch, so it touches this one now.
+	touched := make(map[string]struct{})
+	for k := range p.chunkLive {
+		if _, held := keys[k]; held {
+			touched[k] = struct{}{}
+			p.dropped++
+		}
+	}
+	p.windows[windowID] = &snapshotWindow{batch: batch, keys: keys, touched: touched}
 	return nil
+}
+
+// BeginChunkRead starts remembering the keys of the live changes of target:
+// the chunk about to be read stores its rows window by window, and a change
+// that arrives before the window holding its key is stored must still count
+// against that window. Its row was read before the change, and emitted after
+// it the row undid the change: a row deleted during the snapshot came back
+// (#827). EndChunkRead forgets them once the chunk's last window is stored.
+func (w *Worker) BeginChunkRead(target string) {
+	if p := w.tables[target]; p != nil {
+		p.winMu.Lock()
+		p.chunkLive = map[string]struct{}{}
+		p.winMu.Unlock()
+	}
+}
+
+// EndChunkRead stops remembering live keys for target (see BeginChunkRead).
+func (w *Worker) EndChunkRead(target string) {
+	if p := w.tables[target]; p != nil {
+		p.winMu.Lock()
+		p.chunkLive = nil
+		p.winMu.Unlock()
+	}
 }
 
 // signalWindowClosed wakes the chunk reader's backpressure wait; the send is
@@ -129,7 +162,10 @@ func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) 
 	p.snapshotMu.Lock()
 	marking := p.snapshotState == string(snapshot.StateInProgress) && p.bootstrapGuard != nil
 	p.snapshotMu.Unlock()
-	if !marking && !inWindow {
+	p.winMu.Lock()
+	reading := p.chunkLive != nil
+	p.winMu.Unlock()
+	if !marking && !inWindow && !reading {
 		return nil
 	}
 
@@ -145,6 +181,13 @@ func markBatchSideEffects(p *tablePipeline, batch *dataplane.Batch, ing Ingest) 
 				p.bootstrapGuard.AddString(k)
 			}
 			p.snapshotMu.Unlock()
+		}
+		if reading && !reader.Snapshot(i) {
+			p.winMu.Lock()
+			if p.chunkLive != nil {
+				p.chunkLive[k] = struct{}{}
+			}
+			p.winMu.Unlock()
 		}
 		if inWindow {
 			p.winMu.Lock()
