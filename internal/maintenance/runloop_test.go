@@ -248,3 +248,36 @@ func TestCheckIntervalDisabled(t *testing.T) {
 		t.Fatalf("CheckInterval(disabled) = %v, want 1s (not 30m)", got)
 	}
 }
+
+// A fresh schedule has every enabled operation due. RunLoop runs them at
+// once instead of waiting out a check interval first: with intervals of
+// hours, that wait left a table unmaintained for up to half of one after
+// every restart.
+func TestRunLoopRunsItsFirstTurnAtOnce(t *testing.T) {
+	m := &partialMaintainer{}
+	cfg := &spec.Maintenance{Enabled: true, Compaction: &spec.CompactionConfig{Interval: "6h"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunLoop(ctx, m, "raw.orders", cfg, NewSchedule(), slog.New(slog.NewTextHandler(quietWriter{}, nil)))
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		ran := len(m.completed)
+		m.mu.Unlock()
+		if ran > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("no operation ran within 5s of the loop starting; the first turn waited for the check interval")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}

@@ -185,6 +185,9 @@ func RunLoop(ctx context.Context, m sink.Maintainer, table string, cfg *spec.Mai
 	if log == nil {
 		log = slog.Default()
 	}
+	// One turn at once: a fresh schedule has every operation due, and waiting
+	// out a check interval first would leave the table idle for it.
+	RunTurn(ctx, m, table, cfg, sched, log, time.Now)
 	ticker := time.NewTicker(CheckInterval(cfg))
 	defer ticker.Stop()
 	for {

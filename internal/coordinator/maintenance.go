@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"time"
 
@@ -45,6 +46,11 @@ type maintenanceScheduler struct {
 	mu        sync.Mutex
 	tables    map[string]string // worker name -> table
 	connected map[string]bool   // worker name -> session in progress
+
+	// cfgJSON is cfg as every assignment carries it, marshalled on first use.
+	cfgOnce sync.Once
+	cfgJSON []byte
+	cfgErr  error
 }
 
 func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenanceScheduler {
@@ -78,9 +84,12 @@ func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[st
 	for _, ref := range refs {
 		m.register(maintenanceWorkerName(c.cfg.Spec.Pipeline, ref.Target), ref.Target)
 	}
-	c.maint = m
+	// c.maint is published only once the scheduler is whole: sessions read it
+	// from other goroutines, and one that found it before its Kubernetes
+	// client was set would skip deleting its worker's Pod.
 	if !workerPodTemplateAvailable(workerTarget) {
 		c.log.Warn("coordinator: maintenance enabled but no worker pod template — no maintenance worker will run (Kubernetes provisioning is off)")
+		c.maint = m
 		return nil
 	}
 	ctx, cancel := maintenanceK8sContext()
@@ -90,6 +99,7 @@ func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[st
 		return fmt.Errorf("k8s maintenance provisioning: %w", err)
 	}
 	m.k8s, m.namespace, m.owner = clientset, ns, owner
+	c.maint = m
 	go m.run(c.runCtx)
 	return nil
 }
@@ -124,6 +134,32 @@ func maintenanceK8sContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), maintenanceK8sTimeout)
 }
 
+// maintenancePassTimeout is how long one maintenance pass may hold its table.
+// Compactions are long, so the bound is generous; past it the worker is
+// taken for hung. A variable so tests can shorten it.
+var maintenancePassTimeout = time.Hour
+
+// boundPass starts the watchdog of one pass and returns its stop function.
+// When the pass outlasts maintenancePassTimeout the worker's Pod is deleted:
+// its stream dies, the session returns, and the operations it had not
+// reported stay due, as for a worker that died mid-pass (#457). Without a
+// Kubernetes client there is no Pod to delete and no watchdog.
+func (m *maintenanceScheduler) boundPass(name, table string) (stop func()) {
+	if m.k8s == nil {
+		return func() {}
+	}
+	t := time.AfterFunc(maintenancePassTimeout, func() {
+		m.c.log.Warn("coordinator: maintenance: pass outlasted its bound; deleting the worker pod",
+			"worker", name, "table", table, "bound", maintenancePassTimeout)
+		ctx, cancel := maintenanceK8sContext()
+		defer cancel()
+		if err := deletePod(ctx, m.k8s, m.namespace, name); err != nil {
+			m.c.log.Warn("coordinator: maintenance: delete hung worker pod", "worker", name, "err", err)
+		}
+	})
+	return func() { t.Stop() }
+}
+
 // unexpectedSessionEnd reports whether a maintenance session's Recv error is
 // something other than its two ordinary ends: the worker closing the stream
 // after its pass (io.EOF), and a cancelled context (shutdown, or the worker's
@@ -151,8 +187,10 @@ func (m *maintenanceScheduler) isWorker(name string) bool {
 //
 // A worker that finds nothing due is dismissed immediately rather than left
 // blocked in Recv: its Pod only exists because tick saw a turn due, so
-// nothing due here means the turn was already served (a duplicate Pod, or a
-// coordinator restart that lost the in-memory schedule). Returning ends the
+// nothing due here means the turn was already served: a duplicate Pod, or
+// another session that marked the table between tick and this worker's
+// connect. (A coordinator restart is not a cause: the schedule lives in
+// memory, so a restart makes every operation due again.) Returning ends the
 // session, the worker exits, and the deferred cleanup removes its Pod —
 // leaving it connected would park the Pod forever and silently stop all
 // further maintenance for that table.
@@ -207,6 +245,10 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 		return err
 	}
 	sent := time.Now()
+	// A pass that never ends would hold the table for good: while its session
+	// is connected tick skips the table, and a worker wedged on the catalog
+	// or behind a dead connection never closes its stream.
+	defer m.boundPass(name, table)()
 
 	// The worker reports each operation in its own MaintenanceResult as the
 	// operation ends, then closes the stream when the pass does. MarkRun
@@ -248,16 +290,7 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 // reportedOps returns the operations a worker's report covers, in order.
 func reportedOps(res *pb.MaintenanceResult) []sink.MaintenanceOp {
 	var ops []sink.MaintenanceOp
-	for _, op := range res.Ops {
-		switch op.Op.(type) {
-		case *pb.MaintenanceOpResult_Compaction:
-			ops = append(ops, sink.MaintenanceCompaction)
-		case *pb.MaintenanceOpResult_Expiry:
-			ops = append(ops, sink.MaintenanceSnapshotExpiry)
-		case *pb.MaintenanceOpResult_Orphan:
-			ops = append(ops, sink.MaintenanceOrphanCleanup)
-		}
-	}
+	walkOps(res, func(op sink.MaintenanceOp, _ string) { ops = append(ops, op) })
 	return ops
 }
 
@@ -267,29 +300,37 @@ func reportedOps(res *pb.MaintenanceResult) []sink.MaintenanceOp {
 // carries an Error, so neither is returned.
 func succeededOps(res *pb.MaintenanceResult) []sink.MaintenanceOp {
 	var ops []sink.MaintenanceOp
+	walkOps(res, func(op sink.MaintenanceOp, errText string) {
+		if errText == "" {
+			ops = append(ops, op)
+		}
+	})
+	return ops
+}
+
+// walkOps calls fn with each operation of a worker's report and its error
+// text, empty on success. It is the one place that maps the wire's oneof to
+// an operation: a new operation is added here, not in every function that
+// asks which operations a report holds.
+func walkOps(res *pb.MaintenanceResult, fn func(op sink.MaintenanceOp, errText string)) {
 	for _, op := range res.Ops {
 		switch r := op.Op.(type) {
 		case *pb.MaintenanceOpResult_Compaction:
-			if r.Compaction.Error == "" {
-				ops = append(ops, sink.MaintenanceCompaction)
-			}
+			fn(sink.MaintenanceCompaction, r.Compaction.Error)
 		case *pb.MaintenanceOpResult_Expiry:
-			if r.Expiry.Error == "" {
-				ops = append(ops, sink.MaintenanceSnapshotExpiry)
-			}
+			fn(sink.MaintenanceSnapshotExpiry, r.Expiry.Error)
 		case *pb.MaintenanceOpResult_Orphan:
-			if r.Orphan.Error == "" {
-				ops = append(ops, sink.MaintenanceOrphanCleanup)
-			}
+			fn(sink.MaintenanceOrphanCleanup, r.Orphan.Error)
 		}
 	}
-
-	return ops
 }
 
 // run provisions ephemeral maintenance workers for due turns until ctx is
 // done.
 func (m *maintenanceScheduler) run(ctx context.Context) {
+	// One pass at once: after a restart every operation is due, and waiting
+	// out a full check interval first would leave the tables idle for it.
+	m.tick(time.Now())
 	ticker := time.NewTicker(maintenance.CheckInterval(m.cfg))
 	defer ticker.Stop()
 	for {
@@ -330,7 +371,15 @@ func (m *maintenanceScheduler) tick(now time.Time) {
 	}
 	m.mu.Unlock()
 
-	for name, table := range candidates {
+	// By name, so the order of the Pods and of their log lines is the same
+	// from one tick to the next.
+	names := make([]string, 0, len(candidates))
+	for name := range candidates {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		table := candidates[name]
 		if err := m.provisionWorkerPod(name, table); err != nil {
 			m.c.log.Warn("coordinator: maintenance: provision worker pod", "worker", name, "table", table, "err", err)
 		}
@@ -380,10 +429,12 @@ func (m *maintenanceScheduler) assignment(table string, ops []sink.MaintenanceOp
 	for i, o := range ops {
 		opNames[i] = string(o)
 	}
-	cfgJSON, err := json.Marshal(m.cfg)
-	if err != nil {
-		return nil, err
+	// The config never changes after construction: marshal it once.
+	m.cfgOnce.Do(func() { m.cfgJSON, m.cfgErr = json.Marshal(m.cfg) })
+	if m.cfgErr != nil {
+		return nil, m.cfgErr
 	}
+	cfgJSON := m.cfgJSON
 	return &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Maintenance{
 		Maintenance: &pb.MaintenanceAssignment{
 			TargetTable:       table,
