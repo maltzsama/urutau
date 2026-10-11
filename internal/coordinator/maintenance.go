@@ -83,7 +83,9 @@ func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[st
 		c.log.Warn("coordinator: maintenance enabled but no worker pod template — no maintenance worker will run (Kubernetes provisioning is off)")
 		return nil
 	}
-	clientset, ns, owner, err := inClusterClient(context.Background())
+	ctx, cancel := maintenanceK8sContext()
+	defer cancel()
+	clientset, ns, owner, err := inClusterClient(ctx)
 	if err != nil {
 		return fmt.Errorf("k8s maintenance provisioning: %w", err)
 	}
@@ -107,6 +109,19 @@ func (m *maintenanceScheduler) register(name, table string) {
 	m.mu.Lock()
 	m.tables[name] = table
 	m.mu.Unlock()
+}
+
+// maintenanceK8sTimeout bounds every Kubernetes call the maintenance scheduler
+// makes. The client sets no request timeout of its own, so a hung API server
+// would otherwise hold a call forever: in tick, which is serial, that stops
+// maintenance for every table; in a session's teardown it keeps the table
+// marked connected, so tick skips it for good. With the bound a hung server
+// costs one tick or one teardown.
+const maintenanceK8sTimeout = 30 * time.Second
+
+// maintenanceK8sContext is the context of one maintenance Kubernetes call.
+func maintenanceK8sContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), maintenanceK8sTimeout)
 }
 
 // unexpectedSessionEnd reports whether a maintenance session's Recv error is
@@ -163,9 +178,11 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 		// window see the Pod, count it as its own, and then watch this delete
 		// take it away.
 		if m.k8s != nil {
-			if err := deletePod(context.Background(), m.k8s, m.namespace, name); err != nil {
+			ctx, cancel := maintenanceK8sContext()
+			if err := deletePod(ctx, m.k8s, m.namespace, name); err != nil {
 				m.c.log.Warn("coordinator: maintenance: delete worker pod", "worker", name, "err", err)
 			}
+			cancel()
 		}
 		m.mu.Lock()
 		delete(m.connected, name)
@@ -330,7 +347,8 @@ func (m *maintenanceScheduler) tick(now time.Time) {
 //     on the next tick, so a failed image pull or an unschedulable Pod does
 //     not stall the table forever.
 func (m *maintenanceScheduler) provisionWorkerPod(name, table string) error {
-	ctx := context.Background()
+	ctx, cancel := maintenanceK8sContext()
+	defer cancel()
 	existing, err := getPod(ctx, m.k8s, m.namespace, name)
 	if err != nil {
 		return err
