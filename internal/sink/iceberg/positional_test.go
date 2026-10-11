@@ -2,8 +2,12 @@ package iceberg
 
 import (
 	"context"
+	"io/fs"
 	"maps"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -321,4 +325,49 @@ func TestSinkDeleteModeSelectsPositionalWriters(t *testing.T) {
 			t.Errorf("deleteMode %q: writer positional = %v, want %v", tc.mode, got, tc.want)
 		}
 	}
+}
+
+// Snapshot expiry and orphan cleanup run over a table with deletion vectors,
+// including vectors an earlier commit superseded. Whatever they delete, the
+// live vectors must survive: the table reads the same before and after, and
+// the next positional commit still works.
+func TestMaintenanceKeepsLiveDeletionVectors(t *testing.T) {
+	ctx := context.Background()
+	s := hadoopSink(t)
+	ref, w := positionalWriter(t, s)
+	commitInserts(t, w, 1, 4)
+	commitRows(t, w, [3]any{int64(1), "a", rowchange.OpUpdate}) // a vector on the first file
+	commitRows(t, w, [3]any{int64(2), nil, rowchange.OpDelete}) // superseded by a merged one
+	commitRows(t, w, [3]any{int64(1), "b", rowchange.OpUpdate}) // a vector on the file of "a"
+	want := map[int64]string{1: "b", 3: "x", 4: "x"}
+	tbl := expectValues(t, s, ref, want)
+
+	// Age every file past the safety windows, as a long-lived table's would be.
+	old := time.Now().Add(-3 * time.Hour)
+	err := filepath.WalkDir(localDir(tbl.Location()), func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		return os.Chtimes(path, old, old)
+	})
+	if err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	cfg := spec.Maintenance{
+		Enabled:        true,
+		SnapshotExpiry: &spec.SnapshotExpiryConfig{RetainLast: 1, MaxAge: "1ms"},
+		OrphanCleanup:  &spec.OrphanCleanupConfig{OlderThan: "1h"},
+	}
+	m := NewMaintainer(s.cat, s.ident(ref.Target), cfg, nil, func() string { return "p" }, &recordingMetrics{})
+	if err := m.RunOnce(ctx, []sink.MaintenanceOp{sink.MaintenanceSnapshotExpiry, sink.MaintenanceOrphanCleanup}); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	after := expectValues(t, s, ref, want)
+	if c := planDeletes(t, after); c.vectors == 0 {
+		t.Fatalf("no deletion vector left after maintenance: %+v", c)
+	}
+	commitRows(t, w, [3]any{int64(3), "c", rowchange.OpUpdate})
+	expectValues(t, s, ref, map[int64]string{1: "b", 3: "c", 4: "x"})
 }
