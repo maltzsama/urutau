@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -54,5 +55,32 @@ func TestDispatchedPositionAcceptsEqualOpaquePositions(t *testing.T) {
 	c.lastSent = map[string]string{"raw.a": "cookie-1", "raw.b": "cookie-1"}
 	if got := c.dispatchedPosition(); got == nil || got.String() != "cookie-1" {
 		t.Fatalf("dispatchedPosition = %v, want cookie-1", got)
+	}
+}
+
+// flakyParse fails to parse one table's position.
+type flakyParse struct{ fakeSource }
+
+func (flakyParse) ParsePosition(s string) (position.Position, error) {
+	if s == "broken" {
+		return nil, errors.New("unparsable")
+	}
+	return position.MustLSN(s), nil
+}
+
+// A position that does not parse is skipped, and said: the other tables still
+// fold to the frontier.
+func TestDispatchedPositionSkipsAndReportsAnUnparsablePosition(t *testing.T) {
+	var out bytes.Buffer
+	c, _ := coordHarness()
+	c.log = slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	c.src = flakyParse{}
+	c.lastSent = map[string]string{"raw.a": "0/10", "raw.b": "broken", "raw.c": "0/30"}
+	got := c.dispatchedPosition()
+	if got == nil || got.String() != "0/30" {
+		t.Fatalf("dispatchedPosition = %v, want 0/30", got)
+	}
+	if !strings.Contains(out.String(), "raw.b") || !strings.Contains(out.String(), "does not parse") {
+		t.Fatalf("the unparsable position was not reported: %q", out.String())
 	}
 }
