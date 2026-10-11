@@ -52,9 +52,16 @@ func (r *batchReceiver) sendIngest(ing worker.Ingest) error {
 	}
 }
 
-// covered reports whether a positioned batch was already committed. Batches
-// without a position (snapshot window rows) are never skipped.
+// covered reports whether a positioned batch was already committed. Snapshot
+// window rows are never skipped: they are not part of the stream the
+// committed position measures. A fan-out snapshot's rows do carry a position,
+// their chunk's low watermark, and a resumed snapshot's is behind the
+// committed position: skipped, the window closed empty and the chunk counted
+// as done without its rows (#824).
 func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
+	if meta.Window != nil && meta.Window.Snapshot {
+		return false
+	}
 	cp, ok := r.committed[meta.Table]
 	if !ok || meta.HighPos == "" {
 		return false
