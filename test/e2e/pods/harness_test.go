@@ -261,6 +261,19 @@ type crOptions struct {
 
 // buildCR renders a CDCPipeline. The source and catalog URIs come from the
 // Secrets; everything else lives in definition.inline, exactly as the sample.
+// coordinatorMemoryFor is the coordinator's memory for a scenario that does
+// not set its own. The release binary peaks near 130 MiB under the smoke
+// workload and runs in the product's 1Gi floor. The race image holds the same
+// heap plus the race detector's shadow memory, about seven times more, which
+// the Go memory limit does not account for: at 1Gi it was OOM-killed a minute
+// into every production-readiness run.
+func coordinatorMemoryFor(image string) string {
+	if image == raceImage() {
+		return "2Gi"
+	}
+	return "1Gi"
+}
+
 func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tables []tableSpec, opts crOptions) string {
 	sourceKind := opts.SourceKind
 	if sourceKind == "" {
@@ -323,7 +336,7 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 			"compaction": map[string]any{"minInputFiles": 2, "interval": interval},
 		}
 	}
-	coordinator := map[string]any{"cpu": "500m", "memory": "1Gi", "metricsAddr": ":8080", "eventlog": e2eEventlog}
+	coordinator := map[string]any{"cpu": "500m", "memory": coordinatorMemoryFor(image), "metricsAddr": ":8080", "eventlog": e2eEventlog}
 	if opts.CoordinatorMemory != "" {
 		coordinator["memory"] = opts.CoordinatorMemory
 	}
