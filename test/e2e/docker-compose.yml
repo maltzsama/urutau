@@ -277,6 +277,8 @@ services:
       AWS_SECRET_ACCESS_KEY: urutau_dev_secret
       POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,s3cr3t
       polaris.realm-context.realms: POLARIS
+      # DROP TABLE ... PURGE is refused unless this is on.
+      polaris.features."DROP_WITH_PURGE_ENABLED": "true"
       quarkus.otel.sdk.disabled: "true"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
