@@ -54,6 +54,10 @@ var errWorkerLost = errors.New("worker lost")
 // are uncommitted, errWorkerLost when lost closes first (its windows died),
 // or when ctx ends (the chunk watchdog).
 func (c *Coordinator) awaitChunkCommits(ctx context.Context, worker string, below int, lost <-chan struct{}) error {
+	// One ticker for the whole wait: the safety-net poll below used to
+	// allocate a timer on every pass of the loop.
+	poll := time.NewTicker(chunkCommitPoll)
+	defer poll.Stop()
 	for {
 		if c.uncommittedChunks(worker) < below {
 			return nil
@@ -69,7 +73,7 @@ func (c *Coordinator) awaitChunkCommits(ctx context.Context, worker string, belo
 		case <-lost:
 			return errWorkerLost
 		case <-c.ackNotify:
-		case <-time.After(chunkCommitPoll):
+		case <-poll.C:
 		}
 	}
 }

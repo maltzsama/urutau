@@ -3,6 +3,7 @@ package routing
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -196,5 +197,61 @@ func TestOwnerEmptyAndSingle(t *testing.T) {
 	}
 	if got := Owner(0, []string{"only"}); got != 0 {
 		t.Fatalf("Owner(single) = %d, want 0", got)
+	}
+}
+
+// A Router must give OwnerOfKey's answer for every key: it is the same
+// decision, cached per slot.
+func TestRouterAgreesWithOwnerOfKey(t *testing.T) {
+	for _, workers := range [][]string{{"w0"}, {"w0", "w1"}, {"p-raw-orders-0", "p-raw-orders-1", "p-raw-orders-2", "p-raw-orders-3"}, nil} {
+		r := NewRouter(workers)
+		for i := int64(0); i < 20000; i++ {
+			for _, key := range [][]any{{i}, {i, "tenant"}, {"sku-" + strconv.FormatInt(i, 36)}} {
+				want, werr := OwnerOfKey(key, workers)
+				got, gerr := r.OwnerOfKey(key)
+				if got != want || (gerr == nil) != (werr == nil) {
+					t.Fatalf("workers %v key %v: Router = %d (%v), OwnerOfKey = %d (%v)", workers, key, got, gerr, want, werr)
+				}
+			}
+		}
+	}
+}
+
+func TestRouterRejectsWhatOwnerOfKeyRejects(t *testing.T) {
+	r := NewRouter([]string{"w0", "w1"})
+	for _, key := range [][]any{nil, {}, {nil}, {int64(1), nil}} {
+		if _, err := r.OwnerOfKey(key); err == nil {
+			t.Errorf("Router accepted key %v", key)
+		}
+	}
+	// A rejected key must not poison the next one.
+	want, _ := OwnerOfKey([]any{int64(7)}, []string{"w0", "w1"})
+	if got, err := r.OwnerOfKey([]any{int64(7)}); err != nil || got != want {
+		t.Fatalf("after a rejected key: Router = %d (%v), want %d", got, err, want)
+	}
+}
+
+var benchWorkers = []string{"p-raw-orders-0", "p-raw-orders-1", "p-raw-orders-2", "p-raw-orders-3"}
+
+func BenchmarkOwnerOfKey(b *testing.B) {
+	key := []any{int64(0)}
+	b.ReportAllocs()
+	for i := 0; b.Loop(); i++ {
+		key[0] = int64(i)
+		if _, err := OwnerOfKey(key, benchWorkers); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRouterOwnerOfKey(b *testing.B) {
+	r := NewRouter(benchWorkers)
+	key := []any{int64(0)}
+	b.ReportAllocs()
+	for i := 0; b.Loop(); i++ {
+		key[0] = int64(i)
+		if _, err := r.OwnerOfKey(key); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

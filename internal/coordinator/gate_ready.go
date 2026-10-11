@@ -33,9 +33,14 @@ func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, window
 func (c *Coordinator) enqueueHeld(ctx context.Context, meta *pb.BatchMeta, buf []*dataplane.Batch) error {
 	for len(buf) > 0 {
 		n, rows, bytes := 0, int64(0), int64(0)
-		for n < len(buf) && c.fits(rows, bytes, buf[n].Record.NumRows(), batchBytes(buf[n])) {
-			rows += buf[n].Record.NumRows()
-			bytes += batchBytes(buf[n])
+		for n < len(buf) {
+			// Sized once: batchBytes walks every buffer of the record.
+			addRows, addBytes := buf[n].Record.NumRows(), batchBytes(buf[n])
+			if !c.fits(rows, bytes, addRows, addBytes) {
+				break
+			}
+			rows += addRows
+			bytes += addBytes
 			n++
 		}
 		group := buf[:n]
