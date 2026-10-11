@@ -151,7 +151,7 @@ func runCmd() *cobra.Command {
 	// flow control
 	fl.Int64Var(&f.flowTotalBytes, "flow-total-bytes", 512<<20, "process-wide ceiling on unacked batch bytes in flight")
 	fl.Int64Var(&f.flowPerWorkerMi, "flow-per-worker-min-mi", 16, "per-worker minimum share of the flow budget (MiB)")
-	fl.DurationVar(&f.waitWorker, "wait-worker", 2*time.Minute, "how long to wait for every expected worker session")
+	fl.DurationVar(&f.waitWorker, "wait-worker", coordinator.DefaultWaitWorker, "how long to wait for every expected worker session; keep it above the kubelet's 5m crash backoff")
 	fl.DurationVar(&f.ackTimeout, "ack-timeout", 30*time.Second, "worker considered stale without an ack for this long")
 	fl.IntVar(&f.maxResets, "max-resets", 5, "deprecated, ignored: see --max-consecutive-crashes")
 	fl.DurationVar(&f.resetWindow, "reset-window", 15*time.Minute, "deprecated, ignored: see --max-consecutive-crashes")

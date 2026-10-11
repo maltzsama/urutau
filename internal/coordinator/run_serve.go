@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/eventlog"
@@ -47,7 +46,7 @@ func (c *Coordinator) phaseStream(ctx context.Context, resume position.Position)
 	// Wait for every expected worker session.
 	wait := c.cfg.WaitWorker
 	if wait <= 0 {
-		wait = 2 * time.Minute
+		wait = DefaultWaitWorker
 	}
 	if err := c.waitWorkers(ctx, wait); err != nil {
 		return nil, err
