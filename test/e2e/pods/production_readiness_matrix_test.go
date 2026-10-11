@@ -146,13 +146,42 @@ func (m *matrixSampler) plantOrphan(ctx context.Context) error {
 	return err
 }
 
-// orphanPresent reports whether the planted file still exists.
+// orphanPresent reports whether the planted file still exists. It asks the
+// object store for that one object and tells its three answers apart: there,
+// not there (a 404), or no answer. "No answer" must never read as "deleted":
+// a listing that failed, or whose output the throwaway Pod lost, once failed
+// the run for a file that was still in the bucket. It is retried, and reported
+// as an error if it never gets an answer.
 func (m *matrixSampler) orphanPresent(ctx context.Context) (bool, error) {
-	out, err := s3(ctx, fmt.Sprintf("aws %s s3 ls %s || true", s3Endpoint, m.orphan))
-	if err != nil {
-		return false, err
+	bucket, key, ok := strings.Cut(strings.TrimPrefix(m.orphan, "s3://"), "/")
+	if !ok {
+		return false, fmt.Errorf("orphan %q is not an s3://bucket/key path", m.orphan)
 	}
-	return strings.Contains(out, "urutau-e2e-orphan-"), nil
+	script := fmt.Sprintf(
+		`out=$(aws %s s3api head-object --bucket %s --key %s 2>&1) && echo ORPHAN-PRESENT || { case "$out" in *404*|*"Not Found"*) echo ORPHAN-ABSENT;; *) echo "ORPHAN-UNKNOWN: $out";; esac; }`,
+		s3Endpoint, bucket, key)
+	var last string
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
+		out, err := s3(ctx, script)
+		switch {
+		case err != nil:
+			last = err.Error()
+		case strings.Contains(out, "ORPHAN-PRESENT"):
+			return true, nil
+		case strings.Contains(out, "ORPHAN-ABSENT"):
+			return false, nil
+		default:
+			last = strings.TrimSpace(out)
+		}
+	}
+	return false, fmt.Errorf("the object store never answered whether %s exists: %s", m.orphan, last)
 }
 
 func (m *matrixSampler) start(ctx context.Context) {
