@@ -1,4 +1,4 @@
-package mysql
+package chunk
 
 import (
 	"context"
@@ -51,7 +51,7 @@ func TestChunkerBoundsSeek(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	c, err := NewChunker(db, "shop.orders", "id", 3, nil, nil, filterSQL{})
+	c, err := New(db, "shop.orders", "id", 3, nil, nil, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}

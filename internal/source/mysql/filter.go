@@ -5,33 +5,24 @@ import (
 	"strings"
 
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/mysql/chunk"
 )
-
-// filterSQL is a compiled structured filter: a WHERE fragment with ? placeholders
-// and its positional args, in the order the placeholders appear. Empty when
-// there is no filter.
-type filterSQL struct {
-	where string
-	args  []any
-}
-
-// empty reports whether the filter contributes no predicate.
-func (f filterSQL) empty() bool { return f.where == "" }
 
 // compileFilterSQL renders the structured spec.Filter as a MySQL WHERE
 // fragment. The tree is walked once; the leaves are rendered with ?
 // placeholders and backtick-quoted identifiers, mirroring the Postgres
 // filter_sql.go (which uses squirrel for the same shape). NULL never satisfies
 // a comparison — MySQL's own three-valued logic, no explicit guard needed.
-func compileFilterSQL(f *spec.Filter) (filterSQL, error) {
+func compileFilterSQL(f *spec.Filter) (chunk.Filter, error) {
 	if f == nil {
-		return filterSQL{}, nil
+		return chunk.Filter{}, nil
 	}
 	where, args, err := filterNodeSQL(f)
 	if err != nil {
-		return filterSQL{}, err
+		return chunk.Filter{}, err
 	}
-	return filterSQL{where: where, args: args}, nil
+	return chunk.Filter{Where: where, Args: args}, nil
 }
 
 func filterNodeSQL(f *spec.Filter) (string, []any, error) {

@@ -1,4 +1,4 @@
-package mysql
+package chunk
 
 import (
 	"context"
@@ -145,7 +145,7 @@ func TestChunkerScanArrowHoldsTheChunkOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	c, err := NewChunker(db, "shop.events", "id", rows, nil, nil, filterSQL{})
+	c, err := New(db, "shop.events", "id", rows, nil, nil, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestChunkerScanArrowMatchesTheRowPath(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	loc := time.FixedZone("BRT", -3*3600)
-	c, err := NewChunker(db, "shop.mixed", "id", 10, loc, nil, filterSQL{})
+	c, err := New(db, "shop.mixed", "id", 10, loc, nil, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}

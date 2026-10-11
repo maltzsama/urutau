@@ -17,6 +17,10 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/mysql/dsn"
+
+	"github.com/maltzsama/urutau/internal/source/mysql/chunk"
 )
 
 // Source adapts the MySQL canal reader to the source contract. It is the
@@ -45,7 +49,7 @@ func capabilities() source.Capabilities {
 
 func init() {
 	factory := func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
-		conn, err := ParseURI(s.Source.URI)
+		conn, err := dsn.ParseURI(s.Source.URI)
 		if err != nil {
 			return nil, err
 		}
@@ -156,7 +160,7 @@ func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource
 	if err != nil {
 		return nil, err
 	}
-	return NewChunker(a.db, source, pk, chunkSize, a.loc, t.ColumnFilter, filter)
+	return chunk.New(a.db, source, pk, chunkSize, a.loc, t.ColumnFilter, filter)
 }
 
 // CloseQuery releases the query connection.
@@ -169,7 +173,7 @@ func (a Source) CloseQuery() error {
 
 // Open builds the replication reader over the pipeline's tables.
 func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader, error) {
-	conn, err := ParseURI(a.spec.Source.URI)
+	conn, err := dsn.ParseURI(a.spec.Source.URI)
 	if err != nil {
 		return nil, err
 	}

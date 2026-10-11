@@ -1,4 +1,4 @@
-package mysql
+package chunk
 
 import (
 	"testing"
@@ -22,19 +22,19 @@ func TestNormalizeSnapshotUnsignedBigint(t *testing.T) {
 		{"18446744073709551615", 18446744073709551615},
 	}
 	for _, c := range cases {
-		got := normalizeSnapshot(c.in, "UNSIGNED BIGINT", time.UTC)
+		got := NormalizeSnapshot(c.in, "UNSIGNED BIGINT", time.UTC)
 		if u, ok := got.(uint64); !ok || u != c.want {
-			t.Errorf("normalizeSnapshot(%#v) = %#v (%T), want uint64 %d", c.in, got, got, c.want)
+			t.Errorf("NormalizeSnapshot(%#v) = %#v (%T), want uint64 %d", c.in, got, got, c.want)
 		}
 	}
 	// Signed and other types are untouched.
-	if got := normalizeSnapshot(int64(-5), "BIGINT", time.UTC); got != int64(-5) {
+	if got := NormalizeSnapshot(int64(-5), "BIGINT", time.UTC); got != int64(-5) {
 		t.Errorf("BIGINT: got %#v", got)
 	}
-	if got := normalizeSnapshot([]byte("x"), "VARCHAR", time.UTC); got != "x" {
+	if got := NormalizeSnapshot([]byte("x"), "VARCHAR", time.UTC); got != "x" {
 		t.Errorf("VARCHAR: got %#v", got)
 	}
-	if got := normalizeSnapshot(nil, "UNSIGNED BIGINT", time.UTC); got != nil {
+	if got := NormalizeSnapshot(nil, "UNSIGNED BIGINT", time.UTC); got != nil {
 		t.Errorf("NULL: got %#v", got)
 	}
 }

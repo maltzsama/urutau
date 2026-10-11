@@ -1,4 +1,4 @@
-package mysql
+package chunk
 
 import (
 	"context"
@@ -85,7 +85,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 				enc.AppendBytes(col, *dest[i].(*sql.RawBytes))
 				continue
 			}
-			v := normalizeSnapshot(*dest[i].(*any), dbTypeName(types, i), c.loc)
+			v := NormalizeSnapshot(*dest[i].(*any), dbTypeName(types, i), c.loc)
 			if err := enc.AppendValue(col, v); err != nil {
 				return n, err
 			}
@@ -104,7 +104,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 
 // rawBytesType reports whether a MySQL column type reaches Scan as bytes that
 // normalize turns into the same string: text, JSON and binary types. A
-// temporal or numeric column goes through normalizeSnapshot instead.
+// temporal or numeric column goes through NormalizeSnapshot instead.
 func rawBytesType(dbType string) bool {
 	switch dbType {
 	case "CHAR", "VARCHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT",
@@ -175,7 +175,7 @@ func (c *Chunker) ScanArrowPages(ctx context.Context, ch source.Chunk, enc *tran
 				enc.AppendBytes(col, *dest[i].(*sql.RawBytes))
 				continue
 			}
-			v := normalizeSnapshot(*dest[i].(*any), dbTypeName(types, i), c.loc)
+			v := NormalizeSnapshot(*dest[i].(*any), dbTypeName(types, i), c.loc)
 			if err := enc.AppendValue(col, v); err != nil {
 				return total, err
 			}

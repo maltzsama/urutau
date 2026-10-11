@@ -1,4 +1,4 @@
-package mysql
+package chunk
 
 import (
 	"context"
@@ -44,8 +44,8 @@ func TestChunkerProjectionAndFilter(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	c, err := NewChunker(db, "shop.orders", "id", 10, nil,
-		[]string{"id", "v"}, filterSQL{where: "`status` = ?", args: []any{"active"}})
+	c, err := New(db, "shop.orders", "id", 10, nil,
+		[]string{"id", "v"}, Filter{Where: "`status` = ?", Args: []any{"active"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestChunkerSelectStarWithoutProjection(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	c, err := NewChunker(db, "shop.orders", "id", 10, nil, nil, filterSQL{})
+	c, err := New(db, "shop.orders", "id", 10, nil, nil, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestChunkerCompositeBoundsAreSargable(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	c, err := NewChunker(db, "shop.events", "tenant_id, event_id", 10, nil, nil, filterSQL{})
+	c, err := New(db, "shop.events", "tenant_id, event_id", 10, nil, nil, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}

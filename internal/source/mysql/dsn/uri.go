@@ -1,4 +1,4 @@
-package mysql
+package dsn
 
 import (
 	"crypto/sha256"
@@ -229,7 +229,7 @@ func (c *URI) Addr() string { return c.Host + ":" + c.Port }
 // it by name.
 //
 // The session is pinned to UTC and the driver parses in UTC; the operator's
-// timezone is applied in Go, per column type (see normalizeSnapshot and
+// timezone is applied in Go, per column type (see chunk.NormalizeSnapshot and
 // normalizeCol). That keeps TIMESTAMP's instant exact and interprets DATETIME
 // in the operator's zone without depending on the server's timezone tables or
 // freezing a DST offset (issue #139).

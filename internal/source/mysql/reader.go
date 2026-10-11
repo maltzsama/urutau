@@ -24,6 +24,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/source/mysql/charset"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -677,10 +678,10 @@ func normalizeCol(col schema.TableColumn, v any, loc *time.Location) any {
 		return b
 	case schema.TYPE_STRING:
 		// Text columns carry their bytes in the column's own character set,
-		// unconverted (see charset.go). TYPE_BINARY is deliberately not here:
+		// unconverted (see the charset package). TYPE_BINARY is deliberately not here:
 		// its bytes are not text and reinterpreting them would corrupt them.
 		if b, ok := v.([]byte); ok {
-			return decodeString(b, col.Collation)
+			return charset.Decode(b, col.Collation)
 		}
 
 		return normalize(v)

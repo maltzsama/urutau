@@ -97,7 +97,7 @@ func TestIntrospectFixedSize(t *testing.T) {
 	}
 }
 
-// #180: Collation must survive introspection — decodeString keys the charset
+// #180: Collation must survive introspection — charset.Decode keys the charset
 // decoder on it, so an empty collation silently falls through to passthrough.
 func TestIntrospectCollation(t *testing.T) {
 	col := columnFromIntrospect(t, "name", "varchar", "varchar(64)", "latin1_swedish_ci", 0, 0)
