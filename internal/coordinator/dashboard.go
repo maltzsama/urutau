@@ -52,6 +52,7 @@ const lagInterval = 5 * time.Second
 // each maintenance worker's reported MaintenanceResult.
 type maintStats struct {
 	runs         int64
+	failures     int64
 	lastRun      time.Time
 	filesRemoved int64
 	filesAdded   int64
@@ -473,7 +474,7 @@ func (c *Coordinator) tablePending(target string) int {
 
 // recordMaintStats folds one maintenance operation result into the per-table,
 // per-op aggregate.
-func (c *Coordinator) recordMaintStats(table, op string, at time.Time, apply func(*maintStats)) {
+func (c *Coordinator) recordMaintStats(table, op string, at time.Time, failed bool, apply func(*maintStats)) {
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	if c.maintStats == nil {
@@ -491,6 +492,13 @@ func (c *Coordinator) recordMaintStats(table, op string, at time.Time, apply fun
 	}
 	s.runs++
 	s.lastRun = at
+	// A failed operation is a run and a failure, and nothing else: the same
+	// rule the Prometheus counters follow, so /metrics and the dashboard
+	// never tell two stories about one pass.
+	if failed {
+		s.failures++
+		return
+	}
 	apply(s)
 }
 
@@ -533,19 +541,19 @@ func maintenanceView(m map[string]*maintStats) *dashboard.Maintenance {
 	out := &dashboard.Maintenance{}
 	if s := m["compaction"]; s != nil {
 		out.Compaction = &dashboard.CompactionStatus{
-			Runs: s.runs, LastRun: tsOrEmpty(s.lastRun),
+			Runs: s.runs, Failures: s.failures, LastRun: tsOrEmpty(s.lastRun),
 			FilesRemoved: s.filesRemoved, FilesAdded: s.filesAdded,
 			BytesBefore: s.bytesBefore, BytesAfter: s.bytesAfter,
 		}
 	}
 	if s := m["snapshot_expiry"]; s != nil {
 		out.Expiry = &dashboard.ExpiryStatus{
-			Runs: s.runs, LastRun: tsOrEmpty(s.lastRun), SnapshotsRemoved: s.snapshots,
+			Runs: s.runs, Failures: s.failures, LastRun: tsOrEmpty(s.lastRun), SnapshotsRemoved: s.snapshots,
 		}
 	}
 	if s := m["orphan_cleanup"]; s != nil {
 		out.Orphan = &dashboard.OrphanStatus{
-			Runs: s.runs, LastRun: tsOrEmpty(s.lastRun),
+			Runs: s.runs, Failures: s.failures, LastRun: tsOrEmpty(s.lastRun),
 			FilesDeleted: s.filesDeleted, BytesFreed: s.bytesFreed,
 		}
 	}

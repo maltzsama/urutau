@@ -42,12 +42,12 @@ func TestDashStateTablesAggregates(t *testing.T) {
 	now := time.Now()
 	c.recordTableStats("w-0", "raw.orders", 10, 2, 12, now)
 	c.recordTableStats("w-0", "raw.orders", 5, 0, 8, now)
-	c.recordMaintStats("raw.orders", "compaction", now, func(s *maintStats) {
+	c.recordMaintStats("raw.orders", "compaction", now, false, func(s *maintStats) {
 		s.filesRemoved += 3
 		s.bytesBefore += 100
 		s.bytesAfter += 40
 	})
-	c.recordMaintStats("raw.orders", "orphan_cleanup", now, func(s *maintStats) {
+	c.recordMaintStats("raw.orders", "orphan_cleanup", now, false, func(s *maintStats) {
 		s.filesDeleted += 2
 		s.bytesFreed += 512
 	})
@@ -78,7 +78,7 @@ func TestDashStateTablesAggregates(t *testing.T) {
 func TestRecordStatsLazyInit(t *testing.T) {
 	c := &Coordinator{}
 	c.recordTableStats("w", "t", 1, 0, 0, time.Now())
-	c.recordMaintStats("t", "compaction", time.Now(), func(*maintStats) {})
+	c.recordMaintStats("t", "compaction", time.Now(), false, func(*maintStats) {})
 	if len(dashState{c}.Tables()) != 0 {
 		t.Error("no spec tables, so no rows")
 	}

@@ -505,3 +505,36 @@ func TestRecordResultNilRegistryNoop(t *testing.T) {
 		{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{FilesRemoved: 1}}},
 	}})
 }
+
+// A failed operation may still report what it did before failing. The
+// registry and the dashboard must count that the same way: a run and a
+// failure, and none of its counters.
+func TestRecordResultFailedOpIsCountedTheSameOnTheDashboard(t *testing.T) {
+	metrics := observability.New()
+	c := &Coordinator{metrics: metrics}
+	m := &maintenanceScheduler{c: c}
+	m.recordResult("t", &pb.MaintenanceResult{Ops: []*pb.MaintenanceOpResult{
+		{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{FilesRemoved: 9, FilesAdded: 2, Error: "boom"}}},
+		{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{FilesRemoved: 4, FilesAdded: 1}}},
+		{Op: &pb.MaintenanceOpResult_Orphan{Orphan: &pb.OrphanResult{FilesDeleted: 7, Error: "denied"}}},
+	}})
+
+	c.statsMu.Lock()
+	comp, orphan := *c.maintStats["t"]["compaction"], *c.maintStats["t"]["orphan_cleanup"]
+	c.statsMu.Unlock()
+	if comp.runs != 2 || comp.failures != 1 || comp.filesRemoved != 4 || comp.filesAdded != 1 {
+		t.Errorf("dashboard compaction = %+v, want 2 runs, 1 failure and only the successful pass's files (4 removed, 1 added)", comp)
+	}
+	if orphan.runs != 1 || orphan.failures != 1 || orphan.filesDeleted != 0 {
+		t.Errorf("dashboard orphan cleanup = %+v, want 1 run, 1 failure, no files", orphan)
+	}
+	if got := testutil.ToFloat64(metrics.IcebergCompactionFilesRemoved); got != 4 {
+		t.Errorf("registry compaction files removed = %v, want 4, as on the dashboard", got)
+	}
+	if got := testutil.ToFloat64(metrics.IcebergMaintenanceFailures.WithLabelValues("t", "compaction")); got != 1 {
+		t.Errorf("registry compaction failures = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.IcebergMaintenanceFailures.WithLabelValues("t", "orphan_cleanup")); got != 1 {
+		t.Errorf("registry orphan cleanup failures = %v, want 1", got)
+	}
+}

@@ -52,6 +52,7 @@ type Maintenance struct {
 
 type CompactionStatus struct {
 	Runs         int64  `json:"runs"`
+	Failures     int64  `json:"failures"`
 	LastRun      string `json:"last_run,omitempty"`
 	FilesRemoved int64  `json:"files_removed"`
 	FilesAdded   int64  `json:"files_added"`
@@ -61,12 +62,14 @@ type CompactionStatus struct {
 
 type ExpiryStatus struct {
 	Runs             int64  `json:"runs"`
+	Failures         int64  `json:"failures"`
 	LastRun          string `json:"last_run,omitempty"`
 	SnapshotsRemoved int64  `json:"snapshots_removed"`
 }
 
 type OrphanStatus struct {
 	Runs         int64  `json:"runs"`
+	Failures     int64  `json:"failures"`
 	LastRun      string `json:"last_run,omitempty"`
 	FilesDeleted int64  `json:"files_deleted"`
 	BytesFreed   int64  `json:"bytes_freed"`
