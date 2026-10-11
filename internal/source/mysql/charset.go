@@ -87,13 +87,10 @@ func decoderFor(collation string) (func([]byte) (string, error), bool) {
 // accented characters the charset exists to carry. The generated table
 // avoids that by construction.
 //
-// What remains unlisted, and why: eucjpms is MySQL's Microsoft-flavored
-// EUC-JP. It is multi-byte, so the same-server extraction this package uses
-// for the 7 single-byte sets does not directly apply (enumerating byte pairs
-// found real vendor-row divergences from plain EUC-JP, but also inconsistent
-// error-vs-"?" behavior from MySQL's CONVERT() that was not fully resolved).
-// Tracked separately rather than shipped uncertain — see issue referenced in
-// eucjpms's passthrough test.
+// eucjpms, MySQL's Microsoft-flavored EUC-JP, is generated the same way but
+// is multi-byte: about 15,000 sequences in three lookup arrays
+// (charset_eucjpms_table.go), decoded by decodeEucjpms. Plain EUC-JP is not a
+// substitute — the two differ in the NEC/IBM vendor rows.
 var charsetDecoders = map[string]func([]byte) (string, error){
 	"latin1":   decodeWith(charmap.Windows1252), // MySQL's latin1 IS cp1252, not ISO-8859-1
 	"latin2":   decodeWith(charmap.ISO8859_2),
@@ -131,12 +128,13 @@ var charsetDecoders = map[string]func([]byte) (string, error){
 	//     4-byte forms differ), so each maps to its own decoder.
 	//
 	// ujis is MySQL's name for EUC-JP. eucjpms is MySQL's Microsoft-flavored
-	// EUC-JP variant, deliberately absent: it differs from plain EUC-JP in
-	// exactly the vendor rows x/text does not model, so it passes through
-	// rather than decoding a handful of characters wrongly.
+	// EUC-JP variant: it differs from plain EUC-JP in exactly the vendor rows
+	// x/text does not model, so it has its own decoder generated from a real
+	// server (decodeEucjpms) instead of borrowing japanese.EUCJP.
 	"sjis":    decodeWith(japanese.ShiftJIS),
 	"cp932":   decodeWith(japanese.ShiftJIS),
 	"ujis":    decodeWith(japanese.EUCJP),
+	"eucjpms": decodeEucjpms,
 	"gbk":     decodeWith(simplifiedchinese.GBK),
 	"gb18030": decodeWith(simplifiedchinese.GB18030),
 	"big5":    decodeWith(traditionalchinese.Big5),
@@ -179,6 +177,45 @@ func decodeGenerated(charset string) func([]byte) (string, error) {
 		return string(out), nil
 	}
 }
+
+// decodeEucjpms decodes MySQL's eucjpms from the tables charsetgen extracted
+// from a real server (charset_eucjpms_table.go). The forms are EUC's: a byte
+// below 0x80 is ASCII, 0x8E introduces a half-width kana, 0x8F a three-byte
+// JIS X 0212 character, and any other lead in 0xA1-0xFE a two-byte JIS X 0208
+// one. A malformed or unassigned sequence is a decode error, so the caller
+// keeps the raw bytes (decodeString's policy) instead of the "?" MySQL
+// substitutes.
+func decodeEucjpms(b []byte) (string, error) {
+	var out strings.Builder
+	out.Grow(len(b) * 3 / 2)
+	for i := 0; i < len(b); {
+		c := b[i]
+		var r uint16
+		n := 1
+		switch {
+		case c < 0x80:
+			out.WriteByte(c)
+			i++
+			continue
+		case c == 0x8E && i+1 < len(b) && eucjpmsTrail(b[i+1]):
+			r, n = eucjpmsKana[b[i+1]-0xA1], 2
+		case c == 0x8F && i+2 < len(b) && eucjpmsTrail(b[i+1]) && eucjpmsTrail(b[i+2]):
+			r, n = eucjpmsSupp[int(b[i+1]-0xA1)*94+int(b[i+2]-0xA1)], 3
+		case eucjpmsTrail(c) && i+1 < len(b) && eucjpmsTrail(b[i+1]):
+			r, n = eucjpmsMain[int(c-0xA1)*94+int(b[i+1]-0xA1)], 2
+		}
+		if r == 0 {
+			return "", fmt.Errorf("mysql: invalid or unassigned eucjpms sequence at byte %d (0x%02X)", i, c)
+		}
+		out.WriteRune(rune(r))
+		i += n
+	}
+	return out.String(), nil
+}
+
+// eucjpmsTrail reports whether b is in the 0xA1-0xFE range every byte of an
+// eucjpms multi-byte character falls in.
+func eucjpmsTrail(b byte) bool { return b >= 0xA1 && b <= 0xFE }
 
 // decodeWith adapts an x/text encoding to the decoder signature. The decoder
 // is pooled: x/text's Decoder.Bytes resets the transformer and runs it to EOF

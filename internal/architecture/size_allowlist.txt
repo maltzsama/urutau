@@ -22,6 +22,7 @@ internal/operator/controller.go 997 # baseline (#398)
 internal/operator/controller.go:CoordinatorReconciler.Reconcile 140 # baseline (#398)
 internal/sink/iceberg/writer.go 1002 # baseline (#398)
 internal/sink/iceberg/writer.go:appendColumn 220 # exhaustive type switch over core.Kind
+internal/source/mysql/charset_eucjpms_table.go 1506 # generated eucjpms lookup tables, not logic
 internal/source/mysql/charset_tables.go 1674 # generated charset data tables, not logic
 internal/source/postgres/reader.go 890 # baseline (#398)
 internal/transport/codec.go:appendTypedValue 333 # exhaustive type switch over core.Kind

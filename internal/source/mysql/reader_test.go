@@ -377,9 +377,8 @@ func TestRowToMapLeavesBinaryBytesAlone(t *testing.T) {
 // guess: the raw form is still recoverable, a bad guess is not.
 func TestRowToMapUnknownCollationPassesThrough(t *testing.T) {
 	raw := []byte{0xe9, 0x41}
-	// eucjpms is multi-byte and tracked separately (see charset.go's doc
-	// comment); "notacharset" stands in for anything genuinely unmodeled.
-	for _, collation := range []string{"", "eucjpms_japanese_ci", "notacharset_general_ci"} {
+	// "notacharset" stands in for anything genuinely unmodeled.
+	for _, collation := range []string{"", "notacharset_general_ci"} {
 		tbl := &schema.Table{Columns: []schema.TableColumn{
 			{Name: "v", Type: schema.TYPE_STRING, Collation: collation},
 		}}
@@ -418,20 +417,6 @@ func TestRowToMapDecodesMultibyteCharsets(t *testing.T) {
 				t.Errorf("v = %q, want %q", got, tc.want)
 			}
 		})
-	}
-}
-
-// eucjpms is MySQL's Microsoft-flavored EUC-JP: it differs from plain EUC-JP
-// in exactly the vendor rows x/text does not model, so it must pass through
-// rather than decode a handful of characters wrongly.
-func TestRowToMapEucjpmsStillPassesThrough(t *testing.T) {
-	raw := []byte{0xc6, 0xfc, 0xcb, 0xdc}
-	tbl := &schema.Table{Columns: []schema.TableColumn{
-		{Name: "v", Type: schema.TYPE_STRING, Collation: "eucjpms_japanese_ci"},
-	}}
-	got, _ := rowToMap(tbl, []any{raw}, time.UTC)["v"].(string)
-	if !bytes.Equal([]byte(got), raw) {
-		t.Errorf("eucjpms = %q, want the raw bytes passed through", got)
 	}
 }
 
