@@ -386,7 +386,7 @@ func sortOrderFor(schema *iceberg.Schema, primaryKey []string) (table.SortOrder,
 // A false return with a nil error means a concurrent creator won the race
 // (ErrTableAlreadyExists) — the caller must reload and validate that table.
 func createTable(ctx context.Context, cat catalog.Catalog, ident table.Identifier, schema *iceberg.Schema, partitionBy, primaryKey []string) (bool, error) {
-	props := iceberg.Properties{"format-version": "2"}
+	props := iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(formatVersion)}
 	for k, v := range housekeepingProperties {
 		props[k] = v
 	}
@@ -518,7 +518,12 @@ func EnsureTable(ctx context.Context, cat catalog.Catalog, ident table.Identifie
 		// as absent would attempt a create against a table that may exist.
 		return fmt.Errorf("iceberg: load %v: %w", ident, err)
 	}
-	// Table exists — verify (or evolve) the schema, then the partition spec.
+	// Table exists — bring it to the current format version, then verify (or
+	// evolve) the schema, then the partition spec.
+	existing, err = upgradeFormat(ctx, cat, ident, existing)
+	if err != nil {
+		return err
+	}
 	if evolveSchema {
 		if err := evolveTable(ctx, existing, schema); err != nil {
 			return fmt.Errorf("iceberg: %v: %w", ident, err)
