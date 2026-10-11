@@ -32,9 +32,37 @@ func (s dashState) Ready() bool { return s.c.readiness.Load() }
 // Healthy implements dashboard.Prober: the pump signalled life within the
 // window. A coordinator wedged before the pump starts (lastPump==0) or with a
 // stalled pump reads unhealthy, so the liveness probe restarts it (issue #601).
+//
+// A pump held by backpressure is not stalled: it waits on a full gate for a
+// chunk's SELECT, or on the flow budget for an ack, and loops again when that
+// arrives. Restarting the coordinator there throws the chunk away, and a
+// chunk that takes longer than the probe allows was never finished (#819).
+// Those waits end on their own — the snapshot watchdog and the worker
+// delivery timeout fail the run — so only a pump held past both is wedged.
 func (s dashState) Healthy() bool {
 	ns := s.c.lastPump.Load()
-	return ns != 0 && time.Since(time.Unix(0, ns)) < pumpHealthWindow
+	if ns == 0 {
+		return false
+	}
+	if held := s.c.pumpHeld.Load(); held != 0 {
+		return time.Since(time.Unix(0, held)) < s.c.pumpHeldLimit()
+	}
+	return time.Since(time.Unix(0, ns)) < pumpHealthWindow
+}
+
+// pumpHeldLimit is how long the pump may stay on one piece of work before
+// the liveness signal reads it as wedged: longer than the snapshot watchdog
+// and the worker delivery timeout, which bound every backpressure wait.
+func (c *Coordinator) pumpHeldLimit() time.Duration {
+	limit := c.cfg.SnapshotChunkTimeout
+	if limit <= 0 {
+		limit = defaultSnapshotChunkTimeout
+	}
+	delivery := c.cfg.WorkerDeliveryTimeout
+	if delivery <= 0 {
+		delivery = defaultWorkerDeliveryTimeout
+	}
+	return max(limit, delivery) + pumpHealthWindow
 }
 
 // Summary implements dashboard.State.
