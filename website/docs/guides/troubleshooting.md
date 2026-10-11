@@ -109,7 +109,12 @@ make k8s-load      # eval $(minikube docker-env) && docker build -t urutau:dev .
 **Symptom** — the coordinator waits `--wait-worker` and then fails, with no
 session for one of the expected workers.
 
-**Cause** — the derived worker name never showed up.
+**Cause** — the derived worker name never showed up, or the worker is
+still waiting out its restart backoff. A worker exits when it loses the
+coordinator, and Kubernetes restarts it after a delay that doubles up to five
+minutes. A `--wait-worker` below that ceiling gives up before the worker can
+return, and the coordinator's own exit then resets the workers that had
+connected: the pipeline restarts in a loop.
 
 **Fix** — check:
 

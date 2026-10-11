@@ -71,7 +71,7 @@ server, not a one-shot.
 | `--window-timeout` | `5m` | DBLog window timeout |
 | `--flow-total-bytes` | `536870912` (512 MiB) | Process-wide ceiling on unacked batch bytes in flight |
 | `--flow-per-worker-min-mi` | `16` | Per-worker minimum share of the flow budget (MiB) |
-| `--wait-worker` | `2m` | How long to wait for every expected worker session |
+| `--wait-worker` | `6m` | How long to wait for every expected worker session. Keep it above the kubelet's 5-minute crash backoff: a worker restarting after it lost the coordinator can take that long to come back |
 | `--ack-timeout` | `30s` | A worker is stale without an ack for this long |
 | `--max-consecutive-crashes` | `3` | A worker crashing this many times in a row without delivering what it owed ends the job |
 | `--worker-delivery-timeout` | `5m` | A worker owing work that delivers none of it for this long ends the job |
