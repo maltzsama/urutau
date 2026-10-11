@@ -75,6 +75,10 @@ kind: Service
 metadata:
   name: couchbase
 spec:
+  # Headless: the name must resolve to the Pod IP. node-init makes the server
+  # listen on the address its hostname resolves to, and a ClusterIP is not an
+  # address of the Pod, so the rename fails with eaddrnotavail.
+  clusterIP: None
   selector:
     app: couchbase
   ports:
