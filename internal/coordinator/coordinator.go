@@ -271,6 +271,12 @@ type Coordinator struct {
 	// liveness signal a probe reads, so a wedged pump (which would otherwise
 	// leave the process "live" but doing nothing) is restarted (issue #601).
 	lastPump atomic.Int64
+	// pumpHeld is the unix-nano time at which the pump took up the work it
+	// is on now, zero while it waits for some. That work applies the
+	// pipeline's backpressure (a full gate, a full flow budget), so the pump
+	// may stay in it far longer than a heartbeat; the liveness signal reads
+	// it as held, not wedged, up to pumpHeldLimit (#819).
+	pumpHeld atomic.Int64
 	// decodeErrors, when the source reports it, returns the running count of
 	// records its decoder dropped (Kafka onDecodeError: skip); polled for the
 	// skipped counter (issue #602). Written at boot before the lag loop starts;
