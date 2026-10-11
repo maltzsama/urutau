@@ -31,8 +31,15 @@ import (
 // Window-lifecycle markers (the empty Closes record) are NOT this function's
 // job — they go to one explicit partition owner via enqueueTo.
 func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta *pb.BatchMeta) error {
+	// handed is set when the single-owner path passes b on to enqueueTo,
+	// which then owns the release: one owner releases, never two.
+	handed := false
 	if b != nil {
-		defer b.Release()
+		defer func() {
+			if !handed {
+				b.Release()
+			}
+		}()
 	}
 	if b == nil && (meta == nil || meta.Table == "") {
 		return fmt.Errorf("coordinator: marker batch requires a table in meta")
@@ -69,9 +76,18 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// (supervisor.tick).
 
 	if len(owners) == 1 {
+		handed = true
 		return c.enqueueTo(ctx, owners[0], b, meta)
 	}
 
+	return c.enqueuePartitioned(ctx, b, meta, owners)
+}
+
+// enqueuePartitioned sends one source batch of a table with several
+// partition owners: it routes each row to its owner, opens the cycle the
+// owners' staged deliveries must complete, and sends every owner its share.
+// The caller keeps ownership of b and releases it.
+func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch, meta *pb.BatchMeta, owners []*workerState) error {
 	// Partitioned table: one cycle id for the whole binlog batch. Every
 	// sub-batch sent below shares it, so the staged deliveries group back
 	// into the one cycle that must commit atomically (WK-001 C5). The
@@ -92,6 +108,9 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	pk := c.primaryKeyFor(meta.Table)
 	if len(pk) == 0 {
 		return fmt.Errorf("coordinator: table %s has %d partition owners but no primary key to route by", meta.Table, len(owners))
+	}
+	if b.Record == nil {
+		return fmt.Errorf("coordinator: table %s: a batch without a record cannot be routed to its partitions", meta.Table)
 	}
 	reader, err := transport.NewBatchReader(b.Record, pk)
 	if err != nil {
@@ -246,6 +265,9 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 		// columns); serialize it whole. The commit position is the last
 		// row's __pos — ack truncation frees the batch once the worker
 		// commits at or past it.
+		if b.Record == nil {
+			return fmt.Errorf("coordinator: table %s: batch without a record", meta.Table)
+		}
 		if meta.HighPos == "" {
 			reader, rerr := transport.NewBatchReader(b.Record, nil)
 			if rerr != nil {

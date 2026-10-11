@@ -177,6 +177,17 @@ func logRecordFields(r logging.Record) map[string]any {
 	return f
 }
 
+// jobStartedAttrs names the pipeline and its source in the trail's first
+// event. A coordinator without a spec (a bare one in a test, or a caller that
+// configured only the event log) still gets the event, with empty names.
+func (c *Coordinator) jobStartedAttrs() map[string]any {
+	attrs := map[string]any{"pipeline": "", "source": ""}
+	if s := c.cfg.Spec; s != nil {
+		attrs["pipeline"], attrs["source"] = s.Pipeline, s.Source.Kind
+	}
+	return attrs
+}
+
 // startEventlog opens the run's S3 trail, wires the coordinator's structured
 // logs into it, and returns the shutdown func for the caller to defer: it
 // drains the log trail first, then seals the run, so the last records reach
@@ -196,10 +207,7 @@ func (c *Coordinator) startEventlog(ctx context.Context, cfg eventlog.Config) (f
 	if c.cfg.LogBuffer != nil {
 		trail = newLogTrail(ev, c.cfg.LogBuffer, c.log)
 	}
-	if err := c.emit(eventlog.KindJobStarted, map[string]any{
-		"pipeline": c.cfg.Spec.Pipeline,
-		"source":   c.cfg.Spec.Source.Kind,
-	}); err != nil {
+	if err := c.emit(eventlog.KindJobStarted, c.jobStartedAttrs()); err != nil {
 		c.log.Warn("coordinator: eventlog emit", "err", err)
 	}
 	// Seal the run's first event now: Emit only enqueues, and a crash before

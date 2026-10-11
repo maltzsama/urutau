@@ -347,3 +347,21 @@ func TestBufferedTablesLocked(t *testing.T) {
 		t.Fatalf("BufferedTablesLocked = %v, want [orders]", got)
 	}
 }
+
+// With two windows of one table open, the gate picks the lowest partition
+// every time, whatever order the map yields them in.
+func TestOpenKeyPicksTheLowestPartition(t *testing.T) {
+	for range 200 {
+		g := New[int](0, 0, func(int) int64 { return 1 }, &recSink{})
+		g.Open("raw.orders", 3)
+		g.Open("raw.orders", 1)
+		g.Open("raw.orders", 2)
+		g.Open("raw.other", 0)
+		g.mu.Lock()
+		key, ok := g.openKeyLocked("raw.orders")
+		g.mu.Unlock()
+		if want := (Window{Target: "raw.orders", Partition: 1}).Key(); !ok || key != want {
+			t.Fatalf("openKeyLocked = %q, %v; want %q", key, ok, want)
+		}
+	}
+}

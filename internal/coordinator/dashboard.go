@@ -378,6 +378,9 @@ func (c *Coordinator) publishLag() {
 	// The confirmed-position age is computed before statsMu: confirmedPosition
 	// takes the coordinator's own locks and must not nest under statsMu.
 	c.publishConfirmedAge(now)
+	// Read before statsMu for the same reason: totalOpen takes the staged
+	// tracker's lock.
+	stagedOpen := c.staged.totalOpen()
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	for table, ts := range c.tableStats {
@@ -395,7 +398,7 @@ func (c *Coordinator) publishLag() {
 	for table, n := range pending {
 		c.metrics.PendingBatches.WithLabelValues(table).Set(float64(n))
 	}
-	c.metrics.StagedCycles.Set(float64(c.staged.totalOpen()))
+	c.metrics.StagedCycles.Set(float64(stagedOpen))
 	if c.decodeErrors != nil {
 		if cur := c.decodeErrors(); cur > c.lastDecodeErrors {
 			c.metrics.KafkaRecordsSkipped.Add(float64(cur - c.lastDecodeErrors))

@@ -296,17 +296,25 @@ func (g *Gate[T]) IsOpen(target string, partition int) bool {
 	return g.on[Window{Target: target, Partition: partition}.Key()]
 }
 
-// openKeyLocked returns the first open window key for target. Caller holds mu.
+// openKeyLocked returns the open window of target with the lowest partition.
+// Caller holds mu. A table has one open window today, but the choice must not
+// depend on map order: with two open, a batch held under whichever key the
+// iteration met first would land in a different partition's window from one
+// run to the next.
 func (g *Gate[T]) openKeyLocked(target string) (string, bool) {
+	best, found := Window{}, false
 	for k, on := range g.on {
 		if !on {
 			continue
 		}
-		if w, ok := g.win[k]; ok && w.Target == target {
-			return k, true
+		if w, ok := g.win[k]; ok && w.Target == target && (!found || w.Partition < best.Partition) {
+			best, found = w, true
 		}
 	}
-	return "", false
+	if !found {
+		return "", false
+	}
+	return best.Key(), true
 }
 
 // fullLocked reports whether key's window has reached a bound. Caller holds mu.

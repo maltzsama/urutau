@@ -103,6 +103,14 @@ func (m *maintenanceScheduler) register(name, table string) {
 	m.mu.Unlock()
 }
 
+// isWorker reports whether name is a registered maintenance worker.
+func (m *maintenanceScheduler) isWorker(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.tables[name]
+	return ok
+}
+
 // session serves one connected maintenance worker for exactly one pass: it
 // hands over the operations due for its table, records the result the worker
 // reports, and returns when the worker closes the stream (it exits after the
