@@ -31,6 +31,24 @@ func sinkAssignment(s *spec.Spec) *pb.SinkAssignment {
 	return &pb.SinkAssignment{Type: cfg.Type, Namespace: cfg.Namespace, Options: opts}
 }
 
+// postgresAssignment renders a structured postgres source the DSN cannot
+// fully express (an SSH tunnel has a DialFunc, not a DSN) as its JSON block,
+// so the worker rebuilds the same source (#170). A scoped SnapshotURI wins:
+// the operator deliberately gave the worker a directly reachable read-only
+// connection, and the replication credential stays coordinator-side (D-CD1)
+// — so the block is withheld then, and nil is returned.
+func postgresAssignment(s *spec.Spec) ([]byte, error) {
+	pg := s.Source.Postgres
+	if pg == nil || s.Source.SnapshotURI != "" {
+		return nil, nil
+	}
+	b, err := json.Marshal(pg)
+	if err != nil {
+		return nil, fmt.Errorf("coordinator: postgres config: %w", err)
+	}
+	return b, nil
+}
+
 // assignmentFor builds one worker's table assignment with its own ticket.
 // The table schema travels as Arrow IPC derived from the canonical schema —
 // the same typed discipline as the Flight data plane, no JSON on the wire.
@@ -61,19 +79,11 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
 	}
-	// A structured postgres source that the DSN cannot fully express (an SSH
-	// tunnel has a DialFunc, not a DSN) travels as its JSON block so the
-	// worker rebuilds the same source (#170). A scoped SnapshotURI wins: the
-	// operator deliberately gave the worker a directly reachable read-only
-	// connection, and the replication credential stays coordinator-side
-	// (D-CD1) — so the block is withheld then.
-	if pg := c.cfg.Spec.Source.Postgres; pg != nil && c.cfg.Spec.Source.SnapshotURI == "" {
-		b, err := json.Marshal(pg)
-		if err != nil {
-			return nil, fmt.Errorf("coordinator: postgres config: %w", err)
-		}
-		assign.Postgres = b
+	pg, err := postgresAssignment(c.cfg.Spec)
+	if err != nil {
+		return nil, err
 	}
+	assign.Postgres = pg
 	for _, ref := range w.refs {
 		schemaB, err := transport.EncodeTableSchema(c.canonical[ref.Source])
 		if err != nil {
