@@ -22,6 +22,8 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // ── harness ──────────────────────────────────────────────────────────
@@ -208,7 +210,7 @@ func TestEnsureTableCreateRaceReloadsWinner(t *testing.T) {
 	}
 
 	cat := &raceCatalog{tbl: tbl}
-	ischema, err := FromCanonical(canonicalSchema())
+	ischema, err := convert.FromCanonical(canonicalSchema())
 	if err != nil {
 		t.Fatalf("FromCanonical: %v", err)
 	}

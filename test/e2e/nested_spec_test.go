@@ -20,6 +20,8 @@ import (
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
 	kafkasource "github.com/maltzsama/urutau/internal/source/kafka"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 func TestNestedSpecSpike(t *testing.T) {
@@ -54,7 +56,7 @@ func TestNestedSpecSpike(t *testing.T) {
 		t.Fatalf("unexpected warnings: %v", warns)
 	}
 
-	ischema, err := urutauiceberg.FromCanonical(cs)
+	ischema, err := convert.FromCanonical(cs)
 	if err != nil {
 		t.Fatalf("from canonical: %v", err)
 	}

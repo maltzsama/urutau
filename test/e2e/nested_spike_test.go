@@ -19,6 +19,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	urutauiceberg "github.com/maltzsama/urutau/internal/sink/iceberg"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 func TestNestedSpike(t *testing.T) {
@@ -38,7 +40,7 @@ func TestNestedSpike(t *testing.T) {
 		}}},
 		{Name: "tags", Type: core.ColumnType{Kind: core.KindList, Elem: &core.ColumnType{Kind: core.KindString}}},
 	}}
-	ischema, err := urutauiceberg.FromCanonical(cs)
+	ischema, err := convert.FromCanonical(cs)
 	if err != nil {
 		t.Fatalf("from canonical: %v", err)
 	}

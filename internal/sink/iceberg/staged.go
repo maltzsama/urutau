@@ -21,6 +21,8 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/sink"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // TableWriter is the Iceberg staging writer: the worker writes parquet and
@@ -104,7 +106,7 @@ func (w *TableWriter) WriteStaged(ctx context.Context, b *dataplane.Batch) ([]by
 		return encodeStaged(payload, spec, schema, version)
 	}
 
-	upsertBatch, deleteBatch, err := splitByOp(ctx, b)
+	upsertBatch, deleteBatch, err := convert.SplitByOp(ctx, b)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +117,7 @@ func (w *TableWriter) WriteStaged(ctx context.Context, b *dataplane.Batch) ([]by
 		defer deleteBatch.Release()
 	}
 
-	keys, err := extractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
+	keys, err := convert.ExtractKeys([]*dataplane.Batch{upsertBatch, deleteBatch}, w.delCols)
 	if err != nil {
 		return nil, err
 	}

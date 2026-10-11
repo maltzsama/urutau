@@ -17,8 +17,7 @@ internal/columnar/key.go:EncodeKey 139 # baseline (#398)
 internal/enrich/columnar.go:Stage.ColumnarJoin 289 # baseline (#398)
 internal/enrich/enrich.go:New 150 # baseline (#398)
 internal/operator/controller.go:CoordinatorReconciler.Reconcile 140 # baseline (#398)
-internal/sink/iceberg/writer.go 1002 # baseline (#398)
-internal/sink/iceberg/writer.go:appendColumn 220 # exhaustive type switch over core.Kind
+internal/sink/iceberg/convert/values.go:AppendColumn 220 # exhaustive type switch over core.Kind
 internal/source/mysql/charset/eucjpms_table.go 1506 # generated eucjpms lookup tables, not logic
 internal/source/mysql/charset/tables.go 1674 # generated charset data tables, not logic
 internal/source/postgres/reader.go 890 # baseline (#398)

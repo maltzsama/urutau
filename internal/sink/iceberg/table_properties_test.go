@@ -13,6 +13,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // housekeepingTrue asserts both #463 properties are "true" on tbl.
@@ -45,7 +47,7 @@ func TestCreateSetsHousekeepingProperties(t *testing.T) {
 func TestEnsureHousekeepingConvergesAnExistingTable(t *testing.T) {
 	ctx := context.Background()
 	s := hadoopSink(t)
-	sch, err := FromCanonical(canonicalSchema())
+	sch, err := convert.FromCanonical(canonicalSchema())
 	if err != nil {
 		t.Fatalf("FromCanonical: %v", err)
 	}

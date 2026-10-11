@@ -11,6 +11,8 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // #200.1: Properties must return a copy, not the table's live property map.
@@ -45,7 +47,7 @@ func TestSplitByOpCopiesBatchFields(t *testing.T) {
 	b.SnapshotPending = []uint32{1, 2}
 	defer b.Release()
 
-	up, del, err := splitByOp(context.Background(), b)
+	up, del, err := convert.SplitByOp(context.Background(), b)
 	if err != nil {
 		t.Fatal(err)
 	}
