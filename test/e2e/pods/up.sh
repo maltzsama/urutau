@@ -22,6 +22,7 @@ CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
 KEDA_VERSION="${KEDA_VERSION:-v2.16.1}"
 CHAOS_MESH_VERSION="${CHAOS_MESH_VERSION:-2.8.4}"
 RACE_IMAGE="${RACE_IMAGE:-urutau:dev-race}"
+RELEASE_IMAGE="${RELEASE_IMAGE:-urutau:dev}"
 
 say() { printf '\n==> %s\n' "$*"; }
 
@@ -33,6 +34,17 @@ say "race-instrumented image ($RACE_IMAGE)"
 if ! minikube image ls 2>/dev/null | grep -q "$RACE_IMAGE"; then
   echo "error: image $RACE_IMAGE is not loaded into minikube" >&2
   echo "       run: make k8s-load-race" >&2
+  exit 1
+fi
+
+# The release image is what users run. One scenario starts a pipeline on it,
+# because the race image is built from another Dockerfile and hides whatever
+# is wrong with the release one (a non-numeric USER once kept every Pod from
+# starting, and only the race image was ever exercised).
+say "release image ($RELEASE_IMAGE)"
+if ! minikube image ls 2>/dev/null | grep -q "${RELEASE_IMAGE}\$"; then
+  echo "error: image $RELEASE_IMAGE is not loaded into minikube" >&2
+  echo "       run: make k8s-load" >&2
   exit 1
 fi
 
