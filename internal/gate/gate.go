@@ -202,21 +202,50 @@ func (g *Gate[T]) Flush(ctx context.Context, target string, partition int, windo
 // Close drains a window's held items as ordinary trailing changes (no window
 // tag) and seals just that window — other partitions of the same table keep
 // their own windows open. A no-op when the window holds nothing.
+//
+// The window is sealed only once it is empty. While a drain is being
+// delivered it stays open, so an item the producer reads meanwhile is held
+// behind it and goes out in the next round: sealed first, the window let that
+// item through live, ahead of the older backlog, and an update landed after
+// the delete that followed it (#818).
 func (g *Gate[T]) Close(ctx context.Context, target string, partition int) error {
 	g.flushMu.Lock()
 	defer g.flushMu.Unlock()
-	key := Window{Target: target, Partition: partition}.Key()
-	g.mu.Lock()
-	items := g.takeLocked(key)
+	w := Window{Target: target, Partition: partition}
+	key := w.Key()
+	for {
+		g.mu.Lock()
+		items := g.takeLocked(key)
+		delete(g.ready, key)
+		if len(items) == 0 {
+			g.sealLocked(key)
+			g.mu.Unlock()
+			return nil
+		}
+		g.wakeLocked()
+		g.mu.Unlock()
+		if err := g.sink.Close(ctx, w, items); err != nil {
+			// The run is ending: seal the window and drop what joined it
+			// during the failed delivery.
+			g.mu.Lock()
+			late := g.takeLocked(key)
+			g.sealLocked(key)
+			g.mu.Unlock()
+			if len(late) > 0 {
+				g.sink.Release(late)
+			}
+			return err
+		}
+	}
+}
+
+// sealLocked closes key's window and wakes a producer blocked on it. Caller
+// holds mu.
+func (g *Gate[T]) sealLocked(key string) {
 	delete(g.on, key)
 	delete(g.win, key)
 	delete(g.ready, key)
 	g.wakeLocked()
-	g.mu.Unlock()
-	if len(items) == 0 {
-		return nil
-	}
-	return g.sink.Close(ctx, Window{Target: target, Partition: partition}, items)
 }
 
 // ReleaseAll closes every open window and releases the items held in them.
