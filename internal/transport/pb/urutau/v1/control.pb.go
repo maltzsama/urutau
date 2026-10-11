@@ -1776,7 +1776,11 @@ type Assignment struct {
 	// sink is the spec's sink section minus its credentials. The worker opens
 	// its sink from this plus the URI and credentials of its own environment;
 	// without it a worker can only open the default (Iceberg) sink.
-	Sink          *SinkAssignment `protobuf:"bytes,12,opt,name=sink,proto3" json:"sink,omitempty"`
+	Sink *SinkAssignment `protobuf:"bytes,12,opt,name=sink,proto3" json:"sink,omitempty"`
+	// slot_name is the source's replication slot (postgres). The worker reads
+	// a snapshot window's position from the slot, so it needs the same name
+	// the coordinator streams from.
+	SlotName      string `protobuf:"bytes,13,opt,name=slot_name,json=slotName,proto3" json:"slot_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1893,6 +1897,13 @@ func (x *Assignment) GetSink() *SinkAssignment {
 		return x.Sink
 	}
 	return nil
+}
+
+func (x *Assignment) GetSlotName() string {
+	if x != nil {
+		return x.SlotName
+	}
+	return ""
 }
 
 // SinkAssignment carries the non-credential sink settings of the pipeline
@@ -3056,7 +3067,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\ton_delete\x18\x10 \x01(\tR\bonDelete\"h\n" +
 	"\vBatchConfig\x12\x1b\n" +
 	"\tmax_bytes\x18\x01 \x01(\x03R\bmaxBytes\x12<\n" +
-	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xa5\x03\n" +
+	"\fmax_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\vmaxInterval\"\xc2\x03\n" +
 	"\n" +
 	"Assignment\x12\x1f\n" +
 	"\vworker_name\x18\x01 \x01(\tR\n" +
@@ -3076,7 +3087,8 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"chunk_size\x18\n" +
 	" \x01(\rR\tchunkSize\x12\x1a\n" +
 	"\bpostgres\x18\v \x01(\fR\bpostgres\x12-\n" +
-	"\x04sink\x18\f \x01(\v2\x19.urutau.v1.SinkAssignmentR\x04sink\"\xc0\x01\n" +
+	"\x04sink\x18\f \x01(\v2\x19.urutau.v1.SinkAssignmentR\x04sink\x12\x1b\n" +
+	"\tslot_name\x18\r \x01(\tR\bslotName\"\xc0\x01\n" +
 	"\x0eSinkAssignment\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12@\n" +

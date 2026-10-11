@@ -83,3 +83,24 @@ func TestWorkerSinkConfigKeepsOwnValueForEmptyAssignedOption(t *testing.T) {
 		t.Errorf("warehouse = %q, want quickstart_catalog", v)
 	}
 }
+
+// The worker reads a snapshot window's position from the replication slot, so
+// the slot name must survive the trip from the pipeline spec to the source the
+// worker rebuilds — with a URI source and with the structured postgres block.
+func TestSourceSpecForCarriesTheSlotName(t *testing.T) {
+	s, err := sourceSpecFor("postgres", "host=db", nil, "urutau_orders")
+	if err != nil {
+		t.Fatalf("sourceSpecFor: %v", err)
+	}
+	if s.SlotName != "urutau_orders" {
+		t.Errorf("URI source: SlotName = %q, want urutau_orders", s.SlotName)
+	}
+
+	s, err = sourceSpecFor("postgres", "", []byte(`{"host":"db"}`), "urutau_orders")
+	if err != nil {
+		t.Fatalf("sourceSpecFor with a postgres block: %v", err)
+	}
+	if s.SlotName != "urutau_orders" {
+		t.Errorf("structured source: SlotName = %q, want urutau_orders", s.SlotName)
+	}
+}

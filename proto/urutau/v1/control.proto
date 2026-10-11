@@ -229,6 +229,10 @@ message Assignment {
   // its sink from this plus the URI and credentials of its own environment;
   // without it a worker can only open the default (Iceberg) sink.
   SinkAssignment sink     = 12;
+  // slot_name is the source's replication slot (postgres). The worker reads
+  // a snapshot window's position from the slot, so it needs the same name
+  // the coordinator streams from.
+  string      slot_name   = 13;
 }
 
 // SinkAssignment carries the non-credential sink settings of the pipeline

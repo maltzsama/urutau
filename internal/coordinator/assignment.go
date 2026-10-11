@@ -56,6 +56,7 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		SourceDsn:  dsn,
 		ChunkSize:  uint32(c.cfg.ChunkSize),
 		Sink:       sinkAssignment(c.cfg.Spec),
+		SlotName:   c.cfg.Spec.Source.SlotName,
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
