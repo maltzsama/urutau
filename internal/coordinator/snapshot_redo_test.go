@@ -64,7 +64,7 @@ func TestSnapshotRedoesTheChunksALostWorkerHeld(t *testing.T) {
 					c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: epoch, WindowIds: []uint64{s}}
 				}
 			case q := <-w.queue:
-				c.budget.release(w.name, int64(len(q.body)+len(q.meta)))
+				c.budget.Release(w.name, int64(len(q.body)+len(q.meta)))
 			case <-ctx.Done():
 				return
 			case <-time.After(10 * time.Millisecond):

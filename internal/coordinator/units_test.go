@@ -24,6 +24,8 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // errSource is a source.Source whose ParsePosition always fails.
@@ -52,8 +54,8 @@ func coordHarness() (*Coordinator, *workerState) {
 		log:         slog.New(slog.DiscardHandler),
 		src:         fakeSource{},
 		workers:     map[string]*workerState{"w0": w},
-		budget:      newFlowBudget(1<<20, 1<<10),
-		index:       map[string]*positionIndex{"w0": newPositionIndex("run-1")},
+		budget:      inflight.NewBudget(1<<20, 1<<10),
+		index:       map[string]*inflight.PositionIndex{"w0": inflight.NewPositionIndex("run-1")},
 		confirmed:   map[string]position.Position{},
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},
@@ -289,14 +291,14 @@ func TestOnAckTruncatesAndRecords(t *testing.T) {
 	c, _ := coordHarness()
 	c.tableStats = map[string]*tableStats{}
 	c.maintStats = map[string]map[string]*maintStats{}
-	c.index["w0"].add(inflightBatch{id: 1, table: "raw.orders", high: position.MustLSN("0/10"), bytes: 64})
-	_ = c.budget.acquire(context.Background(), "w0", 64)
+	c.index["w0"].Add(inflight.Batch{ID: 1, Table: "raw.orders", High: position.MustLSN("0/10"), Bytes: 64})
+	_ = c.budget.Acquire(context.Background(), "w0", 64)
 
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Position: "0/10", Rows: 5, Deletes: 1})
 	if got := c.index["w0"].InFlight(); got != 0 {
 		t.Fatalf("in-flight = %d, want 0", got)
 	}
-	if got := c.budget.inFlight("w0"); got != 0 {
+	if got := c.budget.InFlight("w0"); got != 0 {
 		t.Fatalf("budget in-flight = %d, want 0", got)
 	}
 	if pos := c.confirmed["w0"]; pos == nil || pos.String() != "0/10" {
@@ -483,31 +485,6 @@ func TestGateHoldContextCancelReturnsLive(t *testing.T) {
 }
 
 // ── checkpoint ───────────────────────────────────────────────────────
-
-func TestNewCheckpointRejectsBadURI(t *testing.T) {
-	if _, err := newCheckpoint(context.Background(), CheckpointConfig{URI: "http://nope"}); err == nil {
-		t.Fatal("a non-s3 URI must be rejected")
-	}
-}
-
-func TestNewCheckpointBuildsClient(t *testing.T) {
-	cp, err := newCheckpoint(context.Background(), CheckpointConfig{
-		URI:       "s3://bucket/prefix/",
-		Endpoint:  "http://127.0.0.1:1",
-		AccessKey: "a",
-		SecretKey: "b",
-	})
-	if err != nil {
-		// No AWS config in the sandbox: the constructor's error arm ran.
-		return
-	}
-	if cp.bucket != "bucket" || cp.prefix != "prefix" {
-		t.Fatalf("checkpoint = %+v", cp)
-	}
-	if cp.interval != 10*time.Second {
-		t.Fatalf("default interval = %v, want 10s", cp.interval)
-	}
-}
 
 // #212: an aborted snapshot returns before closeWindow, so releaseAllGates
 // must drain any batches still held in an open gate.

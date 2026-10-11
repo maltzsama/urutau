@@ -15,6 +15,8 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // A stalled worker with unacked batches is reset (issue #461): the batches
@@ -26,8 +28,8 @@ func TestSupervisorResetsAStalledWorkerWithInFlight(t *testing.T) {
 	w := workers["w1"]
 	cancelled := false
 	w.cancel = func() { cancelled = true }
-	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
-	c.index["w1"].add(inflightBatch{id: 1, table: "t"})
+	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
+	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
 	s.noteAck("w1", time.Now().Add(-2*time.Minute))
 
 	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second}); err != nil {
@@ -46,8 +48,8 @@ func TestSupervisorEndsTheRunForAStalledAppendWorkerWithInFlight(t *testing.T) {
 	c := s.c
 	workers["w1"].refs = []source.TableRef{{Source: "shop.t", Target: "raw.t"}}
 	c.cfg.Spec = &spec.Spec{Tables: []spec.Table{{Source: "shop.t", Target: "raw.t", WriteMode: spec.WriteModeAppend}}}
-	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
-	c.index["w1"].add(inflightBatch{id: 1, table: "raw.t"})
+	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
+	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "raw.t"})
 	s.noteAck("w1", time.Now().Add(-2*time.Minute))
 
 	err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second})
@@ -61,7 +63,7 @@ func TestSupervisorEndsTheRunForAStalledAppendWorkerWithInFlight(t *testing.T) {
 func TestSupervisorResetWithoutInFlightRecovers(t *testing.T) {
 	s, workers := supervisorHarness()
 	c := s.c
-	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
+	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
 	w := workers["w1"]
 	cancelled := false
 	w.cancel = func() { cancelled = true }
@@ -306,9 +308,9 @@ func (o opaquePos) Contains(other position.Position) bool {
 func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
 	// A different opaque cookie cannot prove coverage: the batch stays
 	// queued.
-	p := newPositionIndex("run-p2a")
-	p.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
-	if freed, _, _ := p.truncate("t", opaquePos("cookie-2")); freed != 0 {
+	p := inflight.NewPositionIndex("run-p2a")
+	p.Add(inflight.Batch{Table: "t", High: opaquePos("cookie-1"), Bytes: 5})
+	if freed, _, _ := p.Truncate("t", opaquePos("cookie-2")); freed != 0 {
 		t.Fatalf("incomparable ack freed %d, want 0 (must not truncate)", freed)
 	}
 	if p.InFlight() != 1 {
@@ -316,9 +318,9 @@ func TestPositionIndexIncomparableAckDoesNotTruncate(t *testing.T) {
 	}
 
 	// Identity DOES cover it (same cookie).
-	p2 := newPositionIndex("run-p2b")
-	p2.add(inflightBatch{table: "t", high: opaquePos("cookie-1"), bytes: 5})
-	if freed, _, _ := p2.truncate("t", opaquePos("cookie-1")); freed != 5 {
+	p2 := inflight.NewPositionIndex("run-p2b")
+	p2.Add(inflight.Batch{Table: "t", High: opaquePos("cookie-1"), Bytes: 5})
+	if freed, _, _ := p2.Truncate("t", opaquePos("cookie-1")); freed != 5 {
 		t.Fatalf("identical ack freed %d, want 5", freed)
 	}
 }

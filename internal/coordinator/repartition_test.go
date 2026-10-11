@@ -15,6 +15,8 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // partitionChunker hands out n contiguous ranges over an int64 key domain,
@@ -253,7 +255,7 @@ func TestScaleWaitsForInFlightBatches(t *testing.T) {
 	owners, _ := c.loadRouting().ownersOf("raw.orders")
 
 	// One batch delivered and unacked on the current owner.
-	c.index[owners[0].name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 	if c.inFlight(owners[0].name) == 0 {
 		t.Fatal("precondition: the owner must have an in-flight batch")
 	}
@@ -385,7 +387,7 @@ func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 	c.cfg.ScaleDrainTimeout = 200 * time.Millisecond
 	owners, _ := c.loadRouting().ownersOf("raw.orders")
 	// One in-flight batch the drain can never clear.
-	c.index[owners[0].name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 
 	if err := c.ScaleTable(context.Background(), "raw.orders", 2); err == nil {
 		t.Fatal("the scale must fail when the drain never converges")
@@ -417,7 +419,7 @@ func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
 	w, _ := c.loadRouting().ownersOf("raw.orders")
 	owner := w[0]
 	// A batch that will never drain, so the loop would spin.
-	c.index[owner.name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+	c.index[owner.name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

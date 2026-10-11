@@ -61,7 +61,7 @@ func (c *Coordinator) statusz(w http.ResponseWriter, r *http.Request) {
 			Phase:     phase,
 			Epoch:     w.epoch,
 			Attached:  w.attached,
-			Inflight:  c.budget.inFlight(name),
+			Inflight:  c.budget.InFlight(name),
 			Committed: w.committed,
 		}
 	}

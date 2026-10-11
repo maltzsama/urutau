@@ -14,6 +14,8 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // testSnapshotKind is a source kind registered only for these tests, so
@@ -192,7 +194,7 @@ func TestFinishSnapshotOnAStagedTableIsACycle(t *testing.T) {
 	c.snk = snk
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
-	c.index["w1"] = newPositionIndex("run-1")
+	c.index["w1"] = inflight.NewPositionIndex("run-1")
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	if err := c.sendClosesPending(context.Background(), w1, "raw.orders", position.MustLSN("0/10"), 0, nil, 0, nil); err != nil {
@@ -241,7 +243,7 @@ func TestSnapshotDoneWaitsForEveryEarlierWindow(t *testing.T) {
 	c.snk = snk
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
-	c.index["w1"] = newPositionIndex("run-1")
+	c.index["w1"] = inflight.NewPositionIndex("run-1")
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	ctx := context.Background()

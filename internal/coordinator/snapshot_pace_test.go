@@ -52,7 +52,7 @@ func TestSnapshotChunksWaitForCommits(t *testing.T) {
 					c.chunkReady <- &pb.ChunkReady{Table: req.Table, ChunkId: req.ChunkId, Epoch: w.epoch}
 				}
 			case q := <-w.queue:
-				c.budget.release(w.name, int64(len(q.body)+len(q.meta)))
+				c.budget.Release(w.name, int64(len(q.body)+len(q.meta)))
 			case <-ctx.Done():
 				return
 			}

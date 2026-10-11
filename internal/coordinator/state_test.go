@@ -23,6 +23,8 @@ import (
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // fakeControl satisfies the control-plane server by embedding the interface;
@@ -195,7 +197,7 @@ func TestEnqueueBatchSplitsByPartition(t *testing.T) {
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
-	c.index["w1"] = newPositionIndex("run-1")
+	c.index["w1"] = inflight.NewPositionIndex("run-1")
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 
 	// Keys chosen by the production owner function so one routes to each

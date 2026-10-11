@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // supervisorHarness builds a Coordinator with the minimal surface the
@@ -165,8 +167,8 @@ func TestSupervisorAwaitsALostWorkerOwingWork(t *testing.T) {
 	c := s.c
 	w := workers["w1"]
 	w.attached, w.hadSession = false, true
-	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
-	c.index["w1"].add(inflightBatch{id: 1, table: "t"})
+	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
+	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
 	now := time.Now()
 	s.pendingSet("w1")
 	s.noteAck("w1", now.Add(-2*time.Minute))
@@ -250,8 +252,8 @@ func TestRecordResetReturnsWindowedCount(t *testing.T) {
 // ago: past the ack timeout.
 func progressHarness(ago time.Duration) (*supervisor, *workerState, time.Time) {
 	s, workers := supervisorHarness()
-	s.c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
-	s.c.index["w1"].add(inflightBatch{id: 1, table: "t"})
+	s.c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
+	s.c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
 	now := time.Now()
 	s.noteAck("w1", now.Add(-ago))
 	return s, workers["w1"], now

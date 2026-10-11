@@ -14,6 +14,8 @@ import (
 	"github.com/maltzsama/urutau/spec"
 
 	"github.com/maltzsama/urutau/internal/coordk8s"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // phaseEventlog opens the run's audit trail and writes job_started. It returns
@@ -206,13 +208,13 @@ func (c *Coordinator) phaseProvisionWorkers(ctx context.Context, workerTarget ma
 		}
 	}
 	if cfg := c.cfg.Checkpoint; cfg != nil {
-		cp, err := newCheckpoint(ctx, *cfg)
+		cp, err := inflight.NewCheckpoint(ctx, *cfg)
 		if err != nil {
 			return fmt.Errorf("coordinator: checkpoint: %w", err)
 		}
 		c.cp = cp
-		go cp.run(ctx, c.runID, c.indexSnapshot, c.log)
-		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.interval)
+		go cp.Run(ctx, c.runID, c.indexSnapshot, c.log)
+		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.Interval)
 	}
 	return nil
 }

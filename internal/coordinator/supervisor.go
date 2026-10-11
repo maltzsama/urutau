@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/eventlog"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // SupervisorConfig tunes worker supervision (design §7/§8): a worker that
@@ -220,7 +222,7 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		if idx := s.c.indexOf(probes[i].name); idx != nil {
 			probes[i].owes = probes[i].owes || idx.InFlight() > 0
 			if recovering[probes[i].name] {
-				id = idx.minHeldID()
+				id = idx.MinHeldID()
 			}
 		}
 		held = append(held, minHeld{probes[i].name, id})
@@ -288,14 +290,14 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 const defaultWorkerDeliveryTimeout = 5 * time.Minute
 
 // indexOf returns a worker's position index under indexMu, or nil.
-func (c *Coordinator) indexOf(worker string) *positionIndex {
+func (c *Coordinator) indexOf(worker string) *inflight.PositionIndex {
 	c.indexMu.RLock()
 	defer c.indexMu.RUnlock()
 	return c.index[worker]
 }
 
 // setIndex installs a worker's position index under indexMu.
-func (c *Coordinator) setIndex(worker string, idx *positionIndex) {
+func (c *Coordinator) setIndex(worker string, idx *inflight.PositionIndex) {
 	c.indexMu.Lock()
 	defer c.indexMu.Unlock()
 	c.index[worker] = idx
@@ -310,10 +312,10 @@ func (c *Coordinator) deleteIndex(worker string) {
 
 // indexSnapshot copies the index map under indexMu, for a reader that iterates
 // it (the checkpoint runner) while registerOwner may be writing.
-func (c *Coordinator) indexSnapshot() map[string]*positionIndex {
+func (c *Coordinator) indexSnapshot() map[string]*inflight.PositionIndex {
 	c.indexMu.RLock()
 	defer c.indexMu.RUnlock()
-	out := make(map[string]*positionIndex, len(c.index))
+	out := make(map[string]*inflight.PositionIndex, len(c.index))
 	for k, v := range c.index {
 		out[k] = v
 	}

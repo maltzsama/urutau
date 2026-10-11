@@ -75,7 +75,7 @@ func TestWindowCatchUpDoesNotStallOnAFullGate(t *testing.T) {
 		for {
 			select {
 			case q := <-w0.queue:
-				c.budget.release("w0", int64(len(q.body)+len(q.meta)))
+				c.budget.Release("w0", int64(len(q.body)+len(q.meta)))
 				m := &pb.BatchMeta{}
 				if err := proto.Unmarshal(q.meta, m); err == nil {
 					mu.Lock()
@@ -134,7 +134,7 @@ func TestFullGateWaitsForChunkReadyThenDrains(t *testing.T) {
 		for {
 			select {
 			case q := <-w0.queue:
-				c.budget.release("w0", int64(len(q.body)+len(q.meta)))
+				c.budget.Release("w0", int64(len(q.body)+len(q.meta)))
 				sent.Add(1)
 			case <-ctx.Done():
 				return

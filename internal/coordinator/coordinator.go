@@ -32,6 +32,8 @@ import (
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // Config tunes the coordinator for one pipeline.
@@ -43,6 +45,11 @@ import (
 // the coordinator then exits, which resets the workers that had connected and
 // lengthens everyone's backoff — a restart loop with no progress.
 const DefaultWaitWorker = 6 * time.Minute
+
+// CheckpointConfig points the async position checkpoint at its S3 store. It
+// is part of the coordinator's configuration; the checkpoint itself lives in
+// internal/inflight.
+type CheckpointConfig = inflight.CheckpointConfig
 
 type Config struct {
 	Spec       *spec.Spec
@@ -213,7 +220,7 @@ type Coordinator struct {
 	chunkersMu sync.Mutex
 	workers    map[string]*workerState
 	byTicket   map[string]*workerState
-	budget     *flowBudget
+	budget     *inflight.Budget
 	// index is the per-worker position index. It was written only at boot
 	// until live re-slicing (issue #312) made registerOwner write it at
 	// runtime, so it now needs its own lock: the readers (inFlight, enqueueTo,
@@ -222,7 +229,7 @@ type Coordinator struct {
 	// by readers and as c.mu -> indexMu by registerOwner/unregisterOwner, so
 	// the order is consistent and never cycles.
 	indexMu sync.RWMutex
-	index   map[string]*positionIndex
+	index   map[string]*inflight.PositionIndex
 
 	// Kubernetes worker provisioning (issue #298): k8s is the in-cluster
 	// client, built lazily and cached. workerK8s is set at boot when the
@@ -389,7 +396,7 @@ type Coordinator struct {
 	// never stage them. Written once before the pump starts, read-only after.
 	bootCommitted map[string]position.Position
 
-	cp         *checkpoint
+	cp         *inflight.Checkpoint
 	supervisor *supervisor
 	terminate  chan error
 	metrics    *observability.Metrics
@@ -507,7 +514,7 @@ func Run(ctx context.Context, cfg Config) error {
 		log:         cfg.Logger,
 		workers:     map[string]*workerState{},
 		byTicket:    map[string]*workerState{},
-		index:       map[string]*positionIndex{},
+		index:       map[string]*inflight.PositionIndex{},
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
 		ackNotify:   make(chan struct{}, 1),
@@ -522,8 +529,8 @@ func Run(ctx context.Context, cfg Config) error {
 		booted:      make(chan struct{}),
 	}
 	c.gate = gate.New[*dataplane.Batch](gateMaxEvents, gateMaxBytes, batchBytes, batchSink{c})
-	c.budget = newFlowBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
-	c.budget.perWorkerMax = cfg.FlowPerWorkerMax
+	c.budget = inflight.NewBudget(cfg.FlowTotalBytes, cfg.FlowPerWorkerMin)
+	c.budget.PerWorkerMax = cfg.FlowPerWorkerMax
 	c.runID = time.Now().UTC().Format("2006-01-02T15:04:05Z") + "-" + randSuffix(6)
 	c.supervisor = newSupervisor(c)
 	c.terminate = make(chan error, 1)

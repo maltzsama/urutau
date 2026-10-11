@@ -37,7 +37,7 @@ func TestStagedTableBatchesTravelAsFewCycles(t *testing.T) {
 			for {
 				select {
 				case q := <-w.queue:
-					c.budget.release(w.name, int64(len(q.body)+len(q.meta)))
+					c.budget.Release(w.name, int64(len(q.body)+len(q.meta)))
 					subBatches.Add(1)
 					rows.Add(queuedRows(t, q))
 				case <-ctx.Done():

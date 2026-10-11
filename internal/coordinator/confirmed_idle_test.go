@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/maltzsama/urutau/position"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // a worker with nothing in flight (idle table) must not pin the
@@ -12,7 +14,7 @@ func TestConfirmedPositionIdleWorkerDoesNotPin(t *testing.T) {
 	c, _ := coordHarness()
 	idle := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = idle
-	c.index["w1"] = newPositionIndex("run-1")
+	c.index["w1"] = inflight.NewPositionIndex("run-1")
 	c.confirmed["w0"] = position.MustLSN("0/100")
 	c.confirmed["w1"] = position.MustLSN("0/10")
 

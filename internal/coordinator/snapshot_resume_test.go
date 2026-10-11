@@ -73,7 +73,7 @@ func newResumeHarness(t *testing.T) *resumeHarness {
 					h.markers = append(h.markers, meta.GetWindow().GetSnapshotPending())
 					h.mu.Unlock()
 				}
-				c.budget.release(w.name, int64(len(q.body)+len(q.meta)))
+				c.budget.Release(w.name, int64(len(q.body)+len(q.meta)))
 			case <-ctx.Done():
 				return
 			case <-time.After(10 * time.Millisecond):

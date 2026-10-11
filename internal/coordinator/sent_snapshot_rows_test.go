@@ -18,7 +18,7 @@ func TestSnapshotRowBatchesAreNotKeptForRedelivery(t *testing.T) {
 	if err := c.deliverBatch(ctx, w, &pb.BatchMeta{Table: "raw.orders", BatchId: 1}, []byte("rows"), nil, 4, true, ""); err != nil {
 		t.Fatalf("deliverBatch (snapshot rows): %v", err)
 	}
-	if err := c.budget.acquire(ctx, w.name, 4); err != nil {
+	if err := c.budget.Acquire(ctx, w.name, 4); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	if err := c.deliverBatch(ctx, w, &pb.BatchMeta{Table: "raw.orders", BatchId: 2}, []byte("live"), nil, 4, false, "0/30"); err != nil {

@@ -12,6 +12,8 @@ import (
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // routing is the immutable snapshot of one table's partition layout: the
@@ -398,7 +400,7 @@ func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerSt
 		break
 	}
 	c.workers[name] = w
-	c.setIndex(name, newPositionIndex(c.runID))
+	c.setIndex(name, inflight.NewPositionIndex(c.runID))
 	// Seed the ack clock before the pod can attach, or the supervisor's
 	// next tick sees an attached worker with no lastAck and resets it.
 	c.supervisor.noteRegistered(name, time.Now())

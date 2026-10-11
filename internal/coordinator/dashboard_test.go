@@ -9,6 +9,8 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // The pipeline summary carries the running project version, so the dashboard
@@ -178,7 +180,7 @@ func TestRestartWorkerRefusesInFlightOnAnAppendTable(t *testing.T) {
 	}
 
 	// In-flight on an upsert table: allowed.
-	c.index[w.name].add(inflightBatch{id: 1, table: "raw.orders", bytes: 10})
+	c.index[w.name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 	if err := ds.RestartWorker(w.name); err != nil {
 		t.Fatalf("RestartWorker(in-flight, upsert) = %v, want nil", err)
 	}
