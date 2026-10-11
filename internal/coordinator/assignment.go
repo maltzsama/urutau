@@ -9,10 +9,27 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+// sinkAssignment renders the spec's sink section for the worker, without the
+// credentials: the client id and secret reach the worker from its mounted
+// Secret, never over the control plane. Empty options are dropped so the
+// worker keeps its own value for anything the spec leaves unset.
+func sinkAssignment(s *spec.Spec) *pb.SinkAssignment {
+	cfg := driver.SinkConfig(s)
+	opts := make(map[string]string, len(cfg.Options))
+	for k, v := range cfg.Options {
+		if v == "" || k == driver.OptClientID || k == driver.OptClientSecret {
+			continue
+		}
+		opts[k] = v
+	}
+	return &pb.SinkAssignment{Type: cfg.Type, Namespace: cfg.Namespace, Options: opts}
+}
 
 // assignmentFor builds one worker's table assignment with its own ticket.
 // The table schema travels as Arrow IPC derived from the canonical schema —
@@ -38,6 +55,7 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		SourceKind: c.cfg.Spec.Source.Kind,
 		SourceDsn:  dsn,
 		ChunkSize:  uint32(c.cfg.ChunkSize),
+		Sink:       sinkAssignment(c.cfg.Spec),
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
 		},

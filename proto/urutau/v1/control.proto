@@ -225,6 +225,19 @@ message Assignment {
   // an SSH tunnel has a DialFunc, not a DSN. Empty means "use source_dsn"
   // (a URI source, or a scoped read-only snapshotUri).
   bytes       postgres    = 11;
+  // sink is the spec's sink section minus its credentials. The worker opens
+  // its sink from this plus the URI and credentials of its own environment;
+  // without it a worker can only open the default (Iceberg) sink.
+  SinkAssignment sink     = 12;
+}
+
+// SinkAssignment carries the non-credential sink settings of the pipeline
+// spec to the worker that writes to it. The URI and the credentials never
+// travel here: they reach the worker from its mounted Secret.
+message SinkAssignment {
+  string              type      = 1;  // sink type, e.g. "iceberg+rest", "couchbase"
+  string              namespace = 2;  // sink.namespace of the spec
+  map<string, string> options   = 3;  // neutral sink options, credentials removed
 }
 
 // ── Acks ─────────────────────────────────────────────────────────────────
