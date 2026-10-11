@@ -126,4 +126,7 @@ func (te *tableEncoder) materialize() arrow.RecordBatch {
 type heldRec struct {
 	target string
 	rec    arrow.RecordBatch
+	// partial: a later record of the transaction holds more rows of the
+	// same table (dataplane.Batch.Partial).
+	partial bool
 }

@@ -57,12 +57,21 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	// free rows the remaining pieces still owe. A transaction's rows are
 	// contiguous in the buffer (take groups each transaction at its end), so
 	// the head of rest is enough to tell whether it continues.
+	//
+	// The cut is partial only when the rows that follow are the same table's:
+	// take files a transaction's rows table by table, so a run that ends its
+	// table's rows holds all of them and carries the transaction's position
+	// even while another table's rows of it are still to come. Stamped with
+	// the safe position, those complete rows passed for already committed on
+	// a replay (#823).
 	lastPos := run[len(run)-1].Position
-	if len(rest) > 0 && rest[0].Position == lastPos {
+	continues := len(rest) > 0 && rest[0].Position == lastPos
+	partial := continues && rest[0].Table == table
+	if partial {
 		for i := range run {
 			run[i].Position = p.safePos
 		}
-	} else if lastPos != "" {
+	} else if !continues && lastPos != "" {
 		p.safePos = lastPos
 	}
 
@@ -78,7 +87,7 @@ func (p *Puller) makeBatch() (*dataplane.Batch, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &dataplane.Batch{Table: table, Record: rec, Mode: dataplane.UpsertMode}, nil
+	return &dataplane.Batch{Table: table, Record: rec, Mode: dataplane.UpsertMode, Partial: partial}, nil
 }
 
 // EncodeChanges encodes one table's changes into a wire record against its
