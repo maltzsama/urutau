@@ -20,6 +20,15 @@ round-trip correctly (proven end to end against a real catalog + Trino).
 at write time. Cast a `Map` column to `string` (JSON) until iceberg-go
 fixes this upstream.
 
+### Format version
+
+Every table the sink creates is Iceberg **format-version 3**. A table an
+earlier release created as version 2 is upgraded in place the next time its
+pipeline starts: the upgrade is a metadata change, no data or delete file is
+rewritten, and the equality deletes the table already carries stay valid.
+Readers must support format-version 3 (Trino 483 and Polaris 1.8.0 are the
+versions the e2e suite runs against).
+
 ### Table maintenance
 
 `sink.maintenance` is Iceberg-only: a maintenance block on any other sink
