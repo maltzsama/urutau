@@ -37,15 +37,15 @@ import (
 //   - a worker owing work that delivers none of it for the delivery timeout,
 //     connected or not (supervisor.tick).
 
-// defaultMaxConsecutiveCrashes is how many times in a row one worker may
-// crash without delivering what it owed before the run ends.
-const defaultMaxConsecutiveCrashes = 3
-
 // workerReportedError is an error the worker sent itself
 // (WorkerMessage_Error). It ends the run: it is not a hiccup.
 type workerReportedError struct{ detail string }
 
 func (e *workerReportedError) Error() string { return "coordinator: worker error: " + e.detail }
+
+// defaultMaxConsecutiveCrashes is how many times in a row one worker may
+// crash without delivering what it owed before the run ends.
+const defaultMaxConsecutiveCrashes = 3
 
 // maxConsecutiveCrashes is the configured limit, or its default.
 func (c *Coordinator) maxConsecutiveCrashes() int {
@@ -100,10 +100,11 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	return nil
 }
 
-// onAttach records a worker's session attaching, outside c.mu: noteAttach
-// takes the supervisor lock, and the supervisor's lock order is c.mu then
-// supervisor.mu (supervisor.tick). Acquiring supervisor.mu first would invert
-// that order and deadlock the two (audit #3). A worker back from a crash loop
+// onAttach records a worker's session attaching. The caller must NOT hold
+// c.mu: workerBack below takes it, and noteAttach takes the supervisor lock.
+// The supervisor's lock order is c.mu then supervisor.mu (supervisor.tick);
+// acquiring supervisor.mu first would invert it and deadlock the two (audit
+// #3). A worker back from a crash loop
 // ends the run here, with its Pod's reason.
 func (c *Coordinator) onAttach(worker string) error {
 	c.supervisor.noteAttach(worker)
@@ -300,6 +301,9 @@ func (s *supervisor) noteBack(worker string, term podTermination, known bool, ow
 	h.owedMark, h.backAt = owedMark, now
 	crashed, desc := false, ""
 	if known {
+		// A crash is fresh when the same Pod restarted since it was last
+		// seen. The second arm is the first sighting of a Pod: nothing was
+		// seen before, so any restart it already counts is new to us.
 		fresh := (term.podUID == h.seenUID && term.restarts > h.seenRestarts) ||
 			(h.seenUID == "" && term.restarts > 0)
 		if h.lossPending && fresh {
@@ -408,6 +412,8 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 		timeout = defaultWorkerDeliveryTimeout
 	}
 	deadline := c.supervisor.lossTime(w.name).Add(timeout)
+	poll := time.NewTicker(reattachPoll)
+	defer poll.Stop()
 	for {
 		c.mu.Lock()
 		attached := w.attached
@@ -422,7 +428,7 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(reattachPoll):
+		case <-poll.C:
 		}
 	}
 }
@@ -436,10 +442,7 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 // committed window returns nil, and is re-read from its start.
 func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint64]int, partition int, next int) (int, []any) {
 	from := next
-	for _, m := range c.takeLostWindows(w.name) {
-		if m.target != target {
-			continue
-		}
+	for _, m := range c.takeLostWindows(w.name, target) {
 		if i, ok := windows[m.window]; ok && i < from {
 			from = i
 		}
@@ -461,12 +464,26 @@ func (c *Coordinator) noteLostWindows(worker string) {
 	c.lostWindows[worker] = append(c.lostWindows[worker], held...)
 }
 
-// takeLostWindows returns and forgets the chunk windows worker lost.
-func (c *Coordinator) takeLostWindows(worker string) []chunkMarker {
+// takeLostWindows returns and forgets the chunk windows worker lost on
+// target. A marker of another table stays for that table's own redo: today a
+// worker serves one table, so there is none, but taking them all here and
+// skipping the others would drop them for good the day that changes.
+func (c *Coordinator) takeLostWindows(worker, target string) []chunkMarker {
 	c.chunkMarkersMu.Lock()
 	defer c.chunkMarkersMu.Unlock()
-	out := c.lostWindows[worker]
-	delete(c.lostWindows, worker)
+	var out, kept []chunkMarker
+	for _, m := range c.lostWindows[worker] {
+		if m.target == target {
+			out = append(out, m)
+		} else {
+			kept = append(kept, m)
+		}
+	}
+	if len(kept) == 0 {
+		delete(c.lostWindows, worker)
+	} else {
+		c.lostWindows[worker] = kept
+	}
 	return out
 }
 
