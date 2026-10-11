@@ -30,5 +30,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # override `command` with their own binary.
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/ /usr/local/bin/
-USER nonroot
+# Numeric on purpose: with runAsNonRoot the kubelet can only verify a numeric
+# user. A name ("nonroot") fails the Pod with CreateContainerConfigError.
+# 65532 is the distroless nonroot uid/gid.
+USER 65532:65532
 ENTRYPOINT ["urutau"]

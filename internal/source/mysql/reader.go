@@ -201,8 +201,18 @@ func canalConfig(cfg Config, includeRegex []string) *canal.Config {
 		// A finite reconnect budget: 0 would retry a permanently broken
 		// stream forever instead of surfacing the failure (#182).
 		MaxReconnectAttempts: cfg.MaxReconnectAttempts,
+		EventCacheCount:      eventReadAhead,
 	}
 }
+
+// eventReadAhead is how many binlog events go-mysql may hold between its
+// network reader and this package. Its default is 10,240, counted in events,
+// and every queued event keeps its whole packet: when the pipeline lags (a
+// backlog, a replay after a restart) the queue fills, and with wide rows that
+// is hundreds of megabytes outside every flow budget — enough to OOM-kill the
+// coordinator. A short queue gives the same throughput (the server keeps
+// sending as fast as events are taken) and lets TCP carry the backpressure.
+const eventReadAhead = 256
 
 // stop closes done exactly once, unblocking any OnRow send in progress.
 func (r *Reader) stop() {
