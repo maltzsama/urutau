@@ -10,7 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -201,7 +201,7 @@ func closeWindow(p *tablePipeline, ing Ingest) (*dataplane.Batch, bool, error) {
 		win.batch.Release()
 		return nil, true, nil
 	}
-	sel, err := dpint.SelectRows(win.batch, keepIdx, "", dataplane.AppendMode, "", nil)
+	sel, err := columnar.SelectRows(win.batch, keepIdx, "", dataplane.AppendMode, "", nil)
 	win.batch.Release() // the window is consumed; selectRows retained its columns
 	if err != nil {
 		return nil, true, err

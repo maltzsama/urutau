@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 import (
 	"testing"
@@ -7,10 +7,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 )
 
-func int64Batch(alloc memory.Allocator, vals ...int64) *dataplane.Batch {
+func int64Batch(alloc memory.Allocator, vals ...int64) *columnar.Batch {
 	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
 	rb := array.NewRecordBuilder(alloc, schema)
 	for _, v := range vals {
@@ -18,10 +18,10 @@ func int64Batch(alloc memory.Allocator, vals ...int64) *dataplane.Batch {
 	}
 	rec := rb.NewRecordBatch()
 	rb.Release()
-	return &dataplane.Batch{Table: "t", Record: rec}
+	return &columnar.Batch{Table: "t", Record: rec}
 }
 
-func stringBatch(alloc memory.Allocator, vals ...string) *dataplane.Batch {
+func stringBatch(alloc memory.Allocator, vals ...string) *columnar.Batch {
 	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.BinaryTypes.String}}, nil)
 	rb := array.NewRecordBuilder(alloc, schema)
 	for _, v := range vals {
@@ -29,7 +29,7 @@ func stringBatch(alloc memory.Allocator, vals ...string) *dataplane.Batch {
 	}
 	rec := rb.NewRecordBatch()
 	rb.Release()
-	return &dataplane.Batch{Table: "t", Record: rec}
+	return &columnar.Batch{Table: "t", Record: rec}
 }
 
 // #508: one concatenation helper with a single schema check.
@@ -40,7 +40,7 @@ func TestConcatBatchesSchemaCheck(t *testing.T) {
 	b := int64Batch(alloc, 4, 5)
 	defer b.Record.Release()
 
-	out, err := dataplane.ConcatBatches(nil, []*dataplane.Batch{a, b})
+	out, err := columnar.ConcatBatches(nil, []*columnar.Batch{a, b})
 	if err != nil {
 		t.Fatalf("ConcatBatches: %v", err)
 	}
@@ -52,12 +52,12 @@ func TestConcatBatchesSchemaCheck(t *testing.T) {
 	// A different schema must be rejected, not silently concatenated.
 	other := stringBatch(alloc, "x")
 	defer other.Record.Release()
-	if _, err := dataplane.ConcatBatches(nil, []*dataplane.Batch{a, other}); err == nil {
+	if _, err := columnar.ConcatBatches(nil, []*columnar.Batch{a, other}); err == nil {
 		t.Fatal("ConcatBatches must reject a schema mismatch")
 	}
 
 	// Empty inputs concatenate to nil.
-	if out, err := dataplane.ConcatBatches(nil, nil); err != nil || out != nil {
+	if out, err := columnar.ConcatBatches(nil, nil); err != nil || out != nil {
 		t.Fatalf("empty concat = %v, %v; want nil, nil", out, err)
 	}
 }
@@ -67,10 +67,10 @@ func TestMergeBatchesNilSides(t *testing.T) {
 	a := int64Batch(alloc, 1, 2)
 	defer a.Record.Release()
 
-	if out, err := dataplane.MergeBatches(nil, nil, nil); err != nil || out != nil {
+	if out, err := columnar.MergeBatches(nil, nil, nil); err != nil || out != nil {
 		t.Fatalf("merge of two nils = %v, %v", out, err)
 	}
-	out, err := dataplane.MergeBatches(nil, a, nil)
+	out, err := columnar.MergeBatches(nil, a, nil)
 	if err != nil || out == nil || out.Record.NumRows() != 2 {
 		t.Fatalf("merge(a, nil) = %v, %v", out, err)
 	}

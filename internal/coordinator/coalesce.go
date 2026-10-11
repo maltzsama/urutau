@@ -11,7 +11,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 )
 
 // A staged table (several owners on a staging sink) commits one Iceberg
@@ -74,7 +74,7 @@ func (c *Coordinator) cycleMaxBytes() int64 {
 }
 
 // batchBytes is a batch's in-memory size, the byte bound's measure.
-func batchBytes(b *dataplane.Batch) int64 { return dpint.BatchBytes(b) }
+func batchBytes(b *dataplane.Batch) int64 { return columnar.BatchBytes(b) }
 
 // fits reports whether a batch of rows/bytes may join one already holding
 // accRows/accBytes: always for the first, then within both bounds.

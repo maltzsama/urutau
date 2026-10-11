@@ -2,7 +2,7 @@ package remote
 
 import (
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/internal/worker"
 )
@@ -32,7 +32,7 @@ func installAcks(w *worker.Worker, sender *sessionSender, epoch uint64, cfg Remo
 		// Carry the equality-delete count so the coordinator's dashboard
 		// metrics (deletes, collapse ratio) are not always zero in distributed
 		// mode (issue #263).
-		_, deletes := dpint.CountOps(b)
+		_, deletes := columnar.CountOps(b)
 		_ = sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Ack{Ack: &pb.Ack{
 			Table:    b.Table,
 			Epoch:    epoch,

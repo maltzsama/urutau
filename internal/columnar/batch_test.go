@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 import (
 	"testing"
@@ -6,7 +6,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 )
 
 func newTestRecord(t *testing.T, alloc memory.Allocator) arrow.RecordBatch {
@@ -25,7 +25,7 @@ func newTestRecord(t *testing.T, alloc memory.Allocator) arrow.RecordBatch {
 }
 
 func TestReleaseNilRecord(t *testing.T) {
-	b := &dataplane.Batch{Table: "t", Watermark: []byte("w")}
+	b := &columnar.Batch{Table: "t", Watermark: []byte("w")}
 	b.Release()
 }
 
@@ -33,7 +33,7 @@ func TestReleaseFreesRecord(t *testing.T) {
 	alloc := checkedAlloc(t)
 	rec := newTestRecord(t, alloc)
 
-	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
+	b := &columnar.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 	b.Release()
 
 	if b.Record != nil {
@@ -45,7 +45,7 @@ func TestReleaseIdempotent(t *testing.T) {
 	alloc := checkedAlloc(t)
 	rec := newTestRecord(t, alloc)
 
-	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
+	b := &columnar.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 	b.Release()
 	b.Release()
 }
@@ -55,7 +55,7 @@ func TestBatchTable(t *testing.T) {
 	rec := newTestRecord(t, alloc)
 	defer rec.Release()
 
-	b := &dataplane.Batch{Table: "orders", Record: rec, Watermark: []byte("offset-42")}
+	b := &columnar.Batch{Table: "orders", Record: rec, Watermark: []byte("offset-42")}
 	if b.Table != "orders" {
 		t.Errorf("Table = %q, want orders", b.Table)
 	}
@@ -68,8 +68,8 @@ func TestBatchOwnershipTransfer(t *testing.T) {
 	alloc := checkedAlloc(t)
 	rec := newTestRecord(t, alloc)
 
-	producer := func() *dataplane.Batch {
-		return &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
+	producer := func() *columnar.Batch {
+		return &columnar.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 	}
 
 	b := producer()
@@ -81,7 +81,7 @@ func TestBatchRetainBeforeEscape(t *testing.T) {
 	rec := newTestRecord(t, alloc)
 
 	rec.Retain()
-	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
+	b := &columnar.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 
 	rec.Release()
 

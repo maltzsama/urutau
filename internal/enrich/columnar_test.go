@@ -9,7 +9,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
@@ -105,7 +105,7 @@ func TestColdPassMissesEveryRow(t *testing.T) {
 //	BenchmarkColumnarJoin-16   ~210 µs/op   ~47 KB/op   ~390 allocs/op
 //
 // The allocs are the compute kernels' internal buffers (the v18.7.0 leak,
-// tracked in internal/dataplane/arrowgo_residual_test.go) plus the encode
+// tracked in internal/columnar/arrowgo_residual_test.go) plus the encode
 // of the input batch (excluded from the timed section).
 func BenchmarkColumnarJoin(b *testing.B) {
 	s, err := New([]spec.Enrich{refCfg(nil)}, evSchema("id", "user_ref", "q"), nil)
@@ -149,7 +149,7 @@ func BenchmarkColumnarJoin(b *testing.B) {
 		if encErr != nil {
 			b.Fatal(encErr)
 		}
-		in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+		in := &columnar.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 		b.StartTimer()
 
 		out, jErr := s.ColumnarJoin(b.Context(), in)

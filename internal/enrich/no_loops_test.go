@@ -3,7 +3,7 @@ package enrich
 // P8 of BRIEF-PERF v10 Onda 2 — the prohibitions, enforced by AST walk.
 //
 // These tests parse the NON-TEST .go files of internal/enrich (and, for
-// TestNoPanicOutsideTest, internal/dataplane too) with go/ast — no type
+// TestNoPanicOutsideTest, internal/columnar too) with go/ast — no type
 // info, no build, no shell. They are name-heuristic by design: a scalar
 // slice is recognized by its element type name against a fixed list, so
 // renaming a mask to "banana" is still caught as []bool.
@@ -21,7 +21,7 @@ package enrich
 //	                                 scan loop, Row 2 the appendTyped switch
 //	internal/enrich/enrich.go      — snapshot key index (once per refresh)
 //	internal/enrich/columnar.go    — the ref-column gather pass
-//	internal/dataplane/collapse.go — composite-PK hashing, LWW grouping,
+//	internal/columnar/collapse.go — composite-PK hashing, LWW grouping,
 //	                                 distinct-key winner list
 
 import (
@@ -262,7 +262,7 @@ func isEmptyIface(e ast.Expr) bool {
 
 func TestNoPanicOutsideTest(t *testing.T) {
 	fset := token.NewFileSet()
-	dirs := []string{".", "../dataplane"}
+	dirs := []string{".", "../columnar"}
 	for _, dir := range dirs {
 		for _, path := range nonTestGoFiles(t, dir) {
 			f, err := parser.ParseFile(fset, path, nil, 0)

@@ -17,7 +17,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
@@ -154,7 +154,7 @@ func runColumnar(t *testing.T, s *Stage, changes []rowchange.Change) []rowchange
 	if err != nil {
 		t.Fatalf("encode input: %v", err)
 	}
-	in := &dpint.Batch{Table: "t", Record: rec, Mode: dataplane.UpsertMode}
+	in := &columnar.Batch{Table: "t", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
 
 	out, err := s.ColumnarJoin(t.Context(), in)

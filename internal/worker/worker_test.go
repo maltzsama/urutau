@@ -10,8 +10,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
+	"github.com/maltzsama/urutau/internal/columnar"
+	"github.com/maltzsama/urutau/internal/columnar/columnartest"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -326,25 +326,25 @@ func (f CommitterFunc) Commit(ctx context.Context, b *dataplane.Batch) error { r
 // guard existed (audit #5). This is the exact trap the enum shift exposed.
 func TestMergeBatchesPropagatesMode(t *testing.T) {
 	mk := func(mode dataplane.WriteMode) *dataplane.Batch {
-		b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 1, Allocator: nil})
+		b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{NumRows: 1, Allocator: nil})
 		b.Mode = mode
 		return b
 	}
 	for _, mode := range []dataplane.WriteMode{dataplane.UpsertMode, dataplane.AppendMode} {
 		// a-only
-		got, err := dpint.MergeBatches(nil, mk(mode), nil)
+		got, err := columnar.MergeBatches(nil, mk(mode), nil)
 		if err != nil || got.Mode != mode {
 			t.Fatalf("a-only mode = %v, want %v (err %v)", got.Mode, mode, err)
 		}
 		got.Release()
 		// b-only
-		got, err = dpint.MergeBatches(nil, nil, mk(mode))
+		got, err = columnar.MergeBatches(nil, nil, mk(mode))
 		if err != nil || got.Mode != mode {
 			t.Fatalf("b-only mode = %v, want %v (err %v)", got.Mode, mode, err)
 		}
 		got.Release()
 		// concat
-		got, err = dpint.MergeBatches(nil, mk(mode), mk(mode))
+		got, err = columnar.MergeBatches(nil, mk(mode), mk(mode))
 		if err != nil || got.Mode != mode {
 			t.Fatalf("concat mode = %v, want %v (err %v)", got.Mode, mode, err)
 		}

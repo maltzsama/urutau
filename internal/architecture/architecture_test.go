@@ -128,14 +128,14 @@ func TestWorkerCoreStaysFreeOfRemote(t *testing.T) {
 	}
 }
 
-// TestDataplaneNeverKnowsWorker: internal/dataplane is the shared columnar
+// TestColumnarNeverKnowsWorker: internal/columnar is the shared columnar
 // batch library; it must not depend on the worker that consumes it (issue
 // #401).
-func TestDataplaneNeverKnowsWorker(t *testing.T) {
-	const dp = "github.com/maltzsama/urutau/internal/dataplane"
+func TestColumnarNeverKnowsWorker(t *testing.T) {
+	const dp = "github.com/maltzsama/urutau/internal/columnar"
 	for imp := range directImports(t, dp) {
 		if strings.HasPrefix(imp, "github.com/maltzsama/urutau/internal/worker") {
-			t.Errorf("internal/dataplane imports %s — the batch library must stay independent of the worker", imp)
+			t.Errorf("internal/columnar imports %s — the batch library must stay independent of the worker", imp)
 		}
 	}
 }

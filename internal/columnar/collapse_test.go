@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 import (
 	"context"
@@ -6,16 +6,16 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/maltzsama/urutau/internal/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
+	"github.com/maltzsama/urutau/internal/columnar"
+	"github.com/maltzsama/urutau/internal/columnar/columnartest"
 )
 
 func TestCollapseBasic(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 10, Allocator: alloc})
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -42,10 +42,10 @@ func TestCollapseBasic(t *testing.T) {
 
 func TestCollapseDeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialDeleteLast(alloc)
+	b := columnartest.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -68,10 +68,10 @@ func TestCollapseDeleteLast(t *testing.T) {
 
 func TestCollapseInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialInsertAfterDelete(alloc)
+	b := columnartest.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -94,10 +94,10 @@ func TestCollapseInsertAfterDelete(t *testing.T) {
 
 func TestCollapseCompositeKey(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialCompositeKey(alloc)
+	b := columnartest.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -124,14 +124,14 @@ func TestCollapseCompositeKey(t *testing.T) {
 
 func TestCollapseNullPK(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{
 		NumRows:       3,
 		IncludeNullPK: true,
 		Allocator:     alloc,
 	})
 	defer b.Release()
 
-	_, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	_, _, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err == nil {
 		t.Fatal("expected error for null PK")
 	}
@@ -139,10 +139,10 @@ func TestCollapseNullPK(t *testing.T) {
 
 func TestCollapsePreservesWatermark(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 10, Allocator: alloc})
+	b := columnartest.GenerateBatch(42, columnartest.GeneratorOpts{NumRows: 10, Allocator: alloc})
 	defer b.Release()
 
-	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	ups, _, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -159,14 +159,14 @@ func TestCollapsePreservesWatermark(t *testing.T) {
 
 func TestCollapseEmptyBatch(t *testing.T) {
 	alloc := checkedAlloc(t)
-	rb := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 1, Allocator: alloc})
+	rb := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{NumRows: 1, Allocator: alloc})
 	defer rb.Release()
 	empty := rb.Record.NewSlice(0, 0)
 	defer empty.Release()
 
-	b := &dataplane.Batch{Table: rb.Table, Record: empty, Watermark: rb.Watermark}
+	b := &columnar.Batch{Table: rb.Table, Record: empty, Watermark: rb.Watermark}
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -182,10 +182,10 @@ func TestCollapseEmptyBatch(t *testing.T) {
 
 func TestCollapseInt64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialInt64Overflow(alloc)
+	b := columnartest.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
-	ups, _, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	ups, _, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -219,10 +219,10 @@ func TestCollapseMissingOpColumn(t *testing.T) {
 	bb.Field(0).(*array.Int64Builder).Append(1)
 	rec := bb.NewRecordBatch()
 	bb.Release()
-	nobatch := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
+	nobatch := &columnar.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
 	defer nobatch.Release()
 
-	_, _, err := dataplane.Collapse(context.Background(), alloc, nobatch, []string{"id"})
+	_, _, err := columnar.Collapse(context.Background(), alloc, nobatch, []string{"id"})
 	if err == nil {
 		t.Fatal("expected error for missing __op column")
 	}
@@ -232,10 +232,10 @@ func TestCollapseMissingOpColumn(t *testing.T) {
 // returns a nil key for each) and silently drop all but the last.
 func TestCollapseRejectsEmptyPrimaryKey(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 5, Allocator: alloc})
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
-	if _, _, err := dataplane.Collapse(context.Background(), alloc, b, nil); err == nil {
+	if _, _, err := columnar.Collapse(context.Background(), alloc, b, nil); err == nil {
 		t.Fatal("an empty primary key list must error")
 	}
 }
