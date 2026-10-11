@@ -50,6 +50,11 @@ func (c *Coordinator) closeOneWindow(ctx context.Context, rdr source.SourceReade
 	if err != nil {
 		return fmt.Errorf("coordinator: window %d pos %q: %w", wo.Seq, wo.Pos, err)
 	}
+	// The window's rows are in the worker's window: from here a full gate
+	// drains tagged for it rather than block the pump. Marked ready only
+	// after the catch-up, the gate blocked the pump during it, the reader
+	// stopped and never reached pos (#821, the #435 stall again).
+	c.markWindowReady(ref.Target, partition, wo.Seq)
 	// A worker lost while the reader catches up takes its window with it, and
 	// its full queue blocks the shared pump so the reader never reaches high;
 	// waiting out the window timeout would end the run (issue #526) instead of
@@ -57,7 +62,6 @@ func (c *Coordinator) closeOneWindow(ctx context.Context, rdr source.SourceReade
 	if err := c.waitCaughtUpOrLost(ctx, rdr, pos, cfg, wo.Seq, lost); err != nil {
 		return err
 	}
-	c.markWindowReady(ref.Target, partition, wo.Seq)
 	// Release the window's gated live events (InWindow-tagged) ahead of the
 	// Closes marker — FIFO keeps them before it.
 	if err := c.flushWindow(ctx, ref.Target, partition, wo.Seq); err != nil {
