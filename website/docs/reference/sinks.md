@@ -29,6 +29,40 @@ rewritten, and the equality deletes the table already carries stay valid.
 Readers must support format-version 3 (Trino 483 and Polaris 1.8.0 are the
 versions the e2e suite runs against).
 
+### Row deletes: `deleteMode`
+
+An `upsert` removes a row's old version in one of two ways:
+
+| `deleteMode` | How the old version is removed | Cost |
+| --- | --- | --- |
+| `equality` (default) | An equality delete on the primary key | Cheap to write. Every reader joins the delete files against the data until a compaction applies them. |
+| `positional` | The row's position is marked in a deletion vector | Readers skip the row by position. At each commit the writer reads the key columns of the data files whose key range can hold one of the batch's keys. |
+
+```yaml title="Positional deletes"
+sink:
+  type: iceberg+rest
+  deleteMode: positional
+```
+
+There is no key index: positions are resolved at commit time, against the
+table as that commit attempt loaded it, and resolved again on a retry. A data
+file carries at most one deletion vector, so a file that already has one gets
+a merged replacement in the same snapshot. Rows, vectors and `cdc.position`
+land in one atomic commit, as in `equality` mode.
+
+Things to know before switching it on:
+
+- Tables written by more than one worker (`workers > 1`) keep equality
+  deletes in either mode.
+- A table that already carries equality deletes keeps them valid; new commits
+  write deletion vectors.
+- Key columns must be integers, strings, binary, booleans, dates, timestamps
+  or decimals. Another key type fails the commit.
+- The commit cost grows with the number of data files whose key range
+  overlaps the batch. Keys that arrive in order (an auto-increment id, a
+  timestamp-prefixed key) touch few files; keys spread over the whole table
+  touch many.
+
 ### Table maintenance
 
 `sink.maintenance` is Iceberg-only: a maintenance block on any other sink

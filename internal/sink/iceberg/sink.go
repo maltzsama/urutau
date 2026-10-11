@@ -27,6 +27,9 @@ type Sink struct {
 	// evolveSchema opts into additive schema evolution in EnsureTable
 	// (sink.evolveSchema). Off means the historical fail-closed behavior.
 	evolveSchema bool
+	// positional writes deletion vectors instead of equality deletes
+	// (sink.deleteMode: positional) on the tables this sink commits directly.
+	positional bool
 }
 
 // Open dials the catalog and ensures the namespace, returning a Sink that
@@ -58,6 +61,7 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 		ns:             cfg.Namespace,
 		targetFileSize: targetFileSizeFrom(cfg.Options[driver.OptTargetFileSize]),
 		evolveSchema:   evolveSchemaFrom(cfg.Options[driver.OptEvolveSchema]),
+		positional:     cfg.Options[driver.OptDeleteMode] == string(spec.DeleteModePositional),
 	}, nil
 }
 
@@ -124,7 +128,12 @@ func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.S
 
 // Writer opens the per-table committer.
 func (s *Sink) Writer(ctx context.Context, ref core.TableRef, cast core.CastPolicy, meta []core.MetadataColumn) (sink.TableWriter, error) {
-	return NewTableWriter(ctx, s.cat, s.ident(ref.Target), ref.PrimaryKey, cast, meta, ref.Source, s.targetFileSize)
+	w, err := NewTableWriter(ctx, s.cat, s.ident(ref.Target), ref.PrimaryKey, cast, meta, ref.Source, s.targetFileSize)
+	if err != nil {
+		return nil, err
+	}
+	w.positional = s.positional
+	return w, nil
 }
 
 // Position reads the committed CDC position (with walk-back). An empty

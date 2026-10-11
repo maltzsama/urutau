@@ -133,6 +133,7 @@ func (s *Spec) Validate(opts ...ValidateOption) error {
 	}
 	validateMaintenance(s.Sink.Maintenance, s.Sink.Type, &problems)
 	validateEvolveSchema(s.Sink.EvolveSchema, s.Sink.Type, &problems)
+	validateDeleteMode(s.Sink.DeleteMode, s.Sink.Type, &problems)
 
 	// A discovery pipeline declares no tables: the source lists them at boot.
 	discover := s.Source.Postgres != nil && s.Source.Postgres.Discover

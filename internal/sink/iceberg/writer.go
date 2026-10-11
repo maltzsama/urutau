@@ -62,6 +62,12 @@ type TableWriter struct {
 	metaByName     map[string]core.MetadataColumn
 	sourceTable    string
 	targetFileSize int64
+	// positional removes old row versions with deletion vectors instead of
+	// equality deletes (positional.go). Set by the sink from sink.deleteMode.
+	positional bool
+	// filesMatched counts the data files positional commits have read to
+	// resolve positions (the cost the scan plan's pruning keeps down).
+	filesMatched int
 }
 
 // NewTableWriter loads the table, resolves the equality-delete key (the
@@ -201,7 +207,7 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	// (the empty-batch case). Writing a zero-row delete record would panic
 	// the parquet writer, so skip the record and file entirely.
 	var files []iceberg.DataFile
-	if len(keys) > 0 {
+	if len(keys) > 0 && !w.positional {
 		rec, err := w.deleteRecord(keys)
 		if err != nil {
 			return err
@@ -218,7 +224,8 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			return fmt.Errorf("iceberg: write equality deletes %v: %w", w.ident, err)
 		}
 	}
-	if len(files) == 0 && pos == "" && snapshotState == "" && snapshotPending == nil {
+	resolved := w.positional && len(keys) > 0 // deletes resolved per attempt
+	if len(files) == 0 && !resolved && pos == "" && snapshotState == "" && snapshotPending == nil {
 		// Nothing to delete, no position and no snapshot state to advance.
 		return nil
 	}
@@ -226,6 +233,12 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 	// A retry after a lost catalog response must not re-add the same files
 	// (issue #123, same guard the staged path uses).
 	key := cycleKey(files, nil, pos)
+	if resolved {
+		var err error
+		if key, err = w.keyedCycle(keys, nil, pos); err != nil {
+			return err
+		}
+	}
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
 	p[propCycle] = key
@@ -249,18 +262,16 @@ func (w *TableWriter) commitDeletes(ctx context.Context, keys [][]any, pos strin
 			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
-		if len(files) > 0 {
-			// The RowDelta builder's Commit stages the row-level update onto
-			// the transaction (txn.apply); it does NOT commit to the catalog.
-			// The single catalog commit is below, after properties are staged,
-			// so the deletes and the position land in one atomic snapshot.
-			if err := txn.NewRowDelta(p).AddDeletes(files...).Commit(ctx); err != nil {
-				if !isRetryableError(err) {
-					return err
-				}
-				lastErr = err
-				continue
+		// stageRowDelta stages the row-level update onto the transaction
+		// (txn.apply); it does NOT commit to the catalog. The single catalog
+		// commit is below, after properties are staged, so the deletes and
+		// the position land in one atomic snapshot.
+		if err := w.stageRowDelta(ctx, tbl, txn, p, keys, files, nil); err != nil {
+			if !isRetryableError(err) {
+				return err
 			}
+			lastErr = err
+			continue
 		}
 		// Persist the position AND the snapshot state: a snapshot-only
 		// transition (no position) must still advance, matching

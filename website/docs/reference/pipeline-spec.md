@@ -122,6 +122,7 @@ accepts `timezone` and TLS (`tls`, `ssl-ca`, `ssl-cert`, `ssl-key`,
 | `warehouse` | iceberg | Catalog warehouse name |
 | `clientId` / `clientSecret` / `scope` | iceberg | OAuth2 credentials; filled from `URUTAU_SINK_*` on Kubernetes |
 | `commitMode` | couchbase | `fast` (default) or `atomic` |
+| `deleteMode` | iceberg | `equality` (default) or `positional` — see [Sinks: row deletes](./sinks#row-deletes-deletemode) |
 | `defaults.writeMode` | no | Pipeline-wide `writeMode` default |
 | `defaults.targetFileSize` | no | Target data-file size |
 | `maintenance.enabled` | no | Background Iceberg table maintenance (Iceberg sink only — rejected on any other sink type). `false` by default — omitting the whole `maintenance` block, or leaving `enabled` unset, is the same as `false` |
