@@ -398,3 +398,23 @@ func TestReconcileReplicasReportsAnUnreadableStatefulSet(t *testing.T) {
 		})
 	}
 }
+
+// A cooldown is written when a scale fails. When its table leaves the
+// pipeline the entry goes with it; the cooldown of a table still there stays.
+func TestReconcileReplicasPrunesTheCooldownOfATableThatLeft(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.workerK8s = true
+	c.k8sNS = "ns"
+	c.k8sClient = fake.NewSimpleClientset()
+	later := time.Now().Add(time.Minute)
+	c.scaleRetryAfter = map[string]time.Time{"raw.orders": later, "raw.gone": later}
+
+	c.reconcileReplicas(context.Background())
+
+	if _, ok := c.scaleRetryAfter["raw.gone"]; ok {
+		t.Error("the cooldown of a table no longer in the pipeline was kept")
+	}
+	if got, ok := c.scaleRetryAfter["raw.orders"]; !ok || !got.Equal(later) {
+		t.Errorf("the cooldown of a table still in the pipeline was dropped or changed: %v, %v", got, ok)
+	}
+}

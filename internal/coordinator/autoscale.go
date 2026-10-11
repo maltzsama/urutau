@@ -32,6 +32,11 @@ func (c *Coordinator) scaleReconcileLoop(ctx context.Context) {
 	if !c.workerK8s {
 		return
 	}
+	// The cooldown map belongs to this loop alone; it is made here, where
+	// that ownership starts, not checked for on every pass.
+	if c.scaleRetryAfter == nil {
+		c.scaleRetryAfter = map[string]time.Time{}
+	}
 	// Converge once at start: a coordinator restart after a KEDA scale must
 	// not wait a full interval before routing matches the running pods.
 	c.reconcileReplicas(ctx)
@@ -56,15 +61,14 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 	if c.cfg.Spec == nil {
 		return
 	}
-	if c.scaleRetryAfter == nil {
-		c.scaleRetryAfter = map[string]time.Time{}
-	}
 	cs, ns, _, err := c.workerClientset(ctx)
 	if err != nil {
 		c.log.Debug("coordinator: scale reconcile skipped", "err", err)
 		return
 	}
-	for _, t := range c.tablesOrSpec() {
+	tables := c.tablesOrSpec()
+	c.pruneScaleRetry(tables)
+	for _, t := range tables {
 		if c.scaleRetryAfter[t.Target].After(time.Now()) {
 			continue // this table's recent scale failed; let it drain first
 		}
@@ -98,7 +102,29 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 		}
 		if err := c.ScaleTable(ctx, t.Target, want); err != nil {
 			c.log.Warn("coordinator: scale reconcile", "table", t.Target, "replicas", want, "err", err)
+			if c.scaleRetryAfter == nil {
+				c.scaleRetryAfter = map[string]time.Time{} // a pass run outside the loop (tests)
+			}
 			c.scaleRetryAfter[t.Target] = time.Now().Add(scaleFailureCooldown)
+		}
+	}
+}
+
+// pruneScaleRetry drops the cooldown of every table that is no longer in the
+// pipeline. A cooldown is written when a scale fails and nothing else ever
+// removed it, so a table that left the spec kept its entry for the life of
+// the process.
+func (c *Coordinator) pruneScaleRetry(tables []spec.Table) {
+	if len(c.scaleRetryAfter) == 0 {
+		return
+	}
+	live := make(map[string]struct{}, len(tables))
+	for _, t := range tables {
+		live[t.Target] = struct{}{}
+	}
+	for target := range c.scaleRetryAfter {
+		if _, ok := live[target]; !ok {
+			delete(c.scaleRetryAfter, target)
 		}
 	}
 }
