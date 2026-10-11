@@ -108,23 +108,50 @@ func RunRemote(ctx context.Context, cfg RemoteConfig) error {
 	return serve(ctx, sessCtx, cancelAll, cfg, conn, session, sender, w, assign, pkByTable, committed)
 }
 
-// openWorkerSink opens the catalog sink the assignment's writes go through.
+// openWorkerSink opens the sink the assignment's writes go through.
 func openWorkerSink(ctx context.Context, cfg RemoteConfig, assign *pb.Assignment) (sink.Sink, error) {
-	snk, err := driver.OpenSinkConfig(ctx, sink.Config{
+	sc := workerSinkConfig(cfg, assign.GetSink())
+	// The sink parses the opaque position strings it stores with this kind
+	// (position.Parse): an empty kind defaults to MySQL GTID, so a Postgres
+	// LSN or Kafka offset read back on restart would be parsed as a GTID set
+	// and resume from the wrong point.
+	sc.SourceKind = assign.SourceKind
+	snk, err := driver.OpenSinkConfig(ctx, sc)
+	if err != nil {
+		return nil, fmt.Errorf("worker: sink: %w", err)
+	}
+	return snk, nil
+}
+
+// workerSinkConfig merges the worker's own sink access (URI and credentials
+// from its environment) with the sink settings the coordinator assigned from
+// the pipeline spec. The spec wins for the type, the namespace and every
+// option it sets; a nil assignment (an older coordinator) leaves the worker's
+// own config untouched.
+func workerSinkConfig(cfg RemoteConfig, assigned *pb.SinkAssignment) sink.Config {
+	sc := sink.Config{
 		Type:      cfg.Sink.Type,
 		URI:       cfg.Sink.URI,
 		Namespace: cfg.Namespace,
-		Options:   cfg.Sink.Options,
-		// The sink parses the opaque position strings it stores with this
-		// kind (position.Parse): an empty kind defaults to MySQL GTID, so a
-		// Postgres LSN or Kafka offset read back on restart would be parsed
-		// as a GTID set and resume from the wrong point.
-		SourceKind: assign.SourceKind,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("worker: catalog: %w", err)
+		Options:   make(map[string]string, len(cfg.Sink.Options)+len(assigned.GetOptions())),
 	}
-	return snk, nil
+	for k, v := range cfg.Sink.Options {
+		sc.Options[k] = v
+	}
+	if t := assigned.GetType(); t != "" {
+		sc.Type = t
+	}
+	if ns := assigned.GetNamespace(); ns != "" {
+		sc.Namespace = ns
+	}
+	for k, v := range assigned.GetOptions() {
+		// Credentials only ever come from the worker's own environment.
+		if v == "" || k == driver.OptClientID || k == driver.OptClientSecret {
+			continue
+		}
+		sc.Options[k] = v
+	}
+	return sc
 }
 
 // applyAssignment builds the worker from the assignment: it ensures each

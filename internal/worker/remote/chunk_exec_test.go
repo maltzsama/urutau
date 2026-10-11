@@ -148,7 +148,7 @@ func TestSpecTablesFromAssignmentBadFilter(t *testing.T) {
 // over the DSN; without it, kind + DSN is used.
 func TestSourceSpecFor(t *testing.T) {
 	// No block: kind + DSN.
-	s, err := sourceSpecFor("postgres", "host=db", nil)
+	s, err := sourceSpecFor("postgres", "host=db", nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestSourceSpecFor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err = sourceSpecFor("postgres", "ignored", b)
+	s, err = sourceSpecFor("postgres", "ignored", b, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,12 +174,12 @@ func TestSourceSpecFor(t *testing.T) {
 	}
 
 	// Malformed block: error, not a silent DSN fallback.
-	if _, err := sourceSpecFor("postgres", "host=db", []byte("not json")); err == nil {
+	if _, err := sourceSpecFor("postgres", "host=db", []byte("not json"), ""); err == nil {
 		t.Fatal("want an error for a malformed postgres block")
 	}
 
 	// A postgres block with a non-postgres kind is rejected (issue #268).
-	if _, err := sourceSpecFor("mysql", "", []byte(`{"host":"h"}`)); err == nil {
+	if _, err := sourceSpecFor("mysql", "", []byte(`{"host":"h"}`), ""); err == nil {
 		t.Fatal("sourceSpecFor accepted a postgres block for a mysql source")
 	}
 }

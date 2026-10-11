@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/core"
@@ -605,6 +606,13 @@ var retryableMessage = regexp.MustCompile(`\b(SlowDown|RequestTimeout|throttl\w*
 // are transient; schema, type, and 4xx errors are terminal.
 func isRetryableError(err error) bool {
 	if errors.Is(err, table.ErrCommitFailed) {
+		return true
+	}
+	// The catalog answered a commit with 500/502/503/504: it may or may not
+	// have landed. Every retry reloads the table and checks cycleCommitted
+	// first, so retrying is what settles it. Matched by the sentinel, not by
+	// a status code in the text: the message is the server's own wording.
+	if errors.Is(err, rest.ErrCommitStateUnknown) {
 		return true
 	}
 	// A truncated or dropped stream is transient. Match the io sentinels, not

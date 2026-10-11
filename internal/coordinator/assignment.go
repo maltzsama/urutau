@@ -9,10 +9,45 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+// sinkAssignment renders the spec's sink section for the worker, without the
+// credentials: the client id and secret reach the worker from its mounted
+// Secret, never over the control plane. Empty options are dropped so the
+// worker keeps its own value for anything the spec leaves unset.
+func sinkAssignment(s *spec.Spec) *pb.SinkAssignment {
+	cfg := driver.SinkConfig(s)
+	opts := make(map[string]string, len(cfg.Options))
+	for k, v := range cfg.Options {
+		if v == "" || k == driver.OptClientID || k == driver.OptClientSecret {
+			continue
+		}
+		opts[k] = v
+	}
+	return &pb.SinkAssignment{Type: cfg.Type, Namespace: cfg.Namespace, Options: opts}
+}
+
+// postgresAssignment renders a structured postgres source the DSN cannot
+// fully express (an SSH tunnel has a DialFunc, not a DSN) as its JSON block,
+// so the worker rebuilds the same source (#170). A scoped SnapshotURI wins:
+// the operator deliberately gave the worker a directly reachable read-only
+// connection, and the replication credential stays coordinator-side (D-CD1)
+// — so the block is withheld then, and nil is returned.
+func postgresAssignment(s *spec.Spec) ([]byte, error) {
+	pg := s.Source.Postgres
+	if pg == nil || s.Source.SnapshotURI != "" {
+		return nil, nil
+	}
+	b, err := json.Marshal(pg)
+	if err != nil {
+		return nil, fmt.Errorf("coordinator: postgres config: %w", err)
+	}
+	return b, nil
+}
 
 // assignmentFor builds one worker's table assignment with its own ticket.
 // The table schema travels as Arrow IPC derived from the canonical schema —
@@ -38,23 +73,17 @@ func (c *Coordinator) assignmentFor(w *workerState) (*pb.CoordinatorMessage, err
 		SourceKind: c.cfg.Spec.Source.Kind,
 		SourceDsn:  dsn,
 		ChunkSize:  uint32(c.cfg.ChunkSize),
+		Sink:       sinkAssignment(c.cfg.Spec),
+		SlotName:   c.cfg.Spec.Source.SlotName,
 		Batching: &pb.BatchConfig{
 			MaxInterval: durationpb.New(2 * time.Second),
 		},
 	}
-	// A structured postgres source that the DSN cannot fully express (an SSH
-	// tunnel has a DialFunc, not a DSN) travels as its JSON block so the
-	// worker rebuilds the same source (#170). A scoped SnapshotURI wins: the
-	// operator deliberately gave the worker a directly reachable read-only
-	// connection, and the replication credential stays coordinator-side
-	// (D-CD1) — so the block is withheld then.
-	if pg := c.cfg.Spec.Source.Postgres; pg != nil && c.cfg.Spec.Source.SnapshotURI == "" {
-		b, err := json.Marshal(pg)
-		if err != nil {
-			return nil, fmt.Errorf("coordinator: postgres config: %w", err)
-		}
-		assign.Postgres = b
+	pg, err := postgresAssignment(c.cfg.Spec)
+	if err != nil {
+		return nil, err
 	}
+	assign.Postgres = pg
 	for _, ref := range w.refs {
 		schemaB, err := transport.EncodeTableSchema(c.canonical[ref.Source])
 		if err != nil {

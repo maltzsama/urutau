@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/logging"
+
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 
 	"github.com/maltzsama/urutau/core"
@@ -38,7 +40,7 @@ func Open(ctx context.Context, cfg sink.Config) (*Sink, error) {
 	opt, err := ch.ParseDSN(cfg.URI)
 	if err != nil {
 		if strings.HasPrefix(cfg.URI, "clickhouse://") {
-			return nil, fmt.Errorf("clickhouse: parse dsn %q: %w", cfg.URI, err)
+			return nil, fmt.Errorf("clickhouse: parse dsn %q: %w", logging.RedactURI(cfg.URI), err)
 		}
 		// A bare host:port is accepted as the native address.
 		opt = &ch.Options{Addr: []string{cfg.URI}}

@@ -133,7 +133,7 @@ e2e-pods-down: ## Tear down the pod e2e: CRs, operator, and the in-cluster stack
 e2e-pods-image: ## Build the pod e2e harness image (urutau-e2e:dev) into minikube
 	eval $$(minikube docker-env) && docker build -f build/Dockerfile.e2e -t urutau-e2e:dev .
 
-e2e-pods-test: ## Run the pod e2e scenarios as a Job inside minikube (needs e2e-pods-up, k8s-load-race, e2e-pods-image); RUN= selects tests
+e2e-pods-test: ## Run the pod e2e scenarios as a Job inside minikube (needs e2e-pods-up, k8s-load, k8s-load-race, e2e-pods-image); RUN= selects tests
 	./$(POD_E2E_DIR)/run-in-cluster.sh
 
 E2E_COMPOSE := test/e2e/docker-compose.yml

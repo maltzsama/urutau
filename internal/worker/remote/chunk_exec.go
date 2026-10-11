@@ -27,6 +27,7 @@ type chunkExecutor struct {
 	kind     string
 	dsn      string
 	postgres []byte // JSON spec.PostgresSource (#170); empty = use dsn
+	slot     string // source replication slot (postgres); the window position is read from it
 	chunkSz  int
 	// perRow is each target's last chunk's bytes per row per column: the
 	// next chunk's buffers are sized from it (readChunk).
@@ -55,6 +56,7 @@ func newChunkExecutor(assign *pb.Assignment, w *worker.Worker, log *slog.Logger,
 		kind:     assign.SourceKind,
 		dsn:      assign.SourceDsn,
 		postgres: assign.Postgres,
+		slot:     assign.SlotName,
 		chunkSz:  int(assign.ChunkSize),
 		epoch:    assign.Epoch,
 		bySource: bySource,
@@ -79,7 +81,7 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 	if err != nil {
 		return nil, err
 	}
-	srcSpec, err := sourceSpecFor(x.kind, x.dsn, x.postgres)
+	srcSpec, err := sourceSpecFor(x.kind, x.dsn, x.postgres, x.slot)
 	if err != nil {
 		return nil, err
 	}
@@ -101,10 +103,12 @@ func (x *chunkExecutor) querySource(ctx context.Context) (source.QuerySource, er
 
 // sourceSpecFor builds the source config the worker opens its snapshot
 // connection from: the structured postgres block when the assignment carries
-// one (#170 — an SSH tunnel is a DialFunc, not a DSN), else kind + DSN.
-func sourceSpecFor(kind, dsn string, postgres []byte) (spec.Source, error) {
+// one (#170 — an SSH tunnel is a DialFunc, not a DSN), else kind + DSN. The
+// slot name rides along in both forms: the source reads a window's position
+// from the slot, and without the name that read fails.
+func sourceSpecFor(kind, dsn string, postgres []byte, slot string) (spec.Source, error) {
 	if len(postgres) == 0 {
-		return spec.Source{Kind: kind, URI: dsn}, nil
+		return spec.Source{Kind: kind, URI: dsn, SlotName: slot}, nil
 	}
 	// A postgres block only makes sense for a postgres source; a mismatched
 	// kind would build a nonsensical spec the driver then mis-handles
@@ -116,7 +120,7 @@ func sourceSpecFor(kind, dsn string, postgres []byte) (spec.Source, error) {
 	if err := json.Unmarshal(postgres, &pg); err != nil {
 		return spec.Source{}, fmt.Errorf("worker: postgres config: %w", err)
 	}
-	return spec.Source{Kind: kind, Postgres: &pg}, nil
+	return spec.Source{Kind: kind, Postgres: &pg, SlotName: slot}, nil
 }
 
 // specTablesFromAssignment reconstructs the per-table spec the source needs

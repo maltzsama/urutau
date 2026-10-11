@@ -35,7 +35,7 @@ fi
 
 # Scenario knobs pass through as env; empty ones are left unset.
 envs=""
-for v in URUTAU_E2E_PROFILE URUTAU_E2E_SEED URUTAU_E2E_TABLES URUTAU_E2E_PODS_IMAGE; do
+for v in URUTAU_E2E_PROFILE URUTAU_E2E_SEED URUTAU_E2E_TABLES URUTAU_E2E_PODS_IMAGE URUTAU_E2E_RELEASE_IMAGE; do
   if [ -n "${!v:-}" ]; then
     envs+="            - {name: $v, value: \"${!v}\"}"$'\n'
   fi
