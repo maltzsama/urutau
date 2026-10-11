@@ -37,6 +37,15 @@ import (
 )
 
 // Config tunes the coordinator for one pipeline.
+// DefaultWaitWorker is how long the coordinator waits at boot for every
+// expected worker session. It has to outlast the kubelet's crash backoff,
+// which doubles to a ceiling of five minutes: a worker exits when it loses
+// its coordinator, so a few coordinator restarts in a row leave every worker
+// waiting out that backoff. A shorter wait gives up before they can return;
+// the coordinator then exits, which resets the workers that had connected and
+// lengthens everyone's backoff — a restart loop with no progress.
+const DefaultWaitWorker = 6 * time.Minute
+
 type Config struct {
 	Spec       *spec.Spec
 	ListenAddr string // gRPC + Flight listen address ("host:port" or ":0")
@@ -92,7 +101,7 @@ type Config struct {
 	Checkpoint *CheckpointConfig
 
 	// WaitWorker bounds how long the coordinator waits for every expected
-	// worker session before failing the boot.
+	// worker session before failing the boot. Zero means DefaultWaitWorker.
 	WaitWorker time.Duration
 
 	// Supervision: a worker that stops acking past AckTimeout is reset
