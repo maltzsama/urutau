@@ -36,6 +36,14 @@ if ! minikube image ls 2>/dev/null | grep -q "$RACE_IMAGE"; then
   exit 1
 fi
 
+# The node's default of 128 inotify instances per user is shared by every
+# container runtime shim, the kubelet and each `kubectl logs -f` the harness
+# starts. With the full data stack the node sits at the limit, and a follow
+# then fails with "failed to create fsnotify watcher: too many open files",
+# which loses that Pod's log from the artifacts.
+say "node inotify limit"
+minikube ssh -- 'sudo sh -c "echo 1024 > /proc/sys/fs/inotify/max_user_instances"'
+
 say "cert-manager ($CERT_MANAGER_VERSION)"
 if ! "$KUBECTL" get namespace cert-manager >/dev/null 2>&1; then
   "$KUBECTL" apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
