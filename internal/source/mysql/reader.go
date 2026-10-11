@@ -562,10 +562,11 @@ func (r *Reader) keyOf(ref TableRef, tbl *schema.Table, row []any) []any {
 	return key
 }
 
-// closeTxn materializes the transaction's remaining rows, stamps only its
-// final record with the transaction position, and emits every record in
-// order. Earlier pieces carry the previous safe position, so an ack cannot
-// advance the durable checkpoint past rows a later piece still owes (#456).
+// closeTxn materializes the transaction's remaining rows and emits every
+// record in order. Each table's last record carries the transaction's
+// position: the table then holds all its rows of it. Its earlier records
+// carry the previous safe position, so an ack cannot advance the checkpoint
+// past rows still owed (#456), and are marked partial (#823).
 func (r *Reader) closeTxn() error {
 	for _, target := range r.encoderOrder {
 		if rec := r.encoders[target].materialize(); rec != nil {
@@ -575,19 +576,29 @@ func (r *Reader) closeTxn() error {
 	if len(r.pending) == 0 {
 		return nil
 	}
-	last := &r.pending[len(r.pending)-1]
-	rebuilt, err := transport.WithPosition(last.rec, r.curGTID)
-	if err != nil {
-		r.releasePending()
-		return err
+	last := make(map[string]int, len(r.encoderOrder))
+	for i, hb := range r.pending {
+		last[hb.target] = i
 	}
-	last.rec.Release()
-	last.rec = rebuilt
+	for i := range r.pending {
+		hb := &r.pending[i]
+		if last[hb.target] != i {
+			hb.partial = true
+			continue
+		}
+		rebuilt, err := transport.WithPosition(hb.rec, r.curGTID)
+		if err != nil {
+			r.releasePending()
+			return err
+		}
+		hb.rec.Release()
+		hb.rec = rebuilt
+	}
 
 	pending := r.pending
 	r.pending = nil
 	for i, hb := range pending {
-		b := &dataplane.Batch{Table: hb.target, Record: hb.rec, Mode: dataplane.UpsertMode}
+		b := &dataplane.Batch{Table: hb.target, Record: hb.rec, Mode: dataplane.UpsertMode, Partial: hb.partial}
 		if err := r.sendBatch(b); err != nil {
 			// Release this record and every record not yet sent: a failed
 			// send must not leak the transaction's Arrow buffers.

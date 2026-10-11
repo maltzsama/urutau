@@ -7,61 +7,14 @@ import (
 	"sort"
 	"time"
 
-	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/dashboard"
-	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/internal/version"
-	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/spec"
 )
 
 // errOperatorCancel marks a run terminated by the dashboard's Cancel action —
 // distinct from a crashloop so the terminal event says so.
 var errOperatorCancel = errors.New("coordinator: cancelled by operator")
-
-// tableStats is the per-table aggregate the dashboard serves. Updated on every
-// ack (rows/deletes/commits) and by the worker's metrics report (the series the
-// coordinator cannot derive from acks).
-type tableStats struct {
-	commits          int64
-	rows             int64
-	deletes          int64
-	lastCommit       time.Time
-	commitLatencyMs  float64
-	commitFailures   int64
-	deletesDropped   int64
-	snapshotProgress float64
-
-	// rows/s over a sliding window, recomputed every rateWindow and carried
-	// forward between recomputations so the number stays stable between acks.
-	rateWindowStart time.Time
-	rateWindowRows  int64
-	rowsRate        float64
-}
-
-// rateWindow is how often the per-table rows/s rate is recomputed.
-const rateWindow = 5 * time.Second
-
-// lagInterval is how often the per-table lag gauge is recomputed. Lag grows
-// between commits, so it cannot be set on the ack path (that would pin it to
-// ~0 after every commit); it needs its own clock, mirroring the dashboard's
-// on-demand Tables().
-const lagInterval = 5 * time.Second
-
-// maintStats is the per-table, per-operation maintenance aggregate, folded from
-// each maintenance worker's reported MaintenanceResult.
-type maintStats struct {
-	runs         int64
-	failures     int64
-	lastRun      time.Time
-	filesRemoved int64
-	filesAdded   int64
-	bytesBefore  int64
-	bytesAfter   int64
-	snapshots    int64
-	filesDeleted int64
-	bytesFreed   int64
-}
 
 // dashState adapts the coordinator to dashboard.State. A separate type so the
 // dashboard's method names never collide with the coordinator's own.
@@ -79,9 +32,37 @@ func (s dashState) Ready() bool { return s.c.readiness.Load() }
 // Healthy implements dashboard.Prober: the pump signalled life within the
 // window. A coordinator wedged before the pump starts (lastPump==0) or with a
 // stalled pump reads unhealthy, so the liveness probe restarts it (issue #601).
+//
+// A pump held by backpressure is not stalled: it waits on a full gate for a
+// chunk's SELECT, or on the flow budget for an ack, and loops again when that
+// arrives. Restarting the coordinator there throws the chunk away, and a
+// chunk that takes longer than the probe allows was never finished (#819).
+// Those waits end on their own — the snapshot watchdog and the worker
+// delivery timeout fail the run — so only a pump held past both is wedged.
 func (s dashState) Healthy() bool {
 	ns := s.c.lastPump.Load()
-	return ns != 0 && time.Since(time.Unix(0, ns)) < pumpHealthWindow
+	if ns == 0 {
+		return false
+	}
+	if held := s.c.pumpHeld.Load(); held != 0 {
+		return time.Since(time.Unix(0, held)) < s.c.pumpHeldLimit()
+	}
+	return time.Since(time.Unix(0, ns)) < pumpHealthWindow
+}
+
+// pumpHeldLimit is how long the pump may stay on one piece of work before
+// the liveness signal reads it as wedged: longer than the snapshot watchdog
+// and the worker delivery timeout, which bound every backpressure wait.
+func (c *Coordinator) pumpHeldLimit() time.Duration {
+	limit := c.cfg.SnapshotChunkTimeout
+	if limit <= 0 {
+		limit = defaultSnapshotChunkTimeout
+	}
+	delivery := c.cfg.WorkerDeliveryTimeout
+	if delivery <= 0 {
+		delivery = defaultWorkerDeliveryTimeout
+	}
+	return max(limit, delivery) + pumpHealthWindow
 }
 
 // Summary implements dashboard.State.
@@ -295,310 +276,6 @@ func (c *Coordinator) dashPushLoop(ctx context.Context) {
 			}
 		}
 	}
-}
-
-// recordTableStats folds one ack into the per-table aggregate. The maps are
-// lazily initialized so a zero Coordinator (tests) is safe.
-func (c *Coordinator) recordTableStats(worker, table string, rows, deletes int64, commitLatencyMs float64, at time.Time) {
-	c.statsMu.Lock()
-	if c.tableStats == nil {
-		c.tableStats = map[string]*tableStats{}
-	}
-	if c.lastAck == nil {
-		c.lastAck = map[string]time.Time{}
-	}
-	ts := c.tableStats[table]
-	if ts == nil {
-		ts = &tableStats{}
-		c.tableStats[table] = ts
-	}
-	ts.commits++
-	ts.rows += rows
-	ts.deletes += deletes
-	// The ack never carries a real commit duration (it precedes the commit),
-	// so only fold a non-zero one; the worker's metrics report is the real
-	// source and must not be clobbered by the always-zero ack value.
-	if commitLatencyMs > 0 {
-		ts.commitLatencyMs = commitLatencyMs
-	}
-	ts.lastCommit = at
-	// rows/s: recompute over the window once it has elapsed, then restart the
-	// window. Before the first window elapses the rate reads 0.
-	if ts.rateWindowStart.IsZero() {
-		ts.rateWindowStart = at
-		ts.rateWindowRows = ts.rows
-	} else if at.Sub(ts.rateWindowStart) >= rateWindow {
-		if dt := at.Sub(ts.rateWindowStart).Seconds(); dt > 0 {
-			ts.rowsRate = float64(ts.rows-ts.rateWindowRows) / dt
-		}
-		ts.rateWindowStart = at
-		ts.rateWindowRows = ts.rows
-	}
-	c.lastAck[worker] = at
-	c.statsMu.Unlock()
-	c.pushDashState()
-}
-
-// lagLoop keeps urutau_coordinator_lag_seconds current. The dashboard computes
-// the same value on demand in Tables(); a Prometheus gauge needs an active
-// updater, so this recomputes time.Since(lastCommit) per table on a timer and
-// publishes it. It stops when the run context is cancelled.
-func (c *Coordinator) lagLoop(ctx context.Context) {
-	t := time.NewTicker(lagInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			c.publishLag()
-		}
-	}
-}
-
-// publishLag sets the per-table lag gauge. Lag is the time since that table's
-// last commit WHILE it still owes work; a table that has caught up reports
-// zero. Reporting time-since-last-commit unconditionally would make an idle
-// pipeline look infinitely behind and scale it to its ceiling (issue #298). A
-// table that has never committed has no series — a permanent 0 would alert on
-// a pipeline that simply has not started.
-func (c *Coordinator) publishLag() {
-	if c.cfg.Spec == nil {
-		return
-	}
-	now := time.Now()
-	c.mu.Lock()
-	tables := c.tablesOrSpec()
-	c.mu.Unlock()
-	// Pending is computed before statsMu: it reads routing and staged state
-	// under their own locks, and statsMu must not be held across them.
-	pending := make(map[string]int, len(tables))
-	for _, t := range tables {
-		pending[t.Target] = c.tablePending(t.Target)
-	}
-	// The confirmed-position age is computed before statsMu: confirmedPosition
-	// takes the coordinator's own locks and must not nest under statsMu.
-	c.publishConfirmedAge(now)
-	// Read before statsMu for the same reason: totalOpen takes the staged
-	// tracker's lock.
-	stagedOpen := c.staged.totalOpen()
-	c.statsMu.Lock()
-	defer c.statsMu.Unlock()
-	for table, ts := range c.tableStats {
-		if ts == nil || ts.lastCommit.IsZero() {
-			continue
-		}
-		lag := 0.0
-		if pending[table] > 0 {
-			lag = now.Sub(ts.lastCommit).Seconds()
-		}
-		c.metrics.LagSeconds.WithLabelValues(table).Set(lag)
-	}
-	// The backlog gauge is set for every table — a table can owe work before
-	// its first commit — so a load-based scaler sees it from the start.
-	for table, n := range pending {
-		c.metrics.PendingBatches.WithLabelValues(table).Set(float64(n))
-	}
-	c.metrics.StagedCycles.Set(float64(stagedOpen))
-	if c.decodeErrors != nil {
-		if cur := c.decodeErrors(); cur > c.lastDecodeErrors {
-			c.metrics.KafkaRecordsSkipped.Add(float64(cur - c.lastDecodeErrors))
-			c.lastDecodeErrors = cur
-		}
-	}
-}
-
-// publishConfirmedAge sets the confirmed-position age gauge: how long the
-// minimum committed position has been stuck WHILE work is pending. A rising
-// age with a live pump is a silent stall; a caught-up pipeline reports zero
-// (nothing is pending, so nothing can stall). The clock resets only on forward
-// progress — the confirmed position can move BACKWARDS when a previously idle
-// worker begins owing work and constrains the minimum, and a mere change is
-// not progress. It starts when work first awaits a first confirmation, so a
-// commit that never arrives is a growing age rather than a gauge pinned at
-// zero (issue #602 review).
-func (c *Coordinator) publishConfirmedAge(now time.Time) {
-	owing := len(c.workersOwing()) > 0
-	pos := c.confirmedPosition()
-
-	c.confirmedMu.Lock()
-	if pos != nil {
-		if c.lastConfirmedPos == nil {
-			c.lastConfirmedPos = pos // first confirmed position
-			c.lastConfirmedAt = now
-		} else if cmp := pos.Compare(c.lastConfirmedPos); cmp != position.Incomparable && cmp > 0 {
-			c.lastConfirmedPos = pos // forward progress
-			c.lastConfirmedAt = now
-		}
-	}
-	if !owing {
-		// Caught up: reset so a later stall is measured from its onset.
-		c.lastConfirmedAt = now
-	} else if c.lastConfirmedAt.IsZero() {
-		// Work is pending and nothing has committed yet: start the clock.
-		c.lastConfirmedAt = now
-	}
-	at := c.lastConfirmedAt
-	c.confirmedMu.Unlock()
-
-	if at.IsZero() {
-		return // nothing pending and nothing confirmed: leave the gauge at 0.
-	}
-	c.metrics.ConfirmedPositionAge.Set(now.Sub(at).Seconds())
-}
-
-// tablePending reports the table's outstanding work: batches queued for or
-// in flight to its owners, plus any open staged cycle. Zero means caught up.
-// It takes c.mu for the in-flight index read (a scale mutates that map), and
-// the staged lock separately, never nested — so a caller can use it without
-// holding c.mu or c.statsMu.
-func (c *Coordinator) tablePending(target string) int {
-	owners, ok := c.loadRouting().ownersOf(target)
-	if !ok {
-		return 0
-	}
-	pending := 0
-	c.mu.Lock()
-	for _, w := range owners {
-		pending += len(w.queue)
-		if idx := c.indexOf(w.name); idx != nil {
-			pending += idx.InFlight()
-		}
-	}
-	c.mu.Unlock()
-	if c.stagesCycles() {
-		pending += c.staged.openFor(core.TableRef{Target: target})
-	}
-	return pending
-}
-
-// recordMaintStats folds one maintenance operation result into the per-table,
-// per-op aggregate.
-func (c *Coordinator) recordMaintStats(table, op string, at time.Time, failed bool, apply func(*maintStats)) {
-	c.statsMu.Lock()
-	defer c.statsMu.Unlock()
-	if c.maintStats == nil {
-		c.maintStats = map[string]map[string]*maintStats{}
-	}
-	byOp := c.maintStats[table]
-	if byOp == nil {
-		byOp = map[string]*maintStats{}
-		c.maintStats[table] = byOp
-	}
-	s := byOp[op]
-	if s == nil {
-		s = &maintStats{}
-		byOp[op] = s
-	}
-	s.runs++
-	s.lastRun = at
-	// A failed operation is a run and a failure, and nothing else: the same
-	// rule the Prometheus counters follow, so /metrics and the dashboard
-	// never tell two stories about one pass.
-	if failed {
-		s.failures++
-		return
-	}
-	apply(s)
-}
-
-// onWorkerMetrics folds a worker's reported series into the per-table
-// aggregate the dashboard serves. It does not duplicate into the coordinator's
-// Prometheus registry: the worker's own /metrics is the Prometheus source for
-// these series, and the report exists for the dashboard, which cannot scrape
-// the worker. Its network output also feeds the supervisor's progress signal
-// (#422).
-func (c *Coordinator) onWorkerMetrics(worker string, rep *pb.WorkerMetricsReport) {
-	if rep == nil {
-		return
-	}
-	if c.supervisor != nil {
-		c.supervisor.noteProgress(worker, rep.GetNetTxBytes(), time.Now())
-	}
-	c.statsMu.Lock()
-	if c.tableStats == nil {
-		c.tableStats = map[string]*tableStats{}
-	}
-	for _, tm := range rep.Tables {
-		ts := c.tableStats[tm.Table]
-		if ts == nil {
-			ts = &tableStats{}
-			c.tableStats[tm.Table] = ts
-		}
-		ts.commitFailures = tm.CommitFailures
-		ts.deletesDropped = tm.DeletesDropped
-		ts.snapshotProgress = tm.SnapshotProgress
-		if tm.CommitLatencyMs > 0 {
-			ts.commitLatencyMs = tm.CommitLatencyMs
-		}
-	}
-	c.statsMu.Unlock()
-	c.pushDashState()
-}
-
-// maintenanceView renders the per-op aggregate for the API.
-func maintenanceView(m map[string]*maintStats) *dashboard.Maintenance {
-	out := &dashboard.Maintenance{}
-	if s := m["compaction"]; s != nil {
-		out.Compaction = &dashboard.CompactionStatus{
-			Runs: s.runs, Failures: s.failures, LastRun: tsOrEmpty(s.lastRun),
-			FilesRemoved: s.filesRemoved, FilesAdded: s.filesAdded,
-			BytesBefore: s.bytesBefore, BytesAfter: s.bytesAfter,
-		}
-	}
-	if s := m["snapshot_expiry"]; s != nil {
-		out.Expiry = &dashboard.ExpiryStatus{
-			Runs: s.runs, Failures: s.failures, LastRun: tsOrEmpty(s.lastRun), SnapshotsRemoved: s.snapshots,
-		}
-	}
-	if s := m["orphan_cleanup"]; s != nil {
-		out.Orphan = &dashboard.OrphanStatus{
-			Runs: s.runs, Failures: s.failures, LastRun: tsOrEmpty(s.lastRun),
-			FilesDeleted: s.filesDeleted, BytesFreed: s.bytesFreed,
-		}
-	}
-	if out.Compaction == nil && out.Expiry == nil && out.Orphan == nil {
-		return nil
-	}
-	return out
-}
-
-// tablePositions returns the latest durably-committed position per table, by
-// looking up the worker that serves it (one worker serves exactly one table).
-// Empty where nothing is committed yet. Never holds two locks at once.
-func (c *Coordinator) tablePositions() map[string]string {
-	tableWorkers := make(map[string][]string)
-	c.mu.Lock()
-	for name, w := range c.workers {
-		for _, ref := range w.refs {
-			tableWorkers[ref.Target] = append(tableWorkers[ref.Target], name)
-		}
-	}
-	c.mu.Unlock()
-
-	c.confirmedMu.Lock()
-	defer c.confirmedMu.Unlock()
-	out := make(map[string]string, len(tableWorkers))
-	for table, workers := range tableWorkers {
-		positions := make([]position.Position, 0, len(workers))
-		for _, worker := range workers {
-			if pos := c.confirmed[worker]; pos != nil {
-				positions = append(positions, pos)
-			}
-		}
-		if len(positions) == 0 {
-			continue
-		}
-		// Several owners of one table: report the MINIMUM committed position —
-		// the point every owner has passed — not one owner at random
-		// (issue #576).
-		best, err := position.MinSafe(positions)
-		if err != nil || best == nil {
-			continue
-		}
-		out[table] = best.String()
-	}
-	return out
 }
 
 // writeModeLabel renders a table's write mode, defaulting to upsert (the
