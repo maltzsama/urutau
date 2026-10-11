@@ -66,6 +66,13 @@ func (c *Coordinator) bufferedTables() []string {
 // dispatchedPosition is the greatest position handed to a worker, the frontier
 // the confirmed may advance to when nothing is in flight. It parses each
 // table's last sent position and takes the greatest; nil before any dispatch.
+//
+// "The greatest" exists only when the positions can be ordered. Opaque plugin
+// offsets, GTID sets of disjoint servers and offsets of disjoint topics
+// cannot: there the frontier is undefined, and it is nil too, with a warning.
+// Returning whichever position the map yields first would make the source's
+// retention depend on iteration order; nil sends confirmedPosition to the
+// minimum over what was confirmed, which holds retention when it has to.
 func (c *Coordinator) dispatchedPosition() position.Position {
 	c.sentMu.Lock()
 	defer c.sentMu.Unlock()
@@ -82,7 +89,12 @@ func (c *Coordinator) dispatchedPosition() position.Position {
 			best = p
 			continue
 		}
-		if cmp := p.Compare(best); cmp != position.Incomparable && cmp > 0 {
+		switch cmp := p.Compare(best); {
+		case cmp == position.Incomparable:
+			c.log.Warn("coordinator: incomparable dispatched positions; not advancing retention past what is confirmed",
+				"have", best.String(), "candidate", p.String())
+			return nil
+		case cmp > 0:
 			best = p
 		}
 	}
