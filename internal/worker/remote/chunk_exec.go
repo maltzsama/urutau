@@ -191,6 +191,12 @@ func (x *chunkExecutor) run(ctx context.Context, req *pb.ChunkRequest) error {
 	}
 	ch := source.Chunk{Low: low, High: high}
 
+	// The chunk is one SELECT whose pages become windows one after the
+	// other: a live change that reaches the worker before the page holding
+	// its key is stored must still count against that page (#827).
+	x.w.BeginChunkRead(ta.TargetTable)
+	defer x.w.EndChunkRead(ta.TargetTable)
+
 	var total int
 	var windowIDs []uint64
 	emit := func(page arrow.RecordBatch, n int) error {

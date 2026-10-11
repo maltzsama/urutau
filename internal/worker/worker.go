@@ -99,7 +99,11 @@ type tablePipeline struct {
 	// winMu. The window OWNS its batch; Closes consumes and releases it.
 	winMu   sync.Mutex
 	windows map[uint64]*snapshotWindow
-	dropped int64
+	// chunkLive holds the keys of the live changes received while a chunk
+	// of this table is being read, nil otherwise; guarded by winMu. A window
+	// stored later in the same read takes them as touched (#827).
+	chunkLive map[string]struct{}
+	dropped   int64
 	// winClosed signals (non-blocking) when a window closes, waking the chunk
 	// reader's backpressure wait (issue #622).
 	winClosed chan struct{}
