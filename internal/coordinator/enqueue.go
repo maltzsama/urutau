@@ -303,7 +303,7 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 		var err error
 		if high, err = c.src.ParsePosition(posStr); err != nil {
 			if !snapshotRows {
-				c.budget.release(w.name, n)
+				c.releaseUndelivered(w.name, n)
 			}
 			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
 		}
@@ -327,9 +327,21 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 			if idx != nil {
 				idx.remove(meta.BatchId)
 			}
-			c.budget.release(w.name, n)
+			c.releaseUndelivered(w.name, n)
 		}
 		return ctx.Err()
+	}
+}
+
+// releaseUndelivered returns the budget of a batch that never reached its
+// worker. release alone frees the oversized slot only when the worker's
+// charge drops to zero; a worker with other traffic in flight would keep the
+// slot, and every later oversized batch would wait on it forever. No ack will
+// come for this batch to clear it, so it is cleared here.
+func (c *Coordinator) releaseUndelivered(worker string, n int64) {
+	c.budget.release(worker, n)
+	if c.budget.isOversized(n) {
+		c.budget.clearOversized(worker)
 	}
 }
 
