@@ -166,7 +166,22 @@ func (r *distributedRelay) GateFlush(ctx context.Context) error {
 		r.fail(err)
 		return err
 	}
+	// The chunk's rows are still in the owners' window, and the catch-up to
+	// its high watermark comes next. The flush forgot the window was ready,
+	// so a gate the catch-up filled blocked the pump, the reader stopped and
+	// the catch-up never came (#820): it stays ready until Release.
+	r.c.markWindowReady(r.ref.Target, 0, r.windowID)
 	return nil
+}
+
+// endChunkDrain stops the early drain of the chunk's window before its
+// Closes marker goes out: a batch drained after the marker would be tagged
+// for a window the owners have closed. Taken under the gate's flush lock, so
+// a drain under way has delivered before the marker is queued.
+func (r *distributedRelay) endChunkDrain() {
+	r.c.gate.WithFlush(func() {
+		r.c.gate.ClearReady(r.ref.Target, 0)
+	})
 }
 
 // AddWindowRows splits the chunk's rows by owner and queues each owner's
@@ -243,6 +258,7 @@ func (r *distributedRelay) Release(ctx context.Context, table string, chunkID ui
 	// rows were never committed.
 	remaining := snapshot.RemoveFromPending(r.pending, chunkID)
 	r.pending = remaining
+	r.endChunkDrain()
 	if err := r.c.closeFanoutChunk(ctx, r.ref, r.owners, at, uint64(chunkID), remaining); err != nil {
 		r.fail(err)
 		return err
