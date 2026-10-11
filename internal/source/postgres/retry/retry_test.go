@@ -1,4 +1,4 @@
-package postgres
+package retry
 
 import (
 	"context"
@@ -15,26 +15,26 @@ func TestRetryBackoffCapped(t *testing.T) {
 	// Never negative, never above the 30s cap, even for a huge retryCount
 	// where 2^attempt * time.Second would overflow time.Duration.
 	for _, attempt := range []int{0, 1, 4, 5, 6, 34, 35, 100} {
-		d := retryBackoff(attempt)
+		d := Backoff(attempt)
 		if d <= 0 {
-			t.Fatalf("retryBackoff(%d) = %v, want > 0", attempt, d)
+			t.Fatalf("Backoff(%d) = %v, want > 0", attempt, d)
 		}
 		if d > 30*time.Second {
-			t.Fatalf("retryBackoff(%d) = %v, want <= 30s", attempt, d)
+			t.Fatalf("Backoff(%d) = %v, want <= 30s", attempt, d)
 		}
 	}
-	if got := retryBackoff(0); got != time.Second {
-		t.Fatalf("retryBackoff(0) = %v, want 1s", got)
+	if got := Backoff(0); got != time.Second {
+		t.Fatalf("Backoff(0) = %v, want 1s", got)
 	}
-	if got := retryBackoff(5); got != 30*time.Second {
-		t.Fatalf("retryBackoff(5) = %v, want 30s", got)
+	if got := Backoff(5); got != 30*time.Second {
+		t.Fatalf("Backoff(5) = %v, want 30s", got)
 	}
 }
 
 func TestRetryTransientErr(t *testing.T) {
 	attempts := 0
 	transient := &pgconn.PgError{Code: "08006"}
-	err := retryTransientErr(context.Background(), 3, func() error {
+	err := DoErr(context.Background(), 3, func() error {
 		attempts++
 		if attempts == 1 {
 			return transient
@@ -77,73 +77,37 @@ func TestIsTransientSQLState(t *testing.T) {
 }
 
 func TestIsTransientPgError(t *testing.T) {
-	if !isTransient(&pgconn.PgError{Code: "08006"}) {
+	if !IsTransient(&pgconn.PgError{Code: "08006"}) {
 		t.Fatal("connection exception must be transient")
 	}
-	if isTransient(&pgconn.PgError{Code: "28P01"}) {
+	if IsTransient(&pgconn.PgError{Code: "28P01"}) {
 		t.Fatal("invalid password must not be transient")
 	}
 	// A wrapped PgError is still classified.
 	wrapped := fmt.Errorf("connect: %w", &pgconn.PgError{Code: "53300"})
-	if !isTransient(wrapped) {
+	if !IsTransient(wrapped) {
 		t.Fatal("wrapped transient PgError must be transient")
 	}
 }
 
 func TestIsTransientNetworkError(t *testing.T) {
-	if !isTransient(&net.OpError{Op: "dial", Err: errors.New("connection refused")}) {
+	if !IsTransient(&net.OpError{Op: "dial", Err: errors.New("connection refused")}) {
 		t.Fatal("net.Error must be transient")
 	}
-	if !isTransient(context.DeadlineExceeded) {
+	if !IsTransient(context.DeadlineExceeded) {
 		t.Fatal("deadline exceeded must be transient")
 	}
-	if isTransient(errors.New("plain error")) {
+	if IsTransient(errors.New("plain error")) {
 		t.Fatal("a plain error must not be transient")
 	}
-	if isTransient(nil) {
+	if IsTransient(nil) {
 		t.Fatal("nil must not be transient")
-	}
-}
-
-func TestResolveMaxThreads(t *testing.T) {
-	if got := resolveMaxThreads(5); got != 5 {
-		t.Fatalf("resolveMaxThreads(5) = %d, want 5", got)
-	}
-	if got := resolveMaxThreads(0); got < 1 || got > maxMaxThreads {
-		t.Fatalf("resolveMaxThreads(0) = %d, want 1..%d", got, maxMaxThreads)
-	}
-	if got := resolveMaxThreads(1000); got != maxMaxThreads {
-		t.Fatalf("resolveMaxThreads(1000) = %d, want %d", got, maxMaxThreads)
-	}
-}
-
-func TestResolveRetryCount(t *testing.T) {
-	if got := resolveRetryCount(0); got != defaultRetryCount {
-		t.Fatalf("resolveRetryCount(0) = %d, want %d", got, defaultRetryCount)
-	}
-	if got := resolveRetryCount(7); got != 7 {
-		t.Fatalf("resolveRetryCount(7) = %d, want 7", got)
-	}
-	if got := resolveRetryCount(-1); got != 0 {
-		t.Fatalf("resolveRetryCount(-1) = %d, want 0", got)
-	}
-}
-
-func TestResolveInitialWaitTime(t *testing.T) {
-	if got := resolveInitialWaitTime(0); got != defaultInitialWait {
-		t.Fatalf("resolveInitialWaitTime(0) = %v, want %v", got, defaultInitialWait)
-	}
-	if got := resolveInitialWaitTime(120); got != 120*time.Second {
-		t.Fatalf("resolveInitialWaitTime(120) = %v, want 120s", got)
-	}
-	if got := resolveInitialWaitTime(5); got != minInitialWait {
-		t.Fatalf("resolveInitialWaitTime(5) = %v, want the %v floor", got, minInitialWait)
 	}
 }
 
 func TestIsTransientNonPgError(t *testing.T) {
 	// A plain error has no SQLSTATE; the shared rules decide (not retryable).
-	if isTransient(errors.New("plain")) {
+	if IsTransient(errors.New("plain")) {
 		t.Fatal("a plain error must not be transient")
 	}
 }
@@ -151,7 +115,7 @@ func TestIsTransientNonPgError(t *testing.T) {
 func TestRetryTransientPermanentNotRetried(t *testing.T) {
 	attempts := 0
 	perm := &pgconn.PgError{Code: "28P01"} // invalid password
-	_, err := retryTransient(context.Background(), 5, func() (int, error) {
+	_, err := Do(context.Background(), 5, func() (int, error) {
 		attempts++
 		return 0, perm
 	})
@@ -166,7 +130,7 @@ func TestRetryTransientPermanentNotRetried(t *testing.T) {
 func TestRetryTransientSucceedsAfterRetry(t *testing.T) {
 	attempts := 0
 	transient := &pgconn.PgError{Code: "08006"} // connection failure
-	v, err := retryTransient(context.Background(), 3, func() (int, error) {
+	v, err := Do(context.Background(), 3, func() (int, error) {
 		attempts++
 		if attempts == 1 {
 			return 0, transient
@@ -184,7 +148,7 @@ func TestRetryTransientSucceedsAfterRetry(t *testing.T) {
 func TestRetryTransientExhaustsBudget(t *testing.T) {
 	attempts := 0
 	transient := &pgconn.PgError{Code: "53300"} // too many connections
-	_, err := retryTransient(context.Background(), 1, func() (int, error) {
+	_, err := Do(context.Background(), 1, func() (int, error) {
 		attempts++
 		return 0, transient
 	})
@@ -201,7 +165,7 @@ func TestRetryTransientContextCancel(t *testing.T) {
 	cancel()
 	attempts := 0
 	transient := &pgconn.PgError{Code: "08006"}
-	_, err := retryTransient(ctx, 5, func() (int, error) {
+	_, err := Do(ctx, 5, func() (int, error) {
 		attempts++
 		return 0, transient
 	})

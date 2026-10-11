@@ -1,4 +1,4 @@
-package postgres
+package connect
 
 import (
 	"context"
@@ -63,7 +63,7 @@ func TestNewSSHTunnelAddr(t *testing.T) {
 
 func TestBuildConnConfigFromPostgresSSHBypassesLocalDNS(t *testing.T) {
 	kh := writeKnownHosts(t)
-	cc, err := BuildConnConfigFromPostgres(&spec.PostgresSource{
+	cc, err := BuildFromPostgres(&spec.PostgresSource{
 		Host:     "db.internal",
 		Database: "db",
 		SSH:      &spec.SSHConfig{Host: "bastion", Username: "u", Password: "p", KnownHosts: kh},
@@ -102,7 +102,7 @@ func TestTransportDead(t *testing.T) {
 
 func TestBuildConnConfigFromPostgresMinimal(t *testing.T) {
 	pg := &spec.PostgresSource{Host: "localhost", Database: "mydb"}
-	cc, err := BuildConnConfigFromPostgres(pg)
+	cc, err := BuildFromPostgres(pg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestBuildConnConfigFromPostgresMinimal(t *testing.T) {
 
 func TestBuildConnConfigFromPostgresWithPort(t *testing.T) {
 	pg := &spec.PostgresSource{Host: "db.local", Database: "test", Port: 5433}
-	cc, err := BuildConnConfigFromPostgres(pg)
+	cc, err := BuildFromPostgres(pg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestBuildConnConfigFromPostgresWithCredentials(t *testing.T) {
 		Username: "admin",
 		Password: "secret",
 	}
-	cc, err := BuildConnConfigFromPostgres(pg)
+	cc, err := BuildFromPostgres(pg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestBuildConnConfigFromPostgresWithParams(t *testing.T) {
 		Database: "test",
 		Params:   map[string]string{"application_name": "urutau"},
 	}
-	cc, err := BuildConnConfigFromPostgres(pg)
+	cc, err := BuildFromPostgres(pg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestBuildConnConfigFromPostgresMaxThreadsAndRetry(t *testing.T) {
 		MaxThreads: 8,
 		RetryCount: 3,
 	}
-	cc, err := BuildConnConfigFromPostgres(pg)
+	cc, err := BuildFromPostgres(pg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,14 +189,14 @@ func TestBuildConnConfigFromPostgresMaxThreadsAndRetry(t *testing.T) {
 
 func TestBuildConnConfigFromPostgresRejectsMissingHost(t *testing.T) {
 	pg := &spec.PostgresSource{Database: "mydb"}
-	if _, err := BuildConnConfigFromPostgres(pg); err == nil {
+	if _, err := BuildFromPostgres(pg); err == nil {
 		t.Fatal("want error for missing host")
 	}
 }
 
 func TestBuildConnConfigFromPostgresRejectsMissingDatabase(t *testing.T) {
 	pg := &spec.PostgresSource{Host: "localhost"}
-	if _, err := BuildConnConfigFromPostgres(pg); err == nil {
+	if _, err := BuildFromPostgres(pg); err == nil {
 		t.Fatal("want error for missing database")
 	}
 }
@@ -266,7 +266,7 @@ func TestDSNQuotesValues(t *testing.T) {
 
 func TestBuildConnConfigDefaults(t *testing.T) {
 	pg := &spec.PostgresSource{Host: "localhost", Database: "mydb"}
-	cc, err := BuildConnConfigFromPostgres(pg)
+	cc, err := BuildFromPostgres(pg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestBuildConnConfigDefaults(t *testing.T) {
 
 func TestBuildConnConfigFromPostgresTLSModes(t *testing.T) {
 	// disable -> no TLS
-	cc, err := BuildConnConfigFromPostgres(&spec.PostgresSource{
+	cc, err := BuildFromPostgres(&spec.PostgresSource{
 		Host: "localhost", Database: "db", SSL: &spec.SSLConfig{Mode: "disable"},
 	})
 	if err != nil {
@@ -291,7 +291,7 @@ func TestBuildConnConfigFromPostgresTLSModes(t *testing.T) {
 	}
 
 	// require -> TLS without verification
-	cc, err = BuildConnConfigFromPostgres(&spec.PostgresSource{
+	cc, err = BuildFromPostgres(&spec.PostgresSource{
 		Host: "localhost", Database: "db", SSL: &spec.SSLConfig{Mode: "require"},
 	})
 	if err != nil {
@@ -306,7 +306,7 @@ func TestBuildConnConfigFromPostgresTLSModes(t *testing.T) {
 }
 
 func TestBuildConnConfigFromPostgresCertWithoutKey(t *testing.T) {
-	_, err := BuildConnConfigFromPostgres(&spec.PostgresSource{
+	_, err := BuildFromPostgres(&spec.PostgresSource{
 		Host: "localhost", Database: "db", SSL: &spec.SSLConfig{Mode: "require", Cert: "/cert.pem"},
 	})
 	if err == nil {
@@ -316,7 +316,7 @@ func TestBuildConnConfigFromPostgresCertWithoutKey(t *testing.T) {
 
 func TestBuildConnConfigFromPostgresRuntimeParamsInitialized(t *testing.T) {
 	// Reader.New writes "replication" into RuntimeParams; a nil map panics.
-	cc, err := BuildConnConfigFromPostgres(&spec.PostgresSource{Host: "localhost", Database: "db"})
+	cc, err := BuildFromPostgres(&spec.PostgresSource{Host: "localhost", Database: "db"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestBuildConnConfigFromPostgresRuntimeParamsInitialized(t *testing.T) {
 }
 
 func TestBuildConnConfigFromURIFallback(t *testing.T) {
-	cc, err := BuildConnConfig("postgres://localhost:5432/mydb?sslmode=disable")
+	cc, err := Build("postgres://localhost:5432/mydb?sslmode=disable")
 	if err != nil {
 		t.Fatal(err)
 	}

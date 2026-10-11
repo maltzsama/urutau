@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"context"
@@ -11,10 +11,12 @@ import (
 
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // errRowsDriver is a minimal database/sql driver whose query yields a Rows
-// whose Next fails, so scanRow can be exercised without a real database.
+// whose Next fails, so ScanRow can be exercised without a real database.
 type errRowsDriver struct{}
 
 func (errRowsDriver) Open(string) (driver.Conn, error) { return errRowsConn{}, nil }
@@ -97,9 +99,9 @@ func TestScanRowPropagatesIterationError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = scanRow(rows)
+	_, err = ScanRow(rows)
 	if err == nil || errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("scanRow = %v, want the iteration error, not sql.ErrNoRows", err)
+		t.Fatalf("ScanRow = %v, want the iteration error, not sql.ErrNoRows", err)
 	}
 }
 
@@ -112,7 +114,7 @@ func TestChunkScanUsesRepeatableReadReadOnly(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	c, err := NewChunker(context.Background(), db, "public.orders", "id", 100, WithWorkers(1), WithRetries(0))
+	c, err := New(context.Background(), db, "public.orders", "id", 100, WithWorkers(1), WithRetries(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,13 +139,13 @@ func TestChunkScanProjectionAndFilterSQL(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	filter, err := filterToSquirrel(&spec.Filter{
+	filter, err := CompileFilter(&spec.Filter{
 		Predicate: &spec.Predicate{Column: "status", Op: spec.OpEq, Value: "active"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewChunker(context.Background(), db, "public.orders", "id", 100,
+	c, err := New(context.Background(), db, "public.orders", "id", 100,
 		WithWorkers(1), WithRetries(0),
 		WithColumns([]string{"id", "name"}),
 		WithFilter(filter))
@@ -181,7 +183,7 @@ func TestChunkScanKeyStrategySQL(t *testing.T) {
 
 	// The capture driver has no pg_catalog, so resolveStrategy would fail
 	// introspection; build the chunker and set the strategy directly.
-	c, err := NewChunker(context.Background(), db, "public.orders", "id", 100,
+	c, err := New(context.Background(), db, "public.orders", "id", 100,
 		WithWorkers(1), WithRetries(0))
 	if err != nil {
 		t.Fatal(err)
@@ -210,14 +212,14 @@ func TestChunkScanKeyStrategySQL(t *testing.T) {
 	}
 }
 
-// normalize folds driver-native []byte cells into strings so bounds and
+// Normalize folds driver-native []byte cells into strings so bounds and
 // rows share one scalar mapping.
 func TestNormalize(t *testing.T) {
-	if got := normalize([]byte("abc")); got != "abc" {
-		t.Fatalf("normalize([]byte) = %v, want string", got)
+	if got := Normalize([]byte("abc")); got != "abc" {
+		t.Fatalf("Normalize([]byte) = %v, want string", got)
 	}
-	if got := normalize(int64(5)); got != int64(5) {
-		t.Fatalf("normalize(int64) changed the value")
+	if got := Normalize(int64(5)); got != int64(5) {
+		t.Fatalf("Normalize(int64) changed the value")
 	}
 }
 
@@ -235,12 +237,12 @@ func TestQuotedList(t *testing.T) {
 }
 
 func TestQuoteIdent(t *testing.T) {
-	if quotePgIdent("orders") != `"orders"` {
-		t.Fatalf("quotePgIdent = %q", quotePgIdent("orders"))
+	if catalog.QuoteIdent("orders") != `"orders"` {
+		t.Fatalf("catalog.QuoteIdent = %q", catalog.QuoteIdent("orders"))
 	}
 }
 
 // quotedList joins the quoted identifiers with ", " (test-only helper).
 func quotedList(cols []string) string {
-	return strings.Join(quotedIdents(cols), ", ")
+	return strings.Join(catalog.QuoteIdents(cols), ", ")
 }

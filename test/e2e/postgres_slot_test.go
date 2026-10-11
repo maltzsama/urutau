@@ -6,8 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maltzsama/urutau/internal/source/postgres"
 	"github.com/maltzsama/urutau/position"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/replication"
 )
 
 // TestPostgresSlotValidationAndAdvance covers #156 against a real slot: the
@@ -24,13 +25,13 @@ func TestPostgresSlotValidationAndAdvance(t *testing.T) {
 	pgExec(t, db, fmt.Sprintf(`SELECT pg_catalog.pg_create_logical_replication_slot('%s', 'pgoutput')`, slot))
 	t.Cleanup(func() { dropSlot(t, db, slot) })
 
-	confirmed, err := postgres.ConfirmedLSN(ctx, db, slot)
+	confirmed, err := replication.ConfirmedLSN(ctx, db, slot)
 	if err != nil {
 		t.Fatalf("confirmed lsn: %v", err)
 	}
 
 	// First boot (no resume) starts at the slot's point.
-	got, err := postgres.ValidateSlotState(ctx, db, slot, nil, nil)
+	got, err := replication.ValidateSlotState(ctx, db, slot, nil, nil)
 	if err != nil || got.Compare(confirmed) != 0 {
 		t.Fatalf("first boot = %v, %v; want %v", got, err, confirmed)
 	}
@@ -38,7 +39,7 @@ func TestPostgresSlotValidationAndAdvance(t *testing.T) {
 	// A resume behind the slot drifts forward to the slot's authoritative
 	// point.
 	behind := *confirmed - 1
-	got, err = postgres.ValidateSlotState(ctx, db, slot, &behind, nil)
+	got, err = replication.ValidateSlotState(ctx, db, slot, &behind, nil)
 	if err != nil || got.Compare(confirmed) != 0 {
 		t.Fatalf("behind resume = %v, %v; want %v", got, err, confirmed)
 	}
@@ -60,14 +61,14 @@ func TestPostgresSlotValidationAndAdvance(t *testing.T) {
 		t.Fatalf("current WAL %s is not ahead of confirmed %s", cur, confirmed)
 	}
 	ahead := position.LSN((uint64(*confirmed) + uint64(*cur)) / 2)
-	got, err = postgres.ValidateSlotState(ctx, db, slot, &ahead, nil)
+	got, err = replication.ValidateSlotState(ctx, db, slot, &ahead, nil)
 	if err != nil || got.Compare(&ahead) != 0 {
 		t.Fatalf("ahead resume = %v, %v; want %v", got, err, ahead)
 	}
-	if err := postgres.AdvanceSlot(ctx, db, slot, ahead); err != nil {
+	if err := replication.AdvanceSlot(ctx, db, slot, ahead); err != nil {
 		t.Fatalf("advance slot: %v", err)
 	}
-	after, err := postgres.ConfirmedLSN(ctx, db, slot)
+	after, err := replication.ConfirmedLSN(ctx, db, slot)
 	if err != nil {
 		t.Fatalf("confirmed after advance: %v", err)
 	}

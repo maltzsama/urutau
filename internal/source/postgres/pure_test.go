@@ -1,16 +1,16 @@
 package postgres
 
 import (
-	"context"
 	"testing"
 	"time"
 
 	"github.com/maltzsama/urutau/core"
-	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 func TestFindColumnFound(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "id", DataType: "bigint"},
 		{Name: "name", DataType: "text"},
 		{Name: "amount", DataType: "numeric"},
@@ -21,7 +21,7 @@ func TestFindColumnFound(t *testing.T) {
 }
 
 func TestFindColumnNotFound(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "id", DataType: "bigint"},
 	}}
 	if got := st.FindColumn("missing"); got != -1 {
@@ -30,12 +30,12 @@ func TestFindColumnNotFound(t *testing.T) {
 }
 
 func TestCanonicalSchemaIntTypes(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "a", DataType: "smallint"},
 		{Name: "b", DataType: "integer"},
 		{Name: "c", DataType: "bigint"},
 	}}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -47,12 +47,12 @@ func TestCanonicalSchemaIntTypes(t *testing.T) {
 }
 
 func TestCanonicalSchemaFloatTypes(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "a", DataType: "real"},
 		{Name: "b", DataType: "double precision"},
 		{Name: "c", DataType: "money"},
 	}}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -64,13 +64,13 @@ func TestCanonicalSchemaFloatTypes(t *testing.T) {
 }
 
 func TestCanonicalSchemaStringTypes(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "a", DataType: "character varying"},
 		{Name: "b", DataType: "character"},
 		{Name: "c", DataType: "text"},
 		{Name: "d", DataType: "citext"},
 	}}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -82,12 +82,12 @@ func TestCanonicalSchemaStringTypes(t *testing.T) {
 }
 
 func TestCanonicalSchemaBoolAndJSON(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "a", DataType: "boolean"},
 		{Name: "b", DataType: "json"},
 		{Name: "c", DataType: "jsonb"},
 	}}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -103,14 +103,14 @@ func TestCanonicalSchemaBoolAndJSON(t *testing.T) {
 }
 
 func TestCanonicalSchemaTemporalTypes(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "a", DataType: "date"},
 		{Name: "b", DataType: "time without time zone"},
 		{Name: "c", DataType: "time with time zone"},
 		{Name: "d", DataType: "timestamp without time zone"},
 		{Name: "e", DataType: "timestamp with time zone"},
 	}}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -123,11 +123,11 @@ func TestCanonicalSchemaTemporalTypes(t *testing.T) {
 }
 
 func TestCanonicalSchemaUUIDAndBinary(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "a", DataType: "uuid"},
 		{Name: "b", DataType: "bytea"},
 	}}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -140,11 +140,11 @@ func TestCanonicalSchemaUUIDAndBinary(t *testing.T) {
 }
 
 func TestCanonicalSchemaPKColumns(t *testing.T) {
-	st := &TableState{
-		Columns:   []Column{{Name: "a"}, {Name: "b"}, {Name: "id"}},
+	st := &catalog.TableState{
+		Columns:   []catalog.Column{{Name: "a"}, {Name: "b"}, {Name: "id"}},
 		PKColumns: []int{2},
 	}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -154,8 +154,8 @@ func TestCanonicalSchemaPKColumns(t *testing.T) {
 }
 
 func TestCanonicalSchemaEmptyColumns(t *testing.T) {
-	st := &TableState{Columns: []Column{}}
-	got, err := CanonicalSchema(st)
+	st := &catalog.TableState{Columns: []catalog.Column{}}
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -165,10 +165,10 @@ func TestCanonicalSchemaEmptyColumns(t *testing.T) {
 }
 
 func TestCanonicalSchemaNumericPrecision(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "a", DataType: "numeric(10,2)"},
 	}}
-	got, err := CanonicalSchema(st)
+	got, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		t.Fatalf("CanonicalSchema: %v", err)
 	}
@@ -177,100 +177,6 @@ func TestCanonicalSchemaNumericPrecision(t *testing.T) {
 	}
 	if got.Columns[0].Type.Precision != 10 || got.Columns[0].Type.Scale != 2 {
 		t.Errorf("numeric precision = %d, scale = %d", got.Columns[0].Type.Precision, got.Columns[0].Type.Scale)
-	}
-}
-
-func TestNewChunkerBadSource(t *testing.T) {
-	_, err := NewChunker(context.Background(), nil, "no_schema_dot", "id", 1000)
-	if err == nil {
-		t.Error("bare source name: want error")
-	}
-}
-
-func TestNewChunkerBadChunkSize(t *testing.T) {
-	_, err := NewChunker(context.Background(), nil, "public.orders", "id", 0)
-	if err == nil {
-		t.Error("zero chunk size: want error")
-	}
-	_, err = NewChunker(context.Background(), nil, "public.orders", "id", -1)
-	if err == nil {
-		t.Error("negative chunk size: want error")
-	}
-}
-
-func TestNewChunkerValid(t *testing.T) {
-	c, err := NewChunker(context.Background(), nil, "public.orders", "id", 1000)
-	if err != nil {
-		t.Fatalf("NewChunker: %v", err)
-	}
-	if c.pk[0] != "id" {
-		t.Errorf("pk = %v", c.pk)
-	}
-}
-
-func TestNewChunkerCompositeKey(t *testing.T) {
-	c, err := NewChunker(context.Background(), nil, "public.orders", "a, b", 1000)
-	if err != nil {
-		t.Fatalf("NewChunker: %v", err)
-	}
-	if len(c.pk) != 2 || c.pk[0] != "a" || c.pk[1] != "b" {
-		t.Errorf("pk = %v", c.pk)
-	}
-}
-
-func TestNewChunkerKeyWithSpaces(t *testing.T) {
-	c, err := NewChunker(context.Background(), nil, "public.orders", " a , b , c ", 500)
-	if err != nil {
-		t.Fatalf("NewChunker: %v", err)
-	}
-	if len(c.pk) != 3 {
-		t.Errorf("pk = %v", c.pk)
-	}
-}
-
-func TestEnsureSetupBadSlotName(t *testing.T) {
-	err := EnsureSetup(t.Context(), nil, "bad-name!", []source.TableRef{{Source: "public.t"}}, "pgoutput", "full")
-	if err == nil {
-		t.Error("bad slot name: want error")
-	}
-}
-
-func TestEnsureSetupEmptyTables(t *testing.T) {
-	err := EnsureSetup(t.Context(), nil, "slot", nil, "pgoutput", "full")
-	if err == nil {
-		t.Error("empty tables: want error")
-	}
-}
-
-func TestEnsureSetupBareSourceName(t *testing.T) {
-	err := EnsureSetup(t.Context(), nil, "slot", []source.TableRef{{Source: "no_dot"}}, "pgoutput", "full")
-	if err == nil {
-		t.Error("bare source name: want error")
-	}
-}
-
-func TestEnsureSetupValidSlotName(t *testing.T) {
-	// Valid slot name passes validation; the nil DB causes a panic later,
-	// so just verify the slot-name regex accepts it.
-	if !slotNameRe.MatchString("_valid_slot_123") {
-		t.Error("_valid_slot_123 should match slot name regex")
-	}
-	if !slotNameRe.MatchString("mySlot") {
-		t.Error("mySlot should match slot name regex")
-	}
-	if slotNameRe.MatchString("bad-name!") {
-		t.Error("bad-name! should not match slot name regex")
-	}
-	if slotNameRe.MatchString("1starts_digit") {
-		t.Error("starts with digit should not match")
-	}
-}
-
-// "keep" must not touch the database at all — the nil DB proves no query runs
-// (issue #571).
-func TestEnsureReplicaIdentityKeepSkipsDB(t *testing.T) {
-	if err := ensureReplicaIdentity(t.Context(), nil, "public.t", "public", "t", "keep"); err != nil {
-		t.Fatalf("keep must not touch the DB: %v", err)
 	}
 }
 

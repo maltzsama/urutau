@@ -5,10 +5,12 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 func TestProjectionKeep(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "id", DataType: "bigint"},
 		{Name: "name", DataType: "text"},
 		{Name: "status", DataType: "text"},
@@ -81,7 +83,7 @@ func TestCheckColumnFilterCoversPK(t *testing.T) {
 }
 
 func TestCheckColumnFilterExists(t *testing.T) {
-	st := &TableState{Columns: []Column{{Name: "id"}, {Name: "name"}}}
+	st := &catalog.TableState{Columns: []catalog.Column{{Name: "id"}, {Name: "name"}}}
 	if err := checkColumnFilterExists(st, []string{"id", "name"}); err != nil {
 		t.Fatalf("known columns: %v", err)
 	}

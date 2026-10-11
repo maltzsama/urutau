@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	sq "github.com/Masterminds/squirrel"
 
 	"github.com/maltzsama/urutau/core"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // maxChunkBounds caps the chunk count a value-range split may produce. A
@@ -18,8 +20,8 @@ const maxChunkBounds = 1 << 20
 // batchBounds splits an integer/float chunk column by value range: MIN..MAX
 // stepped by chunkSize. A dense key yields ~chunkSize rows per chunk.
 func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
-	col := quotePgIdent(c.chunkColumn)
-	query, args, err := psql.
+	col := catalog.QuoteIdent(c.chunkColumn)
+	query, args, err := Builder.
 		Select("MIN("+col+")", "MAX("+col+")").
 		From(c.qualifiedTable()).
 		ToSql()
@@ -92,8 +94,8 @@ func (c *Chunker) batchBounds(ctx context.Context) ([][]any, error) {
 // nextBounds steps a non-numeric chunk column by cursor: the next boundary is
 // the maximum of the first chunkSize values past the previous boundary.
 func (c *Chunker) nextBounds(ctx context.Context) ([][]any, error) {
-	col := quotePgIdent(c.chunkColumn)
-	query, args, err := psql.Select("MIN(" + col + ")").From(c.qualifiedTable()).ToSql()
+	col := catalog.QuoteIdent(c.chunkColumn)
+	query, args, err := Builder.Select("MIN(" + col + ")").From(c.qualifiedTable()).ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("postgres: chunker: min sql: %w", err)
 	}
@@ -124,13 +126,13 @@ func (c *Chunker) nextBounds(ctx context.Context) ([][]any, error) {
 
 // nextChunkEnd returns MAX(col) of the first chunkSize rows past prev.
 func (c *Chunker) nextChunkEnd(ctx context.Context, prev any) (any, error) {
-	col := quotePgIdent(c.chunkColumn)
-	sub := psql.Select(col).
+	col := catalog.QuoteIdent(c.chunkColumn)
+	sub := Builder.Select(col).
 		From(c.qualifiedTable()).
 		Where(sq.Gt{col: prev}).
 		OrderBy(col).
 		Limit(uint64(c.chunkSize))
-	query, args, err := psql.Select("MAX("+col+")").FromSelect(sub, "t").ToSql()
+	query, args, err := Builder.Select("MAX("+col+")").FromSelect(sub, "t").ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("postgres: chunker: next sql: %w", err)
 	}

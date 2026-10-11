@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"context"

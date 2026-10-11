@@ -11,6 +11,8 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/chunk"
 )
 
 // IncrementalBatch implements source.BatchIncrementalSource (#733): the
@@ -156,7 +158,7 @@ func newIncrementalArrow(enc *transport.RowEncoder, names, dbTypes []string) (*i
 			return nil, fmt.Errorf("%w: %s", transport.ErrColumnNotInSchema, name)
 		}
 		cols[i], seen[col] = col, true
-		raw[i] = enc.IsBytes(col) && pgRawBytesType(dbTypes[i])
+		raw[i] = enc.IsBytes(col) && chunk.RawBytesType(dbTypes[i])
 	}
 	var absent []int
 	for col := range enc.Schema().Columns {
@@ -178,7 +180,7 @@ func (a *incrementalArrow) appendRow(values []any) error {
 			a.enc.AppendBytes(col, b)
 			continue
 		}
-		if err := a.enc.AppendValue(col, normalize(values[i])); err != nil {
+		if err := a.enc.AppendValue(col, chunk.Normalize(values[i])); err != nil {
 			return err
 		}
 	}
@@ -205,7 +207,7 @@ func dbTypeNames(types []*sql.ColumnType) []string {
 func cellByName(names []string, vals []any, name string) any {
 	for i, n := range names {
 		if n == name {
-			return normalize(vals[i])
+			return chunk.Normalize(vals[i])
 		}
 	}
 	return nil

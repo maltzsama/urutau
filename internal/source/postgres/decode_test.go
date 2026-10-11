@@ -6,15 +6,17 @@ import (
 	pglogrepl "github.com/jackc/pglogrepl"
 
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // orderState is the introspected shape of shop.orders used by the golden
 // tests: id bigint, v text, amount numeric, active boolean.
-func orderState() *TableState {
-	return &TableState{
+func orderState() *catalog.TableState {
+	return &catalog.TableState{
 		Schema: "shop",
 		Name:   "orders",
-		Columns: []Column{
+		Columns: []catalog.Column{
 			{Name: "id", DataType: "bigint"},
 			{Name: "v", DataType: "text"},
 			{Name: "amount", DataType: "numeric"},
@@ -122,7 +124,7 @@ func TestTupleRowBadScalarIsHardError(t *testing.T) {
 }
 
 func TestKeyTupleSpecOrder(t *testing.T) {
-	st := &TableState{Schema: "shop", Name: "orders", Columns: []Column{
+	st := &catalog.TableState{Schema: "shop", Name: "orders", Columns: []catalog.Column{
 		{Name: "a"}, {Name: "b"}, {Name: "id"},
 	}, PKColumns: []int{2, 0}}
 	ref := source.TableRef{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id", "a"}}

@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/retry"
 )
 
 // reserveAfterRows is how many rows ScanArrow reads before sizing the
@@ -54,7 +56,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 		tx   *sql.Tx
 		rows *sql.Rows
 	)
-	err = retryTransientErr(ctx, c.retries, func() error {
+	err = retry.DoErr(ctx, c.retries, func() error {
 		var e error
 		tx, e = c.db.BeginTx(ctx, &sql.TxOptions{
 			Isolation: sql.LevelRepeatableRead,
@@ -86,7 +88,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 	}
 	// Each result column's encoder column and scan target: the driver's
 	// buffer only for a PostgreSQL text, JSON or binary column; any other
-	// type (numeric, temporal, bool) goes through normalize + AppendValue
+	// type (numeric, temporal, bool) goes through Normalize + AppendValue
 	// exactly as Scan does. Selecting the raw path from the SOURCE type, not
 	// the destination schema, matters when a cast maps a TIMESTAMPTZ source
 	// to a string target: scanning time.Time into *[]byte would fail
@@ -101,7 +103,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 			return 0, fmt.Errorf("%w: %s", transport.ErrColumnNotInSchema, name)
 		}
 		cols[i], seen[col] = col, true
-		if enc.IsBytes(col) && pgRawBytesType(types[i].DatabaseTypeName()) {
+		if enc.IsBytes(col) && RawBytesType(types[i].DatabaseTypeName()) {
 			raw[i] = true
 			dest[i] = new([]byte)
 		} else {
@@ -126,7 +128,7 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 				enc.AppendBytes(col, *dest[i].(*[]byte))
 				continue
 			}
-			if err := enc.AppendValue(col, normalize(*dest[i].(*any))); err != nil {
+			if err := enc.AppendValue(col, Normalize(*dest[i].(*any))); err != nil {
 				return n, err
 			}
 		}
@@ -148,11 +150,11 @@ func (c *Chunker) ScanArrow(ctx context.Context, ch source.Chunk, enc *transport
 	return n, nil
 }
 
-// pgRawBytesType reports whether a PostgreSQL column type reaches Scan as
-// bytes that normalize turns into the same string: the text, JSON and binary
-// types. Any other type goes through normalize + AppendValue, exactly as the
+// RawBytesType reports whether a PostgreSQL column type reaches Scan as
+// bytes that Normalize turns into the same string: the text, JSON and binary
+// types. Any other type goes through Normalize + AppendValue, exactly as the
 // row path.
-func pgRawBytesType(dbType string) bool {
+func RawBytesType(dbType string) bool {
 	switch dbType {
 	case "TEXT", "VARCHAR", "CHAR", "BPCHAR", "NAME", "JSON", "JSONB", "BYTEA", "XML":
 		return true
@@ -180,7 +182,7 @@ func (c *Chunker) ScanArrowPages(ctx context.Context, ch source.Chunk, enc *tran
 		tx   *sql.Tx
 		rows *sql.Rows
 	)
-	err = retryTransientErr(ctx, c.retries, func() error {
+	err = retry.DoErr(ctx, c.retries, func() error {
 		var e error
 		tx, e = c.db.BeginTx(ctx, &sql.TxOptions{
 			Isolation: sql.LevelRepeatableRead,
@@ -220,7 +222,7 @@ func (c *Chunker) ScanArrowPages(ctx context.Context, ch source.Chunk, enc *tran
 			return 0, fmt.Errorf("%w: %s", transport.ErrColumnNotInSchema, name)
 		}
 		cols[i], seen[col] = col, true
-		if enc.IsBytes(col) && pgRawBytesType(types[i].DatabaseTypeName()) {
+		if enc.IsBytes(col) && RawBytesType(types[i].DatabaseTypeName()) {
 			raw[i] = true
 			dest[i] = new([]byte)
 		} else {
@@ -245,7 +247,7 @@ func (c *Chunker) ScanArrowPages(ctx context.Context, ch source.Chunk, enc *tran
 				enc.AppendBytes(col, *dest[i].(*[]byte))
 				continue
 			}
-			if err := enc.AppendValue(col, normalize(*dest[i].(*any))); err != nil {
+			if err := enc.AppendValue(col, Normalize(*dest[i].(*any))); err != nil {
 				return total, err
 			}
 		}

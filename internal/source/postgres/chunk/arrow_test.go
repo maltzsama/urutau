@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"context"
@@ -81,7 +81,7 @@ func TestChunkerScanArrowMatchesTheRowPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	c, err := NewChunker(context.Background(), db, "public.mixed", "id", 10, WithWorkers(1), WithRetries(0))
+	c, err := New(context.Background(), db, "public.mixed", "id", 10, WithWorkers(1), WithRetries(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestChunkerScanArrowRetriesTheSetup(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	c, err := NewChunker(context.Background(), db, "public.mixed", "id", 10, WithWorkers(1), WithRetries(1))
+	c, err := New(context.Background(), db, "public.mixed", "id", 10, WithWorkers(1), WithRetries(1))
 	if err != nil {
 		t.Fatal(err)
 	}

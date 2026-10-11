@@ -11,6 +11,8 @@ import (
 
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/replication"
 )
 
 func TestCapabilities(t *testing.T) {
@@ -38,7 +40,7 @@ func TestParsePosition(t *testing.T) {
 }
 
 func TestPublicationFor(t *testing.T) {
-	if got := publicationFor("urutau_slot"); got != "urutau_slot_pub" {
+	if got := replication.PublicationFor("urutau_slot"); got != "urutau_slot_pub" {
 		t.Fatalf("publicationFor = %q", got)
 	}
 }

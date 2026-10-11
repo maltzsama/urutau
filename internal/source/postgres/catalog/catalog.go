@@ -3,7 +3,7 @@
 // into rowchange.Change, positions them at their commit LSN, and exposes the
 // synced and confirmed positions for the DBLog watermark logic. The
 // snapshot path reuses the source-agnostic DBLog orchestrator.
-package postgres
+package catalog
 
 import (
 	"context"

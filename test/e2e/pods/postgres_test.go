@@ -18,8 +18,9 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/maltzsama/urutau/internal/faultinject"
-	"github.com/maltzsama/urutau/internal/source/postgres"
 	"github.com/maltzsama/urutau/position"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/replication"
 )
 
 // PostgreSQL is the logical-replication source the commit-boundary matrix
@@ -260,7 +261,7 @@ func assertSlotNotPastSink(t *testing.T, source, trino *sql.DB, slot, target str
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	confirmed, err := postgres.ConfirmedLSN(ctx, source, slot)
+	confirmed, err := replication.ConfirmedLSN(ctx, source, slot)
 	if err != nil {
 		t.Fatalf("read slot %s confirmed_flush_lsn: %v", slot, err)
 	}
@@ -293,7 +294,7 @@ func reportPostgresBoundaryOnFailure(t *testing.T, source, trino *sql.DB, pipeli
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		if lsn, err := postgres.ConfirmedLSN(ctx, source, slot); err != nil {
+		if lsn, err := replication.ConfirmedLSN(ctx, source, slot); err != nil {
 			t.Logf("boundary %s: slot %s confirmed_flush_lsn read: %v", point, slot, err)
 		} else {
 			t.Logf("boundary %s: slot %s confirmed_flush_lsn=%s", point, slot, lsn.String())

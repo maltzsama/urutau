@@ -1,4 +1,4 @@
-package postgres
+package catalog
 
 import (
 	"testing"
@@ -99,8 +99,5 @@ func TestMapColumnTypeModifiedTypes(t *testing.T) {
 	nc, _ := mapColumnType("numeric", "numeric(10,2)")
 	if nc.Precision != 10 || nc.Scale != 2 {
 		t.Errorf("numeric(10,2) = (%d,%d), want (10,2)", nc.Precision, nc.Scale)
-	}
-	if !isStringType("character varying") {
-		t.Error("isStringType(character varying) must be true so a varchar(n) PK can partition")
 	}
 }

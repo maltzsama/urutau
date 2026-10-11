@@ -11,6 +11,8 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // heldRec is one materialized record of the committing transaction, before
@@ -46,7 +48,7 @@ type pgTable struct {
 
 // newPgTable builds an encoder for one target table. The column mapping
 // resolves each projected column against the introspected table now.
-func newPgTable(target string, cs core.Schema, st *TableState, proj Projection) (*pgTable, error) {
+func newPgTable(target string, cs core.Schema, st *catalog.TableState, proj Projection) (*pgTable, error) {
 	enc, err := transport.NewRowEncoder(cs, nil)
 	if err != nil {
 		return nil, err
@@ -65,7 +67,7 @@ func newPgTable(target string, cs core.Schema, st *TableState, proj Projection) 
 
 // appendRow writes one projected image (positional, in table column order)
 // into the builders and ends the row with meta's operation/position.
-func (te *pgTable) appendRow(row []any, st *TableState, meta transport.RowMeta) error {
+func (te *pgTable) appendRow(row []any, st *catalog.TableState, meta transport.RowMeta) error {
 	if len(st.Columns) != te.imgCols {
 		return fmt.Errorf("postgres: schema drift: table now carries %d columns, the schema was built for %d — declare the change and resume", len(st.Columns), te.imgCols)
 	}
@@ -111,7 +113,7 @@ func pgCellBytes(v any) int {
 // order (nil for NULL and for columns the tuple omits). Unchanged-TOAST
 // columns are recovered from the old tuple. This replaces the row map that
 // tupleToMap built, so no map[string]any is materialized on the hot path.
-func tupleRow(st *TableState, tuple *pglogrepl.TupleData, old *pglogrepl.TupleData) ([]any, error) {
+func tupleRow(st *catalog.TableState, tuple *pglogrepl.TupleData, old *pglogrepl.TupleData) ([]any, error) {
 	row := make([]any, len(st.Columns))
 	for i, col := range tuple.Columns {
 		if i >= len(st.Columns) {
@@ -143,7 +145,7 @@ func tupleRow(st *TableState, tuple *pglogrepl.TupleData, old *pglogrepl.TupleDa
 // keyTupleRow decodes a key-only old tuple ('K') by the primary key's column
 // order, returning a positional row (nil for every non-key column). A shorter
 // or longer tuple is a malformed identity tuple and fails loud.
-func keyTupleRow(st *TableState, tuple *pglogrepl.TupleData, names []string) ([]any, error) {
+func keyTupleRow(st *catalog.TableState, tuple *pglogrepl.TupleData, names []string) ([]any, error) {
 	if len(tuple.Columns) != len(names) {
 		return nil, fmt.Errorf("postgres: decode %s.%s: key tuple has %d columns, want the primary key's %d",
 			st.Schema, st.Name, len(tuple.Columns), len(names))
@@ -173,7 +175,7 @@ func keyTupleRow(st *TableState, tuple *pglogrepl.TupleData, names []string) ([]
 
 // oldTupleRow decodes an old tuple: key-only by the primary key's column
 // order, a full one positionally (issue #500).
-func oldTupleRow(st *TableState, t *pglogrepl.TupleData, keyOnly bool, key []string) ([]any, error) {
+func oldTupleRow(st *catalog.TableState, t *pglogrepl.TupleData, keyOnly bool, key []string) ([]any, error) {
 	if keyOnly {
 		return keyTupleRow(st, t, key)
 	}
@@ -181,7 +183,7 @@ func oldTupleRow(st *TableState, t *pglogrepl.TupleData, keyOnly bool, key []str
 }
 
 // wal2jsonRowPos keys a wal2json change's columns to a positional table row.
-func wal2jsonRowPos(st *TableState, names []string, values []any) ([]any, error) {
+func wal2jsonRowPos(st *catalog.TableState, names []string, values []any) ([]any, error) {
 	row := make([]any, len(st.Columns))
 	for i, name := range names {
 		col := st.FindColumn(name)
@@ -203,7 +205,7 @@ func wal2jsonRowPos(st *TableState, names []string, values []any) ([]any, error)
 
 // keyTuple builds a row's primary-key tuple from the positional row, in spec
 // order.
-func keyTuple(st *TableState, ref source.TableRef, row []any) []any {
+func keyTuple(st *catalog.TableState, ref source.TableRef, row []any) []any {
 	key := make([]any, 0, len(ref.PrimaryKey))
 	for _, pk := range ref.PrimaryKey {
 		if j := st.FindColumn(pk); j >= 0 && j < len(row) {

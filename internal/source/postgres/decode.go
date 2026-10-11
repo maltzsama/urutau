@@ -7,11 +7,13 @@ import (
 	"strings"
 
 	pglogrepl "github.com/jackc/pglogrepl"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // toastFromOld recovers column i from the old tuple when it carries a
 // text value there.
-func toastFromOld(st *TableState, old *pglogrepl.TupleData, i int) (any, bool) {
+func toastFromOld(st *catalog.TableState, old *pglogrepl.TupleData, i int) (any, bool) {
 	if old == nil || i >= len(old.Columns) || i >= len(st.Columns) {
 		return nil, false
 	}
