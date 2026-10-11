@@ -520,6 +520,14 @@ func (c *chaosController) inject(ctx context.Context, seq int, d chaosDecision, 
 					return
 				}
 			}
+			if resource == "networkchaos" {
+				if other, held := c.coordinatorFaultSince(applied, ev.Name); held {
+					c.mu.Lock()
+					ev.Skipped = "the coordinator was under " + other + " during injection"
+					c.mu.Unlock()
+					return
+				}
+			}
 			record(fmt.Errorf("not injected within 90s after %d re-apply(s) (last %q, %v; last re-apply error: %v)", ev.Reapplied, out, err, reapplyErr))
 			return
 		}
@@ -596,13 +604,34 @@ func manifestTargets(manifest string, pods []podInfo) []podInfo {
 			named[name] = true
 		}
 	}
+	// A network fault's other side is the coordinator, selected by label:
+	// it is a target too, and one that restarts takes the fault with it.
+	coordinator := strings.Contains(manifest, `app: "urutau-coordinator"`)
 	var out []podInfo
 	for _, p := range pods {
-		if named[p.name] {
+		if named[p.name] || (coordinator && p.app == "urutau-coordinator") {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// coordinatorFaultSince names a fault on the coordinator, other than self,
+// that was active at any time since from. A network fault cannot be injected
+// into a coordinator that a pod-failure holds down or a kill is restarting,
+// whether that began before the network fault was applied or after (#825).
+func (c *chaosController) coordinatorFaultSince(from time.Time, self string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, ev := range c.events {
+		if ev.Name == self || (ev.Kind != chaosCoordinatorKill && ev.Kind != chaosCoordFailure) || ev.Resource == "" {
+			continue
+		}
+		if ev.RemovedAt.IsZero() || ev.RemovedAt.After(from) {
+			return ev.Name + " (" + string(ev.Kind) + ")", true
+		}
+	}
+	return "", false
 }
 
 // targetLeft reports whether a target of a fault left while it was being
