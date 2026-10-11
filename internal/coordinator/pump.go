@@ -62,8 +62,10 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 		// cycleCheckEvery (the tick), so a stale lastPump means the loop is
 		// wedged (issue #601).
 		c.lastPump.Store(time.Now().UnixNano())
+		c.pumpHeld.Store(0)
 		select {
 		case <-tick.C:
+			c.pumpHeld.Store(time.Now().UnixNano())
 			if err := c.flushDueAccums(ctx); err != nil {
 				c.pumpFail(ctx, err)
 				return
@@ -72,6 +74,7 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 			if !ok {
 				return
 			}
+			c.pumpHeld.Store(time.Now().UnixNano())
 			if b.Record != nil {
 				c.log.Debug("coordinator: reader batch", "table", b.Table, "rows", b.Record.NumRows(), "mode", b.Mode)
 			}
@@ -105,6 +108,7 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 				return
 			}
 		case <-c.pauseWake:
+			c.pumpHeld.Store(time.Now().UnixNano())
 			// A table resumed: route the batches held during its pause, in
 			// order, under the new layout.
 			if err := c.flushPaused(ctx); err != nil {
