@@ -11,11 +11,11 @@ func TestChunkCursorRoundTrip(t *testing.T) {
 	c.noteChunkMarker("w0", 100, "raw.orders", 1, 7, []any{int64(50)})
 	c.recordCursor("w0", 100)
 
-	got := c.takeCursor(7)
+	got := c.takeCursor("raw.orders", 7)
 	if len(got) != 1 || got[0] != int64(50) {
 		t.Fatalf("takeCursor = %v, want [50]", got)
 	}
-	if got := c.takeCursor(7); got != nil {
+	if got := c.takeCursor("raw.orders", 7); got != nil {
 		t.Fatalf("takeCursor after take = %v, want nil (the cursor is forgotten)", got)
 	}
 }
@@ -64,7 +64,46 @@ func TestCursorNotRecordedWithoutMarkerAck(t *testing.T) {
 	c, _ := coordHarness()
 	c.noteChunkMarker("w0", 100, "raw.orders", 1, 7, []any{int64(50)})
 	// No onMarkerAck/recordCursor: the marker was never acked.
-	if got := c.takeCursor(7); got != nil {
+	if got := c.takeCursor("raw.orders", 7); got != nil {
 		t.Fatalf("cursor = %v, want nil (no ack)", got)
+	}
+}
+
+// A cursor belongs to one table's chunk. Table A finishes its snapshot with a
+// cursor recorded at (partition 0, chunk 0) and never redoes it; table B then
+// loses its worker at its own (partition 0, chunk 0). B's redo must start the
+// chunk from its beginning: resuming from A's high key would skip every row of
+// B's chunk below it.
+func TestAChunkCursorNeverCrossesTables(t *testing.T) {
+	c, w := coordHarness()
+	c.noteChunkMarker(w.name, 100, "raw.a", 1, chunkRef(0, 0), []any{int64(50)})
+	c.recordCursor(w.name, 100)
+
+	c.lostWindows = map[string][]chunkMarker{w.name: {{target: "raw.b", window: 9}}}
+	from, cursor := c.redoFrom(w, "raw.b", map[uint64]int{9: 0}, 0, 0)
+	if from != 0 {
+		t.Fatalf("redoFrom = %d, want 0", from)
+	}
+	if cursor != nil {
+		t.Fatalf("table raw.b resumes its chunk from %v, table raw.a's cursor; want nil", cursor)
+	}
+}
+
+// A table's cursors are dropped when its snapshot finishes: nothing will redo
+// its chunks again, and the entries would otherwise stay for the whole run.
+func TestFinishedSnapshotForgetsItsCursors(t *testing.T) {
+	c, w := coordHarness()
+	c.noteChunkMarker(w.name, 100, "raw.a", 1, chunkRef(0, 0), []any{int64(50)})
+	c.noteChunkMarker(w.name, 101, "raw.b", 2, chunkRef(0, 0), []any{int64(70)})
+	c.recordCursor(w.name, 100)
+	c.recordCursor(w.name, 101)
+
+	c.forgetCursors("raw.a")
+
+	if got := c.takeCursor("raw.a", chunkRef(0, 0)); got != nil {
+		t.Fatalf("raw.a still has cursor %v after its snapshot finished", got)
+	}
+	if got := c.takeCursor("raw.b", chunkRef(0, 0)); len(got) != 1 || got[0] != int64(70) {
+		t.Fatalf("raw.b's cursor = %v, want [70]: another table's finish must not touch it", got)
 	}
 }

@@ -183,19 +183,43 @@ func (c *Coordinator) recordCursor(worker string, id uint64) {
 	for _, m := range c.chunkMarkers[worker] {
 		if m.id == id && m.highKey != nil {
 			if c.chunkCursor == nil {
-				c.chunkCursor = map[uint32][]any{}
+				c.chunkCursor = map[cursorKey][]any{}
 			}
-			c.chunkCursor[m.chunkRef] = m.highKey
+			c.chunkCursor[cursorKey{m.target, m.chunkRef}] = m.highKey
 			return
 		}
 	}
 }
 
-// takeCursor returns and forgets a chunk's resume cursor, or nil.
-func (c *Coordinator) takeCursor(chunkRef uint32) []any {
+// cursorKey names one chunk of one table. chunkRef alone is partition and
+// chunk index, which every table shares: a cursor keyed only by it could be
+// taken by another table's redo of the same partition and index, and that
+// table would resume its chunk from the wrong key, skipping rows.
+type cursorKey struct {
+	target   string
+	chunkRef uint32
+}
+
+// takeCursor returns and forgets the resume cursor of one of target's chunks,
+// or nil.
+func (c *Coordinator) takeCursor(target string, chunkRef uint32) []any {
 	c.chunkMarkersMu.Lock()
 	defer c.chunkMarkersMu.Unlock()
-	cur := c.chunkCursor[chunkRef]
-	delete(c.chunkCursor, chunkRef)
+	k := cursorKey{target, chunkRef}
+	cur := c.chunkCursor[k]
+	delete(c.chunkCursor, k)
 	return cur
+}
+
+// forgetCursors drops every cursor of target. Called when its snapshot
+// finishes: no chunk of it will be redone, and a cursor nothing takes would
+// otherwise stay for the whole run.
+func (c *Coordinator) forgetCursors(target string) {
+	c.chunkMarkersMu.Lock()
+	defer c.chunkMarkersMu.Unlock()
+	for k := range c.chunkCursor {
+		if k.target == target {
+			delete(c.chunkCursor, k)
+		}
+	}
 }

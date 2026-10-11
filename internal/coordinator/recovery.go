@@ -432,7 +432,7 @@ func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint64
 			from = i
 		}
 	}
-	return from, c.takeCursor(chunkRef(partition, from))
+	return from, c.takeCursor(target, chunkRef(partition, from))
 }
 
 // noteLostWindows records the chunk windows a lost worker had not committed.

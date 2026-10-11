@@ -172,6 +172,7 @@ func (c *Coordinator) phaseSnapshot(ctx context.Context, rdr source.Reader, need
 				snapDone <- fmt.Errorf("coordinator: snapshot %s: %w", ref.Source, err)
 				return
 			}
+			c.forgetCursors(ref.Target)
 			c.log.Info("coordinator snapshot done", "table", ref.Source)
 			if err := c.emit(eventlog.KindSnapshotDone, map[string]any{"table": ref.Source}); err != nil {
 				c.log.Warn("coordinator: eventlog emit", "err", err)

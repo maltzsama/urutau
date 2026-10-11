@@ -348,8 +348,9 @@ type Coordinator struct {
 	// lostWindows are the chunk windows each lost worker had not
 	// committed, taken at the loss (recovery.go); under chunkMarkersMu.
 	lostWindows map[string][]chunkMarker
-	// chunkCursor is, per chunkRef, the last acked window's high key (#646).
-	chunkCursor map[uint32][]any
+	// chunkCursor is, per table and chunkRef, the last acked window's high
+	// key (#646).
+	chunkCursor map[cursorKey][]any
 	// podTermination reads a worker's last container termination; nil
 	// reads it from Kubernetes (recovery.go). Set by tests.
 	podTermination func(worker string) (podTermination, bool)
