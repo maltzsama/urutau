@@ -1,4 +1,4 @@
-package mysql
+package charset
 
 import (
 	"fmt"
@@ -30,10 +30,10 @@ import (
 // mangled — a wrong guess would corrupt data that the raw bytes at least
 // preserve.
 
-// decodeString converts raw binlog bytes to UTF-8 using the column's
+// Decode converts raw binlog bytes to UTF-8 using the column's
 // collation (e.g. "latin1_swedish_ci"). An empty collation, a UTF-8-family
 // character set, or one with no decoder returns the bytes as a plain string.
-func decodeString(b []byte, collation string) string {
+func Decode(b []byte, collation string) string {
 	if len(b) == 0 {
 		return ""
 	}
@@ -76,9 +76,9 @@ func decoderFor(collation string) (func([]byte) (string, error), bool) {
 // single-byte sets, the Unicode family, the multi-byte East Asian sets), plus
 // 7 single-byte sets x/text has no decoder for at all — armscii8, dec8,
 // geostd8, hp8, keybcs2, swe7, macce — decoded via generatedCharsetTables
-// (charset_tables.go), extracted directly from a real MySQL 8.4 server
+// (tables.go), extracted directly from a real MySQL 8.4 server
 // rather than borrowed from a lookalike standard. See
-// internal/source/mysql/charsetgen's doc comment for the extraction method.
+// internal/source/mysql/charset/charsetgen's doc comment for the extraction method.
 //
 // macce deserves a specific note: it is NOT charmap.Macintosh (Mac Roman).
 // Byte 0x8E decodes to "é" under Mac Roman and to a different character
@@ -89,7 +89,7 @@ func decoderFor(collation string) (func([]byte) (string, error), bool) {
 //
 // eucjpms, MySQL's Microsoft-flavored EUC-JP, is generated the same way but
 // is multi-byte: about 15,000 sequences in three lookup arrays
-// (charset_eucjpms_table.go), decoded by decodeEucjpms. Plain EUC-JP is not a
+// (eucjpms_table.go), decoded by decodeEucjpms. Plain EUC-JP is not a
 // substitute — the two differ in the NEC/IBM vendor rows.
 var charsetDecoders = map[string]func([]byte) (string, error){
 	"latin1":   decodeWith(charmap.Windows1252), // MySQL's latin1 IS cp1252, not ISO-8859-1
@@ -158,9 +158,9 @@ var charsetDecoders = map[string]func([]byte) (string, error){
 }
 
 // decodeGenerated returns a decoder backed by one of generatedCharsetTables'
-// per-byte maps (charset_tables.go). A byte absent from the table is
+// per-byte maps (tables.go). A byte absent from the table is
 // unassigned in the source charset — MySQL itself would convert it to "?",
-// but this package's policy (see decodeString) is that a byte the decoder
+// but this package's policy (see Decode) is that a byte the decoder
 // cannot place is kept raw rather than replaced, so it is reported as a
 // decode error and the caller falls back to the original bytes.
 func decodeGenerated(charset string) func([]byte) (string, error) {
@@ -179,11 +179,11 @@ func decodeGenerated(charset string) func([]byte) (string, error) {
 }
 
 // decodeEucjpms decodes MySQL's eucjpms from the tables charsetgen extracted
-// from a real server (charset_eucjpms_table.go). The forms are EUC's: a byte
+// from a real server (eucjpms_table.go). The forms are EUC's: a byte
 // below 0x80 is ASCII, 0x8E introduces a half-width kana, 0x8F a three-byte
 // JIS X 0212 character, and any other lead in 0xA1-0xFE a two-byte JIS X 0208
 // one. A malformed or unassigned sequence is a decode error, so the caller
-// keeps the raw bytes (decodeString's policy) instead of the "?" MySQL
+// keeps the raw bytes (Decode's policy) instead of the "?" MySQL
 // substitutes.
 func decodeEucjpms(b []byte) (string, error) {
 	var out strings.Builder

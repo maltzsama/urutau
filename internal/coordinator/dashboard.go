@@ -45,7 +45,9 @@ func (s dashState) Healthy() bool {
 		return false
 	}
 	if held := s.c.pumpHeld.Load(); held != 0 {
-		return time.Since(time.Unix(0, held)) < s.c.pumpHeldLimit()
+		// Held, the pump is wedged only once nothing has moved for the
+		// limit: an ack says a worker is still committing what holds it.
+		return time.Since(time.Unix(0, max(held, s.c.lastProgress.Load()))) < s.c.pumpHeldLimit()
 	}
 	return time.Since(time.Unix(0, ns)) < pumpHealthWindow
 }

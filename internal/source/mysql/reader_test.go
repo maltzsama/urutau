@@ -18,6 +18,8 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
+
+	"github.com/maltzsama/urutau/internal/source/mysql/chunk"
 )
 
 const readerTestUUID = "3e11fa47-71ca-11e1-9e33-c80aa9429562"
@@ -490,7 +492,7 @@ func TestRowToMapDecodesGeneratedCharsets(t *testing.T) {
 
 // swe7 is a strict 7-bit set: every byte 0x80-0xFF has no assignment.
 // MySQL itself converts such a byte to "?" without error, but this
-// package's decodeString policy is to keep unmappable bytes raw (more
+// charset package's Decode policy is to keep unmappable bytes raw (more
 // recoverable than a lossy substitute), so it must fall through untouched
 // rather than becoming "?".
 func TestRowToMapGeneratedCharsetUnassignedByteFallsThrough(t *testing.T) {
@@ -712,14 +714,14 @@ func TestTemporalParityAcrossDST(t *testing.T) {
 	// 2018-12-15: São Paulo observed DST (-02:00).
 	instant := time.Date(2018, 12, 15, 15, 0, 0, 0, time.UTC)
 
-	snapTS := normalizeSnapshot(instant, "TIMESTAMP", loc).(time.Time)
+	snapTS := chunk.NormalizeSnapshot(instant, "TIMESTAMP", loc).(time.Time)
 	cdcTS := normalizeCol(schema.TableColumn{Name: "t", Type: schema.TYPE_TIMESTAMP}, instant, loc).(time.Time)
 	if !snapTS.Equal(instant) || !cdcTS.Equal(instant) || !snapTS.Equal(cdcTS) {
 		t.Fatalf("DST timestamp parity: snap=%v cdc=%v instant=%v", snapTS, cdcTS, instant)
 	}
 
 	wall := time.Date(2018, 12, 15, 12, 0, 0, 0, time.UTC) // naive DATETIME, parsed in UTC
-	snapDT := normalizeSnapshot(wall, "DATETIME", loc).(time.Time)
+	snapDT := chunk.NormalizeSnapshot(wall, "DATETIME", loc).(time.Time)
 	cdcDT := normalizeCol(schema.TableColumn{Name: "d", Type: schema.TYPE_DATETIME}, wall, loc).(time.Time)
 	if !snapDT.Equal(cdcDT) {
 		t.Fatalf("DST datetime parity: snap=%v cdc=%v", snapDT, cdcDT)

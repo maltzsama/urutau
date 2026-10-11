@@ -1,4 +1,4 @@
-package mysql
+package chunk
 
 import (
 	"testing"
@@ -14,7 +14,7 @@ func TestNormalize(t *testing.T) {
 	}
 }
 
-// The snapshot query parses in UTC; normalizeSnapshot re-tags naive temporals
+// The snapshot query parses in UTC; NormalizeSnapshot re-tags naive temporals
 // into the operator's location so a snapshot row matches the CDC decode of the
 // same row (issue #139).
 func TestNormalizeSnapshotTemporal(t *testing.T) {
@@ -25,20 +25,20 @@ func TestNormalizeSnapshotTemporal(t *testing.T) {
 	utc := time.Date(2023, 1, 8, 12, 30, 45, 0, time.UTC)
 
 	// DATETIME: the same wall clock, re-tagged to loc.
-	if got := normalizeSnapshot(utc, "DATETIME", loc).(time.Time); !got.Equal(time.Date(2023, 1, 8, 12, 30, 45, 0, loc)) {
+	if got := NormalizeSnapshot(utc, "DATETIME", loc).(time.Time); !got.Equal(time.Date(2023, 1, 8, 12, 30, 45, 0, loc)) {
 		t.Fatalf("DATETIME = %v", got)
 	}
 	// TIMESTAMP: the same instant.
-	if got := normalizeSnapshot(utc, "TIMESTAMP", loc).(time.Time); !got.Equal(utc) {
+	if got := NormalizeSnapshot(utc, "TIMESTAMP", loc).(time.Time); !got.Equal(utc) {
 		t.Fatalf("TIMESTAMP = %v, want %v", got, utc)
 	}
 	// DATE: midnight in loc.
 	d := time.Date(2023, 1, 8, 0, 0, 0, 0, time.UTC)
-	if got := normalizeSnapshot(d, "DATE", loc).(time.Time); !got.Equal(time.Date(2023, 1, 8, 0, 0, 0, 0, loc)) {
+	if got := NormalizeSnapshot(d, "DATE", loc).(time.Time); !got.Equal(time.Date(2023, 1, 8, 0, 0, 0, 0, loc)) {
 		t.Fatalf("DATE = %v", got)
 	}
 	// Non-temporal values fall back to normalize.
-	if got := normalizeSnapshot([]byte("x"), "VARCHAR", loc); got != "x" {
+	if got := NormalizeSnapshot([]byte("x"), "VARCHAR", loc); got != "x" {
 		t.Fatalf("VARCHAR = %v, want x", got)
 	}
 }

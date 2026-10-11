@@ -1,4 +1,4 @@
-package mysql
+package chunk
 
 import (
 	"context"
@@ -33,13 +33,24 @@ type Chunker struct {
 	columns []string
 	// filter is the compiled row filter (#163/#183), composed with the chunk
 	// bounds.
-	filter filterSQL
+	filter Filter
 }
 
-// NewChunker builds a chunker for one source table. loc may be nil (UTC).
+// Filter is a compiled row filter: a WHERE fragment with ? placeholders and
+// its positional args, in the order the placeholders appear. The zero value
+// filters nothing.
+type Filter struct {
+	Where string
+	Args  []any
+}
+
+// Empty reports whether the filter contributes no predicate.
+func (f Filter) Empty() bool { return f.Where == "" }
+
+// New builds a chunker for one source table. loc may be nil (UTC).
 // columns is the read projection (empty means all); filter is the compiled
 // row filter (empty means none).
-func NewChunker(db *sql.DB, source, pk string, chunkSize int, loc *time.Location, columns []string, filter filterSQL) (*Chunker, error) {
+func New(db *sql.DB, source, pk string, chunkSize int, loc *time.Location, columns []string, filter Filter) (*Chunker, error) {
 	schema, table, ok := strings.Cut(source, ".")
 	if !ok {
 		return nil, fmt.Errorf("mysql: chunker: source %q must be db.table", source)
@@ -154,13 +165,13 @@ func (c *Chunker) chunkQuery(ch source.Chunk) (string, []any, error) {
 	}
 	// The row filter (#163/#183) is composed with the chunk bounds; its args
 	// follow the bound args in placeholder order.
-	if !c.filter.empty() {
+	if !c.filter.Empty() {
 		if where == "" {
-			where = " WHERE " + c.filter.where
+			where = " WHERE " + c.filter.Where
 		} else {
-			where += " AND (" + c.filter.where + ")"
+			where += " AND (" + c.filter.Where + ")"
 		}
-		args = append(args, c.filter.args...)
+		args = append(args, c.filter.Args...)
 	}
 
 	// The projection (#162/#183) narrows the SELECT list; empty means all.
@@ -204,7 +215,7 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 		}
 		m := make(map[string]any, len(colsMeta))
 		for i, name := range colsMeta {
-			m[name] = normalizeSnapshot(vals[i], dbTypeName(colTypes, i), c.loc)
+			m[name] = NormalizeSnapshot(vals[i], dbTypeName(colTypes, i), c.loc)
 		}
 		if err := fn(m); err != nil {
 			return err
@@ -249,11 +260,11 @@ func dbTypeName(cols []*sql.ColumnType, i int) string {
 	return ""
 }
 
-// normalizeSnapshot puts a snapshot cell's temporal value in the operator's
+// NormalizeSnapshot puts a snapshot cell's temporal value in the operator's
 // location, matching the CDC decode: DATETIME (naive) is re-tagged, DATE is
 // midnight, TIMESTAMP keeps its instant. The query connection parses in UTC,
 // so these arrive UTC-tagged. Non-temporal values fall back to normalize.
-func normalizeSnapshot(v any, dbType string, loc *time.Location) any {
+func NormalizeSnapshot(v any, dbType string, loc *time.Location) any {
 	if dbType == "UNSIGNED BIGINT" {
 		return normalizeUnsigned(v)
 	}
@@ -332,4 +343,14 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 		vals[i] = normalize(vals[i])
 	}
 	return vals, nil
+}
+
+// normalize converts driver-native []byte cells to strings so the canonical
+// value space sees text, not raw bytes. The binlog reader keeps the same rule
+// for its own values.
+func normalize(v any) any {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return v
 }

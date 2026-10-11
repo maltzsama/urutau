@@ -1,4 +1,4 @@
-package mysql
+package charset
 
 import (
 	"bufio"
@@ -47,7 +47,7 @@ func TestEucjpmsDecodesEverySequenceAsTheServerDoes(t *testing.T) {
 		t.Fatalf("server table has %d sequences, want 15078", len(table))
 	}
 	for seq, want := range table {
-		if got := decodeString([]byte(seq), "eucjpms_japanese_ci"); got != want {
+		if got := Decode([]byte(seq), "eucjpms_japanese_ci"); got != want {
 			t.Fatalf("sequence %X decodes to %q, want %q", seq, got, want)
 		}
 	}
@@ -66,7 +66,7 @@ func TestEucjpmsFollowsTheServerWhereEUCJPDiffers(t *testing.T) {
 			continue
 		}
 		differ++
-		if got := decodeString([]byte(seq), "eucjpms_japanese_ci"); got != want {
+		if got := Decode([]byte(seq), "eucjpms_japanese_ci"); got != want {
 			t.Errorf("sequence %X decodes to %q, want the server's %q (plain EUC-JP gives %q)", seq, got, want, other)
 		}
 	}
@@ -90,7 +90,7 @@ func TestEucjpmsDecodesMixedText(t *testing.T) {
 		{"duplicate encoding of ≒", []byte{0xad, 0xf0}, "≒"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := decodeString(tc.raw, "eucjpms_japanese_ci"); got != tc.want {
+			if got := Decode(tc.raw, "eucjpms_japanese_ci"); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
@@ -114,7 +114,7 @@ func TestEucjpmsKeepsRawBytesForInvalidSequences(t *testing.T) {
 		{"valid then invalid", []byte{0xc6, 0xfc, 0xff}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := decodeString(tc.raw, "eucjpms_japanese_ci"); got != string(tc.raw) {
+			if got := Decode(tc.raw, "eucjpms_japanese_ci"); got != string(tc.raw) {
 				t.Errorf("got %q, want the raw bytes %q", got, tc.raw)
 			}
 		})

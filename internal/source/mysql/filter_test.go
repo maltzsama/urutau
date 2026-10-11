@@ -64,15 +64,15 @@ func TestCompileFilterSQL(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.where != c.where {
-				t.Fatalf("where = %q, want %q", got.where, c.where)
+			if got.Where != c.where {
+				t.Fatalf("where = %q, want %q", got.Where, c.where)
 			}
-			if len(got.args) != len(c.args) {
-				t.Fatalf("args = %v, want %v", got.args, c.args)
+			if len(got.Args) != len(c.args) {
+				t.Fatalf("args = %v, want %v", got.Args, c.args)
 			}
 			for i := range c.args {
-				if got.args[i] != c.args[i] {
-					t.Fatalf("args[%d] = %v, want %v", i, got.args[i], c.args[i])
+				if got.Args[i] != c.args[i] {
+					t.Fatalf("args[%d] = %v, want %v", i, got.Args[i], c.args[i])
 				}
 			}
 		})
@@ -84,7 +84,7 @@ func TestCompileFilterSQLEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.empty() {
-		t.Fatalf("nil filter must compile to empty, got %q", got.where)
+	if !got.Empty() {
+		t.Fatalf("nil filter must compile to empty, got %q", got.Where)
 	}
 }

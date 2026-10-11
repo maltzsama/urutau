@@ -1,4 +1,4 @@
-package mysql
+package dsn
 
 import (
 	"crypto/ecdsa"

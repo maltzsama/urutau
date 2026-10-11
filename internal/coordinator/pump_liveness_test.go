@@ -74,6 +74,20 @@ func TestPumpHeldByBackpressureIsNotWedged(t *testing.T) {
 		t.Fatal("a pump held past the snapshot watchdog still reads as healthy")
 	}
 
+	// Held that long with acks still arriving, the pipeline is slow, not
+	// wedged: a table committing at its own pace keeps the budget full and
+	// the pump behind it for as long as its backlog lasts. Restarted there,
+	// the coordinator replayed the backlog from its resume point and took
+	// longer still (#826).
+	c.lastProgress.Store(time.Now().UnixNano())
+	if !s.Healthy() {
+		t.Fatal("a pump held past the limit reads as wedged although a worker has just acked")
+	}
+	c.lastProgress.Store(time.Now().Add(-2 * c.pumpHeldLimit()).UnixNano())
+	if s.Healthy() {
+		t.Fatal("a pump held past the limit with no ack since still reads as healthy")
+	}
+
 	c.markWindowReady("raw.orders", 0, 1)
 	select {
 	case <-fed:

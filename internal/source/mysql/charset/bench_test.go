@@ -1,4 +1,4 @@
-package mysql
+package charset
 
 import "testing"
 
@@ -16,14 +16,14 @@ var sjisInput = []byte{0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea}
 func BenchmarkDecodeStringLatin1(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		benchSink = decodeString(latin1Input, "latin1_swedish_ci")
+		benchSink = Decode(latin1Input, "latin1_swedish_ci")
 	}
 }
 
 func BenchmarkDecodeStringSjis(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		benchSink = decodeString(sjisInput, "sjis_japanese_ci")
+		benchSink = Decode(sjisInput, "sjis_japanese_ci")
 	}
 }
 
@@ -31,6 +31,6 @@ func BenchmarkDecodeStringGenerated(b *testing.B) {
 	in := []byte("abcdefgh")
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		benchSink = decodeString(in, "macce_general_ci")
+		benchSink = Decode(in, "macce_general_ci")
 	}
 }
