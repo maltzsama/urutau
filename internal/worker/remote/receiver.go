@@ -67,6 +67,14 @@ func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
 	// committed point. An Incomparable comparison (opaque plugin offsets)
 	// cannot decide — never skip, reprocess is safe.
 	c := high.Compare(cp)
+	if meta.Partial {
+		// A partial batch carries the position of the transaction before
+		// its own. A commit that landed between two batches of that
+		// transaction recorded this same position, with this batch in it or
+		// not: at the committed position it is applied again, which an
+		// upsert absorbs, and skipped only strictly before it (#823).
+		return c != position.Incomparable && c < 0
+	}
 	return c != position.Incomparable && c <= 0
 }
 
@@ -83,7 +91,13 @@ func (r *batchReceiver) skipCovered(meta *pb.BatchMeta) bool {
 	}
 	r.log.Info("worker skip covered batch", "table", meta.Table, "high", meta.HighPos)
 	if r.ack != nil {
-		r.ack(meta.Table, meta.HighPos)
+		// A partial batch leaves the coordinator's in-flight index only on
+		// an ack strictly beyond its position: ack what is committed.
+		pos := meta.HighPos
+		if meta.Partial {
+			pos = r.committed[meta.Table].String()
+		}
+		r.ack(meta.Table, pos)
 	}
 	return true
 }
