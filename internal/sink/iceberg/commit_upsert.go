@@ -27,7 +27,7 @@ func (w *TableWriter) commitUpsert(ctx context.Context, keys [][]any, upsertBatc
 		if err != nil {
 			return fmt.Errorf("iceberg: load %v: %w", w.ident, err)
 		}
-		if len(keys) > 0 {
+		if len(keys) > 0 && !w.positional {
 			rec, err := w.deleteRecord(keys)
 			if err != nil {
 				return err
@@ -50,13 +50,20 @@ func (w *TableWriter) commitUpsert(ctx context.Context, keys [][]any, upsertBatc
 			}
 		}
 	}
-	if len(delFiles) == 0 && len(dataFiles) == 0 && pos == "" && snapshotState == "" && snapshotPending == nil {
+	resolved := w.positional && len(keys) > 0 // deletes resolved per attempt
+	if len(delFiles) == 0 && len(dataFiles) == 0 && !resolved && pos == "" && snapshotState == "" && snapshotPending == nil {
 		return nil
 	}
 
 	// A retry after a lost catalog response must not re-add the same files
 	// (issue #123, same guard the other paths use).
 	key := cycleKey(delFiles, dataFiles, pos)
+	if resolved {
+		var err error
+		if key, err = w.keyedCycle(keys, dataFiles, pos); err != nil {
+			return err
+		}
+	}
 	p := props(pos)
 	addSnapshotProps(p, snapshotState, snapshotPending)
 	p[propCycle] = key
@@ -80,17 +87,10 @@ func (w *TableWriter) commitUpsert(ctx context.Context, keys [][]any, upsertBatc
 			return nil // a previous attempt's commit landed
 		}
 		txn := tbl.NewTransaction()
-		rd := txn.NewRowDelta(p)
-		if len(delFiles) > 0 {
-			rd.AddDeletes(delFiles...)
-		}
-		if len(dataFiles) > 0 {
-			rd.AddRows(dataFiles...)
-		}
-		// The RowDelta stages the row-level update onto the transaction; the
+		// The row delta stages the row-level update onto the transaction; the
 		// single catalog commit is below, so the deletes, the rows and the
 		// position land in one atomic snapshot.
-		if err := rd.Commit(ctx); err != nil {
+		if err := w.stageRowDelta(ctx, tbl, txn, p, keys, delFiles, dataFiles); err != nil {
 			if !isRetryableError(err) {
 				return err
 			}

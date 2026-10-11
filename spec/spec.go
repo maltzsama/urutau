@@ -303,6 +303,16 @@ type Sink struct {
 	// widening) — never a narrowing, rename, or drop. Iceberg-only: other
 	// sinks ignore it.
 	EvolveSchema bool `json:"evolveSchema,omitempty"`
+	// DeleteMode selects how an upsert removes a row's old version in an
+	// Iceberg table. Empty or "equality" writes an equality delete on the
+	// key: cheap to write, joined against the data by every reader until a
+	// compaction applies it. "positional" marks the old row's position in a
+	// deletion vector: readers skip it by position, and the writer pays for
+	// it by reading the key columns of the data files that can hold the
+	// batch's keys at each commit. Tables written by more than one worker
+	// keep equality deletes in either mode. Iceberg-only: any other sink type
+	// rejects it in Validate.
+	DeleteMode DeleteMode `json:"deleteMode,omitempty"`
 	// Maintenance configures background Iceberg table maintenance
 	// (compaction, snapshot expiry, orphan cleanup). Iceberg-only: any
 	// other sink type rejects a maintenance block in Validate rather than
@@ -423,6 +433,16 @@ const (
 	DefaultCompactionInterval     = 5 * time.Minute
 	DefaultSnapshotExpiryInterval = 10 * time.Minute
 	DefaultOrphanCleanupInterval  = time.Hour
+)
+
+// DeleteMode is how an Iceberg upsert removes a row's old version.
+type DeleteMode string
+
+const (
+	// DeleteModeEquality writes equality deletes on the primary key.
+	DeleteModeEquality DeleteMode = "equality"
+	// DeleteModePositional writes deletion vectors.
+	DeleteModePositional DeleteMode = "positional"
 )
 
 // CommitMode is the data-vs-position commit sequencing selector.

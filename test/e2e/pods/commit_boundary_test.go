@@ -219,9 +219,16 @@ var (
 // and waits until it has converged; it returns the sink table.
 func startBoundaryPipeline(t *testing.T, mysql, trino *sql.DB, pipeline, serverID, base string, workers int) string {
 	t.Helper()
+	return startBoundaryPipelineWith(t, mysql, trino, pipeline, serverID, base, workers, crOptions{})
+}
+
+// startBoundaryPipelineWith is startBoundaryPipeline with explicit pipeline
+// options (the sink's delete mode, for one).
+func startBoundaryPipelineWith(t *testing.T, mysql, trino *sql.DB, pipeline, serverID, base string, workers int, opts crOptions) string {
+	t.Helper()
 	target := uniqueTarget(base)
 	cr := buildCR(pipeline, testNS, raceImage(), "pod-e2e-source", "pod-e2e-catalog", serverID,
-		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: workers}}, crOptions{})
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: workers}}, opts)
 	applyPipeline(t, testNS, pipeline, cr)
 	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 5*time.Minute)
 	waitPodsByPrefix(t, testNS, workerSTSs(t, testNS, pipeline)[0]+"-", workers, 5*time.Minute)
@@ -240,6 +247,45 @@ func TestCommitBoundaryFaultsDirect(t *testing.T) {
 	target := startBoundaryPipeline(t, mysql, trino, pipeline, "2309", "pod_fault_direct", 1)
 	runBoundaryCases(t, mysql, trino, pipeline, target, 1, directBoundaries)
 	assertNoRaces(t, testNS, pipeline+"-")
+}
+
+// TestCommitBoundaryFaultsDirectPositional fires every direct-path boundary
+// with sink.deleteMode: positional. Each recovery replays a batch whose
+// deletion vectors are resolved again against the table as the crash left it,
+// so the sink must converge exactly, with no row resurrected and none lost.
+// It also checks the mode is what removed the rows: the table carries
+// deletion vectors and not a single equality delete.
+func TestCommitBoundaryFaultsDirectPositional(t *testing.T) {
+	requirePods(t)
+	mysql, trino := setupPodEnv(t)
+	const pipeline = "pod-fault-positional"
+	seedOrders(t, mysql, 50)
+	target := startBoundaryPipelineWith(t, mysql, trino, pipeline, "2311", "pod_fault_positional", 1,
+		crOptions{DeleteMode: "positional"})
+	runBoundaryCases(t, mysql, trino, pipeline, target, 1, directBoundaries)
+	assertNoRaces(t, testNS, pipeline+"-")
+
+	// Trino's $files metadata table: content 1 is a position delete (a
+	// deletion vector on a v3 table), 2 an equality delete.
+	counts := map[int]int{}
+	rows, err := trino.Query(fmt.Sprintf(`SELECT content, count(*) FROM "%s$files" GROUP BY content`, target))
+	if err != nil {
+		t.Fatalf("trino $files: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var content, n int
+		if err := rows.Scan(&content, &n); err != nil {
+			t.Fatalf("trino $files scan: %v", err)
+		}
+		counts[content] = n
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("trino $files rows: %v", err)
+	}
+	if counts[2] != 0 || counts[1] == 0 {
+		t.Fatalf("table has %d equality delete files and %d position delete files; want deletion vectors only", counts[2], counts[1])
+	}
 }
 
 // TestCommitBoundaryFaultsStaged fires every staged-path boundary (two

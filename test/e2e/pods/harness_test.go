@@ -238,6 +238,9 @@ type crOptions struct {
 	// Empty omits the field, letting the sink default to fast; every other
 	// sink type rejects a non-empty commitMode.
 	CommitMode string
+	// DeleteMode is the Iceberg sink's row-delete selector ("equality" |
+	// "positional"); empty keeps the sink's default.
+	DeleteMode string
 	// SourceKind selects the source driver. Empty is the mysql default;
 	// "postgres" selects the PostgreSQL source (its URI comes from the source
 	// Secret, and SlotName is required).
@@ -293,6 +296,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 	}
 	if opts.CommitMode != "" {
 		sink["commitMode"] = opts.CommitMode
+	}
+	if opts.DeleteMode != "" {
+		sink["deleteMode"] = opts.DeleteMode
 	}
 	if opts.MaintenanceBlock != nil {
 		sink["maintenance"] = opts.MaintenanceBlock

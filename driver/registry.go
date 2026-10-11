@@ -289,6 +289,7 @@ const (
 	OptCommitMode     = "commit_mode"
 	OptTargetFileSize = "target_file_size"
 	OptEvolveSchema   = "evolve_schema"
+	OptDeleteMode     = "delete_mode"
 )
 
 // SinkConfig renders a spec's sink section into the neutral config.
@@ -305,6 +306,7 @@ func SinkConfig(s *spec.Spec) sink.Config {
 			OptCommitMode:     string(s.Sink.CommitMode),
 			OptTargetFileSize: s.Sink.Defaults.TargetFileSize,
 			OptEvolveSchema:   strconv.FormatBool(s.Sink.EvolveSchema),
+			OptDeleteMode:     string(s.Sink.DeleteMode),
 		},
 		// Position decoding hint for sinks that compare per-partition
 		// positions (WK-001 C7). Not a source coupling — a string hint.
