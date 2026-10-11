@@ -47,8 +47,7 @@ func TestApplySkipsAnUnlimitedFile(t *testing.T) {
 		cgroupFiles = saved
 		debug.SetMemoryLimit(math.MaxInt64)
 	})
-	gib := float64(1 << 30)
-	if got, want := Apply(nil), int64(gib*Fraction); got != want {
-		t.Fatalf("Apply = %d, want %d (90%% of the second file's 1 GiB)", got, want)
+	if got, want := Apply(nil), runtimeShare(1<<30); got != want {
+		t.Fatalf("Apply = %d, want %d (the runtime's share of the second file's 1 GiB)", got, want)
 	}
 }
