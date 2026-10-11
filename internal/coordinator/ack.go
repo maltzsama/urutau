@@ -121,6 +121,15 @@ func (c *Coordinator) onSchemaDrift(worker string, d *pb.SchemaDrift) {
 	})
 }
 
+// supersededEpoch reports whether epoch is not worker's current generation.
+// The epoch is read under c.mu: resetWorker writes it from other goroutines.
+func (c *Coordinator) supersededEpoch(worker string, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.workers[worker]
+	return w != nil && w.epoch != epoch
+}
+
 // onAck advances the worker's position index: every head batch the commit
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
@@ -137,6 +146,16 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		// error (issue #210). Terminate for replay instead of continuing.
 		c.log.Warn("coordinator: ack position", "worker", worker, "err", err)
 		c.fail(fmt.Errorf("coordinator: worker %s: unparsable ack position %q: %w", worker, ack.Position, err))
+		return
+	}
+	// On a staged table the ack is evidence of nothing durable: the cycle is
+	// committed from the worker's staged delivery, and a delivery from a
+	// superseded generation is dropped (onStagedBatch). Its ack is dropped
+	// with it. Accepting it would take the batch out of the in-flight index,
+	// so it would never be redelivered, and the cycle would wait forever for
+	// that owner's share with every later cycle of the table queued behind it.
+	if c.isStagedTable(ack.Table) && c.supersededEpoch(worker, ack.Epoch) {
+		c.log.Warn("coordinator: stale staged ack", "worker", worker, "table", ack.Table, "position", ack.Position, "got", ack.Epoch)
 		return
 	}
 	faultinject.At(faultinject.CoordinatorAckBeforeRecord,
