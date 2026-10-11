@@ -24,3 +24,20 @@ func validateEvolveSchema(enabled bool, sinkType string, problems *[]string) {
 func sinkSupportsEvolveSchema(sinkType string) bool {
 	return sinkType == "iceberg" || strings.HasPrefix(sinkType, "iceberg+")
 }
+
+// validateDeleteMode rejects an unknown sink.deleteMode, and a positional one
+// on a sink that has no deletion vectors — the knob would do nothing there.
+func validateDeleteMode(mode DeleteMode, sinkType string, problems *[]string) {
+	switch mode {
+	case "", DeleteModeEquality:
+		return
+	case DeleteModePositional:
+	default:
+		*problems = append(*problems, fmt.Sprintf("sink.deleteMode: unknown %q (equality | positional)", mode))
+		return
+	}
+	if !sinkSupportsEvolveSchema(sinkType) {
+		*problems = append(*problems, fmt.Sprintf(
+			"sink.deleteMode: only the Iceberg sink writes positional deletes, not sink.type %q", sinkType))
+	}
+}
