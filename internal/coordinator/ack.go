@@ -134,6 +134,7 @@ func (c *Coordinator) supersededEpoch(worker string, epoch uint64) bool {
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.noteAck(worker, time.Now())
+	c.lastProgress.Store(time.Now().UnixNano())
 	if ack.BatchId != 0 && ack.Position == "" {
 		c.onMarkerAck(worker, ack.BatchId)
 		return

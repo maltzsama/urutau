@@ -285,6 +285,9 @@ type Coordinator struct {
 	// may stay in it far longer than a heartbeat; the liveness signal reads
 	// it as held, not wedged, up to pumpHeldLimit (#819).
 	pumpHeld atomic.Int64
+	// lastProgress is the unix-nano time of the last worker ack: while acks
+	// arrive, a held pump is behind a slow table, not wedged (#826).
+	lastProgress atomic.Int64
 	// decodeErrors, when the source reports it, returns the running count of
 	// records its decoder dropped (Kafka onDecodeError: skip); polled for the
 	// skipped counter (issue #602). Written at boot before the lag loop starts;
