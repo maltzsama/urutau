@@ -58,6 +58,15 @@ func requirePods(t *testing.T) {
 	}
 }
 
+// releaseImage is the image users run (build/Dockerfile, `make k8s-load`).
+// Override with URUTAU_E2E_RELEASE_IMAGE.
+func releaseImage() string {
+	if v := os.Getenv("URUTAU_E2E_RELEASE_IMAGE"); v != "" {
+		return v
+	}
+	return "urutau:dev"
+}
+
 func raceImage() string {
 	if v := os.Getenv("URUTAU_E2E_PODS_IMAGE"); v != "" {
 		return v

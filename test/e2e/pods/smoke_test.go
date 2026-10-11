@@ -47,3 +47,33 @@ func TestPodSmoke(t *testing.T) {
 
 	t.Log("smoke ok: engine ran as Pods over the pod network, converged exactly, no data races")
 }
+
+// TestPodSmokeReleaseImage runs the smoke pipeline on the release image. Every
+// other scenario runs the race image, which is built from another Dockerfile:
+// what is wrong with the release image alone (its user, its base, a missing
+// file) shows up nowhere else. The operator's Pod security context must admit
+// it, the Pods must become Ready, and the snapshot must land.
+func TestPodSmokeReleaseImage(t *testing.T) {
+	requirePods(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+
+	mysql, trino := setupPodEnv(t)
+	target := uniqueTarget("pod_smoke_release")
+	seedOrders(t, mysql, 50)
+
+	const pipeline = "pod-smoke-release"
+	cr := buildCR(pipeline, testNS, releaseImage(), "pod-e2e-source", "pod-e2e-catalog", "2312",
+		[]tableSpec{{Source: "shop.orders", Target: "raw." + target, PrimaryKey: []string{"id"}, Workers: 1}}, crOptions{})
+	applyPipeline(t, testNS, pipeline, cr)
+
+	waitPodsByPrefix(t, testNS, pipeline+"-coordinator-", 1, 4*time.Minute)
+	stss := workerSTSs(t, testNS, pipeline)
+	if len(stss) != 1 {
+		t.Fatalf("want 1 worker StatefulSet, got %v", stss)
+	}
+	waitPodsByPrefix(t, testNS, stss[0]+"-", 1, 4*time.Minute)
+
+	waitConverged(t, ctx, trino, "SELECT count(*) FROM "+target, 50, 4*time.Minute)
+	assertSinkEqualsSource(t, readOrders(t, mysql), readOrdersSink(t, trino, target))
+}
