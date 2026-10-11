@@ -238,7 +238,7 @@ func concatSourceBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
 	first := bs[0]
 	if len(bs) == 1 {
 		first.Record.Retain()
-		return &dataplane.Batch{Table: first.Table, Record: first.Record, Watermark: first.Watermark, Mode: first.Mode}, nil
+		return &dataplane.Batch{Table: first.Table, Record: first.Record, Watermark: first.Watermark, Mode: first.Mode, Partial: first.Partial}, nil
 	}
 	schema := first.Record.Schema()
 	var rows int64
@@ -268,5 +268,6 @@ func concatSourceBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
 		col.Release()
 	}
 	last := bs[len(bs)-1]
-	return &dataplane.Batch{Table: first.Table, Record: rec, Watermark: last.Watermark, Mode: first.Mode}, nil
+	// The merged batch ends where its last one does: partial when that one is.
+	return &dataplane.Batch{Table: first.Table, Record: rec, Watermark: last.Watermark, Mode: first.Mode, Partial: last.Partial}, nil
 }

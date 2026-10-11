@@ -62,6 +62,9 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 		}
 	}
 
+	if b != nil && b.Partial {
+		meta.Partial = true
+	}
 	if b == nil {
 		// Window-lifecycle markers are enqueued to one explicit partition
 		// owner via enqueueTo (snapshotTable does this per partition);
@@ -168,7 +171,7 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 		if subReader.NumRows() > 0 {
 			highs[p] = subReader.Position(subReader.NumRows() - 1)
 		}
-		if c.coveredAtBoot(meta.Table, highs[p]) {
+		if c.coveredAtBoot(meta.Table, highs[p], meta.Partial) {
 			continue
 		}
 		cycleOwners = append(cycleOwners, owners[p].name)
@@ -203,9 +206,10 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 
 // coveredAtBoot mirrors the worker's covered check (batchReceiver.covered):
 // a sub-batch whose high position is at or before the table's committed
-// position at boot is skipped by its worker, acked but never staged. An
-// Incomparable pair is never covered, matching the worker.
-func (c *Coordinator) coveredAtBoot(table, high string) bool {
+// position at boot is skipped by its worker, acked but never staged. A
+// partial one only when strictly before it (#823). An Incomparable pair is
+// never covered, matching the worker.
+func (c *Coordinator) coveredAtBoot(table, high string, partial bool) bool {
 	cp, ok := c.bootCommitted[table]
 	if !ok || high == "" {
 		return false
@@ -215,6 +219,9 @@ func (c *Coordinator) coveredAtBoot(table, high string) bool {
 		return false
 	}
 	cmp := p.Compare(cp)
+	if partial {
+		return cmp != position.Incomparable && cmp < 0
+	}
 	return cmp != position.Incomparable && cmp <= 0
 }
 
@@ -342,7 +349,7 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 	if !snapshotRows {
 		if idx = c.indexOf(w.name); idx != nil {
 			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
-				marker: meta.Window != nil && meta.Window.Closes})
+				marker: meta.Window != nil && meta.Window.Closes, partial: meta.Partial})
 		}
 	}
 	select {

@@ -148,9 +148,36 @@ func (c *Coordinator) commitStagedCycleLocked(cy *stagedCycle) error {
 			for owner := range cy.owners {
 				c.recordConfirmed(owner, p)
 			}
+			c.releaseCommittedCycles(cy.ref.Target, p)
 		}
 	}
 	return nil
+}
+
+// releaseCommittedCycles takes out of every owner's in-flight index the
+// table's batches a cycle committed at p covers. A table's cycles commit in
+// order, so everything of it before p is durable for all its owners, whether
+// or not they had rows in this cycle. An owner's ack of its own staged share
+// carries that share's position, which does not release a partial batch
+// (#823): the owner that had rows in a transaction's earlier batches and none
+// in its last would hold them in flight until its next rows.
+func (c *Coordinator) releaseCommittedCycles(table string, p position.Position) {
+	owners, _ := c.loadRouting().ownersOf(table)
+	for _, w := range owners {
+		idx := c.indexOf(w.name)
+		if idx == nil {
+			continue
+		}
+		freed, freedOversized, popped := idx.truncate(table, p)
+		if freed > 0 {
+			c.budget.release(w.name, freed)
+		}
+		if freedOversized {
+			c.budget.clearOversized(w.name)
+		}
+		w.dropSent(popped)
+	}
+	c.notifyAck()
 }
 
 // stagedLock returns the mutex serializing staged commits for one table.

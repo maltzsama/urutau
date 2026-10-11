@@ -2751,7 +2751,12 @@ type BatchMeta struct {
 	// commit mode on a re-slice (1 owner → N) is consistent from the first
 	// batch after the flip: the surviving owner stages too, and its cycle is
 	// not left open blocking the new owners' cycles.
-	Staged        bool `protobuf:"varint,7,opt,name=staged,proto3" json:"staged,omitempty"`
+	Staged bool `protobuf:"varint,7,opt,name=staged,proto3" json:"staged,omitempty"`
+	// partial marks a batch that does not end its table's rows of the
+	// transaction its last row belongs to. It carries the previous
+	// transaction's position, so it is covered only by a position strictly
+	// beyond its own (issue #823).
+	Partial       bool `protobuf:"varint,8,opt,name=partial,proto3" json:"partial,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2831,6 +2836,13 @@ func (x *BatchMeta) GetWindow() *WindowTag {
 func (x *BatchMeta) GetStaged() bool {
 	if x != nil {
 		return x.Staged
+	}
+	return false
+}
+
+func (x *BatchMeta) GetPartial() bool {
+	if x != nil {
+		return x.Partial
 	}
 	return false
 }
@@ -3158,7 +3170,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05table\x18\x02 \x01(\tR\x05table\"Q\n" +
 	"\bShutdown\x12/\n" +
 	"\x05grace\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\x05grace\x12\x14\n" +
-	"\x05drain\x18\x02 \x01(\bR\x05drain\"\xcc\x01\n" +
+	"\x05drain\x18\x02 \x01(\bR\x05drain\"\xe6\x01\n" +
 	"\tBatchMeta\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x17\n" +
 	"\alow_pos\x18\x02 \x01(\tR\x06lowPos\x12\x19\n" +
@@ -3166,7 +3178,8 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\bbatch_id\x18\x04 \x01(\x04R\abatchId\x12\x14\n" +
 	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\x12,\n" +
 	"\x06window\x18\x06 \x01(\v2\x14.urutau.v1.WindowTagR\x06window\x12\x16\n" +
-	"\x06staged\x18\a \x01(\bR\x06staged\"\xc9\x01\n" +
+	"\x06staged\x18\a \x01(\bR\x06staged\x12\x18\n" +
+	"\apartial\x18\b \x01(\bR\apartial\"\xc9\x01\n" +
 	"\tWindowTag\x12\x1b\n" +
 	"\tin_window\x18\x01 \x01(\bR\binWindow\x12\x16\n" +
 	"\x06closes\x18\x02 \x01(\bR\x06closes\x12\x1b\n" +

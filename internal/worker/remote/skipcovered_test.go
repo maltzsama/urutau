@@ -40,3 +40,62 @@ func TestCoveredBatchIsAcked(t *testing.T) {
 		t.Fatalf("an uncovered batch must not be acked, acked=%v", acked)
 	}
 }
+
+// A partial batch carries the position of the transaction before its own. A
+// commit that landed between two batches of that transaction recorded this
+// same position whether or not this batch was in it, so at the committed
+// position it must be applied again: skipped, the rows of the batches that
+// were not in the commit were lost for good (#823).
+func TestPartialBatchAtTheCommittedPositionIsNotSkipped(t *testing.T) {
+	pos := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	recv := &batchReceiver{
+		committed: map[string]position.Position{"t": pos},
+		parsePos:  parsePosition("mysql"),
+		log:       slog.New(slog.DiscardHandler),
+	}
+	var acked []string
+	recv.ack = func(table, p string) { acked = append(acked, table+"|"+p) }
+
+	if recv.skipCovered(&pb.BatchMeta{Table: "t", HighPos: pos.String(), Partial: true}) {
+		t.Fatal("a partial batch at the committed position was skipped: its rows may never have been committed")
+	}
+	if len(acked) != 0 {
+		t.Fatalf("a batch that is applied must not be acked on receipt, acked=%v", acked)
+	}
+
+	// Strictly before the committed position its transaction is durable:
+	// skipped, and acked with the committed position, the only one that
+	// takes a partial batch out of the coordinator's in-flight index.
+	before := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-3")
+	if !recv.skipCovered(&pb.BatchMeta{Table: "t", HighPos: before.String(), Partial: true}) {
+		t.Fatal("a partial batch strictly before the committed position must be skipped")
+	}
+	if len(acked) != 1 || acked[0] != "t|"+pos.String() {
+		t.Fatalf("acked = %v, want the committed position %s", acked, pos)
+	}
+}
+
+// A fan-out snapshot's chunk rows travel with the chunk's low watermark as
+// their position. When the snapshot resumes after a restart, the table's
+// stream has usually been committed past that watermark, and the rows passed
+// for covered: the worker skipped them, the window's Closes marker found no
+// window, and the chunk counted as done with none of its rows (#824).
+func TestSnapshotWindowRowsAreNeverSkippedAsCovered(t *testing.T) {
+	committed := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9")
+	recv := &batchReceiver{
+		committed: map[string]position.Position{"t": committed},
+		parsePos:  parsePosition("mysql"),
+		log:       slog.New(slog.DiscardHandler),
+	}
+	var acked []string
+	recv.ack = func(table, p string) { acked = append(acked, table+"|"+p) }
+
+	low := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	rows := &pb.BatchMeta{Table: "t", HighPos: low.String(), Window: &pb.WindowTag{Snapshot: true, WindowId: 9}}
+	if recv.skipCovered(rows) {
+		t.Fatal("snapshot window rows behind the committed position were skipped: the window closes empty and the chunk is lost")
+	}
+	if len(acked) != 0 {
+		t.Fatalf("snapshot window rows must not be acked as covered, acked=%v", acked)
+	}
+}
