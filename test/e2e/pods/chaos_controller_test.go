@@ -687,7 +687,12 @@ func renderChaos(ns, pipeline string, d chaosDecision, name string, pods []podIn
 		case "urutau-worker":
 			// The coordinator's maintenance Pods live for seconds: a fault
 			// aimed at one would rarely land, so they are never targets.
-			if strings.HasSuffix(p.group, "-maint") {
+			// One is a bare Pod named after its worker, where a table's
+			// worker is a StatefulSet replica, <group>-<ordinal>. The name
+			// alone does not tell: it ended in "-maint" once and ends in a
+			// hash now, and a fault aimed at one failed the run as "not
+			// injected" (#825).
+			if p.group == p.name || strings.HasSuffix(p.group, "-maint") {
 				continue
 			}
 			workers = append(workers, p)

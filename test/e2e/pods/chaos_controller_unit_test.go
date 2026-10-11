@@ -165,8 +165,11 @@ func TestADrawWithoutATargetIsSkipped(t *testing.T) {
 // Maintenance Pods live for seconds, so no fault aims at them, and a
 // network fault names exactly the running Pods of its worker side.
 func TestRenderChaosSkipsMaintenanceAndListsRunningPods(t *testing.T) {
+	// A maintenance Pod is a bare Pod named after its worker: the coordinator
+	// names it <pipeline>-<table>-<hash>, with no "-maint" in it (#825).
 	pods := append([]podInfo{
 		{name: "p-raw-a-maint", app: "urutau-worker", group: "p-raw-a-maint", phase: "Running"},
+		{name: "p-raw-a-3c0795c0", app: "urutau-worker", group: "p-raw-a-3c0795c0", phase: "Running"},
 	}, testPods...)
 	for i := range 40 {
 		for _, k := range []chaosKind{chaosWorkerKill, chaosNetworkPartition} {
@@ -179,7 +182,7 @@ func TestRenderChaosSkipsMaintenanceAndListsRunningPods(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", k, err)
 			}
-			if strings.Contains(m, "maint") || strings.Contains(target, "maint") {
+			if strings.Contains(m, "maint") || strings.Contains(target, "maint") || strings.Contains(m, "3c0795c0") || strings.Contains(target, "3c0795c0") {
 				t.Fatalf("%s aimed at a maintenance Pod:\n%s", k, m)
 			}
 			if k == chaosNetworkPartition && (!strings.Contains(m, "- p-raw-a-0") || strings.Contains(m, "p-raw-b-0")) {
