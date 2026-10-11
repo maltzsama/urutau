@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/logging"
+
 	// Embed the IANA timezone database so `timezone=<IANA>` resolves even in a
 	// scratch container without OS tzdata.
 	_ "time/tzdata"
@@ -77,7 +79,7 @@ func ParseURI(uri string) (*URI, error) {
 	}
 	c.Host = u.Hostname()
 	if c.Host == "" {
-		return nil, fmt.Errorf("mysql: source uri %q lacks host", uri)
+		return nil, fmt.Errorf("mysql: source uri %q lacks host", logging.RedactURI(uri))
 	}
 	if p := u.Port(); p != "" {
 		c.Port = p
@@ -86,7 +88,7 @@ func ParseURI(uri string) (*URI, error) {
 	}
 	c.DB = strings.TrimPrefix(u.Path, "/")
 	if c.DB == "" {
-		return nil, fmt.Errorf("mysql: source uri %q lacks /db", uri)
+		return nil, fmt.Errorf("mysql: source uri %q lacks /db", logging.RedactURI(uri))
 	}
 
 	q := u.Query()
