@@ -11,7 +11,6 @@
 core/cast.go 1020 # baseline (#398)
 core/cast.go:CheckCast 122 # baseline (#398)
 internal/coordinator/assignment.go:Coordinator.assignmentFor 133 # baseline (#398)
-internal/coordinator/enqueue.go:Coordinator.enqueueBatch 143 # baseline (#398)
 internal/coordinator/control.go:controlServer.Session 128 # baseline (#398)
 internal/dataplane/collapse.go:Collapse 163 # baseline (#398)
 internal/dataplane/key.go:EncodeKey 139 # baseline (#398)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/maltzsama/urutau/spec"
@@ -70,7 +71,16 @@ func (c *Coordinator) reconcileReplicas(ctx context.Context) {
 		name := spec.WorkerGroupPrefix(c.cfg.Spec.Pipeline, t.Target)
 		sts, err := cs.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			continue // not provisioned for this table
+			// Not found is the quiet case: nothing provisioned for this
+			// table. Anything else (forbidden, timeout, the API server
+			// down) is the reconcile going blind: the StatefulSet may be
+			// scaled while routing never follows. One table's error does
+			// not stop the others.
+			if !apierrors.IsNotFound(err) {
+				c.log.Warn("coordinator: scale reconcile: cannot read the worker statefulset",
+					"table", t.Target, "statefulset", name, "err", err)
+			}
+			continue
 		}
 		if sts.Spec.Replicas == nil {
 			continue

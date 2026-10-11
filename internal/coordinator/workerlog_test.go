@@ -73,8 +73,9 @@ func TestOnWorkerLogWritesMaintenanceLinesToTheCoordinatorLog(t *testing.T) {
 		cfg:     Config{LogBuffer: buf},
 		workers: map[string]*workerState{},
 		log:     slog.New(slog.NewTextHandler(&out, nil)),
-		maint:   &maintenanceScheduler{},
 	}
+	c.maint = newMaintenanceScheduler(c, nil)
+	c.maint.register("p-raw-orders-maint", "raw.orders")
 	c.onWorkerLog("p-raw-orders-maint", &pb.WorkerLog{
 		Ts:        time.Now().Format(time.RFC3339Nano),
 		Level:     "WARN",
@@ -86,5 +87,29 @@ func TestOnWorkerLogWritesMaintenanceLinesToTheCoordinatorLog(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Fatalf("coordinator log %q does not carry %q", line, want)
 		}
+	}
+}
+
+// A data worker retired by a scale-in is unknown to the registry, like a
+// maintenance worker. Its straggling log lines are not a maintenance pass's:
+// they are dropped.
+func TestOnWorkerLogDropsARetiredDataWorker(t *testing.T) {
+	_, buf, err := logging.NewBuffered("debug", "text", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c := &Coordinator{
+		cfg:     Config{LogBuffer: buf},
+		workers: map[string]*workerState{},
+		log:     slog.New(slog.NewTextHandler(&out, nil)),
+	}
+	c.maint = newMaintenanceScheduler(c, nil)
+	c.maint.register("p-raw-orders-maint", "raw.orders")
+	c.onWorkerLog("p-raw-orders-3", &pb.WorkerLog{
+		Ts: time.Now().Format(time.RFC3339Nano), Level: "WARN", Msg: "late line from a retired worker",
+	})
+	if out.Len() != 0 {
+		t.Fatalf("a retired data worker's log reached the coordinator log: %q", out.String())
 	}
 }

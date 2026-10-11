@@ -20,8 +20,12 @@ func (c *Coordinator) onWorkerLog(worker string, msg *pb.WorkerLog) {
 	}
 	c.mu.Lock()
 	w := c.workers[worker]
+	// A data worker's log must come from its current generation. A worker
+	// the registry does not hold is accepted only if it is a maintenance
+	// worker: a retired data worker (scaled in) is unknown too, and its
+	// stragglers must not be taken for a maintenance pass's log.
 	validEpoch := (w != nil && msg.Epoch == w.epoch) ||
-		(w == nil && c.maint != nil)
+		(w == nil && c.maint != nil && c.maint.isWorker(worker))
 	c.mu.Unlock()
 	if !validEpoch {
 		return

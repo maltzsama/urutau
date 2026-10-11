@@ -70,6 +70,7 @@ type Metrics struct {
 	IcebergOrphanCleanupRuns       *prometheus.CounterVec
 	IcebergOrphanCleanupFiles      *prometheus.CounterVec
 	IcebergOrphanCleanupBytes      *prometheus.CounterVec
+	IcebergMaintenanceFailures     *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -176,6 +177,9 @@ func New() *Metrics {
 	m.IcebergOrphanCleanupBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "urutau_iceberg_orphan_cleanup_bytes_freed_total", Help: "storage bytes freed by orphan cleanup, per table."},
 		[]string{"table"})
+	m.IcebergMaintenanceFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "urutau_iceberg_maintenance_failures_total", Help: "maintenance operations that failed, per table and operation (compaction, snapshot_expiry, orphan_cleanup)."},
+		[]string{"table", "op"})
 
 	reg.MustRegister(m.LagSeconds, m.PendingBatches, m.InflightBytes, m.WorkerResets, m.CommitsTotal, m.EventsDecoded)
 	reg.MustRegister(m.SourceTruncates, m.SourceDestructiveDDL, m.EventlogQueue, m.ConfirmedPositionAge, m.StagedCycles, m.KafkaRecordsSkipped)
@@ -185,6 +189,7 @@ func New() *Metrics {
 		m.IcebergCompactionBytesBefore, m.IcebergCompactionBytesAfter)
 	reg.MustRegister(m.IcebergSnapshotExpiryRuns, m.IcebergSnapshotExpirySnapshots)
 	reg.MustRegister(m.IcebergOrphanCleanupRuns, m.IcebergOrphanCleanupFiles, m.IcebergOrphanCleanupBytes)
+	reg.MustRegister(m.IcebergMaintenanceFailures)
 	return m
 }
 

@@ -3,15 +3,21 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/maintenance"
+	"github.com/maltzsama/urutau/internal/observability"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
@@ -77,7 +83,9 @@ func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[st
 		c.log.Warn("coordinator: maintenance enabled but no worker pod template — no maintenance worker will run (Kubernetes provisioning is off)")
 		return nil
 	}
-	clientset, ns, owner, err := inClusterClient(context.Background())
+	ctx, cancel := maintenanceK8sContext()
+	defer cancel()
+	clientset, ns, owner, err := inClusterClient(ctx)
 	if err != nil {
 		return fmt.Errorf("k8s maintenance provisioning: %w", err)
 	}
@@ -101,6 +109,38 @@ func (m *maintenanceScheduler) register(name, table string) {
 	m.mu.Lock()
 	m.tables[name] = table
 	m.mu.Unlock()
+}
+
+// maintenanceK8sTimeout bounds every Kubernetes call the maintenance scheduler
+// makes. The client sets no request timeout of its own, so a hung API server
+// would otherwise hold a call forever: in tick, which is serial, that stops
+// maintenance for every table; in a session's teardown it keeps the table
+// marked connected, so tick skips it for good. With the bound a hung server
+// costs one tick or one teardown.
+const maintenanceK8sTimeout = 30 * time.Second
+
+// maintenanceK8sContext is the context of one maintenance Kubernetes call.
+func maintenanceK8sContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), maintenanceK8sTimeout)
+}
+
+// unexpectedSessionEnd reports whether a maintenance session's Recv error is
+// something other than its two ordinary ends: the worker closing the stream
+// after its pass (io.EOF), and a cancelled context (shutdown, or the worker's
+// Pod being deleted).
+func unexpectedSessionEnd(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	return status.Code(err) != codes.Canceled
+}
+
+// isWorker reports whether name is a registered maintenance worker.
+func (m *maintenanceScheduler) isWorker(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.tables[name]
+	return ok
 }
 
 // session serves one connected maintenance worker for exactly one pass: it
@@ -138,9 +178,11 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 		// window see the Pod, count it as its own, and then watch this delete
 		// take it away.
 		if m.k8s != nil {
-			if err := deletePod(context.Background(), m.k8s, m.namespace, name); err != nil {
+			ctx, cancel := maintenanceK8sContext()
+			if err := deletePod(ctx, m.k8s, m.namespace, name); err != nil {
 				m.c.log.Warn("coordinator: maintenance: delete worker pod", "worker", name, "err", err)
 			}
+			cancel()
 		}
 		m.mu.Lock()
 		delete(m.connected, name)
@@ -179,7 +221,14 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	for {
 		in, err := stream.Recv()
 		if err != nil {
-			return nil // the worker finished (or died); either way it is gone
+			// The worker finished (or died); either way it is gone. A clean
+			// end is the normal one; anything else is said out loud, or a
+			// dropped stream would look exactly like a pass that ended.
+			if unexpectedSessionEnd(err) {
+				m.c.log.Warn("coordinator: maintenance: session ended unexpectedly",
+					"worker", hello.WorkerName, "table", table, "err", err)
+			}
+			return nil
 		}
 		if res := in.GetMaintenanceResult(); res != nil {
 			m.logPass(name, table, reportedOps(res), time.Since(sent), res)
@@ -298,7 +347,8 @@ func (m *maintenanceScheduler) tick(now time.Time) {
 //     on the next tick, so a failed image pull or an unschedulable Pod does
 //     not stall the table forever.
 func (m *maintenanceScheduler) provisionWorkerPod(name, table string) error {
-	ctx := context.Background()
+	ctx, cancel := maintenanceK8sContext()
+	defer cancel()
 	existing, err := getPod(ctx, m.k8s, m.namespace, name)
 	if err != nil {
 		return err
@@ -381,49 +431,77 @@ func (m *maintenanceScheduler) logPass(worker, table string, due []sink.Maintena
 // optional (a nil registry records no metrics; the aggregate is always kept).
 func (m *maintenanceScheduler) recordResult(table string, res *pb.MaintenanceResult) {
 	now := time.Now()
+	metrics := m.c.metrics
 	for _, op := range res.Ops {
 		switch r := op.Op.(type) {
 		case *pb.MaintenanceOpResult_Compaction:
-			if m.c.metrics != nil {
-				m.c.metrics.IcebergCompactionRuns.WithLabelValues(table).Inc()
-				if r.Compaction.Error == "" {
-					m.c.metrics.IcebergCompactionFilesRemoved.WithLabelValues(table).Add(float64(r.Compaction.FilesRemoved))
-					m.c.metrics.IcebergCompactionFilesAdded.WithLabelValues(table).Add(float64(r.Compaction.FilesAdded))
-					m.c.metrics.IcebergCompactionBytesBefore.WithLabelValues(table).Add(float64(r.Compaction.BytesBefore))
-					m.c.metrics.IcebergCompactionBytesAfter.WithLabelValues(table).Add(float64(r.Compaction.BytesAfter))
-				}
+			failed := m.countRun(table, "compaction", r.Compaction.Error, metricsRuns(metrics, "compaction"))
+			if metrics != nil && !failed {
+				metrics.IcebergCompactionFilesRemoved.WithLabelValues(table).Add(float64(r.Compaction.FilesRemoved))
+				metrics.IcebergCompactionFilesAdded.WithLabelValues(table).Add(float64(r.Compaction.FilesAdded))
+				metrics.IcebergCompactionBytesBefore.WithLabelValues(table).Add(float64(r.Compaction.BytesBefore))
+				metrics.IcebergCompactionBytesAfter.WithLabelValues(table).Add(float64(r.Compaction.BytesAfter))
 			}
-			m.c.recordMaintStats(table, "compaction", now, func(s *maintStats) {
+			m.c.recordMaintStats(table, "compaction", now, failed, func(s *maintStats) {
 				s.filesRemoved += r.Compaction.FilesRemoved
 				s.filesAdded += r.Compaction.FilesAdded
 				s.bytesBefore += r.Compaction.BytesBefore
 				s.bytesAfter += r.Compaction.BytesAfter
 			})
 		case *pb.MaintenanceOpResult_Expiry:
-			if m.c.metrics != nil {
-				m.c.metrics.IcebergSnapshotExpiryRuns.WithLabelValues(table).Inc()
-				if r.Expiry.Error == "" {
-					m.c.metrics.IcebergSnapshotExpirySnapshots.WithLabelValues(table).Add(float64(r.Expiry.SnapshotsRemoved))
-				}
+			failed := m.countRun(table, "snapshot_expiry", r.Expiry.Error, metricsRuns(metrics, "snapshot_expiry"))
+			if metrics != nil && !failed {
+				metrics.IcebergSnapshotExpirySnapshots.WithLabelValues(table).Add(float64(r.Expiry.SnapshotsRemoved))
 			}
-			m.c.recordMaintStats(table, "snapshot_expiry", now, func(s *maintStats) {
+			m.c.recordMaintStats(table, "snapshot_expiry", now, failed, func(s *maintStats) {
 				s.snapshots += r.Expiry.SnapshotsRemoved
 			})
 		case *pb.MaintenanceOpResult_Orphan:
-			if m.c.metrics != nil {
-				m.c.metrics.IcebergOrphanCleanupRuns.WithLabelValues(table).Inc()
-				if r.Orphan.Error == "" {
-					m.c.metrics.IcebergOrphanCleanupFiles.WithLabelValues(table).Add(float64(r.Orphan.FilesDeleted))
-					m.c.metrics.IcebergOrphanCleanupBytes.WithLabelValues(table).Add(float64(r.Orphan.BytesFreed))
-				}
+			failed := m.countRun(table, "orphan_cleanup", r.Orphan.Error, metricsRuns(metrics, "orphan_cleanup"))
+			if metrics != nil && !failed {
+				metrics.IcebergOrphanCleanupFiles.WithLabelValues(table).Add(float64(r.Orphan.FilesDeleted))
+				metrics.IcebergOrphanCleanupBytes.WithLabelValues(table).Add(float64(r.Orphan.BytesFreed))
 			}
-			m.c.recordMaintStats(table, "orphan_cleanup", now, func(s *maintStats) {
+			m.c.recordMaintStats(table, "orphan_cleanup", now, failed, func(s *maintStats) {
 				s.filesDeleted += r.Orphan.FilesDeleted
 				s.bytesFreed += r.Orphan.BytesFreed
 			})
 		}
 	}
 	m.c.pushDashState()
+}
+
+// countRun counts one operation's run in the registry and, when it failed, its
+// failure. It reports whether the operation failed: the caller then records
+// nothing else for it, in the registry or in the dashboard. A failed operation
+// may report the work it did before failing; counting that in one place and
+// not the other is how /metrics and the dashboard came to disagree.
+func (m *maintenanceScheduler) countRun(table, op, errText string, runs *prometheus.CounterVec) bool {
+	failed := errText != ""
+	if m.c.metrics == nil {
+		return failed
+	}
+	runs.WithLabelValues(table).Inc()
+	if failed {
+		m.c.metrics.IcebergMaintenanceFailures.WithLabelValues(table, op).Inc()
+	}
+	return failed
+}
+
+// metricsRuns is the run counter of one maintenance operation, nil without a
+// registry.
+func metricsRuns(m *observability.Metrics, op string) *prometheus.CounterVec {
+	if m == nil {
+		return nil
+	}
+	switch op {
+	case "compaction":
+		return m.IcebergCompactionRuns
+	case "snapshot_expiry":
+		return m.IcebergSnapshotExpiryRuns
+	default:
+		return m.IcebergOrphanCleanupRuns
+	}
 }
 
 // maintenanceWorkerName is maintenance.WorkerName — the operator names these

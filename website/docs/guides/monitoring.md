@@ -63,6 +63,7 @@ maintenance worker is ephemeral and reports its pass back before exiting)
 | `urutau_iceberg_orphan_cleanup_runs_total` | counter (table) | Orphan cleanup attempts |
 | `urutau_iceberg_orphan_cleanup_files_deleted_total` | counter (table) | Unreferenced files deleted |
 | `urutau_iceberg_orphan_cleanup_bytes_freed_total` | counter (table) | Storage bytes freed |
+| `urutau_iceberg_maintenance_failures_total` | counter (table, op) | Maintenance operations that failed; `op` is `compaction`, `snapshot_expiry` or `orphan_cleanup`. A failed operation counts as a run and a failure, and none of its file or byte counters |
 
 **Enrichment**
 

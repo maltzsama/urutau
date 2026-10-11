@@ -207,31 +207,38 @@ func (s *controlServer) Control(stream pb.UrutauControl_ControlServer) (retErr e
 	if !known {
 		return fmt.Errorf("coordinator: unknown worker %q", hello.WorkerName)
 	}
-	defer func() {
-		c.mu.Lock()
-		// Only act on the stream this handler installed: a worker that
-		// reconnected before the server noticed this stream died has already
-		// replaced w.control with a new stream, and niling it would make
-		// gracefulShutdown skip the worker (issue #552).
-		if w.control == stream {
-			w.control = nil
-			// The Control stream is gone while this handler still owned it:
-			// end the Session too, so the worker reconnects and re-establishes
-			// both streams. A Session left alive with no Control never gets a
-			// shutdown drain and never reattaches (issue #552).
-			if w.cancel != nil {
-				w.cancel()
-			}
-		}
-		c.mu.Unlock()
-		// A worker mid-reset suicides and closes this stream too; only a
-		// non-reset death is a real session failure (signalSessionEnd owns
-		// the reset/snapshot rule).
-		c.signalSessionEnd(hello.WorkerName, retErr)
-	}()
+	defer func() { c.controlEnded(w, stream, retErr) }()
 	// The worker never writes again; its death is the stream ending.
 	<-stream.Context().Done()
 	return stream.Context().Err()
+}
+
+// controlEnded runs when a Control stream's handler returns. It acts only if
+// that stream is still the worker's: a worker that reconnected before the
+// server noticed the old stream die has installed a new one, and the old
+// handler must leave the new generation alone. Niling its stream would make
+// gracefulShutdown skip the worker (issue #552); reporting a session end
+// would bump its epoch and mark it lost, so the Assignment it was just sent
+// carries a stale epoch, its Hello is rejected and it is reset once more.
+//
+// While the handler does own the stream, the Control stream is gone: end the
+// Session too, so the worker reconnects and re-establishes both — a Session
+// left alive with no Control never gets a shutdown drain and never reattaches
+// (issue #552) — and report the end. A worker mid-reset closes this stream
+// too; signalSessionEnd owns the reset rule.
+func (c *Coordinator) controlEnded(w *workerState, stream pb.UrutauControl_ControlServer, retErr error) {
+	c.mu.Lock()
+	own := w.control == stream
+	if own {
+		w.control = nil
+		if w.cancel != nil {
+			w.cancel()
+		}
+	}
+	c.mu.Unlock()
+	if own {
+		c.signalSessionEnd(w.name, retErr)
+	}
 }
 
 // gracefulShutdown tells every connected worker to drain: flush + commit +

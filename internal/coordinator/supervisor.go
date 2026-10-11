@@ -111,6 +111,18 @@ func (s *supervisor) pendingSet(worker string) {
 	s.mu.Unlock()
 }
 
+// markPending sets worker pending and reports whether it already was. The
+// test and the set are one step: a loss arrives on two goroutines (the
+// worker's Session and its Control stream both end), and each must be able to
+// tell whether it is the first to see it.
+func (s *supervisor) markPending(worker string) (already bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	already = s.pending[worker]
+	s.pending[worker] = true
+	return already
+}
+
 // isPending reports whether a worker is reset-and-not-reattached.
 func (s *supervisor) isPending(worker string) bool {
 	s.mu.Lock()
@@ -222,7 +234,17 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// An ATTACHED worker that owes nothing is merely idle — a quiet
 		// table, or one that just went through a re-slice — and resetting it
 		// is pointless (issue #312).
+		// The clock starts at the last ack, or at the last tick that saw
+		// the worker owing nothing, whichever is later: a worker that waited
+		// for work acked nothing in the meantime, and that wait is not a
+		// stall. After a coordinator restart the workers reconnect up to a
+		// minute before the reader starts; counted from the Hello alone, the
+		// first batch queued found the timeout already spent, and every
+		// worker that had connected early was reset.
 		at, ok := s.lastAck[p.name]
+		if idle, seen := s.lastDelivered[p.name]; seen && idle.After(at) {
+			at, ok = idle, true
+		}
 		if p.attached && p.owes && (!ok || now.Sub(at) > ack) && !s.busyLocked(p.name, now, at, ack) {
 			stalled = append(stalled, p.name)
 		}
