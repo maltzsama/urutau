@@ -1,14 +1,22 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/maltzsama/urutau/spec"
 )
@@ -352,5 +360,41 @@ func TestOwnerFromPodUsesTheControllingOwner(t *testing.T) {
 	pod2 := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", UID: types.UID("p-uid"), OwnerReferences: []metav1.OwnerReference{cm}}}
 	if got := ownerFromPod(pod2); got.Kind != "Pod" {
 		t.Fatalf("non-controller owner = %+v, want the Pod fallback", got)
+	}
+}
+
+// A StatefulSet that cannot be read is not a StatefulSet that does not exist.
+// Not found is silent; any other error is logged, because a reconcile that
+// cannot see the replica count never re-slices and nothing else would say so.
+func TestReconcileReplicasReportsAnUnreadableStatefulSet(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		wantLog bool
+	}{
+		{"forbidden", apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "statefulsets"}, "x", errors.New("rbac")), true},
+		{"not found", apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "statefulsets"}, "x"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			c, _ := scaleHarness(t)
+			c.log = slog.New(slog.NewTextHandler(&out, nil))
+			c.workerK8s = true
+			c.k8sNS = "ns"
+			cs := fake.NewSimpleClientset()
+			cs.PrependReactor("get", "statefulsets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, tc.err
+			})
+			c.k8sClient = cs
+
+			c.reconcileReplicas(context.Background())
+
+			if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+				t.Fatalf("owners = %d, want the untouched 1", len(got))
+			}
+			if logged := strings.Contains(out.String(), "cannot read the worker statefulset"); logged != tc.wantLog {
+				t.Fatalf("logged = %v, want %v; log: %q", logged, tc.wantLog, out.String())
+			}
+		})
 	}
 }
