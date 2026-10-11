@@ -74,3 +74,28 @@ func TestPartialBatchAtTheCommittedPositionIsNotSkipped(t *testing.T) {
 		t.Fatalf("acked = %v, want the committed position %s", acked, pos)
 	}
 }
+
+// A fan-out snapshot's chunk rows travel with the chunk's low watermark as
+// their position. When the snapshot resumes after a restart, the table's
+// stream has usually been committed past that watermark, and the rows passed
+// for covered: the worker skipped them, the window's Closes marker found no
+// window, and the chunk counted as done with none of its rows (#824).
+func TestSnapshotWindowRowsAreNeverSkippedAsCovered(t *testing.T) {
+	committed := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9")
+	recv := &batchReceiver{
+		committed: map[string]position.Position{"t": committed},
+		parsePos:  parsePosition("mysql"),
+		log:       slog.New(slog.DiscardHandler),
+	}
+	var acked []string
+	recv.ack = func(table, p string) { acked = append(acked, table+"|"+p) }
+
+	low := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+	rows := &pb.BatchMeta{Table: "t", HighPos: low.String(), Window: &pb.WindowTag{Snapshot: true, WindowId: 9}}
+	if recv.skipCovered(rows) {
+		t.Fatal("snapshot window rows behind the committed position were skipped: the window closes empty and the chunk is lost")
+	}
+	if len(acked) != 0 {
+		t.Fatalf("snapshot window rows must not be acked as covered, acked=%v", acked)
+	}
+}
