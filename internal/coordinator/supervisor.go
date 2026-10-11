@@ -111,6 +111,18 @@ func (s *supervisor) pendingSet(worker string) {
 	s.mu.Unlock()
 }
 
+// markPending sets worker pending and reports whether it already was. The
+// test and the set are one step: a loss arrives on two goroutines (the
+// worker's Session and its Control stream both end), and each must be able to
+// tell whether it is the first to see it.
+func (s *supervisor) markPending(worker string) (already bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	already = s.pending[worker]
+	s.pending[worker] = true
+	return already
+}
+
 // isPending reports whether a worker is reset-and-not-reattached.
 func (s *supervisor) isPending(worker string) bool {
 	s.mu.Lock()

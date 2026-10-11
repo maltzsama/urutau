@@ -68,9 +68,12 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 		c.mu.Unlock()
 		return nil
 	}
-	pending := c.supervisor.isPending(worker)
-	if !pending {
-		// A supervisor reset bumped the epoch already.
+	// The loss is marked pending in the same step that decides whether to
+	// bump the epoch, still under c.mu: both of the worker's streams report
+	// the loss, each from its own goroutine, and a check here with the mark
+	// taken later let both see "not pending" and bump the epoch twice. An
+	// already-pending worker was reset by the supervisor, which bumped it.
+	if !c.supervisor.markPending(worker) {
 		w.epoch++
 	}
 	epoch := w.epoch
@@ -81,10 +84,11 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	// now, before it can reconnect and ack their redelivered Closes markers
 	// as empty windows, which would hide them from the snapshot's redo.
 	c.noteLostWindows(worker)
+	// The loss is recorded before its waiters wake: a snapshot loop woken by
+	// the close goes on to awaitReattached, which reads the pending mark.
 	if lost != nil {
 		close(lost)
 	}
-	c.supervisor.pendingSet(worker)
 	if !c.supervisor.noteLoss(worker, epoch) {
 		// The same loss seen again on the worker's other stream (Session
 		// and Control both end when it is lost).
