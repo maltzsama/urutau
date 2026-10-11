@@ -2,16 +2,20 @@ package iceberg
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/catalog/rest"
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/maltzsama/urutau/core"
@@ -370,4 +374,73 @@ func TestMaintenanceKeepsLiveDeletionVectors(t *testing.T) {
 	}
 	commitRows(t, w, [3]any{int64(3), "c", rowchange.OpUpdate})
 	expectValues(t, s, ref, map[int64]string{1: "b", 3: "c", 4: "x"})
+}
+
+// interleavingCatalog runs a step right before the first commit it sees, as a
+// concurrent writer that wins the race would. The commit that lost then fails
+// its requirements; the hadoop catalog of the tests reports that as a plain
+// error, so it is translated to what the REST catalog the pipelines use
+// returns for it (HTTP 409, rest.ErrCommitFailed).
+type interleavingCatalog struct {
+	catalog.Catalog
+	before func()
+	done   bool
+}
+
+func (c *interleavingCatalog) LoadTable(ctx context.Context, ident table.Identifier) (*table.Table, error) {
+	tbl, err := c.Catalog.LoadTable(ctx, ident)
+	if err != nil {
+		return nil, err
+	}
+	return table.New(tbl.Identifier(), tbl.Metadata(), tbl.MetadataLocation(), tbl.FS, c), nil
+}
+
+func (c *interleavingCatalog) CommitTable(ctx context.Context, ident table.Identifier, reqs []table.Requirement, updates []table.Update) (table.Metadata, string, error) {
+	if !c.done {
+		c.done = true
+		c.before()
+	}
+	meta, loc, err := c.Catalog.CommitTable(ctx, ident, reqs, updates)
+	if err != nil && strings.Contains(err.Error(), "requirement failed") {
+		return nil, "", fmt.Errorf("%w: %v", rest.ErrCommitFailed, err)
+	}
+	return meta, loc, err
+}
+
+// A compaction that lands between the moment a positional commit resolved its
+// positions and the moment it commits has rewritten the files those positions
+// point into. The commit must not publish them: it loses the race, resolves
+// again against the rewritten files, and the table ends exact.
+func TestPositionalCommitLosesTheRaceToACompaction(t *testing.T) {
+	ctx := context.Background()
+	s := hadoopSink(t)
+	ref, w := positionalWriter(t, s)
+	commitInserts(t, w, 1, 3)
+	commitInserts(t, w, 4, 3)
+	commitRows(t, w, [3]any{int64(2), "y", rowchange.OpUpdate}) // a vector on the first file
+
+	inner := s.cat
+	compact := func() {
+		cfg := fullMaintenance()
+		cfg.Compaction = &spec.CompactionConfig{MinInputFiles: 2}
+		m := NewMaintainer(inner, s.ident(ref.Target), cfg, nil, func() string { return "p" }, &recordingMetrics{})
+		if err := m.RunOnce(ctx, []sink.MaintenanceOp{sink.MaintenanceCompaction}); err != nil {
+			t.Errorf("concurrent compaction: %v", err)
+		}
+	}
+	racing := &interleavingCatalog{Catalog: inner, before: compact}
+	w.cat = racing
+
+	// Touches a row with an existing vector (a superseding commit) and one
+	// without (a plain new vector), and deletes a third.
+	commitRows(t, w,
+		[3]any{int64(1), "z", rowchange.OpUpdate},
+		[3]any{int64(5), "z", rowchange.OpUpdate},
+		[3]any{int64(6), nil, rowchange.OpDelete})
+	if !racing.done {
+		t.Fatal("the compaction never interleaved")
+	}
+
+	s.cat = inner
+	expectValues(t, s, ref, map[int64]string{1: "z", 2: "y", 3: "x", 4: "x", 5: "z"})
 }
