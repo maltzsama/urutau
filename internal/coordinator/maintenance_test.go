@@ -21,6 +21,8 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/coordk8s"
 )
 
 // fakeSessionStream is a scripted UrutauControl_SessionServer: Recv returns
@@ -139,7 +141,7 @@ func TestMaintenanceWorkerPodIsEphemeral(t *testing.T) {
 		},
 	}
 	owner := metav1.OwnerReference{Name: "coord-pod", Kind: "Pod"}
-	pod := maintenanceWorkerPod("shop-raw-orders-maint", "raw", owner, tmpl)
+	pod := coordk8s.MaintenanceWorkerPod("shop-raw-orders-maint", "raw", owner, tmpl)
 
 	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		t.Errorf("RestartPolicy = %v, want Never — a one-shot worker must not be restarted", pod.Spec.RestartPolicy)

@@ -10,6 +10,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/maltzsama/urutau/internal/coordk8s"
 )
 
 // The kubelet lists container statuses by name, so a sidecar can come before
@@ -19,7 +21,7 @@ func TestDescribeTerminationReadsTheWorkerContainerNotASidecar(t *testing.T) {
 		Phase: corev1.PodRunning,
 		ContainerStatuses: []corev1.ContainerStatus{
 			{Name: "istio-proxy", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}},
-			{Name: workerContainerName, LastTerminationState: corev1.ContainerState{
+			{Name: coordk8s.WorkerContainerName, LastTerminationState: corev1.ContainerState{
 				Terminated: &corev1.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}},
 		},
 	}}
@@ -39,7 +41,7 @@ func TestDescribeTerminationFallsBackToThePhase(t *testing.T) {
 		Phase: corev1.PodRunning,
 		ContainerStatuses: []corev1.ContainerStatus{
 			{Name: "istio-proxy", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}},
-			{Name: workerContainerName},
+			{Name: coordk8s.WorkerContainerName},
 		},
 	}}
 	if got, want := describeTermination("w0", pod), "; pod w0 is Running"; got != want {

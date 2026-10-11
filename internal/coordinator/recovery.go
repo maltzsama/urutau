@@ -12,6 +12,8 @@ import (
 
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/eventlog"
+
+	"github.com/maltzsama/urutau/internal/coordk8s"
 )
 
 // A worker lost to a hiccup — its Pod killed or OOM-killed, its stream cut —
@@ -161,13 +163,6 @@ type podTermination struct {
 	message  string
 }
 
-// workerContainerName is the worker container's name in the Pod template the
-// operator renders (internal/operator). The kubelet sorts containerStatuses
-// by container name, so an injected sidecar (istio-proxy, linkerd-proxy) can
-// precede the worker; crash detection must select the worker's status by name,
-// never by index (issue #553).
-const workerContainerName = "worker"
-
 // networkExitPrefix starts the termination message of a worker that exited
 // because it lost the coordinator (cmd/worker writes it): not a crash.
 const networkExitPrefix = "network: "
@@ -206,7 +201,7 @@ func (c *Coordinator) k8sTermination(worker string) (podTermination, bool) {
 	}
 	var st *corev1.ContainerStatus
 	for i := range pod.Status.ContainerStatuses {
-		if pod.Status.ContainerStatuses[i].Name == workerContainerName {
+		if pod.Status.ContainerStatuses[i].Name == coordk8s.WorkerContainerName {
 			st = &pod.Status.ContainerStatuses[i]
 			break
 		}
@@ -364,7 +359,7 @@ func (c *Coordinator) workerTermination(worker string) string {
 func describeTermination(worker string, pod *corev1.Pod) string {
 	var parts []string
 	for _, st := range pod.Status.ContainerStatuses {
-		if st.Name != workerContainerName {
+		if st.Name != coordk8s.WorkerContainerName {
 			continue
 		}
 		if t := st.LastTerminationState.Terminated; t != nil {

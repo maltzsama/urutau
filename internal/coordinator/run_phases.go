@@ -12,6 +12,8 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/coordk8s"
 )
 
 // phaseEventlog opens the run's audit trail and writes job_started. It returns
@@ -182,7 +184,7 @@ func (c *Coordinator) phaseResolveRouting(ctx context.Context) (map[string]strin
 	if c.cfg.OnReady != nil {
 		c.cfg.OnReady(c)
 	}
-	c.workerK8s = workerPodTemplateAvailable(workerTarget)
+	c.workerK8s = coordk8s.WorkerPodTemplateAvailable(workerTarget)
 	return workerTarget, nil
 }
 
