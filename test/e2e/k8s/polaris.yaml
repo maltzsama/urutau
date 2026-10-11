@@ -32,6 +32,9 @@ spec:
               value: "POLARIS,root,s3cr3t"
             - name: polaris.realm-context.realms
               value: POLARIS
+            # DROP TABLE ... PURGE is refused unless this is on.
+            - name: polaris.features."DROP_WITH_PURGE_ENABLED"
+              value: "true"
             - name: quarkus.otel.sdk.disabled
               value: "true"
             # The container sizes its heap from the limit; cap it so the
