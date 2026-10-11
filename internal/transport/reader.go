@@ -160,12 +160,19 @@ func (r *BatchReader) Key(i int) []any {
 	if len(r.keyCols) == 0 {
 		return nil
 	}
-	key := make([]any, len(r.keyCols))
-	for k, idx := range r.keyCols {
+	return r.KeyInto(make([]any, 0, len(r.keyCols)), i)
+}
+
+// KeyInto is Key into a slice the caller reuses: it appends row i's key tuple
+// to dst[:0] and returns it. For a caller that reads the key of every row and
+// keeps none of them, such as partition routing.
+func (r *BatchReader) KeyInto(dst []any, i int) []any {
+	dst = dst[:0]
+	for _, idx := range r.keyCols {
 		v, _ := r.value(r.rec.Column(idx), r.colTypes[idx], i)
-		key[k] = v
+		dst = append(dst, v)
 	}
-	return key
+	return dst
 }
 
 // DataColumns returns the data column names in record order.

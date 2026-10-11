@@ -40,7 +40,7 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 	w.sentMu.Unlock()
 	for _, qb := range redeliver {
 		if err := stream.Send(&flight.FlightData{
-			DataHeader:  []byte("urutau-batch"),
+			DataHeader:  batchHeader,
 			DataBody:    qb.body,
 			AppMetadata: qb.meta,
 		}); err != nil {
@@ -55,7 +55,7 @@ func (s *flightServer) DoGet(req *flight.Ticket, stream flight.FlightService_DoG
 			// redeliverable until its ack arrives.
 			w.recordSent(qb)
 			if err := stream.Send(&flight.FlightData{
-				DataHeader:  []byte("urutau-batch"),
+				DataHeader:  batchHeader,
 				DataBody:    qb.body,
 				AppMetadata: qb.meta,
 			}); err != nil {
@@ -81,6 +81,10 @@ func (w *workerState) recordSent(qb queuedBatch) {
 	w.sent = append(w.sent, qb)
 	w.sentMu.Unlock()
 }
+
+// batchHeader marks a Flight message as one of ours. One slice for every
+// send: the literal conversion allocated it per message.
+var batchHeader = []byte("urutau-batch")
 
 // dropSent removes the batches an ack covered from the worker's sent list.
 func (w *workerState) dropSent(ids []uint64) {

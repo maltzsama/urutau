@@ -25,8 +25,9 @@ func (c *Coordinator) workersOwing() map[string]bool {
 			owing[name] = true
 		}
 	}
-	for _, table := range c.bufferedTables() {
-		for _, w := range c.loadRouting().owners[table] {
+	routing := c.loadRouting()
+	for table := range c.bufferedTables() {
+		for _, w := range routing.owners[table] {
 			owing[w.name] = true
 		}
 	}
@@ -35,16 +36,16 @@ func (c *Coordinator) workersOwing() map[string]bool {
 
 // bufferedTables returns the tables with decoded-but-unsent data in the
 // snapshot gate, the re-slice pause buffer, or the staged accumulator.
-func (c *Coordinator) bufferedTables() []string {
-	seen := map[string]bool{}
+func (c *Coordinator) bufferedTables() map[string]struct{} {
+	seen := map[string]struct{}{}
 	if c.gate != nil {
 		c.gate.Lock()
 		for _, target := range c.gate.BufferedTablesLocked() {
-			seen[target] = true
+			seen[target] = struct{}{}
 		}
 		for table, acc := range c.accum {
 			if acc != nil && len(acc.batches) > 0 {
-				seen[table] = true
+				seen[table] = struct{}{}
 			}
 		}
 		c.gate.Unlock()
@@ -52,15 +53,11 @@ func (c *Coordinator) bufferedTables() []string {
 	c.pausedMu.Lock()
 	for table, buf := range c.pauseBuf {
 		if len(buf) > 0 {
-			seen[table] = true
+			seen[table] = struct{}{}
 		}
 	}
 	c.pausedMu.Unlock()
-	out := make([]string, 0, len(seen))
-	for table := range seen {
-		out = append(out, table)
-	}
-	return out
+	return seen
 }
 
 // dispatchedPosition is the greatest position handed to a worker, the frontier
@@ -74,15 +71,26 @@ func (c *Coordinator) bufferedTables() []string {
 // retention depend on iteration order; nil sends confirmedPosition to the
 // minimum over what was confirmed, which holds retention when it has to.
 func (c *Coordinator) dispatchedPosition() position.Position {
+	// Copy under the lock, parse outside it: sentMu is taken on every enqueue
+	// (noteSent), and this runs on every ack.
 	c.sentMu.Lock()
-	defer c.sentMu.Unlock()
-	var best position.Position
-	for _, s := range c.lastSent {
-		if s == "" {
-			continue
+	raw := make(map[string]string, len(c.lastSent))
+	for table, s := range c.lastSent {
+		if s != "" {
+			raw[table] = s
 		}
+	}
+	c.sentMu.Unlock()
+
+	var best position.Position
+	for table, s := range raw {
 		p, err := c.src.ParsePosition(s)
 		if err != nil {
+			// deliverBatch parsed this very string before it was recorded,
+			// so a failure here means the source's parser changed its mind.
+			// The frontier is advisory, so the table is skipped, not the run
+			// ended; but it is said.
+			c.log.Debug("coordinator: dispatched position does not parse", "table", table, "pos", s, "err", err)
 			continue
 		}
 		if best == nil {

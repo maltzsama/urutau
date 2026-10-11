@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"testing"
 
@@ -282,5 +283,59 @@ func TestStagedCycleIgnoresUnexpectedOwners(t *testing.T) {
 	}
 	if c, _ := s.deliver(core.TableRef{Target: "t", Owner: "b"}, 1, []byte{2}, "0/20", "", nil); len(c) != 1 || len(c[0].descriptors) != 2 {
 		t.Fatalf("b's delivery: committable=%v; want the cycle with a's and b's descriptors only", c)
+	}
+}
+
+// openFor answers from the table's send order instead of walking every
+// table's cycles. The two must agree after every step of any mix of cycles
+// expected, delivered out of order and committed.
+func TestOpenForMatchesTheCycleMaps(t *testing.T) {
+	s := newStagedCycles()
+	tables := []string{"raw.a", "raw.b", "raw.c"}
+	rng := rand.New(rand.NewPCG(1, 2))
+	type share struct {
+		seq   uint64
+		owner string
+	}
+	owed := map[string][]share{} // table → deliveries not made yet
+	var seq uint64
+	check := func(step string) {
+		t.Helper()
+		for _, tb := range tables {
+			ref := core.TableRef{Target: tb}
+			open, done := s.openForBreakdown(ref)
+			if got := s.openFor(ref); got != open+done {
+				t.Fatalf("%s: openFor(%s) = %d, the maps hold %d open + %d done", step, tb, got, open, done)
+			}
+		}
+	}
+	for range 3000 {
+		tb := tables[rng.IntN(len(tables))]
+		if len(owed[tb]) == 0 || rng.IntN(3) == 0 {
+			seq++
+			s.expect(core.TableRef{Target: tb}, seq, []string{"w0", "w1"})
+			owed[tb] = append(owed[tb], share{seq, "w0"}, share{seq, "w1"})
+			check("expect")
+			continue
+		}
+		// Any owed share, in any order: cycles complete out of send order.
+		i := rng.IntN(len(owed[tb]))
+		sh := owed[tb][i]
+		owed[tb] = append(owed[tb][:i], owed[tb][i+1:]...)
+		s.deliver(core.TableRef{Target: tb, Owner: sh.owner}, sh.seq, []byte{1}, "", "", nil)
+		check("deliver")
+	}
+	// Everything owed is delivered: nothing may be left open, in the maps or
+	// in the send order.
+	for tb, shares := range owed {
+		for _, sh := range shares {
+			s.deliver(core.TableRef{Target: tb, Owner: sh.owner}, sh.seq, []byte{1}, "", "", nil)
+		}
+	}
+	check("drain")
+	for _, tb := range tables {
+		if n := s.openFor(core.TableRef{Target: tb}); n != 0 {
+			t.Fatalf("%s: %d cycles left after every delivery", tb, n)
+		}
 	}
 }

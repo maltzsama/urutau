@@ -198,7 +198,13 @@ func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
 		q = q[1:]
 		out = append(out, cy)
 	}
-	s.order[table] = q
+	if len(q) == 0 {
+		// Nothing left in send order: drop the entry, so the slice's backing
+		// array (and a table that has gone quiet) does not stay forever.
+		delete(s.order, table)
+	} else {
+		s.order[table] = q
+	}
 	return out
 }
 
@@ -207,8 +213,16 @@ func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
 // order (done). A re-slice waits for this to reach zero, so no cycle spans
 // two partition layouts.
 func (s *stagedCycles) openFor(ref core.TableRef) int {
-	open, done := s.openForBreakdown(ref)
-	return open + done
+	if s == nil {
+		return 0
+	}
+	// The table's send order holds exactly its cycles not committed yet: a
+	// cycle enters it when expected and leaves it when drained. Its length is
+	// the count, without walking every table's cycles — this is asked on the
+	// coalescing path, once per batch.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.order[ref.Target])
 }
 
 // openForBreakdown splits openFor's count: cycles still accumulating a

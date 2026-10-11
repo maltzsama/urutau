@@ -107,3 +107,27 @@ func TestFinishedSnapshotForgetsItsCursors(t *testing.T) {
 		t.Fatalf("raw.b's cursor = %v, want [70]: another table's finish must not touch it", got)
 	}
 }
+
+// redoFrom takes the lost windows of its own table and leaves another
+// table's where they are, for that table's redo.
+func TestRedoFromLeavesAnotherTablesLostWindows(t *testing.T) {
+	c, w := coordHarness()
+	c.lostWindows = map[string][]chunkMarker{w.name: {
+		{target: "raw.a", window: 1},
+		{target: "raw.b", window: 2},
+	}}
+
+	if from, _ := c.redoFrom(w, "raw.a", map[uint64]int{1: 0}, 0, 3); from != 0 {
+		t.Fatalf("redoFrom(raw.a) = %d, want 0", from)
+	}
+	left := c.lostWindows[w.name]
+	if len(left) != 1 || left[0].target != "raw.b" {
+		t.Fatalf("lost windows left = %+v, want raw.b's marker kept for its own redo", left)
+	}
+	if from, _ := c.redoFrom(w, "raw.b", map[uint64]int{2: 1}, 0, 3); from != 1 {
+		t.Fatalf("redoFrom(raw.b) = %d, want 1: its lost window was dropped by raw.a's redo", from)
+	}
+	if _, still := c.lostWindows[w.name]; still {
+		t.Fatal("the worker's entry was kept after its last marker was taken")
+	}
+}

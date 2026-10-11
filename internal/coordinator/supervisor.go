@@ -123,6 +123,23 @@ func (s *supervisor) markPending(worker string) (already bool) {
 	return already
 }
 
+// recovering returns the workers noteDeliveringLocked acts on: those with a
+// crash on record and no loss pending. Nil when there is none.
+func (s *supervisor) recovering() map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out map[string]bool
+	for name, h := range s.health {
+		if h != nil && h.crashes > 0 && !h.lossPending {
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[name] = true
+		}
+	}
+	return out
+}
+
 // isPending reports whether a worker is reset-and-not-reattached.
 func (s *supervisor) isPending(worker string) bool {
 	s.mu.Lock()
@@ -187,23 +204,26 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	}
 	s.c.mu.Unlock()
 	// A worker owes work when it holds a delivered-but-unacked batch or has
-	// one queued. inFlight takes the index's own lock, so it is read outside
-	// c.mu.
-	for i := range probes {
-		probes[i].owes = probes[i].owes || s.c.inFlight(probes[i].name) > 0
-	}
-
+	// one queued. The index has its own lock, so it is read outside c.mu,
+	// once per worker. Its oldest held batch is needed only for a worker
+	// coming back from a crash (noteDeliveringLocked ignores the others), and
+	// finding it scans the worker's whole in-flight window: it is not looked
+	// up for a healthy worker, which is nearly every worker on every tick.
+	recovering := s.recovering()
 	type minHeld struct {
 		name string
 		id   uint64
 	}
 	held := make([]minHeld, 0, len(probes))
-	for _, p := range probes {
+	for i := range probes {
 		var id uint64
-		if idx := s.c.indexOf(p.name); idx != nil {
-			id = idx.minHeldID()
+		if idx := s.c.indexOf(probes[i].name); idx != nil {
+			probes[i].owes = probes[i].owes || idx.InFlight() > 0
+			if recovering[probes[i].name] {
+				id = idx.minHeldID()
+			}
 		}
-		held = append(held, minHeld{p.name, id})
+		held = append(held, minHeld{probes[i].name, id})
 	}
 
 	// Mid-snapshot only the delivery rule applies: a reset would drop the

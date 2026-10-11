@@ -538,3 +538,110 @@ func TestRecordResultFailedOpIsCountedTheSameOnTheDashboard(t *testing.T) {
 		t.Errorf("registry orphan cleanup failures = %v, want 1", got)
 	}
 }
+
+// podsLookedUp lists, in order, the Pods the scheduler asked the fake client
+// about. provisionWorkerPod starts with that lookup, so it marks every
+// provisioning attempt even where no Pod template is mounted to create from.
+func podsLookedUp(cs *fake.Clientset) []string {
+	var names []string
+	for _, a := range cs.Actions() {
+		if g, ok := a.(k8stesting.GetAction); ok && a.GetResource().Resource == "pods" {
+			names = append(names, g.GetName())
+		}
+	}
+	return names
+}
+
+// The scheduler provisions for a due table as soon as it starts, not one
+// check interval later.
+func TestMaintenanceRunProvisionsAtOnce(t *testing.T) {
+	m, cs := testScheduler(t)
+	m.register("p-raw-orders-maint", "raw.orders")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); m.run(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(podsLookedUp(cs)) == 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("no provisioning attempt within 5s of the scheduler starting; the first pass waited for the check interval")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+}
+
+// tick provisions its due tables in name order, whatever order the map
+// yields them in.
+func TestMaintenanceTickProvisionsInNameOrder(t *testing.T) {
+	for range 20 {
+		m, cs := testScheduler(t)
+		m.register("w-d", "raw.d")
+		m.register("w-b", "raw.b")
+		m.register("w-a", "raw.a")
+		m.register("w-c", "raw.c")
+		m.tick(time.Now())
+		if got, want := podsLookedUp(cs), []string{"w-a", "w-b", "w-c", "w-d"}; !slices.Equal(got, want) {
+			t.Fatalf("tables provisioned in order %v, want %v", got, want)
+		}
+	}
+}
+
+// A pass that outlasts its bound has its worker's Pod deleted: the hung
+// worker's stream then dies and its session lets go of the table.
+func TestMaintenancePassBoundDeletesTheHungWorkerPod(t *testing.T) {
+	old := maintenancePassTimeout
+	maintenancePassTimeout = 20 * time.Millisecond
+	defer func() { maintenancePassTimeout = old }()
+
+	m, cs := testScheduler(t)
+	deleted := make(chan string, 1)
+	cs.PrependReactor("delete", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		deleted <- a.(k8stesting.DeleteAction).GetName()
+		return true, nil, nil
+	})
+	stop := m.boundPass("p-raw-orders-maint", "raw.orders")
+	defer stop()
+	select {
+	case name := <-deleted:
+		if name != "p-raw-orders-maint" {
+			t.Fatalf("deleted Pod %q, want the hung worker's", name)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hung worker's Pod was not deleted after the pass bound")
+	}
+}
+
+// A pass that ends in time stops its watchdog: nothing is deleted later.
+func TestMaintenancePassBoundIsStoppedByAPassThatEnds(t *testing.T) {
+	old := maintenancePassTimeout
+	maintenancePassTimeout = 30 * time.Millisecond
+	defer func() { maintenancePassTimeout = old }()
+
+	m, cs := testScheduler(t)
+	m.boundPass("p-raw-orders-maint", "raw.orders")()
+	time.Sleep(120 * time.Millisecond)
+	for _, a := range cs.Actions() {
+		if a.GetVerb() == "delete" {
+			t.Fatal("the watchdog of a finished pass deleted the worker's Pod")
+		}
+	}
+}
+
+// succeededOps and reportedOps read a report through one walk.
+func TestWalkOpsNamesEveryOperationOnce(t *testing.T) {
+	res := &pb.MaintenanceResult{Ops: []*pb.MaintenanceOpResult{
+		{Op: &pb.MaintenanceOpResult_Compaction{Compaction: &pb.CompactionResult{}}},
+		{Op: &pb.MaintenanceOpResult_Expiry{Expiry: &pb.ExpiryResult{Error: "boom"}}},
+		{Op: &pb.MaintenanceOpResult_Orphan{Orphan: &pb.OrphanResult{}}},
+	}}
+	if got, want := reportedOps(res), []sink.MaintenanceOp{sink.MaintenanceCompaction, sink.MaintenanceSnapshotExpiry, sink.MaintenanceOrphanCleanup}; !slices.Equal(got, want) {
+		t.Errorf("reportedOps = %v, want %v", got, want)
+	}
+	if got, want := succeededOps(res), []sink.MaintenanceOp{sink.MaintenanceCompaction, sink.MaintenanceOrphanCleanup}; !slices.Equal(got, want) {
+		t.Errorf("succeededOps = %v, want %v", got, want)
+	}
+}

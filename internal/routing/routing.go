@@ -73,10 +73,15 @@ const (
 // contract violation, and guessing an owner for it would be worse than
 // failing the batch.
 func EncodeKey(key []any) ([]byte, error) {
+	return appendKey(nil, key)
+}
+
+// appendKey appends key's canonical encoding to buf: EncodeKey into a buffer
+// the caller owns, for a caller that encodes one key per row.
+func appendKey(buf []byte, key []any) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, fmt.Errorf("routing: empty primary key")
 	}
-	var buf []byte
 	var lenBuf [4]byte
 	for i, v := range key {
 		if v == nil {
@@ -239,4 +244,49 @@ func rendezvousWeight(slotBytes []byte, worker string) uint64 {
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(worker))
 	return h.Sum64()
+}
+
+// Router assigns the keys of one batch to one set of workers. It gives the
+// same answer as OwnerOfKey, without its per-row cost: OwnerOfKey allocates
+// an encode buffer and a hash for the key and then hashes the key's slot
+// against every worker, for every row. A Router reuses one buffer and one
+// hash, and works out each slot's owner once — a slot's owner depends only on
+// the slot and the workers, and a batch of thousands of rows hits each of the
+// 4096 slots again and again.
+//
+// A Router is not safe for concurrent use, and is tied to the workers it was
+// built for: build one per batch.
+type Router struct {
+	workers []string
+	// owner is each slot's owner index plus one; zero means not worked out.
+	owner [Slots]int32
+	buf   []byte
+	hash  *xxhash.Digest
+}
+
+// NewRouter returns a Router over workers.
+func NewRouter(workers []string) *Router {
+	return &Router{workers: workers, hash: xxhash.New()}
+}
+
+// OwnerOfKey returns the index into the Router's workers of key's owner, or
+// -1 for an empty worker set.
+func (r *Router) OwnerOfKey(key []any) (int, error) {
+	enc, err := appendKey(r.buf[:0], key)
+	if err != nil {
+		return -1, err
+	}
+	r.buf = enc
+	r.hash.Reset()
+	_, _ = r.hash.Write(seedPrefix)
+	_, _ = r.hash.Write(enc)
+	slot := uint32(r.hash.Sum64() % Slots)
+	if o := r.owner[slot]; o != 0 {
+		return int(o) - 1, nil
+	}
+	o := Owner(slot, r.workers)
+	if o >= 0 {
+		r.owner[slot] = int32(o) + 1
+	}
+	return o, nil
 }

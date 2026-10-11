@@ -122,16 +122,21 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 	// database uses can no longer disagree with the routing Go uses (#574).
 	// A range cannot be the owner function when the bounds are sampled in a
 	// non-binary collation: those bounds are not contiguous in byte order.
-	names := ownerNames(owners)
+	// One router and one key slice for the whole batch: per row, OwnerOfKey
+	// would allocate a key tuple, an encode buffer and a hash, and hash the
+	// row's slot against every owner again.
+	router := route.NewRouter(ownerNames(owners))
 	nrows := reader.NumRows()
 	owner := make([]int, nrows)
+	key := make([]any, 0, len(pk))
 	for i := 0; i < nrows; i++ {
-		p, err := route.OwnerOfKey(reader.Key(i), names)
+		key = reader.KeyInto(key, i)
+		p, err := router.OwnerOfKey(key)
 		if err != nil {
 			return fmt.Errorf("coordinator: table %s: row %d: %w", meta.Table, i, err)
 		}
 		if p < 0 {
-			return fmt.Errorf("coordinator: table %s: row %d's key %v has no owner", meta.Table, i, reader.Key(i))
+			return fmt.Errorf("coordinator: table %s: row %d's key %v has no owner", meta.Table, i, key)
 		}
 		owner[i] = p
 	}
@@ -175,11 +180,14 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 		c.staged.expectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, batchPosition(reader))
 		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
+	// One copy of the meta serves every sub-batch: enqueueTo serializes it
+	// before it returns and keeps nothing of it, so the copy is rewritten for
+	// the next partition instead of cloned again.
+	subMeta := cloneBatchMeta(meta)
 	for p, sub := range subBatches {
 		if sub == nil {
 			continue // no rows for this partition in this batch
 		}
-		subMeta := cloneBatchMeta(meta)
 		subMeta.HighPos = highs[p]
 		subBatch := &dataplane.Batch{Table: b.Table, Record: sub, Watermark: b.Watermark, Mode: b.Mode}
 		if err := c.enqueueTo(ctx, owners[p], subBatch, subMeta); err != nil {
@@ -430,7 +438,7 @@ func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwne
 		builders[p] = nil
 		// Every row belongs to this one partition: retain the record instead
 		// of materializing an identity Take.
-		if len(owner) == nRows && b.Len() == nRows {
+		if b.Len() == nRows {
 			b.Release()
 			rec.Retain()
 			out[p] = rec
