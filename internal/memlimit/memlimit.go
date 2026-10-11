@@ -43,7 +43,7 @@ func Apply(log *slog.Logger) int64 {
 		if !ok {
 			continue // unlimited or unreadable here: the other version may set one
 		}
-		set := int64(float64(limit) * Fraction)
+		set := runtimeShare(limit)
 		debug.SetMemoryLimit(set)
 		if log != nil {
 			log.Info("memory limit", "cgroup_bytes", limit, "runtime_bytes", set)
@@ -51,6 +51,14 @@ func Apply(log *slog.Logger) int64 {
 		return set
 	}
 	return 0
+}
+
+// runtimeShare is the runtime's soft limit for a cgroup limit: Fraction of
+// it, less what the binary holds outside the Go heap (the race detector's
+// shadow memory in a race build, which the runtime cannot see and which
+// OOM-killed a worker whose heap was within its limit, #822).
+func runtimeShare(cgroup int64) int64 {
+	return int64(float64(cgroup)*Fraction) - outsideHeap(cgroup)
 }
 
 // parse reads a cgroup memory limit: a byte count, or "max" (v2) or a value

@@ -99,6 +99,16 @@ type Batch struct {
 	// chunk. Nil when not in snapshot phase.
 	SnapshotPending []uint32
 
+	// Partial marks a batch that does not end its table's rows of the
+	// transaction its last row belongs to: more of them follow in a later
+	// batch. A source cuts a large transaction into several batches, and the
+	// earlier ones carry the previous transaction's position (the last one
+	// safe to commit), which a commit between two of them records. Position
+	// alone then cannot tell a cut batch that was applied from one that was
+	// not, so a partial batch counts as durable only once its table is
+	// committed strictly beyond its position (#823).
+	Partial bool
+
 	// Seq is the coordinator's monotonic batch sequence (BatchMeta.batch_id),
 	// assigned once per sub-batch in binlog order. Sinks use it to order
 	// concurrent writes from the N workers of one partitioned table.
