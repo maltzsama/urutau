@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: polaris
-          image: apache/polaris:latest
+          image: apache/polaris:1.8.0
           env:
             - name: AWS_REGION
               value: us-east-1

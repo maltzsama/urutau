@@ -264,7 +264,7 @@ services:
         echo bucket ready
 
   polaris:
-    image: apache/polaris:latest
+    image: apache/polaris:1.8.0
     ports:
       - "8181:8181"
       - "8182:8182"
