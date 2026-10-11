@@ -396,11 +396,13 @@ func (m *maintenanceScheduler) assignment(table string, ops []sink.MaintenanceOp
 // logPass records a maintenance worker's report in the coordinator's log: its
 // table, the operations reported, each one's outcome or error, and how long
 // the worker had held the table by then (no other pass runs on it
-// meanwhile). The worker's Pod is deleted after the pass, so this line is
+// meanwhile). reported is what the worker's result covers, not what was due:
+// an operation that was due and never reported (the worker died mid-pass) is
+// absent from it, and that absence is the point of the line. The worker's Pod is deleted after the pass, so this line is
 // what shows why a table is not being maintained (issue #457). A report with
 // a failed operation is a warning.
-func (m *maintenanceScheduler) logPass(worker, table string, due []sink.MaintenanceOp, took time.Duration, res *pb.MaintenanceResult) {
-	attrs := []any{"table", table, "worker", worker, "ops", due, "took", took.Round(time.Millisecond)}
+func (m *maintenanceScheduler) logPass(worker, table string, reported []sink.MaintenanceOp, took time.Duration, res *pb.MaintenanceResult) {
+	attrs := []any{"table", table, "worker", worker, "ops", reported, "took", took.Round(time.Millisecond)}
 	failed := false
 	for _, op := range res.Ops {
 		switch r := op.Op.(type) {
