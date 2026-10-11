@@ -1,4 +1,4 @@
-package dataplane
+package columnar
 
 import (
 	"github.com/apache/arrow-go/v18/arrow"

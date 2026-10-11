@@ -13,13 +13,13 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
 )
 
-func pkBatch(t *testing.T) *dpint.Batch {
+func pkBatch(t *testing.T) *columnar.Batch {
 	t.Helper()
 	changes := []rowchange.Change{
 		{Op: rowchange.OpInsert, Key: []any{int64(1)},
@@ -38,7 +38,7 @@ func pkBatch(t *testing.T) *dpint.Batch {
 	if err != nil {
 		t.Fatalf("encode input: %v", err)
 	}
-	return &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+	return &columnar.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 }
 
 func TestEnrichBatchKeepsDeletesColumnar(t *testing.T) {
@@ -122,7 +122,7 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 		})
 	}
 
-	mkBatch := func(t *testing.T, id int64) *dpint.Batch {
+	mkBatch := func(t *testing.T, id int64) *columnar.Batch {
 		t.Helper()
 		changes := []rowchange.Change{
 			{Op: rowchange.OpInsert, Key: []any{id},
@@ -132,7 +132,7 @@ func TestEnrichBatchSameSchemaAcrossEmptyAndHotReference(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
-		return &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+		return &columnar.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	}
 
 	loader := &fakeLoader{} // first image: empty (SetRec makes it hot)

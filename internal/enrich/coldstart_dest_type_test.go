@@ -9,7 +9,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
@@ -36,13 +36,13 @@ func TestColdAndHotDestColumnsShareTheDeclaredType(t *testing.T) {
 		},
 		PrimaryKey: []string{"id"},
 	}
-	join := func() *dpint.Batch {
+	join := func() *columnar.Batch {
 		t.Helper()
 		rec, encErr := transport.RecordFromChanges([]rowchange.Change{searchEvent(1, int64(1))}, decl, nil)
 		if encErr != nil {
 			t.Fatalf("encode: %v", encErr)
 		}
-		in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+		in := &columnar.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 		out, jErr := s.ColumnarJoin(context.Background(), in)
 		in.Release()
 		if jErr != nil {
@@ -89,7 +89,7 @@ func TestColdAndHotDestColumnsShareTheDeclaredType(t *testing.T) {
 	}
 }
 
-func assertDestType(t *testing.T, b *dpint.Batch, col string, want arrow.DataType) {
+func assertDestType(t *testing.T, b *columnar.Batch, col string, want arrow.DataType) {
 	t.Helper()
 	for i := 0; i < b.Record.Schema().NumFields(); i++ {
 		if f := b.Record.Schema().Field(i); f.Name == col {

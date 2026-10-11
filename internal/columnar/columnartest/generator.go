@@ -1,7 +1,7 @@
-// Package dataplanetest holds the batch fixtures the engine's tests build
+// Package columnartest holds the batch fixtures the engine's tests build
 // their inputs from. It lives outside the production dataplane package so the
 // fixtures do not ship in the engine (issue #608).
-package dataplanetest
+package columnartest
 
 import (
 	"fmt"
@@ -14,7 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	publicdp "github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/transport"
 )
 
@@ -89,18 +89,18 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *publicdp.Batch {
 		bb.Field(1).(*array.StringBuilder).Append(val)
 
 		// __op: mix of inserts, updates, and deletes
-		op := uint8(dataplane.OpInsert)
+		op := uint8(columnar.OpInsert)
 		if opts.DeletesOnlyAtEnd {
 			if i == opts.NumRows-1 && rng.IntN(3) == 0 {
-				op = dataplane.OpDelete
+				op = columnar.OpDelete
 			} else if i > 0 && rng.IntN(4) == 0 {
-				op = dataplane.OpUpdate
+				op = columnar.OpUpdate
 			}
 		} else {
 			if rng.IntN(5) == 0 {
-				op = dataplane.OpDelete
+				op = columnar.OpDelete
 			} else if i > 0 && rng.IntN(3) == 0 {
-				op = dataplane.OpUpdate
+				op = columnar.OpUpdate
 			}
 		}
 		bb.Field(opCol).(*array.Uint8Builder).Append(op)
@@ -108,7 +108,7 @@ func GenerateBatch(seed int64, opts GeneratorOpts) *publicdp.Batch {
 		// __before_val: last known val for this PK (real before-image for
 		// updates/deletes), null for inserts.
 		if id >= 0 {
-			if before, ok := lastVal[id]; ok && op != dataplane.OpInsert {
+			if before, ok := lastVal[id]; ok && op != columnar.OpInsert {
 				bb.Field(2).(*array.StringBuilder).Append(before)
 			} else {
 				bb.Field(2).(*array.StringBuilder).AppendNull()

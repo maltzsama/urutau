@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 import (
 	"testing"

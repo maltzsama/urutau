@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 // T-9 (real): Collapse with composite multi-type PKs — including UUID
 // (FixedSizeBinary), Decimal128 and Binary — plus EncodeKey anti-collision
@@ -14,7 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 )
 
 // wireBatch builds a wire-schema record from data fields + rows, with the
@@ -25,7 +25,7 @@ type wireRow struct {
 	data map[string]any
 }
 
-func buildWireBatch(t *testing.T, alloc *memory.CheckedAllocator, dataFields []arrow.Field, rows []wireRow) *dataplane.Batch {
+func buildWireBatch(t *testing.T, alloc *memory.CheckedAllocator, dataFields []arrow.Field, rows []wireRow) *columnar.Batch {
 	t.Helper()
 
 	fields := make([]arrow.Field, 0, len(dataFields)+5)
@@ -82,7 +82,7 @@ func buildWireBatch(t *testing.T, alloc *memory.CheckedAllocator, dataFields []a
 		}
 	}
 	rec := bld.NewRecordBatch()
-	return &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
+	return &columnar.Batch{Table: "t", Record: rec, Watermark: []byte("w")}
 }
 
 func TestCollapseCompositeMultiTypePK(t *testing.T) {
@@ -94,13 +94,13 @@ func TestCollapseCompositeMultiTypePK(t *testing.T) {
 		{Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
 	}
 	b := buildWireBatch(t, alloc, fields, []wireRow{
-		{op: uint8(dataplane.OpInsert), pos: "p1", data: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v1"}},
-		{op: uint8(dataplane.OpUpdate), pos: "p2", data: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v2"}},
-		{op: uint8(dataplane.OpInsert), pos: "p3", data: map[string]any{"pk1": int32(2), "pk2": "b", "v": "v3"}},
+		{op: uint8(columnar.OpInsert), pos: "p1", data: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v1"}},
+		{op: uint8(columnar.OpUpdate), pos: "p2", data: map[string]any{"pk1": int32(1), "pk2": "a", "v": "v2"}},
+		{op: uint8(columnar.OpInsert), pos: "p3", data: map[string]any{"pk1": int32(2), "pk2": "b", "v": "v3"}},
 	})
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}
@@ -143,13 +143,13 @@ func TestCollapseUUIDDecimalBinaryPK(t *testing.T) {
 		{Name: "v", Type: arrow.BinaryTypes.String, Nullable: true},
 	}
 	b := buildWireBatch(t, alloc, fields, []wireRow{
-		{op: uint8(dataplane.OpInsert), pos: "p1", data: map[string]any{"pk_uuid": uuidA, "pk_dec": dec1, "pk_bin": []byte{1, 2}, "v": "first"}},
-		{op: uint8(dataplane.OpUpdate), pos: "p2", data: map[string]any{"pk_uuid": uuidA, "pk_dec": dec1, "pk_bin": []byte{1, 2}, "v": "second"}},
-		{op: uint8(dataplane.OpInsert), pos: "p3", data: map[string]any{"pk_uuid": uuidB, "pk_dec": dec2, "pk_bin": []byte{3}, "v": "other"}},
+		{op: uint8(columnar.OpInsert), pos: "p1", data: map[string]any{"pk_uuid": uuidA, "pk_dec": dec1, "pk_bin": []byte{1, 2}, "v": "first"}},
+		{op: uint8(columnar.OpUpdate), pos: "p2", data: map[string]any{"pk_uuid": uuidA, "pk_dec": dec1, "pk_bin": []byte{1, 2}, "v": "second"}},
+		{op: uint8(columnar.OpInsert), pos: "p3", data: map[string]any{"pk_uuid": uuidB, "pk_dec": dec2, "pk_bin": []byte{3}, "v": "other"}},
 	})
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"pk_uuid", "pk_dec", "pk_bin"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"pk_uuid", "pk_dec", "pk_bin"})
 	if err != nil {
 		t.Fatalf("Collapse (uuid/decimal/binary keys): %v", err)
 	}
@@ -216,7 +216,7 @@ func TestEncodeKeyTypeAntiCollision(t *testing.T) {
 			}
 			idxs[i] = found
 		}
-		k, err := dataplane.EncodeKey(rec, row, idxs, cols)
+		k, err := columnar.EncodeKey(rec, row, idxs, cols)
 		if err != nil {
 			t.Fatalf("EncodeKey: %v", err)
 		}
@@ -251,15 +251,15 @@ func TestCollapseMasksByKernel(t *testing.T) {
 	b := buildWireBatch(t, alloc,
 		[]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}},
 		[]wireRow{
-			{op: dataplane.OpInsert, pos: "p1", data: map[string]any{"id": int64(1)}},
-			{op: dataplane.OpUpdate, pos: "p2", data: map[string]any{"id": int64(2)}},
-			{op: dataplane.OpDelete, pos: "p3", data: map[string]any{"id": int64(3)}},
-			{op: dataplane.OpInsert, pos: "p4", data: map[string]any{"id": int64(2)}}, // collapses onto id=2, wins as insert
+			{op: columnar.OpInsert, pos: "p1", data: map[string]any{"id": int64(1)}},
+			{op: columnar.OpUpdate, pos: "p2", data: map[string]any{"id": int64(2)}},
+			{op: columnar.OpDelete, pos: "p3", data: map[string]any{"id": int64(3)}},
+			{op: columnar.OpInsert, pos: "p4", data: map[string]any{"id": int64(2)}}, // collapses onto id=2, wins as insert
 		},
 	)
 	defer b.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, b, []string{"id"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, b, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse: %v", err)
 	}

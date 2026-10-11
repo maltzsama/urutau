@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 // T-11: a batch carrying an unknown __op value (3) must be rejected by the
 // op-consuming stage. An unknown op that slipped through would vanish
@@ -16,19 +16,19 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 
-	"github.com/maltzsama/urutau/internal/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
+	"github.com/maltzsama/urutau/internal/columnar"
+	"github.com/maltzsama/urutau/internal/columnar/columnartest"
 )
 
 func TestCollapseRejectsUnknownOp(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 2, Allocator: alloc})
+	b := columnartest.GenerateBatch(42, columnartest.GeneratorOpts{NumRows: 2, Allocator: alloc})
 	defer b.Release()
 
 	bad := withOpValues(t, b, 0, 3)
 	defer bad.Release()
 
-	if _, _, err := dataplane.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
+	if _, _, err := columnar.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
 		t.Error("Collapse: unknown op accepted")
 	}
 }
@@ -38,13 +38,13 @@ func TestCollapseRejectsUnknownOp(t *testing.T) {
 // either way.
 func TestCollapseRejectsUnknownOpInLosingRow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 2, Allocator: alloc})
+	b := columnartest.GenerateBatch(42, columnartest.GeneratorOpts{NumRows: 2, Allocator: alloc})
 	defer b.Release()
 
 	bad := withOpValues(t, b, 3, 0)
 	defer bad.Release()
 
-	if _, _, err := dataplane.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
+	if _, _, err := columnar.Collapse(context.Background(), alloc, bad, []string{"id"}); err == nil {
 		t.Error("Collapse: poison op in potentially-losing row accepted")
 	}
 }
@@ -52,13 +52,13 @@ func TestCollapseRejectsUnknownOpInLosingRow(t *testing.T) {
 // Every valid op must still pass — the guard rejects the unknown, not the known.
 func TestCollapseAcceptsEveryValidOp(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 3, Allocator: alloc})
+	b := columnartest.GenerateBatch(42, columnartest.GeneratorOpts{NumRows: 3, Allocator: alloc})
 	defer b.Release()
 
 	ok := withOpValues(t, b, 0, 1, 2) // insert, update, delete
 	defer ok.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, ok, []string{"id"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, ok, []string{"id"})
 	if err != nil {
 		t.Fatalf("Collapse rejected a batch of valid ops: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestCollapseAcceptsEveryValidOp(t *testing.T) {
 // withOpValues returns a new Batch (caller releases) with the __op column
 // replaced by the given values. Record immutability forbids mutation, so the
 // record is rebuilt sharing every other column.
-func withOpValues(t *testing.T, b *dataplane.Batch, ops ...uint8) *dataplane.Batch {
+func withOpValues(t *testing.T, b *columnar.Batch, ops ...uint8) *columnar.Batch {
 	t.Helper()
 	rec := b.Record
 	opIdx := -1
@@ -109,5 +109,5 @@ func withOpValues(t *testing.T, b *dataplane.Batch, ops ...uint8) *dataplane.Bat
 	for _, c := range cols {
 		c.Release()
 	}
-	return &dataplane.Batch{Table: b.Table, Record: newRec, Watermark: b.Watermark}
+	return &columnar.Batch{Table: b.Table, Record: newRec, Watermark: b.Watermark}
 }

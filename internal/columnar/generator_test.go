@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 import (
 	"bytes"
@@ -9,12 +9,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
-	"github.com/maltzsama/urutau/internal/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
+	"github.com/maltzsama/urutau/internal/columnar"
+	"github.com/maltzsama/urutau/internal/columnar/columnartest"
 )
 
 // opCol extracts the __op column as []uint8 from a batch.
-func opCol(b *dataplane.Batch) []uint8 {
+func opCol(b *columnar.Batch) []uint8 {
 	if b == nil || b.Record == nil {
 		return nil
 	}
@@ -32,7 +32,7 @@ func opCol(b *dataplane.Batch) []uint8 {
 }
 
 // fieldIndex finds a column index by name. Panics if not found (test only).
-func fieldIndex(t *testing.T, b *dataplane.Batch, name string) int {
+func fieldIndex(t *testing.T, b *columnar.Batch, name string) int {
 	t.Helper()
 	for i := range b.Record.Schema().NumFields() {
 		if b.Record.Schema().Field(i).Name == name {
@@ -45,7 +45,7 @@ func fieldIndex(t *testing.T, b *dataplane.Batch, name string) int {
 
 func TestGeneratorWatermarkIsLastRowPos(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{NumRows: 20, Allocator: alloc})
+	b := columnartest.GenerateBatch(42, columnartest.GeneratorOpts{NumRows: 20, Allocator: alloc})
 	defer b.Release()
 
 	posIdx := fieldIndex(t, b, "__pos")
@@ -58,7 +58,7 @@ func TestGeneratorWatermarkIsLastRowPos(t *testing.T) {
 
 func TestGeneratorSchemaCoherent(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 5, Allocator: alloc})
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{NumRows: 5, Allocator: alloc})
 	defer b.Release()
 
 	schema := b.Record.Schema()
@@ -83,7 +83,7 @@ func TestGeneratorSchemaCoherent(t *testing.T) {
 
 func TestGeneratorPKNotNull(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{
 		NumRows:       10,
 		IncludeNullPK: false,
 		Allocator:     alloc,
@@ -100,7 +100,7 @@ func TestGeneratorPKNotNull(t *testing.T) {
 
 func TestGeneratorPosMonotonic(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(99, dataplanetest.GeneratorOpts{NumRows: 30, Allocator: alloc})
+	b := columnartest.GenerateBatch(99, columnartest.GeneratorOpts{NumRows: 30, Allocator: alloc})
 	defer b.Release()
 
 	posIdx := fieldIndex(t, b, "__pos")
@@ -115,7 +115,7 @@ func TestGeneratorPosMonotonic(t *testing.T) {
 
 func TestGeneratorInt64Overflow(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialInt64Overflow(alloc)
+	b := columnartest.AdversarialInt64Overflow(alloc)
 	defer b.Release()
 
 	idCol := b.Record.Column(0).(*array.Int64)
@@ -131,7 +131,7 @@ func TestGeneratorInt64Overflow(t *testing.T) {
 
 func TestGeneratorDeleteLast(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialDeleteLast(alloc)
+	b := columnartest.AdversarialDeleteLast(alloc)
 	defer b.Release()
 
 	opIdx := fieldIndex(t, b, "__op")
@@ -143,7 +143,7 @@ func TestGeneratorDeleteLast(t *testing.T) {
 
 func TestGeneratorInsertAfterDelete(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialInsertAfterDelete(alloc)
+	b := columnartest.AdversarialInsertAfterDelete(alloc)
 	defer b.Release()
 
 	opIdx := fieldIndex(t, b, "__op")
@@ -158,7 +158,7 @@ func TestGeneratorInsertAfterDelete(t *testing.T) {
 
 func TestGeneratorCompositeKeyDistinct(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialCompositeKey(alloc)
+	b := columnartest.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
 	pk1 := b.Record.Column(0).(*array.String)
@@ -177,7 +177,7 @@ func TestGeneratorCompositeKeyDistinct(t *testing.T) {
 
 func TestGeneratorNullBefore(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialNullBefore(alloc)
+	b := columnartest.AdversarialNullBefore(alloc)
 	defer b.Release()
 
 	valCol := b.Record.Column(1).(*array.String)
@@ -197,14 +197,14 @@ func TestGeneratorNullBefore(t *testing.T) {
 
 func TestEncodeKeyDistinct(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.AdversarialCompositeKey(alloc)
+	b := columnartest.AdversarialCompositeKey(alloc)
 	defer b.Release()
 
-	key0, err := dataplane.EncodeKey(b.Record, 0, []int{0, 1}, []string{"pk1", "pk2"})
+	key0, err := columnar.EncodeKey(b.Record, 0, []int{0, 1}, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
-	key1, err := dataplane.EncodeKey(b.Record, 1, []int{0, 1}, []string{"pk1", "pk2"})
+	key1, err := columnar.EncodeKey(b.Record, 1, []int{0, 1}, []string{"pk1", "pk2"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestEncodeKeyDistinct(t *testing.T) {
 
 func TestGeneratorNullPK(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{
 		NumRows:       3,
 		IncludeNullPK: true,
 		Allocator:     alloc,
@@ -236,7 +236,7 @@ func TestGeneratorDeletesMidBatch(t *testing.T) {
 	found := false
 	for seed := range 50 {
 		alloc := checkedAlloc(t)
-		b := dataplanetest.GenerateBatch(int64(seed), dataplanetest.GeneratorOpts{NumRows: 30, Allocator: alloc})
+		b := columnartest.GenerateBatch(int64(seed), columnartest.GeneratorOpts{NumRows: 30, Allocator: alloc})
 		ops := opCol(b)
 		for i := 0; i < len(ops)-1; i++ { // exclude last row
 			if ops[i] == 2 {
@@ -252,7 +252,7 @@ func TestGeneratorDeletesMidBatch(t *testing.T) {
 
 func TestGeneratorDuplicatePKDomain(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{
+	b := columnartest.GenerateBatch(42, columnartest.GeneratorOpts{
 		NumRows:   20,
 		PKDomain:  5,
 		Allocator: alloc,
@@ -275,7 +275,7 @@ func TestGeneratorDuplicatePKDomain(t *testing.T) {
 
 func TestGeneratorDefaultPKDomain(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 9, Allocator: alloc})
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{NumRows: 9, Allocator: alloc})
 	defer b.Release()
 
 	// Default PKDomain = max(1, 9/3) = 3 → IDs 1..3 repeating
@@ -292,7 +292,7 @@ func TestGeneratorDefaultPKDomain(t *testing.T) {
 func TestGeneratorBeforeValReal(t *testing.T) {
 	alloc := checkedAlloc(t)
 	// Use DeletesOnlyAtEnd=true so we get predictable inserts/updates
-	b := dataplanetest.GenerateBatch(42, dataplanetest.GeneratorOpts{
+	b := columnartest.GenerateBatch(42, columnartest.GeneratorOpts{
 		NumRows:          10,
 		DeletesOnlyAtEnd: true,
 		PKDomain:         3, // 3 distinct PKs → updates after first occurrence
@@ -352,7 +352,7 @@ func TestEncodeKeyV4AllTypes(t *testing.T) {
 	rec := bld.NewRecordBatch()
 	defer rec.Release()
 
-	key1, err := dataplane.EncodeKey(rec, 0, []int{0, 1, 2, 3, 4, 5}, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
+	key1, err := columnar.EncodeKey(rec, 0, []int{0, 1, 2, 3, 4, 5}, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestEncodeKeyV4AllTypes(t *testing.T) {
 	rec2 := bld2.NewRecordBatch()
 	defer rec2.Release()
 
-	key2, err := dataplane.EncodeKey(rec2, 0, []int{0, 1, 2, 3, 4, 5}, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
+	key2, err := columnar.EncodeKey(rec2, 0, []int{0, 1, 2, 3, 4, 5}, []string{"pk_int32", "pk_int64", "pk_uint64", "pk_float64", "pk_string", "pk_bool"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestEncodeKeyNarrowIntWidths(t *testing.T) {
 	seen := map[string]arrow.DataType{}
 	for _, typ := range types {
 		rec := singleIntRecord(t, typ, 1)
-		key, err := dataplane.EncodeKey(rec, 0, []int{0}, []string{"k"})
+		key, err := columnar.EncodeKey(rec, 0, []int{0}, []string{"k"})
 		rec.Release()
 		if err != nil {
 			t.Fatalf("%s: %v", typ, err)
@@ -454,15 +454,15 @@ func TestEncodeKeyDecimal128Stable(t *testing.T) {
 	arr.Release()
 	defer rec.Release()
 
-	k0, err := dataplane.EncodeKey(rec, 0, []int{0}, []string{"k"})
+	k0, err := columnar.EncodeKey(rec, 0, []int{0}, []string{"k"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
-	k1, err := dataplane.EncodeKey(rec, 1, []int{0}, []string{"k"})
+	k1, err := columnar.EncodeKey(rec, 1, []int{0}, []string{"k"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
-	k2, err := dataplane.EncodeKey(rec, 2, []int{0}, []string{"k"})
+	k2, err := columnar.EncodeKey(rec, 2, []int{0}, []string{"k"})
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -487,7 +487,7 @@ func BenchmarkEncodeKeyDecimal128(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := dataplane.EncodeKey(rec, 0, []int{0}, []string{"k"}); err != nil {
+		if _, err := columnar.EncodeKey(rec, 0, []int{0}, []string{"k"}); err != nil {
 			b.Fatal(err)
 		}
 	}

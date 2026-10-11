@@ -9,7 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/core"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -96,7 +96,7 @@ func scanChunkRecord(ctx context.Context, chunker source.ChunkSource, ch source.
 	if len(parts) == 1 {
 		return parts[0], total, nil
 	}
-	rec, err := dpint.ConcatRecords(memory.DefaultAllocator, parts)
+	rec, err := columnar.ConcatRecords(memory.DefaultAllocator, parts)
 	release()
 	if err != nil {
 		return nil, 0, fmt.Errorf("encode: %w", err)

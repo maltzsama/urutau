@@ -8,7 +8,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/faultinject"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/sink"
@@ -103,13 +103,13 @@ func (b *batcher) commitPending() error {
 	if len(b.pending) == 0 {
 		return nil
 	}
-	merged, err := dpint.ConcatBatches(memory.DefaultAllocator, b.pending)
+	merged, err := columnar.ConcatBatches(memory.DefaultAllocator, b.pending)
 	if err != nil {
 		b.freePending()
 		return fmt.Errorf("worker: table %s: concat: %w", b.p.target, err)
 	}
 	rows := int(merged.Record.NumRows())
-	pos := dpint.LastRowPos(merged)
+	pos := columnar.LastRowPos(merged)
 
 	b.p.snapshotMu.Lock()
 	inSnapshot := b.p.snapshotState == string(snapshot.StateInProgress)
@@ -159,7 +159,7 @@ func (b *batcher) commitSnapshot(merged *dataplane.Batch, pos string, guard *blo
 		appendPos = ""
 	}
 	if len(untouchedIdx) > 0 {
-		ab, err := dpint.SelectRows(merged, untouchedIdx, appendPos, dataplane.AppendMode, snapState, snapPending)
+		ab, err := columnar.SelectRows(merged, untouchedIdx, appendPos, dataplane.AppendMode, snapState, snapPending)
 		if err != nil {
 			return fmt.Errorf("worker: table %s: select append: %w", b.p.target, err)
 		}
@@ -168,7 +168,7 @@ func (b *batcher) commitSnapshot(merged *dataplane.Batch, pos string, guard *blo
 		}
 	}
 	if len(restIdx) > 0 {
-		rest, err := dpint.SelectRows(merged, restIdx, pos, dataplane.UpsertMode, snapState, snapPending)
+		rest, err := columnar.SelectRows(merged, restIdx, pos, dataplane.UpsertMode, snapState, snapPending)
 		if err != nil {
 			return fmt.Errorf("worker: table %s: select rest: %w", b.p.target, err)
 		}
@@ -188,7 +188,7 @@ func (b *batcher) commitAppend(merged *dataplane.Batch, pos, snapState string, s
 	if err != nil {
 		return err
 	}
-	out, err := dpint.SelectRows(merged, keepIdx, pos, dataplane.AppendMode, snapState, snapPending)
+	out, err := columnar.SelectRows(merged, keepIdx, pos, dataplane.AppendMode, snapState, snapPending)
 	if err != nil {
 		return fmt.Errorf("worker: table %s: select append: %w", b.p.target, err)
 	}
@@ -243,7 +243,7 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 		// A window's marker progress (flushSnapshotProgress) wins (#461).
 		snapState, snapPending = b.SnapshotState, b.SnapshotPending
 	}
-	upserts, deletes, cerr := dpint.Collapse(ctx, nil, b, p.knownSchema.PrimaryKey)
+	upserts, deletes, cerr := columnar.Collapse(ctx, nil, b, p.knownSchema.PrimaryKey)
 	if cerr != nil {
 		return 0, 0, fmt.Errorf("worker: table %s: collapse: %w", p.target, cerr)
 	}
@@ -261,7 +261,7 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 	if deletes != nil {
 		delCount = int(deletes.Record.NumRows())
 	}
-	combined, err := dpint.MergeBatches(nil, upserts, deletes)
+	combined, err := columnar.MergeBatches(nil, upserts, deletes)
 	if err != nil {
 		return 0, 0, fmt.Errorf("worker: table %s: merge: %w", p.target, err)
 	}
@@ -269,7 +269,7 @@ func collapseAndSend(ctx context.Context, p *tablePipeline, b *dataplane.Batch, 
 		// Nothing survived the collapse: the cycle still needs its delivery
 		// so the coordinator does not leave it open (WK-001 C5.4).
 		if p.stage(b) && b.Seq != 0 {
-			return 0, 0, ready(dpint.EmptyBatch(b, p.mode), 0, 0, 0)
+			return 0, 0, ready(columnar.EmptyBatch(b, p.mode), 0, 0, 0)
 		}
 		return 0, 0, nil
 	}

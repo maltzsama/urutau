@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 // T-13 (W-3 / H-7 / D-6): the wire encode must preserve the batch's arrival
 // order. With the old upserts+deletes buckets, the delete concatenated at
@@ -15,7 +15,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	publicdp "github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 )
@@ -41,10 +41,10 @@ func TestWireEncodeOrderInsertDeleteInsertWinsWithInsert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	dpb := &dataplane.Batch{Table: "t", Record: rec, Mode: publicdp.UpsertMode}
+	dpb := &columnar.Batch{Table: "t", Record: rec, Mode: publicdp.UpsertMode}
 	defer dpb.Release()
 
-	ups, dels, err := dataplane.Collapse(context.Background(), alloc, dpb, []string{"id"})
+	ups, dels, err := columnar.Collapse(context.Background(), alloc, dpb, []string{"id"})
 	if err != nil {
 		t.Fatalf("collapse: %v", err)
 	}

@@ -1,4 +1,4 @@
-package dataplane_test
+package columnar_test
 
 import (
 	"strings"
@@ -10,8 +10,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	publicdp "github.com/maltzsama/urutau/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane"
-	"github.com/maltzsama/urutau/internal/dataplane/dataplanetest"
+	"github.com/maltzsama/urutau/internal/columnar"
+	"github.com/maltzsama/urutau/internal/columnar/columnartest"
 )
 
 // payloadRecord builds an id/v wire-shaped record with n rows whose v cell is
@@ -46,7 +46,7 @@ func vData(t *testing.T, rec arrow.RecordBatch) uintptr {
 }
 
 func TestCountOpsNilBatch(t *testing.T) {
-	u, d := dataplane.CountOps(nil)
+	u, d := columnar.CountOps(nil)
 	if u != 0 || d != 0 {
 		t.Errorf("CountOps(nil) = %d, %d, want 0, 0", u, d)
 	}
@@ -54,9 +54,9 @@ func TestCountOpsNilBatch(t *testing.T) {
 
 func TestCountOpsSplitsByOp(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(1, dataplanetest.GeneratorOpts{NumRows: 50, Allocator: alloc})
+	b := columnartest.GenerateBatch(1, columnartest.GeneratorOpts{NumRows: 50, Allocator: alloc})
 	defer b.Release()
-	up, del := dataplane.CountOps(b)
+	up, del := columnar.CountOps(b)
 	if up+del != int(b.Record.NumRows()) {
 		t.Fatalf("upserts %d + deletes %d != rows %d", up, del, b.Record.NumRows())
 	}
@@ -73,7 +73,7 @@ func TestSelectRowsEveryRowDoesNotCopy(t *testing.T) {
 	for i := range idx {
 		idx[i] = int32(i)
 	}
-	out, err := dataplane.SelectRows(b, idx, "p100", publicdp.AppendMode, "", nil)
+	out, err := columnar.SelectRows(b, idx, "p100", publicdp.AppendMode, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestSelectRowsCarriesSeqStaged(t *testing.T) {
 	rec := payloadRecord(t, alloc, 3, 8)
 	b := &publicdp.Batch{Table: "t", Record: rec, Seq: 9, Staged: true}
 	defer b.Release()
-	out, err := dataplane.SelectRows(b, []int32{2, 0}, "p", publicdp.UpsertMode, "s", []uint32{1})
+	out, err := columnar.SelectRows(b, []int32{2, 0}, "p", publicdp.UpsertMode, "s", []uint32{1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestSelectRowsEmptyIndices(t *testing.T) {
 	rec := payloadRecord(t, alloc, 2, 4)
 	b := &publicdp.Batch{Table: "t", Record: rec}
 	defer b.Release()
-	out, err := dataplane.SelectRows(b, nil, "", publicdp.AppendMode, "", nil)
+	out, err := columnar.SelectRows(b, nil, "", publicdp.AppendMode, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestEmptyBatch(t *testing.T) {
 	rec := payloadRecord(t, alloc, 2, 4)
 	b := &publicdp.Batch{Table: "t", Record: rec, Watermark: []byte("p9"), Seq: 4, Staged: true}
 	defer b.Release()
-	out := dataplane.EmptyBatch(b, publicdp.AppendMode)
+	out := columnar.EmptyBatch(b, publicdp.AppendMode)
 	defer out.Release()
 	if out.Record.NumRows() != 0 {
 		t.Fatalf("rows = %d, want 0", out.Record.NumRows())
@@ -140,9 +140,9 @@ func TestEmptyBatch(t *testing.T) {
 
 func TestLastRowPos(t *testing.T) {
 	alloc := checkedAlloc(t)
-	b := dataplanetest.GenerateBatch(2, dataplanetest.GeneratorOpts{NumRows: 7, Allocator: alloc})
+	b := columnartest.GenerateBatch(2, columnartest.GeneratorOpts{NumRows: 7, Allocator: alloc})
 	defer b.Release()
-	if got, want := dataplane.LastRowPos(b), string(b.Watermark); got != want {
+	if got, want := columnar.LastRowPos(b), string(b.Watermark); got != want {
 		t.Fatalf("LastRowPos = %q, want %q", got, want)
 	}
 }
@@ -152,7 +152,7 @@ func TestLastRowPosEmpty(t *testing.T) {
 	rec := payloadRecord(t, alloc, 0, 4)
 	b := &publicdp.Batch{Table: "t", Record: rec}
 	defer b.Release()
-	if got := dataplane.LastRowPos(b); got != "" {
+	if got := columnar.LastRowPos(b); got != "" {
 		t.Fatalf("LastRowPos(empty) = %q, want empty", got)
 	}
 }

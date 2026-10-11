@@ -5,7 +5,7 @@ import (
 	"sync"
 
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/gate"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -93,7 +93,7 @@ func newRelay(ingest chan<- worker.Ingest, window *worker.Worker, onDeliver func
 		flushReq:     make(chan chan struct{}, 1),
 		gateFlushReq: make(chan chan struct{}, 1),
 	}
-	r.gate = gate.New[*dataplane.Batch](relayGateMaxEvents, relayGateMaxBytes, dpint.BatchBytes, relaySink{r})
+	r.gate = gate.New[*dataplane.Batch](relayGateMaxEvents, relayGateMaxBytes, columnar.BatchBytes, relaySink{r})
 	return r
 }
 

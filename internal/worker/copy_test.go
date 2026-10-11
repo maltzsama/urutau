@@ -11,7 +11,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 )
 
@@ -77,7 +77,7 @@ func TestConcatBatchesCopiesEachBatchOnce(t *testing.T) {
 	var m0, m1 runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&m0)
-	out, err := dpint.ConcatBatches(memory.DefaultAllocator, bs)
+	out, err := columnar.ConcatBatches(memory.DefaultAllocator, bs)
 	runtime.ReadMemStats(&m1)
 	if err != nil {
 		t.Fatal(err)

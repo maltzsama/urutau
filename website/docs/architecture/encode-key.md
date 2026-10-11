@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # EncodeKey — design and invariant (supersedes the v4 `n:`/`f:` table)
 
-> **Status:** implemented in `internal/dataplane/generator.go` (`EncodeKey`).
+> **Status:** implemented in `internal/columnar/key.go` (`EncodeKey`).
 > **Supersedes:** the H-1 section of `DP-AUDIT v4` proposed value-space
 > prefixes (`n:`, `f:`, `s:`, `bin:`) with stability under widening
 > (`int32(5)` and `int64(5)` → the same key). The implementation uses

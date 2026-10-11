@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 )
 
 // batcher buffers, collapses and flushes one table's ingest into ready
@@ -190,7 +190,7 @@ func (b *batcher) deliverEmpty(bt *dataplane.Batch) error {
 	if !b.p.stage(bt) || bt.Seq == 0 {
 		return nil
 	}
-	return b.ready(dpint.EmptyBatch(bt, b.p.mode), 0, 0, 0)
+	return b.ready(columnar.EmptyBatch(bt, b.p.mode), 0, 0, 0)
 }
 
 // flush commits the pending batches and then queues the markers of the
@@ -218,7 +218,7 @@ func (b *batcher) addPending(bt *dataplane.Batch, rows int) error {
 	}
 	b.pending = append(b.pending, bt)
 	b.pendingSeq = bt.Seq
-	b.pendingRows, b.pendingBytes = b.pendingRows+rows, b.pendingBytes+dpint.BatchBytes(bt)
+	b.pendingRows, b.pendingBytes = b.pendingRows+rows, b.pendingBytes+columnar.BatchBytes(bt)
 	if (b.w.cfg.MaxRows > 0 && b.pendingRows >= b.w.cfg.MaxRows) || b.pendingBytes >= b.w.cfg.MaxBytes {
 		return b.flush()
 	}
@@ -227,5 +227,5 @@ func (b *batcher) addPending(bt *dataplane.Batch, rows int) error {
 
 // bufferEmpty queues an empty batch so the flush delivers it in Seq order.
 func (b *batcher) bufferEmpty(bt *dataplane.Batch) error {
-	return b.addPending(dpint.EmptyBatch(bt, b.p.mode), 0)
+	return b.addPending(columnar.EmptyBatch(bt, b.p.mode), 0)
 }

@@ -13,7 +13,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
-	dpint "github.com/maltzsama/urutau/internal/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/spec"
@@ -157,7 +157,7 @@ func (s *Stage) applyChanges(t *testing.T, changes []rowchange.Change) ([]rowcha
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+	in := &columnar.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
 	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
@@ -1016,7 +1016,7 @@ func TestNonStringReferenceLandsTyped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	in := &dpint.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
+	in := &columnar.Batch{Table: "events", Record: rec, Mode: dataplane.UpsertMode}
 	defer in.Release()
 	out, err := s.ColumnarJoin(t.Context(), in)
 	if err != nil {
