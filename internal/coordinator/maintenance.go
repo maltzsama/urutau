@@ -3,10 +3,14 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -103,6 +107,17 @@ func (m *maintenanceScheduler) register(name, table string) {
 	m.mu.Unlock()
 }
 
+// unexpectedSessionEnd reports whether a maintenance session's Recv error is
+// something other than its two ordinary ends: the worker closing the stream
+// after its pass (io.EOF), and a cancelled context (shutdown, or the worker's
+// Pod being deleted).
+func unexpectedSessionEnd(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	return status.Code(err) != codes.Canceled
+}
+
 // isWorker reports whether name is a registered maintenance worker.
 func (m *maintenanceScheduler) isWorker(name string) bool {
 	m.mu.Lock()
@@ -187,7 +202,14 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 	for {
 		in, err := stream.Recv()
 		if err != nil {
-			return nil // the worker finished (or died); either way it is gone
+			// The worker finished (or died); either way it is gone. A clean
+			// end is the normal one; anything else is said out loud, or a
+			// dropped stream would look exactly like a pass that ended.
+			if unexpectedSessionEnd(err) {
+				m.c.log.Warn("coordinator: maintenance: session ended unexpectedly",
+					"worker", hello.WorkerName, "table", table, "err", err)
+			}
+			return nil
 		}
 		if res := in.GetMaintenanceResult(); res != nil {
 			m.logPass(name, table, reportedOps(res), time.Since(sent), res)

@@ -349,8 +349,20 @@ func (c *Coordinator) workerTermination(worker string) string {
 	if err != nil {
 		return ""
 	}
+	return describeTermination(worker, pod)
+}
+
+// describeTermination renders a worker Pod's state for workerTermination. It
+// reads the worker's own container, selected by name: the kubelet sorts
+// container statuses by name, so an injected sidecar (istio-proxy,
+// linkerd-proxy) can come first, and a sidecar stuck in CrashLoopBackOff
+// would otherwise be reported as the reason the worker did not come back.
+func describeTermination(worker string, pod *corev1.Pod) string {
 	var parts []string
 	for _, st := range pod.Status.ContainerStatuses {
+		if st.Name != workerContainerName {
+			continue
+		}
 		if t := st.LastTerminationState.Terminated; t != nil {
 			parts = append(parts, fmt.Sprintf("last terminated %s, exit code %d", t.Reason, t.ExitCode))
 		}
