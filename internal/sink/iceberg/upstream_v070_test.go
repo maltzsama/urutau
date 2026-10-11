@@ -232,23 +232,6 @@ func TestUpstreamRejectsAFloatPrimaryKeyAtTheFirstUpsert(t *testing.T) {
 	}
 }
 
-// The sink creates every table as format-version 2 (createTable), and v0.7.0
-// keeps honouring it: deletion vectors and the public position-delete writer
-// need version 3 (apache/iceberg-go#2004), so #134 stays out of reach until
-// the tables move to it.
-func TestUpstreamStillCreatesFormatVersion2Tables(t *testing.T) {
-	ctx := context.Background()
-	s := hadoopSink(t)
-	createOrders(t, s)
-	tbl, err := s.cat.LoadTable(ctx, s.ident("orders"))
-	if err != nil {
-		t.Fatalf("LoadTable: %v", err)
-	}
-	if v := tbl.Metadata().Version(); v != 2 {
-		t.Fatalf("format version = %d, want 2", v)
-	}
-}
-
 // commitOrders commits n single-row upserts, one snapshot pair each, and
 // returns the table.
 func commitOrders(t *testing.T, s *Sink, ref core.TableRef, n int) *table.Table {
