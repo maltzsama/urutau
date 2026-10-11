@@ -125,7 +125,7 @@ func runCmd() *cobra.Command {
 				"coordinator", cfg.Coordinator,
 				"name", cfg.Name,
 				"namespace", cfg.Namespace,
-				"catalog", cfg.Sink.URI,
+				"catalog", logging.RedactURI(cfg.Sink.URI),
 				"metrics", cfg.MetricsAddr,
 			)
 			return remote.RunRemote(cmd.Context(), cfg)
