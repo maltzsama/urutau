@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/maltzsama/urutau/dataplane"
@@ -146,75 +144,27 @@ func (c *Coordinator) workerBack(worker string) error {
 }
 
 // terminationFor reads worker's last container termination.
-func (c *Coordinator) terminationFor(worker string) (podTermination, bool) {
+func (c *Coordinator) terminationFor(worker string) (coordk8s.Termination, bool) {
 	if c.podTermination != nil {
 		return c.podTermination(worker)
 	}
 	return c.k8sTermination(worker)
 }
 
-// podTermination is a worker container's last termination, as its Pod status
-// reports it, with the Pod's identity and restart count to tell a fresh
-// termination from one already seen.
-type podTermination struct {
-	podUID   string
-	restarts int32
-	reason   string
-	exitCode int32
-	message  string
-}
-
-// networkExitPrefix starts the termination message of a worker that exited
-// because it lost the coordinator (cmd/worker writes it): not a crash.
-const networkExitPrefix = "network: "
-
-// crash reports whether the termination was the worker failing on its own,
-// and describes it.
-func (t podTermination) crash() (bool, string) {
-	desc := fmt.Sprintf("last terminated %s, exit code %d", t.reason, t.exitCode)
-	if msg := strings.TrimSpace(t.message); msg != "" {
-		desc += ": " + strings.SplitN(msg, "\n", 2)[0]
-	}
-	switch {
-	case t.reason == "OOMKilled":
-		return true, desc
-	case strings.HasPrefix(t.message, networkExitPrefix):
-		return false, desc
-	case t.exitCode == 0:
-		return false, desc
-	default:
-		return true, desc
-	}
-}
-
 // k8sTermination reads worker's Pod status from Kubernetes. Outside it there
 // is no Pod to read, and no loss is taken for a crash.
-func (c *Coordinator) k8sTermination(worker string) (podTermination, bool) {
+func (c *Coordinator) k8sTermination(worker string) (coordk8s.Termination, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cs, ns, _, err := c.workerClientset(ctx)
 	if err != nil || cs == nil {
-		return podTermination{}, false
+		return coordk8s.Termination{}, false
 	}
 	pod, err := cs.CoreV1().Pods(ns).Get(ctx, worker, metav1.GetOptions{})
 	if err != nil {
-		return podTermination{}, false
+		return coordk8s.Termination{}, false
 	}
-	var st *corev1.ContainerStatus
-	for i := range pod.Status.ContainerStatuses {
-		if pod.Status.ContainerStatuses[i].Name == coordk8s.WorkerContainerName {
-			st = &pod.Status.ContainerStatuses[i]
-			break
-		}
-	}
-	if st == nil {
-		return podTermination{}, false
-	}
-	t := podTermination{podUID: string(pod.UID), restarts: st.RestartCount}
-	if last := st.LastTerminationState.Terminated; last != nil {
-		t.reason, t.exitCode, t.message = last.Reason, last.ExitCode, last.Message
-	}
-	return t, true
+	return coordk8s.TerminationOf(pod)
 }
 
 // errCrashLoop marks a run ended by a worker crashing again and again.
@@ -288,7 +238,7 @@ func (s *supervisor) noteLoss(worker string, epoch uint64) bool {
 // noteBack classifies the loss a worker comes back from (see workerBack) and
 // returns its crashes in a row, whether this loss was one, and its
 // description.
-func (s *supervisor) noteBack(worker string, term podTermination, known bool, owedMark uint64, now time.Time) (int, bool, string) {
+func (s *supervisor) noteBack(worker string, term coordk8s.Termination, known bool, owedMark uint64, now time.Time) (int, bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := s.healthOf(worker)
@@ -298,12 +248,12 @@ func (s *supervisor) noteBack(worker string, term podTermination, known bool, ow
 		// A crash is fresh when the same Pod restarted since it was last
 		// seen. The second arm is the first sighting of a Pod: nothing was
 		// seen before, so any restart it already counts is new to us.
-		fresh := (term.podUID == h.seenUID && term.restarts > h.seenRestarts) ||
-			(h.seenUID == "" && term.restarts > 0)
+		fresh := (term.PodUID == h.seenUID && term.Restarts > h.seenRestarts) ||
+			(h.seenUID == "" && term.Restarts > 0)
 		if h.lossPending && fresh {
-			crashed, desc = term.crash()
+			crashed, desc = term.Crash()
 		}
-		h.seenUID, h.seenRestarts = term.podUID, term.restarts
+		h.seenUID, h.seenRestarts = term.PodUID, term.Restarts
 	}
 	h.lossPending = false
 	if crashed {
@@ -347,36 +297,7 @@ func (c *Coordinator) workerTermination(worker string) string {
 	if err != nil {
 		return ""
 	}
-	return describeTermination(worker, pod)
-}
-
-// describeTermination renders a worker Pod's state for workerTermination. It
-// reads the worker's own container, selected by name: the kubelet sorts
-// container statuses by name, so an injected sidecar (istio-proxy,
-// linkerd-proxy) can come first, and a sidecar stuck in CrashLoopBackOff
-// would otherwise be reported as the reason the worker did not come back.
-func describeTermination(worker string, pod *corev1.Pod) string {
-	var parts []string
-	for _, st := range pod.Status.ContainerStatuses {
-		if st.Name != coordk8s.WorkerContainerName {
-			continue
-		}
-		if t := st.LastTerminationState.Terminated; t != nil {
-			parts = append(parts, fmt.Sprintf("last terminated %s, exit code %d", t.Reason, t.ExitCode))
-		}
-		if w := st.State.Waiting; w != nil && w.Reason != "" {
-			parts = append(parts, "waiting: "+w.Reason)
-		}
-	}
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type == corev1.PodScheduled && cond.Status != corev1.ConditionTrue && cond.Message != "" {
-			parts = append(parts, "not scheduled: "+cond.Message)
-		}
-	}
-	if len(parts) == 0 {
-		return fmt.Sprintf("; pod %s is %s", worker, pod.Status.Phase)
-	}
-	return fmt.Sprintf("; pod %s: %s", worker, strings.Join(parts, "; "))
+	return coordk8s.DescribeTermination(worker, pod)
 }
 
 // workerAppends reports whether any table the worker writes is append-only,

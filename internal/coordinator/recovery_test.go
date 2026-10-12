@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"github.com/maltzsama/urutau/internal/coordk8s"
 	"strings"
 	"testing"
 	"time"
@@ -12,18 +13,18 @@ import (
 // scriptedTerminations stands in for the Kubernetes Pod status: each worker's
 // last container termination, as the coordinator reads it when the worker
 // comes back.
-type scriptedTerminations map[string]podTermination
+type scriptedTerminations map[string]coordk8s.Termination
 
-func (s scriptedTerminations) of(worker string) (podTermination, bool) {
+func (s scriptedTerminations) of(worker string) (coordk8s.Termination, bool) {
 	t, ok := s[worker]
 	return t, ok
 }
 
 // crashAgain records one more restart of worker's container, ended as t.
-func (s scriptedTerminations) crashAgain(worker string, t podTermination) {
+func (s scriptedTerminations) crashAgain(worker string, t coordk8s.Termination) {
 	prev := s[worker]
-	t.podUID = "uid-1"
-	t.restarts = prev.restarts + 1
+	t.PodUID = "uid-1"
+	t.Restarts = prev.Restarts + 1
 	s[worker] = t
 }
 
@@ -36,7 +37,7 @@ func recoveryHarness(t *testing.T) (*Coordinator, *supervisor, scriptedTerminati
 	c.sessionErrs = make(chan error, 8)
 	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
 	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
-	terms := scriptedTerminations{"w1": {podUID: "uid-1"}}
+	terms := scriptedTerminations{"w1": {PodUID: "uid-1"}}
 	c.podTermination = terms.of
 	return c, s, terms
 }
@@ -54,7 +55,7 @@ func loseAndReturn(c *Coordinator, s *supervisor) error {
 func TestConsecutiveCrashesEndTheRun(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
 	for i := 1; i <= defaultMaxConsecutiveCrashes; i++ {
-		terms.crashAgain("w1", podTermination{reason: "OOMKilled", exitCode: 137})
+		terms.crashAgain("w1", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137})
 		err := loseAndReturn(c, s)
 		if i < defaultMaxConsecutiveCrashes && err != nil {
 			t.Fatalf("crash %d ended the run: %v", i, err)
@@ -72,7 +73,7 @@ func TestConsecutiveCrashesEndTheRun(t *testing.T) {
 func TestNetworkLossesAreNotCrashes(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
 	for i := 0; i < 3*defaultMaxConsecutiveCrashes; i++ {
-		terms.crashAgain("w1", podTermination{exitCode: 1, message: "network: worker: channel lost: connection timed out"})
+		terms.crashAgain("w1", coordk8s.Termination{ExitCode: 1, Message: "network: worker: channel lost: connection timed out"})
 		if err := loseAndReturn(c, s); err != nil {
 			t.Fatalf("network loss %d ended the run: %v", i+1, err)
 		}
@@ -84,7 +85,7 @@ func TestNetworkLossesAreNotCrashes(t *testing.T) {
 func TestAReplacedPodIsNotACrash(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
 	for i := 0; i < 3*defaultMaxConsecutiveCrashes; i++ {
-		terms["w1"] = podTermination{podUID: "uid-new-" + string(rune('a'+i))}
+		terms["w1"] = coordk8s.Termination{PodUID: "uid-new-" + string(rune('a'+i))}
 		if err := loseAndReturn(c, s); err != nil {
 			t.Fatalf("replaced Pod %d ended the run: %v", i+1, err)
 		}
@@ -99,7 +100,7 @@ func TestDeliveringWhatItOwedStartsTheCountOver(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second}
 	for i := 0; i < 3*defaultMaxConsecutiveCrashes; i++ {
-		terms.crashAgain("w1", podTermination{reason: "OOMKilled", exitCode: 137})
+		terms.crashAgain("w1", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137})
 		if err := loseAndReturn(c, s); err != nil {
 			t.Fatalf("spaced crash %d ended the run: %v", i+1, err)
 		}
@@ -120,7 +121,7 @@ func TestAnIdleWorkerCrashLoopEndsTheRun(t *testing.T) {
 	c.index["w1"].Clear()
 	var err error
 	for i := 0; i < defaultMaxConsecutiveCrashes; i++ {
-		terms.crashAgain("w1", podTermination{exitCode: 2, message: "panic: nil map"})
+		terms.crashAgain("w1", coordk8s.Termination{ExitCode: 2, Message: "panic: nil map"})
 		err = loseAndReturn(c, s)
 	}
 	if err == nil || !strings.Contains(err.Error(), "panic") {
@@ -162,17 +163,17 @@ func TestAWorkerOwingNothingIsNeverAbsent(t *testing.T) {
 func TestPodTerminationClassification(t *testing.T) {
 	cases := []struct {
 		name  string
-		term  podTermination
+		term  coordk8s.Termination
 		crash bool
 	}{
-		{"oom", podTermination{reason: "OOMKilled", exitCode: 137}, true},
-		{"panic", podTermination{exitCode: 2, message: "panic: runtime error"}, true},
-		{"error", podTermination{exitCode: 1, message: "worker: table t: commit: boom"}, true},
-		{"network", podTermination{exitCode: 1, message: "network: worker: channel lost"}, false},
-		{"clean exit", podTermination{exitCode: 0}, false},
+		{"oom", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137}, true},
+		{"panic", coordk8s.Termination{ExitCode: 2, Message: "panic: runtime error"}, true},
+		{"error", coordk8s.Termination{ExitCode: 1, Message: "worker: table t: commit: boom"}, true},
+		{"network", coordk8s.Termination{ExitCode: 1, Message: "network: worker: channel lost"}, false},
+		{"clean exit", coordk8s.Termination{ExitCode: 0}, false},
 	}
 	for _, tc := range cases {
-		if got, _ := tc.term.crash(); got != tc.crash {
+		if got, _ := tc.term.Crash(); got != tc.crash {
 			t.Errorf("%s: crash = %v, want %v", tc.name, got, tc.crash)
 		}
 	}
@@ -183,7 +184,7 @@ func TestPodTerminationClassification(t *testing.T) {
 func TestALossSeenOnBothStreamsCountsOnce(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
 	for i := 1; i < defaultMaxConsecutiveCrashes; i++ {
-		terms.crashAgain("w1", podTermination{reason: "OOMKilled", exitCode: 137})
+		terms.crashAgain("w1", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137})
 		c.signalSessionEnd("w1", context.Canceled) // Session stream
 		c.signalSessionEnd("w1", context.Canceled) // Control stream, same loss
 		s.noteAttach("w1")

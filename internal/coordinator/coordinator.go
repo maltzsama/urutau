@@ -367,9 +367,9 @@ type Coordinator struct {
 	// chunkCursor is, per table and chunkRef, the last acked window's high
 	// key (#646).
 	chunkCursor map[cursorKey][]any
-	// podTermination reads a worker's last container termination; nil
+	// coordk8s.Termination reads a worker's last container termination; nil
 	// reads it from Kubernetes (recovery.go). Set by tests.
-	podTermination func(worker string) (podTermination, bool)
+	podTermination func(worker string) (coordk8s.Termination, bool)
 	// snapshotTodo is each snapshotting table's chunks still to do
 	// (snapshotPlan); read-only once set.
 	snapshotTodoMu sync.Mutex

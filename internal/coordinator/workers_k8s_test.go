@@ -141,11 +141,11 @@ func TestK8sTerminationReadsWorkerContainerNotSidecar(t *testing.T) {
 	if !ok {
 		t.Fatal("termination not read")
 	}
-	if term.restarts != 2 || term.reason != "OOMKilled" || term.exitCode != 137 {
+	if term.Restarts != 2 || term.Reason != "OOMKilled" || term.ExitCode != 137 {
 		t.Fatalf("read the wrong container: %+v", term)
 	}
-	if term.podUID != "uid-1" {
-		t.Fatalf("podUID = %q, want uid-1", term.podUID)
+	if term.PodUID != "uid-1" {
+		t.Fatalf("podUID = %q, want uid-1", term.PodUID)
 	}
 }
 

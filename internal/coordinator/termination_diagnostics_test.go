@@ -25,7 +25,7 @@ func TestDescribeTerminationReadsTheWorkerContainerNotASidecar(t *testing.T) {
 				Terminated: &corev1.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}},
 		},
 	}}
-	got := describeTermination("w0", pod)
+	got := coordk8s.DescribeTermination("w0", pod)
 	if !strings.Contains(got, "OOMKilled") || !strings.Contains(got, "137") {
 		t.Errorf("message %q does not carry the worker's own termination", got)
 	}
@@ -44,7 +44,7 @@ func TestDescribeTerminationFallsBackToThePhase(t *testing.T) {
 			{Name: coordk8s.WorkerContainerName},
 		},
 	}}
-	if got, want := describeTermination("w0", pod), "; pod w0 is Running"; got != want {
+	if got, want := coordk8s.DescribeTermination("w0", pod), "; pod w0 is Running"; got != want {
 		t.Errorf("message = %q, want %q", got, want)
 	}
 }
