@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"context"
@@ -10,6 +10,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // Partitions divides this table's single-column primary key into n
@@ -31,7 +33,7 @@ func (c *Chunker) Partitions(ctx context.Context, n int) ([]source.Chunk, error)
 	}
 	pk := c.pk[0]
 
-	st, err := QueryTable(ctx, c.db, c.schema, c.table)
+	st, err := catalog.QueryTable(ctx, c.db, c.schema, c.table)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: partition: introspect %s: %w", c.qualifiedTable(), err)
 	}
@@ -105,8 +107,8 @@ func isStringType(dataType string) bool {
 }
 
 func (c *Chunker) minMax(ctx context.Context, col string) (minVal, maxVal any, err error) {
-	quoted := quotePgIdent(col)
-	query := psql.Select("MIN("+quoted+")", "MAX("+quoted+")").From(c.qualifiedTable())
+	quoted := catalog.QuoteIdent(col)
+	query := Builder.Select("MIN("+quoted+")", "MAX("+quoted+")").From(c.qualifiedTable())
 	sqlStr, args, err := query.ToSql()
 	if err != nil {
 		return nil, nil, err
@@ -243,14 +245,14 @@ func (c *Chunker) partitionNumeric(minVal, maxVal any, n int) ([]source.Chunk, e
 // character set. A sparse table (fewer distinct keys than workers) is padded
 // with degenerate empty ranges so the count stays n.
 func (c *Chunker) partitionString(ctx context.Context, col string, n int) ([]source.Chunk, error) {
-	quoted := quotePgIdent(col)
+	quoted := catalog.QuoteIdent(col)
 	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("postgres: partition: tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	countQ := psql.Select("COUNT(*)").From(c.qualifiedTable())
+	countQ := Builder.Select("COUNT(*)").From(c.qualifiedTable())
 	sqlStr, args, err := countQ.ToSql()
 	if err != nil {
 		return nil, err
@@ -266,7 +268,7 @@ func (c *Chunker) partitionString(ctx context.Context, col string, n int) ([]sou
 	var boundaries []any
 	for i := 1; i < n; i++ {
 		off := int64(i) * total / int64(n)
-		q := psql.Select(quoted).
+		q := Builder.Select(quoted).
 			From(c.qualifiedTable()).
 			OrderBy(quoted).
 			Limit(1).

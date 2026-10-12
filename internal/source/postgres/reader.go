@@ -25,6 +25,14 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/retry"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/connect"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/replication"
 )
 
 // statusInterval is how often the reader reports its applied LSN back to
@@ -47,7 +55,7 @@ const (
 // connection used for introspection and position reads.
 type Config struct {
 	URI      string
-	ConnCfg  *ConnConfig // resolved from nested config (nil when using URI)
+	ConnCfg  *connect.Config // resolved from nested config (nil when using URI)
 	DB       *sql.DB
 	SlotName string
 	Tables   []source.TableRef
@@ -100,7 +108,7 @@ type Projection struct {
 
 // newProjection builds a projection, compiling the structured filter (#163)
 // to an expr program once per table, using the introspected column types.
-func newProjection(f *spec.Filter, st *TableState) (Projection, error) {
+func newProjection(f *spec.Filter, st *catalog.TableState) (Projection, error) {
 	p := Projection{filterCols: filterColumns(f)}
 	prog, err := compileFilterExpr(f, st)
 	if err != nil {
@@ -116,7 +124,7 @@ func (p Projection) hasFilter() bool { return p.program != nil }
 // keep reports whether a decoded positional row (table column order) satisfies
 // the filter. It materializes a map of ONLY the filter-referenced columns — the
 // hot path never builds a full row map (#455).
-func (p Projection) keep(row []any, st *TableState) (bool, error) {
+func (p Projection) keep(row []any, st *catalog.TableState) (bool, error) {
 	if p.program == nil {
 		return true, nil
 	}
@@ -170,7 +178,7 @@ func filterColumns(f *spec.Filter) []string {
 // relEntry binds a pgoutput relation id to its introspected state and the
 // pipeline's target mapping.
 type relEntry struct {
-	state *TableState
+	state *catalog.TableState
 	ref   source.TableRef
 	proj  Projection
 }
@@ -197,9 +205,9 @@ type Reader struct {
 	// builders and are emitted as ready wire batches (#455). No map[string]any
 	// and no row-change channel on the live path.
 	batchOut chan<- *dataplane.Batch
-	bySrc    map[string]source.TableRef // "schema.table" → ref (PK + target)
-	states   map[string]*TableState     // "schema.table" → introspected state
-	relByID  map[uint32]relEntry        // relation id → state, from Relation messages
+	bySrc    map[string]source.TableRef     // "schema.table" → ref (PK + target)
+	states   map[string]*catalog.TableState // "schema.table" → introspected state
+	relByID  map[uint32]relEntry            // relation id → state, from Relation messages
 	// projections is the per-source read projection (#162/#163).
 	projections map[string]Projection
 
@@ -253,18 +261,18 @@ func New(ctx context.Context, cfg Config, batchOut chan<- *dataplane.Batch) (*Re
 	if cfg.Plugin == "" {
 		cfg.Plugin = "pgoutput"
 	}
-	if err := EnsureSetup(ctx, cfg.DB, cfg.SlotName, cfg.Tables, cfg.Plugin, cfg.ReplicaIdentity); err != nil {
+	if err := replication.EnsureSetup(ctx, cfg.DB, cfg.SlotName, cfg.Tables, cfg.Plugin, cfg.ReplicaIdentity); err != nil {
 		return nil, err
 	}
 
 	bySrc := make(map[string]source.TableRef, len(cfg.Tables))
-	states := make(map[string]*TableState, len(cfg.Tables))
+	states := make(map[string]*catalog.TableState, len(cfg.Tables))
 	for _, ref := range cfg.Tables {
 		schema, table, ok := splitSource(ref.Source)
 		if !ok {
 			return nil, fmt.Errorf("postgres: reader: source %q must be schema.table", ref.Source)
 		}
-		st, err := QueryTable(ctx, cfg.DB, schema, table)
+		st, err := catalog.QueryTable(ctx, cfg.DB, schema, table)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: reader: introspect %s: %w", ref.Source, err)
 		}
@@ -313,7 +321,7 @@ func New(ctx context.Context, cfg Config, batchOut chan<- *dataplane.Batch) (*Re
 
 	wait := cfg.InitialWait
 	if wait <= 0 {
-		wait = defaultInitialWait
+		wait = connect.DefaultInitialWait
 	}
 	return &Reader{
 		cfg:         cfg,
@@ -413,7 +421,7 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 		}
 		if needConnect {
 			if derr := r.dialReplication(ctx); derr != nil {
-				if !isTransient(derr) || attempt >= r.retries {
+				if !retry.IsTransient(derr) || attempt >= r.retries {
 					return derr
 				}
 				r.cfg.Logger.Warn("postgres: replication reconnect failed",
@@ -421,7 +429,7 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
-				case <-time.After(retryBackoff(attempt)):
+				case <-time.After(retry.Backoff(attempt)):
 				}
 				continue
 			}
@@ -434,7 +442,7 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !isTransient(err) || attempt >= r.retries {
+		if !retry.IsTransient(err) || attempt >= r.retries {
 			return err
 		}
 		r.cfg.Logger.Warn("postgres: replication stream lost, reconnecting",
@@ -452,7 +460,7 @@ func (r *Reader) StartFromLSN(ctx context.Context, at *position.LSN) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(retryBackoff(attempt)):
+		case <-time.After(retry.Backoff(attempt)):
 		}
 	}
 }
@@ -570,7 +578,7 @@ func (r *Reader) pluginArgs() []string {
 	}
 	return []string{
 		`"proto_version" '1'`,
-		`"publication_names" '` + publicationFor(r.cfg.SlotName) + `'`,
+		`"publication_names" '` + replication.PublicationFor(r.cfg.SlotName) + `'`,
 	}
 }
 

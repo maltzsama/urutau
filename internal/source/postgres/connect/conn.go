@@ -1,4 +1,4 @@
-package postgres
+package connect
 
 import (
 	"context"
@@ -24,17 +24,17 @@ import (
 const (
 	defaultRetryCount = 3
 	maxMaxThreads     = 32
-	// defaultInitialWait and minInitialWait bound the CDC initial WAL wait.
-	defaultInitialWait = 300 * time.Second
+	// DefaultInitialWait and minInitialWait bound the CDC initial WAL wait.
+	DefaultInitialWait = 300 * time.Second
 	minInitialWait     = 30 * time.Second
 )
 
 // sshDialTimeout bounds the TCP dial to the bastion and the SSH handshake.
 const sshDialTimeout = 15 * time.Second
 
-// ConnConfig holds the resolved connection parameters, built from either a
+// Config holds the resolved connection parameters, built from either a
 // URI or the nested PostgresSource config.
-type ConnConfig struct {
+type Config struct {
 	// QueryURI is the libpq DSN rendered from the config. It is what travels
 	// to a distributed worker (the worker only receives kind + dsn).
 	QueryURI string
@@ -56,30 +56,30 @@ type ConnConfig struct {
 
 // Close tears down the SSH tunnel, if one was established. Safe to call
 // multiple times.
-func (c *ConnConfig) Close() error {
+func (c *Config) Close() error {
 	if c == nil || c.tunnel == nil {
 		return nil
 	}
 	return c.tunnel.Close()
 }
 
-// BuildConnConfig constructs a ConnConfig from a URI string.
-func BuildConnConfig(uri string) (*ConnConfig, error) {
+// Build constructs a Config from a URI string.
+func Build(uri string) (*Config, error) {
 	cfg, err := pgx.ParseConfig(uri)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse uri: %w", err)
 	}
-	return &ConnConfig{
+	return &Config{
 		QueryURI:        uri,
 		ConnConfig:      cfg,
 		MaxOpenConns:    resolveMaxThreads(0),
 		RetryCount:      defaultRetryCount,
-		InitialWaitTime: defaultInitialWait,
+		InitialWaitTime: DefaultInitialWait,
 		Plugin:          "pgoutput",
 	}, nil
 }
 
-// BuildConnConfigFromPostgres constructs a ConnConfig from the nested
+// BuildFromPostgres constructs a Config from the nested
 // PostgresSource config. When present, source.uri is ignored for connection
 // building.
 //
@@ -89,7 +89,7 @@ func BuildConnConfig(uri string) (*ConnConfig, error) {
 // Parsing the DSN also gets pgx's native TLS handling for free (require,
 // verify-ca and verify-full all follow libpq semantics, including loading the
 // CA and client cert/key). Only the SSH DialFunc is layered on afterwards.
-func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
+func BuildFromPostgres(pg *spec.PostgresSource) (*Config, error) {
 	if pg.Host == "" {
 		return nil, fmt.Errorf("postgres: host required")
 	}
@@ -103,7 +103,7 @@ func BuildConnConfigFromPostgres(pg *spec.PostgresSource) (*ConnConfig, error) {
 		return nil, fmt.Errorf("postgres: parse config: %w", err)
 	}
 
-	cc := &ConnConfig{
+	cc := &Config{
 		QueryURI:        dsn,
 		ConnConfig:      cfg,
 		MaxOpenConns:    resolveMaxThreads(pg.MaxThreads),
@@ -167,7 +167,7 @@ func resolveRetryCount(n int) int {
 // it, this is defense in depth).
 func resolveInitialWaitTime(seconds int) time.Duration {
 	if seconds == 0 {
-		return defaultInitialWait
+		return DefaultInitialWait
 	}
 	d := time.Duration(seconds) * time.Second
 	if d < minInitialWait {

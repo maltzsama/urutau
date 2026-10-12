@@ -20,6 +20,16 @@ import (
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/retry"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/connect"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/chunk"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/replication"
 )
 
 // Source adapts the Postgres pgoutput reader to the source contract. It is
@@ -27,8 +37,8 @@ import (
 type Source struct {
 	spec    *spec.Spec
 	rt      source.Runtime
-	db      *sql.DB     // the source's query connection (chunk SELECTs, introspection)
-	connCfg *ConnConfig // resolved connection config (nil when using URI)
+	db      *sql.DB         // the source's query connection (chunk SELECTs, introspection)
+	connCfg *connect.Config // resolved connection config (nil when using URI)
 }
 
 func capabilities() source.Capabilities {
@@ -46,15 +56,15 @@ func capabilities() source.Capabilities {
 
 func init() {
 	factory := func(s *spec.Spec, rt source.Runtime) (source.Source, error) {
-		var cc *ConnConfig
+		var cc *connect.Config
 		var err error
 		if s.Source.Postgres != nil {
-			cc, err = BuildConnConfigFromPostgres(s.Source.Postgres)
+			cc, err = connect.BuildFromPostgres(s.Source.Postgres)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			cc, err = BuildConnConfig(s.Source.URI)
+			cc, err = connect.Build(s.Source.URI)
 			if err != nil {
 				return nil, err
 			}
@@ -84,7 +94,7 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	if !ok {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: source %q must be db.table", t.Source)
 	}
-	st, err := QueryTable(ctx, a.db, schemaName, tableName)
+	st, err := catalog.QueryTable(ctx, a.db, schemaName, tableName)
 	if err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: introspect %s: %w", t.Source, err)
 	}
@@ -108,7 +118,7 @@ func (a Source) Introspect(ctx context.Context, t spec.Table) (core.TableRef, co
 	if err := checkColumnFilterCoversPK(t.ColumnFilter, pk); err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: %s: %w", t.Source, err)
 	}
-	cs, err := CanonicalSchema(st)
+	cs, err := catalog.CanonicalSchema(st)
 	if err != nil {
 		return source.TableRef{}, core.Schema{}, nil, fmt.Errorf("postgres: schema %s: %w", t.Source, err)
 	}
@@ -146,14 +156,14 @@ func (a Source) Incremental(ctx context.Context, t source.TableRef, cursor, afte
 	}
 	raw := make([]map[string]any, 0, incrementalPageSize+1)
 	for len(raw) <= incrementalPageSize {
-		vals, err := scanRow(rows)
+		vals, err := chunk.ScanRow(rows)
 		if errors.Is(err, sql.ErrNoRows) {
 			break
 		}
 		if err != nil {
 			return "", nil, false, err
 		}
-		raw = append(raw, normalizeRow(colsMeta, vals))
+		raw = append(raw, chunk.NormalizeRow(colsMeta, vals))
 	}
 	if err := rows.Err(); err != nil {
 		return "", nil, false, err
@@ -193,7 +203,7 @@ func (a Source) incrementalQuery(ctx context.Context, t source.TableRef, cursor,
 	if !ok {
 		return "", nil, fmt.Errorf("postgres: incremental: source %q must be schema.table", t.Source)
 	}
-	st, err := QueryTable(ctx, a.db, schema, table)
+	st, err := catalog.QueryTable(ctx, a.db, schema, table)
 	if err != nil {
 		return "", nil, fmt.Errorf("postgres: incremental: introspect %s: %w", t.Source, err)
 	}
@@ -211,9 +221,9 @@ func (a Source) incrementalQuery(ctx context.Context, t source.TableRef, cursor,
 	if len(specTable.ColumnFilter) > 0 && !slices.Contains(specTable.ColumnFilter, cursor) {
 		return "", nil, fmt.Errorf("postgres: incremental: cursor column %q must be listed in columnFilter", cursor)
 	}
-	q := psql.Select("*").From(quotePgIdent(schema) + "." + quotePgIdent(table))
+	q := chunk.Builder.Select("*").From(catalog.QuoteIdent(schema) + "." + catalog.QuoteIdent(table))
 	if len(specTable.ColumnFilter) > 0 {
-		q = psql.Select(quotedIdents(specTable.ColumnFilter)...).From(quotePgIdent(schema) + "." + quotePgIdent(table))
+		q = chunk.Builder.Select(catalog.QuoteIdents(specTable.ColumnFilter)...).From(catalog.QuoteIdent(schema) + "." + catalog.QuoteIdent(table))
 	}
 
 	afterCursor, afterPK := decodeIncrementalPos(after)
@@ -222,13 +232,13 @@ func (a Source) incrementalQuery(ctx context.Context, t source.TableRef, cursor,
 		return "", nil, err
 	}
 	if specTable.Filter != nil {
-		f, err := filterToSquirrel(specTable.Filter)
+		f, err := chunk.CompileFilter(specTable.Filter)
 		if err != nil {
 			return "", nil, fmt.Errorf("postgres: incremental: %s: %w", t.Source, err)
 		}
 		q = q.Where(f)
 	}
-	order := append([]string{quotePgIdent(cursor)}, quotedIdents(t.PrimaryKey)...)
+	order := append([]string{catalog.QuoteIdent(cursor)}, catalog.QuoteIdents(t.PrimaryKey)...)
 	q = q.OrderBy(order...).Limit(incrementalPageSize + 1)
 	query, args, err := q.ToSql()
 	if err != nil {
@@ -242,13 +252,13 @@ func (a Source) incrementalQuery(ctx context.Context, t source.TableRef, cursor,
 // upsert, so a non-unique cursor is never dropped); a cursor carrying a PK
 // tie-break advances the keyset on (cursor, pk) so a boundary group larger than
 // a page is not re-read forever (issue #572).
-func incrementalResume(q sq.SelectBuilder, st *TableState, source, cursor, afterCursor string, afterPK, primaryKey []string) (sq.SelectBuilder, error) {
+func incrementalResume(q sq.SelectBuilder, st *catalog.TableState, source, cursor, afterCursor string, afterPK, primaryKey []string) (sq.SelectBuilder, error) {
 	if afterCursor == "" {
 		return q, nil
 	}
 	ci := st.FindColumn(cursor)
 	if len(afterPK) == 0 {
-		return q.Where(sq.Expr(quotePgIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, afterCursor)), nil
+		return q.Where(sq.Expr(catalog.QuoteIdent(cursor)+" >= ?::"+st.Columns[ci].DataType, afterCursor)), nil
 	}
 	pkCols := make([]string, 0, len(primaryKey))
 	ph := make([]string, 0, len(primaryKey))
@@ -258,13 +268,13 @@ func incrementalResume(q sq.SelectBuilder, st *TableState, source, cursor, after
 		if kci < 0 {
 			return q, fmt.Errorf("postgres: incremental: key column %q not found in %s", name, source)
 		}
-		pkCols = append(pkCols, quotePgIdent(name))
+		pkCols = append(pkCols, catalog.QuoteIdent(name))
 		ph = append(ph, "?::"+st.Columns[kci].DataType)
 		args = append(args, afterPK[i])
 	}
 	expr := fmt.Sprintf("%s > ?::%s OR (%s = ?::%s AND (%s) > (%s))",
-		quotePgIdent(cursor), st.Columns[ci].DataType,
-		quotePgIdent(cursor), st.Columns[ci].DataType,
+		catalog.QuoteIdent(cursor), st.Columns[ci].DataType,
+		catalog.QuoteIdent(cursor), st.Columns[ci].DataType,
 		strings.Join(pkCols, ", "), strings.Join(ph, ", "))
 	return q.Where(sq.Expr(expr, args...)), nil
 }
@@ -351,7 +361,7 @@ func (a Source) Discover(ctx context.Context, schemas []string) ([]source.TableR
 // (filterSchemaColumns drops unknown names) and then fail the snapshot with an
 // unknown-column SQL error — or, with a snapshot-skipping bootstrap, leave the
 // requested column silently absent.
-func checkColumnFilterExists(st *TableState, columnFilter []string) error {
+func checkColumnFilterExists(st *catalog.TableState, columnFilter []string) error {
 	for _, c := range columnFilter {
 		if st.FindColumn(c) < 0 {
 			return fmt.Errorf("columnFilter %q not found in the source table", c)
@@ -399,7 +409,7 @@ func (a Source) projectionFor(source string) (columns []string, filter sq.Sqlize
 	if len(t.ColumnFilter) > 0 {
 		columns = t.ColumnFilter
 	}
-	filter, err = filterToSquirrel(t.Filter)
+	filter, err = chunk.CompileFilter(t.Filter)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -412,29 +422,29 @@ func (a Source) projectionFor(source string) (columns []string, filter sq.Sqlize
 // filter (#163), and the chunk column / CTID target bytes (#151) come from the
 // spec.
 func (a Source) NewChunker(source, pk string, chunkSize int) (source.ChunkSource, error) {
-	opts := []ChunkerOption{}
+	opts := []chunk.Option{}
 	if a.connCfg != nil {
-		opts = append(opts, WithWorkers(a.connCfg.MaxOpenConns), WithRetries(a.connCfg.RetryCount))
+		opts = append(opts, chunk.WithWorkers(a.connCfg.MaxOpenConns), chunk.WithRetries(a.connCfg.RetryCount))
 	}
 	cols, filter, err := a.projectionFor(source)
 	if err != nil {
 		return nil, err
 	}
 	if len(cols) > 0 {
-		opts = append(opts, WithColumns(cols))
+		opts = append(opts, chunk.WithColumns(cols))
 	}
 	if filter != nil {
-		opts = append(opts, WithFilter(filter))
+		opts = append(opts, chunk.WithFilter(filter))
 	}
 	if t, ok := a.tableFor(source); ok && t.ChunkColumn != "" {
-		opts = append(opts, WithChunkColumn(t.ChunkColumn))
+		opts = append(opts, chunk.WithChunkColumn(t.ChunkColumn))
 	}
 	if tb := a.chunkTargetBytes(); tb > 0 {
-		opts = append(opts, WithTargetBytes(tb))
+		opts = append(opts, chunk.WithTargetBytes(tb))
 	}
 	// The construction introspects the chunk column's type (a one-time boot
 	// query); a background context is fine here.
-	return NewChunker(context.Background(), a.db, source, pk, chunkSize, opts...)
+	return chunk.New(context.Background(), a.db, source, pk, chunkSize, opts...)
 }
 
 // chunkTargetBytes parses sink.defaults.targetFileSize into the CTID
@@ -474,7 +484,7 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 	// Determine the replication URI and retry budget.
 	uri := a.spec.Source.URI
 	maxRetries := 0
-	initialWait := defaultInitialWait
+	initialWait := connect.DefaultInitialWait
 	plugin := "pgoutput"
 	if a.connCfg != nil {
 		uri = a.connCfg.QueryURI
@@ -493,11 +503,11 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 			if !ok {
 				continue
 			}
-			st, qerr := QueryTable(ctx, a.db, schemaName, tableName)
+			st, qerr := catalog.QueryTable(ctx, a.db, schemaName, tableName)
 			if qerr != nil {
 				return nil, fmt.Errorf("postgres: introspect %s: %w", ref.Source, qerr)
 			}
-			cs, serr := CanonicalSchema(st)
+			cs, serr := catalog.CanonicalSchema(st)
 			if serr != nil {
 				return nil, fmt.Errorf("postgres: schema %s: %w", ref.Source, serr)
 			}
@@ -554,15 +564,15 @@ func (a Source) Open(ctx context.Context, refs []source.TableRef) (source.Reader
 		}
 		// Retry only transient failures: a permanent error (bad password,
 		// missing database) is not going to heal with backoff.
-		if !isTransient(err) || attempt >= maxRetries {
+		if !retry.IsTransient(err) || attempt >= maxRetries {
 			return nil, fmt.Errorf("postgres: open (after %d retries): %w", attempt, err)
 		}
 		a.rt.Logger.Warn("postgres: connection failed, retrying",
-			"attempt", attempt+1, "backoff", retryBackoff(attempt), "err", err)
+			"attempt", attempt+1, "backoff", retry.Backoff(attempt), "err", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(retryBackoff(attempt)):
+		case <-time.After(retry.Backoff(attempt)):
 		}
 	}
 
@@ -616,7 +626,7 @@ func (a Source) filtersColumnsFor(refs []source.TableRef) (map[string]*spec.Filt
 // streaming from the slot's consistency point — everything after it flows
 // through the stream, everything before it belongs to the snapshot.
 func (a Source) InitialPosition(ctx context.Context) (position.Position, error) {
-	return ConfirmedLSN(ctx, a.db, a.spec.Source.SlotName)
+	return replication.ConfirmedLSN(ctx, a.db, a.spec.Source.SlotName)
 }
 
 // ParsePosition decodes a stored cdc.position as an LSN.
@@ -646,11 +656,11 @@ func (s stream) Start(ctx context.Context, from position.Position) error {
 	// Reconcile the stored resume with the slot before attaching the
 	// walsender, then advance the slot to the effective point so the server
 	// can recycle WAL the sink already committed (#156).
-	start, err := ValidateSlotState(ctx, s.db, s.cfg.SlotName, l, s.cfg.Logger)
+	start, err := replication.ValidateSlotState(ctx, s.db, s.cfg.SlotName, l, s.cfg.Logger)
 	if err != nil {
 		return err
 	}
-	if err := AdvanceSlot(ctx, s.db, s.cfg.SlotName, *start); err != nil {
+	if err := replication.AdvanceSlot(ctx, s.db, s.cfg.SlotName, *start); err != nil {
 		return err
 	}
 	s.Reader.SetResume(start.String())

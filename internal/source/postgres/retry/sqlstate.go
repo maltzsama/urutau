@@ -1,4 +1,4 @@
-package postgres
+package retry
 
 // retryableSQLState reports whether a PostgreSQL SQLSTATE is transient, per
 // the error-code appendix:

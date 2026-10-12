@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"context"
@@ -11,10 +11,14 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/retry"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
-// psql builds queries with Postgres $N placeholders.
-var psql = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
+// Builder builds queries with Postgres $N placeholders.
+var Builder = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
 // defaultChunkTargetBytes is the CTID strategy's target bytes per chunk when
 // the pipeline leaves sink.defaults.targetFileSize unset. It mirrors the sink's
@@ -82,12 +86,12 @@ type Chunker struct {
 	partitioned bool
 }
 
-// ChunkerOption tunes a Chunker.
-type ChunkerOption func(*Chunker)
+// Option tunes a Chunker.
+type Option func(*Chunker)
 
 // WithWorkers sets the concurrent normalization pool size. n < 1 is clamped
 // to 1 (sequential).
-func WithWorkers(n int) ChunkerOption {
+func WithWorkers(n int) Option {
 	return func(c *Chunker) {
 		if n < 1 {
 			n = 1
@@ -97,7 +101,7 @@ func WithWorkers(n int) ChunkerOption {
 }
 
 // WithRetries sets the transient-error retry budget for snapshot queries.
-func WithRetries(n int) ChunkerOption {
+func WithRetries(n int) Option {
 	return func(c *Chunker) {
 		if n < 0 {
 			n = 0
@@ -107,24 +111,24 @@ func WithRetries(n int) ChunkerOption {
 }
 
 // WithColumns sets the column projection (#162). Empty means all columns.
-func WithColumns(cols []string) ChunkerOption {
+func WithColumns(cols []string) Option {
 	return func(c *Chunker) { c.columns = cols }
 }
 
 // WithFilter sets the compiled structured filter (#163). Nil means none.
-func WithFilter(f sq.Sqlizer) ChunkerOption {
+func WithFilter(f sq.Sqlizer) Option {
 	return func(c *Chunker) { c.filter = f }
 }
 
 // WithChunkColumn selects the chunk column (#151). Empty keeps the CTID
 // default.
-func WithChunkColumn(col string) ChunkerOption {
+func WithChunkColumn(col string) Option {
 	return func(c *Chunker) { c.chunkColumn = strings.TrimSpace(col) }
 }
 
 // WithTargetBytes sets the CTID strategy's target bytes per chunk (from
 // sink.defaults.targetFileSize). Non-positive keeps the default.
-func WithTargetBytes(n int64) ChunkerOption {
+func WithTargetBytes(n int64) Option {
 	return func(c *Chunker) {
 		if n > 0 {
 			c.targetBytes = n
@@ -132,8 +136,8 @@ func WithTargetBytes(n int64) ChunkerOption {
 	}
 }
 
-// NewChunker builds a chunker for one source table.
-func NewChunker(ctx context.Context, db *sql.DB, source, pk string, chunkSize int, opts ...ChunkerOption) (*Chunker, error) {
+// New builds a chunker for one source table.
+func New(ctx context.Context, db *sql.DB, source, pk string, chunkSize int, opts ...Option) (*Chunker, error) {
 	schema, table, ok := strings.Cut(source, ".")
 	if !ok {
 		return nil, fmt.Errorf("postgres: chunker: source %q must be schema.table", source)
@@ -174,7 +178,7 @@ func (c *Chunker) resolveStrategy(ctx context.Context) error {
 		c.strategy = strategyCTID
 		return nil
 	}
-	st, err := QueryTable(ctx, c.db, c.schema, c.table)
+	st, err := catalog.QueryTable(ctx, c.db, c.schema, c.table)
 	if err != nil {
 		return fmt.Errorf("postgres: chunker: introspect %s: %w", c.qualifiedTable(), err)
 	}
@@ -205,7 +209,7 @@ func (c *Chunker) resolveStrategy(ctx context.Context) error {
 // The whole computation is retried on a transient error.
 func (c *Chunker) Bounds(ctx context.Context) ([][]any, error) {
 	var bounds [][]any
-	err := retryTransientErr(ctx, c.retries, func() error {
+	err := retry.DoErr(ctx, c.retries, func() error {
 		var err error
 		bounds, err = c.bounds(ctx)
 		return err
@@ -239,7 +243,7 @@ func (c *Chunker) keyBounds(ctx context.Context) ([][]any, error) {
 	if len(c.pk) != 1 {
 		return nil, fmt.Errorf("postgres: chunker: %s: partitioned chunking requires a single-column primary key", c.qualifiedTable())
 	}
-	st, err := QueryTable(ctx, c.db, c.schema, c.table)
+	st, err := catalog.QueryTable(ctx, c.db, c.schema, c.table)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +270,7 @@ func (c *Chunker) keyBounds(ctx context.Context) ([][]any, error) {
 
 // qualifiedTable is the quoted "schema"."table".
 func (c *Chunker) qualifiedTable() string {
-	return quotePgIdent(c.schema) + "." + quotePgIdent(c.table)
+	return catalog.QuoteIdent(c.schema) + "." + catalog.QuoteIdent(c.table)
 }
 
 // selectList is the SELECT column list: the projection, or * for all.
@@ -274,7 +278,7 @@ func (c *Chunker) selectList() []string {
 	if len(c.columns) == 0 {
 		return []string{"*"}
 	}
-	return quotedIdents(c.columns)
+	return catalog.QuoteIdents(c.columns)
 }
 
 // Scan executes the chunk SELECT and calls fn for every row, keyed by column
@@ -291,7 +295,7 @@ func (c *Chunker) selectList() []string {
 // inserts, order-independent).
 func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[string]any) error) error {
 	var buffered []map[string]any
-	err := retryTransientErr(ctx, c.retries, func() error {
+	err := retry.DoErr(ctx, c.retries, func() error {
 		buffered = buffered[:0]
 		return c.scanOnce(ctx, ch, func(m map[string]any) error {
 			buffered = append(buffered, m)
@@ -312,7 +316,7 @@ func (c *Chunker) Scan(ctx context.Context, ch source.Chunk, fn func(row map[str
 // chunkQuery builds the chunk SELECT: the projection, the strategy's range
 // predicate, and the structured filter, all ANDed.
 func (c *Chunker) chunkQuery(ch source.Chunk) (sq.SelectBuilder, error) {
-	q := psql.Select(c.selectList()...).From(c.qualifiedTable())
+	q := Builder.Select(c.selectList()...).From(c.qualifiedTable())
 	switch {
 	case c.strategy == strategyCTID && !c.partitioned:
 		if ch.Low != nil {
@@ -322,7 +326,7 @@ func (c *Chunker) chunkQuery(ch source.Chunk) (sq.SelectBuilder, error) {
 			q = q.Where(ctidCompare("<", ch.High[0]))
 		}
 	default:
-		col := quotePgIdent(c.chunkColumn)
+		col := catalog.QuoteIdent(c.chunkColumn)
 		if ch.Low != nil {
 			q = q.Where(sq.GtOrEq{col: ch.Low[0]})
 		}
@@ -417,7 +421,7 @@ const scanBatchSize = 256
 
 // scanPipeline pulls raw rows from produce and calls fn with the normalized
 // map. With workers <= 1 it is a straight loop; otherwise a producer feeds a
-// bounded pool of workers that normalize whole batches in parallel, and a
+// bounded pool of workers that Normalize whole batches in parallel, and a
 // single collector calls fn — so fn never runs concurrently and no row
 // escapes by racing a channel pull. Row order is not preserved: snapshot rows
 // are keyed inserts, order-independent.
@@ -437,7 +441,7 @@ func scanPipeline(
 			if !ok {
 				return nil
 			}
-			if err := fn(normalizeRow(cols, vals)); err != nil {
+			if err := fn(NormalizeRow(cols, vals)); err != nil {
 				return err
 			}
 		}
@@ -493,7 +497,7 @@ func scanPipeline(
 			for b := range jobs {
 				out := make([]map[string]any, len(b))
 				for j := range b {
-					out[j] = normalizeRow(cols, b[j])
+					out[j] = NormalizeRow(cols, b[j])
 				}
 				select {
 				case results <- out:
@@ -536,17 +540,17 @@ func scanPipeline(
 	return g.Wait()
 }
 
-// normalizeRow maps one raw row to a column-keyed map through the shared
+// NormalizeRow maps one raw row to a column-keyed map through the shared
 // scalar mapping.
-func normalizeRow(cols []string, vals []any) map[string]any {
+func NormalizeRow(cols []string, vals []any) map[string]any {
 	m := make(map[string]any, len(cols))
 	for i, name := range cols {
-		m[name] = normalize(vals[i])
+		m[name] = Normalize(vals[i])
 	}
 	return m
 }
 
-func scanRow(rows *sql.Rows) ([]any, error) {
+func ScanRow(rows *sql.Rows) ([]any, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -572,28 +576,14 @@ func scanRow(rows *sql.Rows) ([]any, error) {
 	// []byte cell here would otherwise flow raw into the persisted bounds
 	// and be bound back into SQL as the wrong type.
 	for i := range vals {
-		vals[i] = normalize(vals[i])
+		vals[i] = Normalize(vals[i])
 	}
 	return vals, nil
 }
 
-// quotePgIdent quotes one identifier, doubling embedded quotes.
-func quotePgIdent(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
-}
-
-// quotedIdents quotes each identifier.
-func quotedIdents(cols []string) []string {
-	out := make([]string, len(cols))
-	for i, c := range cols {
-		out[i] = quotePgIdent(strings.TrimSpace(c))
-	}
-	return out
-}
-
-// normalize maps driver values into the scalar subset shared with the
+// Normalize maps driver values into the scalar subset shared with the
 // stream decoder.
-func normalize(v any) any {
+func Normalize(v any) any {
 	switch t := v.(type) {
 	case []byte:
 		return string(t)

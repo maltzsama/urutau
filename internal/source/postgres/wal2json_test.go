@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/maltzsama/urutau/position"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 func TestCoerceWal2json(t *testing.T) {
@@ -37,7 +39,7 @@ func TestCoerceWal2json(t *testing.T) {
 }
 
 func TestWal2jsonRowPos(t *testing.T) {
-	st := &TableState{Columns: []Column{
+	st := &catalog.TableState{Columns: []catalog.Column{
 		{Name: "id", DataType: "bigint"},
 		{Name: "v", DataType: "text"},
 	}}

@@ -9,6 +9,8 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/chunk"
 )
 
 // paritySchema exercises every encoding branch the incremental direct path
@@ -79,7 +81,7 @@ func TestIncrementalArrowParityWithMapPath(t *testing.T) {
 	for i, r := range rows {
 		m := make(map[string]any, len(parityNames))
 		for j, name := range parityNames {
-			m[name] = normalize(r[j])
+			m[name] = chunk.Normalize(r[j])
 		}
 		changes[i] = rowchange.Change{
 			Op:       rowchange.OpInsert,
@@ -153,7 +155,7 @@ func TestIncrementalArrowAllocsFewerThanMapPath(t *testing.T) {
 		for i, r := range rows {
 			m := make(map[string]any, len(parityNames))
 			for j, name := range parityNames {
-				m[name] = normalize(r[j])
+				m[name] = chunk.Normalize(r[j])
 			}
 			changes[i] = rowchange.Change{Op: rowchange.OpInsert, Table: "raw.t", After: m, Position: "1"}
 		}
@@ -210,7 +212,7 @@ func benchIncremental(b *testing.B, direct bool) {
 		for i, r := range rows {
 			m := make(map[string]any, len(parityNames))
 			for j, name := range parityNames {
-				m[name] = normalize(r[j])
+				m[name] = chunk.Normalize(r[j])
 			}
 			changes[i] = rowchange.Change{Op: rowchange.OpInsert, Table: "raw.t", After: m, Position: "1"}
 		}

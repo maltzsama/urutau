@@ -10,11 +10,13 @@ import (
 	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // rowPos builds a positional table row (table column order) from a sparse
 // named image; columns not named are nil. Test shim for the direct path.
-func rowPos(st *TableState, vals map[string]any) []any {
+func rowPos(st *catalog.TableState, vals map[string]any) []any {
 	row := make([]any, len(st.Columns))
 	for name, v := range vals {
 		if i := st.FindColumn(name); i >= 0 {
@@ -27,7 +29,7 @@ func rowPos(st *TableState, vals map[string]any) []any {
 // testSchema maps an introspected table to a canonical schema without the
 // decimal precision the test fixtures omit; numeric/text both encode as string,
 // matching decodeScalar.
-func testSchema(st *TableState, pk []string) core.Schema {
+func testSchema(st *catalog.TableState, pk []string) core.Schema {
 	cols := make([]core.Column, len(st.Columns))
 	for i, c := range st.Columns {
 		cols[i] = core.Column{Name: c.Name, Type: core.ColumnType{Kind: testKind(c.DataType)}}
@@ -50,14 +52,14 @@ func testKind(dataType string) core.Kind {
 
 // directReader builds a Reader wired to a batch channel for the direct path:
 // the canonical schema, projection and relation entry the encoder needs.
-func directReader(out chan *dataplane.Batch, st *TableState, ref source.TableRef, upsert bool) *Reader {
+func directReader(out chan *dataplane.Batch, st *catalog.TableState, ref source.TableRef, upsert bool) *Reader {
 	cs := testSchema(st, ref.PrimaryKey)
 	proj, _ := newProjection(nil, st)
 	entry := relEntry{state: st, ref: ref, proj: proj}
 	return &Reader{
 		batchOut: out,
 		bySrc:    map[string]source.TableRef{ref.Source: ref},
-		states:   map[string]*TableState{ref.Source: st},
+		states:   map[string]*catalog.TableState{ref.Source: st},
 		relByID:  map[uint32]relEntry{1: entry},
 		encoders: map[string]*pgTable{},
 		cfg: Config{

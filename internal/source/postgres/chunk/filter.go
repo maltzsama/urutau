@@ -1,4 +1,4 @@
-package postgres
+package chunk
 
 import (
 	"fmt"
@@ -6,14 +6,16 @@ import (
 	sq "github.com/Masterminds/squirrel"
 
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
-// filterToSquirrel compiles the structured filter into a squirrel Sqlizer for
+// CompileFilter compiles the structured filter into a squirrel Sqlizer for
 // the snapshot chunk SELECT. Squirrel owns the SQL shape — identifier quoting
 // aside, there is no hand-built SQL string, and it handles placeholder
 // numbering and value binding. The structured spec.Filter is the single
 // filter type; this is only its SQL rendering.
-func filterToSquirrel(f *spec.Filter) (sq.Sqlizer, error) {
+func CompileFilter(f *spec.Filter) (sq.Sqlizer, error) {
 	if f == nil {
 		return nil, nil
 	}
@@ -62,7 +64,7 @@ func filterGroupToSquirrel(nodes []spec.Filter) ([]sq.Sqlizer, error) {
 }
 
 func filterPredicateToSquirrel(p *spec.Predicate) (sq.Sqlizer, error) {
-	col := quotePgIdent(p.Column)
+	col := catalog.QuoteIdent(p.Column)
 	switch p.Op {
 	case spec.OpEq:
 		return sq.Eq{col: p.Value}, nil

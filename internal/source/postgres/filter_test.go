@@ -6,6 +6,10 @@ import (
 	"testing"
 
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/chunk"
 )
 
 func TestFilterToSquirrel(t *testing.T) {
@@ -36,11 +40,11 @@ func TestFilterToSquirrel(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			filter, err := filterToSquirrel(c.f)
+			filter, err := chunk.CompileFilter(c.f)
 			if err != nil {
 				t.Fatal(err)
 			}
-			sqlStr, _, err := psql.Select("*").From("t").Where(filter).ToSql()
+			sqlStr, _, err := chunk.Builder.Select("*").From("t").Where(filter).ToSql()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -51,11 +55,11 @@ func TestFilterToSquirrel(t *testing.T) {
 	}
 }
 
-func testFilterState() *TableState {
-	return &TableState{
+func testFilterState() *catalog.TableState {
+	return &catalog.TableState{
 		Schema: "public",
 		Name:   "orders",
-		Columns: []Column{
+		Columns: []catalog.Column{
 			{Name: "status", DataType: "text"},
 			{Name: "amount", DataType: "numeric"},
 			{Name: "active", DataType: "boolean"},
@@ -253,7 +257,7 @@ func TestCheckFilterColumns(t *testing.T) {
 // A float column can hold NaN/Infinity; the filter must accept the special
 // literal instead of failing to compile a float-vs-string comparison.
 func TestFilterExprFloatSpecialValues(t *testing.T) {
-	st := &TableState{Columns: []Column{{Name: "amount", DataType: "double precision"}}}
+	st := &catalog.TableState{Columns: []catalog.Column{{Name: "amount", DataType: "double precision"}}}
 	cases := []struct {
 		name string
 		val  any

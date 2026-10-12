@@ -12,10 +12,12 @@ import (
 
 	"github.com/maltzsama/urutau/internal/source/filterexpr"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/source/postgres/catalog"
 )
 
 // pgPredicate adapts the Postgres leaf builder to filterexpr.PredicateBuilder.
-type pgPredicate struct{ st *TableState }
+type pgPredicate struct{ st *catalog.TableState }
 
 func (b pgPredicate) Predicate(p *spec.Predicate) (string, error) {
 	return filterExprPredicate(p, b.st)
@@ -42,7 +44,7 @@ func (b pgPredicate) Predicate(p *spec.Predicate) (string, error) {
 // exactly through pg_numeric_cmp (math/big), because Postgres evaluates
 // `numeric > float8` at the column's native precision, which float64 cannot
 // represent.
-func compileFilterExpr(f *spec.Filter, st *TableState) (*vm.Program, error) {
+func compileFilterExpr(f *spec.Filter, st *catalog.TableState) (*vm.Program, error) {
 	if f == nil {
 		return nil, nil
 	}
@@ -69,7 +71,7 @@ func compileFilterExpr(f *spec.Filter, st *TableState) (*vm.Program, error) {
 	return prog, nil
 }
 
-func filterExprPredicate(p *spec.Predicate, st *TableState) (string, error) {
+func filterExprPredicate(p *spec.Predicate, st *catalog.TableState) (string, error) {
 	raw := "row[" + strconv.Quote(p.Column) + "]"
 	switch p.Op {
 	case spec.OpIsNull:
@@ -158,14 +160,14 @@ func filterExprPgNumeric(p *spec.Predicate, raw string) (string, error) {
 
 // checkFilterColumns reports an error when a filter references a column that
 // is not in the introspected table (see filterexpr.CheckColumns).
-func checkFilterColumns(st *TableState, f *spec.Filter) error {
+func checkFilterColumns(st *catalog.TableState, f *spec.Filter) error {
 	return filterexpr.CheckColumns(f, st)
 }
 
 // columnIsPgNumeric reports whether the column is compared through the exact
 // pg_numeric_cmp helper: `numeric` and the floating types, which can hold
 // NaN/Infinity.
-func columnIsPgNumeric(st *TableState, name string) bool {
+func columnIsPgNumeric(st *catalog.TableState, name string) bool {
 	if st == nil {
 		return false
 	}
@@ -284,7 +286,7 @@ func cmpPgNumeric(a, b pgNumeric) int {
 // columnIsInteger reports whether the column is an integer type. Those are
 // compared through float() to match the snapshot, where Postgres casts the
 // integer column to float8 against the float8 literal parameter.
-func columnIsInteger(st *TableState, name string) bool {
+func columnIsInteger(st *catalog.TableState, name string) bool {
 	if st == nil {
 		return false
 	}
