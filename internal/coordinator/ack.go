@@ -90,6 +90,18 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	c.supervisor.NoteAck(worker, time.Now())
 	c.lastProgress.Store(time.Now().UnixNano())
 	if ack.BatchId != 0 && ack.Position == "" {
+		// A window's rows on a staged table are committed from the worker's
+		// staged delivery, and a delivery from a superseded generation is
+		// dropped. Its marker ack is dropped with it: a released marker is
+		// not redelivered to the reconnected worker, so the window's cycle
+		// would never get that owner's share, and every later cycle of the
+		// table would wait behind it (#855). Kept in flight, the marker is
+		// redelivered, the worker reports the window lost and the chunk is
+		// read again (#829).
+		if c.isStagedTable(ack.Table) && c.supersededEpoch(worker, ack.Epoch) {
+			c.log.Warn("coordinator: stale staged marker ack", "worker", worker, "table", ack.Table, "marker", ack.BatchId, "got", ack.Epoch)
+			return
+		}
 		c.onMarkerAck(worker, ack.BatchId)
 		return
 	}
