@@ -224,3 +224,21 @@ func (c *Coordinator) startEventlog(ctx context.Context, cfg eventlog.Config) (f
 		}
 	}, nil
 }
+
+// emitLog writes an event and logs any failure (best-effort trail).
+func (c *Coordinator) emitLog(kind string, fields map[string]any) {
+	if err := c.emit(kind, fields); err != nil {
+		c.log.Warn("coordinator: eventlog emit", "kind", kind, "err", err)
+	}
+}
+
+// terminalFields builds a job_stopped / job_terminated event's fields: the
+// coarse reason code plus the underlying error text, so a postmortem has more
+// than "reason": "crashloop" to go on (issue #351). err may be nil.
+func terminalFields(reason string, err error) map[string]any {
+	f := map[string]any{"reason": reason}
+	if err != nil {
+		f["error"] = err.Error()
+	}
+	return f
+}
