@@ -215,8 +215,17 @@ func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerSt
 // never committed, so no ghost owner is left registered under the old
 // layout — accepting Hellos, supervised, and holding a retention position it
 // will never advance.
+//
+// A worker may have attached to it while the scale was draining. Its session
+// ends here: left attached it stays bound to this forgotten group, and when
+// the scale is retried and registers the name again nothing reads the new
+// group's queue (#842). The worker attaches again and is refused as unknown
+// until the retry registers it.
 func (c *Coordinator) unregisterOwner(w *workerState) {
 	c.mu.Lock()
+	if cancel := w.cancel; cancel != nil {
+		cancel()
+	}
 	delete(c.workers, w.name)
 	delete(c.byTicket, string(w.ticket))
 	c.deleteIndex(w.name)
