@@ -89,7 +89,8 @@ func (r *CoordinatorReconciler) fieldManager() string {
 // +kubebuilder:rbac:groups=urutau.io,resources=cdcpipelines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=urutau.io,resources=cdcpipelines/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=configmaps;services,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;create;update;patch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch
@@ -231,6 +232,11 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// targeting the worker StatefulSet the coordinator creates. A no-op
 	// unless the operator was started with a Prometheus address.
 	if err := r.ensureScaledObjects(ctx, cr); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// The workers of a table removed from the pipeline (#835).
+	if err := r.pruneWorkerWorkloads(ctx, cr); err != nil {
 		return ctrl.Result{}, err
 	}
 
