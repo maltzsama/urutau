@@ -256,7 +256,17 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// An ATTACHED worker that owes nothing is merely idle — a quiet
 		// table, or one that just went through a re-slice — and resetting it
 		// is pointless (issue #312).
+		// The clock starts at the last ack, or at the last tick that saw
+		// the worker owing nothing, whichever is later: a worker that waited
+		// for work acked nothing in the meantime, and that wait is not a
+		// stall. After a coordinator restart the workers reconnect up to a
+		// minute before the reader starts; counted from the Hello alone, the
+		// first batch queued found the timeout already spent, and every
+		// worker that had connected early was reset.
 		at, ok := s.lastAck[p.name]
+		if idle, seen := s.lastDelivered[p.name]; seen && idle.After(at) {
+			at, ok = idle, true
+		}
 		if p.attached && p.owes && (!ok || now.Sub(at) > ack) && !s.busyLocked(p.name, now, at, ack) {
 			stalled = append(stalled, p.name)
 		}

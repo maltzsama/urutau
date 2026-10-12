@@ -20,6 +20,11 @@ type Batch struct {
 	// of its own id, once the window's rows are committed, never on a
 	// position ack a batch of the same or a later position sent (#468).
 	Marker bool
+	// Partial is a batch that does not end its table's rows of a transaction
+	// (dataplane.Batch.Partial). It carries the previous transaction's
+	// position, so an ack at that position does not say it was committed:
+	// it leaves only once the table is acked strictly beyond it (#823).
+	Partial bool
 }
 
 // PositionIndex tracks each worker's unacked batches so an Ack can release
@@ -150,7 +155,7 @@ func (p *PositionIndex) popCoveredLocked() (freed int64, freedOversized bool, po
 			if _, ok := p.acked[h.Table]; !ok {
 				break
 			}
-		} else if cur, ok := p.acked[h.Table]; !ok || !covered(h.High, cur) {
+		} else if cur, ok := p.acked[h.Table]; !ok || !covered(h.High, cur) || (h.Partial && !advances(cur, h.High)) {
 			break
 		}
 		freed += h.Bytes

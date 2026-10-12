@@ -52,9 +52,16 @@ func (r *batchReceiver) sendIngest(ing worker.Ingest) error {
 	}
 }
 
-// covered reports whether a positioned batch was already committed. Batches
-// without a position (snapshot window rows) are never skipped.
+// covered reports whether a positioned batch was already committed. Snapshot
+// window rows are never skipped: they are not part of the stream the
+// committed position measures. A fan-out snapshot's rows do carry a position,
+// their chunk's low watermark, and a resumed snapshot's is behind the
+// committed position: skipped, the window closed empty and the chunk counted
+// as done without its rows (#824).
 func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
+	if meta.Window != nil && meta.Window.Snapshot {
+		return false
+	}
 	cp, ok := r.committed[meta.Table]
 	if !ok || meta.HighPos == "" {
 		return false
@@ -67,6 +74,14 @@ func (r *batchReceiver) covered(meta *pb.BatchMeta) bool {
 	// committed point. An Incomparable comparison (opaque plugin offsets)
 	// cannot decide — never skip, reprocess is safe.
 	c := high.Compare(cp)
+	if meta.Partial {
+		// A partial batch carries the position of the transaction before
+		// its own. A commit that landed between two batches of that
+		// transaction recorded this same position, with this batch in it or
+		// not: at the committed position it is applied again, which an
+		// upsert absorbs, and skipped only strictly before it (#823).
+		return c != position.Incomparable && c < 0
+	}
 	return c != position.Incomparable && c <= 0
 }
 
@@ -83,7 +98,13 @@ func (r *batchReceiver) skipCovered(meta *pb.BatchMeta) bool {
 	}
 	r.log.Info("worker skip covered batch", "table", meta.Table, "high", meta.HighPos)
 	if r.ack != nil {
-		r.ack(meta.Table, meta.HighPos)
+		// A partial batch leaves the coordinator's in-flight index only on
+		// an ack strictly beyond its position: ack what is committed.
+		pos := meta.HighPos
+		if meta.Partial {
+			pos = r.committed[meta.Table].String()
+		}
+		r.ack(meta.Table, pos)
 	}
 	return true
 }

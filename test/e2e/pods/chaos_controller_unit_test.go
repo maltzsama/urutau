@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -165,8 +166,11 @@ func TestADrawWithoutATargetIsSkipped(t *testing.T) {
 // Maintenance Pods live for seconds, so no fault aims at them, and a
 // network fault names exactly the running Pods of its worker side.
 func TestRenderChaosSkipsMaintenanceAndListsRunningPods(t *testing.T) {
+	// A maintenance Pod is a bare Pod named after its worker: the coordinator
+	// names it <pipeline>-<table>-<hash>, with no "-maint" in it (#825).
 	pods := append([]podInfo{
 		{name: "p-raw-a-maint", app: "urutau-worker", group: "p-raw-a-maint", phase: "Running"},
+		{name: "p-raw-a-3c0795c0", app: "urutau-worker", group: "p-raw-a-3c0795c0", phase: "Running"},
 	}, testPods...)
 	for i := range 40 {
 		for _, k := range []chaosKind{chaosWorkerKill, chaosNetworkPartition} {
@@ -179,7 +183,7 @@ func TestRenderChaosSkipsMaintenanceAndListsRunningPods(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %v", k, err)
 			}
-			if strings.Contains(m, "maint") || strings.Contains(target, "maint") {
+			if strings.Contains(m, "maint") || strings.Contains(target, "maint") || strings.Contains(m, "3c0795c0") || strings.Contains(target, "3c0795c0") {
 				t.Fatalf("%s aimed at a maintenance Pod:\n%s", k, m)
 			}
 			if k == chaosNetworkPartition && (!strings.Contains(m, "- p-raw-a-0") || strings.Contains(m, "p-raw-b-0")) {
@@ -296,5 +300,44 @@ func TestATargetThatLeavesDuringInjectionIsDetected(t *testing.T) {
 	got := manifestTargets(m, []podInfo{{name: "w-3"}, {name: "w-2"}})
 	if len(got) != 1 || got[0].name != "w-3" {
 		t.Fatalf("manifest targets = %v, want [w-3]", got)
+	}
+}
+
+// A network fault has two sides, and the coordinator's is selected by label:
+// it is a target as much as the workers named in the manifest. A fault that
+// could not be injected because the coordinator was restarting, or held down
+// by a pod-failure, lost its target; it used to fail the run as "not
+// injected" (#825).
+func TestNetworkFaultCountsTheCoordinatorAsATarget(t *testing.T) {
+	d := newChaosPlanner(1, smokeChaos).next()
+	d.Kind, d.Scope = chaosNetworkDelay, scopeAllWorkers
+	m, _, _, _, err := renderChaos("pod-e2e", "p", d, "x", testPods)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var coordinator bool
+	for _, p := range manifestTargets(m, testPods) {
+		coordinator = coordinator || p.name == "p-coordinator-0"
+	}
+	if !coordinator {
+		t.Fatalf("the coordinator is not among the fault's targets:\n%s", m)
+	}
+
+	start := time.Now()
+	c := &chaosController{}
+	c.events = []*chaosEvent{
+		{Name: "net", Kind: chaosNetworkDelay, Resource: "networkchaos"},
+		{Name: "old", Kind: chaosCoordFailure, Resource: "podchaos", RemovedAt: start.Add(-time.Minute)},
+	}
+	if other, held := c.coordinatorFaultSince(start, "net"); held {
+		t.Fatalf("a fault removed before the injection began counts as holding the coordinator: %s", other)
+	}
+	c.events = append(c.events, &chaosEvent{Name: "down", Kind: chaosCoordFailure, Resource: "podchaos"})
+	if _, held := c.coordinatorFaultSince(start, "net"); !held {
+		t.Fatal("a pod-failure still on the coordinator is not seen")
+	}
+	c.events[2].RemovedAt = start.Add(30 * time.Second)
+	if _, held := c.coordinatorFaultSince(start, "net"); !held {
+		t.Fatal("a pod-failure that ended during the injection is not seen")
 	}
 }

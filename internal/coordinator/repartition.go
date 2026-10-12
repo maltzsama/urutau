@@ -10,6 +10,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 
@@ -161,14 +162,12 @@ func (c *Coordinator) flushPaused(ctx context.Context) error {
 			releaseHeld()
 			return fmt.Errorf("flush accumulated batches for %s: %w", table, err)
 		}
-		for i, b := range batches {
-			if err := c.enqueueBatch(ctx, b, nil); err != nil {
-				for _, rest := range batches[i+1:] {
-					rest.Release()
-				}
-				releaseHeld()
-				return fmt.Errorf("flush held batches for %s: %w", table, err)
-			}
+		// Sent the way a gate's held batches are: concatenated up to the
+		// cycle bounds. One by one, every held source batch became a cycle,
+		// and a commit, of its own (#828). enqueueHeld releases them all.
+		if err := c.enqueueHeld(ctx, &pb.BatchMeta{Table: table}, batches); err != nil {
+			releaseHeld()
+			return fmt.Errorf("flush held batches for %s: %w", table, err)
 		}
 	}
 	return nil
