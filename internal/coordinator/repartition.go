@@ -252,48 +252,23 @@ func (c *Coordinator) seedConfirmed(added []*workerState) {
 }
 
 // drainForFlip blocks until target owes nothing: no in-flight batch on any
-// current owner and no open staged cycle. Only this table is held; the
-// shared reader keeps streaming every other table.
+// current owner and no open staged cycle (route.AwaitDrained has the why).
+// Only this table is held; the shared reader keeps streaming every other
+// table.
 func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []*workerState) error {
-	deadline := time.NewTimer(c.drainTimeout())
-	defer deadline.Stop()
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		inflight, queued := 0, 0
-		// In-flight batches first. positionIndex frees a worker's queue
-		// strictly from the head, in send order, and a batch leaves only
-		// when the table's acked position covers it. After a flip the owner
-		// receives a DIFFERENT key range, whose acks need not cover the
-		// batch still at its head, so the queue can wedge: the owner stops
-		// acking, the supervisor calls it stale, and the reset discards its
-		// open staged cycles — silently losing the rows they carried.
+	ref := core.TableRef{Target: target}
+	owed := func() route.Owed {
+		var o route.Owed
 		for _, w := range owners {
-			inflight += c.index.InFlight(w.name)
-			queued += len(w.queue)
+			o.InFlight += c.index.InFlight(w.name)
+			o.Queued += len(w.queue)
 		}
-		// Then the staged cycles, which must commit as one unit and so must
-		// not span two layouts.
-		cycles := 0
-		cyclesOpen, cyclesDone := 0, 0
 		if c.stagesCycles() {
-			cyclesOpen, cyclesDone = c.staged.OpenForBreakdown(core.TableRef{Target: target})
-			cycles = cyclesOpen + cyclesDone
+			o.CyclesOpen, o.CyclesDone = c.staged.OpenForBreakdown(ref)
 		}
-		pending := inflight + queued + cycles
-		if pending == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s (in-flight=%d queued=%d staged-cycles=%d open=%d done=%d open-seqs=%v)",
-				pending, c.drainTimeout(), inflight, queued, cycles, cyclesOpen, cyclesDone, c.staged.OpenSeqs(core.TableRef{Target: target}))
-		case <-c.ackNotify: // an ack may have drained in-flight (issue #587)
-		case <-tick.C:
-		}
+		return o
 	}
+	return route.AwaitDrained(ctx, c.drainTimeout(), c.ackNotify, owed, func() []uint64 { return c.staged.OpenSeqs(ref) })
 }
 
 // retireOwner drains a removed owner's in-flight batches, then detaches it.
@@ -304,27 +279,17 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 // scale-out that reuses the name must not inherit the retired owner's crash
 // and delivery clocks (issue #491).
 func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
-	deadline := time.NewTimer(c.drainTimeout())
-	defer deadline.Stop()
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for c.index.InFlight(w.name) != 0 || len(w.queue) != 0 {
-		select {
-		case <-ctx.Done():
-			// The flip has already committed: the retire must finish, or the
-			// owner stays registered with a live session under the new
-			// layout. Force the detach rather than abort mid-way.
-			c.log.Warn("coordinator: owner drain context done; forcing removal",
-				"worker", w.name, "inflight", c.index.InFlight(w.name))
-		case <-deadline.C:
-			c.log.Warn("coordinator: owner drain timed out; forcing removal",
-				"worker", w.name, "inflight", c.index.InFlight(w.name), "timeout", c.drainTimeout())
-		case <-c.ackNotify: // an ack may have drained in-flight (issue #587)
-			continue
-		case <-tick.C:
-			continue
-		}
-		break
+	busy := func() bool { return c.index.InFlight(w.name) != 0 || len(w.queue) != 0 }
+	switch route.AwaitIdle(ctx, c.drainTimeout(), c.ackNotify, busy) {
+	case route.IdleCancelled:
+		// The flip has already committed: the retire must finish, or the
+		// owner stays registered with a live session under the new layout.
+		// Force the detach rather than abort mid-way.
+		c.log.Warn("coordinator: owner drain context done; forcing removal",
+			"worker", w.name, "inflight", c.index.InFlight(w.name))
+	case route.IdleTimedOut:
+		c.log.Warn("coordinator: owner drain timed out; forcing removal",
+			"worker", w.name, "inflight", c.index.InFlight(w.name), "timeout", c.drainTimeout())
 	}
 	c.mu.Lock()
 	if cancel := w.cancel; cancel != nil {
@@ -430,42 +395,31 @@ func (c *Coordinator) emitScale(target string, from, to int) {
 	c.log.Info("coordinator: table repartitioned", "table", target, "from", from, "to", to)
 }
 
-const (
-	defaultScaleDrainTimeout = 60 * time.Second
-	defaultMaxWorkers        = 32
-)
-
 // drainTimeout bounds the staged-cycle and in-flight drains of a re-slice.
 func (c *Coordinator) drainTimeout() time.Duration {
-	if c.cfg.ScaleDrainTimeout > 0 {
-		return c.cfg.ScaleDrainTimeout
-	}
-	return defaultScaleDrainTimeout
+	return route.DrainTimeout(c.cfg.ScaleDrainTimeout)
 }
 
-// maxWorkersFor returns target's partition cap: the table's own
-// spec.Table.Workers.Max when set, else the pipeline-wide Config.MaxWorkers,
-// else the default. A table that declares its own cap ignores the global one.
+// maxWorkersFor returns target's partition cap (route.WorkerCap): the table's
+// own spec.Table.Workers.Max when set, else the pipeline-wide
+// Config.MaxWorkers, else the default.
 func (c *Coordinator) maxWorkersFor(target string) int {
+	tableMax := 0
 	if c.specByTarget != nil {
-		if t, ok := c.specByTarget[target]; ok && t.Workers != nil && t.Workers.Max > 0 {
-			return t.Workers.Max
+		if t, ok := c.specByTarget[target]; ok && t.Workers != nil {
+			tableMax = t.Workers.Max
 		}
 	} else if c.cfg.Spec != nil {
 		for _, t := range c.tablesOrSpec() {
-			if t.Target != target {
-				continue
+			if t.Target == target {
+				if t.Workers != nil {
+					tableMax = t.Workers.Max
+				}
+				break
 			}
-			if t.Workers != nil && t.Workers.Max > 0 {
-				return t.Workers.Max
-			}
-			break
 		}
 	}
-	if c.cfg.MaxWorkers > 0 {
-		return c.cfg.MaxWorkers
-	}
-	return defaultMaxWorkers
+	return route.WorkerCap(tableMax, c.cfg.MaxWorkers)
 }
 
 // lookupChunker returns target's chunker, or nil when none is built yet.
