@@ -39,7 +39,7 @@ type supervisor struct {
 	// whose output grows is busy on slow storage, not stalled (#422).
 	progress sup.Progress
 	// health is each worker's losses and crashes (recovery.go).
-	health map[string]*workerHealth
+	health sup.Health
 	// lastDelivered is when each worker last delivered: an ack, or owing
 	// nothing. Unlike lastAck, a reconnect does not move it.
 	lastDelivered map[string]time.Time
@@ -51,7 +51,6 @@ func newSupervisor(c *Coordinator) *supervisor {
 		lastAck:       map[string]time.Time{},
 		resets:        map[string][]time.Time{},
 		pending:       map[string]bool{},
-		health:        map[string]*workerHealth{},
 		lastDelivered: map[string]time.Time{},
 	}
 }
@@ -99,7 +98,7 @@ func (s *supervisor) forget(worker string) {
 	delete(s.pending, worker)
 	delete(s.resets, worker)
 	s.progress.Forget(worker)
-	delete(s.health, worker)
+	s.health.Forget(worker)
 	delete(s.lastDelivered, worker)
 	s.mu.Unlock()
 }
@@ -121,23 +120,6 @@ func (s *supervisor) markPending(worker string) (already bool) {
 	already = s.pending[worker]
 	s.pending[worker] = true
 	return already
-}
-
-// recovering returns the workers noteDeliveringLocked acts on: those with a
-// crash on record and no loss pending. Nil when there is none.
-func (s *supervisor) recovering() map[string]bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out map[string]bool
-	for name, h := range s.health {
-		if h != nil && h.crashes > 0 && !h.lossPending {
-			if out == nil {
-				out = map[string]bool{}
-			}
-			out[name] = true
-		}
-	}
-	return out
 }
 
 // isPending reports whether a worker is reset-and-not-reattached.
@@ -206,10 +188,10 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	// A worker owes work when it holds a delivered-but-unacked batch or has
 	// one queued. The index has its own lock, so it is read outside c.mu,
 	// once per worker. Its oldest held batch is needed only for a worker
-	// coming back from a crash (noteDeliveringLocked ignores the others), and
+	// coming back from a crash (Health.Delivering ignores the others), and
 	// finding it scans the worker's whole in-flight window: it is not looked
 	// up for a healthy worker, which is nearly every worker on every tick.
-	recovering := s.recovering()
+	recovering := s.health.Recovering()
 	type minHeld struct {
 		name string
 		id   uint64
@@ -237,7 +219,7 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 			s.lastDelivered[p.name] = now
 		}
 		if p.attached && !s.pending[p.name] {
-			s.noteDeliveringLocked(p.name, held[i].id, now, ack)
+			s.health.Delivering(p.name, held[i].id, now, ack)
 		}
 		// A worker that owes work and has delivered none of it for the
 		// delivery timeout ends the run, attached or not: a partition that
