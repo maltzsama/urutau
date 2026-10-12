@@ -143,15 +143,14 @@ func TestDashStateTablesPosition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseGTID: %v", err)
 	}
-	c := &Coordinator{
+	c := withConfirmed(&Coordinator{
 		cfg: Config{Spec: &spec.Spec{Tables: []spec.Table{
 			{Source: "shop.orders", Target: "raw.orders"},
 		}}},
 		workers: map[string]*workerState{
 			"w-0": {refs: []source.TableRef{{Source: "shop.orders", Target: "raw.orders"}}},
 		},
-		confirmed: map[string]position.Position{"w-0": pos},
-	}
+	}, map[string]position.Position{"w-0": pos})
 
 	got := dashState{c}.Tables()
 	if len(got) != 1 {

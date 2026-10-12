@@ -305,10 +305,8 @@ func (c *Coordinator) phaseMaintenanceResumeBaseline(ctx context.Context, worker
 	// source slot advance past data a worker had not committed (WK-001 §2.2).
 	// resume is nil on a fresh boot, which correctly holds the slot until every
 	// worker has committed at least once.
-	c.confirmedMu.Lock()
 	for name := range c.workers {
-		c.confirmed[name] = resume
+		c.confirmed.Baseline(name, resume)
 	}
-	c.confirmedMu.Unlock()
 	return needsSnapshot, resume, nil
 }

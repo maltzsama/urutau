@@ -25,11 +25,10 @@ func owingCoordinator(t *testing.T, pos position.Position) *Coordinator {
 	t.Helper()
 	q := make(chan queuedBatch, 1)
 	q <- queuedBatch{}
-	return &Coordinator{
-		metrics:   observability.New(),
-		confirmed: map[string]position.Position{"w": pos},
-		workers:   map[string]*workerState{"w": {name: "w", queue: q}},
-	}
+	return withConfirmed(&Coordinator{
+		metrics: observability.New(),
+		workers: map[string]*workerState{"w": {name: "w", queue: q}},
+	}, map[string]position.Position{"w": pos})
 }
 
 // #602 review: the confirmed-position age grows while work is pending and the
@@ -53,18 +52,14 @@ func TestPublishConfirmedAge(t *testing.T) {
 	}
 
 	// Forward progress resets the clock.
-	c.confirmedMu.Lock()
-	c.confirmed["w"] = mustLSN(t, "0/16B6C51")
-	c.confirmedMu.Unlock()
+	c.confirmed.Baseline("w", mustLSN(t, "0/16B6C51"))
 	c.publishConfirmedAge(base.Add(45 * time.Second))
 	if got := testutil.ToFloat64(c.metrics.ConfirmedPositionAge); got != 0 {
 		t.Fatalf("age after the position advanced = %v, want 0", got)
 	}
 
 	// A REGRESSION (the minimum drops) must not reset the clock.
-	c.confirmedMu.Lock()
-	c.confirmed["w"] = mustLSN(t, "0/16B6C00")
-	c.confirmedMu.Unlock()
+	c.confirmed.Baseline("w", mustLSN(t, "0/16B6C00"))
 	c.publishConfirmedAge(base.Add(50 * time.Second))
 	if got := testutil.ToFloat64(c.metrics.ConfirmedPositionAge); got != 5 {
 		t.Fatalf("age after a regression = %v, want 5 (clock kept)", got)

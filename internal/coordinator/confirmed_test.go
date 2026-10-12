@@ -11,7 +11,7 @@ import (
 // numerically, and a string min would advance the Postgres slot past data
 // still in flight.
 func TestConfirmedPositionUsesPositionOrdering(t *testing.T) {
-	c := &Coordinator{confirmed: make(map[string]position.Position)}
+	c := &Coordinator{}
 
 	c.recordConfirmed("w1", position.MustLSN("0/10"))
 	c.recordConfirmed("w2", position.MustLSN("0/2"))
@@ -27,7 +27,7 @@ func TestConfirmedPositionUsesPositionOrdering(t *testing.T) {
 // the first and the Postgres slot advanced past WAL the lagging partition
 // had not read. Fails on the pre-C6 code.
 func TestConfirmedPositionMinAcrossWorkersOfSameTable(t *testing.T) {
-	c := &Coordinator{confirmed: make(map[string]position.Position)}
+	c := &Coordinator{}
 
 	c.recordConfirmed("orders-raw.orders-0", position.MustLSN("0/100"))
 	c.recordConfirmed("orders-raw.orders-1", position.MustLSN("0/2"))
@@ -39,7 +39,7 @@ func TestConfirmedPositionMinAcrossWorkersOfSameTable(t *testing.T) {
 
 // Nothing acked yet means nil: the source's retention must not advance.
 func TestConfirmedPositionEmptyIsNil(t *testing.T) {
-	c := &Coordinator{confirmed: make(map[string]position.Position)}
+	c := &Coordinator{}
 	if c.confirmedPosition() != nil {
 		t.Fatal("confirmed = non-nil with no acks, want nil")
 	}
@@ -49,11 +49,19 @@ func TestConfirmedPositionEmptyIsNil(t *testing.T) {
 // hold confirmedPosition back, not be omitted. The boot baseline seeds every
 // worker's entry, so the min never advances over a worker that owes data.
 func TestConfirmedPositionHoldsBackForUnackedWorker(t *testing.T) {
-	c := &Coordinator{confirmed: map[string]position.Position{
+	c := withConfirmed(&Coordinator{}, map[string]position.Position{
 		"orders-raw.orders-0": position.MustLSN("0/100"), // acked
 		"orders-raw.orders-1": nil,                       // registered, not acked
-	}}
+	})
 	if c.confirmedPosition() != nil {
 		t.Fatal("an unacked registered worker must hold confirmed at nil")
 	}
+}
+
+// withConfirmed registers each worker at its position in c.
+func withConfirmed(c *Coordinator, positions map[string]position.Position) *Coordinator {
+	for worker, pos := range positions {
+		c.confirmed.Baseline(worker, pos)
+	}
+	return c
 }

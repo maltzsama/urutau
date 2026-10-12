@@ -20,6 +20,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/confirmed"
 	"github.com/maltzsama/urutau/internal/coordk8s"
 	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/eventlog"
@@ -393,13 +394,7 @@ type Coordinator struct {
 	// only because one worker serves exactly one table (WorkerGroupNames
 	// embeds the target); a shared worker would fold two tables' positions
 	// into one minimum. See TestWorkerGroupNamesEmbedTarget.
-	confirmedMu sync.Mutex
-	confirmed   map[string]position.Position
-	// lastConfirmedPos/At track when the confirmed (minimum committed)
-	// position last advanced, for the confirmed-position age gauge (issue
-	// #602). Guarded by confirmedMu.
-	lastConfirmedPos position.Position
-	lastConfirmedAt  time.Time
+	confirmed confirmed.Positions
 
 	// bootCommitted is each table's committed cdc.position read at boot
 	// (resumeFrom). A crash recovery replays every table from the minimum
@@ -532,7 +527,6 @@ func Run(ctx context.Context, cfg Config) error {
 		ackNotify:   make(chan struct{}, 1),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
-		confirmed:   make(map[string]position.Position),
 		staged:      staged.New(),
 		stagedLocks: map[string]*sync.Mutex{},
 		booted:      make(chan struct{}),

@@ -160,9 +160,7 @@ func TestScaleInDropsOwnerAndShrinksRanges(t *testing.T) {
 	if c.index[dropped.name] == nil {
 		t.Fatalf("retired owner %q lost its position index: the ack path would nil-panic", dropped.name)
 	}
-	c.confirmedMu.Lock()
-	_, stillConfirmed := c.confirmed[dropped.name]
-	c.confirmedMu.Unlock()
+	stillConfirmed := c.confirmed.Has(dropped.name)
 	if stillConfirmed {
 		t.Fatalf("retired owner %q still counts toward confirmedPosition: it would pin retention", dropped.name)
 	}
@@ -186,10 +184,8 @@ func TestScaleOutSeedsConfirmedPosition(t *testing.T) {
 		t.Fatal("confirmedPosition went nil after scale-out: retention would stall pipeline-wide")
 	}
 	after, _ := c.loadRouting().OwnersOf("raw.orders")
-	c.confirmedMu.Lock()
-	defer c.confirmedMu.Unlock()
 	for _, w := range after[1:] {
-		if c.confirmed[w.name] == nil {
+		if c.confirmed.Of(w.name) == nil {
 			t.Fatalf("new owner %q was not seeded", w.name)
 		}
 	}
@@ -399,9 +395,7 @@ func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 	_, inWorkers := c.workers[name]
 	_, inIndex := c.index[name]
 	c.mu.Unlock()
-	c.confirmedMu.Lock()
-	_, inConfirmed := c.confirmed[name]
-	c.confirmedMu.Unlock()
+	inConfirmed := c.confirmed.Has(name)
 	if inWorkers || inIndex || inConfirmed {
 		t.Fatalf("created owner %q lingered after a failed scale: workers=%v index=%v confirmed=%v",
 			name, inWorkers, inIndex, inConfirmed)
