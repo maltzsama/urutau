@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -52,14 +51,13 @@ func coordHarness() (*Coordinator, *workerState) {
 			Source:   spec.Source{Kind: "postgres"},
 			Sink:     spec.Sink{Type: "iceberg"},
 		}},
-		log:         slog.New(slog.DiscardHandler),
-		src:         fakeSource{},
-		workers:     map[string]*workerState{"w0": w},
-		budget:      inflight.NewBudget(1<<20, 1<<10),
-		staged:      staged.New(),
-		stagedLocks: map[string]*sync.Mutex{},
-		runID:       "run-1",
-		windowOpen:  make(chan *pb.WindowOpen, 1024),
+		log:        slog.New(slog.DiscardHandler),
+		src:        fakeSource{},
+		workers:    map[string]*workerState{"w0": w},
+		budget:     inflight.NewBudget(1<<20, 1<<10),
+		staged:     staged.New(),
+		runID:      "run-1",
+		windowOpen: make(chan *pb.WindowOpen, 1024),
 	}
 	c.gate = gate.New[*dataplane.Batch](gateMaxEvents, gateMaxBytes, batchBytes, batchSink{c})
 	c.index.Set("w0", inflight.NewPositionIndex("run-1"))
@@ -326,32 +324,6 @@ func TestOnAckBadPositionIsIgnored(t *testing.T) {
 }
 
 // ── staged ───────────────────────────────────────────────────────────
-
-func TestMinSafePositions(t *testing.T) {
-	c, _ := coordHarness()
-	if got, err := c.minSafePositions([]string{"0/20", "0/10"}); err != nil || got != "0/10" {
-		t.Fatalf("minSafePositions = %q, %v; want 0/10", got, err)
-	}
-	if got, err := c.minSafePositions(nil); err != nil || got != "" {
-		t.Fatalf("minSafePositions(empty) = %q, %v; want empty", got, err)
-	}
-	c.src = errSource{}
-	if _, err := c.minSafePositions([]string{"x"}); err == nil {
-		t.Fatal("a bad position must error")
-	}
-}
-
-func TestStagedLockSerializesPerTable(t *testing.T) {
-	c, _ := coordHarness()
-	a1 := c.stagedLock("a")
-	a2 := c.stagedLock("a")
-	if a1 != a2 {
-		t.Fatal("same table must share one mutex")
-	}
-	if a1 == c.stagedLock("b") {
-		t.Fatal("different tables must not share a mutex")
-	}
-}
 
 func TestOnStagedBatchGuards(t *testing.T) {
 	c, _ := coordHarness()

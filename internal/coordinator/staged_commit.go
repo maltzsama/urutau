@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"fmt"
-	"sync"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/faultinject"
@@ -63,7 +62,7 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		return
 	}
 
-	mu := c.stagedLock(sb.Table)
+	mu := c.stagedLocks.For(sb.Table)
 	mu.Lock()
 	defer mu.Unlock()
 	if c.staged.IsPoisoned(sb.Table) {
@@ -98,7 +97,7 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 // commitStagedCycle commits one complete cycle, taking the table's staged
 // lock. Kept for callers that do not already hold it (tests, one-off paths).
 func (c *Coordinator) commitStagedCycle(cy *staged.Cycle) error {
-	mu := c.stagedLock(cy.Ref.Target)
+	mu := c.stagedLocks.For(cy.Ref.Target)
 	mu.Lock()
 	defer mu.Unlock()
 	if c.staged.IsPoisoned(cy.Ref.Target) {
@@ -130,7 +129,7 @@ func (c *Coordinator) commitStagedCycleLocked(cy *staged.Cycle) error {
 		pos = ""
 	} else if pos == "" {
 		var err error
-		if pos, err = c.minSafePositions(cy.Positions); err != nil {
+		if pos, err = staged.MinSafePosition(c.src.ParsePosition, cy.Positions); err != nil {
 			return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.Ref.Target, cy.Seq, err)
 		}
 	}
@@ -189,42 +188,6 @@ func (c *Coordinator) releaseCommittedCycles(table string, p position.Position) 
 		w.dropSent(popped)
 	}
 	c.notifyAck()
-}
-
-// stagedLock returns the mutex serializing staged commits for one table.
-func (c *Coordinator) stagedLock(table string) *sync.Mutex {
-	c.stagedMu.Lock()
-	defer c.stagedMu.Unlock()
-	mu := c.stagedLocks[table]
-	if mu == nil {
-		mu = &sync.Mutex{}
-		c.stagedLocks[table] = mu
-	}
-	return mu
-}
-
-// minSafePositions parses each delivery's watermark and returns the lowest one
-// as the cycle's commit position. An empty position set yields "".
-func (c *Coordinator) minSafePositions(positions []string) (string, error) {
-	vals := make([]position.Position, 0, len(positions))
-	for _, s := range positions {
-		if s == "" {
-			continue
-		}
-		p, err := c.src.ParsePosition(s)
-		if err != nil {
-			return "", err
-		}
-		vals = append(vals, p)
-	}
-	if len(vals) == 0 {
-		return "", nil
-	}
-	best, err := position.MinSafe(vals)
-	if err != nil {
-		return "", err
-	}
-	return best.String(), nil
 }
 
 // fail reports a terminal coordinator error without blocking if one is

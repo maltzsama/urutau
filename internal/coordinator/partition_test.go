@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/columnar"
 	"github.com/maltzsama/urutau/internal/partition"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -60,7 +61,7 @@ func TestSplitByOwnerRoutesRowsToTheirOwningPartition(t *testing.T) {
 		owner[i] = mustPartitionOwner(t, ranges, reader.Key(i))
 	}
 
-	subs, err := splitByOwner(context.Background(), rec, owner, len(ranges))
+	subs, err := columnar.SplitByOwner(context.Background(), rec, owner, len(ranges))
 	if err != nil {
 		t.Fatalf("splitByOwner: %v", err)
 	}
@@ -106,7 +107,7 @@ func TestSplitByOwnerOmitsEmptyPartitions(t *testing.T) {
 
 	// All rows go to partition 0; partitions 1 and 2 get nothing.
 	owner := []int{0}
-	subs, err := splitByOwner(context.Background(), rec, owner, 3)
+	subs, err := columnar.SplitByOwner(context.Background(), rec, owner, 3)
 	if err != nil {
 		t.Fatalf("splitByOwner: %v", err)
 	}
@@ -159,7 +160,7 @@ func TestSplitByOwnerAllRowsToOnePartitionRetainsInput(t *testing.T) {
 	}
 	defer rec.Release()
 
-	subs, err := splitByOwner(context.Background(), rec, []int{0, 0}, 1)
+	subs, err := columnar.SplitByOwner(context.Background(), rec, []int{0, 0}, 1)
 	if err != nil {
 		t.Fatalf("splitByOwner: %v", err)
 	}

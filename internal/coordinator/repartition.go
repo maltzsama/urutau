@@ -130,7 +130,7 @@ func (h routingHost) Retire(ctx context.Context, w *workerState) { h.c.retireOwn
 // onto a sink that cannot order concurrent writers.
 func (h routingHost) Admit(target string, n int) error {
 	c := h.c
-	if c.isSnapshotting(target) {
+	if c.snapshots.Is(target) {
 		return errors.New("snapshot in progress; retry once it completes")
 	}
 	if max := c.maxWorkersFor(target); n > max {

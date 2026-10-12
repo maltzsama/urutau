@@ -6,6 +6,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	route "github.com/maltzsama/urutau/internal/routing"
 	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/transport"
@@ -58,14 +59,14 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 	relay := &distributedRelay{c: c, ctx: ctx, ref: ref, owners: owners}
 	// Resume: reuse recorded bounds and pending when the previous run was
 	// interrupted mid-snapshot. Only progress THIS path recorded is safe: the
-	// range path also stamped propSnapshotPartitions and packed its pending
+	// range path also stamped snapshot.PropSnapshotPartitions and packed its pending
 	// ids (partition<<20 | index), which this path would misread as plain
 	// chunk indices, skip every chunk and mark an empty snapshot complete.
-	// resumableProgress rejects that stale shape so the snapshot runs afresh
+	// snapshot.FanoutProgress rejects that stale shape so the snapshot runs afresh
 	// (idempotent upserts).
 	if c.snk != nil {
 		if props, err := c.snk.Properties(ctx, tref); err == nil {
-			cfg.Progress = resumableProgress(props)
+			cfg.Progress = snapshot.FanoutProgress(props)
 		}
 		// Persist is called once, at cold start, with the full chunk set. The
 		// list is captured here so Release can name the chunks still to do
@@ -121,26 +122,6 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 		cfg.Progress = &snapshot.SnapshotProgress{State: snapshot.StateInProgress, Bounds: relay.bounds, Pending: redo}
 		relay.plan(relay.bounds, redo)
 	}
-}
-
-// resumableProgress returns the snapshot progress this fan-out path may
-// resume, or nil when there is none or it was written by the range path.
-//
-// The range path persists pending chunk ids packed as partition<<20 | index
-// (chunkRef) and stamps propSnapshotPartitions; the fan-out uses plain chunk
-// indices, so resuming a pack-format list would make every id out of range,
-// skip every chunk, and complete a snapshot that copied nothing. Presence of
-// propSnapshotPartitions is the discriminator: it is only ever written by the
-// range path, so its absence means the progress is the fan-out's own.
-func resumableProgress(props map[string]string) *snapshot.SnapshotProgress {
-	if props[propSnapshotPartitions] != "" {
-		return nil
-	}
-	sp, err := snapshot.ReadSnapshotProgress(props)
-	if err != nil || !snapshot.Resumable(sp) {
-		return nil
-	}
-	return sp
 }
 
 // distributedRelay adapts snapshot.SnapshotTable to the distributed
@@ -257,7 +238,7 @@ func (r *distributedRelay) fanOut(target string, chunkID uint32, batch *dataplan
 		}
 		owner[i] = p
 	}
-	subs, err := splitByOwner(r.ctx, batch.Record, owner, len(r.owners))
+	subs, err := columnar.SplitByOwner(r.ctx, batch.Record, owner, len(r.owners))
 	if err != nil {
 		batch.Release()
 		return fmt.Errorf("coordinator: snapshot %s: split by owner: %w", target, err)
@@ -275,7 +256,7 @@ func (r *distributedRelay) fanOut(target string, chunkID uint32, batch *dataplan
 		}
 		subBatch := &dataplane.Batch{Table: target, Record: sub, Mode: dataplane.AppendMode}
 		if err := r.c.enqueueTo(r.ctx, r.owners[p], subBatch, meta); err != nil {
-			releaseRecords(subs[p+1:])
+			columnar.ReleaseRecords(subs[p+1:])
 			batch.Release()
 			return err
 		}

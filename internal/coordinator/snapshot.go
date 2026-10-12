@@ -43,8 +43,8 @@ func (c *Coordinator) waitChunkReadyOr(ctx context.Context, table string, chunkI
 // Closes marker. The worker holds the chunk rows in its window; the window
 // is what InWindow events drain and the Closes marker flushes.
 func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
-	c.beginSnapshot(ref.Target)
-	defer c.endSnapshot(ref.Target)
+	c.snapshots.Begin(ref.Target)
+	defer c.snapshots.End(ref.Target)
 
 	rt := c.loadRouting()
 	owners, ok := rt.OwnersOf(ref.Target)
@@ -83,8 +83,8 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	if err != nil {
 		return err
 	}
-	c.setSnapshotTodo(ref.Target, todo)
-	defer c.setSnapshotTodo(ref.Target, nil)
+	c.snapshots.SetTodo(ref.Target, todo)
+	defer c.snapshots.SetTodo(ref.Target, nil)
 	var emptyOwners []string
 	for p, w := range owners {
 		clipped, err := snapshot.ClipChunksToRange(allChunks, ranges[p])
@@ -133,7 +133,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 	windows := map[uint64]int{} // window seq → chunk index, this partition
 	var epoch uint64
 	haveEpoch := false
-	todo := c.snapshotTodoFor(ref.Target)
+	todo := c.snapshots.Todo(ref.Target)
 	for i := 0; i < len(chunks); {
 		if err := ctx.Err(); err != nil {
 			return err

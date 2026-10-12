@@ -4,12 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/compute"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 	route "github.com/maltzsama/urutau/internal/routing"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
@@ -145,7 +142,7 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 		}
 		owner[i] = p
 	}
-	subBatches, err := splitByOwner(ctx, b.Record, owner, len(owners))
+	subBatches, err := columnar.SplitByOwner(ctx, b.Record, owner, len(owners))
 	if err != nil {
 		return fmt.Errorf("coordinator: table %s: split by partition: %w", meta.Table, err)
 	}
@@ -167,7 +164,7 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 		}
 		subReader, rerr := transport.NewBatchReader(sub, nil)
 		if rerr != nil {
-			releaseRecords(subBatches)
+			columnar.ReleaseRecords(subBatches)
 			return fmt.Errorf("coordinator: table %s: partition %d: %w", meta.Table, p, rerr)
 		}
 		if subReader.NumRows() > 0 {
@@ -199,7 +196,7 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 			// enqueueTo already released subBatch (and its Record — the same
 			// pointer as sub), so do NOT release sub again; release only the
 			// sub-batches not yet sent (issue #217).
-			releaseRecords(subBatches[p+1:])
+			columnar.ReleaseRecords(subBatches[p+1:])
 			return err
 		}
 	}
@@ -408,82 +405,6 @@ func (c *Coordinator) primaryKeyFor(target string) []string {
 // one struct across concurrent-ish sends.
 func cloneBatchMeta(meta *pb.BatchMeta) *pb.BatchMeta {
 	return proto.Clone(meta).(*pb.BatchMeta)
-}
-
-// splitByOwner filters rec into len(nOwners) sub-records, one per
-// partition index in owner (owner[i] is the partition row i belongs to).
-// A partition with zero matching rows gets a nil entry (skipped by the
-// caller) rather than an empty-but-non-nil record — enqueueTo's
-// zero-row marker path is for markers only, not empty data batches.
-func splitByOwner(ctx context.Context, rec arrow.RecordBatch, owner []int, nOwners int) ([]arrow.RecordBatch, error) {
-	nRows := int(rec.NumRows())
-	// One pass bucketing the row indices by owner (was one full scan per
-	// partition, O(owners × rows)).
-	builders := make([]*array.Int64Builder, nOwners)
-	for i, o := range owner {
-		if o < 0 || o >= nOwners {
-			continue
-		}
-		if builders[o] == nil {
-			builders[o] = array.NewInt64Builder(memory.DefaultAllocator)
-		}
-		builders[o].Append(int64(i))
-	}
-	releaseBuilders := func(from int) {
-		for j := from; j < nOwners; j++ {
-			if builders[j] != nil {
-				builders[j].Release()
-				builders[j] = nil
-			}
-		}
-	}
-
-	out := make([]arrow.RecordBatch, nOwners)
-	for p := 0; p < nOwners; p++ {
-		b := builders[p]
-		if b == nil {
-			continue
-		}
-		builders[p] = nil
-		// Every row belongs to this one partition: retain the record instead
-		// of materializing an identity Take.
-		if b.Len() == nRows {
-			b.Release()
-			rec.Retain()
-			out[p] = rec
-			continue
-		}
-		idxArr := b.NewInt64Array()
-		b.Release()
-		datum, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
-			&compute.RecordDatum{Value: rec}, &compute.ArrayDatum{Value: idxArr.Data()})
-		idxArr.Release()
-		if err != nil {
-			releaseRecords(out)
-			releaseBuilders(p + 1)
-			return nil, fmt.Errorf("partition %d: %w", p, err)
-		}
-		// Take returns a *RecordDatum for a record input; guard the assertion
-		// so a future kernel change cannot panic the coordinator (issue #211).
-		rd, ok := datum.(*compute.RecordDatum)
-		if !ok {
-			datum.Release()
-			releaseRecords(out)
-			releaseBuilders(p + 1)
-			return nil, fmt.Errorf("partition %d: unexpected Take datum %T", p, datum)
-		}
-		out[p] = rd.Value
-	}
-	return out, nil
-}
-
-// releaseRecords releases every non-nil record in a splitByOwner result.
-func releaseRecords(recs []arrow.RecordBatch) {
-	for _, r := range recs {
-		if r != nil {
-			r.Release()
-		}
-	}
 }
 
 // batchPosition returns the source position of a batch's last row — the

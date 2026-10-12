@@ -309,8 +309,7 @@ type Coordinator struct {
 	// grouped by binlog batch). stagedLocks serializes CommitStaged per
 	// table so two cycles of the same table never race on the catalog.
 	staged      *staged.Cycles
-	stagedLocks map[string]*sync.Mutex
-	stagedMu    sync.Mutex
+	stagedLocks staged.TableLocks
 
 	// The latest position sent per table and the worker its latest snapshot
 	// window went to: where a table's snapshot-done marker goes (#428).
@@ -364,18 +363,9 @@ type Coordinator struct {
 	// coordk8s.Termination reads a worker's last container termination; nil
 	// reads it from Kubernetes (recovery.go). Set by tests.
 	podTermination func(worker string) (coordk8s.Termination, bool)
-	// snapshotTodo is each snapshotting table's chunks still to do
-	// (snapshotPlan); read-only once set.
-	snapshotTodoMu sync.Mutex
-	snapshotTodo   map[string]map[uint32]bool
-
-	// snapshotting marks a table whose snapshot is running. A re-slice must
-	// not flip that table's owner layout mid-snapshot: the fan-out captured
-	// the owners at start and the live stream routes by the current layout,
-	// so a flip would send a key's snapshot row and its live row to different
-	// workers.
-	snapshottingMu sync.Mutex
-	snapshotting   map[string]bool
+	// snapshots is the tables whose snapshot is running and the chunks each
+	// has still to do (snapshotPlan). A re-slice refuses a table in it.
+	snapshots snapshot.Running
 
 	// confirmed tracks the latest position each WORKER durably committed
 	// (from worker Acks). The minimum across workers is reported to the
@@ -521,7 +511,6 @@ func Run(ctx context.Context, cfg Config) error {
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
 		staged:      staged.New(),
-		stagedLocks: map[string]*sync.Mutex{},
 		booted:      make(chan struct{}),
 	}
 	c.gate = gate.New[*dataplane.Batch](gateMaxEvents, gateMaxBytes, batchBytes, batchSink{c})
