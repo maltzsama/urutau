@@ -31,11 +31,14 @@ func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.
 	if !graceful {
 		pipeCancel()
 		log.Error("worker: channel lost, aborting in-flight transactions", "cause", cause)
+		lost := fmt.Errorf("worker: channel lost: %w", cause)
 		select {
 		case <-runErr:
 		case <-time.After(5 * time.Second):
+			// Not stopped: nothing may attach again next to it.
+			return CoordinatorLost(pipelineRunning(lost))
 		}
-		return CoordinatorLost(fmt.Errorf("worker: channel lost: %w", cause))
+		return CoordinatorLost(lost)
 	}
 
 	// Graceful: drain whatever is buffered; pipeCtx is still alive unless
