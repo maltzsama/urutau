@@ -179,7 +179,7 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 	// (ClickHouse, Couchbase) the workers commit their own sub-batches, so
 	// no cycle is tracked and none can leak.
 	if c.stagesCycles() && len(cycleOwners) > 0 {
-		c.staged.ExpectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, batchPosition(reader))
+		c.staged.ExpectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, reader.LastPosition())
 		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
 	// One copy of the meta serves every sub-batch: enqueueTo serializes it
@@ -405,21 +405,4 @@ func (c *Coordinator) primaryKeyFor(target string) []string {
 // one struct across concurrent-ish sends.
 func cloneBatchMeta(meta *pb.BatchMeta) *pb.BatchMeta {
 	return proto.Clone(meta).(*pb.BatchMeta)
-}
-
-// batchPosition returns the source position of a batch's last row — the
-// position that covers every row it carries, whichever key range each row is
-// routed to. The coordinator records it as a staged cycle's committed
-// position (issue #492). It is "" for an empty batch.
-//
-// A maximum over the per-partition highs is NOT equivalent in general: a source
-// whose positions are opaque (incomparable across partitions, e.g. a plugin
-// adapter) has no ordering to take a maximum over, and picking one partition's
-// high would not cover the others' rows. The batch's last row is the
-// source-provided position that does.
-func batchPosition(r *transport.BatchReader) string {
-	if r.NumRows() == 0 {
-		return ""
-	}
-	return r.Position(r.NumRows() - 1)
 }

@@ -35,3 +35,21 @@ func TestMinSafePosition(t *testing.T) {
 		t.Fatal("an unparsable position was accepted")
 	}
 }
+
+func TestCycleCommitPosition(t *testing.T) {
+	parse := func(s string) (position.Position, error) { return position.MustLSN(s), nil }
+	positions := []string{"0/30", "0/20"}
+
+	window := &Cycle{Window: true, BatchPos: "0/40", Positions: positions}
+	if got, err := window.CommitPosition(parse); err != nil || got != "" {
+		t.Fatalf("window cycle commits %q, %v; want no position", got, err)
+	}
+	batch := &Cycle{BatchPos: "0/40", Positions: positions}
+	if got, err := batch.CommitPosition(parse); err != nil || got != "0/40" {
+		t.Fatalf("one-batch cycle commits %q, %v; want the batch's last position", got, err)
+	}
+	other := &Cycle{Positions: positions}
+	if got, err := other.CommitPosition(parse); err != nil || got != "0/20" {
+		t.Fatalf("cycle commits %q, %v; want the minimum over its deliveries", got, err)
+	}
+}
