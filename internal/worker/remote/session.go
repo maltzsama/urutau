@@ -21,10 +21,17 @@ type sessionSender struct {
 	s  pb.UrutauControl_SessionClient
 }
 
+// send writes msg to the Session stream. A failed send is the stream gone,
+// and with it the coordinator: the error is marked as its loss, so a worker
+// that learns of it here — before the stream's reader does — is not taken
+// for one that failed by itself (#841).
 func (s *sessionSender) send(msg *pb.WorkerMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.s.Send(msg)
+	if err := s.s.Send(msg); err != nil {
+		return CoordinatorLost(err)
+	}
+	return nil
 }
 
 // workerHandshake opens the Session, sends the Hello and waits for the
