@@ -20,66 +20,20 @@ import (
 // disjoint key ranges and must each hold their own position; a per-table key
 // would let the last acker overwrite the lagging partitions (WK-001 §2.2).
 func (c *Coordinator) recordConfirmed(worker string, pos position.Position) {
-	if pos == nil {
-		return
-	}
-	c.confirmedMu.Lock()
-	defer c.confirmedMu.Unlock()
-	c.confirmed[worker] = pos
+	c.confirmed.Record(worker, pos)
 }
 
 // confirmedPosition returns the minimum committed position across the workers
-// that still owe work; nil while nothing is provably committed.
-//
-// A worker with nothing in flight (empty queue and empty index) must NOT
-// constrain the minimum: an idle table never acks, so its committed position
-// would otherwise pin the source's retention forever and let the Postgres WAL
-// grow without bound. When no worker owes anything, every dispatched
-// batch is committed, so the confirmed may advance to the dispatched frontier.
-//
-// MinSafe, not Min: incomparable committed positions have no safe minimum, so
-// nil holds retention back rather than advancing past uncommitted data.
+// that still owe work; nil while nothing is provably committed (see
+// confirmed.Positions.Min for the rule).
 func (c *Coordinator) confirmedPosition() position.Position {
-	// Read the dispatched frontier FIRST: enqueueTo makes a batch visible to
-	// the queue/index before noteSent records its position, so a frontier read
-	// before the owing snapshot can never name a batch that snapshot missed —
-	// reading the other order could pair a stale "nothing owing" with a newer
-	// frontier and confirm a batch that has not been acked.
+	// The dispatched frontier is read FIRST: enqueueTo makes a batch visible
+	// to the queue/index before noteSent records its position, so a frontier
+	// read before the owing snapshot can never name a batch that snapshot
+	// missed.
 	dispatched := c.dispatchedPosition()
 	owing := c.workersOwing()
-	c.confirmedMu.Lock()
-	defer c.confirmedMu.Unlock()
-	if len(c.confirmed) == 0 {
-		return nil
-	}
-	var vals []position.Position
-	anyOwing := false
-	for name, p := range c.confirmed {
-		if !owing[name] {
-			continue // idle: does not constrain the minimum
-		}
-		anyOwing = true
-		if p == nil {
-			// A worker that owes work but has no committed position yet: hold
-			// retention back rather than advance over its data.
-			return nil
-		}
-		vals = append(vals, p)
-	}
-	if !anyOwing && dispatched != nil {
-		// Every dispatched batch is committed: advance to the frontier.
-		return dispatched
-	}
-	if !anyOwing {
-		// Nothing dispatched yet this run: the boot baseline, min over all.
-		for _, p := range c.confirmed {
-			if p == nil {
-				return nil
-			}
-			vals = append(vals, p)
-		}
-	}
-	best, err := position.MinSafe(vals)
+	best, err := c.confirmed.Min(owing, dispatched)
 	if err != nil {
 		c.log.Warn("coordinator: incomparable committed positions; not advancing retention", "err", err)
 		return nil

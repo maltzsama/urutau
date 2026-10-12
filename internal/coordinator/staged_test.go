@@ -79,7 +79,6 @@ func TestCommitStagedCycleAdvancesConfirmedForOwners(t *testing.T) {
 	c := &Coordinator{
 		src:         fakeSource{},
 		snk:         &recordingStagedSink{committed: &committed},
-		confirmed:   map[string]position.Position{},
 		stagedLocks: map[string]*sync.Mutex{},
 		log:         slog.Default(),
 	}
@@ -96,8 +95,8 @@ func TestCommitStagedCycleAdvancesConfirmedForOwners(t *testing.T) {
 	if !committed {
 		t.Fatal("CommitStaged was not called")
 	}
-	if len(c.confirmed) != 2 {
-		t.Fatalf("confirmed owners = %d, want 2", len(c.confirmed))
+	if c.confirmed.Len() != 2 {
+		t.Fatalf("confirmed owners = %d, want 2", c.confirmed.Len())
 	}
 	if got := c.confirmedPosition(); got == nil || got.String() != "0/10" {
 		t.Fatalf("confirmed = %v, want 0/10 (the cycle MinSafe)", got)

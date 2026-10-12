@@ -15,8 +15,8 @@ func TestConfirmedPositionIdleWorkerDoesNotPin(t *testing.T) {
 	idle := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = idle
 	c.index["w1"] = inflight.NewPositionIndex("run-1")
-	c.confirmed["w0"] = position.MustLSN("0/100")
-	c.confirmed["w1"] = position.MustLSN("0/10")
+	c.confirmed.Baseline("w0", position.MustLSN("0/100"))
+	c.confirmed.Baseline("w1", position.MustLSN("0/10"))
 
 	// Both workers owe nothing and something has been dispatched: advance to
 	// the dispatched frontier, not the idle worker's old 0/10.
@@ -36,8 +36,8 @@ func TestConfirmedPositionIdleWorkerDoesNotPin(t *testing.T) {
 // baseline: the minimum over every committed position.
 func TestConfirmedPositionBootBaseline(t *testing.T) {
 	c, _ := coordHarness()
-	c.confirmed["w0"] = position.MustLSN("0/50")
-	c.confirmed["w1"] = position.MustLSN("0/30")
+	c.confirmed.Baseline("w0", position.MustLSN("0/50"))
+	c.confirmed.Baseline("w1", position.MustLSN("0/30"))
 	if got := c.confirmedPosition(); got == nil || got.String() != "0/30" {
 		t.Fatalf("confirmed = %v, want 0/30 (boot baseline)", got)
 	}

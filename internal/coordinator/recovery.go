@@ -222,9 +222,7 @@ var errCrashLoop = errors.New("crash loop")
 
 // confirmedFor returns worker's latest durably committed position, or "".
 func (c *Coordinator) confirmedFor(worker string) string {
-	c.confirmedMu.Lock()
-	defer c.confirmedMu.Unlock()
-	if p := c.confirmed[worker]; p != nil {
+	if p := c.confirmed.Of(worker); p != nil {
 		return p.String()
 	}
 	return ""

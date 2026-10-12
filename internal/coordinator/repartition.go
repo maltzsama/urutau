@@ -221,9 +221,7 @@ func (c *Coordinator) unregisterOwner(w *workerState) {
 	delete(c.byTicket, string(w.ticket))
 	c.deleteIndex(w.name)
 	c.mu.Unlock()
-	c.confirmedMu.Lock()
-	delete(c.confirmed, w.name)
-	c.confirmedMu.Unlock()
+	c.confirmed.Forget(w.name)
 	c.supervisor.forget(w.name)
 }
 
@@ -239,12 +237,8 @@ func (c *Coordinator) seedConfirmed(added []*workerState) {
 	if base == nil {
 		return // nothing durably committed yet; boot baseline already holds
 	}
-	c.confirmedMu.Lock()
-	defer c.confirmedMu.Unlock()
 	for _, w := range added {
-		if _, ok := c.confirmed[w.name]; !ok {
-			c.confirmed[w.name] = base
-		}
+		c.confirmed.Seed(w.name, base)
 	}
 }
 
@@ -337,9 +331,7 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	// by the run's lifetime.
 	c.mu.Unlock()
 
-	c.confirmedMu.Lock()
-	delete(c.confirmed, w.name)
-	c.confirmedMu.Unlock()
+	c.confirmed.Forget(w.name)
 
 	c.supervisor.forget(w.name)
 

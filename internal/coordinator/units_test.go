@@ -57,7 +57,6 @@ func coordHarness() (*Coordinator, *workerState) {
 		workers:     map[string]*workerState{"w0": w},
 		budget:      inflight.NewBudget(1<<20, 1<<10),
 		index:       map[string]*inflight.PositionIndex{"w0": inflight.NewPositionIndex("run-1")},
-		confirmed:   map[string]position.Position{},
 		staged:      staged.New(),
 		stagedLocks: map[string]*sync.Mutex{},
 		runID:       "run-1",
@@ -299,7 +298,7 @@ func TestOnAckTruncatesAndRecords(t *testing.T) {
 	if got := c.budget.InFlight("w0"); got != 0 {
 		t.Fatalf("budget in-flight = %d, want 0", got)
 	}
-	if pos := c.confirmed["w0"]; pos == nil || pos.String() != "0/10" {
+	if pos := c.confirmed.Of("w0"); pos == nil || pos.String() != "0/10" {
 		t.Fatalf("confirmed = %v", pos)
 	}
 }
@@ -312,8 +311,8 @@ func TestOnAckStagedTableDoesNotAdvanceConfirmed(t *testing.T) {
 	c.setRouteForTest("raw.orders", []*workerState{{name: "w0"}, {name: "w1"}})
 
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Position: "0/10"})
-	if len(c.confirmed) != 0 {
-		t.Fatalf("confirmed = %v, want empty on a staged table", c.confirmed)
+	if c.confirmed.Len() != 0 {
+		t.Fatalf("confirmed = %v, want empty on a staged table", c.confirmed.Len())
 	}
 }
 
@@ -321,8 +320,8 @@ func TestOnAckBadPositionIsIgnored(t *testing.T) {
 	c, _ := coordHarness()
 	c.src = errSource{}
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Position: "nonsense"})
-	if len(c.confirmed) != 0 {
-		t.Fatalf("confirmed = %v, want empty", c.confirmed)
+	if c.confirmed.Len() != 0 {
+		t.Fatalf("confirmed = %v, want empty", c.confirmed.Len())
 	}
 }
 

@@ -384,10 +384,9 @@ func TestSnapshotDSNPostgres(t *testing.T) {
 // committed positions are not mutually comparable there is no safe minimum —
 // it must return nil (hold retention), never an arbitrary pick.
 func TestConfirmedPositionIncomparableHoldsRetention(t *testing.T) {
-	c := &Coordinator{
-		confirmed: map[string]position.Position{"a": opaquePos("x"), "b": opaquePos("y")},
-		log:       slog.New(slog.DiscardHandler),
-	}
+	c := withConfirmed(&Coordinator{
+		log: slog.New(slog.DiscardHandler),
+	}, map[string]position.Position{"a": opaquePos("x"), "b": opaquePos("y")})
 	if got := c.confirmedPosition(); got != nil {
 		t.Fatalf("incomparable committed positions must hold retention (nil), got %s", got)
 	}
@@ -395,10 +394,9 @@ func TestConfirmedPositionIncomparableHoldsRetention(t *testing.T) {
 	// Comparable positions still fold to the minimum.
 	lo := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-3")
 	hi := position.MustGTID("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
-	c2 := &Coordinator{
-		confirmed: map[string]position.Position{"a": lo, "b": hi},
-		log:       slog.New(slog.DiscardHandler),
-	}
+	c2 := withConfirmed(&Coordinator{
+		log: slog.New(slog.DiscardHandler),
+	}, map[string]position.Position{"a": lo, "b": hi})
 	if got := c2.confirmedPosition(); got == nil || got.String() != lo.String() {
 		t.Fatalf("comparable fold = %v, want %s", got, lo)
 	}

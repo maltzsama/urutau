@@ -178,25 +178,7 @@ func (c *Coordinator) publishConfirmedAge(now time.Time) {
 	owing := len(c.workersOwing()) > 0
 	pos := c.confirmedPosition()
 
-	c.confirmedMu.Lock()
-	if pos != nil {
-		if c.lastConfirmedPos == nil {
-			c.lastConfirmedPos = pos // first confirmed position
-			c.lastConfirmedAt = now
-		} else if cmp := pos.Compare(c.lastConfirmedPos); cmp != position.Incomparable && cmp > 0 {
-			c.lastConfirmedPos = pos // forward progress
-			c.lastConfirmedAt = now
-		}
-	}
-	if !owing {
-		// Caught up: reset so a later stall is measured from its onset.
-		c.lastConfirmedAt = now
-	} else if c.lastConfirmedAt.IsZero() {
-		// Work is pending and nothing has committed yet: start the clock.
-		c.lastConfirmedAt = now
-	}
-	at := c.lastConfirmedAt
-	c.confirmedMu.Unlock()
+	at := c.confirmed.StalledSince(pos, owing, now)
 
 	if at.IsZero() {
 		return // nothing pending and nothing confirmed: leave the gauge at 0.
@@ -333,13 +315,11 @@ func (c *Coordinator) tablePositions() map[string]string {
 	}
 	c.mu.Unlock()
 
-	c.confirmedMu.Lock()
-	defer c.confirmedMu.Unlock()
 	out := make(map[string]string, len(tableWorkers))
 	for table, workers := range tableWorkers {
 		positions := make([]position.Position, 0, len(workers))
 		for _, worker := range workers {
-			if pos := c.confirmed[worker]; pos != nil {
+			if pos := c.confirmed.Of(worker); pos != nil {
 				positions = append(positions, pos)
 			}
 		}
