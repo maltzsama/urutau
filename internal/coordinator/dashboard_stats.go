@@ -252,7 +252,7 @@ func (c *Coordinator) onWorkerMetrics(worker string, rep *pb.WorkerMetricsReport
 		return
 	}
 	if c.supervisor != nil {
-		c.supervisor.progress.Note(worker, rep.GetNetTxBytes(), time.Now())
+		c.supervisor.Progress.Note(worker, rep.GetNetTxBytes(), time.Now())
 	}
 	c.statsMu.Lock()
 	if c.tableStats == nil {

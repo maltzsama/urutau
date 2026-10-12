@@ -31,7 +31,7 @@ func TestSupervisorResetsAStalledWorkerWithInFlight(t *testing.T) {
 	w.cancel = func() { cancelled = true }
 	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "t"})
-	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+	s.NoteAck("w1", time.Now().Add(-2*time.Minute))
 
 	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second}); err != nil {
 		t.Fatalf("tick: %v; a stalled upsert worker must be reset", err)
@@ -51,7 +51,7 @@ func TestSupervisorEndsTheRunForAStalledAppendWorkerWithInFlight(t *testing.T) {
 	c.cfg.Spec = &spec.Spec{Tables: []spec.Table{{Source: "shop.t", Target: "raw.t", WriteMode: spec.WriteModeAppend}}}
 	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "raw.t"})
-	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+	s.NoteAck("w1", time.Now().Add(-2*time.Minute))
 
 	err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second})
 	if err == nil || !strings.Contains(err.Error(), "append") {
@@ -68,7 +68,7 @@ func TestSupervisorResetWithoutInFlightRecovers(t *testing.T) {
 	w := workers["w1"]
 	cancelled := false
 	w.cancel = func() { cancelled = true }
-	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+	s.NoteAck("w1", time.Now().Add(-2*time.Minute))
 
 	if err := s.tick(time.Now(), SupervisorConfig{
 		AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute,
@@ -159,7 +159,7 @@ func TestSignalSessionEndPendingDoesNotDiscard(t *testing.T) {
 	c := s.c
 	c.sessionErrs = make(chan error, 4)
 	c.snapshotActive.Store(false)
-	s.pendingSet("w1")
+	s.SetPending("w1")
 	c.staged = staged.New()
 	c.staged.Expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1", "w2"})
 
@@ -188,7 +188,7 @@ func TestSignalSessionEndStreamErrorRecovers(t *testing.T) {
 		t.Fatalf("a dead stream must be recovered, not end the run: %v", err)
 	default:
 	}
-	if workers["w1"].epoch != 1 || !s.isPending("w1") {
+	if workers["w1"].epoch != 1 || !s.IsPending("w1") {
 		t.Fatal("the worker must be awaited under a new epoch")
 	}
 }
@@ -218,8 +218,8 @@ func TestSignalSessionEndOwingWorkRecovers(t *testing.T) {
 	if len(workers["w1"].queue) != 1 {
 		t.Fatalf("w1's queue holds %d batches, want its 1 owed batch kept for redelivery", len(workers["w1"].queue))
 	}
-	if workers["w1"].epoch != 1 || !s.isPending("w1") {
-		t.Fatalf("epoch=%d pending=%v; want a new epoch and the worker awaited like a reset", workers["w1"].epoch, s.isPending("w1"))
+	if workers["w1"].epoch != 1 || !s.IsPending("w1") {
+		t.Fatalf("epoch=%d pending=%v; want a new epoch and the worker awaited like a reset", workers["w1"].epoch, s.IsPending("w1"))
 	}
 }
 

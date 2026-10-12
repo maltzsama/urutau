@@ -221,9 +221,7 @@ func TestDashWorkersPending(t *testing.T) {
 	c.maintStats = map[string]map[string]*maintStats{}
 	c.lastAck = map[string]time.Time{}
 	w.attached = false
-	c.supervisor.mu.Lock()
-	c.supervisor.pending["w0"] = true
-	c.supervisor.mu.Unlock()
+	c.supervisor.SetPending("w0")
 
 	got := dashState{c}.Workers()
 	if len(got) != 1 || got[0].Status != "pending" {
