@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/eventlog"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 
 	"github.com/maltzsama/urutau/source"
@@ -278,4 +279,47 @@ var errSessionReset = errors.New("session reset")
 type workerSession struct {
 	out  chan *pb.CoordinatorMessage
 	done chan error
+}
+
+// onHello processes a worker's ready Hello: it carries the phase and the
+// committed positions the worker read from Iceberg. A Hello with a stale
+// epoch is a zombie from a superseded generation — reject it (design §5.5).
+func (c *Coordinator) onHello(worker string, h *pb.Hello) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w, ok := c.workers[worker]
+	if !ok {
+		c.log.Warn("coordinator: Hello for unknown worker", "worker", worker)
+		return
+	}
+	if h.Epoch != w.epoch {
+		c.log.Warn("coordinator: stale Hello epoch", "worker", worker, "have", w.epoch, "got", h.Epoch)
+		return
+	}
+	w.committed = h.Committed
+	c.log.Info("worker hello", "worker", worker, "phase", h.Phase.String(),
+		"committed", len(h.Committed))
+}
+
+// onSchemaDrift records a worker's schema-drift report, so the log and the
+// event trail surface WHY a worker is stopping instead of a bare
+// CrashLoopBackOff (issue #272).
+func (c *Coordinator) onSchemaDrift(worker string, d *pb.SchemaDrift) {
+	if d == nil {
+		return
+	}
+	c.log.Error("coordinator: worker schema drift",
+		"worker", worker, "table", d.Table, "column", d.Column, "kind", d.Kind)
+	c.emitLog(eventlog.KindSchemaDrift, map[string]any{
+		"worker": worker, "table": d.Table, "column": d.Column, "kind": d.Kind,
+	})
+}
+
+// supersededEpoch reports whether epoch is not worker's current generation.
+// The epoch is read under c.mu: resetWorker writes it from other goroutines.
+func (c *Coordinator) supersededEpoch(worker string, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.workers[worker]
+	return w != nil && w.epoch != epoch
 }
