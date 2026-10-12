@@ -3,6 +3,8 @@ package coordinator
 import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // tablesOrSpec returns the expanded table list once boot has set c.tables, and
@@ -44,7 +46,7 @@ func (c *Coordinator) bootWorker(name string, ref core.TableRef) *workerState {
 			break
 		}
 		c.workers[name] = w
-		c.setIndex(name, newPositionIndex(c.runID))
+		c.setIndex(name, inflight.NewPositionIndex(c.runID))
 	}
 	w.refs = append(w.refs, ref)
 	return w

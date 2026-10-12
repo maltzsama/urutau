@@ -205,7 +205,7 @@ func (s dashState) Workers() []dashboard.WorkerStatus {
 			Status:        status,
 			Epoch:         sn.epoch,
 			Tables:        sn.tables,
-			InflightBytes: c.budget.inFlight(sn.name),
+			InflightBytes: c.budget.InFlight(sn.name),
 			Committed:     sn.committed,
 		}
 		if t, ok := lastAck[sn.name]; ok {

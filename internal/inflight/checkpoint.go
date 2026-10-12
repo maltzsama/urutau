@@ -1,4 +1,4 @@
-package coordinator
+package inflight
 
 import (
 	"bytes"
@@ -18,7 +18,7 @@ import (
 // CheckpointConfig points the async position checkpoint at its S3 store.
 // The manifest is convenience only: recovery reads the Iceberg table
 // property (the source of truth) on each worker's Hello, so a lost or stale
-// checkpoint never blocks anything (design §6).
+// Checkpoint never blocks anything (design §6).
 type CheckpointConfig struct {
 	URI      string // s3://<bucket>/<prefix>
 	Interval time.Duration
@@ -28,15 +28,15 @@ type CheckpointConfig struct {
 	SecretKey string
 }
 
-// checkpoint writes per-worker PositionManifests to S3 on an interval.
-type checkpoint struct {
-	interval time.Duration
+// Checkpoint writes per-worker PositionManifests to S3 on an interval.
+type Checkpoint struct {
+	Interval time.Duration
 	client   *s3.Client
 	bucket   string
 	prefix   string
 }
 
-func newCheckpoint(ctx context.Context, cfg CheckpointConfig) (*checkpoint, error) {
+func NewCheckpoint(ctx context.Context, cfg CheckpointConfig) (*Checkpoint, error) {
 	bucket, prefix, err := parseS3URI(cfg.URI)
 	if err != nil {
 		return nil, err
@@ -58,7 +58,7 @@ func newCheckpoint(ctx context.Context, cfg CheckpointConfig) (*checkpoint, erro
 			o.UsePathStyle = true
 		}
 	})
-	return &checkpoint{interval: interval, client: client, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/")}, nil
+	return &Checkpoint{Interval: interval, client: client, bucket: bucket, prefix: strings.TrimSuffix(prefix, "/")}, nil
 }
 
 // putTimeout bounds a single S3 PutObject so a slow endpoint stalls only
@@ -73,8 +73,8 @@ const putTimeout = 10 * time.Second
 // boot-time snapshot would never checkpoint a dynamically added worker and
 // would keep checkpointing a retired one (issue #554). index must return a
 // fresh, race-safe copy (Coordinator.indexSnapshot).
-func (c *checkpoint) run(ctx context.Context, runID string, index func() map[string]*positionIndex, log *slog.Logger) {
-	ticker := time.NewTicker(c.interval)
+func (c *Checkpoint) Run(ctx context.Context, runID string, index func() map[string]*PositionIndex, log *slog.Logger) {
+	ticker := time.NewTicker(c.Interval)
 	defer ticker.Stop()
 	for {
 		select {

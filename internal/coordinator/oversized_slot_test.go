@@ -22,12 +22,12 @@ func (unparsablePositions) ParsePosition(s string) (position.Position, error) {
 func oversizedAdmitted(c *Coordinator, worker string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	n := c.budget.totalBytes + 1
-	if err := c.budget.acquire(ctx, worker, n); err != nil {
+	n := c.budget.TotalBytes + 1
+	if err := c.budget.Acquire(ctx, worker, n); err != nil {
 		return false
 	}
-	c.budget.release(worker, n)
-	c.budget.clearOversized(worker)
+	c.budget.Release(worker, n)
+	c.budget.ClearOversized(worker)
 	return true
 }
 
@@ -57,11 +57,11 @@ func TestUndeliveredOversizedBatchFreesTheOversizedSlot(t *testing.T) {
 			c, w := coordHarness()
 			ctx := context.Background()
 			// Ordinary traffic in flight keeps the worker's charge above zero.
-			if err := c.budget.acquire(ctx, w.name, 64); err != nil {
+			if err := c.budget.Acquire(ctx, w.name, 64); err != nil {
 				t.Fatalf("acquire: %v", err)
 			}
-			n := c.budget.totalBytes + 1
-			if err := c.budget.acquire(ctx, w.name, n); err != nil {
+			n := c.budget.TotalBytes + 1
+			if err := c.budget.Acquire(ctx, w.name, n); err != nil {
 				t.Fatalf("acquire oversized: %v", err)
 			}
 			if err := tc.deliver(t, c, w, n); err == nil {

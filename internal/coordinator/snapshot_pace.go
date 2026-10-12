@@ -100,7 +100,7 @@ func (c *Coordinator) heldChunkMarkers(worker string) []chunkMarker {
 	defer c.chunkMarkersMu.Unlock()
 	kept := c.chunkMarkers[worker][:0]
 	for _, m := range c.chunkMarkers[worker] {
-		if idx != nil && idx.holds(m.id) {
+		if idx != nil && idx.Holds(m.id) {
 			kept = append(kept, m)
 		}
 	}
@@ -111,44 +111,6 @@ func (c *Coordinator) heldChunkMarkers(worker string) []chunkMarker {
 	clear(c.chunkMarkers[worker][len(kept):])
 	c.chunkMarkers[worker] = kept
 	return append([]chunkMarker(nil), kept...)
-}
-
-// holds reports whether batch id is still unacked.
-func (p *positionIndex) holds(id uint64) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, h := range p.head {
-		if h.id == id {
-			return true
-		}
-	}
-	return false
-}
-
-// minHeldID returns the oldest unacked batch id, or 0.
-func (p *positionIndex) minHeldID() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	var min uint64
-	for _, h := range p.head {
-		if min == 0 || h.id < min {
-			min = h.id
-		}
-	}
-	return min
-}
-
-// maxHeldID returns the newest unacked batch id, or 0.
-func (p *positionIndex) maxHeldID() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	var max uint64
-	for _, h := range p.head {
-		if h.id > max {
-			max = h.id
-		}
-	}
-	return max
 }
 
 // onMarkerAck releases a Closes marker the worker acked by id: the window's
@@ -163,13 +125,13 @@ func (c *Coordinator) onMarkerAck(worker string, id uint64) {
 	// concurrent heldChunkMarkers prunes acked markers, so this must read the
 	// marker while it is still held (issue #646).
 	c.recordCursor(worker, id)
-	freed, freedOversized, popped := idx.releaseMarker(id)
+	freed, freedOversized, popped := idx.ReleaseMarker(id)
 	c.notifyAck()
 	if freed > 0 {
-		c.budget.release(worker, freed)
+		c.budget.Release(worker, freed)
 	}
 	if freedOversized {
-		c.budget.clearOversized(worker)
+		c.budget.ClearOversized(worker)
 	}
 	if w := c.workerFor(worker); w != nil {
 		w.dropSent(popped)

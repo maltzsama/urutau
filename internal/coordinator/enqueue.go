@@ -15,6 +15,8 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // enqueueBatch queues ONE source batch on a worker's Flight stream and
@@ -316,7 +318,7 @@ func (c *Coordinator) enqueueTo(ctx context.Context, w *workerState, b *dataplan
 	// window carries the position and the staged cycle.
 	snapshotRows := meta.Window != nil && meta.Window.Snapshot
 	if !snapshotRows {
-		if err := c.budget.acquire(ctx, w.name, n); err != nil {
+		if err := c.budget.Acquire(ctx, w.name, n); err != nil {
 			return err
 		}
 	}
@@ -345,11 +347,11 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 			return fmt.Errorf("coordinator: batch %s position %q: %w", meta.Table, posStr, err)
 		}
 	}
-	var idx *positionIndex
+	var idx *inflight.PositionIndex
 	if !snapshotRows {
 		if idx = c.indexOf(w.name); idx != nil {
-			idx.add(inflightBatch{id: meta.BatchId, table: meta.Table, high: high, bytes: n, oversized: c.budget.isOversized(n),
-				marker: meta.Window != nil && meta.Window.Closes, partial: meta.Partial})
+			idx.Add(inflight.Batch{ID: meta.BatchId, Table: meta.Table, High: high, Bytes: n, Oversized: c.budget.IsOversized(n),
+				Marker: meta.Window != nil && meta.Window.Closes, Partial: meta.Partial})
 		}
 	}
 	select {
@@ -362,7 +364,7 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 		if !snapshotRows {
 			// The batch never reached the worker: undo the registration.
 			if idx != nil {
-				idx.remove(meta.BatchId)
+				idx.Remove(meta.BatchId)
 			}
 			c.releaseUndelivered(w.name, n)
 		}
@@ -376,9 +378,9 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 // slot, and every later oversized batch would wait on it forever. No ack will
 // come for this batch to clear it, so it is cleared here.
 func (c *Coordinator) releaseUndelivered(worker string, n int64) {
-	c.budget.release(worker, n)
-	if c.budget.isOversized(n) {
-		c.budget.clearOversized(worker)
+	c.budget.Release(worker, n)
+	if c.budget.IsOversized(n) {
+		c.budget.ClearOversized(worker)
 	}
 }
 

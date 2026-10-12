@@ -27,7 +27,7 @@ func TestRangeCatchUpDrainsAFullGate(t *testing.T) {
 		for {
 			select {
 			case q := <-w0.queue:
-				c.budget.release("w0", int64(len(q.body)+len(q.meta)))
+				c.budget.Release("w0", int64(len(q.body)+len(q.meta)))
 			case <-ctx.Done():
 				return
 			}

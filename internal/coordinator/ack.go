@@ -167,13 +167,13 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 		// nothing to truncate, and it holds no budget this ack would free.
 		return
 	}
-	freed, freedOversized, popped := idx.truncate(ack.Table, pos)
+	freed, freedOversized, popped := idx.Truncate(ack.Table, pos)
 	c.notifyAck()
 	if freed > 0 {
-		c.budget.release(worker, freed)
+		c.budget.Release(worker, freed)
 	}
 	if freedOversized {
-		c.budget.clearOversized(worker)
+		c.budget.ClearOversized(worker)
 	}
 	// The ack is durable evidence: the popped batches can leave the sent list
 	// and need no redelivery (issue #235); the registry is read under c.mu (#479).
@@ -199,11 +199,11 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	}
 	c.recordTableStats(worker, ack.Table, int64(ack.Rows), int64(ack.Deletes), commitLatencyMs, time.Now())
 	if c.metrics != nil {
-		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.inFlight(worker)))
+		c.metrics.InflightBytes.WithLabelValues(worker).Set(float64(c.budget.InFlight(worker)))
 		c.metrics.CommitsTotal.WithLabelValues(ack.Table).Inc()
 	}
 	c.log.Info("worker ack", "worker", worker, "table", ack.Table,
-		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.inFlight(worker))
+		"rows", ack.Rows, "position", ack.Position, "inflight", c.budget.InFlight(worker))
 	// The audit trail upload is a synchronous S3 put; on the ack hot path a
 	// slow endpoint would delay budget release and trip the supervisor's
 	// stale-ack resets (audit #15). Fire it and forget, bounded (#494).

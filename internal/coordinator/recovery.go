@@ -130,7 +130,7 @@ func (c *Coordinator) workerBack(worker string) error {
 	term, ok := c.terminationFor(worker)
 	var mark uint64
 	if idx := c.indexOf(worker); idx != nil {
-		mark = idx.maxHeldID()
+		mark = idx.MaxHeldID()
 	}
 	n, crashed, desc := c.supervisor.noteBack(worker, term, ok, mark, time.Now())
 	if !crashed {

@@ -178,12 +178,12 @@ func (c *Coordinator) releaseCommittedCycles(table string, p position.Position) 
 		if idx == nil {
 			continue
 		}
-		freed, freedOversized, popped := idx.truncate(table, p)
+		freed, freedOversized, popped := idx.Truncate(table, p)
 		if freed > 0 {
-			c.budget.release(w.name, freed)
+			c.budget.Release(w.name, freed)
 		}
 		if freedOversized {
-			c.budget.clearOversized(w.name)
+			c.budget.ClearOversized(w.name)
 		}
 		w.dropSent(popped)
 	}

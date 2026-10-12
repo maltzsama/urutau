@@ -19,6 +19,8 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // transportSchema is a canonical schema with the wire metadata columns, for
@@ -73,7 +75,7 @@ func TestEnqueueBatchPartitionedErrors(t *testing.T) {
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
-	c.index["w1"] = newPositionIndex("run-1")
+	c.index["w1"] = inflight.NewPositionIndex("run-1")
 
 	// No primary key to route by.
 	if err := c.enqueueBatch(ctx, wireBatchIDs(t, 1), &pb.BatchMeta{Table: "raw.orders"}); err == nil {

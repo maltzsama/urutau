@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/maltzsama/urutau/internal/inflight"
 )
 
 // scriptedTerminations stands in for the Kubernetes Pod status: each worker's
@@ -32,8 +34,8 @@ func recoveryHarness(t *testing.T) (*Coordinator, *supervisor, scriptedTerminati
 	s, _ := supervisorHarness()
 	c := s.c
 	c.sessionErrs = make(chan error, 8)
-	c.index = map[string]*positionIndex{"w1": newPositionIndex("run-1")}
-	c.index["w1"].add(inflightBatch{id: 1, table: "t"})
+	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
+	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
 	terms := scriptedTerminations{"w1": {podUID: "uid-1"}}
 	c.podTermination = terms.of
 	return c, s, terms
@@ -102,8 +104,8 @@ func TestDeliveringWhatItOwedStartsTheCountOver(t *testing.T) {
 			t.Fatalf("spaced crash %d ended the run: %v", i+1, err)
 		}
 		// It delivers what it owed, then runs well for a while.
-		c.index["w1"].truncateAll()
-		c.index["w1"].add(inflightBatch{id: uint64(100 + i), table: "t"})
+		c.index["w1"].Clear()
+		c.index["w1"].Add(inflight.Batch{ID: uint64(100 + i), Table: "t"})
 		s.noteAck("w1", time.Now())
 		if err := s.tick(time.Now().Add(time.Minute), cfg); err != nil {
 			t.Fatalf("tick: %v", err)
@@ -115,7 +117,7 @@ func TestDeliveringWhatItOwedStartsTheCountOver(t *testing.T) {
 // stayed up for an ack timeout: coming back is not enough.
 func TestAnIdleWorkerCrashLoopEndsTheRun(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
-	c.index["w1"].truncateAll()
+	c.index["w1"].Clear()
 	var err error
 	for i := 0; i < defaultMaxConsecutiveCrashes; i++ {
 		terms.crashAgain("w1", podTermination{exitCode: 2, message: "panic: nil map"})
@@ -146,7 +148,7 @@ func TestAWorkerDeliveringNothingPastTheDeliveryTimeoutEndsTheRun(t *testing.T) 
 // quiet table's Pod stuck Pending hurts nothing until work arrives for it.
 func TestAWorkerOwingNothingIsNeverAbsent(t *testing.T) {
 	c, s, _ := recoveryHarness(t)
-	c.index["w1"].truncateAll()
+	c.index["w1"].Clear()
 	<-c.workers["w1"].queue // the harness seeds one queued batch
 	now := time.Now()
 	s.noteDeliveredAt("w1", now.Add(-time.Hour))
@@ -189,13 +191,6 @@ func TestALossSeenOnBothStreamsCountsOnce(t *testing.T) {
 			t.Fatalf("crash %d ended the run: %v", i, err)
 		}
 	}
-}
-
-// truncateAll acks every batch the index holds.
-func (p *positionIndex) truncateAll() {
-	p.mu.Lock()
-	p.head = nil
-	p.mu.Unlock()
 }
 
 // The supervisor starts after the snapshot, so its delivery-timeout rule does
