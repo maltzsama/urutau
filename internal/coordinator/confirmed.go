@@ -76,10 +76,8 @@ func (c *Coordinator) bufferedTables() map[string]struct{} {
 		for _, target := range c.gate.BufferedTablesLocked() {
 			seen[target] = struct{}{}
 		}
-		for table, acc := range c.accum {
-			if acc.Holds() {
-				seen[table] = struct{}{}
-			}
+		for _, table := range c.accum.HoldingLocked() {
+			seen[table] = struct{}{}
 		}
 		c.gate.Unlock()
 	}

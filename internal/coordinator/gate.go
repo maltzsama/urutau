@@ -5,6 +5,7 @@ import (
 
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/gate"
+	"github.com/maltzsama/urutau/internal/staged"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
@@ -113,4 +114,32 @@ func (c *Coordinator) openKeyForTableLocked(target string) (string, bool) {
 	c.gate.Lock()
 	defer c.gate.Unlock()
 	return c.gate.OpenKeyLocked(target)
+}
+
+// gateMaxBytes bounds one window's held live batches by size, as
+// gateMaxEvents does by count: rows carry payloads, and 1024 batches of the
+// full profile's events held GiBs and OOM-killed the coordinator (#438). A
+// gate is full once it holds this much; the batch that crosses it is
+// admitted, so one oversized batch never deadlocks the gate.
+const gateMaxBytes = 64 << 20
+
+// enqueueWindowed queues held batches InWindow-tagged for windowID, in order.
+// A fresh meta per batch: enqueueBatch assigns the cycle id into it, and a
+// shared one would put every held batch in one cycle.
+func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, windowID uint64, buf []*dataplane.Batch) error {
+	return c.enqueueHeld(ctx, &pb.BatchMeta{
+		Table:  target,
+		Window: &pb.WindowTag{InWindow: true, WindowId: windowID},
+	}, buf)
+}
+
+// enqueueHeld sends a gate's held batches, in order, with meta's window tag.
+// They are consecutive batches of one table under one tag, so they go out
+// concatenated, up to the cycle's row and byte bounds per batch
+// (staged.SendGrouped).
+// A fresh meta per sent batch: enqueueBatch assigns the cycle id into it.
+func (c *Coordinator) enqueueHeld(ctx context.Context, meta *pb.BatchMeta, buf []*dataplane.Batch) error {
+	return staged.SendGrouped(ctx, c.cycleBounds(), batchBytes, buf, func(ctx context.Context, merged *dataplane.Batch) error {
+		return c.enqueueBatch(ctx, merged, cloneBatchMeta(meta))
+	})
 }
