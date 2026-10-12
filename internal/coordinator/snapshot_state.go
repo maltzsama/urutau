@@ -103,7 +103,7 @@ func (c *Coordinator) finishSnapshot(ctx context.Context, ref source.TableRef) e
 	}
 	if c.stagesCycles() && c.isStagedTable(ref.Target) {
 		meta.BatchId = c.batchSeq.Add(1)
-		c.staged.expect(core.TableRef{Target: ref.Target}, meta.BatchId, []string{w.name})
+		c.staged.Expect(core.TableRef{Target: ref.Target}, meta.BatchId, []string{w.name})
 	}
 	return c.enqueueTo(ctx, w, nil, meta)
 }
@@ -292,7 +292,7 @@ func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, tar
 	}
 	if c.stagesCycles() && c.isStagedTable(target) {
 		meta.BatchId = c.batchSeq.Add(1)
-		c.staged.expectWindow(core.TableRef{Target: target}, meta.BatchId, []string{w.name})
+		c.staged.ExpectWindow(core.TableRef{Target: target}, meta.BatchId, []string{w.name})
 	}
 	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
 		return err

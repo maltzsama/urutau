@@ -182,7 +182,7 @@ func (c *Coordinator) enqueuePartitioned(ctx context.Context, b *dataplane.Batch
 	// (ClickHouse, Couchbase) the workers commit their own sub-batches, so
 	// no cycle is tracked and none can leak.
 	if c.stagesCycles() && len(cycleOwners) > 0 {
-		c.staged.expectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, batchPosition(reader))
+		c.staged.ExpectAt(core.TableRef{Target: meta.Table}, meta.BatchId, cycleOwners, batchPosition(reader))
 		c.log.Debug("coordinator: cycle expected", "table", meta.Table, "seq", meta.BatchId, "nrows", nrows, "owners", cycleOwners)
 	}
 	// One copy of the meta serves every sub-batch: enqueueTo serializes it

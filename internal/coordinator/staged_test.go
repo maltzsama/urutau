@@ -3,125 +3,15 @@ package coordinator
 import (
 	"context"
 	"log/slog"
-	"math/rand/v2"
 	"sync"
 	"testing"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/staged"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
 )
-
-func ref(t *testing.T, target string) core.TableRef {
-	t.Helper()
-	return core.TableRef{Target: target}
-}
-
-func TestStagedCycleWaitsForEveryDelivery(t *testing.T) {
-	s := newStagedCycles()
-	r := ref(t, "orders")
-	s.expect(r, 7, []string{"a", "b", "c"})
-
-	if got, _ := s.deliver(r, 7, []byte("a"), "100", "", nil); got != nil {
-		t.Fatalf("cycle committed after 1/3 deliveries: %v", got)
-	}
-	if got, _ := s.deliver(r, 7, []byte("b"), "101", "", nil); got != nil {
-		t.Fatalf("cycle committed after 2/3 deliveries: %v", got)
-	}
-	got, _ := s.deliver(r, 7, []byte("c"), "102", "", nil)
-	if len(got) != 1 {
-		t.Fatalf("cycle not committed after 3/3 deliveries: %v", got)
-	}
-	cy := got[0]
-	if len(cy.descriptors) != 3 {
-		t.Fatalf("cycle has %d descriptors, want 3", len(cy.descriptors))
-	}
-	if len(cy.positions) != 3 {
-		t.Fatalf("cycle has %d positions, want 3", len(cy.positions))
-	}
-}
-
-func TestStagedCyclesCommitInSendOrder(t *testing.T) {
-	s := newStagedCycles()
-	r := ref(t, "orders")
-	s.expect(r, 1, []string{"a", "b"})
-	s.expect(r, 2, []string{"a", "b"})
-
-	// Cycle 2 completes first — it must wait for cycle 1, or committing it
-	// would advance the checkpoint past cycle 1 and regress it later.
-	if got, _ := s.deliver(r, 2, []byte("2a"), "200", "", nil); got != nil {
-		t.Fatalf("cycle 2 committed out of order: %v", got)
-	}
-	if got, _ := s.deliver(r, 2, []byte("2b"), "201", "", nil); got != nil {
-		t.Fatalf("cycle 2 committed before cycle 1: %v", got)
-	}
-
-	got, _ := s.deliver(r, 1, []byte("1a"), "100", "", nil)
-	if got != nil {
-		t.Fatalf("cycle 1 committed before its second delivery: %v", got)
-	}
-	got, _ = s.deliver(r, 1, []byte("1b"), "101", "", nil)
-	if len(got) != 2 {
-		t.Fatalf("expected cycle 1 then cycle 2 to commit, got %d", len(got))
-	}
-	if got[0].seq != 1 || got[1].seq != 2 {
-		t.Fatalf("commit order = [%d %d], want [1 2]", got[0].seq, got[1].seq)
-	}
-}
-
-func TestStagedCycleSeqZeroCommitsOnArrival(t *testing.T) {
-	s := newStagedCycles()
-	r := ref(t, "orders")
-	// A worker-generated snapshot batch never saw a BatchMeta: seq 0, its
-	// own cycle of one.
-	got, _ := s.deliver(r, 0, []byte("snap"), "10", "state-1", []uint32{3, 4})
-	if len(got) != 1 {
-		t.Fatalf("seq-0 delivery did not commit on arrival: %v", got)
-	}
-	if got[0].state != "state-1" || len(got[0].pending) != 2 {
-		t.Fatalf("seq-0 cycle lost snapshot state: %+v", got[0])
-	}
-	if s.len() != 0 {
-		t.Fatalf("seq-0 cycle leaked: %d tracked", s.len())
-	}
-}
-
-// A partial delivery of a known cycle reports known=true (it is still
-// accumulating, not dropped); a delivery for an unknown seq reports false.
-// This is what lets onStagedBatch warn only on a real wedge instead of every
-// multi-owner partial delivery (issue #372).
-func TestDeliverReportsKnownCycle(t *testing.T) {
-	s := newStagedCycles()
-	r := ref(t, "orders")
-	s.expect(r, 7, []string{"a", "b"})
-
-	if got, known := s.deliver(r, 7, []byte("a"), "100", "", nil); got != nil || !known {
-		t.Fatalf("partial delivery: got=%v known=%v, want nil,true", got, known)
-	}
-	if got, known := s.deliver(r, 99, []byte("x"), "900", "", nil); got != nil || known {
-		t.Fatalf("unknown seq: got=%v known=%v, want nil,false", got, known)
-	}
-}
-
-func TestStagedCyclesDiscardTable(t *testing.T) {
-	s := newStagedCycles()
-	s.expect(ref(t, "orders"), 1, []string{"a", "b"})
-	s.expect(ref(t, "orders"), 2, []string{"a", "b"})
-	s.expect(ref(t, "items"), 3, []string{"a"})
-
-	if n := s.discardTable("orders"); n != 2 {
-		t.Fatalf("discarded %d cycles, want 2", n)
-	}
-	if s.len() != 1 {
-		t.Fatalf("%d cycles tracked after discard, want 1", s.len())
-	}
-	// A discarded cycle's late delivery must be dropped, never committed as
-	// a cycle of one — that would commit a partial cycle.
-	if got, _ := s.deliver(ref(t, "orders"), 1, []byte("late"), "100", "", nil); got != nil {
-		t.Fatalf("late delivery for a discarded cycle committed: %v", got)
-	}
-}
 
 // fakeStagedSink satisfies sink.StagedCommitter (and sink.Sink via the
 // embedded interface) so isStagedTable's capability probe is exercised.
@@ -193,12 +83,12 @@ func TestCommitStagedCycleAdvancesConfirmedForOwners(t *testing.T) {
 		stagedLocks: map[string]*sync.Mutex{},
 		log:         slog.Default(),
 	}
-	cy := &stagedCycle{
-		ref:         core.TableRef{Target: "t"},
-		seq:         5,
-		owners:      map[string]bool{"w0": true, "w1": true},
-		descriptors: [][]byte{{1}},
-		positions:   []string{"0/10", "0/20"},
+	cy := &staged.Cycle{
+		Ref:         core.TableRef{Target: "t"},
+		Seq:         5,
+		Owners:      map[string]bool{"w0": true, "w1": true},
+		Descriptors: [][]byte{{1}},
+		Positions:   []string{"0/10", "0/20"},
 	}
 	if err := c.commitStagedCycle(cy); err != nil {
 		t.Fatalf("commitStagedCycle: %v", err)
@@ -211,128 +101,5 @@ func TestCommitStagedCycleAdvancesConfirmedForOwners(t *testing.T) {
 	}
 	if got := c.confirmedPosition(); got == nil || got.String() != "0/10" {
 		t.Fatalf("confirmed = %v, want 0/10 (the cycle MinSafe)", got)
-	}
-}
-
-// discardTable drops every cycle of a table. Test-only: it moved here from
-// staged.go, whose production build has no caller for the per-table variant.
-func (s *stagedCycles) discardTable(table string) int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	n := 0
-	for k := range s.open {
-		if k.table == table {
-			delete(s.open, k)
-			n++
-		}
-	}
-	for k := range s.done {
-		if k.table == table {
-			delete(s.done, k)
-			n++
-		}
-	}
-	delete(s.order, table)
-	return n
-}
-
-// len reports the number of tracked cycles. Test-only: it moved here from
-// staged.go, whose production build has no caller for it.
-func (s *stagedCycles) len() int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.open) + len(s.done)
-}
-
-// A cycle completes once every expected owner delivered, not after as many
-// deliveries: an owner delivering the same cycle twice (a redelivery after a
-// session reset) must not commit it without the other owner's rows.
-func TestStagedCycleCountsOwnersNotDeliveries(t *testing.T) {
-	s := newStagedCycles()
-	s.expect(core.TableRef{Target: "t"}, 1, []string{"a", "b"})
-	if c, _ := s.deliver(core.TableRef{Target: "t", Owner: "a"}, 1, []byte{1}, "0/10", "", nil); len(c) != 0 {
-		t.Fatal("the cycle completed with one of two owners")
-	}
-	if c, known := s.deliver(core.TableRef{Target: "t", Owner: "a"}, 1, []byte{1}, "0/10", "", nil); len(c) != 0 || !known {
-		t.Fatalf("a's second delivery: committable=%d known=%v; want the cycle still waiting for b", len(c), known)
-	}
-	if c, _ := s.deliver(core.TableRef{Target: "t", Owner: "b"}, 1, []byte{2}, "0/20", "", nil); len(c) != 1 || len(c[0].descriptors) != 2 {
-		t.Fatalf("b's delivery: committable=%v; want the cycle with a's and b's descriptors", c)
-	}
-}
-
-// Only the owners a cycle was sent to count toward it: a delivery from any
-// other worker must not stand in for an expected owner's.
-func TestStagedCycleIgnoresUnexpectedOwners(t *testing.T) {
-	s := newStagedCycles()
-	s.expect(core.TableRef{Target: "t"}, 1, []string{"a", "b"})
-	if c, _ := s.deliver(core.TableRef{Target: "t", Owner: "a"}, 1, []byte{1}, "0/10", "", nil); len(c) != 0 {
-		t.Fatal("the cycle completed with one of two owners")
-	}
-	if c, known := s.deliver(core.TableRef{Target: "t", Owner: "x"}, 1, []byte{9}, "0/90", "", nil); len(c) != 0 || !known {
-		t.Fatalf("x's delivery: committable=%d known=%v; want the cycle still waiting for b", len(c), known)
-	}
-	if c, _ := s.deliver(core.TableRef{Target: "t", Owner: "b"}, 1, []byte{2}, "0/20", "", nil); len(c) != 1 || len(c[0].descriptors) != 2 {
-		t.Fatalf("b's delivery: committable=%v; want the cycle with a's and b's descriptors only", c)
-	}
-}
-
-// openFor answers from the table's send order instead of walking every
-// table's cycles. The two must agree after every step of any mix of cycles
-// expected, delivered out of order and committed.
-func TestOpenForMatchesTheCycleMaps(t *testing.T) {
-	s := newStagedCycles()
-	tables := []string{"raw.a", "raw.b", "raw.c"}
-	rng := rand.New(rand.NewPCG(1, 2))
-	type share struct {
-		seq   uint64
-		owner string
-	}
-	owed := map[string][]share{} // table → deliveries not made yet
-	var seq uint64
-	check := func(step string) {
-		t.Helper()
-		for _, tb := range tables {
-			ref := core.TableRef{Target: tb}
-			open, done := s.openForBreakdown(ref)
-			if got := s.openFor(ref); got != open+done {
-				t.Fatalf("%s: openFor(%s) = %d, the maps hold %d open + %d done", step, tb, got, open, done)
-			}
-		}
-	}
-	for range 3000 {
-		tb := tables[rng.IntN(len(tables))]
-		if len(owed[tb]) == 0 || rng.IntN(3) == 0 {
-			seq++
-			s.expect(core.TableRef{Target: tb}, seq, []string{"w0", "w1"})
-			owed[tb] = append(owed[tb], share{seq, "w0"}, share{seq, "w1"})
-			check("expect")
-			continue
-		}
-		// Any owed share, in any order: cycles complete out of send order.
-		i := rng.IntN(len(owed[tb]))
-		sh := owed[tb][i]
-		owed[tb] = append(owed[tb][:i], owed[tb][i+1:]...)
-		s.deliver(core.TableRef{Target: tb, Owner: sh.owner}, sh.seq, []byte{1}, "", "", nil)
-		check("deliver")
-	}
-	// Everything owed is delivered: nothing may be left open, in the maps or
-	// in the send order.
-	for tb, shares := range owed {
-		for _, sh := range shares {
-			s.deliver(core.TableRef{Target: tb, Owner: sh.owner}, sh.seq, []byte{1}, "", "", nil)
-		}
-	}
-	check("drain")
-	for _, tb := range tables {
-		if n := s.openFor(core.TableRef{Target: tb}); n != 0 {
-			t.Fatalf("%s: %d cycles left after every delivery", tb, n)
-		}
 	}
 }

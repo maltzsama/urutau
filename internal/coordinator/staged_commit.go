@@ -6,6 +6,7 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/faultinject"
+	"github.com/maltzsama/urutau/internal/staged"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -65,15 +66,15 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 	mu := c.stagedLock(sb.Table)
 	mu.Lock()
 	defer mu.Unlock()
-	if c.staged.isPoisoned(sb.Table) {
+	if c.staged.IsPoisoned(sb.Table) {
 		return
 	}
 
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
 	if sb.WindowLost {
-		c.staged.markLost(ref, sb.Seq)
+		c.staged.MarkLost(ref, sb.Seq)
 	}
-	committable, known := c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
+	committable, known := c.staged.Deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
 	if sb.Seq != 0 && !known {
 		// The seq named no cycle this tracker holds: a too-late delivery for
 		// a discarded cycle — the telltale of a wedged cycle (issue #372). A
@@ -87,7 +88,7 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 		// the durable position past the gap the failed cycle left, and its
 		// data would never be replayed (WK-001 C5.4).
 		if err := c.commitStagedCycleLocked(cy); err != nil {
-			c.staged.poison(sb.Table)
+			c.staged.Poison(sb.Table)
 			c.fail(err)
 			return
 		}
@@ -96,11 +97,11 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 
 // commitStagedCycle commits one complete cycle, taking the table's staged
 // lock. Kept for callers that do not already hold it (tests, one-off paths).
-func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
-	mu := c.stagedLock(cy.ref.Target)
+func (c *Coordinator) commitStagedCycle(cy *staged.Cycle) error {
+	mu := c.stagedLock(cy.Ref.Target)
 	mu.Lock()
 	defer mu.Unlock()
-	if c.staged.isPoisoned(cy.ref.Target) {
+	if c.staged.IsPoisoned(cy.Ref.Target) {
 		return nil
 	}
 	return c.commitStagedCycleLocked(cy)
@@ -112,40 +113,40 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 // the batch's last position: every partition received its whole share, so the
 // table is durable through it (#459). Any other cycle commits the minimum safe
 // position over its deliveries.
-func (c *Coordinator) commitStagedCycleLocked(cy *stagedCycle) error {
+func (c *Coordinator) commitStagedCycleLocked(cy *staged.Cycle) error {
 	// A fan-out window an owner lost, and the windows queued behind it, do
 	// not commit: their progress records the lost chunk as done (#829).
-	if cy.window && c.fanout.resolve(cy.ref.Target, cy.seq, cy.lost) {
+	if cy.Window && c.fanout.resolve(cy.Ref.Target, cy.Seq, cy.Lost) {
 		c.log.Warn("coordinator: snapshot window not committed; its chunk is read again",
-			"table", cy.ref.Target, "seq", cy.seq, "lost", cy.lost)
+			"table", cy.Ref.Target, "seq", cy.Seq, "lost", cy.Lost)
 		return nil
 	}
 	// A snapshot window's cycle commits no position: its marker carries the
 	// reader's, past stream cycles of the table not committed yet, and a
 	// crash would then skip them as covered (#468). Only the stream advances
 	// a table's position.
-	pos := cy.batchPos
-	if cy.window {
+	pos := cy.BatchPos
+	if cy.Window {
 		pos = ""
 	} else if pos == "" {
 		var err error
-		if pos, err = c.minSafePositions(cy.positions); err != nil {
-			return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.ref.Target, cy.seq, err)
+		if pos, err = c.minSafePositions(cy.Positions); err != nil {
+			return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.Ref.Target, cy.Seq, err)
 		}
 	}
 	committer, ok := c.snk.(sink.StagedCommitter)
 	if !ok {
-		return fmt.Errorf("coordinator: table %s: sink does not stage commits", cy.ref.Target)
+		return fmt.Errorf("coordinator: table %s: sink does not stage commits", cy.Ref.Target)
 	}
 	faultinject.At(faultinject.CoordinatorCycleBeforeCommit,
-		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
-	if err := committer.CommitStaged(c.runCtx, cy.ref, cy.descriptors, pos); err != nil {
-		return fmt.Errorf("coordinator: table %s: staged commit: %w", cy.ref.Target, err)
+		"table", cy.Ref.Target, "seq", cy.Seq, "position", pos, "deliveries", len(cy.Descriptors))
+	if err := committer.CommitStaged(c.runCtx, cy.Ref, cy.Descriptors, pos); err != nil {
+		return fmt.Errorf("coordinator: table %s: staged commit: %w", cy.Ref.Target, err)
 	}
 	faultinject.At(faultinject.CoordinatorCycleCommittedBeforeRecord,
-		"table", cy.ref.Target, "seq", cy.seq, "position", pos, "deliveries", len(cy.descriptors))
-	c.log.Debug("coordinator: staged cycle committed", "table", cy.ref.Target, "seq", cy.seq, "pos", pos,
-		"owners", len(cy.owners), "descriptors", len(cy.descriptors), "snapshot_state", cy.state, "pending", pendingHead(cy.pending))
+		"table", cy.Ref.Target, "seq", cy.Seq, "position", pos, "deliveries", len(cy.Descriptors))
+	c.log.Debug("coordinator: staged cycle committed", "table", cy.Ref.Target, "seq", cy.Seq, "pos", pos,
+		"owners", len(cy.Owners), "descriptors", len(cy.Descriptors), "snapshot_state", cy.State, "pending", pendingHead(cy.Pending))
 	// The cycle is durable: only now may source retention advance. Record the
 	// cycle's position for every owner it covered, so confirmedPosition (the
 	// min) reflects the whole cycle — the worker's per-batch ack does not
@@ -153,12 +154,12 @@ func (c *Coordinator) commitStagedCycleLocked(cy *stagedCycle) error {
 	if pos != "" {
 		p, perr := c.src.ParsePosition(pos)
 		if perr != nil {
-			c.log.Warn("coordinator: staged cycle position", "table", cy.ref.Target, "pos", pos, "err", perr)
+			c.log.Warn("coordinator: staged cycle position", "table", cy.Ref.Target, "pos", pos, "err", perr)
 		} else {
-			for owner := range cy.owners {
+			for owner := range cy.Owners {
 				c.recordConfirmed(owner, p)
 			}
-			c.releaseCommittedCycles(cy.ref.Target, p)
+			c.releaseCommittedCycles(cy.Ref.Target, p)
 		}
 	}
 	return nil

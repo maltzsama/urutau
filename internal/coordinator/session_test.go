@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/core"
+	"github.com/maltzsama/urutau/internal/staged"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -159,8 +160,8 @@ func TestSignalSessionEndPendingDoesNotDiscard(t *testing.T) {
 	c.sessionErrs = make(chan error, 4)
 	c.snapshotActive.Store(false)
 	s.pendingSet("w1")
-	c.staged = newStagedCycles()
-	c.staged.expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1", "w2"})
+	c.staged = staged.New()
+	c.staged.Expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1", "w2"})
 
 	c.signalSessionEnd("w1", context.Canceled)
 
@@ -169,7 +170,7 @@ func TestSignalSessionEndPendingDoesNotDiscard(t *testing.T) {
 		t.Fatalf("a pending reset must not fail the run, got %v", err)
 	default:
 	}
-	if c.staged.openFor(core.TableRef{Target: "raw.t"}) != 1 {
+	if c.staged.OpenFor(core.TableRef{Target: "raw.t"}) != 1 {
 		t.Fatal("a pending reset must not discard the worker's cycles")
 	}
 }
@@ -248,8 +249,8 @@ func TestSignalSessionEndKeepsOpenCycles(t *testing.T) {
 	c.sessionErrs = make(chan error, 4)
 	<-workers["w1"].queue // nothing owed: the loss is purely open cycles
 
-	c.staged = newStagedCycles()
-	c.staged.expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1"})
+	c.staged = staged.New()
+	c.staged.Expect(core.TableRef{Target: "raw.t"}, 7, []string{"w1"})
 
 	c.signalSessionEnd("w1", context.Canceled)
 
@@ -258,7 +259,7 @@ func TestSignalSessionEndKeepsOpenCycles(t *testing.T) {
 		t.Fatalf("a worker lost with open cycles must be recovered, not end the run: %v", err)
 	default:
 	}
-	if c.staged.openFor(core.TableRef{Target: "raw.t"}) != 1 {
+	if c.staged.OpenFor(core.TableRef{Target: "raw.t"}) != 1 {
 		t.Fatal("the lost worker's open cycle must stay open for its redelivery")
 	}
 }

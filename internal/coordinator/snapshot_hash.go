@@ -323,7 +323,7 @@ func (c *Coordinator) closeFanoutChunk(ctx context.Context, ref source.TableRef,
 		for i, w := range owners {
 			names[i] = w.name
 		}
-		c.staged.expectWindow(core.TableRef{Target: ref.Target}, meta.BatchId, names)
+		c.staged.ExpectWindow(core.TableRef{Target: ref.Target}, meta.BatchId, names)
 		c.fanout.note(ref.Target, meta.BatchId, uint32(windowID))
 	}
 	for _, w := range owners {

@@ -45,11 +45,11 @@ func TestClosesMarkerIsACycleOfTheSendOrder(t *testing.T) {
 	if !m.Staged || m.BatchId == 0 || m.Window == nil || !m.Window.Closes {
 		t.Fatalf("marker meta = %+v, want a staged Closes marker with a cycle id", &m)
 	}
-	if n := c.staged.len(); n != 1 {
+	if n := c.staged.TotalOpen(); n != 1 {
 		t.Fatalf("%d staged cycles, want the marker's", n)
 	}
 	// Only w0 owes the window: its delivery alone completes the cycle.
-	committable, known := c.staged.deliver(stagedRef("raw.orders", "w0"), m.BatchId, []byte{1}, "0/10", "", nil)
+	committable, known := c.staged.Deliver(stagedRef("raw.orders", "w0"), m.BatchId, []byte{1}, "0/10", "", nil)
 	if !known || len(committable) != 1 {
 		t.Fatalf("w0's window delivery: committable=%d known=%v; want the cycle complete", len(committable), known)
 	}
@@ -63,7 +63,7 @@ func TestClosesMarkerOnAnUnstagedTableOpensNoCycle(t *testing.T) {
 	if err := c.sendClosesPending(context.Background(), w0, "raw.orders", position.MustLSN("0/10"), 7, nil, 0, nil); err != nil {
 		t.Fatalf("sendCloses: %v", err)
 	}
-	if n := c.staged.len(); n != 0 {
+	if n := c.staged.TotalOpen(); n != 0 {
 		t.Fatalf("%d staged cycles for a single-owner table, want 0", n)
 	}
 }

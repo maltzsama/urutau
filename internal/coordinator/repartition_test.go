@@ -289,8 +289,8 @@ func TestScaleWaitsForOpenStagedCycle(t *testing.T) {
 	}
 
 	// Open a cycle that never completes.
-	c.staged.expect(core.TableRef{Target: "raw.orders"}, 7, []string{owners[0].name, second.name})
-	if got := c.staged.openFor(core.TableRef{Target: "raw.orders"}); got != 1 {
+	c.staged.Expect(core.TableRef{Target: "raw.orders"}, 7, []string{owners[0].name, second.name})
+	if got := c.staged.OpenFor(core.TableRef{Target: "raw.orders"}); got != 1 {
 		t.Fatalf("openFor = %d, want 1", got)
 	}
 

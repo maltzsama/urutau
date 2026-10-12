@@ -283,7 +283,7 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 		cycles := 0
 		cyclesOpen, cyclesDone := 0, 0
 		if c.stagesCycles() {
-			cyclesOpen, cyclesDone = c.staged.openForBreakdown(core.TableRef{Target: target})
+			cyclesOpen, cyclesDone = c.staged.OpenForBreakdown(core.TableRef{Target: target})
 			cycles = cyclesOpen + cyclesDone
 		}
 		pending := inflight + queued + cycles
@@ -295,7 +295,7 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 			return ctx.Err()
 		case <-deadline.C:
 			return fmt.Errorf("%d batch(es)/cycle(s) still pending after %s (in-flight=%d queued=%d staged-cycles=%d open=%d done=%d open-seqs=%v)",
-				pending, c.drainTimeout(), inflight, queued, cycles, cyclesOpen, cyclesDone, c.staged.openSeqs(core.TableRef{Target: target}))
+				pending, c.drainTimeout(), inflight, queued, cycles, cyclesOpen, cyclesDone, c.staged.OpenSeqs(core.TableRef{Target: target}))
 		case <-c.ackNotify: // an ack may have drained in-flight (issue #587)
 		case <-tick.C:
 		}

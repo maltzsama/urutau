@@ -211,7 +211,7 @@ func TestFinishSnapshotOnAStagedTableIsACycle(t *testing.T) {
 	if !done.Window.GetSnapshotDone() || !done.Staged || done.BatchId <= metas[0].BatchId {
 		t.Fatalf("done marker = %+v, want a staged cycle after the window's", done)
 	}
-	if n := c.staged.len(); n != 2 {
+	if n := c.staged.TotalOpen(); n != 2 {
 		t.Fatalf("%d staged cycles, want the window's and the done marker's", n)
 	}
 }
@@ -261,14 +261,14 @@ func TestSnapshotDoneWaitsForEveryEarlierWindow(t *testing.T) {
 	w1win, done := w1metas[0], w1metas[1]
 
 	// w1's window and the done marker are delivered; w0's window is not.
-	if got, _ := c.staged.deliver(stagedRef("raw.orders", "w1"), w1win.BatchId, []byte{1}, "0/20", "", nil); len(got) != 0 {
+	if got, _ := c.staged.Deliver(stagedRef("raw.orders", "w1"), w1win.BatchId, []byte{1}, "0/20", "", nil); len(got) != 0 {
 		t.Fatalf("w1's window committed ahead of w0's earlier one: %d cycle(s)", len(got))
 	}
-	if got, _ := c.staged.deliver(stagedRef("raw.orders", "w1"), done.BatchId, []byte{2}, "", "complete", nil); len(got) != 0 {
+	if got, _ := c.staged.Deliver(stagedRef("raw.orders", "w1"), done.BatchId, []byte{2}, "", "complete", nil); len(got) != 0 {
 		t.Fatalf("the done cycle committed ahead of w0's window: %d cycle(s)", len(got))
 	}
-	got, _ := c.staged.deliver(stagedRef("raw.orders", "w0"), w0win.BatchId, []byte{3}, "0/10", "", nil)
-	if len(got) != 3 || got[0].seq != w0win.BatchId || got[2].seq != done.BatchId {
+	got, _ := c.staged.Deliver(stagedRef("raw.orders", "w0"), w0win.BatchId, []byte{3}, "0/10", "", nil)
+	if len(got) != 3 || got[0].Seq != w0win.BatchId || got[2].Seq != done.BatchId {
 		t.Fatalf("committable after w0's window: %d cycle(s), want w0's window, w1's window, then the done cycle", len(got))
 	}
 }

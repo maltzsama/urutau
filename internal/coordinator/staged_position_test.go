@@ -35,10 +35,10 @@ func TestStagedCycleCommitsTheBatchPosition(t *testing.T) {
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	if committable, _ := c.staged.deliver(stagedRef("raw.orders", "w0"), meta.BatchId, []byte{1}, "0/30", "", nil); len(committable) != 0 {
+	if committable, _ := c.staged.Deliver(stagedRef("raw.orders", "w0"), meta.BatchId, []byte{1}, "0/30", "", nil); len(committable) != 0 {
 		t.Fatal("the cycle completed with one of two owners")
 	}
-	committable, known := c.staged.deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{2}, "0/40", "", nil)
+	committable, known := c.staged.Deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{2}, "0/40", "", nil)
 	if !known || len(committable) != 1 {
 		t.Fatalf("committable=%d known=%v; want the cycle complete", len(committable), known)
 	}
@@ -67,10 +67,10 @@ func TestStagedCycleCommitsTheBatchMaximumNotLastPartition(t *testing.T) {
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	if committable, _ := c.staged.deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{1}, "0/30", "", nil); len(committable) != 0 {
+	if committable, _ := c.staged.Deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{1}, "0/30", "", nil); len(committable) != 0 {
 		t.Fatal("the cycle completed with one of two owners")
 	}
-	committable, known := c.staged.deliver(stagedRef("raw.orders", "w0"), meta.BatchId, []byte{2}, "0/40", "", nil)
+	committable, known := c.staged.Deliver(stagedRef("raw.orders", "w0"), meta.BatchId, []byte{2}, "0/40", "", nil)
 	if !known || len(committable) != 1 {
 		t.Fatalf("committable=%d known=%v; want the cycle complete", len(committable), known)
 	}
@@ -96,8 +96,8 @@ func TestAWindowCycleCommitsNoPosition(t *testing.T) {
 	c.snk = snk
 	c.runCtx = context.Background()
 	ref := stagedRef("raw.orders", "w0")
-	c.staged.expectWindow(core.TableRef{Target: "raw.orders"}, 77, []string{"w0"})
-	committable, known := c.staged.deliver(ref, 77, []byte{1}, "0/90", "in_progress", []uint32{5, 6})
+	c.staged.ExpectWindow(core.TableRef{Target: "raw.orders"}, 77, []string{"w0"})
+	committable, known := c.staged.Deliver(ref, 77, []byte{1}, "0/90", "in_progress", []uint32{5, 6})
 	if !known || len(committable) != 1 {
 		t.Fatalf("committable=%d known=%v", len(committable), known)
 	}

@@ -138,7 +138,7 @@ func (c *Coordinator) publishLag() {
 	c.publishConfirmedAge(now)
 	// Read before statsMu for the same reason: totalOpen takes the staged
 	// tracker's lock.
-	stagedOpen := c.staged.totalOpen()
+	stagedOpen := c.staged.TotalOpen()
 	c.statsMu.Lock()
 	defer c.statsMu.Unlock()
 	for table, ts := range c.tableStats {
@@ -224,7 +224,7 @@ func (c *Coordinator) tablePending(target string) int {
 	}
 	c.mu.Unlock()
 	if c.stagesCycles() {
-		pending += c.staged.openFor(core.TableRef{Target: target})
+		pending += c.staged.OpenFor(core.TableRef{Target: target})
 	}
 	return pending
 }
