@@ -181,7 +181,7 @@ func TestFinishSnapshotQueuesTheDoneMarkerBehindTheLastWindow(t *testing.T) {
 		t.Fatalf("done marker position %q, want the latest sent, 0/10", metas[1].LowPos)
 	}
 	// The marker is in flight until the worker acks it, like any batch.
-	if n := c.inFlight("w0"); n != 2 {
+	if n := c.index.InFlight("w0"); n != 2 {
 		t.Fatalf("in flight %d, want 2", n)
 	}
 }
@@ -194,7 +194,7 @@ func TestFinishSnapshotOnAStagedTableIsACycle(t *testing.T) {
 	c.snk = snk
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
-	c.index["w1"] = inflight.NewPositionIndex("run-1")
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	if err := c.sendClosesPending(context.Background(), w1, "raw.orders", position.MustLSN("0/10"), 0, nil, 0, nil); err != nil {
@@ -243,7 +243,7 @@ func TestSnapshotDoneWaitsForEveryEarlierWindow(t *testing.T) {
 	c.snk = snk
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
-	c.index["w1"] = inflight.NewPositionIndex("run-1")
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	ctx := context.Background()

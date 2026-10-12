@@ -242,7 +242,7 @@ func (s dashState) RestartWorker(name string) error {
 	// an upsert table, but appended twice on an append table if one was
 	// committed before its ack was lost. The supervisor refuses the same
 	// reset there, so the dashboard must too (issues #205, #461).
-	if n := c.inFlight(name); n > 0 && c.workerAppends(name) {
+	if n := c.index.InFlight(name); n > 0 && c.workerAppends(name) {
 		return fmt.Errorf("coordinator: worker %s has %d in-flight batch(es) on an append table — a restart would append them twice; wait for it to drain: %w", name, n, dashboard.ErrRestartConflict)
 	}
 	c.supervisor.recordReset(name, time.Now(), supervisionConfig(c.cfg).ResetWindow)

@@ -227,13 +227,12 @@ type Coordinator struct {
 	budget     *inflight.Budget
 	// index is the per-worker position index. It was written only at boot
 	// until live re-slicing (issue #312) made registerOwner write it at
-	// runtime, so it now needs its own lock: the readers (inFlight, enqueueTo,
-	// onAck, the dashboard) deliberately run outside c.mu to avoid the
-	// c.mu/supervisor lock-order deadlock (audit #3). indexMu is taken alone
-	// by readers and as c.mu -> indexMu by registerOwner/unregisterOwner, so
-	// the order is consistent and never cycles.
-	indexMu sync.RWMutex
-	index   map[string]*inflight.PositionIndex
+	// runtime, so it has its own lock: the readers (enqueueTo, onAck, the
+	// supervisor, the dashboard) deliberately run outside c.mu to avoid the
+	// c.mu/supervisor lock-order deadlock (audit #3). Its lock is taken alone
+	// by readers and as c.mu -> index by registerOwner/unregisterOwner, so the
+	// order is consistent and never cycles.
+	index inflight.Indexes
 
 	// Kubernetes worker provisioning (issue #298): k8s is the in-cluster
 	// client, built lazily and cached. workerK8s is set at boot when the
@@ -516,7 +515,6 @@ func Run(ctx context.Context, cfg Config) error {
 		log:         cfg.Logger,
 		workers:     map[string]*workerState{},
 		byTicket:    map[string]*workerState{},
-		index:       map[string]*inflight.PositionIndex{},
 		ready:       make(chan struct{}, 1024),
 		sessionErrs: make(chan error, 1024),
 		ackNotify:   make(chan struct{}, 1),

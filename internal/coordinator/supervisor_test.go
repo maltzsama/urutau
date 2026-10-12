@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/inflight"
+	sup "github.com/maltzsama/urutau/internal/supervisor"
 )
 
 // supervisorHarness builds a Coordinator with the minimal surface the
@@ -167,8 +168,8 @@ func TestSupervisorAwaitsALostWorkerOwingWork(t *testing.T) {
 	c := s.c
 	w := workers["w1"]
 	w.attached, w.hadSession = false, true
-	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
-	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
+	c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "t"})
 	now := time.Now()
 	s.pendingSet("w1")
 	s.noteAck("w1", now.Add(-2*time.Minute))
@@ -252,8 +253,8 @@ func TestRecordResetReturnsWindowedCount(t *testing.T) {
 // ago: past the ack timeout.
 func progressHarness(ago time.Duration) (*supervisor, *workerState, time.Time) {
 	s, workers := supervisorHarness()
-	s.c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
-	s.c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
+	s.c.index.Set("w1", inflight.NewPositionIndex("run-1"))
+	s.c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "t"})
 	now := time.Now()
 	s.noteAck("w1", now.Add(-ago))
 	return s, workers["w1"], now
@@ -269,8 +270,8 @@ var progressCfg = SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 5, R
 func TestSupervisorSparesAWorkerMakingStorageProgress(t *testing.T) {
 	s, w, now := progressHarness(2 * time.Minute)
 	w.cancel = func() {}
-	s.noteProgress("w1", 100<<20, now.Add(-40*time.Second))
-	s.noteProgress("w1", 180<<20, now.Add(-5*time.Second))
+	s.progress.Note("w1", 100<<20, now.Add(-40*time.Second))
+	s.progress.Note("w1", 180<<20, now.Add(-5*time.Second))
 	if err := s.tick(now, progressCfg); err != nil {
 		t.Fatalf("tick terminated a worker whose uploads advance: %v", err)
 	}
@@ -297,19 +298,19 @@ func requireReset(t *testing.T, s *supervisor, w *workerState, err error, why st
 func TestSupervisorResetsAWorkerWithoutProgress(t *testing.T) {
 	s, w, now := progressHarness(2 * time.Minute)
 	w.cancel = func() {}
-	s.noteProgress("w1", 100<<20, now.Add(-90*time.Second))
-	s.noteProgress("w1", 100<<20+4096, now.Add(-5*time.Second)) // heartbeats only
+	s.progress.Note("w1", 100<<20, now.Add(-90*time.Second))
+	s.progress.Note("w1", 100<<20+4096, now.Add(-5*time.Second)) // heartbeats only
 	requireReset(t, s, w, s.tick(now, progressCfg), "a worker without progress")
 }
 
 // Progress without an ack for long is not trusted forever: a worker that
 // keeps sending (retrying one failing upload, say) but never acks is ended
-// at progressAckCap × the ack timeout.
+// at ProgressAckCap × the ack timeout.
 func TestSupervisorCapsProgressWithoutAcks(t *testing.T) {
-	s, w, now := progressHarness(progressAckCap*30*time.Second + time.Second)
+	s, w, now := progressHarness(sup.ProgressAckCap*30*time.Second + time.Second)
 	w.cancel = func() {}
-	s.noteProgress("w1", 100<<20, now.Add(-40*time.Second))
-	s.noteProgress("w1", 900<<20, now.Add(-5*time.Second))
+	s.progress.Note("w1", 100<<20, now.Add(-40*time.Second))
+	s.progress.Note("w1", 900<<20, now.Add(-5*time.Second))
 	requireReset(t, s, w, s.tick(now, progressCfg), "a worker past the progress cap")
 }
 
@@ -319,8 +320,8 @@ func TestSupervisorCapsProgressWithoutAcks(t *testing.T) {
 func TestSupervisorProgressIsGrowthWithinTheTimeout(t *testing.T) {
 	s, w, now := progressHarness(2 * time.Minute)
 	w.cancel = func() {}
-	s.noteProgress("w1", 100<<20, now.Add(-100*time.Second))
-	s.noteProgress("w1", 100<<20+600<<10, now.Add(-45*time.Second))
-	s.noteProgress("w1", 100<<20+1200<<10, now.Add(-5*time.Second)) // 600 KiB in the last 30 s
+	s.progress.Note("w1", 100<<20, now.Add(-100*time.Second))
+	s.progress.Note("w1", 100<<20+600<<10, now.Add(-45*time.Second))
+	s.progress.Note("w1", 100<<20+1200<<10, now.Add(-5*time.Second)) // 600 KiB in the last 30 s
 	requireReset(t, s, w, s.tick(now, progressCfg), "a worker that grew under 1 MiB in the last timeout")
 }

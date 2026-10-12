@@ -133,7 +133,7 @@ func TestEnqueueBatchErrorReleasesRemainingSubBatches(t *testing.T) {
 	w1 := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = w1
 	c.setRouteForTest("raw.orders", []*workerState{w0, w1})
-	c.index["w1"] = inflight.NewPositionIndex("run-1")
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
 	c.setRangesForTest(map[string][]source.Chunk{
 		"raw.orders": {{Low: nil, High: []any{int64(100)}}, {Low: []any{int64(100)}, High: nil}},

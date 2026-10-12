@@ -7,8 +7,7 @@ import (
 	"time"
 
 	"github.com/maltzsama/urutau/internal/eventlog"
-
-	"github.com/maltzsama/urutau/internal/inflight"
+	sup "github.com/maltzsama/urutau/internal/supervisor"
 )
 
 // SupervisorConfig tunes worker supervision (design §7/§8): a worker that
@@ -38,7 +37,7 @@ type supervisor struct {
 	pending map[string]bool // worker reset but not yet reattached
 	// progress is each worker's recent network output reports: a worker
 	// whose output grows is busy on slow storage, not stalled (#422).
-	progress map[string][]progressSample
+	progress sup.Progress
 	// health is each worker's losses and crashes (recovery.go).
 	health map[string]*workerHealth
 	// lastDelivered is when each worker last delivered: an ack, or owing
@@ -52,7 +51,6 @@ func newSupervisor(c *Coordinator) *supervisor {
 		lastAck:       map[string]time.Time{},
 		resets:        map[string][]time.Time{},
 		pending:       map[string]bool{},
-		progress:      map[string][]progressSample{},
 		health:        map[string]*workerHealth{},
 		lastDelivered: map[string]time.Time{},
 	}
@@ -100,7 +98,7 @@ func (s *supervisor) forget(worker string) {
 	delete(s.lastAck, worker)
 	delete(s.pending, worker)
 	delete(s.resets, worker)
-	delete(s.progress, worker)
+	s.progress.Forget(worker)
 	delete(s.health, worker)
 	delete(s.lastDelivered, worker)
 	s.mu.Unlock()
@@ -219,7 +217,7 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	held := make([]minHeld, 0, len(probes))
 	for i := range probes {
 		var id uint64
-		if idx := s.c.indexOf(probes[i].name); idx != nil {
+		if idx := s.c.index.Of(probes[i].name); idx != nil {
 			probes[i].owes = probes[i].owes || idx.InFlight() > 0
 			if recovering[probes[i].name] {
 				id = idx.MinHeldID()
@@ -246,7 +244,7 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// lets it reconnect for a moment every few seconds, or a Pod that
 		// never starts, is not a worker making progress. A worker whose
 		// uploads keep flowing is delivering to storage (#422).
-		if at, ok := s.lastDelivered[p.name]; ok && p.owes && now.Sub(at) > delivery && !s.busyLocked(p.name, now, at, delivery) {
+		if at, ok := s.lastDelivered[p.name]; ok && p.owes && now.Sub(at) > delivery && !s.progress.Busy(p.name, now, at, delivery) {
 			gone = append(gone, p.name)
 			continue
 		}
@@ -267,7 +265,7 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		if idle, seen := s.lastDelivered[p.name]; seen && idle.After(at) {
 			at, ok = idle, true
 		}
-		if p.attached && p.owes && (!ok || now.Sub(at) > ack) && !s.busyLocked(p.name, now, at, ack) {
+		if p.attached && p.owes && (!ok || now.Sub(at) > ack) && !s.progress.Busy(p.name, now, at, ack) {
 			stalled = append(stalled, p.name)
 		}
 	}
@@ -286,7 +284,7 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 		// an upsert worker skips what it committed and re-applies the rest
 		// idempotently, but on an append table a batch committed before its
 		// ack was lost would be appended twice.
-		if n := s.c.inFlight(name); n > 0 && s.c.workerAppends(name) {
+		if n := s.c.index.InFlight(name); n > 0 && s.c.workerAppends(name) {
 			return fmt.Errorf("coordinator: worker %s stalled with %d in-flight batch(es) on an append table — a reset would append them twice",
 				name, n)
 		}
@@ -298,50 +296,6 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 // defaultWorkerDeliveryTimeout is how long a lost worker may take to
 // reconnect before the run ends.
 const defaultWorkerDeliveryTimeout = 5 * time.Minute
-
-// indexOf returns a worker's position index under indexMu, or nil.
-func (c *Coordinator) indexOf(worker string) *inflight.PositionIndex {
-	c.indexMu.RLock()
-	defer c.indexMu.RUnlock()
-	return c.index[worker]
-}
-
-// setIndex installs a worker's position index under indexMu.
-func (c *Coordinator) setIndex(worker string, idx *inflight.PositionIndex) {
-	c.indexMu.Lock()
-	defer c.indexMu.Unlock()
-	c.index[worker] = idx
-}
-
-// deleteIndex removes a worker's position index under indexMu.
-func (c *Coordinator) deleteIndex(worker string) {
-	c.indexMu.Lock()
-	defer c.indexMu.Unlock()
-	delete(c.index, worker)
-}
-
-// indexSnapshot copies the index map under indexMu, for a reader that iterates
-// it (the checkpoint runner) while registerOwner may be writing.
-func (c *Coordinator) indexSnapshot() map[string]*inflight.PositionIndex {
-	c.indexMu.RLock()
-	defer c.indexMu.RUnlock()
-	out := make(map[string]*inflight.PositionIndex, len(c.index))
-	for k, v := range c.index {
-		out[k] = v
-	}
-	return out
-}
-
-// inFlight reports how many batches the worker has been delivered but has not
-// acked. The map lookup is guarded by indexMu because registerOwner writes the
-// map at runtime during a scale-out (issue #312); InFlight takes the index's
-// own lock.
-func (c *Coordinator) inFlight(worker string) int {
-	if idx := c.indexOf(worker); idx != nil {
-		return idx.InFlight()
-	}
-	return 0
-}
 
 // recordReset pushes a reset timestamp into the worker's sliding window,
 // expiring entries older than window, and returns the resulting count — read
@@ -399,71 +353,4 @@ func (c *Coordinator) resetWorker(w *workerState) {
 		w.cancel = nil
 	}
 	c.mu.Unlock()
-}
-
-// A worker that acks nothing past the ack timeout may be wedged, or writing
-// to storage slow enough that one commit outlasts the timeout. Terminating
-// the second replays the same load against the same storage: the matrix run
-// restarted 12 times against a struggling S3 and never converged (#422).
-// The worker reports its network output (WorkerMetricsReport.net_tx_bytes);
-// output that keeps growing marks it busy, not stalled.
-const (
-	// progressMinBytes is the growth that counts as progress: well above
-	// the control stream's own reports and logs.
-	progressMinBytes = 1 << 20
-	// progressAckCap bounds how long progress stands in for acks, in ack
-	// timeouts: a worker that keeps sending but never acks (retrying one
-	// failing upload, say) is ended all the same.
-	progressAckCap = 10
-)
-
-// progressSample is one reported network output and when it arrived.
-type progressSample struct {
-	at    time.Time
-	bytes int64
-}
-
-// progressKeep bounds the samples kept per worker: enough to span any sane
-// ack timeout at the worker's 5 s report cadence.
-const progressKeep = 128
-
-// noteProgress records a worker's cumulative network output. A counter lower
-// than the last one belongs to a new process: its samples start over.
-func (s *supervisor) noteProgress(worker string, txBytes int64, at time.Time) {
-	if txBytes <= 0 {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h := s.progress[worker]
-	if n := len(h); n > 0 && txBytes < h[n-1].bytes {
-		h = h[:0]
-	}
-	h = append(h, progressSample{at: at, bytes: txBytes})
-	if len(h) > progressKeep {
-		h = append(h[:0], h[len(h)-progressKeep:]...)
-	}
-	s.progress[worker] = h
-}
-
-// busyLocked reports whether a worker past its ack timeout is making
-// progress: its output grew by progressMinBytes over the last ack timeout
-// (from the newest sample at or before its start), and its last ack is
-// within progressAckCap timeouts. Caller holds s.mu.
-func (s *supervisor) busyLocked(worker string, now, lastAck time.Time, ack time.Duration) bool {
-	if lastAck.IsZero() || now.Sub(lastAck) > progressAckCap*ack {
-		return false
-	}
-	h := s.progress[worker]
-	if len(h) < 2 || now.Sub(h[len(h)-1].at) > ack {
-		return false
-	}
-	from := h[0]
-	for _, p := range h {
-		if p.at.After(now.Add(-ack)) {
-			break
-		}
-		from = p
-	}
-	return h[len(h)-1].bytes-from.bytes >= progressMinBytes
 }

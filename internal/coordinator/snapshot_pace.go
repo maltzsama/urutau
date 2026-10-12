@@ -77,7 +77,7 @@ func (c *Coordinator) uncommittedChunks(worker string) int {
 // heldChunkMarkers drops worker's committed markers and returns the rest,
 // oldest first.
 func (c *Coordinator) heldChunkMarkers(worker string) []snapshot.Marker {
-	idx := c.indexOf(worker)
+	idx := c.index.Of(worker)
 	return c.markers.Held(worker, func(id uint64) bool { return idx != nil && idx.Holds(id) })
 }
 
@@ -85,7 +85,7 @@ func (c *Coordinator) heldChunkMarkers(worker string) []snapshot.Marker {
 // rows are committed (#468). It advances no position — the window's rows
 // carry none.
 func (c *Coordinator) onMarkerAck(worker string, id uint64) {
-	idx := c.indexOf(worker)
+	idx := c.index.Of(worker)
 	if idx == nil {
 		return
 	}

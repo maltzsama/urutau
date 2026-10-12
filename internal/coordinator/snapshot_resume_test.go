@@ -77,7 +77,7 @@ func newResumeHarness(t *testing.T) *resumeHarness {
 			case <-ctx.Done():
 				return
 			case <-time.After(10 * time.Millisecond):
-				commitEverything(c.index["w0"], "raw.orders", position.MustLSN("0/1"))
+				commitEverything(c.index.Of("w0"), "raw.orders", position.MustLSN("0/1"))
 			}
 		}
 	}()

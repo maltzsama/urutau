@@ -115,7 +115,7 @@ func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
 	}
 	faultinject.At(faultinject.CoordinatorAckBeforeRecord,
 		"table", ack.Table, "worker", worker, "position", ack.Position)
-	idx := c.indexOf(worker)
+	idx := c.index.Of(worker)
 	if idx == nil {
 		// The worker's index is gone (unregistered on a rolled-back scale):
 		// nothing to truncate, and it holds no budget this ack would free.

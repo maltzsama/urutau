@@ -46,7 +46,7 @@ func (c *Coordinator) bootWorker(name string, ref core.TableRef) *workerState {
 			break
 		}
 		c.workers[name] = w
-		c.setIndex(name, inflight.NewPositionIndex(c.runID))
+		c.index.Set(name, inflight.NewPositionIndex(c.runID))
 	}
 	w.refs = append(w.refs, ref)
 	return w

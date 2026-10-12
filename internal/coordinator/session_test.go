@@ -29,8 +29,8 @@ func TestSupervisorResetsAStalledWorkerWithInFlight(t *testing.T) {
 	w := workers["w1"]
 	cancelled := false
 	w.cancel = func() { cancelled = true }
-	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
-	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
+	c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "t"})
 	s.noteAck("w1", time.Now().Add(-2*time.Minute))
 
 	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second}); err != nil {
@@ -49,8 +49,8 @@ func TestSupervisorEndsTheRunForAStalledAppendWorkerWithInFlight(t *testing.T) {
 	c := s.c
 	workers["w1"].refs = []source.TableRef{{Source: "shop.t", Target: "raw.t"}}
 	c.cfg.Spec = &spec.Spec{Tables: []spec.Table{{Source: "shop.t", Target: "raw.t", WriteMode: spec.WriteModeAppend}}}
-	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
-	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "raw.t"})
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
+	c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "raw.t"})
 	s.noteAck("w1", time.Now().Add(-2*time.Minute))
 
 	err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second})
@@ -64,7 +64,7 @@ func TestSupervisorEndsTheRunForAStalledAppendWorkerWithInFlight(t *testing.T) {
 func TestSupervisorResetWithoutInFlightRecovers(t *testing.T) {
 	s, workers := supervisorHarness()
 	c := s.c
-	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	w := workers["w1"]
 	cancelled := false
 	w.cancel = func() { cancelled = true }

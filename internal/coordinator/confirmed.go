@@ -24,7 +24,7 @@ func (c *Coordinator) workersOwing() map[string]bool {
 	}
 	c.mu.Unlock()
 	for _, name := range names {
-		if !owing[name] && c.inFlight(name) > 0 {
+		if !owing[name] && c.index.InFlight(name) > 0 {
 			owing[name] = true
 		}
 	}

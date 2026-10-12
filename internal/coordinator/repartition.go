@@ -174,7 +174,7 @@ func (c *Coordinator) strandedOwner(w *workerState) bool {
 	attached := w.attached
 	queued := len(w.queue)
 	c.mu.Unlock()
-	return !attached && (queued > 0 || c.inFlight(w.name) > 0)
+	return !attached && (queued > 0 || c.index.InFlight(w.name) > 0)
 }
 
 // registerOwner creates a worker group and publishes it in the registry, so
@@ -204,7 +204,7 @@ func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerSt
 		break
 	}
 	c.workers[name] = w
-	c.setIndex(name, inflight.NewPositionIndex(c.runID))
+	c.index.Set(name, inflight.NewPositionIndex(c.runID))
 	// Seed the ack clock before the pod can attach, or the supervisor's
 	// next tick sees an attached worker with no lastAck and resets it.
 	c.supervisor.noteRegistered(name, time.Now())
@@ -228,7 +228,7 @@ func (c *Coordinator) unregisterOwner(w *workerState) {
 	}
 	delete(c.workers, w.name)
 	delete(c.byTicket, string(w.ticket))
-	c.deleteIndex(w.name)
+	c.index.Delete(w.name)
 	c.mu.Unlock()
 	c.confirmed.Forget(w.name)
 	c.supervisor.forget(w.name)
@@ -269,7 +269,7 @@ func (c *Coordinator) drainForFlip(ctx context.Context, target string, owners []
 		// acking, the supervisor calls it stale, and the reset discards its
 		// open staged cycles — silently losing the rows they carried.
 		for _, w := range owners {
-			inflight += c.inFlight(w.name)
+			inflight += c.index.InFlight(w.name)
 			queued += len(w.queue)
 		}
 		// Then the staged cycles, which must commit as one unit and so must
@@ -308,17 +308,17 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
-	for c.inFlight(w.name) != 0 || len(w.queue) != 0 {
+	for c.index.InFlight(w.name) != 0 || len(w.queue) != 0 {
 		select {
 		case <-ctx.Done():
 			// The flip has already committed: the retire must finish, or the
 			// owner stays registered with a live session under the new
 			// layout. Force the detach rather than abort mid-way.
 			c.log.Warn("coordinator: owner drain context done; forcing removal",
-				"worker", w.name, "inflight", c.inFlight(w.name))
+				"worker", w.name, "inflight", c.index.InFlight(w.name))
 		case <-deadline.C:
 			c.log.Warn("coordinator: owner drain timed out; forcing removal",
-				"worker", w.name, "inflight", c.inFlight(w.name), "timeout", c.drainTimeout())
+				"worker", w.name, "inflight", c.index.InFlight(w.name), "timeout", c.drainTimeout())
 		case <-c.ackNotify: // an ack may have drained in-flight (issue #587)
 			continue
 		case <-tick.C:
