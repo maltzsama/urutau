@@ -51,8 +51,12 @@ rules:
   # ConfigMap carries the resolved spec; the Service is the coordinator's
   # headless stable identity. Delete flows through owner-reference GC.
   - apiGroups: [""]
-    resources: ["configmaps", "services"]
+    resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # delete: the Service of a worker StatefulSet whose table left the pipeline.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Per-pipeline coordinator identity, created dynamically at reconcile.
   # list/watch are required because the manager caches every type it
   # creates/owns, not just the ones it watches by name.
