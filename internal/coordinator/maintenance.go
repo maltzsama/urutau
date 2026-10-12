@@ -22,6 +22,8 @@ import (
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/coordk8s"
 )
 
 // maintenanceScheduler owns the ephemeral maintenance workers, one per
@@ -87,14 +89,14 @@ func (c *Coordinator) startMaintenance(refs []core.TableRef, workerTarget map[st
 	// c.maint is published only once the scheduler is whole: sessions read it
 	// from other goroutines, and one that found it before its Kubernetes
 	// client was set would skip deleting its worker's Pod.
-	if !workerPodTemplateAvailable(workerTarget) {
+	if !coordk8s.WorkerPodTemplateAvailable(workerTarget) {
 		c.log.Warn("coordinator: maintenance enabled but no worker pod template — no maintenance worker will run (Kubernetes provisioning is off)")
 		c.maint = m
 		return nil
 	}
 	ctx, cancel := maintenanceK8sContext()
 	defer cancel()
-	clientset, ns, owner, err := inClusterClient(ctx)
+	clientset, ns, owner, err := coordk8s.InClusterClient(ctx)
 	if err != nil {
 		return fmt.Errorf("k8s maintenance provisioning: %w", err)
 	}
@@ -153,7 +155,7 @@ func (m *maintenanceScheduler) boundPass(name, table string) (stop func()) {
 			"worker", name, "table", table, "bound", maintenancePassTimeout)
 		ctx, cancel := maintenanceK8sContext()
 		defer cancel()
-		if err := deletePod(ctx, m.k8s, m.namespace, name); err != nil {
+		if err := coordk8s.DeletePod(ctx, m.k8s, m.namespace, name); err != nil {
 			m.c.log.Warn("coordinator: maintenance: delete hung worker pod", "worker", name, "err", err)
 		}
 	})
@@ -217,7 +219,7 @@ func (m *maintenanceScheduler) session(stream pb.UrutauControl_SessionServer, he
 		// take it away.
 		if m.k8s != nil {
 			ctx, cancel := maintenanceK8sContext()
-			if err := deletePod(ctx, m.k8s, m.namespace, name); err != nil {
+			if err := coordk8s.DeletePod(ctx, m.k8s, m.namespace, name); err != nil {
 				m.c.log.Warn("coordinator: maintenance: delete worker pod", "worker", name, "err", err)
 			}
 			cancel()
@@ -398,23 +400,23 @@ func (m *maintenanceScheduler) tick(now time.Time) {
 func (m *maintenanceScheduler) provisionWorkerPod(name, table string) error {
 	ctx, cancel := maintenanceK8sContext()
 	defer cancel()
-	existing, err := getPod(ctx, m.k8s, m.namespace, name)
+	existing, err := coordk8s.GetPod(ctx, m.k8s, m.namespace, name)
 	if err != nil {
 		return err
 	}
 	if existing != nil {
-		if podCanStillConnect(existing) {
+		if coordk8s.PodCanStillConnect(existing) {
 			return nil
 		}
 		m.c.log.Info("coordinator: maintenance: replacing worker pod that cannot connect",
 			"worker", name, "table", table, "phase", existing.Status.Phase)
-		return deletePod(ctx, m.k8s, m.namespace, name)
+		return coordk8s.DeletePod(ctx, m.k8s, m.namespace, name)
 	}
-	tmpl, err := loadWorkerPodTemplate(table)
+	tmpl, err := coordk8s.LoadWorkerPodTemplate(table)
 	if err != nil {
 		return err
 	}
-	if err := createPod(ctx, m.k8s, m.namespace, maintenanceWorkerPod(name, m.namespace, m.owner, tmpl)); err != nil {
+	if err := coordk8s.CreatePod(ctx, m.k8s, m.namespace, coordk8s.MaintenanceWorkerPod(name, m.namespace, m.owner, tmpl)); err != nil {
 		return err
 	}
 	m.c.log.Info("coordinator: maintenance worker pod provisioned", "worker", name, "table", table)

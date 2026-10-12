@@ -18,11 +18,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/coordk8s"
 	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/eventlog"
 	"github.com/maltzsama/urutau/internal/gate"
@@ -226,24 +224,18 @@ type Coordinator struct {
 	indexMu sync.RWMutex
 	index   map[string]*positionIndex
 
-	// Kubernetes worker provisioning (issue #298): the in-cluster client is
-	// built lazily and cached (workerClientset). workerK8s is set at boot
-	// when the operator rendered worker pod templates — the switch that
-	// turns provisioning and the replica reconcile loop on. Both stay false
-	// for a pipeline that never sets spec.image, so the coordinator makes
-	// zero Kubernetes API calls.
-	k8sMu     sync.Mutex
-	k8sClient kubernetes.Interface
-	k8sNS     string
-	k8sOwner  metav1.OwnerReference
+	// Kubernetes worker provisioning (issue #298): k8s is the in-cluster
+	// client, built lazily and cached. workerK8s is set at boot when the
+	// operator rendered worker pod templates — the switch that turns
+	// provisioning and the replica reconcile loop on. It stays false for a
+	// pipeline that never sets spec.image, so the coordinator makes zero
+	// Kubernetes API calls.
+	k8s       coordk8s.Cluster
 	workerK8s bool
-	// scaleRetryAfter suppresses one table's replica reconcile until the
-	// mapped time after a failed scale: each attempt pauses the table's input
-	// for the whole drain timeout, so retrying every tick would starve the
-	// backlog the drain is waiting on (issue #298). Keyed by table target so
-	// one table's failure does not stall another's. Read and written only by
-	// the reconcile loop.
-	scaleRetryAfter map[string]time.Time
+	// scale follows the worker StatefulSets' replica counts (see
+	// coordk8s.Autoscaler); built on first use by autoscaler().
+	scaleOnce sync.Once
+	scale     *coordk8s.Autoscaler
 
 	// runCtx outlives the helper goroutines that need cancellation (the
 	// wireRelay) but are called outside run's select.
