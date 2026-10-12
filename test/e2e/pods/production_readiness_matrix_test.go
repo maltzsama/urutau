@@ -104,13 +104,25 @@ func newMatrixSampler(r *prRun) *matrixSampler {
 // Pod, the same image and credentials the bucket-init Job uses.
 func s3(ctx context.Context, script string) (string, error) {
 	name := "pr-s3-" + strconv.FormatInt(time.Now().UnixNano()%2176782336, 36)
-	return kubectlCmd("", s3RunArgs(name, script)...)
+	// The call outlasts the Pod's start timeout by what the command itself
+	// may take.
+	return kubectlCmdBy(time.Now().Add(s3PodStartTimeout+kubectlTimeout), "", s3RunArgs(name, script)...)
 }
 
+// s3PodStartTimeout is how long the helper Pod may take to run. kubectl's
+// default is one minute, which a start on a node just out of a chaos window
+// does not always meet (#853).
+const s3PodStartTimeout = 3 * time.Minute
+
 // s3RunArgs is the kubectl invocation of the one-shot Pod that runs script.
+// The image is the one the bucket-init Job pulled when the cluster came up:
+// IfNotPresent keeps a :latest tag from being pulled again on every start, in
+// the middle of a run (#853).
 func s3RunArgs(name, script string) []string {
 	return []string{"-n", dataNS, "run", name, "--rm", "-i", "--quiet", "--restart=Never",
 		"--image=amazon/aws-cli:latest",
+		"--image-pull-policy=IfNotPresent",
+		"--pod-running-timeout=" + s3PodStartTimeout.String(),
 		"--env=AWS_ACCESS_KEY_ID=urutau", "--env=AWS_SECRET_ACCESS_KEY=urutau_dev_secret", "--env=AWS_DEFAULT_REGION=us-east-1",
 		"--command", "--", "sh", "-c", script}
 }
