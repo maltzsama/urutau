@@ -41,7 +41,7 @@ import (
 // (snapshot_hash_redo.go, #829).
 func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
 	rt := c.loadRouting()
-	owners, ok := rt.ownersOf(ref.Target)
+	owners, ok := rt.OwnersOf(ref.Target)
 	if !ok || len(owners) == 0 {
 		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
 	}

@@ -30,7 +30,7 @@ func fanoutHarness(t *testing.T) (*Coordinator, *committedCyclesSink, source.Tab
 	snk := &committedCyclesSink{}
 	c.snk = snk
 	c.bootCommitted = nil
-	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	c.fanout.begin("raw.orders")
 	return c, snk, c.refs[0], owners
 }

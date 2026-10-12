@@ -64,10 +64,7 @@ func coordHarness() (*Coordinator, *workerState) {
 	}
 	c.gate = gate.New[*dataplane.Batch](gateMaxEvents, gateMaxBytes, batchBytes, batchSink{c})
 	c.supervisor = newSupervisor(c)
-	c.publishRouting(&routing{
-		owners: map[string][]*workerState{"raw.orders": {w}},
-		ranges: map[string][]source.Chunk{},
-	})
+	c.publishRouting(newRouting(map[string][]*workerState{"raw.orders": {w}}, map[string][]source.Chunk{}))
 	return c, w
 }
 

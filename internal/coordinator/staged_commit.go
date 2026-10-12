@@ -25,7 +25,7 @@ func (c *Coordinator) stagesCycles() bool {
 // advance the confirmed position; commitStagedCycle does, after the cycle is
 // durable (WK-001 §2.2/F2).
 func (c *Coordinator) isStagedTable(target string) bool {
-	return c.stagesCycles() && len(c.loadRouting().owners[target]) > 1
+	return c.stagesCycles() && c.ownerCount(target) > 1
 }
 
 // onStagedBatch handles one StagedBatch from a worker (WK-001 C5): it records
@@ -172,7 +172,7 @@ func (c *Coordinator) commitStagedCycleLocked(cy *stagedCycle) error {
 // (#823): the owner that had rows in a transaction's earlier batches and none
 // in its last would hold them in flight until its next rows.
 func (c *Coordinator) releaseCommittedCycles(table string, p position.Position) {
-	owners, _ := c.loadRouting().ownersOf(table)
+	owners, _ := c.loadRouting().OwnersOf(table)
 	for _, w := range owners {
 		idx := c.indexOf(w.name)
 		if idx == nil {

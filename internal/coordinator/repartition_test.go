@@ -11,6 +11,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 
 	"github.com/maltzsama/urutau/core"
+	route "github.com/maltzsama/urutau/internal/routing"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
@@ -67,7 +68,7 @@ type WorkerSpecAlias = spec.WorkerSpec
 
 func TestScaleOutRegistersOwnerAndSwapsRouting(t *testing.T) {
 	c, ch := scaleHarness(t)
-	before, _ := c.loadRouting().ownersOf("raw.orders")
+	before, _ := c.loadRouting().OwnersOf("raw.orders")
 	if len(before) != 1 {
 		t.Fatalf("precondition: want 1 owner, got %d", len(before))
 	}
@@ -76,14 +77,14 @@ func TestScaleOutRegistersOwnerAndSwapsRouting(t *testing.T) {
 		t.Fatalf("ScaleTable: %v", err)
 	}
 
-	after, _ := c.loadRouting().ownersOf("raw.orders")
+	after, _ := c.loadRouting().OwnersOf("raw.orders")
 	if len(after) != 3 {
 		t.Fatalf("owners after scale = %d, want 3", len(after))
 	}
 	// Ownership is the rendezvous hash, so a re-slice no longer samples key
 	// ranges: the routing keeps the single unbounded range and Partitions is
 	// never called.
-	if ranges := c.loadRouting().rangesOf("raw.orders"); len(ranges) != 1 {
+	if ranges := c.loadRouting().RangesOf("raw.orders"); len(ranges) != 1 {
 		t.Fatalf("ranges after scale = %d, want 1 (no sampling)", len(ranges))
 	}
 	if ch.calls != 0 {
@@ -112,7 +113,7 @@ func TestScaledOutWorkerIsAcceptedBySession(t *testing.T) {
 	c, _ := scaleHarness(t)
 	srv := &controlServer{c: c}
 
-	newName := partitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)
+	newName := route.PartitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)
 	stream := &fakeSessionStream{in: []*pb.WorkerMessage{
 		{Msg: &pb.WorkerMessage_Hello{Hello: &pb.Hello{WorkerName: newName}}},
 	}}
@@ -135,17 +136,17 @@ func TestScaleInDropsOwnerAndShrinksRanges(t *testing.T) {
 	if err := c.ScaleTable(ctx, "raw.orders", 3); err != nil {
 		t.Fatalf("scale out: %v", err)
 	}
-	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	dropped := owners[2]
 
 	if err := c.ScaleTable(ctx, "raw.orders", 2); err != nil {
 		t.Fatalf("scale in: %v", err)
 	}
-	after, _ := c.loadRouting().ownersOf("raw.orders")
+	after, _ := c.loadRouting().OwnersOf("raw.orders")
 	if len(after) != 2 {
 		t.Fatalf("owners = %d, want 2", len(after))
 	}
-	if len(c.loadRouting().rangesOf("raw.orders")) != 1 {
+	if len(c.loadRouting().RangesOf("raw.orders")) != 1 {
 		t.Fatal("ranges are the single unbounded range; ownership shrinks by owner, not by sampling")
 	}
 	if _, ok := c.workers[dropped.name]; ok {
@@ -171,7 +172,7 @@ func TestScaleInDropsOwnerAndShrinksRanges(t *testing.T) {
 // which stalls source retention for the WHOLE pipeline.
 func TestScaleOutSeedsConfirmedPosition(t *testing.T) {
 	c, _ := scaleHarness(t)
-	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	base := position.MustLSN("0/100")
 	c.recordConfirmed(owners[0].name, base)
 	if got := c.confirmedPosition(); got == nil {
@@ -184,7 +185,7 @@ func TestScaleOutSeedsConfirmedPosition(t *testing.T) {
 	if got := c.confirmedPosition(); got == nil {
 		t.Fatal("confirmedPosition went nil after scale-out: retention would stall pipeline-wide")
 	}
-	after, _ := c.loadRouting().ownersOf("raw.orders")
+	after, _ := c.loadRouting().OwnersOf("raw.orders")
 	c.confirmedMu.Lock()
 	defer c.confirmedMu.Unlock()
 	for _, w := range after[1:] {
@@ -226,7 +227,7 @@ func TestScaleOutBuildsChunkerForUnpartitionedTable(t *testing.T) {
 	if err := c.ScaleTable(context.Background(), "raw.orders", 2); err != nil {
 		t.Fatalf("ScaleTable on a table booted unpartitioned: %v", err)
 	}
-	if owners, _ := c.loadRouting().ownersOf("raw.orders"); len(owners) != 2 {
+	if owners, _ := c.loadRouting().OwnersOf("raw.orders"); len(owners) != 2 {
 		t.Fatalf("owners = %d, want 2", len(owners))
 	}
 	if c.lookupChunker("raw.orders") == nil {
@@ -252,7 +253,7 @@ func TestScaleToSameCountIsNoop(t *testing.T) {
 func TestScaleWaitsForInFlightBatches(t *testing.T) {
 	c, _ := scaleHarness(t)
 	c.cfg.ScaleDrainTimeout = 500 * time.Millisecond
-	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 
 	// One batch delivered and unacked on the current owner.
 	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
@@ -267,7 +268,7 @@ func TestScaleWaitsForInFlightBatches(t *testing.T) {
 	if !strings.Contains(err.Error(), "drain") {
 		t.Fatalf("want a drain error, got %v", err)
 	}
-	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+	if got, _ := c.loadRouting().OwnersOf("raw.orders"); len(got) != 1 {
 		t.Fatalf("owners = %d, want the pre-scale 1 (no flip)", len(got))
 	}
 }
@@ -279,7 +280,7 @@ func TestScaleWaitsForOpenStagedCycle(t *testing.T) {
 	c.snk = fakeStagedSink{}
 	c.cfg.ScaleDrainTimeout = 2 * time.Second
 
-	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	second := &workerState{name: "w1", queue: make(chan queuedBatch, 8)}
 	c.setRouteForTest("raw.orders", []*workerState{owners[0], second})
 	c.setRangesForTest(map[string][]source.Chunk{"raw.orders": {{}, {}}})
@@ -301,7 +302,7 @@ func TestScaleWaitsForOpenStagedCycle(t *testing.T) {
 		t.Fatalf("want a drain error, got %v", err)
 	}
 	// The layout is unchanged: the flip did not happen.
-	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 2 {
+	if got, _ := c.loadRouting().OwnersOf("raw.orders"); len(got) != 2 {
 		t.Fatalf("owners = %d, want the pre-scale 2 (no flip)", len(got))
 	}
 }
@@ -345,11 +346,11 @@ func TestRoutingSnapshotIsConsistentUnderConcurrentScale(t *testing.T) {
 				default:
 				}
 				rt := c.loadRouting()
-				owners, ok := rt.ownersOf("raw.orders")
+				owners, ok := rt.OwnersOf("raw.orders")
 				if !ok {
 					continue
 				}
-				if len(rt.rangesOf("raw.orders")) == 0 {
+				if len(rt.RangesOf("raw.orders")) == 0 {
 					t.Errorf("torn snapshot: %d owners but no range", len(owners))
 					return
 				}
@@ -374,7 +375,7 @@ func TestScaleRejectsNonConcurrentSink(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "concurrent") {
 		t.Fatalf("want a concurrent-writer error, got %v", err)
 	}
-	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+	if got, _ := c.loadRouting().OwnersOf("raw.orders"); len(got) != 1 {
 		t.Fatalf("owners = %d, want the pre-scale 1 (no flip)", len(got))
 	}
 }
@@ -385,7 +386,7 @@ func TestScaleRejectsNonConcurrentSink(t *testing.T) {
 func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 	c, _ := scaleHarness(t)
 	c.cfg.ScaleDrainTimeout = 200 * time.Millisecond
-	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	// One in-flight batch the drain can never clear.
 	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 
@@ -393,7 +394,7 @@ func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 		t.Fatal("the scale must fail when the drain never converges")
 	}
 
-	name := partitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)
+	name := route.PartitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)
 	c.mu.Lock()
 	_, inWorkers := c.workers[name]
 	_, inIndex := c.index[name]
@@ -405,7 +406,7 @@ func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 		t.Fatalf("created owner %q lingered after a failed scale: workers=%v index=%v confirmed=%v",
 			name, inWorkers, inIndex, inConfirmed)
 	}
-	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+	if got, _ := c.loadRouting().OwnersOf("raw.orders"); len(got) != 1 {
 		t.Fatalf("owners = %d, want the pre-scale 1 (no flip)", len(got))
 	}
 }
@@ -416,7 +417,7 @@ func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 // layout.
 func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
 	c, _ := scaleHarness(t)
-	w, _ := c.loadRouting().ownersOf("raw.orders")
+	w, _ := c.loadRouting().OwnersOf("raw.orders")
 	owner := w[0]
 	// A batch that will never drain, so the loop would spin.
 	c.index[owner.name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
@@ -440,7 +441,7 @@ func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
 // first ack (issue #491).
 func TestRetireOwnerForgetsSupervisorState(t *testing.T) {
 	c, _ := scaleHarness(t)
-	w, _ := c.loadRouting().ownersOf("raw.orders")
+	w, _ := c.loadRouting().OwnersOf("raw.orders")
 	owner := w[0]
 
 	c.supervisor.noteAck(owner.name, time.Now())
@@ -511,7 +512,7 @@ func TestScaleInTerminatesOnNeverAttachedOwnerOwingWork(t *testing.T) {
 	if err := c.ScaleTable(ctx, "raw.orders", 2); err != nil {
 		t.Fatalf("scale out: %v", err)
 	}
-	owners, _ := c.loadRouting().ownersOf("raw.orders")
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	lost := owners[1]
 	if lost.attached || lost.hadSession {
 		t.Fatal("precondition: the new owner must never have attached")

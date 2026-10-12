@@ -210,7 +210,7 @@ func (c *Coordinator) publishConfirmedAge(now time.Time) {
 // the staged lock separately, never nested — so a caller can use it without
 // holding c.mu or c.statsMu.
 func (c *Coordinator) tablePending(target string) int {
-	owners, ok := c.loadRouting().ownersOf(target)
+	owners, ok := c.loadRouting().OwnersOf(target)
 	if !ok {
 		return 0
 	}

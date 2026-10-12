@@ -53,12 +53,12 @@ func (c *Coordinator) enqueueBatch(ctx context.Context, b *dataplane.Batch, meta
 	// publish a new layout mid-batch, and routing half the rows by each
 	// would split a key range across two owners (issue #312).
 	rt := c.loadRouting()
-	owners, ok := rt.ownersOf(meta.Table)
+	owners, ok := rt.OwnersOf(meta.Table)
 	if !ok {
 		if b != nil {
 			meta.Table = b.Table
 		}
-		owners, ok = rt.ownersOf(meta.Table)
+		owners, ok = rt.OwnersOf(meta.Table)
 		if !ok {
 			return fmt.Errorf("coordinator: no worker owns table %s", meta.Table)
 		}

@@ -25,9 +25,10 @@ func (c *Coordinator) workersOwing() map[string]bool {
 			owing[name] = true
 		}
 	}
-	routing := c.loadRouting()
+	rt := c.loadRouting()
 	for table := range c.bufferedTables() {
-		for _, w := range routing.owners[table] {
+		owners, _ := rt.OwnersOf(table)
+		for _, w := range owners {
 			owing[w.name] = true
 		}
 	}

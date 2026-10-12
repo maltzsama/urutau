@@ -22,10 +22,7 @@ func lagHarness() *Coordinator {
 		metrics: observability.New(),
 		staged:  newStagedCycles(),
 	}
-	c.publishRouting(&routing{
-		owners: map[string][]*workerState{"raw.orders": {w}},
-		ranges: map[string][]source.Chunk{},
-	})
+	c.publishRouting(newRouting(map[string][]*workerState{"raw.orders": {w}}, map[string][]source.Chunk{}))
 	return c
 }
 
@@ -50,10 +47,7 @@ func TestPublishLagZeroWhenCaughtUp(t *testing.T) {
 	c := lagHarness()
 	// Drain the queue: the table no longer owes anything.
 	w := &workerState{name: "w-0", queue: make(chan queuedBatch, 8)}
-	c.publishRouting(&routing{
-		owners: map[string][]*workerState{"raw.orders": {w}},
-		ranges: map[string][]source.Chunk{},
-	})
+	c.publishRouting(newRouting(map[string][]*workerState{"raw.orders": {w}}, map[string][]source.Chunk{}))
 	c.recordTableStats("w-0", "raw.orders", 1, 0, 0, time.Now().Add(-30*time.Second))
 
 	c.publishLag()

@@ -15,50 +15,16 @@ import (
 	"github.com/maltzsama/urutau/spec"
 
 	"github.com/maltzsama/urutau/internal/inflight"
+	route "github.com/maltzsama/urutau/internal/routing"
 )
 
-// routing is the immutable snapshot of one table's partition layout: the
-// owners in partition order and the key ranges they own, where
-// owners[i] owns ranges[i]. It is never mutated after publication — a
-// re-slice builds a new value and swaps the pointer, so a reader that
-// loaded it keeps routing a whole batch by one consistent layout.
-type routing struct {
-	owners map[string][]*workerState
-	ranges map[string][]source.Chunk
-}
+// routing is the coordinator's partition layout: the routing package's
+// immutable snapshot, with the worker groups as its owners.
+type routing = route.Layout[*workerState]
 
-// ownersOf returns the owners of target and whether the table is routed.
-func (r *routing) ownersOf(target string) ([]*workerState, bool) {
-	if r == nil {
-		return nil, false
-	}
-	o, ok := r.owners[target]
-	return o, ok
-}
-
-// rangesOf returns the key ranges of target, owners[i] owning ranges[i].
-func (r *routing) rangesOf(target string) []source.Chunk {
-	if r == nil {
-		return nil
-	}
-	return r.ranges[target]
-}
-
-// clone copies the two maps one level deep. The slices are shared, never
-// appended to in place: a re-slice replaces a table's slice wholesale, so a
-// reader holding the previous snapshot still sees the previous slice.
-func (r *routing) clone() *routing {
-	out := &routing{
-		owners: make(map[string][]*workerState, len(r.owners)),
-		ranges: make(map[string][]source.Chunk, len(r.ranges)),
-	}
-	for k, v := range r.owners {
-		out.owners[k] = v
-	}
-	for k, v := range r.ranges {
-		out.ranges[k] = v
-	}
-	return out
+// newRouting returns a layout over the given owners and ranges.
+func newRouting(owners map[string][]*workerState, ranges map[string][]source.Chunk) *routing {
+	return route.NewLayout(owners, ranges)
 }
 
 // loadRouting returns the current routing snapshot, never nil.
@@ -66,7 +32,7 @@ func (c *Coordinator) loadRouting() *routing {
 	if r := c.routing.Load(); r != nil {
 		return r
 	}
-	return &routing{owners: map[string][]*workerState{}, ranges: map[string][]source.Chunk{}}
+	return newRouting(nil, nil)
 }
 
 // publishRouting swaps in a new routing snapshot.
@@ -214,7 +180,7 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	defer c.repart.mu.Unlock()
 
 	cur := c.loadRouting()
-	owners, ok := cur.ownersOf(target)
+	owners, ok := cur.OwnersOf(target)
 	if !ok {
 		return fmt.Errorf("coordinator: scale %s: no such routed table", target)
 	}
@@ -307,10 +273,7 @@ func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) erro
 	// COMMIT: the flip is atomic and instant, and happens only now that the
 	// table owes nothing. Resuming routes the pump's held batch — and every
 	// batch after it — by the new layout.
-	snap := cur.clone()
-	snap.owners[target] = next
-	snap.ranges[target] = ranges
-	c.publishRouting(snap)
+	c.publishRouting(cur.WithTable(target, next, ranges))
 	c.resumeTable(target)
 	resumed = true
 	committed = true
@@ -354,22 +317,9 @@ func (c *Coordinator) strandedOwner(w *workerState) bool {
 // drops and the ones this call CREATED (not reused), so a pre-commit failure
 // can roll exactly those back.
 func (c *Coordinator) reslicedOwners(target string, cur []*workerState, n int, ref source.TableRef) (next, removed, created []*workerState, err error) {
-	if n <= len(cur) {
-		return cur[:n:n], cur[n:], nil, nil
-	}
-	next = make([]*workerState, len(cur), n)
-	copy(next, cur)
-	for p := len(cur); p < n; p++ {
-		w, isNew, err := c.registerOwner(partitionName(c.cfg.Spec.Pipeline, target, p), ref)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		next = append(next, w)
-		if isNew {
-			created = append(created, w)
-		}
-	}
-	return next, nil, created, nil
+	return route.Reslice(cur, n, func(p int) (*workerState, bool, error) {
+		return c.registerOwner(route.PartitionName(c.cfg.Spec.Pipeline, target, p), ref)
+	})
 }
 
 // registerOwner creates a worker group and publishes it in the registry, so
@@ -574,7 +524,8 @@ func (c *Coordinator) rangesFor(_ context.Context, target string, n int, ref sou
 
 // tableRef returns the resolved TableRef for target.
 func (c *Coordinator) tableRef(target string) (source.TableRef, bool) {
-	for _, w := range c.loadRouting().owners[target] {
+	owners, _ := c.loadRouting().OwnersOf(target)
+	for _, w := range owners {
 		for _, r := range w.refs {
 			if r.Target == target {
 				return r, true
@@ -582,12 +533,6 @@ func (c *Coordinator) tableRef(target string) (source.TableRef, bool) {
 		}
 	}
 	return source.TableRef{}, false
-}
-
-// partitionName derives partition p's worker group name, the same shape
-// spec.Table.WorkerGroupNames produces at boot.
-func partitionName(pipeline, target string, p int) string {
-	return fmt.Sprintf("%s-%d", spec.WorkerGroupPrefix(pipeline, target), p)
 }
 
 // ownerNames returns the live owner names, the input to the rendezvous owner
@@ -606,7 +551,7 @@ func ownerNames(owners []*workerState) []string {
 // (or a test) uses it to observe a re-slice's effect, including DURING a
 // scale-in/out, without reaching into the coordinator's internals.
 func (c *Coordinator) OwnerNames(target string) []string {
-	owners, ok := c.loadRouting().ownersOf(target)
+	owners, ok := c.loadRouting().OwnersOf(target)
 	if !ok {
 		return nil
 	}
@@ -682,4 +627,10 @@ func (c *Coordinator) storeChunker(target string, ch source.ChunkSource) {
 		c.chunkers = map[string]source.ChunkSource{}
 	}
 	c.chunkers[target] = ch
+}
+
+// ownerCount returns how many owners target has in the live layout.
+func (c *Coordinator) ownerCount(target string) int {
+	owners, _ := c.loadRouting().OwnersOf(target)
+	return len(owners)
 }
