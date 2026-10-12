@@ -53,3 +53,22 @@ func MinSafePosition(parse func(string) (position.Position, error), positions []
 	}
 	return best.String(), nil
 }
+
+// CommitPosition is the position a complete cycle commits.
+//
+// A snapshot window's cycle commits none: its marker carries the reader's
+// position, past stream cycles of the table not committed yet, and a crash
+// would then skip them as covered (#468). Only the stream advances a table's
+// position. A cycle of one source batch commits the batch's last position:
+// every partition received its whole share, so the table is durable through
+// it (#459). Any other cycle commits the minimum safe position over its
+// deliveries.
+func (c *Cycle) CommitPosition(parse func(string) (position.Position, error)) (string, error) {
+	if c.Window {
+		return "", nil
+	}
+	if c.BatchPos != "" {
+		return c.BatchPos, nil
+	}
+	return MinSafePosition(parse, c.Positions)
+}

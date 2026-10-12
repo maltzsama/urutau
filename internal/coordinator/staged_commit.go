@@ -107,11 +107,9 @@ func (c *Coordinator) commitStagedCycle(cy *staged.Cycle) error {
 }
 
 // commitStagedCycleLocked commits one complete cycle through the sink's
-// StagedCommitter. The caller holds the table's staged lock, so cycles of one
-// table commit strictly in send order. A cycle of one source batch commits
-// the batch's last position: every partition received its whole share, so the
-// table is durable through it (#459). Any other cycle commits the minimum safe
-// position over its deliveries.
+// StagedCommitter, at the position staged.Cycle.CommitPosition gives it. The
+// caller holds the table's staged lock, so cycles of one table commit
+// strictly in send order.
 func (c *Coordinator) commitStagedCycleLocked(cy *staged.Cycle) error {
 	// A fan-out window an owner lost, and the windows queued behind it, do
 	// not commit: their progress records the lost chunk as done (#829).
@@ -120,18 +118,9 @@ func (c *Coordinator) commitStagedCycleLocked(cy *staged.Cycle) error {
 			"table", cy.Ref.Target, "seq", cy.Seq, "lost", cy.Lost)
 		return nil
 	}
-	// A snapshot window's cycle commits no position: its marker carries the
-	// reader's, past stream cycles of the table not committed yet, and a
-	// crash would then skip them as covered (#468). Only the stream advances
-	// a table's position.
-	pos := cy.BatchPos
-	if cy.Window {
-		pos = ""
-	} else if pos == "" {
-		var err error
-		if pos, err = staged.MinSafePosition(c.src.ParsePosition, cy.Positions); err != nil {
-			return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.Ref.Target, cy.Seq, err)
-		}
+	pos, err := cy.CommitPosition(c.src.ParsePosition)
+	if err != nil {
+		return fmt.Errorf("coordinator: table %s: staged cycle %d position: %w", cy.Ref.Target, cy.Seq, err)
 	}
 	committer, ok := c.snk.(sink.StagedCommitter)
 	if !ok {

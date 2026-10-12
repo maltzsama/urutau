@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -96,59 +97,29 @@ func (c *Coordinator) finishSnapshot(ctx context.Context, ref source.TableRef) e
 }
 
 // snapshotPlan returns the chunks a table's snapshot covers and which of them
-// are still to do. An in-progress snapshot recorded under the same partition
-// ranges resumes: its bounds are reused and only its pending chunks remain.
-// Otherwise the source's bounds are read afresh, and the new snapshot's
-// progress — bounds, ranges and every chunk pending — is recorded before its
-// first chunk; each window then commits the chunks still to do after it.
+// are still to do: an in-progress snapshot recorded under the same partition
+// ranges resumes, any other starts afresh and records its progress
+// (snapshot.PlanRange).
 func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSource, ref source.TableRef, ranges []source.Chunk) ([]source.Chunk, map[uint32]bool, error) {
-	tref := core.TableRef{Source: ref.Source, Target: ref.Target}
-	layout := snapshot.PartitionLayout(ranges)
+	// A nil sink must stay a nil store: a typed nil in the interface would
+	// pass PlanRange's check.
+	var store snapshot.ProgressStore
 	if c.snk != nil {
-		props, err := c.snk.Properties(ctx, tref)
-		if err != nil {
-			return nil, nil, fmt.Errorf("coordinator: %s: snapshot progress: %w", ref.Target, err)
-		}
-		sp, perr := snapshot.ReadSnapshotProgress(props)
-		if perr == nil && snapshot.Resumable(sp) && props[snapshot.PropSnapshotPartitions] == layout {
-			all := snapshot.Chunks(sp.Bounds)
-			todo := map[uint32]bool{}
-			for _, id := range sp.Pending {
-				todo[id] = true
-			}
-			if len(todo) == 0 {
-				if todo, err = snapshot.AllChunkRefs(all, ranges); err != nil {
-					return nil, nil, err
-				}
-			}
-			c.log.Info("coordinator: resuming the snapshot from its recorded progress",
-				"table", ref.Target, "chunks_pending", len(todo))
-			return all, todo, nil
-		}
+		store = c.snk
 	}
-	bounds, err := chunker.Bounds(ctx)
+	plan, err := snapshot.PlanRange(ctx, store, chunker, core.TableRef{Source: ref.Source, Target: ref.Target}, ranges, time.Now())
 	if err != nil {
+		var pe *snapshot.PlanError
+		if errors.As(err, &pe) {
+			return nil, nil, fmt.Errorf("coordinator: %s: %s: %w", ref.Target, pe.Op, pe.Err)
+		}
 		return nil, nil, err
 	}
-	all := snapshot.Chunks(bounds)
-	todo, err := snapshot.AllChunkRefs(all, ranges)
-	if err != nil {
-		return nil, nil, err
+	if plan.Resumed {
+		c.log.Info("coordinator: resuming the snapshot from its recorded progress",
+			"table", ref.Target, "chunks_pending", len(plan.Todo))
 	}
-	if c.snk != nil {
-		props, err := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
-			State: snapshot.StateInProgress, Bounds: bounds, Pending: snapshot.SortedRefs(todo),
-			Started: time.Now().UTC().Format(time.RFC3339),
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("coordinator: %s: record snapshot progress: %w", ref.Target, err)
-		}
-		props[snapshot.PropSnapshotPartitions] = layout
-		if err := c.snk.SetProperties(ctx, tref, props); err != nil {
-			return nil, nil, fmt.Errorf("coordinator: %s: record snapshot progress: %w", ref.Target, err)
-		}
-	}
-	return all, todo, nil
+	return plan.Chunks, plan.Todo, nil
 }
 
 // sendClosesPending queues a chunk's Closes marker for its partition's worker
