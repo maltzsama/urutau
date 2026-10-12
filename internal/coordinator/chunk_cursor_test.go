@@ -12,15 +12,15 @@ import (
 // (issue #646).
 func TestChunkCursorRoundTrip(t *testing.T) {
 	c, _ := coordHarness()
-	c.noteChunkMarker("w0", 100, "raw.orders", 1, 7, []any{int64(50)})
-	c.recordCursor("w0", 100)
+	c.markers.Note("w0", snapshot.Marker{ID: 100, Target: "raw.orders", Window: 1, ChunkRef: 7, HighKey: []any{int64(50)}})
+	c.markers.RecordCursor("w0", 100)
 
-	got := c.takeCursor("raw.orders", 7)
+	got := c.markers.TakeCursor("raw.orders", 7)
 	if len(got) != 1 || got[0] != int64(50) {
-		t.Fatalf("takeCursor = %v, want [50]", got)
+		t.Fatalf("TakeCursor = %v, want [50]", got)
 	}
-	if got := c.takeCursor("raw.orders", 7); got != nil {
-		t.Fatalf("takeCursor after take = %v, want nil (the cursor is forgotten)", got)
+	if got := c.markers.TakeCursor("raw.orders", 7); got != nil {
+		t.Fatalf("TakeCursor after take = %v, want nil (the cursor is forgotten)", got)
 	}
 }
 
@@ -28,7 +28,7 @@ func TestChunkCursorRoundTrip(t *testing.T) {
 // its start.
 func TestRedoFromNoCursorWhenNoWindowCommitted(t *testing.T) {
 	c, w := coordHarness()
-	c.lostWindows = map[string][]chunkMarker{"w0": {{target: "raw.orders", window: 2}}}
+	c.markers.Lose("w0", []snapshot.Marker{{Target: "raw.orders", Window: 2}})
 
 	windows := map[uint64]int{2: 0}
 	from, cursor := c.redoFrom(w, "raw.orders", windows, 0, 0)
@@ -45,10 +45,10 @@ func TestRedoFromNoCursorWhenNoWindowCommitted(t *testing.T) {
 func TestRedoFromResumesAtLastCommittedWindow(t *testing.T) {
 	c, w := coordHarness()
 	// Window 1 (seq 1) committed: its marker was acked, recording the cursor.
-	c.noteChunkMarker(w.name, 100, "raw.orders", 1, 0, []any{int64(50)})
-	c.recordCursor(w.name, 100)
+	c.markers.Note(w.name, snapshot.Marker{ID: 100, Target: "raw.orders", Window: 1, ChunkRef: 0, HighKey: []any{int64(50)}})
+	c.markers.RecordCursor(w.name, 100)
 	// Window 2 (seq 2) was lost without its marker being acked.
-	c.lostWindows = map[string][]chunkMarker{w.name: {{target: "raw.orders", window: 2}}}
+	c.markers.Lose(w.name, []snapshot.Marker{{Target: "raw.orders", Window: 2}})
 
 	windows := map[uint64]int{1: 0, 2: 0}
 	from, cursor := c.redoFrom(w, "raw.orders", windows, 0, 0)
@@ -66,9 +66,9 @@ func TestRedoFromResumesAtLastCommittedWindow(t *testing.T) {
 // rows that were never committed.
 func TestCursorNotRecordedWithoutMarkerAck(t *testing.T) {
 	c, _ := coordHarness()
-	c.noteChunkMarker("w0", 100, "raw.orders", 1, 7, []any{int64(50)})
-	// No onMarkerAck/recordCursor: the marker was never acked.
-	if got := c.takeCursor("raw.orders", 7); got != nil {
+	c.markers.Note("w0", snapshot.Marker{ID: 100, Target: "raw.orders", Window: 1, ChunkRef: 7, HighKey: []any{int64(50)}})
+	// No onMarkerAck: the marker was never acked.
+	if got := c.markers.TakeCursor("raw.orders", 7); got != nil {
 		t.Fatalf("cursor = %v, want nil (no ack)", got)
 	}
 }
@@ -80,10 +80,10 @@ func TestCursorNotRecordedWithoutMarkerAck(t *testing.T) {
 // B's chunk below it.
 func TestAChunkCursorNeverCrossesTables(t *testing.T) {
 	c, w := coordHarness()
-	c.noteChunkMarker(w.name, 100, "raw.a", 1, snapshot.ChunkRef(0, 0), []any{int64(50)})
-	c.recordCursor(w.name, 100)
+	c.markers.Note(w.name, snapshot.Marker{ID: 100, Target: "raw.a", Window: 1, ChunkRef: snapshot.ChunkRef(0, 0), HighKey: []any{int64(50)}})
+	c.markers.RecordCursor(w.name, 100)
 
-	c.lostWindows = map[string][]chunkMarker{w.name: {{target: "raw.b", window: 9}}}
+	c.markers.Lose(w.name, []snapshot.Marker{{Target: "raw.b", Window: 9}})
 	from, cursor := c.redoFrom(w, "raw.b", map[uint64]int{9: 0}, 0, 0)
 	if from != 0 {
 		t.Fatalf("redoFrom = %d, want 0", from)
@@ -97,17 +97,17 @@ func TestAChunkCursorNeverCrossesTables(t *testing.T) {
 // its chunks again, and the entries would otherwise stay for the whole run.
 func TestFinishedSnapshotForgetsItsCursors(t *testing.T) {
 	c, w := coordHarness()
-	c.noteChunkMarker(w.name, 100, "raw.a", 1, snapshot.ChunkRef(0, 0), []any{int64(50)})
-	c.noteChunkMarker(w.name, 101, "raw.b", 2, snapshot.ChunkRef(0, 0), []any{int64(70)})
-	c.recordCursor(w.name, 100)
-	c.recordCursor(w.name, 101)
+	c.markers.Note(w.name, snapshot.Marker{ID: 100, Target: "raw.a", Window: 1, ChunkRef: snapshot.ChunkRef(0, 0), HighKey: []any{int64(50)}})
+	c.markers.Note(w.name, snapshot.Marker{ID: 101, Target: "raw.b", Window: 2, ChunkRef: snapshot.ChunkRef(0, 0), HighKey: []any{int64(70)}})
+	c.markers.RecordCursor(w.name, 100)
+	c.markers.RecordCursor(w.name, 101)
 
-	c.forgetCursors("raw.a")
+	c.markers.ForgetCursors("raw.a")
 
-	if got := c.takeCursor("raw.a", snapshot.ChunkRef(0, 0)); got != nil {
+	if got := c.markers.TakeCursor("raw.a", snapshot.ChunkRef(0, 0)); got != nil {
 		t.Fatalf("raw.a still has cursor %v after its snapshot finished", got)
 	}
-	if got := c.takeCursor("raw.b", snapshot.ChunkRef(0, 0)); len(got) != 1 || got[0] != int64(70) {
+	if got := c.markers.TakeCursor("raw.b", snapshot.ChunkRef(0, 0)); len(got) != 1 || got[0] != int64(70) {
 		t.Fatalf("raw.b's cursor = %v, want [70]: another table's finish must not touch it", got)
 	}
 }
@@ -116,22 +116,22 @@ func TestFinishedSnapshotForgetsItsCursors(t *testing.T) {
 // table's where they are, for that table's redo.
 func TestRedoFromLeavesAnotherTablesLostWindows(t *testing.T) {
 	c, w := coordHarness()
-	c.lostWindows = map[string][]chunkMarker{w.name: {
-		{target: "raw.a", window: 1},
-		{target: "raw.b", window: 2},
-	}}
+	c.markers.Lose(w.name, []snapshot.Marker{
+		{Target: "raw.a", Window: 1},
+		{Target: "raw.b", Window: 2},
+	})
 
 	if from, _ := c.redoFrom(w, "raw.a", map[uint64]int{1: 0}, 0, 3); from != 0 {
 		t.Fatalf("redoFrom(raw.a) = %d, want 0", from)
 	}
-	left := c.lostWindows[w.name]
-	if len(left) != 1 || left[0].target != "raw.b" {
+	left := c.markers.Lost(w.name)
+	if len(left) != 1 || left[0].Target != "raw.b" {
 		t.Fatalf("lost windows left = %+v, want raw.b's marker kept for its own redo", left)
 	}
 	if from, _ := c.redoFrom(w, "raw.b", map[uint64]int{2: 1}, 0, 3); from != 1 {
 		t.Fatalf("redoFrom(raw.b) = %d, want 1: its lost window was dropped by raw.a's redo", from)
 	}
-	if _, still := c.lostWindows[w.name]; still {
+	if left := c.markers.Lost(w.name); len(left) != 0 {
 		t.Fatal("the worker's entry was kept after its last marker was taken")
 	}
 }
