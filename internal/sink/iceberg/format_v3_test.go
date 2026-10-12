@@ -20,6 +20,8 @@ import (
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // deleteCounts is what a scan plan attaches to the table's data files.
@@ -228,7 +230,7 @@ func TestEnsureTableUpgradesAFormatVersion2Table(t *testing.T) {
 	ctx := context.Background()
 	s := hadoopSink(t)
 	ref := core.TableRef{Target: "orders", PrimaryKey: []string{"id"}}
-	is, err := FromCanonical(canonicalSchema())
+	is, err := convert.FromCanonical(canonicalSchema())
 	if err != nil {
 		t.Fatalf("FromCanonical: %v", err)
 	}

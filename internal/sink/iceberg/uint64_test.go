@@ -11,6 +11,8 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/transport"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // V5: a uint64 column (Iceberg has no unsigned) maps to Decimal(20,0) and
@@ -79,7 +81,7 @@ func TestDeleteRecordUint64PK(t *testing.T) {
 	defer rec.Release()
 	b := &dataplane.Batch{Table: "t", Record: rec, Watermark: []byte("p")}
 
-	keys, err := extractKeys([]*dataplane.Batch{b}, []string{"big"})
+	keys, err := convert.ExtractKeys([]*dataplane.Batch{b}, []string{"big"})
 	if err != nil {
 		t.Fatalf("extractKeys: %v", err)
 	}

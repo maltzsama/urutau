@@ -6,6 +6,8 @@ import (
 	"github.com/apache/iceberg-go"
 
 	"github.com/maltzsama/urutau/core"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // nestedSchema is a two-level struct with a list of structs and a map.
@@ -53,7 +55,7 @@ func nestedByID(t *testing.T, st *iceberg.StructType, id int) iceberg.NestedFiel
 // a field inside a nested struct has a stable, deterministic ID — adding a
 // nested field later is additive evolution that older readers map by ID.
 func TestFromCanonicalCompositeFieldIDs(t *testing.T) {
-	sch, err := FromCanonical(nestedSchema())
+	sch, err := convert.FromCanonical(nestedSchema())
 	if err != nil {
 		t.Fatalf("from canonical: %v", err)
 	}

@@ -15,6 +15,8 @@ import (
 	"github.com/maltzsama/urutau/driver"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // Sink adapts the Iceberg REST catalog to the neutral sink.Sink contract. It
@@ -119,7 +121,7 @@ func splitIdentifier(s string) table.Identifier {
 // and validates compatibility if present. Mode is ignored: an Iceberg table
 // is write-shape agnostic (the worker's collapse handles upsert vs append).
 func (s *Sink) EnsureTable(ctx context.Context, ref core.TableRef, schema core.Schema, partitionBy []string, cast core.CastPolicy, _ dataplane.WriteMode) error {
-	is, err := FromCanonical(schema)
+	is, err := convert.FromCanonical(schema)
 	if err != nil {
 		return err
 	}

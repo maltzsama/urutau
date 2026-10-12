@@ -15,6 +15,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	icebergsink "github.com/maltzsama/urutau/internal/sink/iceberg"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // trinoIDs reads the id column of a sink table through Trino, sorted.
@@ -71,7 +73,7 @@ func TestTrinoReadsDeletionVectorsWrittenByIcebergGo(t *testing.T) {
 
 	target := uniqueTarget("v3_deletion_vectors")
 	ident := table.Identifier{"raw", target}
-	schema, err := icebergsink.FromCanonical(core.Schema{Columns: []core.Column{
+	schema, err := convert.FromCanonical(core.Schema{Columns: []core.Column{
 		{Name: "id", Type: core.ColumnType{Kind: core.KindInt64}},
 		{Name: "v", Type: core.ColumnType{Kind: core.KindString, Nullable: true}},
 	}})

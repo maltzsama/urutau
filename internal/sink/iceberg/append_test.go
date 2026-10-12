@@ -3,7 +3,6 @@ package iceberg
 import (
 	"context"
 	"math"
-	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +16,8 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
 	"github.com/maltzsama/urutau/spec"
+
+	"github.com/maltzsama/urutau/internal/sink/iceberg/convert"
 )
 
 // ── appendColumn: full builder matrix ────────────────────────────────
@@ -52,7 +53,7 @@ func TestAppendColumnAcceptsCanonicalValues(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			b := array.NewBuilder(memory.DefaultAllocator, tc.dt)
 			defer b.Release()
-			if err := appendColumn(b, arrow.Field{Name: "c", Type: tc.dt}, tc.vals); err != nil {
+			if err := convert.AppendColumn(b, arrow.Field{Name: "c", Type: tc.dt}, tc.vals); err != nil {
 				t.Fatalf("appendColumn: %v", err)
 			}
 			arr := b.NewArray()
@@ -101,21 +102,10 @@ func TestAppendColumnRejectsIncompatibleValues(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			b := array.NewBuilder(memory.DefaultAllocator, tc.dt)
 			defer b.Release()
-			if err := appendColumn(b, arrow.Field{Name: "c", Type: tc.dt}, []any{tc.v}); err == nil {
+			if err := convert.AppendColumn(b, arrow.Field{Name: "c", Type: tc.dt}, []any{tc.v}); err == nil {
 				t.Fatalf("appendColumn(%v) must be rejected", tc.v)
 			}
 		})
-	}
-}
-
-// TestAppendColumnUnsupportedBuilder guards the default arm: a column type the
-// writer has no rule for must fail rather than write garbage.
-func TestAppendColumnUnsupportedBuilder(t *testing.T) {
-	b := array.NewBuilder(memory.DefaultAllocator, arrow.FixedWidthTypes.Duration_s)
-	defer b.Release()
-	err := appendColumn(b, arrow.Field{Name: "d", Type: arrow.FixedWidthTypes.Duration_s}, []any{int64(1)})
-	if err == nil || !strings.Contains(err.Error(), "unsupported builder") {
-		t.Fatalf("err = %v, want unsupported builder", err)
 	}
 }
 
@@ -138,13 +128,13 @@ func TestAppendOneCompositeStruct(t *testing.T) {
 	defer b.Release()
 	field := arrow.Field{Name: "s", Type: st}
 
-	if err := appendOneComposite(b, field, map[string]any{"a": int64(1), "b": "x"}); err != nil {
+	if err := convert.AppendOneComposite(b, field, map[string]any{"a": int64(1), "b": "x"}); err != nil {
 		t.Fatalf("struct row: %v", err)
 	}
-	if err := appendOneComposite(b, field, map[string]any{"a": int64(2)}); err != nil {
+	if err := convert.AppendOneComposite(b, field, map[string]any{"a": int64(2)}); err != nil {
 		t.Fatalf("struct row with missing key: %v", err)
 	}
-	if err := appendOneComposite(b, field, nil); err != nil {
+	if err := convert.AppendOneComposite(b, field, nil); err != nil {
 		t.Fatalf("nil struct row: %v", err)
 	}
 	arr := b.NewArray()
@@ -163,13 +153,13 @@ func TestAppendOneCompositeList(t *testing.T) {
 	defer b.Release()
 	field := arrow.Field{Name: "l", Type: lt}
 
-	if err := appendOneComposite(b, field, []any{int64(1), int64(2)}); err != nil {
+	if err := convert.AppendOneComposite(b, field, []any{int64(1), int64(2)}); err != nil {
 		t.Fatalf("list row: %v", err)
 	}
-	if err := appendOneComposite(b, field, []any{}); err != nil {
+	if err := convert.AppendOneComposite(b, field, []any{}); err != nil {
 		t.Fatalf("empty list: %v", err)
 	}
-	if err := appendOneComposite(b, field, nil); err != nil {
+	if err := convert.AppendOneComposite(b, field, nil); err != nil {
 		t.Fatalf("nil list: %v", err)
 	}
 	arr := b.NewArray()
@@ -186,10 +176,10 @@ func TestAppendOneCompositeMap(t *testing.T) {
 	field := arrow.Field{Name: "m", Type: mt}
 
 	// Keys deliberately out of order: sortedKeys must make the write stable.
-	if err := appendOneComposite(b, field, map[string]any{"z": int64(1), "a": int64(2)}); err != nil {
+	if err := convert.AppendOneComposite(b, field, map[string]any{"z": int64(1), "a": int64(2)}); err != nil {
 		t.Fatalf("map row: %v", err)
 	}
-	if err := appendOneComposite(b, field, nil); err != nil {
+	if err := convert.AppendOneComposite(b, field, nil); err != nil {
 		t.Fatalf("nil map: %v", err)
 	}
 	arr := b.NewArray()
@@ -202,142 +192,42 @@ func TestAppendOneCompositeMap(t *testing.T) {
 func TestAppendOneCompositeRejectsMismatches(t *testing.T) {
 	int64Builder := array.NewInt64Builder(memory.DefaultAllocator)
 	defer int64Builder.Release()
-	if err := appendOneComposite(int64Builder, arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int64}, int64(1)); err == nil {
+	if err := convert.AppendOneComposite(int64Builder, arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int64}, int64(1)); err == nil {
 		t.Fatal("non-composite builder must be rejected")
 	}
 
 	st := structTypeOf()
 	sb := array.NewStructBuilder(memory.DefaultAllocator, st)
 	defer sb.Release()
-	if err := appendOneComposite(sb, arrow.Field{Name: "s", Type: st}, "not-a-map"); err == nil {
+	if err := convert.AppendOneComposite(sb, arrow.Field{Name: "s", Type: st}, "not-a-map"); err == nil {
 		t.Fatal("non-map value into struct builder must be rejected")
 	}
-	if err := appendOneComposite(sb, arrow.Field{Name: "s", Type: listTypeOf()}, map[string]any{}); err == nil {
+	if err := convert.AppendOneComposite(sb, arrow.Field{Name: "s", Type: listTypeOf()}, map[string]any{}); err == nil {
 		t.Fatal("struct builder with non-struct field type must be rejected")
 	}
 
 	lt := listTypeOf()
 	lb := array.NewListBuilder(memory.DefaultAllocator, arrow.PrimitiveTypes.Int64)
 	defer lb.Release()
-	if err := appendOneComposite(lb, arrow.Field{Name: "l", Type: lt}, "not-a-list"); err == nil {
+	if err := convert.AppendOneComposite(lb, arrow.Field{Name: "l", Type: lt}, "not-a-list"); err == nil {
 		t.Fatal("non-list value into list builder must be rejected")
 	}
-	if err := appendOneComposite(lb, arrow.Field{Name: "l", Type: st}, []any{}); err == nil {
+	if err := convert.AppendOneComposite(lb, arrow.Field{Name: "l", Type: st}, []any{}); err == nil {
 		t.Fatal("list builder with non-list field type must be rejected")
 	}
 
 	mt := mapTypeOf()
 	mb := array.NewMapBuilder(memory.DefaultAllocator, mt.KeyField().Type, mt.ItemField().Type, false)
 	defer mb.Release()
-	if err := appendOneComposite(mb, arrow.Field{Name: "m", Type: mt}, "not-a-map"); err == nil {
+	if err := convert.AppendOneComposite(mb, arrow.Field{Name: "m", Type: mt}, "not-a-map"); err == nil {
 		t.Fatal("non-map value into map builder must be rejected")
 	}
-	if err := appendOneComposite(mb, arrow.Field{Name: "m", Type: lt}, map[string]any{}); err == nil {
+	if err := convert.AppendOneComposite(mb, arrow.Field{Name: "m", Type: lt}, map[string]any{}); err == nil {
 		t.Fatal("map builder with non-map field type must be rejected")
 	}
 }
 
-func TestSortedKeys(t *testing.T) {
-	got := sortedKeys(map[string]any{"c": 1, "a": 2, "b": 3})
-	want := []string{"a", "b", "c"}
-	if len(got) != len(want) {
-		t.Fatalf("len = %d, want %d", len(got), len(want))
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("got %v, want %v", got, want)
-		}
-	}
-	if len(sortedKeys(map[string]any(nil))) != 0 {
-		t.Fatal("nil map must yield no keys")
-	}
-}
-
 // ── typemap ──────────────────────────────────────────────────────────
-
-func TestMapCanonicalTypeMatrix(t *testing.T) {
-	cases := []struct {
-		name string
-		in   core.ColumnType
-		want iceberg.Type
-	}{
-		{"bool", core.ColumnType{Kind: core.KindBool}, iceberg.PrimitiveTypes.Bool},
-		{"int32", core.ColumnType{Kind: core.KindInt32}, iceberg.PrimitiveTypes.Int32},
-		{"int64", core.ColumnType{Kind: core.KindInt64}, iceberg.PrimitiveTypes.Int64},
-		{"uint64", core.ColumnType{Kind: core.KindUInt64}, iceberg.DecimalTypeOf(20, 0)},
-		{"float32", core.ColumnType{Kind: core.KindFloat32}, iceberg.PrimitiveTypes.Float32},
-		{"float64", core.ColumnType{Kind: core.KindFloat64}, iceberg.PrimitiveTypes.Float64},
-		{"decimal", core.ColumnType{Kind: core.KindDecimal, Precision: 12, Scale: 3}, iceberg.DecimalTypeOf(12, 3)},
-		{"string", core.ColumnType{Kind: core.KindString}, iceberg.PrimitiveTypes.String},
-		{"json", core.ColumnType{Kind: core.KindJSON}, iceberg.PrimitiveTypes.String},
-		{"binary", core.ColumnType{Kind: core.KindBinary}, iceberg.PrimitiveTypes.Binary},
-		{"fixed", core.ColumnType{Kind: core.KindFixedBinary, FixedSize: 8}, iceberg.FixedTypeOf(8)},
-		{"date", core.ColumnType{Kind: core.KindDate}, iceberg.PrimitiveTypes.Date},
-		{"time", core.ColumnType{Kind: core.KindTime}, iceberg.PrimitiveTypes.Time},
-		{"timestamp", core.ColumnType{Kind: core.KindTimestamp}, iceberg.PrimitiveTypes.Timestamp},
-		{"timestamptz", core.ColumnType{Kind: core.KindTimestampTZ}, iceberg.PrimitiveTypes.TimestampTz},
-		{"uuid", core.ColumnType{Kind: core.KindUUID}, iceberg.PrimitiveTypes.UUID},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := mapCanonicalType(tc.in)
-			if err != nil {
-				t.Fatalf("mapCanonicalType: %v", err)
-			}
-			if !got.Equals(tc.want) {
-				t.Fatalf("got %s, want %s", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestMapCanonicalTypeErrors(t *testing.T) {
-	cases := []struct {
-		name string
-		in   core.ColumnType
-	}{
-		{"decimal-zero-precision", core.ColumnType{Kind: core.KindDecimal}},
-		{"decimal-negative-precision", core.ColumnType{Kind: core.KindDecimal, Precision: -1}},
-		{"fixed-zero-size", core.ColumnType{Kind: core.KindFixedBinary}},
-		{"unsupported", core.ColumnType{Kind: core.KindUnknown}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := mapCanonicalType(tc.in); err == nil {
-				t.Fatalf("mapCanonicalType(%v) must fail", tc.in.Kind)
-			}
-		})
-	}
-}
-
-func TestIcebergFromCanonicalTypeCompositeErrors(t *testing.T) {
-	next := 1
-	if _, err := icebergFromCanonicalType(core.ColumnType{Kind: core.KindList}, &next); err == nil {
-		t.Fatal("list without element type must fail")
-	}
-	if _, err := icebergFromCanonicalType(core.ColumnType{Kind: core.KindMap, KeyType: &core.ColumnType{Kind: core.KindString}}, &next); err == nil {
-		t.Fatal("map without value type must fail")
-	}
-	if _, err := icebergFromCanonicalType(core.ColumnType{Kind: core.KindMap, ValueType: &core.ColumnType{Kind: core.KindString}}, &next); err == nil {
-		t.Fatal("map without key type must fail")
-	}
-	bad := core.ColumnType{
-		Kind:   core.KindStruct,
-		Fields: []core.Column{{Name: "x", Type: core.ColumnType{Kind: core.KindDecimal}}},
-	}
-	if _, err := icebergFromCanonicalType(bad, &next); err == nil {
-		t.Fatal("bad struct field must propagate")
-	}
-}
-
-func TestFromCanonicalWrapsColumnError(t *testing.T) {
-	_, err := FromCanonical(core.Schema{Columns: []core.Column{
-		{Name: "amount", Type: core.ColumnType{Kind: core.KindDecimal}},
-	}})
-	if err == nil || !strings.Contains(err.Error(), "amount") {
-		t.Fatalf("err = %v, want it to name the column", err)
-	}
-}
 
 // ── buildPartitionSpec ───────────────────────────────────────────────
 
@@ -396,7 +286,7 @@ func TestBuildPartitionSpecTransforms(t *testing.T) {
 func TestSplitByOp(t *testing.T) {
 	ctx := context.Background()
 
-	up, del, err := splitByOp(ctx, &dataplane.Batch{})
+	up, del, err := convert.SplitByOp(ctx, &dataplane.Batch{})
 	if err != nil || up != nil || del != nil {
 		t.Fatalf("empty batch = %v, %v, %v; want nil,nil,nil", up, del, err)
 	}
@@ -407,7 +297,7 @@ func TestSplitByOp(t *testing.T) {
 		[3]any{int64(3), "c", rowchange.OpDelete},
 	)
 	defer b.Release()
-	up, del, err = splitByOp(ctx, b)
+	up, del, err = convert.SplitByOp(ctx, b)
 	if err != nil {
 		t.Fatalf("splitByOp: %v", err)
 	}
@@ -418,32 +308,6 @@ func TestSplitByOp(t *testing.T) {
 	}
 	if del.Record.NumRows() != 1 {
 		t.Fatalf("deletes = %d, want 1", del.Record.NumRows())
-	}
-}
-
-func TestSplitByOpErrors(t *testing.T) {
-	ctx := context.Background()
-
-	missing := array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{
-		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
-	}, nil))
-	missing.Field(0).(*array.Int64Builder).Append(1)
-	missingRec := missing.NewRecordBatch()
-	missing.Release()
-	defer missingRec.Release()
-	if _, _, err := splitByOp(ctx, &dataplane.Batch{Record: missingRec}); err == nil {
-		t.Fatal("missing __op must fail")
-	}
-
-	wrong := array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{
-		{Name: "__op", Type: arrow.BinaryTypes.String},
-	}, nil))
-	wrong.Field(0).(*array.StringBuilder).Append("insert")
-	wrongRec := wrong.NewRecordBatch()
-	wrong.Release()
-	defer wrongRec.Release()
-	if _, _, err := splitByOp(ctx, &dataplane.Batch{Record: wrongRec}); err == nil {
-		t.Fatal("non-uint8 __op must fail")
 	}
 }
 
@@ -534,43 +398,6 @@ func TestBuildMetaColumnErrors(t *testing.T) {
 	}
 	if _, err := w.buildMetaColumn(src, core.MetaPosition, strField, src.NumRows()); err == nil {
 		t.Fatal("MetaPosition without __pos must fail")
-	}
-}
-
-func TestStringColumnErrors(t *testing.T) {
-	b := array.NewRecordBuilder(memory.DefaultAllocator, arrow.NewSchema([]arrow.Field{
-		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
-	}, nil))
-	b.Field(0).(*array.Int64Builder).Append(1)
-	rec := b.NewRecordBatch()
-	b.Release()
-	defer rec.Release()
-
-	if _, err := stringColumn(rec, "nope"); err == nil {
-		t.Fatal("missing column must fail")
-	}
-	if _, err := stringColumn(rec, "id"); err == nil {
-		t.Fatal("wrong-typed column must fail")
-	}
-}
-
-func TestConstStringAndNullColumn(t *testing.T) {
-	s := constString(3, "x")
-	defer s.Release()
-	str := s.(*array.String)
-	for i := range 3 {
-		if str.Value(i) != "x" {
-			t.Fatalf("constString[%d] = %q, want x", i, str.Value(i))
-		}
-	}
-
-	n := nullColumn(arrow.FixedWidthTypes.Timestamp_us, 2)
-	defer n.Release()
-	if n.Len() != 2 || !n.IsNull(0) || !n.IsNull(1) {
-		t.Fatalf("nullColumn = %v", n)
-	}
-	if n.DataType().ID() != arrow.TIMESTAMP {
-		t.Fatalf("nullColumn type = %s, want timestamp", n.DataType())
 	}
 }
 
