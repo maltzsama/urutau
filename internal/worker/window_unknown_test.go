@@ -12,19 +12,20 @@ import (
 
 // stagedClosesPending runs one Closes marker naming chunks 8 and 9 still to
 // do through a staged table, holding the window's rows first only if held,
-// and returns the snapshot progress the marker's delivery carried.
-func stagedClosesPending(t *testing.T, held bool) (delivered bool, pending []uint32) {
+// and returns the snapshot progress the marker's delivery carried and whether
+// it reported the window lost.
+func stagedClosesPending(t *testing.T, held bool) (delivered bool, pending []uint32, lost bool) {
 	t.Helper()
 	sc := &stagingCommitter{desc: []byte("d")}
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
 	w.Register("raw.orders", sc, dataplane.UpsertMode)
 	w.SetKnownSchema("raw.orders", testSchema())
 	var mu sync.Mutex
-	w.OnStaged(func(_ string, s uint64, _ []byte, _, _ string, p []uint32) error {
+	w.OnStaged(func(_ string, s uint64, _ []byte, _, _ string, p []uint32, l bool) error {
 		mu.Lock()
 		defer mu.Unlock()
 		if s == 42 {
-			delivered, pending = true, p
+			delivered, pending, lost = true, p, l
 		}
 		return nil
 	})
@@ -51,7 +52,7 @@ func stagedClosesPending(t *testing.T, held bool) (delivered bool, pending []uin
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	return delivered, pending
+	return delivered, pending, lost
 }
 
 // A redelivered Closes marker of a window this worker does not hold — a lost
@@ -60,7 +61,7 @@ func stagedClosesPending(t *testing.T, held bool) (delivered bool, pending []uin
 // record the chunk done with none of its rows, and a coordinator restarted
 // before the redo would resume past it (PR #462 review).
 func TestAnUnknownWindowsMarkerCarriesNoSnapshotProgress(t *testing.T) {
-	delivered, pending := stagedClosesPending(t, false)
+	delivered, pending, _ := stagedClosesPending(t, false)
 	if !delivered {
 		t.Fatal("the unknown window's cycle was never delivered")
 	}
@@ -69,10 +70,24 @@ func TestAnUnknownWindowsMarkerCarriesNoSnapshotProgress(t *testing.T) {
 	}
 }
 
+// Withholding its own progress is not enough on a table with several owners:
+// another owner that held its share of the chunk delivers the same cycle with
+// the chunk removed from the pending list, and the cycle commits that. The
+// delivery has to say the window was lost, so the coordinator leaves the
+// chunk to do (#829).
+func TestAnUnknownWindowsMarkerReportsTheWindowLost(t *testing.T) {
+	if delivered, _, lost := stagedClosesPending(t, false); !delivered || !lost {
+		t.Fatalf("delivered=%v lost=%v, want the unknown window's delivery to report it lost", delivered, lost)
+	}
+	if _, _, lost := stagedClosesPending(t, true); lost {
+		t.Fatal("a window this worker held was reported lost")
+	}
+}
+
 // A window this worker holds that emits no rows (live events touched them
 // all) did its chunk: its progress is real and commits.
 func TestAHeldEmptyWindowsMarkerCarriesItsProgress(t *testing.T) {
-	delivered, pending := stagedClosesPending(t, true)
+	delivered, pending, _ := stagedClosesPending(t, true)
 	if !delivered || len(pending) != 2 {
 		t.Fatalf("delivered=%v pending=%v, want the held window's progress [8 9]", delivered, pending)
 	}

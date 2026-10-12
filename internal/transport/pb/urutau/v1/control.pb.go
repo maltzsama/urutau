@@ -2397,6 +2397,7 @@ type StagedBatch struct {
 	SnapshotState   string                 `protobuf:"bytes,5,opt,name=snapshot_state,json=snapshotState,proto3" json:"snapshot_state,omitempty"`               // resumable-backfill state ("" when not in snapshot)
 	SnapshotPending []uint32               `protobuf:"varint,6,rep,packed,name=snapshot_pending,json=snapshotPending,proto3" json:"snapshot_pending,omitempty"` // chunk ids still to process
 	Epoch           uint64                 `protobuf:"varint,7,opt,name=epoch,proto3" json:"epoch,omitempty"`                                                   // stale-epoch guards, like Ack
+	WindowLost      bool                   `protobuf:"varint,8,opt,name=window_lost,json=windowLost,proto3" json:"window_lost,omitempty"`                       // a snapshot window this worker never held: the chunk is not done
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -2478,6 +2479,13 @@ func (x *StagedBatch) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
+}
+
+func (x *StagedBatch) GetWindowLost() bool {
+	if x != nil {
+		return x.WindowLost
+	}
+	return false
 }
 
 type WorkerError struct {
@@ -3142,7 +3150,7 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x19\n" +
 	"\bchunk_id\x18\x02 \x01(\rR\achunkId\x12+\n" +
 	"\x05class\x18\x03 \x01(\x0e2\x15.urutau.v1.ErrorClassR\x05class\x12\x16\n" +
-	"\x06detail\x18\x04 \x01(\tR\x06detail\"\xd9\x01\n" +
+	"\x06detail\x18\x04 \x01(\tR\x06detail\"\xfa\x01\n" +
 	"\vStagedBatch\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12\x1e\n" +
@@ -3152,7 +3160,9 @@ const file_urutau_v1_control_proto_rawDesc = "" +
 	"\bposition\x18\x04 \x01(\tR\bposition\x12%\n" +
 	"\x0esnapshot_state\x18\x05 \x01(\tR\rsnapshotState\x12)\n" +
 	"\x10snapshot_pending\x18\x06 \x03(\rR\x0fsnapshotPending\x12\x14\n" +
-	"\x05epoch\x18\a \x01(\x04R\x05epoch\"|\n" +
+	"\x05epoch\x18\a \x01(\x04R\x05epoch\x12\x1f\n" +
+	"\vwindow_lost\x18\b \x01(\bR\n" +
+	"windowLost\"|\n" +
 	"\vWorkerError\x12+\n" +
 	"\x05class\x18\x01 \x01(\x0e2\x15.urutau.v1.ErrorClassR\x05class\x12\x12\n" +
 	"\x04code\x18\x02 \x01(\tR\x04code\x12\x16\n" +

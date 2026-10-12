@@ -360,6 +360,9 @@ type Coordinator struct {
 	// lostWindows are the chunk windows each lost worker had not
 	// committed, taken at the loss (recovery.go); under chunkMarkersMu.
 	lostWindows map[string][]chunkMarker
+	// fanout is the fan-out snapshot pass each table is in: the window
+	// cycles a lost owner keeps from committing (snapshot_hash_redo.go).
+	fanout fanoutPasses
 	// chunkCursor is, per table and chunkRef, the last acked window's high
 	// key (#646).
 	chunkCursor map[cursorKey][]any

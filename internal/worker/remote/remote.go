@@ -169,7 +169,7 @@ func applyAssignment(ctx context.Context, cfg RemoteConfig, snk sink.Sink, sende
 	// committed; the coordinator groups them by cycle and commits. seq 0 is
 	// a worker-generated snapshot/window batch, committed on arrival. A send
 	// failure must surface — a dropped descriptor is an uncommittable cycle.
-	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32) error {
+	w.OnStaged(func(table string, seq uint64, desc []byte, pos, state string, pending []uint32, lost bool) error {
 		return sender.send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Staged{Staged: &pb.StagedBatch{
 			Table:           table,
 			Seq:             seq,
@@ -178,6 +178,7 @@ func applyAssignment(ctx context.Context, cfg RemoteConfig, snk sink.Sink, sende
 			SnapshotState:   state,
 			SnapshotPending: pending,
 			Epoch:           assign.Epoch,
+			WindowLost:      lost,
 		}}})
 	})
 	var stages []*enrich.Stage

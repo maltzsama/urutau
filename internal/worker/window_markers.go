@@ -52,7 +52,10 @@ func snapshotDoneBatch(p *tablePipeline, ing Ingest) (*dataplane.Batch, error) {
 // owes the cycle its delivery, made here through deliverEmpty. A window this
 // process never held — a lost one, its rows gone with the previous process —
 // owes that delivery too, but has done no chunk: its snapshot progress must
-// not commit, or a restarted coordinator resumes past the chunk's rows.
+// not commit, or a restarted coordinator resumes past the chunk's rows. The
+// delivery says the window was lost: another owner of the table may have
+// held its own share of the chunk, and its progress would commit the chunk
+// as done for both (#829).
 func closesBatch(p *tablePipeline, ing Ingest, deliverEmpty func(*dataplane.Batch) error) (*dataplane.Batch, error) {
 	cb, held, err := closeWindow(p, ing)
 	if err != nil {
@@ -81,6 +84,7 @@ func closesBatch(p *tablePipeline, ing Ingest, deliverEmpty func(*dataplane.Batc
 	if err != nil {
 		return nil, err
 	}
+	eb.WindowLost = !held
 	err = deliverEmpty(eb)
 	eb.Release()
 	return nil, err

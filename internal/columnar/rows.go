@@ -85,6 +85,7 @@ func EmptyBatch(b *dataplane.Batch, mode dataplane.WriteMode) *dataplane.Batch {
 		SnapshotPending: b.SnapshotPending,
 		Seq:             b.Seq,
 		Staged:          b.Staged,
+		WindowLost:      b.WindowLost,
 	}
 }
 

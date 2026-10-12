@@ -90,7 +90,7 @@ func (w *Worker) stageBatch(ctx context.Context, p *tablePipeline, b *dataplane.
 	}
 	faultinject.At(faultinject.WorkerStagedBeforeShip,
 		"table", p.target, "seq", b.Seq, "position", string(b.Watermark))
-	if err := w.onStaged(p.target, b.Seq, desc, string(b.Watermark), b.SnapshotState, b.SnapshotPending); err != nil {
+	if err := w.onStaged(p.target, b.Seq, desc, string(b.Watermark), b.SnapshotState, b.SnapshotPending, b.WindowLost); err != nil {
 		return fmt.Errorf("worker: table %s: ship staged descriptor: %w", p.target, err)
 	}
 	return nil
