@@ -95,12 +95,6 @@ func (c *Coordinator) finishSnapshot(ctx context.Context, ref source.TableRef) e
 	return c.enqueueTo(ctx, w, nil, meta)
 }
 
-// propSnapshotPartitions records the partition ranges a table's in-progress
-// snapshot was chunked for: its pending chunk ids index chunks clipped to
-// those ranges, so progress recorded under other ranges cannot be resumed
-// (issue #461).
-const propSnapshotPartitions = "cdc.snapshot.partitions"
-
 // snapshotPlan returns the chunks a table's snapshot covers and which of them
 // are still to do. An in-progress snapshot recorded under the same partition
 // ranges resumes: its bounds are reused and only its pending chunks remain.
@@ -116,7 +110,7 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 			return nil, nil, fmt.Errorf("coordinator: %s: snapshot progress: %w", ref.Target, err)
 		}
 		sp, perr := snapshot.ReadSnapshotProgress(props)
-		if perr == nil && snapshot.Resumable(sp) && props[propSnapshotPartitions] == layout {
+		if perr == nil && snapshot.Resumable(sp) && props[snapshot.PropSnapshotPartitions] == layout {
 			all := snapshot.Chunks(sp.Bounds)
 			todo := map[uint32]bool{}
 			for _, id := range sp.Pending {
@@ -149,61 +143,12 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 		if err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: record snapshot progress: %w", ref.Target, err)
 		}
-		props[propSnapshotPartitions] = layout
+		props[snapshot.PropSnapshotPartitions] = layout
 		if err := c.snk.SetProperties(ctx, tref, props); err != nil {
 			return nil, nil, fmt.Errorf("coordinator: %s: record snapshot progress: %w", ref.Target, err)
 		}
 	}
 	return all, todo, nil
-}
-
-// setSnapshotTodo records the chunks still to do of the table being
-// snapshotted; nil clears it.
-func (c *Coordinator) setSnapshotTodo(target string, todo map[uint32]bool) {
-	c.snapshotTodoMu.Lock()
-	defer c.snapshotTodoMu.Unlock()
-	if todo == nil {
-		delete(c.snapshotTodo, target)
-		return
-	}
-	if c.snapshotTodo == nil {
-		c.snapshotTodo = map[string]map[uint32]bool{}
-	}
-	c.snapshotTodo[target] = todo
-}
-
-// snapshotTodoFor returns the table's chunks still to do, or nil (every chunk).
-func (c *Coordinator) snapshotTodoFor(target string) map[uint32]bool {
-	c.snapshotTodoMu.Lock()
-	defer c.snapshotTodoMu.Unlock()
-	return c.snapshotTodo[target]
-}
-
-// beginSnapshot marks target's snapshot running; endSnapshot clears it.
-// ScaleTable refuses to flip a table whose snapshot is in progress, so the
-// fan-out's captured owners and the live stream's current owners cannot
-// diverge (a key's snapshot row and live row would otherwise reach different
-// workers).
-func (c *Coordinator) beginSnapshot(target string) {
-	c.snapshottingMu.Lock()
-	if c.snapshotting == nil {
-		c.snapshotting = map[string]bool{}
-	}
-	c.snapshotting[target] = true
-	c.snapshottingMu.Unlock()
-}
-
-func (c *Coordinator) endSnapshot(target string) {
-	c.snapshottingMu.Lock()
-	delete(c.snapshotting, target)
-	c.snapshottingMu.Unlock()
-}
-
-// isSnapshotting reports whether target's snapshot is in progress.
-func (c *Coordinator) isSnapshotting(target string) bool {
-	c.snapshottingMu.Lock()
-	defer c.snapshottingMu.Unlock()
-	return c.snapshotting[target]
 }
 
 // sendClosesPending queues a chunk's Closes marker for its partition's worker

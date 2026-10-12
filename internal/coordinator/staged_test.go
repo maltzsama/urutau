@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"testing"
 
 	"github.com/maltzsama/urutau/core"
@@ -77,10 +76,9 @@ func (s *recordingStagedSink) CommitStaged(context.Context, core.TableRef, [][]b
 func TestCommitStagedCycleAdvancesConfirmedForOwners(t *testing.T) {
 	committed := false
 	c := &Coordinator{
-		src:         fakeSource{},
-		snk:         &recordingStagedSink{committed: &committed},
-		stagedLocks: map[string]*sync.Mutex{},
-		log:         slog.Default(),
+		src: fakeSource{},
+		snk: &recordingStagedSink{committed: &committed},
+		log: slog.Default(),
 	}
 	cy := &staged.Cycle{
 		Ref:         core.TableRef{Target: "t"},
