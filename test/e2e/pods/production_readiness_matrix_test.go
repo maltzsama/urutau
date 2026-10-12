@@ -104,10 +104,15 @@ func newMatrixSampler(r *prRun) *matrixSampler {
 // Pod, the same image and credentials the bucket-init Job uses.
 func s3(ctx context.Context, script string) (string, error) {
 	name := "pr-s3-" + strconv.FormatInt(time.Now().UnixNano()%2176782336, 36)
-	return kubectlCmd("", "-n", dataNS, "run", name, "--rm", "-i", "--quiet", "--restart=Never",
+	return kubectlCmd("", s3RunArgs(name, script)...)
+}
+
+// s3RunArgs is the kubectl invocation of the one-shot Pod that runs script.
+func s3RunArgs(name, script string) []string {
+	return []string{"-n", dataNS, "run", name, "--rm", "-i", "--quiet", "--restart=Never",
 		"--image=amazon/aws-cli:latest",
 		"--env=AWS_ACCESS_KEY_ID=urutau", "--env=AWS_SECRET_ACCESS_KEY=urutau_dev_secret", "--env=AWS_DEFAULT_REGION=us-east-1",
-		"--command", "--", "sh", "-c", script)
+		"--command", "--", "sh", "-c", script}
 }
 
 const s3Endpoint = "--endpoint-url http://rustfs.e2e.svc.cluster.local:9000"
