@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/maltzsama/urutau/core"
@@ -114,15 +113,6 @@ func (c *Coordinator) finishSnapshot(ctx context.Context, ref source.TableRef) e
 // (issue #461).
 const propSnapshotPartitions = "cdc.snapshot.partitions"
 
-// chunkRef is a snapshot chunk's durable id: its partition in the high bits,
-// its index among that partition's clipped chunks in the low 20.
-func chunkRef(partition, index int) uint32 { return uint32(partition)<<20 | uint32(index) }
-
-// partitionLayout renders partition ranges as recorded with the progress.
-func partitionLayout(ranges []source.Chunk) string {
-	return fmt.Sprintf("%d:%v", len(ranges), ranges)
-}
-
 // snapshotPlan returns the chunks a table's snapshot covers and which of them
 // are still to do. An in-progress snapshot recorded under the same partition
 // ranges resumes: its bounds are reused and only its pending chunks remain.
@@ -131,7 +121,7 @@ func partitionLayout(ranges []source.Chunk) string {
 // first chunk; each window then commits the chunks still to do after it.
 func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSource, ref source.TableRef, ranges []source.Chunk) ([]source.Chunk, map[uint32]bool, error) {
 	tref := core.TableRef{Source: ref.Source, Target: ref.Target}
-	layout := partitionLayout(ranges)
+	layout := snapshot.PartitionLayout(ranges)
 	if c.snk != nil {
 		props, err := c.snk.Properties(ctx, tref)
 		if err != nil {
@@ -145,7 +135,7 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 				todo[id] = true
 			}
 			if len(todo) == 0 {
-				if todo, err = allChunkRefs(all, ranges); err != nil {
+				if todo, err = snapshot.AllChunkRefs(all, ranges); err != nil {
 					return nil, nil, err
 				}
 			}
@@ -159,13 +149,13 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 		return nil, nil, err
 	}
 	all := snapshot.Chunks(bounds)
-	todo, err := allChunkRefs(all, ranges)
+	todo, err := snapshot.AllChunkRefs(all, ranges)
 	if err != nil {
 		return nil, nil, err
 	}
 	if c.snk != nil {
 		props, err := snapshot.EncodeSnapshotProgress(&snapshot.SnapshotProgress{
-			State: snapshot.StateInProgress, Bounds: bounds, Pending: sortedRefs(todo),
+			State: snapshot.StateInProgress, Bounds: bounds, Pending: snapshot.SortedRefs(todo),
 			Started: time.Now().UTC().Format(time.RFC3339),
 		})
 		if err != nil {
@@ -177,50 +167,6 @@ func (c *Coordinator) snapshotPlan(ctx context.Context, chunker source.ChunkSour
 		}
 	}
 	return all, todo, nil
-}
-
-// allChunkRefs is every chunk of every partition. A clip failure or a chunk
-// index that overflows the 20 bits a chunk id addresses is an error, not a
-// silently dropped chunk (issue #559).
-func allChunkRefs(all []source.Chunk, ranges []source.Chunk) (map[uint32]bool, error) {
-	todo := map[uint32]bool{}
-	for p, r := range ranges {
-		clipped, err := snapshot.ClipChunksToRange(all, r)
-		if err != nil {
-			return nil, fmt.Errorf("coordinator: clip partition %d: %w", p, err)
-		}
-		if len(clipped) > 1<<20 {
-			return nil, fmt.Errorf("coordinator: partition %d has %d chunks, over the %d a chunk id can address", p, len(clipped), 1<<20)
-		}
-		for i := range clipped {
-			todo[chunkRef(p, i)] = true
-		}
-	}
-	return todo, nil
-}
-
-// sortedRefs lists chunk ids in order.
-func sortedRefs(todo map[uint32]bool) []uint32 {
-	out := make([]uint32, 0, len(todo))
-	for id := range todo {
-		out = append(out, id)
-	}
-	slices.Sort(out)
-	return out
-}
-
-// pendingAfter is the chunks still to do once partition's chunk index is
-// committed: later chunks of the same partition, and every chunk of the
-// partitions after it, among todo.
-func pendingAfter(todo map[uint32]bool, partition, index int) []uint32 {
-	var out []uint32
-	for _, id := range sortedRefs(todo) {
-		p, i := int(id>>20), int(id&(1<<20-1))
-		if p > partition || (p == partition && i > index) {
-			out = append(out, id)
-		}
-	}
-	return out
 }
 
 // setSnapshotTodo records the chunks still to do of the table being

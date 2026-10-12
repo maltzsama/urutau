@@ -12,6 +12,7 @@ import (
 
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/eventlog"
+	"github.com/maltzsama/urutau/internal/snapshot"
 
 	"github.com/maltzsama/urutau/internal/coordk8s"
 )
@@ -442,7 +443,7 @@ func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint64
 			from = i
 		}
 	}
-	return from, c.takeCursor(target, chunkRef(partition, from))
+	return from, c.takeCursor(target, snapshot.ChunkRef(partition, from))
 }
 
 // noteLostWindows records the chunk windows a lost worker had not committed.

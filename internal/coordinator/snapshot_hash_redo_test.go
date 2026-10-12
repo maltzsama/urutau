@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"reflect"
 	"testing"
 
 	"github.com/maltzsama/urutau/core"
@@ -31,7 +30,7 @@ func fanoutHarness(t *testing.T) (*Coordinator, *committedCyclesSink, source.Tab
 	c.snk = snk
 	c.bootCommitted = nil
 	owners, _ := c.loadRouting().OwnersOf("raw.orders")
-	c.fanout.begin("raw.orders")
+	c.fanout.Begin("raw.orders")
 	return c, snk, c.refs[0], owners
 }
 
@@ -71,7 +70,7 @@ func TestFanoutWindowAnOwnerLostIsNotCommitted(t *testing.T) {
 
 	c.onStagedBatch("w1", held(seq3, "w1-chunk3", []uint32{4, 5}))
 	c.onStagedBatch("w0", lost(seq3))
-	if done, _, _ := c.fanout.drained("raw.orders"); done {
+	if done, _, _ := c.fanout.Drained("raw.orders"); done {
 		t.Fatal("the pass reads as drained with chunk 4's window still to deliver")
 	}
 	// Chunk 4 was queued before the loss was known: both owners held it, and
@@ -82,7 +81,7 @@ func TestFanoutWindowAnOwnerLostIsNotCommitted(t *testing.T) {
 	if len(snk.cycles) != 0 {
 		t.Fatalf("committed %v: chunk 3 is recorded done without w0's rows", snk.cycles)
 	}
-	done, from, wasLost := c.fanout.drained("raw.orders")
+	done, from, wasLost := c.fanout.Drained("raw.orders")
 	if !done || !wasLost || from != 3 {
 		t.Fatalf("drained = (%v, from %d, lost %v), want the pass drained with chunk 3 to read again", done, from, wasLost)
 	}
@@ -94,7 +93,7 @@ func TestFanoutWindowAnOwnerLostIsNotCommitted(t *testing.T) {
 	if len(snk.cycles) != 1 {
 		t.Fatalf("committed %v, want the redone chunk 3", snk.cycles)
 	}
-	if done, _, wasLost := c.fanout.drained("raw.orders"); !done || wasLost {
+	if done, _, wasLost := c.fanout.Drained("raw.orders"); !done || wasLost {
 		t.Fatalf("after the redo: done=%v lost=%v, want a clean pass", done, wasLost)
 	}
 }
@@ -111,7 +110,7 @@ func TestFanoutWindowDeliveredBeforeTheRestartCommits(t *testing.T) {
 	if len(snk.cycles) != 1 {
 		t.Fatalf("committed %v, want chunk 3's cycle", snk.cycles)
 	}
-	if _, _, wasLost := c.fanout.drained("raw.orders"); wasLost {
+	if _, _, wasLost := c.fanout.Drained("raw.orders"); wasLost {
 		t.Fatal("a window whose owner had delivered its rows was taken as lost")
 	}
 }
@@ -135,14 +134,5 @@ func TestFanoutOpensTheWindowOnAnOwnerWithNoRows(t *testing.T) {
 		default:
 			t.Fatalf("%s got no window for the chunk: it has no row in it", w.name)
 		}
-	}
-}
-
-func TestPendingFrom(t *testing.T) {
-	if got := pendingFrom([]uint32{2, 3, 5, 8}, 5); !reflect.DeepEqual(got, []uint32{5, 8}) {
-		t.Fatalf("pendingFrom = %v, want [5 8]", got)
-	}
-	if got := pendingFrom([]uint32{2, 3}, 9); got != nil {
-		t.Fatalf("pendingFrom of a chunk outside the pass = %v, want nil", got)
 	}
 }

@@ -138,7 +138,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if todo != nil && !todo[chunkRef(partition, i)] {
+		if todo != nil && !todo[snapshot.ChunkRef(partition, i)] {
 			i++ // committed before a coordinator restart: resumed past
 			continue
 		}
@@ -177,7 +177,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 		chunkCtx, cancel := context.WithTimeout(ctx, timeout)
 		err := c.awaitChunkCommits(chunkCtx, w.name, maxUncommittedChunks, lost)
 		if err == nil {
-			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], chunkRef(partition, i), i, epoch, lost, pendingAfter(todo, partition, i), windows)
+			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], snapshot.ChunkRef(partition, i), i, epoch, lost, snapshot.PendingAfter(todo, partition, i), windows)
 		}
 		if err == nil && i == len(chunks)-1 {
 			// The partition's last chunk: its windows must all be committed

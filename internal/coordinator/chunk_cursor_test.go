@@ -1,6 +1,10 @@
 package coordinator
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/maltzsama/urutau/internal/snapshot"
+)
 
 // A chunk's resume cursor is the high key of the last window whose Closes
 // marker was acked: onMarkerAck records it, redoFrom returns it, and the redo
@@ -76,7 +80,7 @@ func TestCursorNotRecordedWithoutMarkerAck(t *testing.T) {
 // B's chunk below it.
 func TestAChunkCursorNeverCrossesTables(t *testing.T) {
 	c, w := coordHarness()
-	c.noteChunkMarker(w.name, 100, "raw.a", 1, chunkRef(0, 0), []any{int64(50)})
+	c.noteChunkMarker(w.name, 100, "raw.a", 1, snapshot.ChunkRef(0, 0), []any{int64(50)})
 	c.recordCursor(w.name, 100)
 
 	c.lostWindows = map[string][]chunkMarker{w.name: {{target: "raw.b", window: 9}}}
@@ -93,17 +97,17 @@ func TestAChunkCursorNeverCrossesTables(t *testing.T) {
 // its chunks again, and the entries would otherwise stay for the whole run.
 func TestFinishedSnapshotForgetsItsCursors(t *testing.T) {
 	c, w := coordHarness()
-	c.noteChunkMarker(w.name, 100, "raw.a", 1, chunkRef(0, 0), []any{int64(50)})
-	c.noteChunkMarker(w.name, 101, "raw.b", 2, chunkRef(0, 0), []any{int64(70)})
+	c.noteChunkMarker(w.name, 100, "raw.a", 1, snapshot.ChunkRef(0, 0), []any{int64(50)})
+	c.noteChunkMarker(w.name, 101, "raw.b", 2, snapshot.ChunkRef(0, 0), []any{int64(70)})
 	c.recordCursor(w.name, 100)
 	c.recordCursor(w.name, 101)
 
 	c.forgetCursors("raw.a")
 
-	if got := c.takeCursor("raw.a", chunkRef(0, 0)); got != nil {
+	if got := c.takeCursor("raw.a", snapshot.ChunkRef(0, 0)); got != nil {
 		t.Fatalf("raw.a still has cursor %v after its snapshot finished", got)
 	}
-	if got := c.takeCursor("raw.b", chunkRef(0, 0)); len(got) != 1 || got[0] != int64(70) {
+	if got := c.takeCursor("raw.b", snapshot.ChunkRef(0, 0)); len(got) != 1 || got[0] != int64(70) {
 		t.Fatalf("raw.b's cursor = %v, want [70]: another table's finish must not touch it", got)
 	}
 }

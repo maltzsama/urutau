@@ -33,9 +33,9 @@ func TestResumableProgress(t *testing.T) {
 	}
 
 	stale := mustEncode(&snapshot.SnapshotProgress{
-		State: snapshot.StateInProgress, Bounds: bounds, Pending: []uint32{chunkRef(1, 0)},
+		State: snapshot.StateInProgress, Bounds: bounds, Pending: []uint32{snapshot.ChunkRef(1, 0)},
 	})
-	stale[propSnapshotPartitions] = partitionLayout([]source.Chunk{{}, {}})
+	stale[propSnapshotPartitions] = snapshot.PartitionLayout([]source.Chunk{{}, {}})
 	if sp := resumableProgress(stale); sp != nil {
 		t.Fatalf("range-path progress was resumed: %+v", sp)
 	}
