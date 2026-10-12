@@ -21,7 +21,7 @@ func runStagedWindow(t *testing.T, snap, live []rowchange.Change, seq uint64) []
 	w.SetKnownSchema("raw.orders", testSchema())
 	var mu sync.Mutex
 	var seqs []uint64
-	w.OnStaged(func(_ string, s uint64, _ []byte, _, _ string, _ []uint32) error {
+	w.OnStaged(func(_ string, s uint64, _ []byte, _, _ string, _ []uint32, _ bool) error {
 		mu.Lock()
 		seqs = append(seqs, s)
 		mu.Unlock()

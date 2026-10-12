@@ -33,9 +33,12 @@ import (
 // The rows travel over the existing WindowTag.Snapshot path: the owner stores
 // them in its window (AddWindowRows), the gate releases the chunk's live
 // events InWindow-tagged afterwards, and the Closes marker flushes the window.
-// Because the coordinator pushes through each owner's queue, a worker lost
-// mid-snapshot needs no special recovery: its queued window rows and Closes
-// are redelivered when it reconnects.
+//
+// A window's rows are not redelivered (recordSent): a worker lost
+// mid-snapshot comes back without the windows it was sent, and reports each
+// as lost when its Closes marker is redelivered. The chunks from the first
+// lost one on are read again once the pass over the table has drained
+// (snapshot_hash_redo.go, #829).
 func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
 	rt := c.loadRouting()
 	owners, ok := rt.ownersOf(ref.Target)
@@ -73,7 +76,7 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 		// it would not be atomic with the rows (the range path's contract).
 		cfg.Persist = func(sp snapshot.SnapshotProgress) error {
 			if sp.Pending != nil {
-				relay.pending = append([]uint32(nil), sp.Pending...)
+				relay.plan(sp.Bounds, sp.Pending)
 			}
 			props, err := snapshot.EncodeSnapshotProgress(&sp)
 			if err != nil {
@@ -82,19 +85,42 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 			return c.snk.SetProperties(ctx, tref, props)
 		}
 		if cfg.Progress != nil {
-			relay.pending = append([]uint32(nil), cfg.Progress.Pending...)
+			relay.plan(cfg.Progress.Bounds, cfg.Progress.Pending)
 		}
 	}
 
-	if err := snapshot.SnapshotTable(ctx, chunker, rdr, relay, ref.Target, cfg, nil); err != nil {
-		return err
+	c.fanout.begin(ref.Target)
+	defer c.fanout.end(ref.Target)
+	for {
+		if err := snapshot.SnapshotTable(ctx, chunker, rdr, relay, ref.Target, cfg, nil); err != nil {
+			return err
+		}
+		if relay.err != nil {
+			return relay.err
+		}
+		// Seal the table's gate and release the trailing live events
+		// (ordinary changes, no window tag).
+		if err := c.closeWindow(ctx, ref.Target, 0); err != nil {
+			return err
+		}
+		// The snapshot is done only once every window is committed: an
+		// owner that lost one leaves its chunk, and those after it, to do.
+		from, lost, err := c.awaitFanoutPass(ctx, ref.Target)
+		if err != nil {
+			return err
+		}
+		if !lost {
+			return nil
+		}
+		redo := pendingFrom(relay.passChunks, from)
+		if len(redo) == 0 || len(relay.bounds) == 0 {
+			return fmt.Errorf("coordinator: snapshot %s: chunk %d was lost with its worker and is not in the pass to read again", ref.Target, from)
+		}
+		c.log.Warn("coordinator: snapshot chunks lost with a worker; reading them again",
+			"table", ref.Target, "from_chunk", from, "chunks", len(redo))
+		cfg.Progress = &snapshot.SnapshotProgress{State: snapshot.StateInProgress, Bounds: relay.bounds, Pending: redo}
+		relay.plan(relay.bounds, redo)
 	}
-	if relay.err != nil {
-		return relay.err
-	}
-	// Seal the table's gate and release the trailing live events (ordinary
-	// changes, no window tag).
-	return c.closeWindow(ctx, ref.Target, 0)
 }
 
 // resumableProgress returns the snapshot progress this fan-out path may
@@ -134,7 +160,19 @@ type distributedRelay struct {
 	// Persist or the resumed progress. Release derives each window's
 	// SnapshotPending from it, which the worker commits with the rows.
 	pending []uint32
-	err     error
+	// passChunks and bounds are the chunks of the pass under way, in the
+	// order it takes them, and the bounds that number them: what a pass
+	// that lost a chunk reads again from.
+	passChunks []uint32
+	bounds     [][]any
+	err        error
+}
+
+// plan sets the chunks the next pass does.
+func (r *distributedRelay) plan(bounds [][]any, pending []uint32) {
+	r.bounds = bounds
+	r.passChunks = append([]uint32(nil), pending...)
+	r.pending = append([]uint32(nil), pending...)
 }
 
 func (r *distributedRelay) fail(err error) {
@@ -226,7 +264,10 @@ func (r *distributedRelay) fanOut(target string, chunkID uint32, batch *dataplan
 	}
 	for p, sub := range subs {
 		if sub == nil {
-			continue
+			// An owner with no row in the chunk still gets its window:
+			// without one, its Closes marker finds a window it does not
+			// hold, which is what a lost window looks like (#829).
+			sub = batch.Record.NewSlice(0, 0)
 		}
 		meta := &pb.BatchMeta{
 			Table:  target,
@@ -283,6 +324,7 @@ func (c *Coordinator) closeFanoutChunk(ctx context.Context, ref source.TableRef,
 			names[i] = w.name
 		}
 		c.staged.expectWindow(core.TableRef{Target: ref.Target}, meta.BatchId, names)
+		c.fanout.note(ref.Target, meta.BatchId, uint32(windowID))
 	}
 	for _, w := range owners {
 		if err := c.enqueueTo(ctx, w, nil, cloneBatchMeta(meta)); err != nil {

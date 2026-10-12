@@ -70,6 +70,9 @@ func (c *Coordinator) onStagedBatch(worker string, sb *pb.StagedBatch) {
 	}
 
 	ref := core.TableRef{Target: sb.Table, Owner: worker}
+	if sb.WindowLost {
+		c.staged.markLost(ref, sb.Seq)
+	}
 	committable, known := c.staged.deliver(ref, sb.Seq, sb.Descriptor_, sb.Position, sb.SnapshotState, sb.SnapshotPending)
 	if sb.Seq != 0 && !known {
 		// The seq named no cycle this tracker holds: a too-late delivery for
@@ -110,6 +113,13 @@ func (c *Coordinator) commitStagedCycle(cy *stagedCycle) error {
 // table is durable through it (#459). Any other cycle commits the minimum safe
 // position over its deliveries.
 func (c *Coordinator) commitStagedCycleLocked(cy *stagedCycle) error {
+	// A fan-out window an owner lost, and the windows queued behind it, do
+	// not commit: their progress records the lost chunk as done (#829).
+	if cy.window && c.fanout.resolve(cy.ref.Target, cy.seq, cy.lost) {
+		c.log.Warn("coordinator: snapshot window not committed; its chunk is read again",
+			"table", cy.ref.Target, "seq", cy.seq, "lost", cy.lost)
+		return nil
+	}
 	// A snapshot window's cycle commits no position: its marker carries the
 	// reader's, past stream cycles of the table not committed yet, and a
 	// crash would then skip them as covered (#468). Only the stream advances
