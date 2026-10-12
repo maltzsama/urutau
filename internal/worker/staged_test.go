@@ -37,7 +37,7 @@ func TestStagedPipelineShipsDescriptorInsteadOfCommitting(t *testing.T) {
 	w.SetKnownSchema("t", testSchema())
 	var gotDesc []byte
 	var gotTable string
-	w.OnStaged(func(table string, _ uint64, desc []byte, _, _ string, _ []uint32) error {
+	w.OnStaged(func(table string, _ uint64, desc []byte, _, _ string, _ []uint32, _ bool) error {
 		gotTable = table
 		gotDesc = desc
 		return nil
@@ -90,7 +90,7 @@ func TestStagedFlushesPerCycleSeq(t *testing.T) {
 	w.Register("t", sc, dataplane.UpsertMode)
 	w.SetKnownSchema("t", testSchema())
 	var seqs []uint64
-	w.OnStaged(func(_ string, seq uint64, _ []byte, _, _ string, _ []uint32) error {
+	w.OnStaged(func(_ string, seq uint64, _ []byte, _, _ string, _ []uint32, _ bool) error {
 		seqs = append(seqs, seq)
 		return nil
 	})
@@ -156,7 +156,7 @@ func TestStagedDeliversEmptyDescriptorWhenRowsDropped(t *testing.T) {
 	w.SetKnownSchema("t", testSchema())
 	w.SetDropDeletes("t", true)
 	var seqs []uint64
-	w.OnStaged(func(_ string, seq uint64, _ []byte, _, _ string, _ []uint32) error {
+	w.OnStaged(func(_ string, seq uint64, _ []byte, _, _ string, _ []uint32, _ bool) error {
 		seqs = append(seqs, seq)
 		return nil
 	})

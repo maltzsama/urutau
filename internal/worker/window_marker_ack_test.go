@@ -22,7 +22,7 @@ func TestAWindowsMarkerIsNotAckedBeforeItsRowsShip(t *testing.T) {
 	w := New(Config{MaxRows: 100, MaxInterval: time.Hour})
 	w.Register("raw.orders", sc, dataplane.UpsertMode)
 	w.SetKnownSchema("raw.orders", testSchema())
-	w.OnStaged(func(string, uint64, []byte, string, string, []uint32) error {
+	w.OnStaged(func(string, uint64, []byte, string, string, []uint32, bool) error {
 		return errors.New("session lost") // the worker dies before the ship
 	})
 	if err := w.SetStaged("raw.orders"); err != nil {

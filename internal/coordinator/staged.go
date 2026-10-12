@@ -26,7 +26,10 @@ type stagedCycle struct {
 	batchPos string
 	// window marks a snapshot window's cycle: it commits the window's rows
 	// and snapshot progress but no position (#468).
-	window  bool
+	window bool
+	// lost marks a window cycle one of its owners delivered for a window it
+	// never held (#829).
+	lost    bool
 	state   string
 	pending []uint32
 }
@@ -104,6 +107,22 @@ func (s *stagedCycles) expectWindow(ref core.TableRef, seq uint64, owners []stri
 	if cy := s.open[cycleKey{ref.Target, seq}]; cy != nil {
 		cy.window = true
 	}
+}
+
+// markLost records that owner's delivery of cycle seq, about to be made, is
+// for a snapshot window it never held. A delivery the cycle does not expect
+// or already has changes nothing: that owner's share is in the cycle.
+func (s *stagedCycles) markLost(ref core.TableRef, seq uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cy := s.open[cycleKey{ref.Target, seq}]
+	if cy == nil || !cy.owners[ref.Owner] || cy.delivered[ref.Owner] {
+		return
+	}
+	cy.lost = true
 }
 
 // expectAt is expect for a cycle that carries every partition's share of one

@@ -317,6 +317,7 @@ message StagedBatch {
   string          snapshot_state   = 5;  // resumable-backfill state ("" when not in snapshot)
   repeated uint32 snapshot_pending = 6;  // chunk ids still to process
   uint64          epoch            = 7;  // stale-epoch guards, like Ack
+  bool            window_lost      = 8;  // a snapshot window this worker never held: the chunk is not done
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────

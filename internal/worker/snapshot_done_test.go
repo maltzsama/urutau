@@ -98,7 +98,7 @@ func TestSnapshotDoneOnAStagedTableIsDeliveredAsItsCycle(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var got []delivery
-	w.OnStaged(func(_ string, s uint64, _ []byte, pos, state string, _ []uint32) error {
+	w.OnStaged(func(_ string, s uint64, _ []byte, pos, state string, _ []uint32, _ bool) error {
 		mu.Lock()
 		got = append(got, delivery{s, pos, state})
 		mu.Unlock()

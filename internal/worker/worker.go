@@ -43,8 +43,9 @@ type OnDroppedDelete func(table, pos string)
 // coordinator, which commits the whole cycle. seq is the cycle key (0 for a
 // worker-generated snapshot/window batch, committed on arrival). The error
 // matters: a dropped descriptor leaves the cycle uncommittable, so the
-// worker must fail rather than report a successful stage.
-type OnStaged func(table string, seq uint64, descriptor []byte, pos, state string, pending []uint32) error
+// worker must fail rather than report a successful stage. lost says the
+// delivery is for a snapshot window this worker never held (#829).
+type OnStaged func(table string, seq uint64, descriptor []byte, pos, state string, pending []uint32, lost bool) error
 
 type Worker struct {
 	cfg             Config

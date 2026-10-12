@@ -109,6 +109,11 @@ type Batch struct {
 	// committed strictly beyond its position (#823).
 	Partial bool
 
+	// WindowLost marks the delivery of a snapshot window's cycle by a worker
+	// that never held the window: its rows went to a process that died. The
+	// cycle is owed its delivery, but the chunk was not done (#829).
+	WindowLost bool
+
 	// Seq is the coordinator's monotonic batch sequence (BatchMeta.batch_id),
 	// assigned once per sub-batch in binlog order. Sinks use it to order
 	// concurrent writes from the N workers of one partitioned table.
