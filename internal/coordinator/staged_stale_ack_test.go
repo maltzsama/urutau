@@ -6,6 +6,8 @@ import (
 
 	"github.com/maltzsama/urutau/core"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
+	"github.com/maltzsama/urutau/position"
+	"github.com/maltzsama/urutau/source"
 )
 
 // A worker stages a batch of a partitioned table, and its session is lost
@@ -74,5 +76,75 @@ func TestDirectAckFromASupersededGenerationStillClearsTheBatch(t *testing.T) {
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Epoch: old, Position: "0/30", Rows: 1})
 	if n := c.index.Of("w0").InFlight(); n != 0 {
 		t.Fatalf("w0 has %d batches in flight after its commit's ack, want 0", n)
+	}
+}
+
+// A worker stages a snapshot window of a partitioned table and acks the
+// window's Closes marker, and its session is lost before the coordinator
+// handles either. The staged delivery of the old generation is dropped, so
+// the window's cycle still owes that owner's share. The marker ack that came
+// with it must not release the marker: a released marker is not redelivered
+// when the worker reconnects, the cycle waits forever, and every later cycle
+// of the table — window or live — queues behind it (#855).
+func TestMarkerAckFromASupersededGenerationKeepsTheMarkerInFlight(t *testing.T) {
+	c := stagedReplayHarness(t)
+	w0 := c.workers["w0"]
+	if err := c.sendClosesPending(context.Background(), w0, "raw.orders", position.MustLSN("0/30"), 11, nil, 0, nil); err != nil {
+		t.Fatalf("sendClosesPending: %v", err)
+	}
+	held := c.heldChunkMarkers("w0")
+	if len(held) != 1 {
+		t.Fatalf("setup: w0 holds %d markers, want 1", len(held))
+	}
+	marker := held[0].ID
+
+	c.mu.Lock()
+	old := w0.epoch
+	w0.epoch++ // w0's session was lost: a new generation
+	c.mu.Unlock()
+
+	c.onStagedBatch("w0", &pb.StagedBatch{Table: "raw.orders", Seq: marker, Epoch: old, Descriptor_: []byte{1}})
+	c.onAck("w0", &pb.Ack{Table: "raw.orders", Epoch: old, BatchId: marker})
+
+	if !c.index.Of("w0").Holds(marker) {
+		t.Fatal("a stale-generation marker ack released the marker although its staged delivery was dropped: nothing will redeliver it")
+	}
+	if open := c.staged.OpenFor(core.TableRef{Target: "raw.orders"}); open != 1 {
+		t.Fatalf("%d open cycles, want the window's, still owed w0's share", open)
+	}
+
+	// The reconnected worker gets the marker again, reports the window it no
+	// longer holds, and acks: the cycle completes and the marker is released.
+	c.onStagedBatch("w0", &pb.StagedBatch{Table: "raw.orders", Seq: marker, Epoch: old + 1, WindowLost: true})
+	c.onAck("w0", &pb.Ack{Table: "raw.orders", Epoch: old + 1, BatchId: marker})
+	if open := c.staged.OpenFor(core.TableRef{Target: "raw.orders"}); open != 0 {
+		t.Fatalf("%d open cycles after the current generation delivered, want 0", open)
+	}
+	if c.index.Of("w0").Holds(marker) {
+		t.Fatal("the current generation's marker ack did not release the marker")
+	}
+}
+
+// On a table the worker commits itself, a marker ack is evidence that the
+// window's rows are durable, whatever generation sent it.
+func TestMarkerAckFromASupersededGenerationReleasesADirectTablesMarker(t *testing.T) {
+	c, w0 := coordHarness()
+	c.refs = []source.TableRef{{Source: "shop.orders", Target: "raw.orders", PrimaryKey: []string{"id"}}}
+	if err := c.sendClosesPending(context.Background(), w0, "raw.orders", position.MustLSN("0/30"), 11, nil, 0, nil); err != nil {
+		t.Fatalf("sendClosesPending: %v", err)
+	}
+	held := c.heldChunkMarkers("w0")
+	if len(held) != 1 {
+		t.Fatalf("setup: w0 holds %d markers, want 1", len(held))
+	}
+	marker := held[0].ID
+	c.mu.Lock()
+	old := w0.epoch
+	w0.epoch++
+	c.mu.Unlock()
+
+	c.onAck("w0", &pb.Ack{Table: "raw.orders", Epoch: old, BatchId: marker})
+	if c.index.Of("w0").Holds(marker) {
+		t.Fatal("the marker of a table the worker commits itself was kept after its ack")
 	}
 }
