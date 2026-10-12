@@ -87,7 +87,7 @@ func (c *Coordinator) supersededEpoch(worker string, epoch uint64) bool {
 // onAck advances the worker's position index: every head batch the commit
 // covers leaves the flight window and returns its bytes to the budget.
 func (c *Coordinator) onAck(worker string, ack *pb.Ack) {
-	c.supervisor.noteAck(worker, time.Now())
+	c.supervisor.NoteAck(worker, time.Now())
 	c.lastProgress.Store(time.Now().UnixNano())
 	if ack.BatchId != 0 && ack.Position == "" {
 		c.onMarkerAck(worker, ack.BatchId)

@@ -438,24 +438,17 @@ func TestRetireOwnerForgetsSupervisorState(t *testing.T) {
 	w, _ := c.loadRouting().OwnersOf("raw.orders")
 	owner := w[0]
 
-	c.supervisor.noteAck(owner.name, time.Now())
-	c.supervisor.pendingSet(owner.name)
-	c.supervisor.progress.Note(owner.name, 1<<20, time.Now())
-	c.supervisor.recordReset(owner.name, time.Now(), time.Minute)
+	c.supervisor.NoteAck(owner.name, time.Now())
+	c.supervisor.SetPending(owner.name)
+	c.supervisor.Progress.Note(owner.name, 1<<20, time.Now())
+	c.supervisor.RecordReset(owner.name, time.Now(), time.Minute)
 
 	c.retireOwner(context.Background(), owner)
 
-	c.supervisor.mu.Lock()
-	_, ack := c.supervisor.lastAck[owner.name]
-	_, pending := c.supervisor.pending[owner.name]
-	_, resets := c.supervisor.resets[owner.name]
-	progress := c.supervisor.progress.Tracks(owner.name)
-	_, delivered := c.supervisor.lastDelivered[owner.name]
-	c.supervisor.mu.Unlock()
-	health := c.supervisor.health.Tracks(owner.name)
-	if ack || pending || resets || progress || delivered || health {
-		t.Fatalf("retired owner's supervisor state lingered: ack=%v pending=%v resets=%v progress=%v delivered=%v health=%v",
-			ack, pending, resets, progress, delivered, health)
+	// Tracks covers the ack and delivery clocks, the pending flag, the reset
+	// window, the output samples and the crash record.
+	if c.supervisor.Tracks(owner.name) {
+		t.Fatalf("retired owner %q's supervisor state lingered", owner.name)
 	}
 }
 

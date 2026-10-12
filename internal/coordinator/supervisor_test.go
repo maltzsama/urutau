@@ -24,7 +24,7 @@ func supervisorHarness() (*supervisor, map[string]*workerState) {
 	c := &Coordinator{workers: workers, log: slog.New(slog.DiscardHandler)}
 	s := newSupervisor(c)
 	c.supervisor = s // resetWorker reaches it via c.supervisor
-	s.noteAck("w1", time.Now())
+	s.NoteAck("w1", time.Now())
 	return s, workers
 }
 
@@ -40,13 +40,13 @@ func TestSupervisorLeavesIdleWorkerAlone(t *testing.T) {
 	c.supervisor = s
 	workers["w1"].cancel = func() {}
 	// Last ack long past the timeout, but nothing queued and nothing in flight.
-	s.noteAck("w1", time.Now().Add(-time.Minute))
+	s.NoteAck("w1", time.Now().Add(-time.Minute))
 
 	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute}); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if workers["w1"].epoch != 0 || s.isPending("w1") {
-		t.Fatalf("idle worker was reset: epoch=%d pending=%v", workers["w1"].epoch, s.isPending("w1"))
+	if workers["w1"].epoch != 0 || s.IsPending("w1") {
+		t.Fatalf("idle worker was reset: epoch=%d pending=%v", workers["w1"].epoch, s.IsPending("w1"))
 	}
 }
 
@@ -58,7 +58,7 @@ func TestSupervisorTickResetsStaleWorker(t *testing.T) {
 
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute}
 	// Last ack was 2 minutes ago.
-	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+	s.NoteAck("w1", time.Now().Add(-2*time.Minute))
 
 	cancelled := false
 	w.cancel = func() { cancelled = true }
@@ -72,7 +72,7 @@ func TestSupervisorTickResetsStaleWorker(t *testing.T) {
 	if !cancelled {
 		t.Fatal("session cancel was not invoked on reset")
 	}
-	if !s.isPending("w1") {
+	if !s.IsPending("w1") {
 		t.Fatal("reset worker should be marked pending until it reattaches")
 	}
 }
@@ -106,7 +106,7 @@ func TestSupervisorAwaitsAPendingWorker(t *testing.T) {
 
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}
 	now := time.Now()
-	s.noteAck("w1", now.Add(-time.Minute)) // stale
+	s.NoteAck("w1", now.Add(-time.Minute)) // stale
 
 	if err := s.tick(now, cfg); err != nil {
 		t.Fatalf("first tick: %v", err)
@@ -129,33 +129,33 @@ func TestSupervisorAwaitsAPendingWorker(t *testing.T) {
 func TestSupervisorTickHealthyWorkerUntouched(t *testing.T) {
 	s, workers := supervisorHarness()
 	w := workers["w1"]
-	s.noteAck("w1", time.Now())
+	s.NoteAck("w1", time.Now())
 
 	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second}); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if w.epoch != 0 || s.isPending("w1") {
-		t.Fatalf("healthy worker reset: epoch=%d pending=%v", w.epoch, s.isPending("w1"))
+	if w.epoch != 0 || s.IsPending("w1") {
+		t.Fatalf("healthy worker reset: epoch=%d pending=%v", w.epoch, s.IsPending("w1"))
 	}
 }
 
-// noteAttach clears the pending flag; a reattached worker is not reset.
+// NoteAttach clears the pending flag; a reattached worker is not reset.
 func TestSupervisorReattachClearsPending(t *testing.T) {
 	s, workers := supervisorHarness()
 	w := workers["w1"]
 	w.cancel = func() {}
 
 	// Reset it.
-	s.noteAck("w1", time.Now().Add(-time.Minute))
+	s.NoteAck("w1", time.Now().Add(-time.Minute))
 	if err := s.tick(time.Now(), SupervisorConfig{AckTimeout: 30 * time.Second}); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if !s.isPending("w1") {
+	if !s.IsPending("w1") {
 		t.Fatal("expected pending after reset")
 	}
 	// Reattach: clears pending, updates last ack.
-	s.noteAttach("w1")
-	if s.isPending("w1") {
+	s.NoteAttach("w1", time.Now())
+	if s.IsPending("w1") {
 		t.Fatal("pending not cleared on reattach")
 	}
 }
@@ -171,8 +171,8 @@ func TestSupervisorAwaitsALostWorkerOwingWork(t *testing.T) {
 	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "t"})
 	now := time.Now()
-	s.pendingSet("w1")
-	s.noteAck("w1", now.Add(-2*time.Minute))
+	s.SetPending("w1")
+	s.NoteAck("w1", now.Add(-2*time.Minute))
 
 	if err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}); err != nil {
 		t.Fatalf("tick: %v; a worker gone for 2m of a 5m absence timeout must be awaited", err)
@@ -186,8 +186,8 @@ func TestSupervisorEndsTheRunForAWorkerGonePastTheDeliveryTimeout(t *testing.T) 
 	w := workers["w1"]
 	w.attached, w.hadSession = false, true
 	now := time.Now()
-	s.pendingSet("w1")
-	s.noteAck("w1", now.Add(-6*time.Minute))
+	s.SetPending("w1")
+	s.NoteAck("w1", now.Add(-6*time.Minute))
 
 	err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute})
 	if err == nil || !strings.Contains(err.Error(), "delivered nothing") {
@@ -203,48 +203,46 @@ func TestSupervisorTickNeverAttachedNotFlagged(t *testing.T) {
 	w.attached = false
 	w.hadSession = false
 	w.cancel = func() {}
-	s.noteAck("w1", time.Now().Add(-2*time.Minute))
+	s.NoteAck("w1", time.Now().Add(-2*time.Minute))
 
 	if err := s.tick(time.Now(), SupervisorConfig{
 		AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute,
 	}); err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if w.epoch != 0 || s.isPending("w1") {
-		t.Fatalf("never-attached worker was reset: epoch=%d pending=%v", w.epoch, s.isPending("w1"))
+	if w.epoch != 0 || s.IsPending("w1") {
+		t.Fatalf("never-attached worker was reset: epoch=%d pending=%v", w.epoch, s.IsPending("w1"))
 	}
 }
 
-// recordReset slides the window: resets older than the window expire.
+// RecordReset slides the window: resets older than the window expire.
 func TestSupervisorRecordResetWindowSlides(t *testing.T) {
 	s, _ := supervisorHarness()
 	window := 10 * time.Minute
 	now := time.Now()
 
-	s.recordReset("w1", now.Add(-20*time.Minute), window) // expired
-	s.recordReset("w1", now.Add(-5*time.Minute), window)  // within
-	s.recordReset("w1", now, window)
-
-	if got := len(s.resets["w1"]); got != 2 {
+	s.RecordReset("w1", now.Add(-20*time.Minute), window) // expired
+	s.RecordReset("w1", now.Add(-5*time.Minute), window)  // within
+	if got := s.RecordReset("w1", now, window); got != 2 {
 		t.Fatalf("resets in window = %d, want 2 (oldest expired)", got)
 	}
 }
 
-// #208: recordReset returns the post-insert count read under the same lock, so
+// #208: RecordReset returns the post-insert count read under the same lock, so
 // the crashloop check that follows cannot race a concurrent reset.
 func TestRecordResetReturnsWindowedCount(t *testing.T) {
 	s := newSupervisor(&Coordinator{})
 	now := time.Now()
 	window := time.Minute
 
-	if n := s.recordReset("w", now, window); n != 1 {
+	if n := s.RecordReset("w", now, window); n != 1 {
 		t.Fatalf("count = %d, want 1", n)
 	}
-	if n := s.recordReset("w", now.Add(time.Second), window); n != 2 {
+	if n := s.RecordReset("w", now.Add(time.Second), window); n != 2 {
 		t.Fatalf("count = %d, want 2", n)
 	}
 	// An entry older than the window is expired before counting.
-	if n := s.recordReset("w", now.Add(2*window), window); n != 1 {
+	if n := s.RecordReset("w", now.Add(2*window), window); n != 1 {
 		t.Fatalf("count = %d, want 1 after expiry", n)
 	}
 }
@@ -256,7 +254,7 @@ func progressHarness(ago time.Duration) (*supervisor, *workerState, time.Time) {
 	s.c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	s.c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "t"})
 	now := time.Now()
-	s.noteAck("w1", now.Add(-ago))
+	s.NoteAck("w1", now.Add(-ago))
 	return s, workers["w1"], now
 }
 
@@ -270,12 +268,12 @@ var progressCfg = SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 5, R
 func TestSupervisorSparesAWorkerMakingStorageProgress(t *testing.T) {
 	s, w, now := progressHarness(2 * time.Minute)
 	w.cancel = func() {}
-	s.progress.Note("w1", 100<<20, now.Add(-40*time.Second))
-	s.progress.Note("w1", 180<<20, now.Add(-5*time.Second))
+	s.Progress.Note("w1", 100<<20, now.Add(-40*time.Second))
+	s.Progress.Note("w1", 180<<20, now.Add(-5*time.Second))
 	if err := s.tick(now, progressCfg); err != nil {
 		t.Fatalf("tick terminated a worker whose uploads advance: %v", err)
 	}
-	if w.epoch != 0 || s.isPending("w1") {
+	if w.epoch != 0 || s.IsPending("w1") {
 		t.Fatalf("a worker making progress was reset: epoch=%d", w.epoch)
 	}
 }
@@ -288,8 +286,8 @@ func requireReset(t *testing.T, s *supervisor, w *workerState, err error, why st
 	if err != nil {
 		t.Fatalf("tick: %v; %s must be reset, not end the run", err, why)
 	}
-	if w.epoch != 1 || !s.isPending("w1") {
-		t.Fatalf("epoch=%d pending=%v; %s must be reset", w.epoch, s.isPending("w1"), why)
+	if w.epoch != 1 || !s.IsPending("w1") {
+		t.Fatalf("epoch=%d pending=%v; %s must be reset", w.epoch, s.IsPending("w1"), why)
 	}
 }
 
@@ -298,8 +296,8 @@ func requireReset(t *testing.T, s *supervisor, w *workerState, err error, why st
 func TestSupervisorResetsAWorkerWithoutProgress(t *testing.T) {
 	s, w, now := progressHarness(2 * time.Minute)
 	w.cancel = func() {}
-	s.progress.Note("w1", 100<<20, now.Add(-90*time.Second))
-	s.progress.Note("w1", 100<<20+4096, now.Add(-5*time.Second)) // heartbeats only
+	s.Progress.Note("w1", 100<<20, now.Add(-90*time.Second))
+	s.Progress.Note("w1", 100<<20+4096, now.Add(-5*time.Second)) // heartbeats only
 	requireReset(t, s, w, s.tick(now, progressCfg), "a worker without progress")
 }
 
@@ -309,8 +307,8 @@ func TestSupervisorResetsAWorkerWithoutProgress(t *testing.T) {
 func TestSupervisorCapsProgressWithoutAcks(t *testing.T) {
 	s, w, now := progressHarness(sup.ProgressAckCap*30*time.Second + time.Second)
 	w.cancel = func() {}
-	s.progress.Note("w1", 100<<20, now.Add(-40*time.Second))
-	s.progress.Note("w1", 900<<20, now.Add(-5*time.Second))
+	s.Progress.Note("w1", 100<<20, now.Add(-40*time.Second))
+	s.Progress.Note("w1", 900<<20, now.Add(-5*time.Second))
 	requireReset(t, s, w, s.tick(now, progressCfg), "a worker past the progress cap")
 }
 
@@ -320,8 +318,8 @@ func TestSupervisorCapsProgressWithoutAcks(t *testing.T) {
 func TestSupervisorProgressIsGrowthWithinTheTimeout(t *testing.T) {
 	s, w, now := progressHarness(2 * time.Minute)
 	w.cancel = func() {}
-	s.progress.Note("w1", 100<<20, now.Add(-100*time.Second))
-	s.progress.Note("w1", 100<<20+600<<10, now.Add(-45*time.Second))
-	s.progress.Note("w1", 100<<20+1200<<10, now.Add(-5*time.Second)) // 600 KiB in the last 30 s
+	s.Progress.Note("w1", 100<<20, now.Add(-100*time.Second))
+	s.Progress.Note("w1", 100<<20+600<<10, now.Add(-45*time.Second))
+	s.Progress.Note("w1", 100<<20+1200<<10, now.Add(-5*time.Second)) // 600 KiB in the last 30 s
 	requireReset(t, s, w, s.tick(now, progressCfg), "a worker that grew under 1 MiB in the last timeout")
 }

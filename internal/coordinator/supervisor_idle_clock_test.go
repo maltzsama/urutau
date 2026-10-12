@@ -24,7 +24,7 @@ func TestSupervisorDoesNotResetAWorkerForTheTimeItWaitedForWork(t *testing.T) {
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, MaxResets: 5, ResetWindow: 15 * time.Minute}
 
 	start := time.Now()
-	s.noteAck("w1", start) // its Hello, as noteAttach records it
+	s.NoteAck("w1", start) // its Hello, as NoteAttach records it
 
 	// A minute with nothing to do.
 	for d := time.Second; d <= time.Minute; d += time.Second {

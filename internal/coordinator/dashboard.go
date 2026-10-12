@@ -197,7 +197,7 @@ func (s dashState) Workers() []dashboard.WorkerStatus {
 		switch {
 		case sn.attached:
 			status = "attached"
-		case c.supervisor.isPending(sn.name):
+		case c.supervisor.IsPending(sn.name):
 			status = "pending"
 		}
 		ws := dashboard.WorkerStatus{
@@ -245,7 +245,7 @@ func (s dashState) RestartWorker(name string) error {
 	if n := c.index.InFlight(name); n > 0 && c.workerAppends(name) {
 		return fmt.Errorf("coordinator: worker %s has %d in-flight batch(es) on an append table — a restart would append them twice; wait for it to drain: %w", name, n, dashboard.ErrRestartConflict)
 	}
-	c.supervisor.recordReset(name, time.Now(), supervisionConfig(c.cfg).ResetWindow)
+	c.supervisor.RecordReset(name, time.Now(), supervisionConfig(c.cfg).ResetWindow)
 	c.resetWorker(w)
 	return nil
 }

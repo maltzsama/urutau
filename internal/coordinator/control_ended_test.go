@@ -34,7 +34,7 @@ func TestAStaleControlHandlerLeavesTheNewGenerationAlone(t *testing.T) {
 	if w.control != pb.UrutauControl_ControlServer(fresh) {
 		t.Error("the stale handler replaced the new generation's Control stream")
 	}
-	if c.supervisor.isPending(w.name) {
+	if c.supervisor.IsPending(w.name) {
 		t.Error("the stale handler marked the reconnected worker lost")
 	}
 }
@@ -58,7 +58,7 @@ func TestTheOwningControlHandlerReportsTheWorkerLost(t *testing.T) {
 	if w.epoch == epoch {
 		t.Error("the epoch did not move: the loss was not recorded")
 	}
-	if !c.supervisor.isPending(w.name) {
+	if !c.supervisor.IsPending(w.name) {
 		t.Error("the worker is not marked lost")
 	}
 }

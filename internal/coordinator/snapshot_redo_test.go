@@ -129,7 +129,7 @@ func TestSnapshotRedoesTheChunksALostWorkerHeld(t *testing.T) {
 	c.mu.Lock()
 	w.attached = true
 	c.mu.Unlock()
-	c.supervisor.noteAttach(w.name)
+	c.supervisor.NoteAttach(w.name, time.Now())
 
 	select {
 	case err := <-done:

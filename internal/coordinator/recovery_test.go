@@ -45,7 +45,7 @@ func recoveryHarness(t *testing.T) (*Coordinator, *supervisor, scriptedTerminati
 // loseAndReturn is one loss of w1 followed by its reconnect.
 func loseAndReturn(c *Coordinator, s *supervisor) error {
 	c.signalSessionEnd("w1", context.Canceled)
-	s.noteAttach("w1")
+	s.NoteAttach("w1", time.Now())
 	return c.workerBack("w1")
 }
 
@@ -107,7 +107,7 @@ func TestDeliveringWhatItOwedStartsTheCountOver(t *testing.T) {
 		// It delivers what it owed, then runs well for a while.
 		c.index.Of("w1").Clear()
 		c.index.Of("w1").Add(inflight.Batch{ID: uint64(100 + i), Table: "t"})
-		s.noteAck("w1", time.Now())
+		s.NoteAck("w1", time.Now())
 		if err := s.tick(time.Now().Add(time.Minute), cfg); err != nil {
 			t.Fatalf("tick: %v", err)
 		}
@@ -136,9 +136,9 @@ func TestAWorkerDeliveringNothingPastTheDeliveryTimeoutEndsTheRun(t *testing.T) 
 	c, s, _ := recoveryHarness(t)
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}
 	now := time.Now()
-	s.noteDeliveredAt("w1", now.Add(-6*time.Minute))
+	s.NoteDeliveredAt("w1", now.Add(-6*time.Minute))
 	c.signalSessionEnd("w1", context.Canceled)
-	s.noteAttach("w1") // a flapping partition lets it reconnect for a moment
+	s.NoteAttach("w1", time.Now()) // a flapping partition lets it reconnect for a moment
 	err := s.tick(now, cfg)
 	if err == nil || !strings.Contains(err.Error(), "delivered nothing") {
 		t.Fatalf("err = %v, want the run ended for a worker delivering nothing for 6m", err)
@@ -152,7 +152,7 @@ func TestAWorkerOwingNothingIsNeverAbsent(t *testing.T) {
 	c.index.Of("w1").Clear()
 	<-c.workers["w1"].queue // the harness seeds one queued batch
 	now := time.Now()
-	s.noteDeliveredAt("w1", now.Add(-time.Hour))
+	s.NoteDeliveredAt("w1", now.Add(-time.Hour))
 	c.signalSessionEnd("w1", context.Canceled)
 	if err := s.tick(now, SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}); err != nil {
 		t.Fatalf("tick: %v; a worker owing nothing must not be absent", err)
@@ -187,7 +187,7 @@ func TestALossSeenOnBothStreamsCountsOnce(t *testing.T) {
 		terms.crashAgain("w1", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137})
 		c.signalSessionEnd("w1", context.Canceled) // Session stream
 		c.signalSessionEnd("w1", context.Canceled) // Control stream, same loss
-		s.noteAttach("w1")
+		s.NoteAttach("w1", time.Now())
 		if err := c.workerBack("w1"); err != nil {
 			t.Fatalf("crash %d ended the run: %v", i, err)
 		}
@@ -229,7 +229,7 @@ func TestTheDeliveryTimeoutEndsTheRunDuringTheSnapshot(t *testing.T) {
 	c.snapshotActive.Store(true)
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}
 	now := time.Now()
-	s.noteDeliveredAt("w1", now.Add(-6*time.Minute))
+	s.NoteDeliveredAt("w1", now.Add(-6*time.Minute))
 	err := s.tick(now, cfg)
 	if err == nil || !strings.Contains(err.Error(), "delivered nothing") {
 		t.Fatalf("err = %v, want the run ended for a worker delivering nothing for 6m mid-snapshot", err)
@@ -244,8 +244,8 @@ func TestNoAckTimeoutResetDuringTheSnapshot(t *testing.T) {
 	c.snapshotActive.Store(true)
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second, DeliveryTimeout: 5 * time.Minute}
 	now := time.Now()
-	s.noteAck("w1", now.Add(-2*time.Minute))
-	s.noteDeliveredAt("w1", now.Add(-2*time.Minute))
+	s.NoteAck("w1", now.Add(-2*time.Minute))
+	s.NoteDeliveredAt("w1", now.Add(-2*time.Minute))
 	c.mu.Lock()
 	epoch := c.workers["w1"].epoch
 	c.mu.Unlock()
@@ -274,8 +274,8 @@ func TestTheSnapshotWaitForALostWorkerCountsFromTheLoss(t *testing.T) {
 	c.mu.Lock()
 	epoch := w.epoch
 	c.mu.Unlock()
-	s.health.Forget("w1")
-	s.health.Loss("w1", epoch, time.Now().Add(-2*time.Minute))
+	s.Health.Forget("w1")
+	s.Health.Loss("w1", epoch, time.Now().Add(-2*time.Minute))
 
 	done := make(chan error, 1)
 	go func() { done <- c.awaitReattached(context.Background(), w) }()

@@ -77,7 +77,7 @@ func TestRestartWorkerResetsKnownWorker(t *testing.T) {
 	if w.epoch != 1 {
 		t.Fatalf("epoch = %d, want 1 after restart", w.epoch)
 	}
-	if !c.supervisor.isPending("w0") {
+	if !c.supervisor.IsPending("w0") {
 		t.Fatal("a restarted worker must be pending")
 	}
 }
@@ -86,8 +86,8 @@ func TestSupervisorRunEndsTheRunForAnAbsentWorker(t *testing.T) {
 	c, w := coordHarness()
 	w.attached, w.hadSession = false, true
 	w.queue <- queuedBatch{id: 1} // it owes work, and delivers none
-	c.supervisor.pendingSet("w0")
-	c.supervisor.noteAck("w0", time.Now().Add(-time.Hour))
+	c.supervisor.SetPending("w0")
+	c.supervisor.NoteAck("w0", time.Now().Add(-time.Hour))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -105,7 +105,7 @@ func TestSupervisorRunEndsTheRunForAnAbsentWorker(t *testing.T) {
 
 func TestSupervisorRunStopsOnCancel(t *testing.T) {
 	c, _ := coordHarness()
-	c.supervisor.noteAck("w0", time.Now())
+	c.supervisor.NoteAck("w0", time.Now())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

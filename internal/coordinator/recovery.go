@@ -74,7 +74,7 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	// the loss, each from its own goroutine, and a check here with the mark
 	// taken later let both see "not pending" and bump the epoch twice. An
 	// already-pending worker was reset by the supervisor, which bumped it.
-	if !c.supervisor.markPending(worker) {
+	if !c.supervisor.MarkPending(worker) {
 		w.epoch++
 	}
 	epoch := w.epoch
@@ -90,7 +90,7 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	if lost != nil {
 		close(lost)
 	}
-	if !c.supervisor.health.Loss(worker, epoch, time.Now()) {
+	if !c.supervisor.Health.Loss(worker, epoch, time.Now()) {
 		// The same loss seen again on the worker's other stream (Session
 		// and Control both end when it is lost).
 		return nil
@@ -102,13 +102,13 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 }
 
 // onAttach records a worker's session attaching. The caller must NOT hold
-// c.mu: workerBack below takes it, and noteAttach takes the supervisor lock.
+// c.mu: workerBack below takes it, and NoteAttach takes the supervisor lock.
 // The supervisor's lock order is c.mu then supervisor.mu (supervisor.tick);
 // acquiring supervisor.mu first would invert it and deadlock the two (audit
 // #3). A worker back from a crash loop
 // ends the run here, with its Pod's reason.
 func (c *Coordinator) onAttach(worker string) error {
-	c.supervisor.noteAttach(worker)
+	c.supervisor.NoteAttach(worker, time.Now())
 	c.pushDashState() // the worker attached
 	if err := c.workerBack(worker); err != nil {
 		c.fail(err)
@@ -131,7 +131,7 @@ func (c *Coordinator) workerBack(worker string) error {
 	if idx := c.index.Of(worker); idx != nil {
 		mark = idx.MaxHeldID()
 	}
-	n, crashed, desc := c.supervisor.health.Back(worker, term, ok, mark, time.Now())
+	n, crashed, desc := c.supervisor.Health.Back(worker, term, ok, mark, time.Now())
 	if !crashed {
 		return nil
 	}
@@ -189,13 +189,6 @@ func (c *Coordinator) lostSignal(w *workerState) <-chan struct{} {
 	return w.lostCh
 }
 
-// noteDeliveredAt records that worker delivered (acked, or owed nothing) at.
-func (s *supervisor) noteDeliveredAt(worker string, at time.Time) {
-	s.mu.Lock()
-	s.lastDelivered[worker] = at
-	s.mu.Unlock()
-}
-
 // workerTermination describes, for an error message, why the worker's Pod
 // last stopped or is not running: its last termination reason and exit
 // code, a waiting reason, or an unschedulable condition. Best effort: empty
@@ -240,14 +233,14 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 	if timeout <= 0 {
 		timeout = defaultWorkerDeliveryTimeout
 	}
-	deadline := c.supervisor.health.LossTime(w.name, time.Now()).Add(timeout)
+	deadline := c.supervisor.Health.LossTime(w.name, time.Now()).Add(timeout)
 	poll := time.NewTicker(reattachPoll)
 	defer poll.Stop()
 	for {
 		c.mu.Lock()
 		attached := w.attached
 		c.mu.Unlock()
-		if attached && !c.supervisor.isPending(w.name) {
+		if attached && !c.supervisor.IsPending(w.name) {
 			return nil
 		}
 		if time.Now().After(deadline) {

@@ -279,9 +279,9 @@ func TestAssignmentTickLockOrderNoDeadlock(t *testing.T) {
 	s := newSupervisor(c)
 	c.supervisor = s // resetWorker reaches it via c.supervisor
 	// The worker has already acked, so the race between attached=true and
-	// noteAttach never reads it as stale — without this, the tight tick loop
+	// NoteAttach never reads it as stale — without this, the tight tick loop
 	// can drive resetWorker on an uninitialized Coordinator and panic.
-	s.noteAck("w", time.Now())
+	s.NoteAck("w", time.Now())
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -297,12 +297,12 @@ func TestAssignmentTickLockOrderNoDeadlock(t *testing.T) {
 			}
 		}
 	}()
-	// Concurrent noteAttach: takes c.mu then supervisor.mu.
+	// Concurrent NoteAttach: takes c.mu then supervisor.mu.
 	for i := 0; i < 100; i++ {
 		c.mu.Lock()
 		c.workers["w"].attached = true
 		c.mu.Unlock()
-		s.noteAttach("w")
+		s.NoteAttach("w", time.Now())
 	}
 	close(stop)
 	<-done

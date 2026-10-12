@@ -207,7 +207,7 @@ func (c *Coordinator) registerOwner(name string, ref source.TableRef) (*workerSt
 	c.index.Set(name, inflight.NewPositionIndex(c.runID))
 	// Seed the ack clock before the pod can attach, or the supervisor's
 	// next tick sees an attached worker with no lastAck and resets it.
-	c.supervisor.noteRegistered(name, time.Now())
+	c.supervisor.NoteRegistered(name, time.Now())
 	return w, true, nil
 }
 
@@ -231,7 +231,7 @@ func (c *Coordinator) unregisterOwner(w *workerState) {
 	c.index.Delete(w.name)
 	c.mu.Unlock()
 	c.confirmed.Forget(w.name)
-	c.supervisor.forget(w.name)
+	c.supervisor.Forget(w.name)
 }
 
 // seedConfirmed gives each owner the pipeline's current confirmed position
@@ -342,7 +342,7 @@ func (c *Coordinator) retireOwner(ctx context.Context, w *workerState) {
 
 	c.confirmed.Forget(w.name)
 
-	c.supervisor.forget(w.name)
+	c.supervisor.Forget(w.name)
 
 	if err := c.emit(eventlog.KindWorkerRetired, map[string]any{
 		"worker": w.name,
