@@ -55,8 +55,9 @@ func Apply(log *slog.Logger) int64 {
 
 // runtimeShare is the runtime's soft limit for a cgroup limit: Fraction of
 // it, less what the binary holds outside the Go heap (the race detector's
-// shadow memory in a race build, which the runtime cannot see and which
-// OOM-killed a worker whose heap was within its limit, #822).
+// shadow memory in a race build, which the runtime cannot see, which grows
+// with the heap, and which OOM-killed a worker whose heap was within its
+// limit, #822).
 func runtimeShare(cgroup int64) int64 {
 	return int64(float64(cgroup)*Fraction) - outsideHeap(cgroup)
 }
