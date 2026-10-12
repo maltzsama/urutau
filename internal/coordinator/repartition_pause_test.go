@@ -28,7 +28,7 @@ func TestPauseHoldBuffersOnlyThePausedTable(t *testing.T) {
 	if !c.pauseHold(&dataplane.Batch{Table: "raw.orders"}) {
 		t.Fatal("a batch arriving before the flush must queue behind the held ones")
 	}
-	if got := len(c.pauseBuf["raw.orders"]); got != 2 {
+	if got := c.pause.Held("raw.orders"); got != 2 {
 		t.Fatalf("held batches = %d, want 2", got)
 	}
 }

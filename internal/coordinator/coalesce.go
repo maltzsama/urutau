@@ -207,10 +207,7 @@ func (c *Coordinator) sendAccumLocked(ctx context.Context, table string) error {
 // paused for a re-slice, before its first paused batch is held: they are
 // older than everything the pause holds.
 func (c *Coordinator) flushAccumBeforePause(ctx context.Context, table string) error {
-	c.pausedMu.Lock()
-	_, paused := c.paused[table]
-	c.pausedMu.Unlock()
-	if !paused {
+	if !c.pause.Paused(table) {
 		return nil
 	}
 	return c.flushAccum(ctx, table)

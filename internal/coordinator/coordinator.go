@@ -27,6 +27,7 @@ import (
 	"github.com/maltzsama/urutau/internal/grpctls"
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
+	route "github.com/maltzsama/urutau/internal/routing"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -340,14 +341,11 @@ type Coordinator struct {
 	// its own; pausing the input lets the queue drain, then the flip, then
 	// resume. Keyed by target.
 	//
-	// A paused table's batches are BUFFERED (pauseBuf), not left to park the
+	// A paused table's batches are BUFFERED (route.Pause), not left to park the
 	// pump: parking it would stall every other table's batches behind the
 	// paused one in the reader channel (issue #343). resumeTable wakes the
 	// pump to flush them under the new layout, in order.
-	pausedMu  sync.Mutex
-	paused    map[string]chan struct{}
-	pauseBuf  map[string][]*dataplane.Batch
-	pauseWake chan struct{}
+	pause route.Pause[*dataplane.Batch]
 
 	// chunkReady routes worker ChunkReady replies to the snapshot loop.
 	chunkReady chan *pb.ChunkReady
@@ -532,9 +530,6 @@ func Run(ctx context.Context, cfg Config) error {
 		ackNotify:   make(chan struct{}, 1),
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
-		paused:      map[string]chan struct{}{},
-		pauseBuf:    map[string][]*dataplane.Batch{},
-		pauseWake:   make(chan struct{}, 1),
 		confirmed:   make(map[string]position.Position),
 		staged:      newStagedCycles(),
 		stagedLocks: map[string]*sync.Mutex{},

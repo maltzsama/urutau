@@ -51,13 +51,9 @@ func (c *Coordinator) bufferedTables() map[string]struct{} {
 		}
 		c.gate.Unlock()
 	}
-	c.pausedMu.Lock()
-	for table, buf := range c.pauseBuf {
-		if len(buf) > 0 {
-			seen[table] = struct{}{}
-		}
+	for _, table := range c.pause.HeldTables() {
+		seen[table] = struct{}{}
 	}
-	c.pausedMu.Unlock()
 	return seen
 }
 

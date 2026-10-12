@@ -107,7 +107,7 @@ func (c *Coordinator) pump(ctx context.Context, out <-chan *dataplane.Batch) {
 				c.pumpFail(ctx, err)
 				return
 			}
-		case <-c.pauseWake:
+		case <-c.pause.Wake():
 			c.pumpHeld.Store(time.Now().UnixNano())
 			// A table resumed: route the batches held during its pause, in
 			// order, under the new layout.

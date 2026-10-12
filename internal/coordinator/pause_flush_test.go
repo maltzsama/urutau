@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"testing"
 	"time"
-
-	"github.com/maltzsama/urutau/dataplane"
 )
 
 // A re-slice pauses a table and holds its batches until the flip. They were
@@ -34,12 +32,11 @@ func TestBatchesHeldByAPauseAreSentCoalesced(t *testing.T) {
 	}()
 
 	const held = 200
-	c.pausedMu.Lock()
-	c.pauseBuf = map[string][]*dataplane.Batch{}
+	c.pauseTable("raw.orders")
 	for i := 1; i <= held; i++ {
-		c.pauseBuf["raw.orders"] = append(c.pauseBuf["raw.orders"], payloadBatch(t, int64(i), fmt.Sprintf("0/%X", i), 64))
+		c.pauseHold(payloadBatch(t, int64(i), fmt.Sprintf("0/%X", i), 64))
 	}
-	c.pausedMu.Unlock()
+	c.resumeTable("raw.orders")
 
 	if err := c.flushPaused(ctx); err != nil {
 		t.Fatalf("flushPaused: %v", err)
