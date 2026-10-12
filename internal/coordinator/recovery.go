@@ -84,7 +84,7 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	// The chunk windows the worker had not committed died with it. Taken
 	// now, before it can reconnect and ack their redelivered Closes markers
 	// as empty windows, which would hide them from the snapshot's redo.
-	c.noteLostWindows(worker)
+	c.markers.Lose(worker, c.heldChunkMarkers(worker))
 	// The loss is recorded before its waiters wake: a snapshot loop woken by
 	// the close goes on to awaitReattached, which reads the pending mark.
 	if lost != nil {
@@ -357,49 +357,12 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 // committed window returns nil, and is re-read from its start.
 func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint64]int, partition int, next int) (int, []any) {
 	from := next
-	for _, m := range c.takeLostWindows(w.name, target) {
-		if i, ok := windows[m.window]; ok && i < from {
+	for _, m := range c.markers.TakeLost(w.name, target) {
+		if i, ok := windows[m.Window]; ok && i < from {
 			from = i
 		}
 	}
-	return from, c.takeCursor(target, snapshot.ChunkRef(partition, from))
-}
-
-// noteLostWindows records the chunk windows a lost worker had not committed.
-func (c *Coordinator) noteLostWindows(worker string) {
-	held := c.heldChunkMarkers(worker)
-	if len(held) == 0 {
-		return
-	}
-	c.chunkMarkersMu.Lock()
-	defer c.chunkMarkersMu.Unlock()
-	if c.lostWindows == nil {
-		c.lostWindows = map[string][]chunkMarker{}
-	}
-	c.lostWindows[worker] = append(c.lostWindows[worker], held...)
-}
-
-// takeLostWindows returns and forgets the chunk windows worker lost on
-// target. A marker of another table stays for that table's own redo: today a
-// worker serves one table, so there is none, but taking them all here and
-// skipping the others would drop them for good the day that changes.
-func (c *Coordinator) takeLostWindows(worker, target string) []chunkMarker {
-	c.chunkMarkersMu.Lock()
-	defer c.chunkMarkersMu.Unlock()
-	var out, kept []chunkMarker
-	for _, m := range c.lostWindows[worker] {
-		if m.target == target {
-			out = append(out, m)
-		} else {
-			kept = append(kept, m)
-		}
-	}
-	if len(kept) == 0 {
-		delete(c.lostWindows, worker)
-	} else {
-		c.lostWindows[worker] = kept
-	}
-	return out
+	return from, c.markers.TakeCursor(target, snapshot.ChunkRef(partition, from))
 }
 
 // clearChunkReady forgets that a partition's current chunk is in its

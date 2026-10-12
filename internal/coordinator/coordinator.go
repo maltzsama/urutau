@@ -354,19 +354,13 @@ type Coordinator struct {
 	chunkReady chan *pb.ChunkReady
 	// windowOpen routes worker WindowOpen announcements to the snapshot loop.
 	windowOpen chan *pb.WindowOpen
-	// chunkMarkers are each worker's queued snapshot Closes markers, to pace
-	// chunks on commits (snapshot_pace.go).
-	chunkMarkersMu sync.Mutex
-	chunkMarkers   map[string][]chunkMarker
-	// lostWindows are the chunk windows each lost worker had not
-	// committed, taken at the loss (recovery.go); under chunkMarkersMu.
-	lostWindows map[string][]chunkMarker
+	// markers are each worker's queued snapshot Closes markers: they pace
+	// chunks on commits (snapshot_pace.go), and say where a lost worker's
+	// redo starts and resumes (recovery.go).
+	markers snapshot.Markers
 	// fanout is the fan-out snapshot pass each table is in: the window
 	// cycles a lost owner keeps from committing (snapshot_hash_redo.go).
 	fanout snapshot.FanoutPasses
-	// chunkCursor is, per table and chunkRef, the last acked window's high
-	// key (#646).
-	chunkCursor map[cursorKey][]any
 	// coordk8s.Termination reads a worker's last container termination; nil
 	// reads it from Kubernetes (recovery.go). Set by tests.
 	podTermination func(worker string) (coordk8s.Termination, bool)

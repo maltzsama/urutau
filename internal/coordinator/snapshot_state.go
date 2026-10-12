@@ -243,7 +243,7 @@ func (c *Coordinator) sendClosesPending(ctx context.Context, w *workerState, tar
 	if err := c.enqueueTo(ctx, w, nil, meta); err != nil {
 		return err
 	}
-	c.noteChunkMarker(w.name, meta.BatchId, target, windowID, chunkRef, highKey)
+	c.markers.Note(w.name, snapshot.Marker{ID: meta.BatchId, Target: target, Window: windowID, ChunkRef: chunkRef, HighKey: highKey})
 	c.noteWindow(target, w)
 	return nil
 }

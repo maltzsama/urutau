@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/maltzsama/urutau/internal/snapshot"
 )
 
 // A chunk's rows come from the worker's own SELECT and never pass through
@@ -26,26 +28,6 @@ const maxUncommittedChunks = 2
 // ack notification (issue #587), and this bounds how long a missed signal
 // could stall it.
 const chunkCommitPoll = 20 * time.Millisecond
-
-// chunkMarker is a queued Closes marker: its in-flight batch id, and the
-// table and window it closes.
-type chunkMarker struct {
-	id       uint64
-	target   string
-	window   uint64
-	chunkRef uint32
-	highKey  []any // the window's last row's PK tuple (the redo cursor, #646)
-}
-
-// noteChunkMarker records a queued Closes marker of worker's snapshot.
-func (c *Coordinator) noteChunkMarker(worker string, id uint64, target string, window uint64, chunkRef uint32, highKey []any) {
-	c.chunkMarkersMu.Lock()
-	defer c.chunkMarkersMu.Unlock()
-	if c.chunkMarkers == nil {
-		c.chunkMarkers = map[string][]chunkMarker{}
-	}
-	c.chunkMarkers[worker] = append(c.chunkMarkers[worker], chunkMarker{id: id, target: target, window: window, chunkRef: chunkRef, highKey: highKey})
-}
 
 // errWorkerLost is a chunk round-trip cut short by its worker's loss.
 var errWorkerLost = errors.New("worker lost")
@@ -94,23 +76,9 @@ func (c *Coordinator) uncommittedChunks(worker string) int {
 
 // heldChunkMarkers drops worker's committed markers and returns the rest,
 // oldest first.
-func (c *Coordinator) heldChunkMarkers(worker string) []chunkMarker {
+func (c *Coordinator) heldChunkMarkers(worker string) []snapshot.Marker {
 	idx := c.indexOf(worker)
-	c.chunkMarkersMu.Lock()
-	defer c.chunkMarkersMu.Unlock()
-	kept := c.chunkMarkers[worker][:0]
-	for _, m := range c.chunkMarkers[worker] {
-		if idx != nil && idx.Holds(m.id) {
-			kept = append(kept, m)
-		}
-	}
-	if len(kept) == 0 {
-		delete(c.chunkMarkers, worker)
-		return nil
-	}
-	clear(c.chunkMarkers[worker][len(kept):])
-	c.chunkMarkers[worker] = kept
-	return append([]chunkMarker(nil), kept...)
+	return c.markers.Held(worker, func(id uint64) bool { return idx != nil && idx.Holds(id) })
 }
 
 // onMarkerAck releases a Closes marker the worker acked by id: the window's
@@ -124,7 +92,7 @@ func (c *Coordinator) onMarkerAck(worker string, id uint64) {
 	// Record the chunk's resume cursor BEFORE releasing the marker: a
 	// concurrent heldChunkMarkers prunes acked markers, so this must read the
 	// marker while it is still held (issue #646).
-	c.recordCursor(worker, id)
+	c.markers.RecordCursor(worker, id)
 	freed, freedOversized, popped := idx.ReleaseMarker(id)
 	c.notifyAck()
 	if freed > 0 {
@@ -135,57 +103,5 @@ func (c *Coordinator) onMarkerAck(worker string, id uint64) {
 	}
 	if w := c.workerFor(worker); w != nil {
 		w.dropSent(popped)
-	}
-}
-
-// recordCursor stores a chunk's resume cursor — the high key of the last
-// window whose Closes marker this ack committed — so a mid-chunk redo resumes
-// the chunk from it instead of re-emitting already-committed windows (#646).
-// A window whose Closes marker was never sent has no marker here, so it is
-// never mistaken for committed.
-func (c *Coordinator) recordCursor(worker string, id uint64) {
-	c.chunkMarkersMu.Lock()
-	defer c.chunkMarkersMu.Unlock()
-	for _, m := range c.chunkMarkers[worker] {
-		if m.id == id && m.highKey != nil {
-			if c.chunkCursor == nil {
-				c.chunkCursor = map[cursorKey][]any{}
-			}
-			c.chunkCursor[cursorKey{m.target, m.chunkRef}] = m.highKey
-			return
-		}
-	}
-}
-
-// cursorKey names one chunk of one table. chunkRef alone is partition and
-// chunk index, which every table shares: a cursor keyed only by it could be
-// taken by another table's redo of the same partition and index, and that
-// table would resume its chunk from the wrong key, skipping rows.
-type cursorKey struct {
-	target   string
-	chunkRef uint32
-}
-
-// takeCursor returns and forgets the resume cursor of one of target's chunks,
-// or nil.
-func (c *Coordinator) takeCursor(target string, chunkRef uint32) []any {
-	c.chunkMarkersMu.Lock()
-	defer c.chunkMarkersMu.Unlock()
-	k := cursorKey{target, chunkRef}
-	cur := c.chunkCursor[k]
-	delete(c.chunkCursor, k)
-	return cur
-}
-
-// forgetCursors drops every cursor of target. Called when its snapshot
-// finishes: no chunk of it will be redone, and a cursor nothing takes would
-// otherwise stay for the whole run.
-func (c *Coordinator) forgetCursors(target string) {
-	c.chunkMarkersMu.Lock()
-	defer c.chunkMarkersMu.Unlock()
-	for k := range c.chunkCursor {
-		if k.target == target {
-			delete(c.chunkCursor, k)
-		}
 	}
 }
