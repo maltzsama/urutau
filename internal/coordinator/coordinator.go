@@ -28,6 +28,7 @@ import (
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
 	route "github.com/maltzsama/urutau/internal/routing"
+	"github.com/maltzsama/urutau/internal/snapshot"
 	"github.com/maltzsama/urutau/internal/staged"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
@@ -361,7 +362,7 @@ type Coordinator struct {
 	lostWindows map[string][]chunkMarker
 	// fanout is the fan-out snapshot pass each table is in: the window
 	// cycles a lost owner keeps from committing (snapshot_hash_redo.go).
-	fanout fanoutPasses
+	fanout snapshot.FanoutPasses
 	// chunkCursor is, per table and chunkRef, the last acked window's high
 	// key (#646).
 	chunkCursor map[cursorKey][]any

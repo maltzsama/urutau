@@ -89,8 +89,8 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 		}
 	}
 
-	c.fanout.begin(ref.Target)
-	defer c.fanout.end(ref.Target)
+	c.fanout.Begin(ref.Target)
+	defer c.fanout.End(ref.Target)
 	for {
 		if err := snapshot.SnapshotTable(ctx, chunker, rdr, relay, ref.Target, cfg, nil); err != nil {
 			return err
@@ -112,7 +112,7 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 		if !lost {
 			return nil
 		}
-		redo := pendingFrom(relay.passChunks, from)
+		redo := snapshot.PendingFrom(relay.passChunks, from)
 		if len(redo) == 0 || len(relay.bounds) == 0 {
 			return fmt.Errorf("coordinator: snapshot %s: chunk %d was lost with its worker and is not in the pass to read again", ref.Target, from)
 		}
@@ -324,7 +324,7 @@ func (c *Coordinator) closeFanoutChunk(ctx context.Context, ref source.TableRef,
 			names[i] = w.name
 		}
 		c.staged.ExpectWindow(core.TableRef{Target: ref.Target}, meta.BatchId, names)
-		c.fanout.note(ref.Target, meta.BatchId, uint32(windowID))
+		c.fanout.Note(ref.Target, meta.BatchId, uint32(windowID))
 	}
 	for _, w := range owners {
 		if err := c.enqueueTo(ctx, w, nil, cloneBatchMeta(meta)); err != nil {

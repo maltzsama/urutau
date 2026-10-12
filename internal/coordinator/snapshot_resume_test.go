@@ -126,7 +126,7 @@ func TestSnapshotRecordsItsProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sp.State != snapshot.StateInProgress || len(sp.Bounds) != len(resumeBounds) || props[propSnapshotPartitions] != partitionLayout([]source.Chunk{{}}) {
+	if sp.State != snapshot.StateInProgress || len(sp.Bounds) != len(resumeBounds) || props[propSnapshotPartitions] != snapshot.PartitionLayout([]source.Chunk{{}}) {
 		t.Fatalf("recorded progress %+v, partitions %q; want in_progress with the bounds of one partition", sp, props[propSnapshotPartitions])
 	}
 	if !slices.Equal(sp.Pending, []uint32{0, 1, 2}) {
@@ -165,7 +165,7 @@ func TestSnapshotResumesFromItsRecordedProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	props[propSnapshotPartitions] = partitionLayout([]source.Chunk{{}})
+	props[propSnapshotPartitions] = snapshot.PartitionLayout([]source.Chunk{{}})
 	_ = h.snk.SetProperties(context.Background(), core.TableRef{Target: "raw.orders"}, props)
 
 	var calls atomic.Int64
@@ -199,7 +199,7 @@ func TestSnapshotStartsOverWhenThePartitionsChanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	props[propSnapshotPartitions] = partitionLayout([]source.Chunk{{High: []any{int64(15)}}, {Low: []any{int64(15)}}})
+	props[propSnapshotPartitions] = snapshot.PartitionLayout([]source.Chunk{{High: []any{int64(15)}}, {Low: []any{int64(15)}}})
 	_ = h.snk.SetProperties(context.Background(), core.TableRef{Target: "raw.orders"}, props)
 
 	var calls atomic.Int64

@@ -116,7 +116,7 @@ func (c *Coordinator) commitStagedCycle(cy *staged.Cycle) error {
 func (c *Coordinator) commitStagedCycleLocked(cy *staged.Cycle) error {
 	// A fan-out window an owner lost, and the windows queued behind it, do
 	// not commit: their progress records the lost chunk as done (#829).
-	if cy.Window && c.fanout.resolve(cy.Ref.Target, cy.Seq, cy.Lost) {
+	if cy.Window && c.fanout.Resolve(cy.Ref.Target, cy.Seq, cy.Lost) {
 		c.log.Warn("coordinator: snapshot window not committed; its chunk is read again",
 			"table", cy.Ref.Target, "seq", cy.Seq, "lost", cy.Lost)
 		return nil
