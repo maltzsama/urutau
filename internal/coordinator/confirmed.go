@@ -45,7 +45,7 @@ func (c *Coordinator) bufferedTables() map[string]struct{} {
 			seen[target] = struct{}{}
 		}
 		for table, acc := range c.accum {
-			if acc != nil && len(acc.batches) > 0 {
+			if acc.Holds() {
 				seen[table] = struct{}{}
 			}
 		}

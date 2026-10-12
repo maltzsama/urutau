@@ -337,7 +337,7 @@ type Coordinator struct {
 	gate *gate.Gate[*dataplane.Batch]
 	// accum holds each staged table's batches not sent yet (coalesce.go),
 	// guarded by the gate's lock; sent under the gate's flush lock.
-	accum map[string]*cycleAccum
+	accum map[string]*staged.Accum
 
 	// paused holds a table whose re-slice is draining. The flip waits for the
 	// table to owe nothing, which a continuously loaded table never reaches on

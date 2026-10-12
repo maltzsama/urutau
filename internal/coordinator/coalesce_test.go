@@ -16,6 +16,7 @@ import (
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/staged"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
@@ -181,7 +182,7 @@ func TestAccumulatedBatchesPrecedeThePausedOnes(t *testing.T) {
 // source order, the last batch's watermark.
 func TestConcatSourceBatchesKeepsSourceOrder(t *testing.T) {
 	bs := []*dataplane.Batch{gateBatch(t, 7, "0/1"), gateBatch(t, 3, "0/2"), gateBatch(t, 9, "0/3")}
-	merged, err := concatSourceBatches(bs)
+	merged, err := staged.Concat(bs)
 	if err != nil {
 		t.Fatal(err)
 	}

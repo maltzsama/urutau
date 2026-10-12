@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/staged"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 )
 
@@ -26,17 +27,17 @@ func (c *Coordinator) enqueueWindowed(ctx context.Context, target string, window
 
 // enqueueHeld sends a gate's held batches, in order, with meta's window tag.
 // They are consecutive batches of one table under one tag, so they go out
-// concatenated, up to cycleMaxRows rows and cycleMaxBytes bytes per batch
-// (coalesce.go): one held
-// batch per cycle made a window's drain hundreds of one-row commits (#437).
+// concatenated, up to the cycle's row and byte bounds per batch
+// (coalesce.go): one held batch per cycle made a window's drain hundreds of one-row commits (#437).
 // A fresh meta per sent batch: enqueueBatch assigns the cycle id into it.
 func (c *Coordinator) enqueueHeld(ctx context.Context, meta *pb.BatchMeta, buf []*dataplane.Batch) error {
+	bounds := c.cycleBounds()
 	for len(buf) > 0 {
 		n, rows, bytes := 0, int64(0), int64(0)
 		for n < len(buf) {
 			// Sized once: batchBytes walks every buffer of the record.
 			addRows, addBytes := buf[n].Record.NumRows(), batchBytes(buf[n])
-			if !c.fits(rows, bytes, addRows, addBytes) {
+			if !bounds.Fits(rows, bytes, addRows, addBytes) {
 				break
 			}
 			rows += addRows
@@ -45,7 +46,7 @@ func (c *Coordinator) enqueueHeld(ctx context.Context, meta *pb.BatchMeta, buf [
 		}
 		group := buf[:n]
 		buf = buf[n:]
-		merged, err := concatSourceBatches(group)
+		merged, err := staged.Concat(group)
 		for _, b := range group {
 			b.Release()
 		}
