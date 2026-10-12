@@ -531,3 +531,43 @@ func TestScaleInTerminatesOnNeverAttachedOwnerOwingWork(t *testing.T) {
 		t.Fatal("scale-in must terminate the run for a clean replay, not retry the drain")
 	}
 }
+
+// A worker can attach to an owner while the scale that created it is still
+// draining. When that scale is rolled back the owner leaves the registry;
+// its worker's session must end with it. Left attached, the worker stays
+// bound to the forgotten owner, the retry registers the name again with a
+// new queue, and nothing ever reads it (#842).
+func TestScaleRollbackEndsTheSessionOfAnOwnerItForgets(t *testing.T) {
+	c, _ := scaleHarness(t)
+	c.cfg.ScaleDrainTimeout = 300 * time.Millisecond
+	owners, _ := c.loadRouting().OwnersOf("raw.orders")
+	// One in-flight batch the drain can never clear.
+	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
+
+	// The new owner's Pod attaches while the scale drains.
+	name := route.PartitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)
+	ended := make(chan struct{})
+	go func() {
+		for {
+			c.mu.Lock()
+			w, ok := c.workers[name]
+			if ok {
+				w.attached, w.cancel = true, func() { close(ended) }
+			}
+			c.mu.Unlock()
+			if ok {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	if err := c.ScaleTable(context.Background(), "raw.orders", 2); err == nil {
+		t.Fatal("the scale must fail when the drain never converges")
+	}
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the rolled-back owner's worker was left attached to it")
+	}
+}

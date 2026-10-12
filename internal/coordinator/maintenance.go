@@ -48,6 +48,10 @@ type maintenanceScheduler struct {
 	mu        sync.Mutex
 	tables    map[string]string // worker name -> table
 	connected map[string]bool   // worker name -> session in progress
+	// lastTurn is when each worker's Pod was last provisioned: the table
+	// whose turn is oldest goes first, so one that is always due does not
+	// keep the others waiting (tick).
+	lastTurn map[string]time.Time
 
 	// cfgJSON is cfg as every assignment carries it, marshalled on first use.
 	cfgOnce sync.Once
@@ -62,6 +66,7 @@ func newMaintenanceScheduler(c *Coordinator, cfg *spec.Maintenance) *maintenance
 		sched:     maintenance.NewSchedule(),
 		tables:    map[string]string{},
 		connected: map[string]bool{},
+		lastTurn:  map[string]time.Time{},
 	}
 }
 
@@ -345,12 +350,19 @@ func (m *maintenanceScheduler) run(ctx context.Context) {
 	}
 }
 
-// tick provisions one ephemeral Pod per table whose next turn has come due
-// and that has no worker in flight already. Handing over the assignment is
-// session's job, not tick's — the worker gets it the moment it connects.
+// tick provisions the ephemeral Pod of one table whose next turn has come
+// due, when no maintenance worker of the pipeline is in flight. Handing over
+// the assignment is session's job, not tick's — the worker gets it the moment
+// it connects.
 //
-// A table with a live session is skipped; its operations stay due, so
-// nothing is lost. Otherwise the live Pod, not a local flag, decides: a Pod
+// One pass at a time: a compaction holds gigabytes for a large table, and
+// every table of a pipeline comes due together after a restart or a quiet
+// period. Their passes side by side took 4-5 GiB each on 1M-row tables and
+// exhausted the node (#831). The tables take turns, the one served longest
+// ago first.
+//
+// A table with a live session keeps the others waiting; its operations stay
+// due, so nothing is lost. Otherwise the live Pod, not a local flag, decides: a Pod
 // still starting is left alone, and one that will never open a session
 // (Failed, Succeeded without reporting, ImagePullBackOff, unschedulable) is
 // deleted so the next tick provisions a fresh one. A bare flag cannot do
@@ -361,29 +373,43 @@ func (m *maintenanceScheduler) tick(now time.Time) {
 		return
 	}
 	m.mu.Lock()
+	if len(m.connected) > 0 {
+		m.mu.Unlock()
+		return
+	}
 	candidates := make(map[string]string, len(m.tables))
+	turns := make(map[string]time.Time, len(m.tables))
 	for name, table := range m.tables {
-		if m.connected[name] {
-			continue
-		}
 		if len(m.sched.Due(table, m.cfg, now)) == 0 {
 			continue
 		}
 		candidates[name] = table
+		turns[name] = m.lastTurn[name]
 	}
 	m.mu.Unlock()
 
-	// By name, so the order of the Pods and of their log lines is the same
-	// from one tick to the next.
+	// Oldest turn first, then by name, so the order of the Pods and of their
+	// log lines is the same from one tick to the next.
 	names := make([]string, 0, len(candidates))
 	for name := range candidates {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		if ti, tj := turns[names[i]], turns[names[j]]; !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return names[i] < names[j]
+	})
 	for _, name := range names {
 		table := candidates[name]
-		if err := m.provisionWorkerPod(name, table); err != nil {
+		inFlight, err := m.provisionWorkerPod(name, table)
+		if err != nil {
 			m.c.log.Warn("coordinator: maintenance: provision worker pod", "worker", name, "table", table, "err", err)
+		}
+		if inFlight {
+			// This table's worker is on its way: the others wait for its
+			// pass to end.
+			return
 		}
 	}
 }
@@ -397,30 +423,42 @@ func (m *maintenanceScheduler) tick(now time.Time) {
 //   - a Pod that can no longer connect: delete it and create a replacement
 //     on the next tick, so a failed image pull or an unschedulable Pod does
 //     not stall the table forever.
-func (m *maintenanceScheduler) provisionWorkerPod(name, table string) error {
+//
+// inFlight reports whether the table now has a Pod that may still connect.
+func (m *maintenanceScheduler) provisionWorkerPod(name, table string) (inFlight bool, err error) {
 	ctx, cancel := maintenanceK8sContext()
 	defer cancel()
 	existing, err := coordk8s.GetPod(ctx, m.k8s, m.namespace, name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if existing != nil {
 		if coordk8s.PodCanStillConnect(existing) {
-			return nil
+			return true, nil
 		}
 		m.c.log.Info("coordinator: maintenance: replacing worker pod that cannot connect",
 			"worker", name, "table", table, "phase", existing.Status.Phase)
-		return coordk8s.DeletePod(ctx, m.k8s, m.namespace, name)
+		// The table used its turn: the next tick serves another before it.
+		m.noteTurn(name)
+		return false, coordk8s.DeletePod(ctx, m.k8s, m.namespace, name)
 	}
 	tmpl, err := coordk8s.LoadWorkerPodTemplate(table)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := coordk8s.CreatePod(ctx, m.k8s, m.namespace, coordk8s.MaintenanceWorkerPod(name, m.namespace, m.owner, tmpl)); err != nil {
-		return err
+		return false, err
 	}
+	m.noteTurn(name)
 	m.c.log.Info("coordinator: maintenance worker pod provisioned", "worker", name, "table", table)
-	return nil
+	return true, nil
+}
+
+// noteTurn records that name's table was just given a turn.
+func (m *maintenanceScheduler) noteTurn(name string) {
+	m.mu.Lock()
+	m.lastTurn[name] = time.Now()
+	m.mu.Unlock()
 }
 
 // assignment renders one table's due operations into a wire assignment. The
