@@ -7,6 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/maltzsama/urutau/internal/observability"
+	"github.com/maltzsama/urutau/internal/staged"
 	"github.com/maltzsama/urutau/source"
 	"github.com/maltzsama/urutau/spec"
 )
@@ -20,7 +21,7 @@ func lagHarness() *Coordinator {
 	c := &Coordinator{
 		cfg:     Config{Spec: &spec.Spec{Tables: []spec.Table{{Source: "s", Target: "raw.orders"}}}},
 		metrics: observability.New(),
-		staged:  newStagedCycles(),
+		staged:  staged.New(),
 	}
 	c.publishRouting(newRouting(map[string][]*workerState{"raw.orders": {w}}, map[string][]source.Chunk{}))
 	return c

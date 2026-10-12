@@ -19,6 +19,7 @@ import (
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/gate"
 	"github.com/maltzsama/urutau/internal/rowchange"
+	"github.com/maltzsama/urutau/internal/staged"
 	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
@@ -57,7 +58,7 @@ func coordHarness() (*Coordinator, *workerState) {
 		budget:      inflight.NewBudget(1<<20, 1<<10),
 		index:       map[string]*inflight.PositionIndex{"w0": inflight.NewPositionIndex("run-1")},
 		confirmed:   map[string]position.Position{},
-		staged:      newStagedCycles(),
+		staged:      staged.New(),
 		stagedLocks: map[string]*sync.Mutex{},
 		runID:       "run-1",
 		windowOpen:  make(chan *pb.WindowOpen, 1024),

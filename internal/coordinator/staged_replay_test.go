@@ -67,7 +67,7 @@ func TestStagedReplayCycleWaitsOnlyForUncoveredOwners(t *testing.T) {
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	committable, known := c.staged.deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{1}, "0/30", "", nil)
+	committable, known := c.staged.Deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{1}, "0/30", "", nil)
 	if !known || len(committable) != 1 {
 		t.Fatalf("w1's delivery: committable=%d known=%v; want the cycle complete without w0 (whose sub-batch is covered)", len(committable), known)
 	}
@@ -80,7 +80,7 @@ func TestStagedReplayCoveredBatchOpensNoCycle(t *testing.T) {
 	if err := c.enqueueBatch(context.Background(), b, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	if n := c.staged.len(); n != 0 {
+	if n := c.staged.TotalOpen(); n != 0 {
 		t.Fatalf("%d cycle(s) open for a fully covered batch; want 0", n)
 	}
 }
@@ -93,7 +93,7 @@ func TestStagedCycleExpectsEveryOwnerPastCommitted(t *testing.T) {
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	if committable, _ := c.staged.deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{1}, "0/40", "", nil); len(committable) != 0 {
+	if committable, _ := c.staged.Deliver(stagedRef("raw.orders", "w1"), meta.BatchId, []byte{1}, "0/40", "", nil); len(committable) != 0 {
 		t.Fatal("the cycle completed with one of two uncovered owners")
 	}
 }

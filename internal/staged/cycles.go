@@ -1,4 +1,8 @@
-package coordinator
+// Package staged tracks the staged commit cycles of partitioned tables: which
+// owners each cycle still waits for, and the order the complete ones commit
+// in. It holds no sink and no worker: the coordinator opens cycles as it
+// sends, feeds them the workers' deliveries, and commits what comes back.
+package staged
 
 import (
 	"sync"
@@ -6,35 +10,35 @@ import (
 	"github.com/maltzsama/urutau/core"
 )
 
-// stagedCycle accumulates the deliveries of one binlog batch (WK-001 C5) for
+// Cycle accumulates the deliveries of one binlog batch (WK-001 C5) for
 // a partitioned table: the coordinator sends N sub-batches (one per partition
 // with rows) and waits for N staged deliveries, then commits the whole cycle
 // as one unit. A cycle whose workers do not all deliver is discarded, never
 // committed partially.
-type stagedCycle struct {
-	ref         core.TableRef
-	seq         uint64
+type Cycle struct {
+	Ref         core.TableRef
+	Seq         uint64
 	expected    int
-	owners      map[string]bool // workers whose delivery this cycle needs
+	Owners      map[string]bool // workers whose delivery this cycle needs
 	delivered   map[string]bool // owners whose delivery arrived
-	descriptors [][]byte
-	positions   []string
+	Descriptors [][]byte
+	Positions   []string
 	// batchPos is the source batch's last position, when the cycle holds
 	// every partition's share of one batch: the table is then durable
 	// through it once the cycle commits (#459). Empty for a cycle opened
 	// without it; the commit then falls back to the deliveries' minimum.
-	batchPos string
+	BatchPos string
 	// window marks a snapshot window's cycle: it commits the window's rows
 	// and snapshot progress but no position (#468).
-	window bool
+	Window bool
 	// lost marks a window cycle one of its owners delivered for a window it
 	// never held (#829).
-	lost    bool
-	state   string
-	pending []uint32
+	Lost    bool
+	State   string
+	Pending []uint32
 }
 
-// stagedCycles tracks open cycles keyed by (table, seq). Cycles of one table
+// Cycles tracks open cycles keyed by (table, seq). Cycles of one table
 // commit in send order (seq order), even when they complete out of order:
 // committing a higher position first and a lower one after would regress the
 // durable checkpoint and re-deliver rows. A Seq==0 delivery — a
@@ -43,11 +47,11 @@ type stagedCycle struct {
 // during a snapshot, so a window committed on arrival could move the table's
 // position past live cycles still open. They are delivered as their Closes
 // marker's cycle instead (sendClosesPending, #416).
-type stagedCycles struct {
+type Cycles struct {
 	mu    sync.Mutex
-	open  map[cycleKey]*stagedCycle // still accumulating
-	done  map[cycleKey]*stagedCycle // complete, waiting for its turn
-	order map[string][]uint64       // per table, seqs in send order
+	open  map[cycleKey]*Cycle // still accumulating
+	done  map[cycleKey]*Cycle // complete, waiting for its turn
+	order map[string][]uint64 // per table, seqs in send order
 	// poisoned marks a table whose cycle commit failed. Once set, no later
 	// cycle of the table may commit: a later commit would advance the durable
 	// position past the failed cycle's rows, which were never written (#543).
@@ -59,17 +63,18 @@ type cycleKey struct {
 	seq   uint64
 }
 
-func newStagedCycles() *stagedCycles {
-	return &stagedCycles{
-		open:     map[cycleKey]*stagedCycle{},
-		done:     map[cycleKey]*stagedCycle{},
+// New returns an empty set of cycles.
+func New() *Cycles {
+	return &Cycles{
+		open:     map[cycleKey]*Cycle{},
+		done:     map[cycleKey]*Cycle{},
 		order:    map[string][]uint64{},
 		poisoned: map[string]bool{},
 	}
 }
 
-// poison marks a table so no later cycle commits over a failed one (#543).
-func (s *stagedCycles) poison(table string) {
+// Poison marks a table so no later cycle commits over a failed one (#543).
+func (s *Cycles) Poison(table string) {
 	if s == nil {
 		return
 	}
@@ -78,8 +83,8 @@ func (s *stagedCycles) poison(table string) {
 	s.mu.Unlock()
 }
 
-// isPoisoned reports whether the table's commit already failed (#543).
-func (s *stagedCycles) isPoisoned(table string) bool {
+// IsPoisoned reports whether the table's commit already failed (#543).
+func (s *Cycles) IsPoisoned(table string) bool {
 	if s == nil {
 		return false
 	}
@@ -88,46 +93,46 @@ func (s *stagedCycles) isPoisoned(table string) bool {
 	return s.poisoned[table]
 }
 
-// expect records that a delivery is expected from each of owners for
+// Expect records that a delivery is expected from each of owners for
 // (ref.Target, seq). Called once per binlog batch, with exactly the workers a
 // sub-batch was sent to (a partition with no rows is not sent, so its worker
 // is not expected).
-func (s *stagedCycles) expect(ref core.TableRef, seq uint64, owners []string) {
-	s.expectAt(ref, seq, owners, "")
+func (s *Cycles) Expect(ref core.TableRef, seq uint64, owners []string) {
+	s.ExpectAt(ref, seq, owners, "")
 }
 
-// expectWindow is expect for a snapshot window's cycle (sendClosesPending).
-func (s *stagedCycles) expectWindow(ref core.TableRef, seq uint64, owners []string) {
-	s.expect(ref, seq, owners)
+// ExpectWindow is expect for a snapshot window's cycle (sendClosesPending).
+func (s *Cycles) ExpectWindow(ref core.TableRef, seq uint64, owners []string) {
+	s.Expect(ref, seq, owners)
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cy := s.open[cycleKey{ref.Target, seq}]; cy != nil {
-		cy.window = true
+		cy.Window = true
 	}
 }
 
-// markLost records that owner's delivery of cycle seq, about to be made, is
+// MarkLost records that owner's delivery of cycle seq, about to be made, is
 // for a snapshot window it never held. A delivery the cycle does not expect
 // or already has changes nothing: that owner's share is in the cycle.
-func (s *stagedCycles) markLost(ref core.TableRef, seq uint64) {
+func (s *Cycles) MarkLost(ref core.TableRef, seq uint64) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cy := s.open[cycleKey{ref.Target, seq}]
-	if cy == nil || !cy.owners[ref.Owner] || cy.delivered[ref.Owner] {
+	if cy == nil || !cy.Owners[ref.Owner] || cy.delivered[ref.Owner] {
 		return
 	}
-	cy.lost = true
+	cy.Lost = true
 }
 
-// expectAt is expect for a cycle that carries every partition's share of one
+// ExpectAt is expect for a cycle that carries every partition's share of one
 // source batch, whose last position is batchPos.
-func (s *stagedCycles) expectAt(ref core.TableRef, seq uint64, owners []string, batchPos string) {
+func (s *Cycles) ExpectAt(ref core.TableRef, seq uint64, owners []string, batchPos string) {
 	if s == nil || len(owners) == 0 {
 		return
 	}
@@ -141,17 +146,17 @@ func (s *stagedCycles) expectAt(ref core.TableRef, seq uint64, owners []string, 
 	for _, o := range owners {
 		own[o] = true
 	}
-	s.open[k] = &stagedCycle{ref: ref, seq: seq, expected: len(owners), owners: own, batchPos: batchPos}
+	s.open[k] = &Cycle{Ref: ref, Seq: seq, expected: len(owners), Owners: own, BatchPos: batchPos}
 	s.order[ref.Target] = append(s.order[ref.Target], seq)
 }
 
-// deliver records one staged delivery and returns the run of cycles of that
+// Deliver records one staged delivery and returns the run of cycles of that
 // table now committable, head-first. The second return reports whether the
 // delivery named a cycle this tracker knows: false means a too-late delivery
 // for a discarded cycle (dropped), true covers both a still-accumulating cycle
 // and a completed one. A Seq==0 delivery is its own cycle of one, returned
 // immediately.
-func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, state string, pending []uint32) (committable []*stagedCycle, known bool) {
+func (s *Cycles) Deliver(ref core.TableRef, seq uint64, desc []byte, pos, state string, pending []uint32) (committable []*Cycle, known bool) {
 	if s == nil {
 		return nil, false
 	}
@@ -167,10 +172,10 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 		if seq != 0 {
 			return nil, false
 		}
-		return []*stagedCycle{{
-			ref: ref, seq: 0, expected: 1,
-			descriptors: [][]byte{desc}, positions: []string{pos},
-			state: state, pending: pending,
+		return []*Cycle{{
+			Ref: ref, Seq: 0, expected: 1,
+			Descriptors: [][]byte{desc}, Positions: []string{pos},
+			State: state, Pending: pending,
 		}}, true
 	}
 	// One delivery per expected owner: an owner's second delivery of the
@@ -178,7 +183,7 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 	// cycle was not sent to, must not stand in for another owner's and
 	// commit the cycle without its rows.
 	if ref.Owner != "" {
-		if !cy.owners[ref.Owner] || cy.delivered[ref.Owner] {
+		if !cy.Owners[ref.Owner] || cy.delivered[ref.Owner] {
 			return nil, true
 		}
 		if cy.delivered == nil {
@@ -186,15 +191,15 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 		}
 		cy.delivered[ref.Owner] = true
 	}
-	cy.descriptors = append(cy.descriptors, desc)
-	cy.positions = append(cy.positions, pos)
+	cy.Descriptors = append(cy.Descriptors, desc)
+	cy.Positions = append(cy.Positions, pos)
 	if state != "" {
-		cy.state = state
+		cy.State = state
 	}
 	if pending != nil {
-		cy.pending = pending
+		cy.Pending = pending
 	}
-	if len(cy.descriptors) < cy.expected {
+	if len(cy.Descriptors) < cy.expected {
 		return nil, true
 	}
 	delete(s.open, k)
@@ -204,8 +209,8 @@ func (s *stagedCycles) deliver(ref core.TableRef, seq uint64, desc []byte, pos, 
 
 // drainLocked pops the head of table's send order while it is complete,
 // returning the committable run. Caller holds s.mu.
-func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
-	var out []*stagedCycle
+func (s *Cycles) drainLocked(table string) []*Cycle {
+	var out []*Cycle
 	q := s.order[table]
 	for len(q) > 0 {
 		k := cycleKey{table, q[0]}
@@ -227,11 +232,11 @@ func (s *stagedCycles) drainLocked(table string) []*stagedCycle {
 	return out
 }
 
-// openFor counts the cycles of table that are not yet committed: still
+// OpenFor counts the cycles of table that are not yet committed: still
 // accumulating deliveries (open) or complete but waiting their turn in seq
 // order (done). A re-slice waits for this to reach zero, so no cycle spans
 // two partition layouts.
-func (s *stagedCycles) openFor(ref core.TableRef) int {
+func (s *Cycles) OpenFor(ref core.TableRef) int {
 	if s == nil {
 		return 0
 	}
@@ -244,11 +249,11 @@ func (s *stagedCycles) openFor(ref core.TableRef) int {
 	return len(s.order[ref.Target])
 }
 
-// openForBreakdown splits openFor's count: cycles still accumulating a
+// OpenForBreakdown splits openFor's count: cycles still accumulating a
 // delivery, and cycles complete but blocked behind an earlier open cycle in
 // send order. The split names the stall — an open head cycle wedges every
 // complete cycle behind it.
-func (s *stagedCycles) openForBreakdown(ref core.TableRef) (open, done int) {
+func (s *Cycles) OpenForBreakdown(ref core.TableRef) (open, done int) {
 	if s == nil {
 		return 0, 0
 	}
@@ -267,9 +272,9 @@ func (s *stagedCycles) openForBreakdown(ref core.TableRef) (open, done int) {
 	return open, done
 }
 
-// openSeqs returns the seqs of a table's not-yet-committed cycles, for
+// OpenSeqs returns the seqs of a table's not-yet-committed cycles, for
 // diagnostics: the head of send order names which cycle is blocking.
-func (s *stagedCycles) openSeqs(ref core.TableRef) []uint64 {
+func (s *Cycles) OpenSeqs(ref core.TableRef) []uint64 {
 	if s == nil {
 		return nil
 	}
@@ -288,10 +293,10 @@ func (s *stagedCycles) openSeqs(ref core.TableRef) []uint64 {
 	return out
 }
 
-// totalOpen reports how many staged cycles are still accumulating or waiting
+// TotalOpen reports how many staged cycles are still accumulating or waiting
 // to commit. Exposed for the urutau_coordinator_staged_cycles gauge: a growing
 // count is a staged backlog (issue #602).
-func (s *stagedCycles) totalOpen() int {
+func (s *Cycles) TotalOpen() int {
 	if s == nil {
 		return 0
 	}

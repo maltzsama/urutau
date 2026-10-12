@@ -38,7 +38,7 @@ func TestStagedAckFromASupersededGenerationKeepsTheBatchInFlight(t *testing.T) {
 	if n := c.index["w0"].InFlight(); n != 1 {
 		t.Fatalf("after a stale-generation ack w0 has %d batches in flight, want 1: the batch was cleared although its staged delivery was dropped, so nothing will redeliver it", n)
 	}
-	if open := c.staged.openFor(core.TableRef{Target: "raw.orders"}); open != 1 {
+	if open := c.staged.OpenFor(core.TableRef{Target: "raw.orders"}); open != 1 {
 		t.Fatalf("%d open cycles, want the one still owed w0's share", open)
 	}
 
@@ -46,7 +46,7 @@ func TestStagedAckFromASupersededGenerationKeepsTheBatchInFlight(t *testing.T) {
 	c.onStagedBatch("w1", &pb.StagedBatch{Table: "raw.orders", Seq: meta.BatchId, Epoch: c.workers["w1"].epoch, Descriptor_: []byte{2}, Position: "0/40"})
 	c.onStagedBatch("w0", &pb.StagedBatch{Table: "raw.orders", Seq: meta.BatchId, Epoch: old + 1, Descriptor_: []byte{1}, Position: "0/40"})
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Epoch: old + 1, Position: "0/40", Rows: 1})
-	if open := c.staged.openFor(core.TableRef{Target: "raw.orders"}); open != 0 {
+	if open := c.staged.OpenFor(core.TableRef{Target: "raw.orders"}); open != 0 {
 		t.Fatalf("%d open cycles after both owners delivered, want 0", open)
 	}
 	if n := c.index["w0"].InFlight(); n != 0 {

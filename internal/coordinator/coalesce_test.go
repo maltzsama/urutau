@@ -108,7 +108,7 @@ func drainQueue(t *testing.T, w *workerState) (metas []*pb.BatchMeta, rows []int
 // holdAccumulator makes the table's accumulator hold: a cycle is pending, as
 // while an Iceberg commit is in flight.
 func holdAccumulator(c *Coordinator) {
-	c.staged.expect(core.TableRef{Target: "raw.orders"}, 1_000_000, []string{"w0"})
+	c.staged.Expect(core.TableRef{Target: "raw.orders"}, 1_000_000, []string{"w0"})
 }
 
 // Batches accumulated before a DBLog window opens are older than every event

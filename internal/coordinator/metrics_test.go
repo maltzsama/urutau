@@ -6,7 +6,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/observability"
 	"github.com/maltzsama/urutau/position"
 )
@@ -79,18 +78,5 @@ func TestPublishConfirmedAge(t *testing.T) {
 	c.publishConfirmedAge(base.Add(60 * time.Second))
 	if got := testutil.ToFloat64(c.metrics.ConfirmedPositionAge); got != 0 {
 		t.Fatalf("age while caught up = %v, want 0", got)
-	}
-}
-
-// #602: totalOpen counts staged cycles still accumulating or waiting to
-// commit.
-func TestStagedCyclesTotalOpen(t *testing.T) {
-	s := newStagedCycles()
-	if s.totalOpen() != 0 {
-		t.Fatalf("empty stagedCycles totalOpen = %d, want 0", s.totalOpen())
-	}
-	s.expect(core.TableRef{Source: "shop.a", Target: "raw.a"}, 1, []string{"w0"})
-	if s.totalOpen() != 1 {
-		t.Fatalf("totalOpen after one open cycle = %d, want 1", s.totalOpen())
 	}
 }

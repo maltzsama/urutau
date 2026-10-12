@@ -100,14 +100,14 @@ func TestGateDrainGivesEachHeldBatchItsOwnCycle(t *testing.T) {
 			}
 			committed := 0
 			for _, d := range got {
-				cycles, known := c.staged.deliver(stagedRef("raw.orders", d.worker), d.id, []byte{1}, d.pos, "", nil)
+				cycles, known := c.staged.Deliver(stagedRef("raw.orders", d.worker), d.id, []byte{1}, d.pos, "", nil)
 				if !known {
 					t.Fatalf("%s's delivery for cycle %d is unknown: it would be dropped with its rows", d.worker, d.id)
 				}
 				committed += len(cycles)
 			}
-			if committed == 0 || c.staged.len() != 0 {
-				t.Fatalf("after every delivery: %d cycle(s) committed, %d still open; want all committed", committed, c.staged.len())
+			if committed == 0 || c.staged.TotalOpen() != 0 {
+				t.Fatalf("after every delivery: %d cycle(s) committed, %d still open; want all committed", committed, c.staged.TotalOpen())
 			}
 		})
 	}

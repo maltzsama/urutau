@@ -142,7 +142,7 @@ func (c *Coordinator) accumDue(table string, a *cycleAccum) bool {
 		return true
 	}
 	// Nothing of the table is being committed: waiting would only add latency.
-	return c.staged.openFor(core.TableRef{Target: table}) == 0
+	return c.staged.OpenFor(core.TableRef{Target: table}) == 0
 }
 
 func (c *Coordinator) flushAccumIfDue(ctx context.Context, table string) error {

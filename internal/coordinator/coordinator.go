@@ -28,6 +28,7 @@ import (
 	"github.com/maltzsama/urutau/internal/logging"
 	"github.com/maltzsama/urutau/internal/observability"
 	route "github.com/maltzsama/urutau/internal/routing"
+	"github.com/maltzsama/urutau/internal/staged"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/sink"
@@ -306,7 +307,7 @@ type Coordinator struct {
 	// WK-001 C5: open staged cycles (a partitioned table's sub-batches
 	// grouped by binlog batch). stagedLocks serializes CommitStaged per
 	// table so two cycles of the same table never race on the catalog.
-	staged      *stagedCycles
+	staged      *staged.Cycles
 	stagedLocks map[string]*sync.Mutex
 	stagedMu    sync.Mutex
 
@@ -531,7 +532,7 @@ func Run(ctx context.Context, cfg Config) error {
 		chunkReady:  make(chan *pb.ChunkReady, 1024),
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
 		confirmed:   make(map[string]position.Position),
-		staged:      newStagedCycles(),
+		staged:      staged.New(),
 		stagedLocks: map[string]*sync.Mutex{},
 		booted:      make(chan struct{}),
 	}

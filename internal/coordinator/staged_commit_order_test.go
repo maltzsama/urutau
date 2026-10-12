@@ -63,7 +63,7 @@ func TestStagedCyclesCommitInSendOrderAcrossGoroutines(t *testing.T) {
 	c.snk = snk
 	ref := core.TableRef{Target: "raw.orders"}
 	for seq := uint64(1); seq <= 3; seq++ {
-		c.staged.expect(ref, seq, []string{"w0"})
+		c.staged.Expect(ref, seq, []string{"w0"})
 	}
 
 	var wg sync.WaitGroup
@@ -99,11 +99,11 @@ func TestStagedCycleFailurePoisonsLaterCommits(t *testing.T) {
 	snk := &orderedStagedSink{failFirst: true}
 	c.snk = snk
 	ref := core.TableRef{Target: "raw.orders"}
-	c.staged.expect(ref, 1, []string{"w0"})
-	c.staged.expect(ref, 2, []string{"w0"})
+	c.staged.Expect(ref, 1, []string{"w0"})
+	c.staged.Expect(ref, 2, []string{"w0"})
 
 	c.onStagedBatch("w0", &pb.StagedBatch{Table: "raw.orders", Epoch: 0, Seq: 1, Descriptor_: []byte("1"), Position: "0/10"})
-	if !c.staged.isPoisoned("raw.orders") {
+	if !c.staged.IsPoisoned("raw.orders") {
 		t.Fatal("a failed commit must poison the table")
 	}
 	select {
