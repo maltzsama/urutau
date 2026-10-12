@@ -90,7 +90,7 @@ func (c *Coordinator) loseWorker(worker string, cause error) error {
 	if lost != nil {
 		close(lost)
 	}
-	if !c.supervisor.noteLoss(worker, epoch) {
+	if !c.supervisor.health.Loss(worker, epoch, time.Now()) {
 		// The same loss seen again on the worker's other stream (Session
 		// and Control both end when it is lost).
 		return nil
@@ -131,7 +131,7 @@ func (c *Coordinator) workerBack(worker string) error {
 	if idx := c.index.Of(worker); idx != nil {
 		mark = idx.MaxHeldID()
 	}
-	n, crashed, desc := c.supervisor.noteBack(worker, term, ok, mark, time.Now())
+	n, crashed, desc := c.supervisor.health.Back(worker, term, ok, mark, time.Now())
 	if !crashed {
 		return nil
 	}
@@ -189,92 +189,6 @@ func (c *Coordinator) lostSignal(w *workerState) <-chan struct{} {
 	return w.lostCh
 }
 
-// workerHealth is what the supervisor tracks of a worker's losses.
-type workerHealth struct {
-	lossEpoch    uint64 // the epoch of the last loss seen
-	lossPending  bool   // a loss not yet classified by the worker's return
-	crashes      int    // crashes in a row without delivering what it owed
-	seenUID      string // the Pod and restart count last read
-	seenRestarts int32
-	owedMark     uint64    // the highest batch id owed when it came back
-	backAt       time.Time // when it came back
-	lostAt       time.Time // when the last loss was seen
-}
-
-// healthOf returns worker's record. Caller holds s.mu.
-func (s *supervisor) healthOf(worker string) *workerHealth {
-	h := s.health[worker]
-	if h == nil {
-		h = &workerHealth{}
-		s.health[worker] = h
-	}
-	return h
-}
-
-// lossTime is when worker's last loss was seen, or now if none was.
-func (s *supervisor) lossTime(worker string) time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if h := s.health[worker]; h != nil && !h.lostAt.IsZero() {
-		return h.lostAt
-	}
-	return time.Now()
-}
-
-// noteLoss records a loss at epoch, reporting false for a loss already seen
-// (the worker's other stream).
-func (s *supervisor) noteLoss(worker string, epoch uint64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h := s.healthOf(worker)
-	if h.lossPending && h.lossEpoch == epoch {
-		return false
-	}
-	h.lossEpoch, h.lossPending = epoch, true
-	h.lostAt = time.Now()
-	return true
-}
-
-// noteBack classifies the loss a worker comes back from (see workerBack) and
-// returns its crashes in a row, whether this loss was one, and its
-// description.
-func (s *supervisor) noteBack(worker string, term coordk8s.Termination, known bool, owedMark uint64, now time.Time) (int, bool, string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h := s.healthOf(worker)
-	h.owedMark, h.backAt = owedMark, now
-	crashed, desc := false, ""
-	if known {
-		// A crash is fresh when the same Pod restarted since it was last
-		// seen. The second arm is the first sighting of a Pod: nothing was
-		// seen before, so any restart it already counts is new to us.
-		fresh := (term.PodUID == h.seenUID && term.Restarts > h.seenRestarts) ||
-			(h.seenUID == "" && term.Restarts > 0)
-		if h.lossPending && fresh {
-			crashed, desc = term.Crash()
-		}
-		h.seenUID, h.seenRestarts = term.PodUID, term.Restarts
-	}
-	h.lossPending = false
-	if crashed {
-		h.crashes++
-	}
-	return h.crashes, crashed, desc
-}
-
-// noteDelivering starts a worker's crash count over once it has delivered
-// every batch it owed when it came back and stayed up for ack: it is not
-// crash-looping. Caller holds s.mu.
-func (s *supervisor) noteDeliveringLocked(worker string, minHeld uint64, now time.Time, ack time.Duration) {
-	h := s.health[worker]
-	if h == nil || h.crashes == 0 || h.lossPending {
-		return
-	}
-	if (minHeld == 0 || minHeld > h.owedMark) && now.Sub(h.backAt) >= ack {
-		h.crashes = 0
-	}
-}
-
 // noteDeliveredAt records that worker delivered (acked, or owed nothing) at.
 func (s *supervisor) noteDeliveredAt(worker string, at time.Time) {
 	s.mu.Lock()
@@ -326,7 +240,7 @@ func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error
 	if timeout <= 0 {
 		timeout = defaultWorkerDeliveryTimeout
 	}
-	deadline := c.supervisor.lossTime(w.name).Add(timeout)
+	deadline := c.supervisor.health.LossTime(w.name, time.Now()).Add(timeout)
 	poll := time.NewTicker(reattachPoll)
 	defer poll.Stop()
 	for {

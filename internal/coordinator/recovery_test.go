@@ -270,9 +270,12 @@ func TestTheSnapshotWaitForALostWorkerCountsFromTheLoss(t *testing.T) {
 	c.mu.Lock()
 	w.attached = false
 	c.mu.Unlock()
-	s.mu.Lock()
-	s.healthOf("w1").lostAt = time.Now().Add(-2 * time.Minute)
-	s.mu.Unlock()
+	// The loss was seen two minutes ago.
+	c.mu.Lock()
+	epoch := w.epoch
+	c.mu.Unlock()
+	s.health.Forget("w1")
+	s.health.Loss("w1", epoch, time.Now().Add(-2*time.Minute))
 
 	done := make(chan error, 1)
 	go func() { done <- c.awaitReattached(context.Background(), w) }()

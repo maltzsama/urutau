@@ -451,8 +451,8 @@ func TestRetireOwnerForgetsSupervisorState(t *testing.T) {
 	_, resets := c.supervisor.resets[owner.name]
 	progress := c.supervisor.progress.Tracks(owner.name)
 	_, delivered := c.supervisor.lastDelivered[owner.name]
-	_, health := c.supervisor.health[owner.name]
 	c.supervisor.mu.Unlock()
+	health := c.supervisor.health.Tracks(owner.name)
 	if ack || pending || resets || progress || delivered || health {
 		t.Fatalf("retired owner's supervisor state lingered: ack=%v pending=%v resets=%v progress=%v delivered=%v health=%v",
 			ack, pending, resets, progress, delivered, health)
