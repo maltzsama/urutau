@@ -357,7 +357,7 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 	select {
 	case w.queue <- queuedBatch{id: meta.BatchId, body: body, meta: metaBytes, snapshotRows: snapshotRows}:
 		if !snapshotRows {
-			c.noteSent(meta.Table, posStr)
+			c.sent.Note(meta.Table, posStr)
 		}
 		return nil
 	case <-ctx.Done():

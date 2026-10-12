@@ -315,8 +315,9 @@ type Coordinator struct {
 
 	// The latest position sent per table and the worker its latest snapshot
 	// window went to: where a table's snapshot-done marker goes (#428).
+	// lastWindow is under sentMu.
+	sent       confirmed.Sent
 	sentMu     sync.Mutex
-	lastSent   map[string]string
 	lastWindow map[string]*workerState
 
 	// DBLog window gate (design §3.1): while a chunk's SELECT is in flight

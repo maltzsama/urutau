@@ -1,6 +1,9 @@
 package coordinator
 
 import (
+	"errors"
+
+	"github.com/maltzsama/urutau/internal/confirmed"
 	"github.com/maltzsama/urutau/position"
 )
 
@@ -58,50 +61,25 @@ func (c *Coordinator) bufferedTables() map[string]struct{} {
 }
 
 // dispatchedPosition is the greatest position handed to a worker, the frontier
-// the confirmed may advance to when nothing is in flight. It parses each
-// table's last sent position and takes the greatest; nil before any dispatch.
-//
-// "The greatest" exists only when the positions can be ordered. Opaque plugin
-// offsets, GTID sets of disjoint servers and offsets of disjoint topics
-// cannot: there the frontier is undefined, and it is nil too, with a warning.
-// Returning whichever position the map yields first would make the source's
-// retention depend on iteration order; nil sends confirmedPosition to the
-// minimum over what was confirmed, which holds retention when it has to.
+// the confirmed may advance to when nothing is in flight; nil before any
+// dispatch, and nil with a warning when the tables' positions cannot be
+// ordered (see confirmed.Sent.Frontier for the rule).
 func (c *Coordinator) dispatchedPosition() position.Position {
-	// Copy under the lock, parse outside it: sentMu is taken on every enqueue
-	// (noteSent), and this runs on every ack.
-	c.sentMu.Lock()
-	raw := make(map[string]string, len(c.lastSent))
-	for table, s := range c.lastSent {
-		if s != "" {
-			raw[table] = s
-		}
-	}
-	c.sentMu.Unlock()
-
-	var best position.Position
-	for table, s := range raw {
-		p, err := c.src.ParsePosition(s)
-		if err != nil {
-			// deliverBatch parsed this very string before it was recorded,
-			// so a failure here means the source's parser changed its mind.
-			// The frontier is advisory, so the table is skipped, not the run
-			// ended; but it is said.
-			c.log.Debug("coordinator: dispatched position does not parse", "table", table, "pos", s, "err", err)
-			continue
-		}
-		if best == nil {
-			best = p
-			continue
-		}
-		switch cmp := p.Compare(best); {
-		case cmp == position.Incomparable:
-			c.log.Warn("coordinator: incomparable dispatched positions; not advancing retention past what is confirmed",
-				"have", best.String(), "candidate", p.String())
-			return nil
-		case cmp > 0:
-			best = p
-		}
+	// The parser is reached only when something was sent: a coordinator with
+	// no dispatch yet may have no source.
+	parse := func(s string) (position.Position, error) { return c.src.ParsePosition(s) }
+	best, err := c.sent.Frontier(parse, func(table, pos string, err error) {
+		// deliverBatch parsed this very string before it was recorded, so a
+		// failure here means the source's parser changed its mind. The
+		// frontier is advisory, so the table is skipped, not the run ended;
+		// but it is said.
+		c.log.Debug("coordinator: dispatched position does not parse", "table", table, "pos", pos, "err", err)
+	})
+	var inc *confirmed.IncomparableError
+	if errors.As(err, &inc) {
+		c.log.Warn("coordinator: incomparable dispatched positions; not advancing retention past what is confirmed",
+			"have", inc.Have.String(), "candidate", inc.Candidate.String())
+		return nil
 	}
 	return best
 }
