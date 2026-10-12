@@ -26,7 +26,9 @@ func TestDispatchedPositionIsNilWhenPositionsAreIncomparable(t *testing.T) {
 		c, _ := coordHarness()
 		c.log = slog.New(slog.NewTextHandler(&out, nil))
 		c.src = opaqueSource{}
-		c.lastSent = map[string]string{"raw.a": "cookie-1", "raw.b": "cookie-2", "raw.c": "cookie-3"}
+		c.sent.Note("raw.a", "cookie-1")
+		c.sent.Note("raw.b", "cookie-2")
+		c.sent.Note("raw.c", "cookie-3")
 		if got := c.dispatchedPosition(); got != nil {
 			t.Fatalf("dispatchedPosition = %v, want nil: the positions have no order", got)
 		}
@@ -40,7 +42,10 @@ func TestDispatchedPositionIsNilWhenPositionsAreIncomparable(t *testing.T) {
 func TestDispatchedPositionIsTheGreatestSent(t *testing.T) {
 	for range 100 {
 		c, _ := coordHarness()
-		c.lastSent = map[string]string{"raw.a": "0/10", "raw.b": "0/40", "raw.c": "0/25", "raw.d": ""}
+		c.sent.Note("raw.a", "0/10")
+		c.sent.Note("raw.b", "0/40")
+		c.sent.Note("raw.c", "0/25")
+		c.sent.Note("raw.d", "")
 		got := c.dispatchedPosition()
 		if got == nil || got.String() != "0/40" {
 			t.Fatalf("dispatchedPosition = %v, want 0/40", got)
@@ -52,7 +57,8 @@ func TestDispatchedPositionIsTheGreatestSent(t *testing.T) {
 func TestDispatchedPositionAcceptsEqualOpaquePositions(t *testing.T) {
 	c, _ := coordHarness()
 	c.src = opaqueSource{}
-	c.lastSent = map[string]string{"raw.a": "cookie-1", "raw.b": "cookie-1"}
+	c.sent.Note("raw.a", "cookie-1")
+	c.sent.Note("raw.b", "cookie-1")
 	if got := c.dispatchedPosition(); got == nil || got.String() != "cookie-1" {
 		t.Fatalf("dispatchedPosition = %v, want cookie-1", got)
 	}
@@ -75,7 +81,9 @@ func TestDispatchedPositionSkipsAndReportsAnUnparsablePosition(t *testing.T) {
 	c, _ := coordHarness()
 	c.log = slog.New(slog.NewTextHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	c.src = flakyParse{}
-	c.lastSent = map[string]string{"raw.a": "0/10", "raw.b": "broken", "raw.c": "0/30"}
+	c.sent.Note("raw.a", "0/10")
+	c.sent.Note("raw.b", "broken")
+	c.sent.Note("raw.c", "0/30")
 	got := c.dispatchedPosition()
 	if got == nil || got.String() != "0/30" {
 		t.Fatalf("dispatchedPosition = %v, want 0/30", got)

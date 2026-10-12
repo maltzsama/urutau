@@ -20,7 +20,7 @@ func TestConfirmedPositionIdleWorkerDoesNotPin(t *testing.T) {
 
 	// Both workers owe nothing and something has been dispatched: advance to
 	// the dispatched frontier, not the idle worker's old 0/10.
-	c.noteSent("raw.orders", "0/100")
+	c.sent.Note("raw.orders", "0/100")
 	if got := c.confirmedPosition(); got == nil || got.String() != "0/100" {
 		t.Fatalf("confirmed = %v, want 0/100 (idle worker must not pin it)", got)
 	}

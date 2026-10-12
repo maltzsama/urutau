@@ -49,20 +49,6 @@ func (c *Coordinator) markSnapshotsPending(ctx context.Context, refs []source.Ta
 	return nil
 }
 
-// noteSent records the latest position sent for a table (FIFO, so the last
-// one sent is the highest).
-func (c *Coordinator) noteSent(table, pos string) {
-	if pos == "" {
-		return
-	}
-	c.sentMu.Lock()
-	defer c.sentMu.Unlock()
-	if c.lastSent == nil {
-		c.lastSent = map[string]string{}
-	}
-	c.lastSent[table] = pos
-}
-
 // noteWindow records the worker a table's latest window went to.
 func (c *Coordinator) noteWindow(table string, w *workerState) {
 	c.sentMu.Lock()
@@ -73,10 +59,12 @@ func (c *Coordinator) noteWindow(table string, w *workerState) {
 	c.lastWindow[table] = w
 }
 
+// sentState returns the latest position sent for a table and the worker its
+// latest window went to.
 func (c *Coordinator) sentState(table string) (pos string, w *workerState) {
 	c.sentMu.Lock()
 	defer c.sentMu.Unlock()
-	return c.lastSent[table], c.lastWindow[table]
+	return c.sent.Of(table), c.lastWindow[table]
 }
 
 // finishSnapshot commits a table's snapshot completion once every window has
