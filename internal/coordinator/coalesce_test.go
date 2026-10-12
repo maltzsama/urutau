@@ -162,18 +162,11 @@ func TestAccumulatedBatchesPrecedeThePausedOnes(t *testing.T) {
 			t.Fatalf("accumulate %d: taken=%v err=%v", i, taken, err)
 		}
 	}
-	c.pausedMu.Lock()
-	if c.paused == nil {
-		c.paused = map[string]chan struct{}{}
-	}
-	c.paused["raw.orders"] = make(chan struct{})
-	c.pausedMu.Unlock()
+	c.pauseTable("raw.orders")
 	if !c.pauseHold(gateBatch(t, keys[2], "0/3")) {
 		t.Fatal("the paused table did not hold the batch")
 	}
-	c.pausedMu.Lock()
-	delete(c.paused, "raw.orders")
-	c.pausedMu.Unlock()
+	c.resumeTable("raw.orders")
 	if err := c.flushPaused(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +267,7 @@ func TestCoalescedBatchesStayWithinTheByteBound(t *testing.T) {
 	}
 }
 
-// A table's held batches leave pauseBuf when it resumes; if sending them
+// A table's held batches leave the pause when it resumes; if sending them
 // fails, they must be released, not dropped with their buffers.
 func TestFlushPausedReleasesHeldBatchesOnError(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
@@ -290,9 +283,11 @@ func TestFlushPausedReleasesHeldBatchesOnError(t *testing.T) {
 		}
 		return &dataplane.Batch{Table: "raw.nobody", Record: rec, Watermark: []byte(pos), Mode: dataplane.UpsertMode}
 	}
-	c.pausedMu.Lock()
-	c.pauseBuf = map[string][]*dataplane.Batch{"raw.nobody": {held(1, "0/1"), held(2, "0/2"), held(3, "0/3")}}
-	c.pausedMu.Unlock()
+	c.pauseTable("raw.nobody")
+	for i, pos := range []string{"0/1", "0/2", "0/3"} {
+		c.pauseHold(held(int64(i+1), pos))
+	}
+	c.resumeTable("raw.nobody")
 	if err := c.flushPaused(context.Background()); err == nil {
 		t.Fatal("flushPaused: want an error for a table no worker owns")
 	}

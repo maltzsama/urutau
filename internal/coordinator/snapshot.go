@@ -47,7 +47,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	defer c.endSnapshot(ref.Target)
 
 	rt := c.loadRouting()
-	owners, ok := rt.ownersOf(ref.Target)
+	owners, ok := rt.OwnersOf(ref.Target)
 	if !ok {
 		return fmt.Errorf("coordinator: snapshot: no worker owns %s", ref.Target)
 	}
@@ -57,7 +57,7 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	if len(owners) > 1 {
 		return c.snapshotFanoutTable(ctx, rdr, chunker, ref, cfg)
 	}
-	ranges := rt.rangesOf(ref.Target)
+	ranges := rt.RangesOf(ref.Target)
 	if len(ranges) != len(owners) {
 		return fmt.Errorf("coordinator: snapshot: table %s: %d partition ranges for %d owners", ref.Target, len(ranges), len(owners))
 	}

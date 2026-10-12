@@ -146,13 +146,10 @@ func (fakeNonConcurrentSink) SupportsConcurrentWriters() bool { return false }
 // not advance the confirmed position.
 func TestIsStagedTable(t *testing.T) {
 	c := &Coordinator{snk: fakeStagedSink{}}
-	c.publishRouting(&routing{
-		owners: map[string][]*workerState{
-			"orders": {{name: "w0"}, {name: "w1"}},
-			"items":  {{name: "w2"}},
-		},
-		ranges: map[string][]source.Chunk{},
-	})
+	c.publishRouting(newRouting(map[string][]*workerState{
+		"orders": {{name: "w0"}, {name: "w1"}},
+		"items":  {{name: "w2"}},
+	}, map[string][]source.Chunk{}))
 	if !c.isStagedTable("orders") {
 		t.Fatal("partitioned table on a staging sink must be staged")
 	}

@@ -34,7 +34,7 @@ func (c *Coordinator) resumeFrom(ctx context.Context, refs []source.TableRef) (p
 	res, err := resume.Resolve(ctx, c.src, c.snk, refs, resume.Options{
 		Caps: caps,
 		Owners: func(target string) []string {
-			ws := c.loadRouting().owners[target]
+			ws, _ := c.loadRouting().OwnersOf(target)
 			names := make([]string, 0, len(ws))
 			for _, w := range ws {
 				names = append(names, w.name)

@@ -66,7 +66,7 @@ func (h scaleHost) Pipeline() (string, bool) {
 func (h scaleHost) Tables() []spec.Table { return h.c.tablesOrSpec() }
 
 func (h scaleHost) Owners(target string) (int, bool) {
-	owners, ok := h.c.loadRouting().ownersOf(target)
+	owners, ok := h.c.loadRouting().OwnersOf(target)
 	return len(owners), ok
 }
 

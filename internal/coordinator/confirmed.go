@@ -25,9 +25,10 @@ func (c *Coordinator) workersOwing() map[string]bool {
 			owing[name] = true
 		}
 	}
-	routing := c.loadRouting()
+	rt := c.loadRouting()
 	for table := range c.bufferedTables() {
-		for _, w := range routing.owners[table] {
+		owners, _ := rt.OwnersOf(table)
+		for _, w := range owners {
 			owing[w.name] = true
 		}
 	}
@@ -50,13 +51,9 @@ func (c *Coordinator) bufferedTables() map[string]struct{} {
 		}
 		c.gate.Unlock()
 	}
-	c.pausedMu.Lock()
-	for table, buf := range c.pauseBuf {
-		if len(buf) > 0 {
-			seen[table] = struct{}{}
-		}
+	for _, table := range c.pause.HeldTables() {
+		seen[table] = struct{}{}
 	}
-	c.pausedMu.Unlock()
 	return seen
 }
 

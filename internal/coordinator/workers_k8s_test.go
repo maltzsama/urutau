@@ -73,7 +73,7 @@ func TestReconcileReplicasNoStatefulSetIsANoop(t *testing.T) {
 
 	c.reconcileReplicas(context.Background())
 
-	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+	if got, _ := c.loadRouting().OwnersOf("raw.orders"); len(got) != 1 {
 		t.Fatalf("owners = %d, want the untouched 1", len(got))
 	}
 }
@@ -88,7 +88,7 @@ func TestReconcileReplicasFollowsStatefulSet(t *testing.T) {
 
 	c.reconcileReplicas(context.Background())
 
-	got, _ := c.loadRouting().ownersOf("raw.orders")
+	got, _ := c.loadRouting().OwnersOf("raw.orders")
 	if len(got) != 3 {
 		t.Fatalf("owners = %d, want 3 (routing follows the StatefulSet)", len(got))
 	}
@@ -106,7 +106,7 @@ func TestReconcileReplicasBacksOffAfterFailure(t *testing.T) {
 
 	c.reconcileReplicas(context.Background())
 
-	if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+	if got, _ := c.loadRouting().OwnersOf("raw.orders"); len(got) != 1 {
 		t.Fatalf("owners = %d, want the untouched 1 (reconcile suppressed)", len(got))
 	}
 }
@@ -209,7 +209,7 @@ func TestReconcileReplicasReportsAnUnreadableStatefulSet(t *testing.T) {
 
 			c.reconcileReplicas(context.Background())
 
-			if got, _ := c.loadRouting().ownersOf("raw.orders"); len(got) != 1 {
+			if got, _ := c.loadRouting().OwnersOf("raw.orders"); len(got) != 1 {
 				t.Fatalf("owners = %d, want the untouched 1", len(got))
 			}
 			if logged := strings.Contains(out.String(), "cannot read the worker statefulset"); logged != tc.wantLog {

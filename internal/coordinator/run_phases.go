@@ -182,7 +182,7 @@ func (c *Coordinator) phaseResolveRouting(ctx context.Context) (map[string]strin
 	}
 	// Publish the boot layout once: every runtime reader loads this snapshot,
 	// and a re-slice swaps in a successor (issue #312).
-	c.publishRouting(&routing{owners: bootOwners, ranges: bootRanges})
+	c.publishRouting(newRouting(bootOwners, bootRanges))
 	if c.cfg.OnReady != nil {
 		c.cfg.OnReady(c)
 	}

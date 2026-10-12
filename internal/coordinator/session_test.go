@@ -96,7 +96,7 @@ func TestEnqueueToMarkerUnknownTableErrors(t *testing.T) {
 // CD-T4 negative: a marker with an empty table is rejected up front.
 func TestEnqueueBatchMarkerEmptyTableErrors(t *testing.T) {
 	c := &Coordinator{canonical: map[string]core.Schema{}}
-	c.publishRouting(&routing{owners: map[string][]*workerState{}, ranges: map[string][]source.Chunk{}})
+	c.publishRouting(newRouting(map[string][]*workerState{}, map[string][]source.Chunk{}))
 	err := c.enqueueBatch(context.Background(), nil, &pb.BatchMeta{})
 	if err == nil || !strings.Contains(err.Error(), "requires a table") {
 		t.Fatalf("err = %v, want a marker-table error", err)
