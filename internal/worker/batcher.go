@@ -95,8 +95,15 @@ func (b *batcher) handleCloses(ing Ingest) error {
 		return err
 	}
 	if cb == nil {
-		// No rows to commit: the marker is done now.
-		b.w.markerCommitted(b.p.target, ing.MarkerID)
+		// No rows to commit. On a staged table the window still owes its
+		// cycle an empty delivery, which the committer ships: the marker is
+		// acked behind it, by the committer. Acked here, a worker killed
+		// before the ship left a marker the coordinator would never
+		// redeliver and a cycle waiting for a delivery nobody would send
+		// (#833).
+		if ing.MarkerID != 0 {
+			return queueMarkers(b.ctx, b.p.readyCh, []uint64{ing.MarkerID})
+		}
 	} else if ing.MarkerID != 0 {
 		b.pendingMarkers = append(b.pendingMarkers, ing.MarkerID)
 	}

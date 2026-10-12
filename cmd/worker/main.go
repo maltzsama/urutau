@@ -128,7 +128,7 @@ func runCmd() *cobra.Command {
 				"catalog", logging.RedactURI(cfg.Sink.URI),
 				"metrics", cfg.MetricsAddr,
 			)
-			return remote.RunRemote(cmd.Context(), cfg)
+			return remote.Run(cmd.Context(), cfg)
 		},
 	}
 	fl := cmd.Flags()

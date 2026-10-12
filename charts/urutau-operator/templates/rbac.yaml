@@ -44,8 +44,12 @@ rules:
     resources: ["pods"]
     verbs: ["get", "create", "delete"]
   - apiGroups: [""]
-    resources: ["configmaps", "services"]
+    resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # delete: the Service of a worker StatefulSet whose table left the pipeline.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
