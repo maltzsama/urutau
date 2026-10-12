@@ -5,13 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/apache/arrow-go/v18/arrow/memory"
-
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/columnar"
+	"github.com/maltzsama/urutau/internal/staged"
 )
 
 // A staged table (several owners on a staging sink) commits one Iceberg
@@ -30,10 +27,7 @@ import (
 //
 // The accumulator is a group commit: it sends at once while none of the
 // table's cycles is pending, and grows while one is being committed — up to
-// cycleMaxRows rows, cycleMaxBytes bytes or cycleMaxAge, whichever comes
-// first. The byte bound matters as much as the row bound: rows carry
-// payloads (the full profile's reach 256 KiB), and a 10,000-row batch of them
-// OOM-killed a worker.
+// the cycle's row, byte or age bound (staged.Bounds), whichever comes first.
 //
 // Ordering is the invariant. A table's accumulated batches are older than
 // anything a DBLog window gates or a re-slice pauses after them, so they are
@@ -42,55 +36,17 @@ import (
 // paused batch (flushAccumBeforePause), and every send runs under
 // gateFlushMu, like the gate's own drains.
 
-const (
-	defaultCycleMaxRows  = 10000
-	defaultCycleMaxBytes = 16 << 20
-	defaultCycleMaxAge   = time.Second
-	// cycleCheckEvery is how often the pump checks the accumulators it did
-	// not flush on arrival.
-	cycleCheckEvery = 20 * time.Millisecond
-)
+// cycleCheckEvery is how often the pump checks the accumulators it did not
+// flush on arrival.
+const cycleCheckEvery = 20 * time.Millisecond
 
-// cycleAccum is one staged table's batches not sent yet, oldest first.
-type cycleAccum struct {
-	batches []*dataplane.Batch
-	rows    int64
-	bytes   int64
-	since   time.Time
-}
-
-func (c *Coordinator) cycleMaxRows() int64 {
-	if c.cfg.CycleMaxRows > 0 {
-		return int64(c.cfg.CycleMaxRows)
-	}
-	return defaultCycleMaxRows
-}
-
-func (c *Coordinator) cycleMaxBytes() int64 {
-	if c.cfg.CycleMaxBytes > 0 {
-		return c.cfg.CycleMaxBytes
-	}
-	return defaultCycleMaxBytes
+// cycleBounds are the row, byte and age bounds of one cycle.
+func (c *Coordinator) cycleBounds() staged.Bounds {
+	return staged.NewBounds(c.cfg.CycleMaxRows, c.cfg.CycleMaxBytes, c.cfg.CycleMaxAge)
 }
 
 // batchBytes is a batch's in-memory size, the byte bound's measure.
 func batchBytes(b *dataplane.Batch) int64 { return columnar.BatchBytes(b) }
-
-// fits reports whether a batch of rows/bytes may join one already holding
-// accRows/accBytes: always for the first, then within both bounds.
-func (c *Coordinator) fits(accRows, accBytes, rows, bytes int64) bool {
-	if accRows == 0 {
-		return true
-	}
-	return accRows+rows <= c.cycleMaxRows() && accBytes+bytes <= c.cycleMaxBytes()
-}
-
-func (c *Coordinator) cycleMaxAge() time.Duration {
-	if c.cfg.CycleMaxAge > 0 {
-		return c.cfg.CycleMaxAge
-	}
-	return defaultCycleMaxAge
-}
 
 // accumulate takes a live batch of a staged table into its accumulator and
 // reports whether it did. A batch of any other table is not taken: it is
@@ -109,17 +65,15 @@ func (c *Coordinator) accumulate(ctx context.Context, b *dataplane.Batch) (bool,
 			return true, nil
 		}
 		if c.accum == nil {
-			c.accum = map[string]*cycleAccum{}
+			c.accum = map[string]*staged.Accum{}
 		}
 		a := c.accum[b.Table]
 		if a == nil {
-			a = &cycleAccum{since: time.Now()}
+			a = staged.NewAccum(time.Now())
 			c.accum[b.Table] = a
 		}
-		if c.fits(a.rows, a.bytes, rows, bytes) {
-			a.batches = append(a.batches, b)
-			a.rows += rows
-			a.bytes += bytes
+		if c.cycleBounds().Fits(a.Rows, a.Bytes, rows, bytes) {
+			a.Add(b, rows, bytes)
 			c.gate.Unlock()
 			return true, c.flushAccumIfDue(ctx, b.Table)
 		}
@@ -134,11 +88,11 @@ func (c *Coordinator) accumulate(ctx context.Context, b *dataplane.Batch) (bool,
 }
 
 // accumDue reports whether a table's accumulator should be sent now.
-func (c *Coordinator) accumDue(table string, a *cycleAccum) bool {
-	if a == nil || len(a.batches) == 0 {
+func (c *Coordinator) accumDue(table string, a *staged.Accum) bool {
+	if !a.Holds() {
 		return false
 	}
-	if a.rows >= c.cycleMaxRows() || a.bytes >= c.cycleMaxBytes() || time.Since(a.since) >= c.cycleMaxAge() {
+	if a.Full(c.cycleBounds(), time.Now()) {
 		return true
 	}
 	// Nothing of the table is being committed: waiting would only add latency.
@@ -190,15 +144,14 @@ func (c *Coordinator) sendAccumLocked(ctx context.Context, table string) error {
 	a := c.accum[table]
 	delete(c.accum, table)
 	c.gate.Unlock()
-	if a == nil || len(a.batches) == 0 {
+	if !a.Holds() {
 		return nil
 	}
-	merged, err := concatSourceBatches(a.batches)
-	for _, b := range a.batches {
-		b.Release()
-	}
+	n := len(a.Batches)
+	merged, err := staged.Concat(a.Batches)
+	a.Release()
 	if err != nil {
-		return fmt.Errorf("coordinator: %s: coalesce %d batches: %w", table, len(a.batches), err)
+		return fmt.Errorf("coordinator: %s: coalesce %d batches: %w", table, n, err)
 	}
 	return c.enqueueBatch(ctx, merged, nil)
 }
@@ -220,51 +173,7 @@ func (c *Coordinator) releaseAccums() {
 	c.gate.Lock()
 	defer c.gate.Unlock()
 	for table, a := range c.accum {
-		for _, b := range a.batches {
-			b.Release()
-		}
+		a.Release()
 		delete(c.accum, table)
 	}
-}
-
-// concatSourceBatches concatenates one table's source batches, in order, into
-// one owned batch: the watermark and position columns are the rows' own, so
-// the merged batch is what a bigger source batch would have been. The inputs
-// stay the caller's.
-func concatSourceBatches(bs []*dataplane.Batch) (*dataplane.Batch, error) {
-	first := bs[0]
-	if len(bs) == 1 {
-		first.Record.Retain()
-		return &dataplane.Batch{Table: first.Table, Record: first.Record, Watermark: first.Watermark, Mode: first.Mode, Partial: first.Partial}, nil
-	}
-	schema := first.Record.Schema()
-	var rows int64
-	for _, b := range bs {
-		if !b.Record.Schema().Equal(schema) {
-			return nil, fmt.Errorf("schema changed between batches of %s", first.Table)
-		}
-		rows += b.Record.NumRows()
-	}
-	cols := make([]arrow.Array, schema.NumFields())
-	for i := range cols {
-		parts := make([]arrow.Array, len(bs))
-		for j, b := range bs {
-			parts[j] = b.Record.Column(i)
-		}
-		col, err := array.Concatenate(parts, memory.DefaultAllocator)
-		if err != nil {
-			for _, done := range cols[:i] {
-				done.Release()
-			}
-			return nil, err
-		}
-		cols[i] = col
-	}
-	rec := array.NewRecordBatch(schema, cols, rows)
-	for _, col := range cols {
-		col.Release()
-	}
-	last := bs[len(bs)-1]
-	// The merged batch ends where its last one does: partial when that one is.
-	return &dataplane.Batch{Table: first.Table, Record: rec, Watermark: last.Watermark, Mode: first.Mode, Partial: last.Partial}, nil
 }
