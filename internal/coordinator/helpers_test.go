@@ -1,8 +1,11 @@
 package coordinator
 
 import (
+	"context"
+	"sync"
 	"testing"
 
+	"github.com/maltzsama/urutau/position"
 	"github.com/maltzsama/urutau/source"
 
 	route "github.com/maltzsama/urutau/internal/routing"
@@ -54,3 +57,26 @@ func (c *Coordinator) setRouteForTest(target string, owners []*workerState) {
 func (c *Coordinator) setRangesForTest(ranges map[string][]source.Chunk) {
 	c.publishRouting(c.loadRouting().WithRanges(ranges))
 }
+
+// neverCaughtReader never reaches the high watermark, so the caught-up proof
+// would poll until its window timeout unless the wait is aborted. polled
+// closes on the first Synced call, so a test can coordinate with the wait
+// instead of racing a sleep.
+type neverCaughtReader struct {
+	once   sync.Once
+	polled chan struct{}
+}
+
+func (r *neverCaughtReader) Synced() position.Position {
+	r.once.Do(func() { close(r.polled) })
+	return position.MustGTID("")
+}
+
+func (r *neverCaughtReader) Master(context.Context) (position.Position, error) {
+	return position.MustGTID(""), nil
+}
+
+func (r *neverCaughtReader) OpenWindow(context.Context, uint32) {}
+func (r *neverCaughtReader) ClearWindow()                       {}
+
+var _ source.SourceReader = (*neverCaughtReader)(nil)

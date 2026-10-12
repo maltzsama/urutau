@@ -38,7 +38,7 @@ import (
 // mid-snapshot comes back without the windows it was sent, and reports each
 // as lost when its Closes marker is redelivered. The chunks from the first
 // lost one on are read again once the pass over the table has drained
-// (snapshot_hash_redo.go, #829).
+// (snapshot.FanoutPasses, #829).
 func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.SourceReader, chunker source.ChunkSource, ref source.TableRef, cfg snapshot.SnapshotConfig) error {
 	rt := c.loadRouting()
 	owners, ok := rt.OwnersOf(ref.Target)
@@ -105,7 +105,7 @@ func (c *Coordinator) snapshotFanoutTable(ctx context.Context, rdr source.Source
 		}
 		// The snapshot is done only once every window is committed: an
 		// owner that lost one leaves its chunk, and those after it, to do.
-		from, lost, err := c.awaitFanoutPass(ctx, ref.Target)
+		from, lost, err := c.fanout.Await(ctx, ref.Target)
 		if err != nil {
 			return err
 		}

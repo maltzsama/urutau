@@ -5,26 +5,9 @@ import (
 	"fmt"
 
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/transport"
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 	"github.com/maltzsama/urutau/source"
 )
-
-// decodeWindowHighKey decodes a WindowOpen's high_key bytes into the PK tuple
-// it carries, or nil when the window has no high key (the whole-chunk path).
-func decodeWindowHighKey(b []byte) ([]any, error) {
-	if len(b) == 0 {
-		return nil, nil
-	}
-	rows, err := transport.DecodeBounds(b)
-	if err != nil {
-		return nil, err
-	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	return rows[0], nil
-}
 
 // resumeChunkAfterLoss computes where a partition's snapshot resumes after a
 // mid-snapshot worker loss: the chunk index to redo from, and — for a chunk
@@ -59,7 +42,7 @@ func (c *Coordinator) closeOneWindow(ctx context.Context, rdr source.SourceReade
 	// its full queue blocks the shared pump so the reader never reaches high;
 	// waiting out the window timeout would end the run (issue #526) instead of
 	// redoing the chunk, so the wait aborts on the loss.
-	if err := c.waitCaughtUpOrLost(ctx, rdr, pos, cfg, wo.Seq, lost); err != nil {
+	if err := snapshot.WaitCaughtUpOrLost(ctx, rdr, pos, cfg, wo.Seq, lost); err != nil {
 		return err
 	}
 	// Release the window's gated live events (InWindow-tagged) ahead of the
@@ -78,7 +61,7 @@ func (c *Coordinator) closeOneWindow(ctx context.Context, rdr source.SourceReade
 	// partition redoes it.
 	select {
 	case <-lost:
-		return errWorkerLost
+		return snapshot.ErrWorkerLost
 	default:
 		return nil
 	}

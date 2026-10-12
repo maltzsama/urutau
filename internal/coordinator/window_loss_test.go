@@ -82,7 +82,7 @@ func TestAWorkerLostBetweenChunkReadyAndClosesRedoesTheChunk(t *testing.T) {
 	}
 	c.signalSessionEnd(w.name, context.Canceled)
 
-	if err := <-done; !errors.Is(err, errWorkerLost) {
-		t.Fatalf("snapshotChunk = %v, want errWorkerLost: the window died with the worker", err)
+	if err := <-done; !errors.Is(err, snapshot.ErrWorkerLost) {
+		t.Fatalf("snapshotChunk = %v, want snapshot.ErrWorkerLost: the window died with the worker", err)
 	}
 }

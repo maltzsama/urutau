@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/maltzsama/urutau/internal/snapshot"
@@ -29,11 +28,8 @@ const maxUncommittedChunks = 2
 // could stall it.
 const chunkCommitPoll = 20 * time.Millisecond
 
-// errWorkerLost is a chunk round-trip cut short by its worker's loss.
-var errWorkerLost = errors.New("worker lost")
-
 // awaitChunkCommits returns once fewer than below of worker's chunk markers
-// are uncommitted, errWorkerLost when lost closes first (its windows died),
+// are uncommitted, snapshot.ErrWorkerLost when lost closes first (its windows died),
 // or when ctx ends (the chunk watchdog).
 func (c *Coordinator) awaitChunkCommits(ctx context.Context, worker string, below int, lost <-chan struct{}) error {
 	// One ticker for the whole wait: the safety-net poll below used to
@@ -53,7 +49,7 @@ func (c *Coordinator) awaitChunkCommits(ctx context.Context, worker string, belo
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-lost:
-			return errWorkerLost
+			return snapshot.ErrWorkerLost
 		case <-c.ackNotify:
 		case <-poll.C:
 		}
