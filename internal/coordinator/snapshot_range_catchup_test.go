@@ -67,8 +67,8 @@ func TestRangeCatchUpDrainsAFullGate(t *testing.T) {
 	close(lost)
 	select {
 	case err := <-closed:
-		if !errors.Is(err, errWorkerLost) {
-			t.Fatalf("closeOneWindow = %v, want errWorkerLost", err)
+		if !errors.Is(err, snapshot.ErrWorkerLost) {
+			t.Fatalf("closeOneWindow = %v, want snapshot.ErrWorkerLost", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("closeOneWindow did not end on the worker's loss")

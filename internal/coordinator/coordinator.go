@@ -359,7 +359,7 @@ type Coordinator struct {
 	// redo starts and resumes (recovery.go).
 	markers snapshot.Markers
 	// fanout is the fan-out snapshot pass each table is in: the window
-	// cycles a lost owner keeps from committing (snapshot_hash_redo.go).
+	// cycles a lost owner keeps from committing (#829).
 	fanout snapshot.FanoutPasses
 	// coordk8s.Termination reads a worker's last container termination; nil
 	// reads it from Kubernetes (recovery.go). Set by tests.

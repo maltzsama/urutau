@@ -15,7 +15,7 @@ import (
 )
 
 // waitChunkReadyOr blocks until the worker reports the chunk SELECT done for
-// THIS epoch, also returning errWorkerLost when lost closes: the worker's
+// THIS epoch, also returning snapshot.ErrWorkerLost when lost closes: the worker's
 // window died with its session, so no ChunkReady for it will come. A ChunkReady
 // from a superseded generation (same table+chunkID, different epoch) is
 // ignored, so a stale reply cannot satisfy the wait against a dead window.
@@ -29,7 +29,7 @@ func (c *Coordinator) waitChunkReadyOr(ctx context.Context, table string, chunkI
 			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
 				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
 		case <-lost:
-			return 0, errWorkerLost
+			return 0, snapshot.ErrWorkerLost
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
@@ -186,7 +186,7 @@ func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceRe
 			err = c.awaitChunkCommits(chunkCtx, w.name, 1, lost)
 		}
 		cancel()
-		if errors.Is(err, errWorkerLost) {
+		if errors.Is(err, snapshot.ErrWorkerLost) {
 			continue // the next pass finds the new epoch and redoes
 		}
 		if err != nil {
@@ -225,7 +225,7 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 	select {
 	case out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
 	case <-lost:
-		return errWorkerLost
+		return snapshot.ErrWorkerLost
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -239,7 +239,7 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 			return nil
 		}
 		windows[wo.Seq] = index
-		highKey, err := decodeWindowHighKey(wo.HighKey)
+		highKey, err := snapshot.DecodeHighKey(wo.HighKey)
 		if err != nil {
 			return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
 		}
@@ -277,7 +277,7 @@ func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader
 			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
 				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
 		case <-lost:
-			return errWorkerLost
+			return snapshot.ErrWorkerLost
 		case <-ctx.Done():
 			return ctx.Err()
 		}
