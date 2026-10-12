@@ -2,9 +2,9 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/maltzsama/urutau/core"
@@ -89,166 +89,82 @@ func (c *Coordinator) flushPaused(ctx context.Context) error {
 	return nil
 }
 
-// repartitioner serializes re-slices: two concurrent scale events on the
-// same table would each read-modify-write the routing snapshot and one
-// would be lost.
-type repartitioner struct {
-	mu sync.Mutex
-}
-
 // ScaleTable re-slices target across n partitions, adding or removing
 // owners so the table ends up with exactly n of them. It is the entry
-// point a scaler (KEDA today, an operator by hand) drives.
-//
-// The sequence is prepare → commit, and every wait is bounded: a step that
-// cannot complete fails the scale and leaves the OLD layout intact, so a
-// scale is a retryable no-op rather than an incident (never an unbounded
-// pause, never data loss):
-//
-//  1. Resolve the new ranges from the source's chunker.
-//  2. Register any new owner (queue, ticket, index) so its Hello is
-//     accepted the moment its pod starts.
-//  3. Seed the new owner's confirmed position, so confirmedPosition does
-//     not stall the whole pipeline on an owner that has committed nothing.
-//  4. PREPARE: pause the table's input so its drain can converge — a
-//     continuously loaded table never reaches zero in-flight on its own.
-//  5. Drain the table's in-flight batches and open staged cycles. With the
-//     input paused, no new batch arrives and this converges.
-//  6. COMMIT: swap the routing snapshot atomically, then resume the input.
-//     The pump's held batch is routed by the new layout, so no batch spans
-//     the flip.
-//  7. Drain and drop any owner the new layout removed.
-//
-// A timeout in the prepare phase (4-5) resumes the input and returns,
-// leaving the old layout in place: the scaler retries, and worker recovery
-// stays the supervisor's job.
+// point a scaler (KEDA today, an operator by hand) drives. The sequence —
+// prepare, drain, flip, retire — is route.Scaler's; the coordinator does
+// each step through routingHost.
 func (c *Coordinator) ScaleTable(ctx context.Context, target string, n int) error {
-	if n < 1 {
-		return fmt.Errorf("coordinator: scale %s: worker count must be >= 1, got %d", target, n)
-	}
-	c.repart.mu.Lock()
-	defer c.repart.mu.Unlock()
-
-	cur := c.loadRouting()
-	owners, ok := cur.OwnersOf(target)
-	if !ok {
-		return fmt.Errorf("coordinator: scale %s: no such routed table", target)
-	}
-	if len(owners) == n {
-		return nil
-	}
-	if err := c.refuseScaleDuringSnapshot(target); err != nil {
-		return err
-	}
-	if max := c.maxWorkersFor(target); n > max {
-		return fmt.Errorf("coordinator: scale %s: %d exceeds maxWorkers %d", target, n, max)
-	}
-
-	ref, ok := c.tableRef(target)
-	if !ok {
-		return fmt.Errorf("coordinator: scale %s: no table ref", target)
-	}
-	if n > 1 && len(ref.PrimaryKey) == 0 {
-		return fmt.Errorf("coordinator: scale %s: partitioning requires a primary key", target)
-	}
-	// A partitioned table needs a sink that can order concurrent writers —
-	// the same capability boot-time validation requires. Re-checked here
-	// because the table may have booted unpartitioned (workers: 1) and is
-	// only now becoming partitioned.
-	if err := requireConcurrentSink(spec.Table{Target: target, Workers: &spec.WorkerSpec{Number: n}}, c.snk); err != nil {
-		return fmt.Errorf("coordinator: scale %s: %w", target, err)
-	}
-
-	ranges, err := c.rangesFor(ctx, target, n, ref)
+	changed, err := c.repart.Scale(ctx, routingHost{c}, target, n)
 	if err != nil {
-		return fmt.Errorf("coordinator: scale %s: %w", target, err)
+		return fmt.Errorf("coordinator: %w", err)
 	}
-	if len(ranges) == 0 {
-		return fmt.Errorf("coordinator: scale %s: no partition range resolved", target)
+	if changed {
+		c.pushDashState()
 	}
-
-	next, removed, created, err := c.reslicedOwners(target, owners, n, ref)
-	if err != nil {
-		return fmt.Errorf("coordinator: scale %s: %w", target, err)
-	}
-
-	// A scale-in removes owners whose Pods the StatefulSet has already
-	// deleted. One that is not attached yet owes work can never drain it:
-	// the drain below would time out on every retry and the table would
-	// wedge. The case the supervisor cannot see is an owner that never
-	// attached at all — its Pod died while still connecting — so it is never
-	// "detached". Its work is uncommitted, so a clean replay recovers it.
-	for _, w := range removed {
-		if c.strandedOwner(w) {
-			err := fmt.Errorf("coordinator: scale %s: removed owner %s is not attached and owes work; terminating for a clean replay", target, w.name)
-			c.fail(err)
-			return err
-		}
-	}
-
-	// A pre-commit failure leaves the old layout active, so the owners this
-	// call CREATED must be rolled back: otherwise they linger as ghosts —
-	// accepting Hellos, supervised, and holding a retention position they
-	// will never advance.
-	committed := false
-	defer func() {
-		if !committed {
-			for _, w := range created {
-				c.unregisterOwner(w)
-			}
-		}
-	}()
-
-	// The new owners must be able to resume: an owner with no confirmed
-	// position pins confirmedPosition to nil and stalls source retention
-	// for the WHOLE pipeline, not just this table. A scale-in creates none.
-	c.seedConfirmed(created)
-
-	// PREPARE: pause the table's input. The drain below waits until the
-	// table owes nothing — every in-flight batch acked, every staged cycle
-	// committed — and a continuously loaded table never reaches that on its
-	// own. Pausing makes it converge; on any failure the input resumes and
-	// the old layout stands.
-	c.pauseTable(target)
-	resumed := false
-	defer func() {
-		if !resumed {
-			c.resumeTable(target)
-		}
-	}()
-	if err := c.drainForFlip(ctx, target, owners); err != nil {
-		return fmt.Errorf("coordinator: scale %s: drain: %w", target, err)
-	}
-
-	// COMMIT: the flip is atomic and instant, and happens only now that the
-	// table owes nothing. Resuming routes the pump's held batch — and every
-	// batch after it — by the new layout.
-	c.publishRouting(cur.WithTable(target, next, ranges))
-	c.resumeTable(target)
-	resumed = true
-	committed = true
-
-	c.emitScale(target, len(owners), n)
-
-	// Only after the flip: a removed owner still holds in-flight batches
-	// for keys the new layout has reassigned. Draining before the flip
-	// would race the reader still routing to it.
-	for _, w := range removed {
-		c.retireOwner(ctx, w)
-	}
-	c.pushDashState()
 	return nil
 }
 
-// refuseScaleDuringSnapshot rejects a scale of a table whose snapshot is
-// running: the fan-out captured the owners at start and the live stream routes
-// by the current layout, so a flip would send a key's snapshot row and its live
-// row to different workers. The scaler retries once the snapshot completes.
-func (c *Coordinator) refuseScaleDuringSnapshot(target string) error {
+// routingHost is the coordinator as a re-slice sees it.
+type routingHost struct{ c *Coordinator }
+
+func (h routingHost) Layout() *routing                   { return h.c.loadRouting() }
+func (h routingHost) Publish(l *routing)                 { h.c.publishRouting(l) }
+func (h routingHost) Name(w *workerState) string         { return w.name }
+func (h routingHost) Stranded(w *workerState) bool       { return h.c.strandedOwner(w) }
+func (h routingHost) Forget(w *workerState)              { h.c.unregisterOwner(w) }
+func (h routingHost) Seed(created []*workerState)        { h.c.seedConfirmed(created) }
+func (h routingHost) PauseInput(target string)           { h.c.pauseTable(target) }
+func (h routingHost) ResumeInput(target string)          { h.c.resumeTable(target) }
+func (h routingHost) Fail(err error)                     { h.c.fail(fmt.Errorf("coordinator: %w", err)) }
+func (h routingHost) Scaled(target string, from, to int) { h.c.emitScale(target, from, to) }
+
+func (h routingHost) Drain(ctx context.Context, target string, owners []*workerState) error {
+	return h.c.drainForFlip(ctx, target, owners)
+}
+
+func (h routingHost) Retire(ctx context.Context, w *workerState) { h.c.retireOwner(ctx, w) }
+
+// Admit refuses a scale that cannot happen now: during the table's
+// snapshot, past its worker cap, without a primary key to partition by, or
+// onto a sink that cannot order concurrent writers.
+func (h routingHost) Admit(target string, n int) error {
+	c := h.c
 	if c.isSnapshotting(target) {
-		return fmt.Errorf("coordinator: scale %s: snapshot in progress; retry once it completes", target)
+		return errors.New("snapshot in progress; retry once it completes")
 	}
-	return nil
+	if max := c.maxWorkersFor(target); n > max {
+		return fmt.Errorf("%d exceeds maxWorkers %d", n, max)
+	}
+	ref, ok := c.tableRef(target)
+	if !ok {
+		return errors.New("no table ref")
+	}
+	if n > 1 && len(ref.PrimaryKey) == 0 {
+		return errors.New("partitioning requires a primary key")
+	}
+	// The same capability boot-time validation requires. Re-checked here
+	// because the table may have booted unpartitioned (workers: 1) and is
+	// only now becoming partitioned.
+	return requireConcurrentSink(spec.Table{Target: target, Workers: &spec.WorkerSpec{Number: n}}, c.snk)
+}
+
+func (h routingHost) Ranges(ctx context.Context, target string, n int) ([]source.Chunk, error) {
+	ref, ok := h.c.tableRef(target)
+	if !ok {
+		return nil, errors.New("no table ref")
+	}
+	return h.c.rangesFor(ctx, target, n, ref)
+}
+
+// Owner registers the worker group of target's partition p, so Session
+// accepts the pod's Hello the moment it connects.
+func (h routingHost) Owner(target string, p int) (*workerState, bool, error) {
+	ref, ok := h.c.tableRef(target)
+	if !ok {
+		return nil, false, errors.New("no table ref")
+	}
+	return h.c.registerOwner(route.PartitionName(h.c.cfg.Spec.Pipeline, target, p), ref)
 }
 
 // strandedOwner reports whether w has no attached session yet holds queued or
@@ -259,17 +175,6 @@ func (c *Coordinator) strandedOwner(w *workerState) bool {
 	queued := len(w.queue)
 	c.mu.Unlock()
 	return !attached && (queued > 0 || c.inFlight(w.name) > 0)
-}
-
-// reslicedOwners returns the owner slice for n partitions, keeping the
-// existing owners in place (minimal remap: only the boundary moves) and
-// creating the ones a scale-out adds. It also returns the owners a scale-in
-// drops and the ones this call CREATED (not reused), so a pre-commit failure
-// can roll exactly those back.
-func (c *Coordinator) reslicedOwners(target string, cur []*workerState, n int, ref source.TableRef) (next, removed, created []*workerState, err error) {
-	return route.Reslice(cur, n, func(p int) (*workerState, bool, error) {
-		return c.registerOwner(route.PartitionName(c.cfg.Spec.Pipeline, target, p), ref)
-	})
 }
 
 // registerOwner creates a worker group and publishes it in the registry, so

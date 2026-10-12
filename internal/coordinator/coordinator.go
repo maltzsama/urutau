@@ -211,7 +211,7 @@ type Coordinator struct {
 	routing atomic.Pointer[routing]
 	// repart serializes re-slices: two concurrent scale events would each
 	// read-modify-write the snapshot and one would be lost.
-	repart repartitioner
+	repart route.Scaler[*workerState]
 	// chunkers is the per-table chunker built at boot: reused for the
 	// snapshot so a partitioned table's chunker (forced to key-based
 	// chunking by Partitions) is the one the snapshot bounds come from.
