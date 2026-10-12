@@ -228,15 +228,7 @@ func (r *CoordinatorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	log.Info("coordinator ensured", "statefulset", sts.Name)
 
-	// Autoscaling (issue #298): one KEDA ScaledObject per autoscalable table,
-	// targeting the worker StatefulSet the coordinator creates. A no-op
-	// unless the operator was started with a Prometheus address.
-	if err := r.ensureScaledObjects(ctx, cr); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// The workers of a table removed from the pipeline (#835).
-	if err := r.pruneWorkerWorkloads(ctx, cr); err != nil {
+	if err := r.reconcileWorkers(ctx, cr); err != nil {
 		return ctrl.Result{}, err
 	}
 

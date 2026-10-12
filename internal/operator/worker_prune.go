@@ -19,6 +19,18 @@ import (
 // StatefulSet and its headless Service (see internal/coordk8s).
 const workerWorkloadLabel = "urutau.io/worker"
 
+// reconcileWorkers does the operator's part for the worker StatefulSets the
+// coordinator creates: one KEDA ScaledObject per autoscalable table, targeting
+// that table's StatefulSet (issue #298; a no-op unless the operator was
+// started with a Prometheus address), and the removal of the workers of a
+// table that left the pipeline (#835).
+func (r *CoordinatorReconciler) reconcileWorkers(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) error {
+	if err := r.ensureScaledObjects(ctx, cr); err != nil {
+		return err
+	}
+	return r.pruneWorkerWorkloads(ctx, cr)
+}
+
 // pruneWorkerWorkloads deletes the worker StatefulSets and Services of the
 // tables that left the pipeline. The coordinator creates one StatefulSet per
 // table and only ever creates or updates them, and its Role cannot list or
