@@ -349,7 +349,7 @@ func (c *Coordinator) deliverBatch(ctx context.Context, w *workerState, meta *pb
 	}
 	var idx *inflight.PositionIndex
 	if !snapshotRows {
-		if idx = c.indexOf(w.name); idx != nil {
+		if idx = c.index.Of(w.name); idx != nil {
 			idx.Add(inflight.Batch{ID: meta.BatchId, Table: meta.Table, High: high, Bytes: n, Oversized: c.budget.IsOversized(n),
 				Marker: meta.Window != nil && meta.Window.Closes, Partial: meta.Partial})
 		}

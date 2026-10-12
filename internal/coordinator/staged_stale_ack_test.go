@@ -23,7 +23,7 @@ func TestStagedAckFromASupersededGenerationKeepsTheBatchInFlight(t *testing.T) {
 	if err := c.enqueueBatch(context.Background(), b, meta); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	if n := c.index["w0"].InFlight(); n != 1 {
+	if n := c.index.Of("w0").InFlight(); n != 1 {
 		t.Fatalf("setup: w0 has %d batches in flight, want 1", n)
 	}
 
@@ -35,7 +35,7 @@ func TestStagedAckFromASupersededGenerationKeepsTheBatchInFlight(t *testing.T) {
 	c.onStagedBatch("w0", &pb.StagedBatch{Table: "raw.orders", Seq: meta.BatchId, Epoch: old, Descriptor_: []byte{1}, Position: "0/40"})
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Epoch: old, Position: "0/40", Rows: 1})
 
-	if n := c.index["w0"].InFlight(); n != 1 {
+	if n := c.index.Of("w0").InFlight(); n != 1 {
 		t.Fatalf("after a stale-generation ack w0 has %d batches in flight, want 1: the batch was cleared although its staged delivery was dropped, so nothing will redeliver it", n)
 	}
 	if open := c.staged.OpenFor(core.TableRef{Target: "raw.orders"}); open != 1 {
@@ -49,7 +49,7 @@ func TestStagedAckFromASupersededGenerationKeepsTheBatchInFlight(t *testing.T) {
 	if open := c.staged.OpenFor(core.TableRef{Target: "raw.orders"}); open != 0 {
 		t.Fatalf("%d open cycles after both owners delivered, want 0", open)
 	}
-	if n := c.index["w0"].InFlight(); n != 0 {
+	if n := c.index.Of("w0").InFlight(); n != 0 {
 		t.Fatalf("w0 has %d batches in flight after the current generation's ack, want 0", n)
 	}
 }
@@ -63,7 +63,7 @@ func TestDirectAckFromASupersededGenerationStillClearsTheBatch(t *testing.T) {
 	if err := c.enqueueBatch(context.Background(), b, &pb.BatchMeta{Table: "raw.orders"}); err != nil {
 		t.Fatalf("enqueueBatch: %v", err)
 	}
-	if n := c.index["w0"].InFlight(); n != 1 {
+	if n := c.index.Of("w0").InFlight(); n != 1 {
 		t.Fatalf("setup: w0 has %d batches in flight, want 1", n)
 	}
 	c.mu.Lock()
@@ -72,7 +72,7 @@ func TestDirectAckFromASupersededGenerationStillClearsTheBatch(t *testing.T) {
 	c.mu.Unlock()
 
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Epoch: old, Position: "0/30", Rows: 1})
-	if n := c.index["w0"].InFlight(); n != 0 {
+	if n := c.index.Of("w0").InFlight(); n != 0 {
 		t.Fatalf("w0 has %d batches in flight after its commit's ack, want 0", n)
 	}
 }

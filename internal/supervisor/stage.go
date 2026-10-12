@@ -1,6 +1,9 @@
 // Package supervisor manages external plugin subprocesses with restart
 // backoff, circuit breaker protection, and graceful shutdown. It owns the
 // full lifecycle: spawn → connect → run → restart → shutdown.
+//
+// It also holds the evidence the coordinator's worker supervision reads
+// before it resets a worker: Progress, the worker's network output.
 package supervisor
 
 import (

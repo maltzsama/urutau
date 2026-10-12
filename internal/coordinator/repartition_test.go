@@ -102,7 +102,7 @@ func TestScaleOutRegistersOwnerAndSwapsRouting(t *testing.T) {
 		if _, ok := c.byTicket[string(w.ticket)]; !ok {
 			t.Fatalf("owner %q has no ticket: DoGet could not find its queue", w.name)
 		}
-		if c.index[w.name] == nil {
+		if c.index.Of(w.name) == nil {
 			t.Fatalf("owner %q has no position index", w.name)
 		}
 	}
@@ -157,7 +157,7 @@ func TestScaleInDropsOwnerAndShrinksRanges(t *testing.T) {
 	}
 	// Its position index stays: the ack path dereferences c.index without
 	// c.mu, so deleting it under an in-flight batch would panic.
-	if c.index[dropped.name] == nil {
+	if c.index.Of(dropped.name) == nil {
 		t.Fatalf("retired owner %q lost its position index: the ack path would nil-panic", dropped.name)
 	}
 	stillConfirmed := c.confirmed.Has(dropped.name)
@@ -252,8 +252,8 @@ func TestScaleWaitsForInFlightBatches(t *testing.T) {
 	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 
 	// One batch delivered and unacked on the current owner.
-	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
-	if c.inFlight(owners[0].name) == 0 {
+	c.index.Of(owners[0].name).Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
+	if c.index.InFlight(owners[0].name) == 0 {
 		t.Fatal("precondition: the owner must have an in-flight batch")
 	}
 
@@ -384,7 +384,7 @@ func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 	c.cfg.ScaleDrainTimeout = 200 * time.Millisecond
 	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	// One in-flight batch the drain can never clear.
-	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
+	c.index.Of(owners[0].name).Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 
 	if err := c.ScaleTable(context.Background(), "raw.orders", 2); err == nil {
 		t.Fatal("the scale must fail when the drain never converges")
@@ -393,7 +393,7 @@ func TestScaleRollsBackCreatedOwnersOnFailedPrepare(t *testing.T) {
 	name := route.PartitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)
 	c.mu.Lock()
 	_, inWorkers := c.workers[name]
-	_, inIndex := c.index[name]
+	inIndex := c.index.Of(name) != nil
 	c.mu.Unlock()
 	inConfirmed := c.confirmed.Has(name)
 	if inWorkers || inIndex || inConfirmed {
@@ -414,7 +414,7 @@ func TestRetireOwnerDetachesWhenContextCancelled(t *testing.T) {
 	w, _ := c.loadRouting().OwnersOf("raw.orders")
 	owner := w[0]
 	// A batch that will never drain, so the loop would spin.
-	c.index[owner.name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
+	c.index.Of(owner.name).Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -440,7 +440,7 @@ func TestRetireOwnerForgetsSupervisorState(t *testing.T) {
 
 	c.supervisor.noteAck(owner.name, time.Now())
 	c.supervisor.pendingSet(owner.name)
-	c.supervisor.noteProgress(owner.name, 1<<20, time.Now())
+	c.supervisor.progress.Note(owner.name, 1<<20, time.Now())
 	c.supervisor.recordReset(owner.name, time.Now(), time.Minute)
 
 	c.retireOwner(context.Background(), owner)
@@ -449,7 +449,7 @@ func TestRetireOwnerForgetsSupervisorState(t *testing.T) {
 	_, ack := c.supervisor.lastAck[owner.name]
 	_, pending := c.supervisor.pending[owner.name]
 	_, resets := c.supervisor.resets[owner.name]
-	_, progress := c.supervisor.progress[owner.name]
+	progress := c.supervisor.progress.Tracks(owner.name)
 	_, delivered := c.supervisor.lastDelivered[owner.name]
 	_, health := c.supervisor.health[owner.name]
 	c.supervisor.mu.Unlock()
@@ -536,7 +536,7 @@ func TestScaleRollbackEndsTheSessionOfAnOwnerItForgets(t *testing.T) {
 	c.cfg.ScaleDrainTimeout = 300 * time.Millisecond
 	owners, _ := c.loadRouting().OwnersOf("raw.orders")
 	// One in-flight batch the drain can never clear.
-	c.index[owners[0].name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
+	c.index.Of(owners[0].name).Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 
 	// The new owner's Pod attaches while the scale drains.
 	name := route.PartitionName(c.cfg.Spec.Pipeline, "raw.orders", 1)

@@ -200,7 +200,7 @@ func (c *Coordinator) tablePending(target string) int {
 	c.mu.Lock()
 	for _, w := range owners {
 		pending += len(w.queue)
-		if idx := c.indexOf(w.name); idx != nil {
+		if idx := c.index.Of(w.name); idx != nil {
 			pending += idx.InFlight()
 		}
 	}
@@ -252,7 +252,7 @@ func (c *Coordinator) onWorkerMetrics(worker string, rep *pb.WorkerMetricsReport
 		return
 	}
 	if c.supervisor != nil {
-		c.supervisor.noteProgress(worker, rep.GetNetTxBytes(), time.Now())
+		c.supervisor.progress.Note(worker, rep.GetNetTxBytes(), time.Now())
 	}
 	c.statsMu.Lock()
 	if c.tableStats == nil {

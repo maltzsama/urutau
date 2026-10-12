@@ -56,13 +56,13 @@ func coordHarness() (*Coordinator, *workerState) {
 		src:         fakeSource{},
 		workers:     map[string]*workerState{"w0": w},
 		budget:      inflight.NewBudget(1<<20, 1<<10),
-		index:       map[string]*inflight.PositionIndex{"w0": inflight.NewPositionIndex("run-1")},
 		staged:      staged.New(),
 		stagedLocks: map[string]*sync.Mutex{},
 		runID:       "run-1",
 		windowOpen:  make(chan *pb.WindowOpen, 1024),
 	}
 	c.gate = gate.New[*dataplane.Batch](gateMaxEvents, gateMaxBytes, batchBytes, batchSink{c})
+	c.index.Set("w0", inflight.NewPositionIndex("run-1"))
 	c.supervisor = newSupervisor(c)
 	c.publishRouting(newRouting(map[string][]*workerState{"raw.orders": {w}}, map[string][]source.Chunk{}))
 	return c, w
@@ -288,11 +288,11 @@ func TestOnAckTruncatesAndRecords(t *testing.T) {
 	c, _ := coordHarness()
 	c.tableStats = map[string]*tableStats{}
 	c.maintStats = map[string]map[string]*maintStats{}
-	c.index["w0"].Add(inflight.Batch{ID: 1, Table: "raw.orders", High: position.MustLSN("0/10"), Bytes: 64})
+	c.index.Of("w0").Add(inflight.Batch{ID: 1, Table: "raw.orders", High: position.MustLSN("0/10"), Bytes: 64})
 	_ = c.budget.Acquire(context.Background(), "w0", 64)
 
 	c.onAck("w0", &pb.Ack{Table: "raw.orders", Position: "0/10", Rows: 5, Deletes: 1})
-	if got := c.index["w0"].InFlight(); got != 0 {
+	if got := c.index.Of("w0").InFlight(); got != 0 {
 		t.Fatalf("in-flight = %d, want 0", got)
 	}
 	if got := c.budget.InFlight("w0"); got != 0 {
@@ -383,7 +383,7 @@ func TestEnqueueBatchDataAndMarker(t *testing.T) {
 	if len(w.queue) != 1 {
 		t.Fatalf("queue = %d, want 1", len(w.queue))
 	}
-	if got := c.index["w0"].InFlight(); got != 1 {
+	if got := c.index.Of("w0").InFlight(); got != 1 {
 		t.Fatalf("in-flight = %d, want 1", got)
 	}
 

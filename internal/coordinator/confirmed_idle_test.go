@@ -14,7 +14,7 @@ func TestConfirmedPositionIdleWorkerDoesNotPin(t *testing.T) {
 	c, _ := coordHarness()
 	idle := &workerState{name: "w1", attached: true, queue: make(chan queuedBatch, 8)}
 	c.workers["w1"] = idle
-	c.index["w1"] = inflight.NewPositionIndex("run-1")
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
 	c.confirmed.Baseline("w0", position.MustLSN("0/100"))
 	c.confirmed.Baseline("w1", position.MustLSN("0/10"))
 

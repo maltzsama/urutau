@@ -175,7 +175,7 @@ func (c *Coordinator) commitStagedCycleLocked(cy *staged.Cycle) error {
 func (c *Coordinator) releaseCommittedCycles(table string, p position.Position) {
 	owners, _ := c.loadRouting().OwnersOf(table)
 	for _, w := range owners {
-		idx := c.indexOf(w.name)
+		idx := c.index.Of(w.name)
 		if idx == nil {
 			continue
 		}

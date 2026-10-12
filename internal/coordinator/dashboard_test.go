@@ -179,7 +179,7 @@ func TestRestartWorkerRefusesInFlightOnAnAppendTable(t *testing.T) {
 	}
 
 	// In-flight on an upsert table: allowed.
-	c.index[w.name].Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
+	c.index.Of(w.name).Add(inflight.Batch{ID: 1, Table: "raw.orders", Bytes: 10})
 	if err := ds.RestartWorker(w.name); err != nil {
 		t.Fatalf("RestartWorker(in-flight, upsert) = %v, want nil", err)
 	}

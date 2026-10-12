@@ -35,8 +35,8 @@ func recoveryHarness(t *testing.T) (*Coordinator, *supervisor, scriptedTerminati
 	s, _ := supervisorHarness()
 	c := s.c
 	c.sessionErrs = make(chan error, 8)
-	c.index = map[string]*inflight.PositionIndex{"w1": inflight.NewPositionIndex("run-1")}
-	c.index["w1"].Add(inflight.Batch{ID: 1, Table: "t"})
+	c.index.Set("w1", inflight.NewPositionIndex("run-1"))
+	c.index.Of("w1").Add(inflight.Batch{ID: 1, Table: "t"})
 	terms := scriptedTerminations{"w1": {PodUID: "uid-1"}}
 	c.podTermination = terms.of
 	return c, s, terms
@@ -105,8 +105,8 @@ func TestDeliveringWhatItOwedStartsTheCountOver(t *testing.T) {
 			t.Fatalf("spaced crash %d ended the run: %v", i+1, err)
 		}
 		// It delivers what it owed, then runs well for a while.
-		c.index["w1"].Clear()
-		c.index["w1"].Add(inflight.Batch{ID: uint64(100 + i), Table: "t"})
+		c.index.Of("w1").Clear()
+		c.index.Of("w1").Add(inflight.Batch{ID: uint64(100 + i), Table: "t"})
 		s.noteAck("w1", time.Now())
 		if err := s.tick(time.Now().Add(time.Minute), cfg); err != nil {
 			t.Fatalf("tick: %v", err)
@@ -118,7 +118,7 @@ func TestDeliveringWhatItOwedStartsTheCountOver(t *testing.T) {
 // stayed up for an ack timeout: coming back is not enough.
 func TestAnIdleWorkerCrashLoopEndsTheRun(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
-	c.index["w1"].Clear()
+	c.index.Of("w1").Clear()
 	var err error
 	for i := 0; i < defaultMaxConsecutiveCrashes; i++ {
 		terms.crashAgain("w1", coordk8s.Termination{ExitCode: 2, Message: "panic: nil map"})
@@ -149,7 +149,7 @@ func TestAWorkerDeliveringNothingPastTheDeliveryTimeoutEndsTheRun(t *testing.T) 
 // quiet table's Pod stuck Pending hurts nothing until work arrives for it.
 func TestAWorkerOwingNothingIsNeverAbsent(t *testing.T) {
 	c, s, _ := recoveryHarness(t)
-	c.index["w1"].Clear()
+	c.index.Of("w1").Clear()
 	<-c.workers["w1"].queue // the harness seeds one queued batch
 	now := time.Now()
 	s.noteDeliveredAt("w1", now.Add(-time.Hour))

@@ -80,7 +80,7 @@ func TestSnapshotChunksWaitForCommits(t *testing.T) {
 	// The worker commits everything: the rest of the snapshot proceeds.
 	go func() {
 		for {
-			commitEverything(c.index["w0"], "raw.orders", position.MustLSN("0/1"))
+			commitEverything(c.index.Of("w0"), "raw.orders", position.MustLSN("0/1"))
 			select {
 			case <-ctx.Done():
 				return

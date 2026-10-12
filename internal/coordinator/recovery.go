@@ -128,7 +128,7 @@ func (c *Coordinator) onAttach(worker string) error {
 func (c *Coordinator) workerBack(worker string) error {
 	term, ok := c.terminationFor(worker)
 	var mark uint64
-	if idx := c.indexOf(worker); idx != nil {
+	if idx := c.index.Of(worker); idx != nil {
 		mark = idx.MaxHeldID()
 	}
 	n, crashed, desc := c.supervisor.noteBack(worker, term, ok, mark, time.Now())

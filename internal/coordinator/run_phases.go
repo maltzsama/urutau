@@ -213,7 +213,7 @@ func (c *Coordinator) phaseProvisionWorkers(ctx context.Context, workerTarget ma
 			return fmt.Errorf("coordinator: checkpoint: %w", err)
 		}
 		c.cp = cp
-		go cp.Run(ctx, c.runID, c.indexSnapshot, c.log)
+		go cp.Run(ctx, c.runID, c.index.Snapshot, c.log)
 		c.log.Info("coordinator checkpoint", "uri", cfg.URI, "interval", cp.Interval)
 	}
 	return nil
