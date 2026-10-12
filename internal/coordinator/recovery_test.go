@@ -2,11 +2,11 @@ package coordinator
 
 import (
 	"context"
-	"github.com/maltzsama/urutau/internal/coordk8s"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/maltzsama/urutau/internal/coordk8s"
 	"github.com/maltzsama/urutau/internal/inflight"
 )
 
