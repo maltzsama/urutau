@@ -204,6 +204,8 @@ type tableSpec struct {
 	// Cast is the table's cast map (source column → cast target), e.g. the
 	// uint64 cast an unsigned MySQL key needs.
 	Cast map[string]string
+	// PartitionBy is the table's partitionBy expressions, when any.
+	PartitionBy []string
 }
 
 // crOptions are the optional knobs the scenarios toggle.
@@ -303,6 +305,9 @@ func buildCR(name, ns, image, sourceSecret, catalogSecret, serverID string, tabl
 		}
 		if len(tbl.Cast) > 0 {
 			t["cast"] = tbl.Cast
+		}
+		if len(tbl.PartitionBy) > 0 {
+			t["partitionBy"] = tbl.PartitionBy
 		}
 		rendered = append(rendered, t)
 	}

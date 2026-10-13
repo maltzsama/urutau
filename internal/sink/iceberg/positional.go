@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -99,6 +100,7 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	vectors := dv.NewDVWriter(wfs, func(id int32) *iceberg.PartitionSpec { return meta.PartitionSpecByID(int(id)) })
 
 	var out vectorDelta
+	vectored := 0 // data files this commit writes a deletion vector for
 	seen := make(map[string]struct{}, len(tasks))
 	for _, task := range tasks {
 		path := task.File.FilePath()
@@ -132,6 +134,7 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 		if err := vectors.Add(path, hits, specID, partition); err != nil {
 			return vectorDelta{}, fmt.Errorf("iceberg: %v: mark positions in %s: %w", w.ident, path, err)
 		}
+		vectored++
 	}
 
 	locations, err := table.LoadLocationProvider(tbl.Location(), tbl.Properties())
@@ -142,6 +145,10 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	if err != nil {
 		return vectorDelta{}, fmt.Errorf("iceberg: %v: write deletion vectors: %w", w.ident, err)
 	}
+	// What resolving positions cost this commit: the data files the plan
+	// could not rule out were each read for their key columns.
+	slog.Info("iceberg: positions resolved", "table", w.ident, "keys", len(keys),
+		"files_read", len(seen), "files_marked", vectored, "vectors_replaced", len(out.remove))
 	return out, nil
 }
 

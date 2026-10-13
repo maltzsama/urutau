@@ -98,6 +98,12 @@ type benchResults struct {
 	LatencyProbeErrors       int            `json:"latencyProbeErrors"`
 	LatencyProbeLastError    string         `json:"latencyProbeLastError,omitempty"`
 	Resources                resourceReport `json:"resources"`
+	// CommitLatency is the workers' own commit durations (engine "urutau").
+	CommitLatency []commitLatency `json:"workerCommitLatency,omitempty"`
+	// PositionCost is what resolving positions cost each positional commit.
+	PositionCost []positionCost `json:"positionCost,omitempty"`
+	// ReadCheck is each table's scan time before and after compaction.
+	ReadCheck []readCheck `json:"readCheck,omitempty"`
 
 	// Valid is true only when Iceberg ended equal to MySQL and the oracle
 	// agreed with MySQL. The numbers of an invalid run measure a pipeline
@@ -156,6 +162,13 @@ func TestBenchmark(t *testing.T) {
 		if usage != nil {
 			res.Resources = usage.report()
 		}
+		// The log collector has stopped by now: its cleanup runs before this
+		// one.
+		if costs, err := positionCosts(filepath.Join(dir, "logs"), tables); err != nil {
+			t.Logf("position costs: %v", err)
+		} else {
+			res.PositionCost = costs
+		}
 		res.Valid = !t.Failed() && len(res.Problems) == 0
 		path, err := writeBenchResults(res)
 		if err != nil {
@@ -203,9 +216,11 @@ func TestBenchmark(t *testing.T) {
 		}
 		specs := make([]tableSpec, len(tables))
 		for i, tb := range tables {
-			specs[i] = tableSpec{Source: "shop." + tb.Name, Target: "raw." + tb.Target, PrimaryKey: tb.PK, Workers: tb.Workers, Cast: tb.Cast}
+			specs[i] = tableSpec{Source: "shop." + tb.Name, Target: "raw." + tb.Target, PrimaryKey: tb.PK, Workers: tb.Workers, Cast: tb.Cast, PartitionBy: tb.partitionBy}
 		}
-		cr := buildCR(pipeline, testNS, image, "pod-e2e-source", "pod-e2e-catalog", "2330", specs, benchCROptions(profile))
+		opts := benchCROptions(profile)
+		opts.DeleteMode = cfg.DeleteMode
+		cr := buildCR(pipeline, testNS, image, "pod-e2e-source", "pod-e2e-catalog", "2330", specs, opts)
 		manifest := filepath.Join(dir, "engine-manifest.yaml")
 		if err := os.WriteFile(manifest, []byte(cr), 0o644); err != nil {
 			t.Fatalf("write manifest: %v", err)
@@ -289,6 +304,14 @@ func TestBenchmark(t *testing.T) {
 		problem("latency: %d measured transaction(s) never became visible in the sink", n)
 	}
 
+	if cfg.Engine == "urutau" {
+		// Before the pipeline is torn down: the histograms live in its Pods.
+		if cl, err := commitLatencies(podNS, podPrefix); err != nil {
+			problem("worker commit latency: %v", err)
+		} else {
+			res.CommitLatency = cl
+		}
+	}
 	window := w.liveTo.Sub(w.liveFrom).Seconds()
 	for i, g := range w.gens {
 		s := w.stats[i]
@@ -309,6 +332,16 @@ func TestBenchmark(t *testing.T) {
 			th.SinkCommits, th.SinkBytesWritten = bytes.n, bytes.sum
 		}
 		res.Throughput = append(res.Throughput, th)
+	}
+
+	// Last: the compaction it runs adds a snapshot of its own to each table.
+	if cfg.ReadCheck && len(res.Problems) == 0 {
+		res.ReadCheck = checkReads(ctx, trino, tables)
+		for _, rc := range res.ReadCheck {
+			if rc.Error != "" {
+				problem("read check of %s: %s", rc.Table, rc.Error)
+			}
+		}
 	}
 }
 

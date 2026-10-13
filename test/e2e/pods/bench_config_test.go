@@ -64,6 +64,15 @@ type benchTable struct {
 	Mix *benchMix `json:"mix,omitempty"`
 	// Workers is the table's worker count on an engine that partitions it.
 	Workers int `json:"workers,omitempty"`
+	// PartitionBy is the Iceberg table's partition expressions (engine
+	// "urutau"), e.g. ["identity(tenant_id)"] or ["bucket(16, event_id)"].
+	PartitionBy []string `json:"partitionBy,omitempty"`
+	// HotShare is the share of the key space that is hot, and HotWeight the
+	// share of updates and deletes that go to it. For events the hot keys
+	// are whole tenants, so a table partitioned by tenant has hot
+	// partitions. Zero: updates are spread uniformly.
+	HotShare  float64 `json:"hotShare,omitempty"`
+	HotWeight float64 `json:"hotWeight,omitempty"`
 }
 
 // benchConfig is one benchmark run. With its seed it reproduces every random
@@ -84,6 +93,12 @@ type benchConfig struct {
 	PodPrefix string `json:"podPrefix,omitempty"`
 	// PodNamespace is the namespace of those Pods (default: the pipeline's).
 	PodNamespace string `json:"podNamespace,omitempty"`
+	// DeleteMode is the Urutau sink's row-delete mode: "equality" (the
+	// default) or "positional".
+	DeleteMode string `json:"deleteMode,omitempty"`
+	// ReadCheck times a full scan of each sink table once the run has
+	// settled, compacts the table (Trino's optimize), and times it again.
+	ReadCheck bool `json:"readCheck,omitempty"`
 
 	InitialRows int           `json:"initialRows"`
 	Duration    benchDuration `json:"duration"`
@@ -147,6 +162,14 @@ func (c *benchConfig) validate() error {
 	default:
 		bad(`engine %q: want "urutau" or "external"`, c.Engine)
 	}
+	switch c.DeleteMode {
+	case "", "equality", "positional":
+	default:
+		bad(`deleteMode %q: want "equality" or "positional"`, c.DeleteMode)
+	}
+	if c.DeleteMode != "" && c.Engine != "urutau" {
+		bad("deleteMode is the Urutau sink's; it means nothing to an external engine")
+	}
 	if c.InitialRows <= 0 {
 		bad("initialRows must be positive")
 	}
@@ -176,6 +199,15 @@ func (c *benchConfig) validate() error {
 		if t.MeanRate < 0 || t.MaxTxnRows < 0 || t.MaxPayloadBytes < 0 || t.Workers < 0 {
 			bad("table %s: negative value", t.Kind)
 		}
+		if t.HotShare < 0 || t.HotShare > 1 || t.HotWeight < 0 || t.HotWeight > 1 {
+			bad("table %s: hotShare and hotWeight are shares, between 0 and 1", t.Kind)
+		}
+		if (t.HotShare > 0) != (t.HotWeight > 0) {
+			bad("table %s: hotShare and hotWeight go together", t.Kind)
+		}
+		if len(t.PartitionBy) > 0 && c.Engine != "urutau" {
+			bad("table %s: partitionBy is the Urutau pipeline's; an external engine lays its own tables out", t.Kind)
+		}
 		if m := t.Mix; m != nil && (m.Insert < 0 || m.Update < 0 || m.Delete < 0 || m.Insert+m.Update+m.Delete == 0) {
 			bad("table %s: mix weights must be non-negative and not all zero", t.Kind)
 		}
@@ -204,7 +236,8 @@ func (c *benchConfig) shape(all []*prTable) []*prTable {
 			if string(t.Kind) != bt.Kind {
 				continue
 			}
-			tune := &tableTune{MeanRate: bt.MeanRate, MaxTxnRows: bt.MaxTxnRows}
+			tune := &tableTune{MeanRate: bt.MeanRate, MaxTxnRows: bt.MaxTxnRows, HotShare: bt.HotShare, HotWeight: bt.HotWeight}
+			t.partitionBy = bt.PartitionBy
 			if bt.Mix != nil {
 				tune.Mix = [3]float64{bt.Mix.Insert, bt.Mix.Update, bt.Mix.Delete}
 			}

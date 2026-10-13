@@ -1,0 +1,28 @@
+{
+  "name": "dm-pos-tenant-hot",
+  "engine": "urutau",
+  "deleteMode": "positional",
+  "readCheck": true,
+  "initialRows": 200000,
+  "duration": "8m",
+  "settle": "15m",
+  "warmup": "2m",
+  "meanRate": 300,
+  "maxTxnRows": 200,
+  "maxPayloadBytes": 1024,
+  "tables": [
+    {
+      "kind": "events",
+      "mix": {
+        "insert": 0.15,
+        "update": 0.75,
+        "delete": 0.1
+      },
+      "partitionBy": [
+        "identity(tenant_id)"
+      ],
+      "hotShare": 0.0625,
+      "hotWeight": 0.9
+    }
+  ]
+}

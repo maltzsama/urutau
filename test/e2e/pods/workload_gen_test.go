@@ -148,6 +148,9 @@ type prTable struct {
 	// tune, when set, gives this table its own load instead of the
 	// profile's (the benchmark harness, #375).
 	tune *tableTune
+	// partitionBy is the Iceberg table's partition expressions, when the
+	// benchmark sets any.
+	partitionBy []string
 }
 
 // tableTune is one table's own workload distribution. A zero field keeps
@@ -156,6 +159,29 @@ type tableTune struct {
 	MeanRate   float64    // long-run mean mutations/s
 	MaxTxnRows int        // largest transaction, in row mutations
 	Mix        [3]float64 // insert/update/delete weights the regimes vary around
+	// HotShare is the share of the key space that is hot, and HotWeight the
+	// share of updates and deletes that go to a hot key. Zero: every live
+	// key is as likely as another.
+	HotShare, HotWeight float64
+}
+
+// hot reports whether a key belongs to the table's hot share. It depends on
+// the key alone, so a key is hot for its whole life: events by tenant (the
+// lowest tenants, so a table partitioned by tenant has hot partitions), the
+// other tables by a spread of the key.
+func (t *prTable) hot(key []any) bool {
+	if t.tune == nil || t.tune.HotShare <= 0 {
+		return false
+	}
+	switch t.Kind {
+	case eventsKind:
+		return float64(key[0].(int64)) <= math.Max(1, math.Round(64*t.tune.HotShare))
+	case accountsKind:
+		return float64(key[0].(uint64)%1000) < 1000*t.tune.HotShare
+	default:
+		k := key[0].(string)
+		return float64(k[len(k)-1]%36) < 36*t.tune.HotShare
+	}
 }
 
 // meanRate, maxTxnRows and baseMix are the table's load: its own when tuned,
@@ -344,6 +370,26 @@ func (s *keySet) remove(id string) {
 func (s *keySet) pick(r *rand.Rand) (string, []any) {
 	id := s.ids[r.IntN(len(s.ids))]
 	return id, s.keys[id]
+}
+
+// hotPickTries bounds the draws pickFor makes looking for a hot key: with a
+// hot share of 5% it finds one 96 times in 100.
+const hotPickTries = 64
+
+// pickFor picks a live key for an update or a delete of t: a hot one with
+// the table's hot weight, any one otherwise.
+func (s *keySet) pickFor(r *rand.Rand, t *prTable) (string, []any) {
+	id, key := s.pick(r)
+	if t.tune == nil || t.tune.HotShare <= 0 || r.Float64() >= t.tune.HotWeight {
+		return id, key
+	}
+	for range hotPickTries {
+		if t.hot(key) {
+			break
+		}
+		id, key = s.pick(r)
+	}
+	return id, key
 }
 
 // keyID joins a key's canonical texts, the oracle's map key. Key texts are
@@ -629,10 +675,10 @@ func (g *tableGen) buildTxn(n int, onlyInserts bool) (muts []mutation, undo func
 			g.live.add(id, key)
 			undos = append(undos, func() { g.live.remove(id) })
 		case opUpdate:
-			m.ID, m.Key = g.live.pick(g.r)
+			m.ID, m.Key = g.live.pickFor(g.r, g.t)
 			m.Vals, m.Image, m.Bytes = g.values(g.rev)
 		case opDelete:
-			id, key := g.live.pick(g.r)
+			id, key := g.live.pickFor(g.r, g.t)
 			m.ID, m.Key = id, key
 			g.live.remove(id)
 			undos = append(undos, func() { g.live.add(id, key) })
