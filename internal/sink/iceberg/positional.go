@@ -134,21 +134,35 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	read := time.Now()
 
 	// A data file that already has a deletion vector gets a merged one, so
-	// the old vector is read first. Those reads are round trips too, and are
-	// made side by side like the data files' (#864).
+	// the old vector is read first. One Puffin file holds the vectors of a
+	// whole commit: they are read file by file, each file's footer decoded
+	// once for all the vectors wanted from it, and the files side by side.
+	// Read one vector at a time, the footers alone were most of a commit
+	// (#864).
 	old := make([]*dv.RoaringPositionBitmap, len(files))
-	g, _ = errgroup.WithContext(ctx)
-	g.SetLimit(positionReaders)
+	byPuffin := map[string][]int{} // Puffin path → indexes into files
 	for i, task := range files {
 		if len(found[i]) == 0 || len(task.DeletionVectorFiles) == 0 {
 			continue
 		}
+		path := task.DeletionVectorFiles[0].FilePath()
+		byPuffin[path] = append(byPuffin[path], i)
+	}
+	g, _ = errgroup.WithContext(ctx)
+	g.SetLimit(positionReaders)
+	for path, idx := range byPuffin {
 		g.Go(func() error {
-			marked, err := dv.ReadDV(fs, task.DeletionVectorFiles[0])
-			if err != nil {
-				return fmt.Errorf("iceberg: %v: read the deletion vector of %s: %w", w.ident, task.File.FilePath(), err)
+			wanted := make([]iceberg.DataFile, len(idx))
+			for j, i := range idx {
+				wanted[j] = files[i].DeletionVectorFiles[0]
 			}
-			old[i] = marked
+			marked, err := dv.ReadDVs(fs, wanted)
+			if err != nil {
+				return fmt.Errorf("iceberg: %v: read the deletion vectors in %s: %w", w.ident, path, err)
+			}
+			for j, i := range idx {
+				old[i] = marked[j]
+			}
 			return nil
 		})
 	}
