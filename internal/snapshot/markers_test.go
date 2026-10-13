@@ -1,6 +1,12 @@
 package snapshot
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // Held prunes the markers the worker committed and keeps the rest in order.
 func TestMarkersHeldDropsCommitted(t *testing.T) {
@@ -103,5 +109,40 @@ func TestMarkersRedoFrom(t *testing.T) {
 	// Nothing lost any more: the snapshot goes on where it was.
 	if from, cursor := m.RedoFrom("w0", "raw.a", windows, 0, 3); from != 3 || cursor != nil {
 		t.Fatalf("second redo from chunk %d with cursor %v, want chunk 3 and no cursor", from, cursor)
+	}
+}
+
+// The pacer waits while too many of a worker's chunks are uncommitted, wakes
+// on an ack, and gives up as lost when the worker is.
+func TestMarkersAwaitBelow(t *testing.T) {
+	var m Markers
+	m.Note("w0", Marker{ID: 1, Target: "raw.a"})
+	m.Note("w0", Marker{ID: 2, Target: "raw.a"})
+	var committed atomic.Uint64 // ids up to it are committed
+	holds := func(id uint64) bool { return id > committed.Load() }
+	wake := make(chan struct{}, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- m.AwaitBelow(context.Background(), "w0", 2, holds, wake, nil) }()
+	select {
+	case err := <-done:
+		t.Fatalf("returned %v with two chunks uncommitted", err)
+	case <-time.After(3 * chunkCommitPoll):
+	}
+	committed.Store(1)
+	wake <- struct{}{}
+	if err := <-done; err != nil {
+		t.Fatalf("AwaitBelow = %v, want nil once one chunk committed", err)
+	}
+
+	lost := make(chan struct{})
+	close(lost)
+	if err := m.AwaitBelow(context.Background(), "w0", 1, holds, wake, lost); !errors.Is(err, ErrWorkerLost) {
+		t.Fatalf("AwaitBelow = %v, want ErrWorkerLost", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.AwaitBelow(ctx, "w0", 1, holds, wake, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AwaitBelow = %v, want context.Canceled", err)
 	}
 }
