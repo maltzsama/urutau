@@ -36,7 +36,23 @@ An `upsert` removes a row's old version in one of two ways:
 | `deleteMode` | How the old version is removed | Cost |
 | --- | --- | --- |
 | `equality` (default) | An equality delete on the primary key | Cheap to write. Every reader joins the delete files against the data until a compaction applies them. |
-| `positional` | The row's position is marked in a deletion vector | Readers skip the row by position. At each commit the writer reads the key columns of the data files whose key range can hold one of the batch's keys. |
+| `positional` (experimental) | The row's position is marked in a deletion vector | Readers skip the row by position. At each commit the writer reads the key columns of the data files the scan plan cannot rule out, which today is every data file of the table. |
+
+:::warning Positional mode is experimental
+Use it only on an unpartitioned table, with maintenance compacting it.
+
+A positional commit reads the key columns of every data file of the table,
+one after another: the plan's only filter is the range of the batch's first
+key column, which a batch of updates spans. On an unpartitioned table that
+made a commit 8 times slower than an equality one in the
+[delete-mode benchmark](../architecture/delete-mode-benchmark.md), and the
+pipeline kept up. A partitioned table accumulates a data file per partition
+per commit: with 16 buckets the sink ran minutes behind, and with 64
+partitions it did not keep up at all. Tracked in
+[#864](https://github.com/maltzsama/urutau/issues/864).
+
+`equality` is the default and is not affected.
+:::
 
 ```yaml title="Positional deletes"
 sink:
@@ -58,10 +74,11 @@ Things to know before switching it on:
   write deletion vectors.
 - Key columns must be integers, strings, binary, booleans, dates, timestamps
   or decimals. Another key type fails the commit.
-- The commit cost grows with the number of data files whose key range
-  overlaps the batch. Keys that arrive in order (an auto-increment id, a
-  timestamp-prefixed key) touch few files; keys spread over the whole table
-  touch many.
+- The commit cost grows with the number of data files in the table. Only the
+  first key column narrows it, and only when a batch's keys cover a small part
+  of that column's range (an auto-increment id, a timestamp-prefixed key);
+  updates spread over the table read every file. Keep the file count low with
+  compaction.
 
 ### Table maintenance
 
