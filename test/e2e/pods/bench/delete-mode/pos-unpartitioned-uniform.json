@@ -1,0 +1,23 @@
+{
+  "name": "dm-pos-unpartitioned-uniform",
+  "engine": "urutau",
+  "deleteMode": "positional",
+  "readCheck": true,
+  "initialRows": 200000,
+  "duration": "8m",
+  "settle": "15m",
+  "warmup": "2m",
+  "meanRate": 300,
+  "maxTxnRows": 200,
+  "maxPayloadBytes": 1024,
+  "tables": [
+    {
+      "kind": "events",
+      "mix": {
+        "insert": 0.15,
+        "update": 0.75,
+        "delete": 0.1
+      }
+    }
+  ]
+}

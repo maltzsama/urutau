@@ -6,6 +6,9 @@ package pods
 import (
 	"encoding/base64"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -204,5 +207,93 @@ func TestResourceProbeSumsThePodsUnderTest(t *testing.T) {
 				t.Fatalf("replaced worker network = %d/%d, want what the new sandbox showed, 5/6", pod.NetRxBytes, pod.NetTxBytes)
 			}
 		}
+	}
+}
+
+// With a hot share, most updates and deletes go to hot keys; without one the
+// pick draws nothing extra, so an untuned table's stream is unchanged.
+func TestHotKeysTakeTheirShareOfThePicks(t *testing.T) {
+	p := workloadProfile{InitialRows: 1000, MeanRate: 10, MaxTxnRows: 10, MaxPayload: 64}
+	ev := productionTables("x", p)[2]
+	ev.tune = &tableTune{HotShare: 4.0 / 64, HotWeight: 0.9}
+	s := newKeySet()
+	for tenant := int64(1); tenant <= 64; tenant++ {
+		for e := int64(1); e <= 20; e++ {
+			s.add(keyID([]string{strconv.FormatInt(tenant, 10), strconv.FormatInt(e, 10)}), []any{tenant, e})
+		}
+	}
+	r := rand.New(rand.NewPCG(7, 7))
+	hot := 0
+	for range 10000 {
+		if _, key := s.pickFor(r, ev); ev.hot(key) {
+			hot++
+		}
+	}
+	// 90% aimed at the 4 hot tenants, plus the 6% of the rest that land there.
+	if hot < 8500 || hot > 9500 {
+		t.Fatalf("%d of 10000 picks were hot, want about 9060", hot)
+	}
+
+	plain := productionTables("x", p)[2]
+	a, b := rand.New(rand.NewPCG(7, 7)), rand.New(rand.NewPCG(7, 7))
+	for range 100 {
+		id1, _ := s.pickFor(a, plain)
+		id2, _ := s.pick(b)
+		if id1 != id2 {
+			t.Fatal("an untuned table's pick drew differently: its seeded stream would change")
+		}
+	}
+}
+
+func TestBenchConfigDeleteModeAndLayout(t *testing.T) {
+	c, err := parseBenchConfig([]byte(strings.Replace(benchConfigJSON, `"seed": 42,`,
+		`"seed": 42, "deleteMode": "positional", "readCheck": true,`, 1)))
+	if err != nil || c.DeleteMode != "positional" || !c.ReadCheck {
+		t.Fatalf("config = %+v, %v", c, err)
+	}
+	for _, tc := range []struct{ from, to, want string }{
+		{`"seed": 42,`, `"seed": 42, "deleteMode": "vectors",`, `deleteMode "vectors"`},
+		{`"kind": "accounts", "workers": 3,`, `"kind": "accounts", "hotShare": 0.1,`, `go together`},
+		{`"kind": "accounts", "workers": 3,`, `"kind": "accounts", "hotShare": 2, "hotWeight": 0.5,`, `between 0 and 1`},
+	} {
+		if _, err := parseBenchConfig([]byte(strings.Replace(benchConfigJSON, tc.from, tc.to, 1))); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want one naming %q", tc.to, err, tc.want)
+		}
+	}
+}
+
+func TestFoldCommitMetricsSumsThePods(t *testing.T) {
+	const pod = `# HELP urutau_worker_commit_duration_seconds commit latency per table.
+urutau_worker_commit_duration_seconds_bucket{table="raw.a",le="0.5"} 3
+urutau_worker_commit_duration_seconds_bucket{table="raw.a",le="+Inf"} 4
+urutau_worker_commit_duration_seconds_sum{table="raw.a"} 2
+urutau_worker_commit_duration_seconds_count{table="raw.a"} 4
+urutau_worker_rows_written_total{table="raw.a",op="upsert"} 99
+`
+	into, sums := map[string]*commitLatency{}, map[string]float64{}
+	foldCommitMetrics(pod, into, sums)
+	foldCommitMetrics(pod, into, sums) // a second worker of the same table
+	c := into["raw.a"]
+	if c == nil || c.Commits != 8 || sums["raw.a"] != 4 || c.AtMost["0.5"] != 6 || c.AtMost["+Inf"] != 8 {
+		t.Fatalf("folded = %+v, sums %v", c, sums)
+	}
+}
+
+func TestPositionCostsReadTheWorkersLogs(t *testing.T) {
+	dir := t.TempDir()
+	log := `time=2026-10-13T10:00:00Z level=INFO msg="worker ack" table=raw.pr_events_x rows=3
+time=2026-10-13T10:00:01Z level=INFO msg="iceberg: positions resolved" table="[raw pr_events_x]" keys=10 files_read=4 files_marked=2 vectors_replaced=1
+time=2026-10-13T10:00:02Z level=INFO msg="iceberg: positions resolved" table="[raw pr_events_x]" keys=30 files_read=8 files_marked=3 vectors_replaced=3
+time=2026-10-13T10:00:03Z level=INFO msg="iceberg: positions resolved" table="[raw pr_other_y]" keys=1 files_read=1 files_marked=1 vectors_replaced=0
+`
+	if err := os.WriteFile(filepath.Join(dir, "w-worker-r0.log"), []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := positionCosts(dir, []*prTable{{Target: "pr_events_x"}, {Target: "pr_accounts_x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Commits != 2 || got[0].FilesRead.Max != 8 || got[0].FilesRead.Min != 4 || got[0].Keys.Mean != 20 {
+		t.Fatalf("costs = %+v, want the two commits of pr_events_x", got)
 	}
 }

@@ -52,6 +52,10 @@ silently keeps its default.
 | `warmup` | The start of the live window left out of the latency and rate figures: the snapshot and the first catch-up. |
 | `meanRate`, `maxTxnRows`, `maxPayloadBytes` | The run-wide load: mean mutations/s per table, largest transaction, payload bound. |
 | `tables[]` | The tables of the run, each with its own `meanRate`, `maxTxnRows`, `maxPayloadBytes`, `mix` (`insert`/`update`/`delete` weights) and `workers`. An omitted value is the run-wide one. |
+| `tables[].partitionBy` | The Iceberg table's partition expressions (`urutau` only), e.g. `["identity(tenant_id)"]`. |
+| `tables[].hotShare`, `hotWeight` | The share of the key space that is hot, and the share of updates and deletes that go to it. For `events` the hot keys are whole tenants, so a table partitioned by tenant has hot partitions. |
+| `deleteMode` | The Urutau sink's row-delete mode: `equality` (default) or `positional`. |
+| `readCheck` | Once the run has settled, time a full scan of each sink table, compact it with Trino's `optimize`, and time it again. |
 
 The three table kinds are the production-readiness tables: `accounts`
 (unsigned 64-bit key), `items` (string key) and `events` (composite key, large
@@ -86,6 +90,15 @@ Nothing is asked of the engine under test.
   whose runtime does not (minikube on docker), a helper Pod in the host's PID
   namespace reads them from `/proc`. `networkMeasured` says whether any
   sample carried them.
+- **Worker commits** (`urutau`). The workers' own commit durations, from
+  their `urutau_worker_commit_duration_seconds` histogram, scraped before the
+  pipeline is torn down. A worker replaced during the run took its histogram
+  with it.
+- **Position cost** (`deleteMode: positional`). The data files each
+  positional commit read to resolve its keys, from the line the sink logs per
+  commit.
+- **Read check** (`readCheck`). Data and delete files and the time of a full
+  scan, before and after a compaction.
 - **Recovery.** `settleSeconds`: how long after the live window the sink took
   to equal the source.
 - **Correctness.** The final Iceberg state is compared with MySQL row by row,
