@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -259,6 +260,59 @@ func TestPositionalCommitReadsOnlyFilesThatCanHoldTheKeys(t *testing.T) {
 		t.Errorf("an update of one key read %d data files, want 1", got)
 	}
 	expectValues(t, s, ref, map[int64]string{1: "x", 2: "x", 3: "x", 100: "x", 101: "y", 102: "x", 200: "x", 201: "x", 202: "x"})
+}
+
+// A batch's keys are seldom one run: two keys at the ends of the table span
+// every file between them. The plan must rule out the files that hold neither
+// key, not read everything inside the range they span (#864).
+func TestPositionalCommitSkipsFilesBetweenTheKeys(t *testing.T) {
+	s := hadoopSink(t)
+	ref, w := positionalWriter(t, s)
+	commitInserts(t, w, 1, 3)   // file A: 1..3
+	commitInserts(t, w, 100, 3) // file B: 100..102
+	commitInserts(t, w, 200, 3) // file C: 200..202
+
+	before := w.filesMatched
+	commitRows(t, w, [3]any{int64(2), "y", rowchange.OpUpdate}, [3]any{int64(201), "y", rowchange.OpUpdate})
+	if got := w.filesMatched - before; got != 2 {
+		t.Errorf("an update of a key in the first file and one in the last read %d data files, want 2: the file between them holds neither", got)
+	}
+	expectValues(t, s, ref, map[int64]string{1: "x", 2: "y", 3: "x", 100: "x", 101: "x", 102: "x", 200: "x", 201: "y", 202: "x"})
+}
+
+// A batch with more distinct keys than the plan lists one by one falls back
+// to their range, and still removes every old version: a filter may be too
+// wide, never too narrow.
+func TestPositionalCommitOfManyKeysFallsBackToTheirRange(t *testing.T) {
+	s := hadoopSink(t)
+	ref, w := positionalWriter(t, s)
+	const n = keyInMax + 50
+	commitInserts(t, w, 1, n)      // file A: 1..n
+	commitInserts(t, w, 10_000, 3) // file B, past every key of the batch
+
+	rows := make([][3]any, 0, n)
+	want := map[int64]string{10_000: "x", 10_001: "x", 10_002: "x"}
+	for id := int64(1); id <= n; id++ {
+		rows = append(rows, [3]any{id, "y", rowchange.OpUpdate})
+		want[id] = "y"
+	}
+	before := w.filesMatched
+	commitRows(t, w, rows...)
+	if got := w.filesMatched - before; got != 1 {
+		t.Errorf("an update of keys 1..%d read %d data files, want 1: the last file is past their range", n, got)
+	}
+	expectValues(t, s, ref, want)
+}
+
+func TestDistinctUpTo(t *testing.T) {
+	vals := []int64{7, 7, 3, 7, 9, 3}
+	got, ok := distinctUpTo(len(vals), func(i int) int64 { return vals[i] }, 3)
+	if !ok || !slices.Equal(got, []int64{7, 3, 9}) {
+		t.Fatalf("distinct = %v, %v; want [7 3 9]", got, ok)
+	}
+	if _, ok := distinctUpTo(len(vals), func(i int) int64 { return vals[i] }, 2); ok {
+		t.Fatal("three distinct values fit a limit of two")
+	}
 }
 
 // The same key must encode to the same bytes whether it comes from the batch

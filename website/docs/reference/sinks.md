@@ -36,20 +36,19 @@ An `upsert` removes a row's old version in one of two ways:
 | `deleteMode` | How the old version is removed | Cost |
 | --- | --- | --- |
 | `equality` (default) | An equality delete on the primary key | Cheap to write. Every reader joins the delete files against the data until a compaction applies them. |
-| `positional` (experimental) | The row's position is marked in a deletion vector | Readers skip the row by position. At each commit the writer reads the key columns of the data files the scan plan cannot rule out, which today is every data file of the table. |
+| `positional` (experimental) | The row's position is marked in a deletion vector | Readers skip the row by position. At each commit the writer reads the key columns of the data files the scan plan cannot rule out: all of them, for a batch of keys spread over the table. |
 
 :::warning Positional mode is experimental
-Use it only on an unpartitioned table, with maintenance compacting it.
+The cost of a positional commit grows with the number of data files in the
+table: it reads the key columns of every file the scan plan cannot rule out,
+and a batch of keys spread over the table rules out none. Run it with
+maintenance compacting the table.
 
-A positional commit reads the key columns of every data file of the table,
-one after another: the plan's only filter is the range of the batch's first
-key column, which a batch of updates spans. On an unpartitioned table that
-made a commit 8 times slower than an equality one in the
-[delete-mode benchmark](../architecture/delete-mode-benchmark.md), and the
-pipeline kept up. A partitioned table accumulates a data file per partition
-per commit: with 16 buckets the sink ran minutes behind, and with 64
-partitions it did not keep up at all. Tracked in
-[#864](https://github.com/maltzsama/urutau/issues/864).
+In the [delete-mode benchmark](../architecture/delete-mode-benchmark.md), on
+an unpartitioned table the mode kept the end-to-end latency of equality
+deletes at 3.6 times the commit cost. On a table with 16 or 64 partitions,
+which accumulates a data file per partition per commit, a commit took 4 to
+7 s against 1 to 3 s and the sink ran about a minute behind.
 
 `equality` is the default and is not affected.
 :::
@@ -74,11 +73,12 @@ Things to know before switching it on:
   write deletion vectors.
 - Key columns must be integers, strings, binary, booleans, dates, timestamps
   or decimals. Another key type fails the commit.
-- The commit cost grows with the number of data files in the table. Only the
-  first key column narrows it, and only when a batch's keys cover a small part
-  of that column's range (an auto-increment id, a timestamp-prefixed key);
-  updates spread over the table read every file. Keep the file count low with
-  compaction.
+- The commit cost grows with the number of data files the plan cannot rule
+  out. A batch with few distinct values in a key column (up to 200) is
+  planned value by value, so it reads only the partitions and the files that
+  can hold them; a larger batch is planned by each key column's range. Keys
+  that arrive in order touch few files; keys spread over the whole table
+  touch all of them. Keep the file count low with compaction.
 
 ### Table maintenance
 
