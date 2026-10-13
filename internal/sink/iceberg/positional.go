@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -85,10 +86,12 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	}
 	// The plan keeps only the data files whose statistics admit a key of the
 	// batch; the rest are never opened.
+	started := time.Now()
 	tasks, err := tbl.Scan(table.WithRowFilter(within)).PlanFiles(ctx)
 	if err != nil {
 		return vectorDelta{}, fmt.Errorf("iceberg: %v: plan files: %w", w.ident, err)
 	}
+	planned := time.Now()
 	fs, err := tbl.FS(ctx)
 	if err != nil {
 		return vectorDelta{}, fmt.Errorf("iceberg: %v: file io: %w", w.ident, err)
@@ -128,6 +131,7 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	if err := g.Wait(); err != nil {
 		return vectorDelta{}, err
 	}
+	read := time.Now()
 
 	var out vectorDelta
 	vectored := 0 // data files this commit writes a deletion vector for
@@ -166,8 +170,12 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	}
 	// What resolving positions cost this commit: the data files the plan
 	// could not rule out were each read for their key columns.
+	// and where the time went: planning the scan, reading the files, and
+	// merging and writing the vectors.
 	slog.Info("iceberg: positions resolved", "table", w.ident, "keys", len(keys),
-		"files_read", len(seen), "files_marked", vectored, "vectors_replaced", len(out.remove))
+		"files_read", len(seen), "files_marked", vectored, "vectors_replaced", len(out.remove),
+		"plan_ms", planned.Sub(started).Milliseconds(), "read_ms", read.Sub(planned).Milliseconds(),
+		"vectors_ms", time.Since(read).Milliseconds())
 	return out, nil
 }
 
