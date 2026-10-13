@@ -7,6 +7,8 @@ import (
 	"sort"
 	"time"
 
+	sup "github.com/maltzsama/urutau/internal/supervisor"
+
 	"github.com/maltzsama/urutau/internal/dashboard"
 	"github.com/maltzsama/urutau/internal/version"
 	"github.com/maltzsama/urutau/spec"
@@ -62,7 +64,7 @@ func (c *Coordinator) pumpHeldLimit() time.Duration {
 	}
 	delivery := c.cfg.WorkerDeliveryTimeout
 	if delivery <= 0 {
-		delivery = defaultWorkerDeliveryTimeout
+		delivery = sup.DefaultDeliveryTimeout
 	}
 	return max(limit, delivery) + pumpHealthWindow
 }

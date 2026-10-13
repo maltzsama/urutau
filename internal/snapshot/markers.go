@@ -152,3 +152,21 @@ func (m *Markers) TakeLost(worker, target string) []Marker {
 	}
 	return out
 }
+
+// RedoFrom is where a partition's snapshot resumes after its worker was lost
+// at chunk next: the first chunk of this partition whose Closes marker the
+// worker had not committed, whose rows died with its window. windows maps a
+// window to its chunk's index. It also returns that chunk's resume cursor —
+// the high key of the last window whose Closes marker the worker DID commit —
+// so the redo resumes the chunk from there instead of re-emitting committed
+// windows (issue #646). A chunk with no committed window returns nil, and is
+// re-read from its start.
+func (m *Markers) RedoFrom(worker, target string, windows map[uint64]int, partition, next int) (int, []any) {
+	from := next
+	for _, mk := range m.TakeLost(worker, target) {
+		if i, ok := windows[mk.Window]; ok && i < from {
+			from = i
+		}
+	}
+	return from, m.TakeCursor(target, ChunkRef(partition, from))
+}
