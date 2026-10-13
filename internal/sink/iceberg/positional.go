@@ -214,7 +214,7 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 
 // positionReaders is how many data files a commit reads at once to resolve
 // positions. Each reader holds one file's key columns, a batch at a time.
-const positionReaders = 8
+const positionReaders = 16
 
 // unmarked returns the positions not yet set in marked.
 func unmarked(positions []int64, marked *dv.RoaringPositionBitmap) []int64 {
