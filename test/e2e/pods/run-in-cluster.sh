@@ -40,6 +40,12 @@ for v in URUTAU_E2E_PROFILE URUTAU_E2E_SEED URUTAU_E2E_TABLES URUTAU_E2E_PODS_IM
     envs+="            - {name: $v, value: \"${!v}\"}"$'\n'
   fi
 done
+# The benchmark's configuration (BENCH_CONFIG=<file>, test/e2e/pods/bench) is
+# a JSON document: it travels as base64, which needs no quoting in YAML.
+if [ -n "${BENCH_CONFIG:-}" ]; then
+  envs+="            - {name: URUTAU_BENCH_CONFIG, value: \"$(base64 -w0 < "$BENCH_CONFIG")\"}"$'\n'
+  envs+="            - {name: URUTAU_BENCH_REVISION, value: \"$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)\"}"$'\n'
+fi
 
 # The container runs the tests, records the exit code, then waits for this
 # script to copy the artifacts out (the files die with the Pod).

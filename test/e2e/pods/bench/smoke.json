@@ -1,0 +1,18 @@
+{
+  "name": "smoke",
+  "engine": "urutau",
+  "initialRows": 20000,
+  "duration": "4m",
+  "settle": "10m",
+  "warmup": "1m",
+  "meanRate": 100,
+  "maxTxnRows": 200,
+  "maxPayloadBytes": 16384,
+  "tables": [
+    {"kind": "accounts", "workers": 2},
+    {"kind": "items", "workers": 2, "meanRate": 300, "maxTxnRows": 500,
+     "mix": {"insert": 0.2, "update": 0.7, "delete": 0.1}},
+    {"kind": "events", "meanRate": 50, "maxPayloadBytes": 65536,
+     "mix": {"insert": 0.8, "update": 0.15, "delete": 0.05}}
+  ]
+}

@@ -145,6 +145,40 @@ type prTable struct {
 	valueCols []string
 	// maxPayload bounds the table's payload column, bytes.
 	maxPayload int
+	// tune, when set, gives this table its own load instead of the
+	// profile's (the benchmark harness, #375).
+	tune *tableTune
+}
+
+// tableTune is one table's own workload distribution. A zero field keeps
+// the profile's value.
+type tableTune struct {
+	MeanRate   float64    // long-run mean mutations/s
+	MaxTxnRows int        // largest transaction, in row mutations
+	Mix        [3]float64 // insert/update/delete weights the regimes vary around
+}
+
+// meanRate, maxTxnRows and baseMix are the table's load: its own when tuned,
+// the profile's otherwise.
+func (t *prTable) meanRate(p workloadProfile) float64 {
+	if t.tune != nil && t.tune.MeanRate > 0 {
+		return t.tune.MeanRate
+	}
+	return p.MeanRate
+}
+
+func (t *prTable) maxTxnRows(p workloadProfile) int {
+	if t.tune != nil && t.tune.MaxTxnRows > 0 {
+		return t.tune.MaxTxnRows
+	}
+	return p.MaxTxnRows
+}
+
+func (t *prTable) baseMix() [3]float64 {
+	if t.tune != nil && t.tune.Mix[0]+t.tune.Mix[1]+t.tune.Mix[2] > 0 {
+		return t.tune.Mix
+	}
+	return [3]float64{0.45, 0.35, 0.20}
 }
 
 // productionTables returns the three tables for one run. suffix keeps the
@@ -354,20 +388,20 @@ func clamp(v, lo, hi float64) float64 { return math.Max(lo, math.Min(hi, v)) }
 // more than the pipeline drains while the episode lasts.
 func newRegime(r *rand.Rand, p workloadProfile, t *prTable, now time.Time, backlog bool) regime {
 	g := regime{
-		Rate:       p.MeanRate * clamp(math.Exp(r.NormFloat64()*0.8), 0.05, 8),
-		TxnMean:    logUniform(r, 1, math.Max(2, float64(p.MaxTxnRows)/4)),
+		Rate:       t.meanRate(p) * clamp(math.Exp(r.NormFloat64()*0.8), 0.05, 8),
+		TxnMean:    logUniform(r, 1, math.Max(2, float64(t.maxTxnRows(p))/4)),
 		PayloadMax: int(float64(t.maxPayload) * logUniform(r, 0.02, 1)),
 		BurstProb:  r.Float64() * 0.3,
 		Backlog:    backlog,
 	}
-	base := [3]float64{0.45, 0.35, 0.20}
+	base := t.baseMix()
 	for i := range g.Mix {
 		g.Mix[i] = base[i] * math.Exp(r.NormFloat64()*0.6)
 	}
 	dur := 3*time.Second + time.Duration(r.ExpFloat64()*float64(8*time.Second))
 	if backlog {
-		g.Rate = p.MeanRate * 8
-		g.TxnMean = math.Min(float64(p.MaxTxnRows), g.TxnMean*4)
+		g.Rate = t.meanRate(p) * 8
+		g.TxnMean = math.Min(float64(t.maxTxnRows(p)), g.TxnMean*4)
 		g.PayloadMax = t.maxPayload
 		g.BurstProb = 0.5
 		dur = 10*time.Second + time.Duration(r.Float64()*float64(30*time.Second))
