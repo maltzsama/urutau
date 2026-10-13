@@ -261,6 +261,24 @@ func TestPositionalCommitReadsOnlyFilesThatCanHoldTheKeys(t *testing.T) {
 	expectValues(t, s, ref, map[int64]string{1: "x", 2: "x", 3: "x", 100: "x", 101: "y", 102: "x", 200: "x", 201: "x", 202: "x"})
 }
 
+// A batch's keys are seldom one run: two keys at the ends of the table span
+// every file between them. The plan must rule out the files that hold neither
+// key, not read everything inside the range they span (#864).
+func TestPositionalCommitSkipsFilesBetweenTheKeys(t *testing.T) {
+	s := hadoopSink(t)
+	ref, w := positionalWriter(t, s)
+	commitInserts(t, w, 1, 3)   // file A: 1..3
+	commitInserts(t, w, 100, 3) // file B: 100..102
+	commitInserts(t, w, 200, 3) // file C: 200..202
+
+	before := w.filesMatched
+	commitRows(t, w, [3]any{int64(2), "y", rowchange.OpUpdate}, [3]any{int64(201), "y", rowchange.OpUpdate})
+	if got := w.filesMatched - before; got != 2 {
+		t.Errorf("an update of a key in the first file and one in the last read %d data files, want 2: the file between them holds neither", got)
+	}
+	expectValues(t, s, ref, map[int64]string{1: "x", 2: "y", 3: "x", 100: "x", 101: "x", 102: "x", 200: "x", 201: "y", 202: "x"})
+}
+
 // The same key must encode to the same bytes whether it comes from the batch
 // or from a data file, whatever integer width or string flavour each side
 // uses, and two different tuples must never collide.
