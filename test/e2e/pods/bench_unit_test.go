@@ -148,7 +148,7 @@ func TestResourceProbeSumsThePodsUnderTest(t *testing.T) {
 					WorkingSetBytes uint64 `json:"workingSetBytes"`
 				} `json:"memory"`
 			} `json:"containers"`
-			Network struct {
+			Network *struct {
 				RxBytes uint64 `json:"rxBytes"`
 				TxBytes uint64 `json:"txBytes"`
 			} `json:"network"`
@@ -164,7 +164,10 @@ func TestResourceProbeSumsThePodsUnderTest(t *testing.T) {
 			} `json:"memory"`
 		}, 1)
 		p.Containers[0].CPU.UsageNanoCores, p.Containers[0].Memory.WorkingSetBytes = cores, mem
-		p.Network.RxBytes, p.Network.TxBytes = rx, tx
+		p.Network = &struct {
+			RxBytes uint64 `json:"rxBytes"`
+			TxBytes uint64 `json:"txBytes"`
+		}{rx, tx}
 	}
 	add("pod-e2e", "bench-x-coordinator-0", 500_000_000, 100, 10, 20)
 	add("pod-e2e", "bench-x-raw-a-0", 1_500_000_000, 300, 30, 40)
@@ -180,10 +183,13 @@ func TestResourceProbeSumsThePodsUnderTest(t *testing.T) {
 	now := time.Now()
 	p.record(u, now)
 	// The worker is replaced under the same name: its counters start over.
-	u["bench-x-raw-a-0"] = podUsage{cpuCores: 1, memBytes: 200, rx: 5, tx: 6}
-	u["bench-x-coordinator-0"] = podUsage{cpuCores: 0.5, memBytes: 100, rx: 25, tx: 50}
+	u["bench-x-raw-a-0"] = podUsage{cpuCores: 1, memBytes: 200, rx: 5, tx: 6, hasNet: true}
+	u["bench-x-coordinator-0"] = podUsage{cpuCores: 0.5, memBytes: 100, rx: 25, tx: 50, hasNet: true}
 	p.record(u, now.Add(10*time.Second))
 	rep := p.report()
+	if !rep.NetworkMeasured {
+		t.Fatal("network counters were sampled but the report says they were not")
+	}
 	if rep.TotalCPUCores.Max != 2 || rep.TotalCPUCores.Min != 1.5 || rep.PodCount.Max != 2 {
 		t.Fatalf("totals = cpu %+v pods %+v", rep.TotalCPUCores, rep.PodCount)
 	}

@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -198,7 +199,9 @@ type kubeletSummary struct {
 				WorkingSetBytes uint64 `json:"workingSetBytes"`
 			} `json:"memory"`
 		} `json:"containers"`
-		Network struct {
+		// Network is absent on a runtime whose kubelet does not report it
+		// per Pod (cri-dockerd).
+		Network *struct {
 			RxBytes uint64 `json:"rxBytes"`
 			TxBytes uint64 `json:"txBytes"`
 		} `json:"network"`
@@ -210,6 +213,7 @@ type podUsage struct {
 	cpuCores float64
 	memBytes float64
 	rx, tx   uint64
+	hasNet   bool // the kubelet reported the Pod's network counters
 }
 
 // usageOf extracts the usage of the Pods of ns whose name starts with prefix.
@@ -219,7 +223,10 @@ func usageOf(s *kubeletSummary, ns, prefix string) map[string]podUsage {
 		if p.PodRef.Namespace != ns || !strings.HasPrefix(p.PodRef.Name, prefix) {
 			continue
 		}
-		u := podUsage{rx: p.Network.RxBytes, tx: p.Network.TxBytes}
+		u := podUsage{}
+		if p.Network != nil {
+			u.rx, u.tx, u.hasNet = p.Network.RxBytes, p.Network.TxBytes, true
+		}
 		for _, c := range p.Containers {
 			u.cpuCores += float64(c.CPU.UsageNanoCores) / 1e9
 			u.memBytes += float64(c.Memory.WorkingSetBytes)
@@ -265,8 +272,13 @@ type resourceProbe struct {
 	interval   time.Duration
 	nodes      []string
 
+	// netHelper, when set, is a Pod in the host's PID namespace that reads
+	// the network counters the kubelet does not report (netFromHost).
+	netHelper string
+
 	mu      sync.Mutex
 	pods    map[string]*podResources
+	netSeen bool // some sample carried network counters
 	total   struct{ cpu, mem, count *dist }
 	errs    int
 	lastErr string
@@ -294,7 +306,10 @@ func (p *resourceProbe) record(sample map[string]podUsage, at time.Time) {
 		}
 		r.cpu.add(u.cpuCores)
 		r.mem.add(u.memBytes)
-		r.addNet(u.rx, u.tx)
+		if u.hasNet {
+			r.addNet(u.rx, u.tx)
+			p.netSeen = true
+		}
 		r.lastSeenAt = at
 		cpu += u.cpuCores
 		mem += u.memBytes
@@ -328,7 +343,109 @@ func (p *resourceProbe) sample() {
 			merged[name] = u
 		}
 	}
+	p.netFromHost(merged)
 	p.record(merged, time.Now())
+}
+
+// netHelperNS and netHelperImage are where the network helper runs and what
+// it runs: the harness's own image, which is on the node already and has a
+// shell.
+const (
+	netHelperNS    = dataNS
+	netHelperImage = "urutau-e2e:dev"
+)
+
+// startNetHelper starts a Pod in the host's PID namespace. From there the
+// network counters of any Pod on the node can be read from /proc, whatever
+// the Pod's image holds and whatever the container runtime reports.
+func (p *resourceProbe) startNetHelper() error {
+	name := "bench-netprobe-" + strconv.FormatInt(time.Now().UnixNano()%2176782336, 36)
+	manifest := fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata: {name: %s, namespace: %s, labels: {app: urutau-bench-netprobe}}
+spec:
+  hostPID: true
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: probe
+      image: %s
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "86400"]
+      securityContext: {privileged: true, runAsUser: 0}
+`, name, netHelperNS, netHelperImage)
+	if _, err := kubectlCmd(manifest, "apply", "-f", "-"); err != nil {
+		return err
+	}
+	if _, err := kubectlCmd("", "-n", netHelperNS, "wait", "--for=condition=Ready", "pod/"+name, "--timeout=90s"); err != nil {
+		_, _ = kubectlCmd("", "-n", netHelperNS, "delete", "pod", name, "--ignore-not-found", "--wait=false")
+		return err
+	}
+	p.netHelper = name
+	return nil
+}
+
+// netScript prints, for each Pod UID it is given, the receive and transmit
+// byte counters of every interface but the loopback, as seen by one process
+// of that Pod. A Pod's cgroup path carries its UID, with dashes or
+// underscores depending on the cgroup driver.
+const netScript = `for uid in "$@"; do
+  u=$(echo "$uid" | tr - _)
+  for f in /proc/[0-9]*/cgroup; do
+    if grep -qe "pod$uid" -e "pod$u" "$f" 2>/dev/null; then
+      awk -v uid="$uid" 'NR>2 && $1!="lo:" {rx+=$2; tx+=$10} END {print uid, rx+0, tx+0}' "${f%%cgroup}net/dev" 2>/dev/null && break
+    fi
+  done
+done`
+
+// netFromHost fills the network counters the kubelet left out, read through
+// the helper.
+func (p *resourceProbe) netFromHost(sample map[string]podUsage) {
+	if p.netHelper == "" {
+		return
+	}
+	var missing []string
+	for name, u := range sample {
+		if !u.hasNet {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	out, err := kubectlCmd("", "-n", p.ns, "get", "pods", "-o", `jsonpath={range .items[*]}{.metadata.name} {.metadata.uid}{"\n"}{end}`)
+	if err != nil {
+		p.fail(err)
+		return
+	}
+	byUID := map[string]string{}
+	args := []string{"-n", netHelperNS, "exec", p.netHelper, "--", "sh", "-c", netScript, "netprobe"}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && strings.HasPrefix(f[0], p.prefix) {
+			byUID[f[1]] = f[0]
+			args = append(args, f[1])
+		}
+	}
+	if len(byUID) == 0 {
+		return
+	}
+	out, err = kubectlCmd("", args...)
+	if err != nil {
+		p.fail(err)
+		return
+	}
+	for _, line := range strings.Split(out, "\n") {
+		var uid string
+		var rx, tx uint64
+		if n, _ := fmt.Sscan(line, &uid, &rx, &tx); n != 3 {
+			continue
+		}
+		if u, ok := sample[byUID[uid]]; ok && !u.hasNet {
+			u.rx, u.tx, u.hasNet = rx, tx, true
+			sample[byUID[uid]] = u
+		}
+	}
 }
 
 func (p *resourceProbe) start(ctx context.Context) error {
@@ -339,6 +456,14 @@ func (p *resourceProbe) start(ctx context.Context) error {
 	p.nodes = strings.Fields(out)
 	if len(p.nodes) == 0 {
 		return fmt.Errorf("no nodes")
+	}
+	// The helper reads one node's /proc: enough for a single-node cluster,
+	// which is where the kubelet's own counters are missing (minikube on
+	// the docker runtime). A multi-node cluster on containerd has them.
+	if len(p.nodes) == 1 {
+		if err := p.startNetHelper(); err != nil {
+			p.fail(fmt.Errorf("network helper: %w", err))
+		}
 	}
 	go func() {
 		defer close(p.done)
@@ -366,6 +491,9 @@ func (p *resourceProbe) stop() {
 		close(p.stopCh)
 	}
 	<-p.done
+	if p.netHelper != "" {
+		_, _ = kubectlCmd("", "-n", netHelperNS, "delete", "pod", p.netHelper, "--ignore-not-found", "--wait=false")
+	}
 }
 
 // podReport is one Pod's resource usage over the run.
@@ -387,8 +515,12 @@ type resourceReport struct {
 	TotalMemBytes distSummary `json:"totalMemoryWorkingSetBytes"`
 	PodCount      distSummary `json:"podCount"`
 	Pods          []podReport `json:"pods"`
-	SampleErrors  int         `json:"sampleErrors"`
-	LastError     string      `json:"lastError,omitempty"`
+	// NetworkMeasured is false when no sample carried network counters: the
+	// byte counts are then zero because nothing was read, not because
+	// nothing was sent.
+	NetworkMeasured bool   `json:"networkMeasured"`
+	SampleErrors    int    `json:"sampleErrors"`
+	LastError       string `json:"lastError,omitempty"`
 }
 
 func (p *resourceProbe) report() resourceReport {
@@ -397,7 +529,7 @@ func (p *resourceProbe) report() resourceReport {
 	rep := resourceReport{
 		Namespace: p.ns, PodPrefix: p.prefix,
 		TotalCPUCores: p.total.cpu.summary(), TotalMemBytes: p.total.mem.summary(), PodCount: p.total.count.summary(),
-		SampleErrors: p.errs, LastError: p.lastErr,
+		NetworkMeasured: p.netSeen, SampleErrors: p.errs, LastError: p.lastErr,
 	}
 	for name, r := range p.pods {
 		rep.Pods = append(rep.Pods, podReport{
