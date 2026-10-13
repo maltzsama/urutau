@@ -47,6 +47,10 @@ type workload struct {
 	// progress sampler, which reads it from another goroutine.
 	produced []atomic.Int64
 
+	// onCommit, when set, is told of every committed live transaction (the
+	// benchmark's latency probe, #375). Called on the table's own stream.
+	onCommit func(table int, muts []mutation, at time.Time)
+
 	// Filled after the run, for the diagnostics file.
 	checks    []tableCheck
 	sinkRows  []*dist
@@ -287,9 +291,10 @@ func (w *workload) runStream(ctx context.Context, i int) {
 				next = now.Add(time.Duration(g.r.ExpFloat64() * float64(p.Duration/4)))
 			}
 		}
-		n := g.regime.txnRows(g.r, p.MaxTxnRows)
+		maxRows := g.t.maxTxnRows(p)
+		n := g.regime.txnRows(g.r, maxRows)
 		if s.Txns == 3 {
-			n = p.MaxTxnRows // one jumbo transaction per stream, whatever the regimes draw
+			n = maxRows // one jumbo transaction per stream, whatever the regimes draw
 		}
 		muts, undo := g.buildTxn(n, false)
 		// What MySQL has executed before this transaction: once it commits,
@@ -301,7 +306,11 @@ func (w *workload) runStream(ctx context.Context, i int) {
 		switch {
 		case err == nil:
 			g.commit(muts)
-			s.recordTxn(g, muts, time.Now())
+			at := time.Now()
+			s.recordTxn(g, muts, at)
+			if w.onCommit != nil {
+				w.onCommit(i, muts, at)
+			}
 			s.GTIDBeforeLast = before
 			w.produced[i].Add(int64(len(muts)))
 		case ambiguous:
