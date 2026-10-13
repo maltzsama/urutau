@@ -309,9 +309,9 @@ type Sink struct {
 	// compaction applies it. "positional" marks the old row's position in a
 	// deletion vector: readers skip it by position, and the writer pays for
 	// it by reading the key columns of the data files the scan plan cannot
-	// rule out at each commit. That is every data file today, so the mode is
-	// experimental and fit for unpartitioned tables only (#864). Tables
-	// written by more than one worker
+	// rule out at each commit. For a batch of keys spread over the table that
+	// is every data file, so the cost grows with the file count and the mode
+	// is experimental (#864, #754). Tables written by more than one worker
 	// keep equality deletes in either mode. Iceberg-only: any other sink type
 	// rejects it in Validate.
 	DeleteMode DeleteMode `json:"deleteMode,omitempty"`

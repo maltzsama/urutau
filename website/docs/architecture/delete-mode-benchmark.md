@@ -91,26 +91,60 @@ scanned.
   of files.
 - After a compaction the modes are indistinguishable.
 
+## After #864
+
+The write-side numbers above were taken at `0223d42`. They showed where a
+positional commit's time went, and three changes followed (#864): the plan
+filter covers every key column and lists up to 200 distinct values one by
+one, so a small batch reads only the partitions and files its keys can be
+in; the candidate data files are read sixteen at a time; and the deletion
+vectors a commit replaces are read one Puffin file at a time instead of one
+vector at a time. That last one was the larger cost: a commit replacing 1,573
+vectors spent 36 s decoding the same few Puffin footers.
+
+The four positional runs again, same configurations, at `ddd3cc4`:
+
+| layout | converged | end-to-end latency p50 / p99 | mean commit (before) | data files read per commit (mean / max) | worker memory, max | scan before compaction |
+|--------|-----------|------------------------------|----------------------|------------------------------------------|--------------------|------------------------|
+| unpartitioned | yes, 30 s after the window | 3.9 s / 10.4 s | 1.42 s (3.11 s) | 122 / 243 | 157 MiB | 0.99 s |
+| bucket | yes, 80 s | 57.9 s / 83.7 s | 4.0 s (17.7 s) | 773 / 1,760 | 252 MiB | 1.29 s |
+| tenant | yes, 172 s | 66.6 s / 141 s | 7.36 s (87 s, growing) | 1,314 / 3,679 | 287 MiB | 2.59 s |
+| tenant, hot | yes, 229 s | 86.8 s / 237 s | 7.22 s (180 s, growing) | 1,355 / 3,972 | 274 MiB | 2.80 s |
+
+Every layout now converges with Iceberg equal to MySQL. Unpartitioned, the
+end-to-end latency matches equality mode (3.9 s against 4.1 s) at 3.6 times
+its commit cost. Partitioned, a positional commit still costs 2.5 to 4 times
+an equality one and the sink runs about a minute behind under this load,
+where equality runs 10 to 20 s behind.
+
+What did not change: a batch of thousands of keys spread over the table
+still has every data file as a candidate. The files read per commit are
+still half the final file count; they are only read faster. The cost of a
+positional commit stays proportional to the number of data files, which is
+what a compaction bounds and what the index of #754 would remove.
+
+With the deletes already applied by position, the scan before a compaction
+takes 1.0 to 2.8 s on tables where equality deletes take 1.4 to 12.2 s.
+
 ## Recommendations
 
 **A persistent key → position index (#754).** The condition for opening it
-is met: resolving positions by scanning at commit time is too expensive for
-a partitioned table, and expensive for an unpartitioned one. But the scan
-measured here is not the best a scan can do: it prunes nothing and reads
-serially. Two cheaper changes come first, and the numbers should be taken
-again after them: prune the plan by the partitions the batch's keys fall in
-(with updates on 4 of 64 tenants, most partitions would not be read), and
-read the candidate files in parallel. Neither helps updates spread uniformly
-over an unpartitioned table, where the cost stays proportional to the number
-of data files: that case needs either the index or a compaction that keeps
-the file count low.
+is met by the first set of numbers, and the scan has since been made as cheap
+as a scan gets (#864): pruned by every key column, read concurrently. What
+remains is structural. A positional commit of a batch spread over the table
+reads the key columns of every data file, so its cost grows with the file
+count: 1.4 s at 240 files, 7 s at 3,700. Maintenance compacting the table
+bounds that; the index removes it. Whether the index is worth building
+depends on how far behind a partitioned table may run: about a minute under
+this load without it.
 
-**`bucket(N, pk)` as a table layout.** Not on these numbers. Without
-partition pruning in the resolver it made positional commits worse (16 times
-the files). With pruning it would confine a key to one bucket's files, but a
-batch of thousands of uniformly spread keys touches every bucket anyway.
+**`bucket(N, pk)` as a table layout.** Not on these numbers. A batch of
+thousands of uniformly spread keys touches every bucket, so bucketing prunes
+nothing and multiplies the data files: the bucketed table committed in 4.0 s
+where the unpartitioned one took 1.4 s.
 
-**Positional deletes as the default (#755).** No. Equality stays the
-default for every layout. Positional mode is usable today only on an
-unpartitioned table, at 8 times the commit cost, for a read that is twice as
-fast until the next compaction and the same after it.
+**Positional deletes as the default (#755).** Not yet. On an unpartitioned
+table the mode now keeps the latency of equality deletes and scans faster
+before a compaction, at 3.6 times the commit cost. On a partitioned table it
+runs a minute behind. Equality stays the default; the positional mode stays
+opt-in and experimental.
