@@ -2,14 +2,13 @@ package coordinator
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"log/slog"
 
 	pb "github.com/maltzsama/urutau/internal/transport/pb/urutau/v1"
 
 	"github.com/maltzsama/urutau/core"
 	"github.com/maltzsama/urutau/internal/snapshot"
-	"github.com/maltzsama/urutau/internal/transport"
 	"github.com/maltzsama/urutau/sink"
 	"github.com/maltzsama/urutau/source"
 )
@@ -108,178 +107,200 @@ func (c *Coordinator) snapshotTable(ctx context.Context, rdr source.SourceReader
 	return nil
 }
 
-// snapshotPartition runs the DBLog snapshot for one partition of one
-// table: only chunks that fall within partitionRange are sent to w, and
-// the window/gate lifecycle (openWindow/flushWindow/closeWindow) is
-// scoped to this partition alone, so a different partition's concurrent
-// snapshot (if any) is never gated or released by this one's chunks.
-// allChunks is computed once by snapshotTable (one Bounds query per table,
-// not per partition — issue #216).
+// snapshotPartition runs the DBLog snapshot for one partition of one table
+// (snapshot.RunRangePartition): only chunks that fall within partitionRange
+// are sent to w, and the window/gate lifecycle is scoped to this partition
+// alone. allChunks is computed once by snapshotTable (one Bounds query per
+// table, not per partition — issue #216).
 func (c *Coordinator) snapshotPartition(ctx context.Context, rdr source.SourceReader, allChunks []source.Chunk, ref source.TableRef, partitionRange source.Chunk, partition int, w *workerState, cfg snapshot.SnapshotConfig) error {
 	chunks, err := snapshot.ClipChunksToRange(allChunks, partitionRange)
 	if err != nil {
 		return err
 	}
-	if len(chunks) == 0 {
-		return nil // this partition's range contains no rows right now
-	}
-	// A worker lost mid-snapshot takes its windows with it (issue #461): the
-	// rows of every chunk whose Closes marker it had not committed lived only
-	// in its memory. Once it is back, the partition redoes from the first
-	// such chunk. Window ids are the worker's own (attempt, seq), announced in
-	// WindowOpen, so a lost window's Closes marker, redelivered to the
-	// reconnected worker, closes nothing it has open.
-	opened := false
-	windows := map[uint64]int{} // window seq → chunk index, this partition
-	var epoch uint64
-	haveEpoch := false
-	todo := c.snapshots.Todo(ref.Target)
-	for i := 0; i < len(chunks); {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if todo != nil && !todo[snapshot.ChunkRef(partition, i)] {
-			i++ // committed before a coordinator restart: resumed past
-			continue
-		}
-		if err := c.awaitReattached(ctx, w); err != nil {
-			return err
-		}
-		lost := c.lostSignal(w)
-		c.mu.Lock()
-		cur := w.epoch
-		c.mu.Unlock()
-		if haveEpoch && cur != epoch {
-			// Lost (and back) since the previous round-trip.
-			i = c.resumeChunkAfterLoss(chunks, w, ref, partition, windows, i)
-			c.log.Warn("coordinator: snapshot worker was lost; redoing its uncommitted chunks",
-				"table", ref.Source, "partition", partition, "worker", w.name, "from_chunk", i)
-		}
-		// The epoch the ChunkRequests are sent under; the worker echoes it
-		// on ChunkReady and WindowOpen so a reply from a superseded
-		// generation is ignored.
-		epoch, haveEpoch = cur, true
-		if !opened {
-			if err := c.openWindowFlushed(ctx, ref.Target, partition); err != nil {
-				return err
-			}
-			opened = true
-		}
-		// The snapshot watchdog: a worker that attaches but stops draining
-		// would otherwise block the chunk round-trip (send, wait, flush)
-		// forever — the supervisor does not run during the snapshot (issue
-		// #206). The deadline must outlast WaitCaughtUp's own window timeout,
-		// or a slow-but-healthy catch-up would look wedged (Config doc).
-		timeout := c.cfg.SnapshotChunkTimeout
-		if timeout <= 0 {
-			timeout = defaultSnapshotChunkTimeout
-		}
-		chunkCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := c.awaitChunkCommits(chunkCtx, w.name, maxUncommittedChunks, lost)
-		if err == nil {
-			err = c.snapshotChunk(chunkCtx, rdr, ref, partition, w, cfg, chunks[i], snapshot.ChunkRef(partition, i), i, epoch, lost, snapshot.PendingAfter(todo, partition, i), windows)
-		}
-		if err == nil && i == len(chunks)-1 {
-			// The partition's last chunk: its windows must all be committed
-			// before the partition is done, or a loss right after would
-			// leave rows only a lost window held.
-			err = c.awaitChunkCommits(chunkCtx, w.name, 1, lost)
-		}
-		cancel()
-		if errors.Is(err, snapshot.ErrWorkerLost) {
-			continue // the next pass finds the new epoch and redoes
-		}
-		if err != nil {
-			// A parent deadline/cancel (the run's own) surfaces here as
-			// DeadlineExceeded too; report it as-is rather than blaming a
-			// wedged worker. Only a chunk deadline with a live parent is the
-			// watchdog firing.
-			if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("coordinator: snapshot %s: chunk %d did not complete within %s (the worker may be wedged): %w",
-					ref.Source, i, timeout, err)
-			}
-			return err
-		}
-		i++
-	}
-	// Seal this partition's gate and release anything collected after its
-	// last chunk. Other partitions' gates (if any) are untouched.
-	return c.closeWindow(ctx, ref.Target, partition)
+	h := rangeHost{c: c, rdr: rdr, ref: ref, partition: partition, w: w, cfg: cfg}
+	return snapshot.RunRangePartition(ctx, h, h.partitionOf(c.snapshots.Todo(ref.Target)), chunks)
 }
 
-// snapshotChunk runs one chunk's round-trip: send the ChunkRequest, wait for
-// the worker's WindowOpen announcements and ChunkReady, proving the reader
-// caught up and releasing each window's gated live rows and Closes marker.
-// ctx carries the watchdog deadline, so a worker that never acks the chunk
-// fails the run instead of wedging it.
+// snapshotChunk runs one chunk's round-trip (snapshot.RangeChunk).
 func (c *Coordinator) snapshotChunk(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, ch source.Chunk, chunkID uint32, index int, epoch uint64, lost <-chan struct{}, pending []uint32, windows map[uint64]int) error {
-	boundsB, err := transport.EncodeBounds(ch.Low, ch.High)
-	if err != nil {
-		return fmt.Errorf("coordinator: chunk %d bounds: %w", chunkID, err)
-	}
-	req := &pb.ChunkRequest{Table: ref.Source, ChunkId: chunkID, Bounds: boundsB}
+	h := rangeHost{c: c, rdr: rdr, ref: ref, partition: partition, w: w, cfg: cfg}
+	return snapshot.RangeChunk(ctx, h, h.partitionOf(nil), ch, chunkID, index, epoch, lost, pending, windows)
+}
 
-	c.mu.Lock()
-	out := w.out
-	c.mu.Unlock()
+// rangeHost is the coordinator as one partition's range snapshot sees it
+// (snapshot.RangeHost): its worker, its gate, and the worker's replies.
+type rangeHost struct {
+	c         *Coordinator
+	rdr       source.SourceReader
+	ref       source.TableRef
+	partition int
+	w         *workerState
+	cfg       snapshot.SnapshotConfig
+}
+
+func (h rangeHost) partitionOf(todo map[uint32]bool) snapshot.RangePartition {
+	return snapshot.RangePartition{
+		Source: h.ref.Source, Partition: h.partition, Worker: h.w.name,
+		ChunkTimeout: h.c.cfg.SnapshotChunkTimeout, Todo: todo,
+	}
+}
+
+func (h rangeHost) AwaitBack(ctx context.Context) error { return h.c.awaitReattached(ctx, h.w) }
+func (h rangeHost) Lost() <-chan struct{}               { return h.c.lostSignal(h.w) }
+
+func (h rangeHost) Epoch() uint64 {
+	h.c.mu.Lock()
+	defer h.c.mu.Unlock()
+	return h.w.epoch
+}
+
+func (h rangeHost) Redo(chunks []source.Chunk, windows map[uint64]int, next int) int {
+	return h.c.resumeChunkAfterLoss(chunks, h.w, h.ref, h.partition, windows, next)
+}
+
+func (h rangeHost) OpenGate(ctx context.Context) error {
+	return h.c.openWindowFlushed(ctx, h.ref.Target, h.partition)
+}
+
+func (h rangeHost) CloseGate(ctx context.Context) error {
+	return h.c.closeWindow(ctx, h.ref.Target, h.partition)
+}
+
+func (h rangeHost) AwaitCommits(ctx context.Context, below int, lost <-chan struct{}) error {
+	return h.c.awaitChunkCommits(ctx, h.w.name, below, lost)
+}
+
+func (h rangeHost) Out() chan<- *pb.CoordinatorMessage {
+	h.c.mu.Lock()
+	defer h.c.mu.Unlock()
+	return h.w.out
+}
+
+func (h rangeHost) WindowOpens() <-chan *pb.WindowOpen  { return h.c.windowOpen }
+func (h rangeHost) ChunkReadies() <-chan *pb.ChunkReady { return h.c.chunkReady }
+
+func (h rangeHost) CloseWindow(ctx context.Context, wo *pb.WindowOpen, lost <-chan struct{}, pending []uint32, chunkID uint32, highKey []any) error {
+	return h.c.closeOneWindow(ctx, h.rdr, h.ref, h.partition, h.w, h.cfg, wo, lost, pending, chunkID, highKey)
+}
+
+func (h rangeHost) Log() *slog.Logger { return h.c.log }
+
+// resumeChunkAfterLoss computes where a partition's snapshot resumes after a
+// mid-snapshot worker loss: the chunk index to redo from, and — for a chunk
+// the earlier generation partially committed — the resume low key (the last
+// committed window's high key, issue #646). It applies the cursor to the
+// chunk's Low bound so the redo does not re-emit committed windows.
+func (c *Coordinator) resumeChunkAfterLoss(chunks []source.Chunk, w *workerState, ref source.TableRef, partition int, windows map[uint64]int, i int) int {
+	i, cursor := c.redoFrom(w, ref.Target, windows, partition, i)
+	c.clearChunkReady(ref.Target, partition)
+	if cursor != nil {
+		chunks[i].Low = cursor
+	}
+	return i
+}
+
+// closeOneWindow proves the reader caught up to one window's position, then
+// releases its gated live rows (InWindow) and its Closes marker. The worker
+// captured pos AFTER the window's read — never before — so the caught-up proof
+// gates any event the window's SELECT could have seen as pre-image (the
+// interleave invariant).
+func (c *Coordinator) closeOneWindow(ctx context.Context, rdr source.SourceReader, ref source.TableRef, partition int, w *workerState, cfg snapshot.SnapshotConfig, wo *pb.WindowOpen, lost <-chan struct{}, pending []uint32, chunkRef uint32, highKey []any) error {
+	pos, err := c.src.ParsePosition(wo.Pos)
+	if err != nil {
+		return fmt.Errorf("coordinator: window %d pos %q: %w", wo.Seq, wo.Pos, err)
+	}
+	// The window's rows are in the worker's window: from here a full gate
+	// drains tagged for it rather than block the pump. Marked ready only
+	// after the catch-up, the gate blocked the pump during it, the reader
+	// stopped and never reached pos (#821, the #435 stall again).
+	c.markWindowReady(ref.Target, partition, wo.Seq)
+	// A worker lost while the reader catches up takes its window with it, and
+	// its full queue blocks the shared pump so the reader never reaches high;
+	// waiting out the window timeout would end the run (issue #526) instead of
+	// redoing the chunk, so the wait aborts on the loss.
+	if err := snapshot.WaitCaughtUpOrLost(ctx, rdr, pos, cfg, wo.Seq, lost); err != nil {
+		return err
+	}
+	// Release the window's gated live events (InWindow-tagged) ahead of the
+	// Closes marker — FIFO keeps them before it.
+	if err := c.flushWindow(ctx, ref.Target, partition, wo.Seq); err != nil {
+		return err
+	}
+	// The marker's position is the window's own captured position, past every
+	// batch the window's read could have seen.
+	if err := c.sendClosesPending(ctx, w, ref.Target, pos, wo.Seq, pending, chunkRef, highKey); err != nil {
+		return err
+	}
+	// A worker lost before the marker was sent does not record this window
+	// among its lost windows: the marker would reach a worker holding no such
+	// window, and the chunk would pass for done. Report the loss so the
+	// partition redoes it.
 	select {
-	case out <- &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Chunk{Chunk: req}}:
 	case <-lost:
 		return snapshot.ErrWorkerLost
-	case <-ctx.Done():
-		return ctx.Err()
+	default:
+		return nil
 	}
+}
 
-	// handleWindowOpen closes one announced window: prove caught up to its
-	// position, release its gated live rows, send its Closes.
-	handleWindowOpen := func(wo *pb.WindowOpen) error {
-		if wo.Table != ref.Source || wo.ChunkId != chunkID || wo.Attempt != epoch {
-			c.log.Warn("coordinator: ignoring stale/unexpected WindowOpen",
-				"table", wo.Table, "chunk", wo.ChunkId, "attempt", wo.Attempt, "want_epoch", epoch)
-			return nil
-		}
-		windows[wo.Seq] = index
-		highKey, err := snapshot.DecodeHighKey(wo.HighKey)
-		if err != nil {
-			return fmt.Errorf("coordinator: window %d high key: %w", wo.Seq, err)
-		}
-		return c.closeOneWindow(ctx, rdr, ref, partition, w, cfg, wo, lost, pending, chunkID, highKey)
+// maxUncommittedChunks bounds a worker's snapshot chunks whose Closes marker
+// is not yet committed (snapshot.MaxUncommittedChunks has the why).
+const maxUncommittedChunks = snapshot.MaxUncommittedChunks
+
+// awaitChunkCommits returns once fewer than below of worker's chunk markers
+// are uncommitted, snapshot.ErrWorkerLost when lost closes first (its windows
+// died), or when ctx ends (the chunk watchdog).
+func (c *Coordinator) awaitChunkCommits(ctx context.Context, worker string, below int, lost <-chan struct{}) error {
+	// The index is looked up on every check, as heldChunkMarkers does.
+	holds := func(id uint64) bool {
+		idx := c.index.Of(worker)
+		return idx != nil && idx.Holds(id)
 	}
+	return c.markers.AwaitBelow(ctx, worker, below, holds, c.ackNotify, lost)
+}
 
-	// The worker streams WindowOpen as it reads the chunk (byte-cap), then
-	// ChunkReady. Close each window as it opens, in order.
-	for {
-		select {
-		case wo := <-c.windowOpen:
-			if err := handleWindowOpen(wo); err != nil {
-				return err
-			}
-		case cr := <-c.chunkReady:
-			if cr.Table == ref.Source && cr.ChunkId == chunkID && cr.Epoch == epoch {
-				c.log.Info("chunk ready", "table", ref.Source, "partition", partition, "chunk", chunkID, "rows", cr.Rows)
-				// WindowOpen and ChunkReady arrive on SEPARATE channels, so
-				// the select above can receive ChunkReady while earlier
-				// WindowOpen messages are still buffered. The worker sends
-				// every WindowOpen before ChunkReady, so drain and close the
-				// buffered ones now — otherwise their gated live rows are
-				// never released and their windows never commit.
-				for {
-					select {
-					case wo := <-c.windowOpen:
-						if err := handleWindowOpen(wo); err != nil {
-							return err
-						}
-					default:
-						return nil
-					}
-				}
-			}
-			c.log.Warn("coordinator: ignoring stale/unexpected ChunkReady",
-				"table", cr.Table, "chunk", cr.ChunkId, "epoch", cr.Epoch, "want_epoch", epoch)
-		case <-lost:
-			return snapshot.ErrWorkerLost
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+// notifyAck wakes awaitChunkCommits waiters without blocking the ack path
+// (issue #587). Buffered 1: coalesced, a burst of acks is one wake.
+func (c *Coordinator) notifyAck() {
+	select {
+	case c.ackNotify <- struct{}{}:
+	default:
+	}
+}
+
+// uncommittedChunks drops worker's committed markers and counts the rest.
+func (c *Coordinator) uncommittedChunks(worker string) int {
+	return len(c.heldChunkMarkers(worker))
+}
+
+// heldChunkMarkers drops worker's committed markers and returns the rest,
+// oldest first.
+func (c *Coordinator) heldChunkMarkers(worker string) []snapshot.Marker {
+	idx := c.index.Of(worker)
+	return c.markers.Held(worker, func(id uint64) bool { return idx != nil && idx.Holds(id) })
+}
+
+// onMarkerAck releases a Closes marker the worker acked by id: the window's
+// rows are committed (#468). It advances no position — the window's rows
+// carry none.
+func (c *Coordinator) onMarkerAck(worker string, id uint64) {
+	idx := c.index.Of(worker)
+	if idx == nil {
+		return
+	}
+	// Record the chunk's resume cursor BEFORE releasing the marker: a
+	// concurrent heldChunkMarkers prunes acked markers, so this must read the
+	// marker while it is still held (issue #646).
+	c.markers.RecordCursor(worker, id)
+	freed, freedOversized, popped := idx.ReleaseMarker(id)
+	c.notifyAck()
+	if freed > 0 {
+		c.budget.Release(worker, freed)
+	}
+	if freedOversized {
+		c.budget.ClearOversized(worker)
+	}
+	if w := c.workerFor(worker); w != nil {
+		w.dropSent(popped)
 	}
 }

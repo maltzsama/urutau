@@ -157,7 +157,7 @@ const workerQueueCap = 64
 
 // defaultSnapshotChunkTimeout is the snapshot watchdog's default when the
 // config is silent (see Config.SnapshotChunkTimeout).
-const defaultSnapshotChunkTimeout = 10 * time.Minute
+const defaultSnapshotChunkTimeout = snapshot.DefaultChunkTimeout
 
 // maxBatchBytes is the largest serialized batch the control plane will queue.
 // The gRPC servers cap messages at 128 MiB; fail loud with headroom instead of
