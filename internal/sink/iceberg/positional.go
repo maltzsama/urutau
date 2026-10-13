@@ -133,6 +133,30 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	}
 	read := time.Now()
 
+	// A data file that already has a deletion vector gets a merged one, so
+	// the old vector is read first. Those reads are round trips too, and are
+	// made side by side like the data files' (#864).
+	old := make([]*dv.RoaringPositionBitmap, len(files))
+	g, _ = errgroup.WithContext(ctx)
+	g.SetLimit(positionReaders)
+	for i, task := range files {
+		if len(found[i]) == 0 || len(task.DeletionVectorFiles) == 0 {
+			continue
+		}
+		g.Go(func() error {
+			marked, err := dv.ReadDV(fs, task.DeletionVectorFiles[0])
+			if err != nil {
+				return fmt.Errorf("iceberg: %v: read the deletion vector of %s: %w", w.ident, task.File.FilePath(), err)
+			}
+			old[i] = marked
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return vectorDelta{}, err
+	}
+	merged := time.Now()
+
 	var out vectorDelta
 	vectored := 0 // data files this commit writes a deletion vector for
 	for i, task := range files {
@@ -141,12 +165,7 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 			continue
 		}
 		specID, partition := int32(task.File.SpecID()), task.File.Partition()
-		if len(task.DeletionVectorFiles) > 0 {
-			old := task.DeletionVectorFiles[0]
-			marked, err := dv.ReadDV(fs, old)
-			if err != nil {
-				return vectorDelta{}, fmt.Errorf("iceberg: %v: read the deletion vector of %s: %w", w.ident, path, err)
-			}
+		if marked := old[i]; marked != nil {
 			hits = unmarked(hits, marked)
 			if len(hits) == 0 {
 				continue // every match is a row an earlier commit already removed
@@ -170,12 +189,12 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	}
 	// What resolving positions cost this commit: the data files the plan
 	// could not rule out were each read for their key columns.
-	// and where the time went: planning the scan, reading the files, and
-	// merging and writing the vectors.
+	// and where the time went: planning the scan, reading the files, reading
+	// the vectors they already had, and writing the new ones.
 	slog.Info("iceberg: positions resolved", "table", w.ident, "keys", len(keys),
 		"files_read", len(seen), "files_marked", vectored, "vectors_replaced", len(out.remove),
 		"plan_ms", planned.Sub(started).Milliseconds(), "read_ms", read.Sub(planned).Milliseconds(),
-		"vectors_ms", time.Since(read).Milliseconds())
+		"old_vectors_ms", merged.Sub(read).Milliseconds(), "write_ms", time.Since(merged).Milliseconds())
 	return out, nil
 }
 
