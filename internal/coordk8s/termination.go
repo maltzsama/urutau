@@ -1,10 +1,14 @@
 package coordk8s
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 // Termination is a worker container's last termination, as its Pod status
@@ -90,4 +94,39 @@ func DescribeTermination(worker string, pod *corev1.Pod) string {
 		return fmt.Sprintf("; pod %s is %s", worker, pod.Status.Phase)
 	}
 	return fmt.Sprintf("; pod %s: %s", worker, strings.Join(parts, "; "))
+}
+
+// podReadTimeout bounds one read of a worker's Pod.
+const podReadTimeout = 5 * time.Second
+
+// ReadTermination reads worker's last container termination from its Pod.
+// It reports false when there is no cluster (cs is nil) or the Pod cannot be
+// read: no loss is then taken for a crash.
+func ReadTermination(cs kubernetes.Interface, ns, worker string) (Termination, bool) {
+	if cs == nil {
+		return Termination{}, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), podReadTimeout)
+	defer cancel()
+	pod, err := cs.CoreV1().Pods(ns).Get(ctx, worker, metav1.GetOptions{})
+	if err != nil {
+		return Termination{}, false
+	}
+	return TerminationOf(pod)
+}
+
+// ReadDescription describes, for an error message, why worker's Pod last
+// stopped or is not running (DescribeTermination). Best effort: empty
+// without a cluster or when the Pod cannot be read.
+func ReadDescription(cs kubernetes.Interface, ns, worker string) string {
+	if cs == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), podReadTimeout)
+	defer cancel()
+	pod, err := cs.CoreV1().Pods(ns).Get(ctx, worker, metav1.GetOptions{})
+	if err != nil {
+		return ""
+	}
+	return DescribeTermination(worker, pod)
 }

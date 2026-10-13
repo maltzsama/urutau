@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	sup "github.com/maltzsama/urutau/internal/supervisor"
 
 	"github.com/maltzsama/urutau/dataplane"
 	"github.com/maltzsama/urutau/internal/eventlog"
-	"github.com/maltzsama/urutau/internal/snapshot"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/maltzsama/urutau/internal/coordk8s"
 )
@@ -44,16 +44,9 @@ type workerReportedError struct{ detail string }
 
 func (e *workerReportedError) Error() string { return "coordinator: worker error: " + e.detail }
 
-// defaultMaxConsecutiveCrashes is how many times in a row one worker may
-// crash without delivering what it owed before the run ends.
-const defaultMaxConsecutiveCrashes = 3
-
-// maxConsecutiveCrashes is the configured limit, or its default.
+// maxConsecutiveCrashes is the configured crash limit, or its default.
 func (c *Coordinator) maxConsecutiveCrashes() int {
-	if c.cfg.MaxConsecutiveCrashes > 0 {
-		return c.cfg.MaxConsecutiveCrashes
-	}
-	return defaultMaxConsecutiveCrashes
+	return sup.MaxCrashes(c.cfg.MaxConsecutiveCrashes)
 }
 
 // loseWorker handles a worker whose session ended. A worker no longer
@@ -131,14 +124,14 @@ func (c *Coordinator) workerBack(worker string) error {
 	if idx := c.index.Of(worker); idx != nil {
 		mark = idx.MaxHeldID()
 	}
-	n, crashed, desc := c.supervisor.Health.Back(worker, term, ok, mark, time.Now())
-	if !crashed {
+	back := c.supervisor.Back(worker, term, ok, mark, time.Now(), c.maxConsecutiveCrashes())
+	if !back.Crashed {
 		return nil
 	}
-	c.log.Warn("coordinator: worker crashed", "worker", worker, "crashes_in_a_row", n, "termination", desc)
-	if n >= c.maxConsecutiveCrashes() {
+	c.log.Warn("coordinator: worker crashed", "worker", worker, "crashes_in_a_row", back.Crashes, "termination", back.Desc)
+	if back.Loop {
 		return fmt.Errorf("coordinator: worker %s crashed %d times in a row without delivering what it owed (committed position %q); pod %s: %s: %w",
-			worker, n, c.confirmedFor(worker), worker, desc, errCrashLoop)
+			worker, back.Crashes, c.confirmedFor(worker), worker, back.Desc, errCrashLoop)
 	}
 	return nil
 }
@@ -154,21 +147,24 @@ func (c *Coordinator) terminationFor(worker string) (coordk8s.Termination, bool)
 // k8sTermination reads worker's Pod status from Kubernetes. Outside it there
 // is no Pod to read, and no loss is taken for a crash.
 func (c *Coordinator) k8sTermination(worker string) (coordk8s.Termination, bool) {
+	cs, ns := c.podClient()
+	return coordk8s.ReadTermination(cs, ns, worker)
+}
+
+// podClient returns the coordinator's Kubernetes client and namespace, or a
+// nil client outside a cluster.
+func (c *Coordinator) podClient() (kubernetes.Interface, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cs, ns, _, err := c.workerClientset(ctx)
-	if err != nil || cs == nil {
-		return coordk8s.Termination{}, false
-	}
-	pod, err := cs.CoreV1().Pods(ns).Get(ctx, worker, metav1.GetOptions{})
 	if err != nil {
-		return coordk8s.Termination{}, false
+		return nil, ""
 	}
-	return coordk8s.TerminationOf(pod)
+	return cs, ns
 }
 
 // errCrashLoop marks a run ended by a worker crashing again and again.
-var errCrashLoop = errors.New("crash loop")
+var errCrashLoop = sup.ErrCrashLoop
 
 // confirmedFor returns worker's latest durably committed position, or "".
 func (c *Coordinator) confirmedFor(worker string) string {
@@ -194,17 +190,8 @@ func (c *Coordinator) lostSignal(w *workerState) <-chan struct{} {
 // code, a waiting reason, or an unschedulable condition. Best effort: empty
 // outside Kubernetes or when the Pod cannot be read.
 func (c *Coordinator) workerTermination(worker string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cs, ns, _, err := c.workerClientset(ctx)
-	if err != nil || cs == nil {
-		return ""
-	}
-	pod, err := cs.CoreV1().Pods(ns).Get(ctx, worker, metav1.GetOptions{})
-	if err != nil {
-		return ""
-	}
-	return coordk8s.DescribeTermination(worker, pod)
+	cs, ns := c.podClient()
+	return coordk8s.ReadDescription(cs, ns, worker)
 }
 
 // workerAppends reports whether any table the worker writes is append-only,
@@ -221,55 +208,30 @@ func (c *Coordinator) workerAppends(worker string) bool {
 	return false
 }
 
-// reattachPoll is how often the snapshot re-checks a lost worker's return.
-const reattachPoll = 50 * time.Millisecond
-
 // awaitReattached returns once w is attached and no longer awaited after a
-// loss or reset. The supervisor starts after the snapshot, so its delivery
-// timeout does not cover this wait: a worker that does not come back within
-// --worker-delivery-timeout of the loss ends the run here.
+// loss or reset (sup.Watch.AwaitBack). A worker that does not come back
+// within --worker-delivery-timeout of the loss ends the run here: the
+// supervisor starts after the snapshot, so its own timeout does not cover
+// this wait.
 func (c *Coordinator) awaitReattached(ctx context.Context, w *workerState) error {
-	timeout := c.cfg.WorkerDeliveryTimeout
-	if timeout <= 0 {
-		timeout = defaultWorkerDeliveryTimeout
-	}
-	deadline := c.supervisor.Health.LossTime(w.name, time.Now()).Add(timeout)
-	poll := time.NewTicker(reattachPoll)
-	defer poll.Stop()
-	for {
+	timeout := sup.DeliveryTimeout(c.cfg.WorkerDeliveryTimeout)
+	attached := func() bool {
 		c.mu.Lock()
-		attached := w.attached
-		c.mu.Unlock()
-		if attached && !c.supervisor.IsPending(w.name) {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("coordinator: worker %s did not come back within %s of its loss mid-snapshot (--worker-delivery-timeout)%s",
-				w.name, timeout, c.workerTermination(w.name))
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-poll.C:
-		}
+		defer c.mu.Unlock()
+		return w.attached
 	}
+	err := c.supervisor.AwaitBack(ctx, w.name, timeout, attached)
+	if errors.Is(err, sup.ErrNotBack) {
+		return fmt.Errorf("coordinator: worker %s did not come back within %s of its loss mid-snapshot (--worker-delivery-timeout)%s",
+			w.name, timeout, c.workerTermination(w.name))
+	}
+	return err
 }
 
 // redoFrom is where a partition's snapshot resumes after its worker was lost
-// at chunk next: the first chunk of this partition whose Closes marker the
-// worker had not committed, whose rows died with its window. It also returns
-// that chunk's resume cursor — the high key of the last window whose Closes
-// marker the worker DID commit — so the redo resumes the chunk from there
-// instead of re-emitting committed windows (issue #646). A chunk with no
-// committed window returns nil, and is re-read from its start.
+// at chunk next, and that chunk's resume cursor (snapshot.Markers.RedoFrom).
 func (c *Coordinator) redoFrom(w *workerState, target string, windows map[uint64]int, partition int, next int) (int, []any) {
-	from := next
-	for _, m := range c.markers.TakeLost(w.name, target) {
-		if i, ok := windows[m.Window]; ok && i < from {
-			from = i
-		}
-	}
-	return from, c.markers.TakeCursor(target, snapshot.ChunkRef(partition, from))
+	return c.markers.RedoFrom(w.name, target, windows, partition, next)
 }
 
 // clearChunkReady forgets that a partition's current chunk is in its

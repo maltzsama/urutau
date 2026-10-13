@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	sup "github.com/maltzsama/urutau/internal/supervisor"
+
 	"github.com/maltzsama/urutau/internal/coordk8s"
 	"github.com/maltzsama/urutau/internal/inflight"
 )
@@ -54,13 +56,13 @@ func loseAndReturn(c *Coordinator, s *supervisor) error {
 // The third such crash in a row ends the run, with the Pod's reason.
 func TestConsecutiveCrashesEndTheRun(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
-	for i := 1; i <= defaultMaxConsecutiveCrashes; i++ {
+	for i := 1; i <= sup.DefaultMaxConsecutiveCrashes; i++ {
 		terms.crashAgain("w1", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137})
 		err := loseAndReturn(c, s)
-		if i < defaultMaxConsecutiveCrashes && err != nil {
+		if i < sup.DefaultMaxConsecutiveCrashes && err != nil {
 			t.Fatalf("crash %d ended the run: %v", i, err)
 		}
-		if i == defaultMaxConsecutiveCrashes {
+		if i == sup.DefaultMaxConsecutiveCrashes {
 			if err == nil || !strings.Contains(err.Error(), "OOMKilled") {
 				t.Fatalf("crash %d: err = %v, want the run ended citing OOMKilled", i, err)
 			}
@@ -72,7 +74,7 @@ func TestConsecutiveCrashesEndTheRun(t *testing.T) {
 // lasting several reconnects must never end the run.
 func TestNetworkLossesAreNotCrashes(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
-	for i := 0; i < 3*defaultMaxConsecutiveCrashes; i++ {
+	for i := 0; i < 3*sup.DefaultMaxConsecutiveCrashes; i++ {
 		terms.crashAgain("w1", coordk8s.Termination{ExitCode: 1, Message: "network: worker: channel lost: connection timed out"})
 		if err := loseAndReturn(c, s); err != nil {
 			t.Fatalf("network loss %d ended the run: %v", i+1, err)
@@ -84,7 +86,7 @@ func TestNetworkLossesAreNotCrashes(t *testing.T) {
 // new Pod with no termination of its own: not a crash either.
 func TestAReplacedPodIsNotACrash(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
-	for i := 0; i < 3*defaultMaxConsecutiveCrashes; i++ {
+	for i := 0; i < 3*sup.DefaultMaxConsecutiveCrashes; i++ {
 		terms["w1"] = coordk8s.Termination{PodUID: "uid-new-" + string(rune('a'+i))}
 		if err := loseAndReturn(c, s); err != nil {
 			t.Fatalf("replaced Pod %d ended the run: %v", i+1, err)
@@ -99,7 +101,7 @@ func TestAReplacedPodIsNotACrash(t *testing.T) {
 func TestDeliveringWhatItOwedStartsTheCountOver(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
 	cfg := SupervisorConfig{AckTimeout: 30 * time.Second}
-	for i := 0; i < 3*defaultMaxConsecutiveCrashes; i++ {
+	for i := 0; i < 3*sup.DefaultMaxConsecutiveCrashes; i++ {
 		terms.crashAgain("w1", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137})
 		if err := loseAndReturn(c, s); err != nil {
 			t.Fatalf("spaced crash %d ended the run: %v", i+1, err)
@@ -120,7 +122,7 @@ func TestAnIdleWorkerCrashLoopEndsTheRun(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
 	c.index.Of("w1").Clear()
 	var err error
-	for i := 0; i < defaultMaxConsecutiveCrashes; i++ {
+	for i := 0; i < sup.DefaultMaxConsecutiveCrashes; i++ {
 		terms.crashAgain("w1", coordk8s.Termination{ExitCode: 2, Message: "panic: nil map"})
 		err = loseAndReturn(c, s)
 	}
@@ -183,7 +185,7 @@ func TestPodTerminationClassification(t *testing.T) {
 // lost: that is one loss, and one crash when it comes back, not two.
 func TestALossSeenOnBothStreamsCountsOnce(t *testing.T) {
 	c, s, terms := recoveryHarness(t)
-	for i := 1; i < defaultMaxConsecutiveCrashes; i++ {
+	for i := 1; i < sup.DefaultMaxConsecutiveCrashes; i++ {
 		terms.crashAgain("w1", coordk8s.Termination{Reason: "OOMKilled", ExitCode: 137})
 		c.signalSessionEnd("w1", context.Canceled) // Session stream
 		c.signalSessionEnd("w1", context.Canceled) // Control stream, same loss

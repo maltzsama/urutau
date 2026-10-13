@@ -40,26 +40,7 @@ func newSupervisor(c *Coordinator) *supervisor {
 
 // run polls worker health until ctx is done or the job goes terminal.
 func (s *supervisor) run(ctx context.Context, cfg SupervisorConfig, terminate chan<- error) {
-	poll := cfg.Poll
-	if poll <= 0 {
-		poll = time.Second
-	}
-	ticker := time.NewTicker(poll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := s.tick(time.Now(), cfg); err != nil {
-				select {
-				case terminate <- err:
-				case <-ctx.Done():
-				}
-				return
-			}
-		}
-	}
+	sup.Run(ctx, cfg.Poll, func(now time.Time) error { return s.tick(now, cfg) }, terminate)
 }
 
 // tick resets a worker that is attached, owes work and has stopped acking,
@@ -70,14 +51,8 @@ func (s *supervisor) run(ctx context.Context, cfg SupervisorConfig, terminate ch
 // and again without delivering what it owed — is ended by workerBack
 // (recovery.go).
 func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
-	ack := cfg.AckTimeout
-	if ack <= 0 {
-		ack = 30 * time.Second
-	}
-	delivery := cfg.DeliveryTimeout
-	if delivery <= 0 {
-		delivery = defaultWorkerDeliveryTimeout
-	}
+	ack := sup.AckTimeout(cfg.AckTimeout)
+	delivery := sup.DeliveryTimeout(cfg.DeliveryTimeout)
 
 	// Lock order: c.mu first, then the watch's lock. Session takes c.mu and
 	// calls NoteAttach afterwards, so tick must never hold the watch's lock
@@ -127,10 +102,6 @@ func (s *supervisor) tick(now time.Time, cfg SupervisorConfig) error {
 	}
 	return nil
 }
-
-// defaultWorkerDeliveryTimeout is how long a lost worker may take to
-// reconnect before the run ends.
-const defaultWorkerDeliveryTimeout = 5 * time.Minute
 
 // resetWorker bumps the epoch, cancels the worker's session, and waits for
 // the next Hello (the worker suicides on channel loss and reconnects, or a

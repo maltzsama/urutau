@@ -84,3 +84,24 @@ func TestMarkersTakeLostIsPerTable(t *testing.T) {
 		t.Fatalf("left = %+v, want none", got)
 	}
 }
+
+// The redo starts at the earliest chunk whose window the worker lost, and
+// resumes that chunk from the last window it did commit.
+func TestMarkersRedoFrom(t *testing.T) {
+	var m Markers
+	// Chunk 1's first window committed (its cursor is recorded); its second
+	// window and chunk 2's were lost.
+	m.Note("w0", Marker{ID: 10, Target: "raw.a", Window: 5, ChunkRef: ChunkRef(0, 1), HighKey: []any{int64(40)}})
+	m.RecordCursor("w0", 10)
+	m.Lose("w0", []Marker{{Target: "raw.a", Window: 6}, {Target: "raw.a", Window: 7}})
+	windows := map[uint64]int{5: 1, 6: 1, 7: 2}
+
+	from, cursor := m.RedoFrom("w0", "raw.a", windows, 0, 3)
+	if from != 1 || len(cursor) != 1 || cursor[0] != int64(40) {
+		t.Fatalf("redo from chunk %d with cursor %v, want chunk 1 from key 40", from, cursor)
+	}
+	// Nothing lost any more: the snapshot goes on where it was.
+	if from, cursor := m.RedoFrom("w0", "raw.a", windows, 0, 3); from != 3 || cursor != nil {
+		t.Fatalf("second redo from chunk %d with cursor %v, want chunk 3 and no cursor", from, cursor)
+	}
+}
