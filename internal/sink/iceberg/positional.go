@@ -18,6 +18,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/dv"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
 
 // Positional deletes. In this mode the writer removes an old row version by
@@ -99,21 +100,39 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	meta := tbl.Metadata()
 	vectors := dv.NewDVWriter(wfs, func(id int32) *iceberg.PartitionSpec { return meta.PartitionSpecByID(int(id)) })
 
-	var out vectorDelta
-	vectored := 0 // data files this commit writes a deletion vector for
+	// One entry per data file: a large file is planned as several splits.
 	seen := make(map[string]struct{}, len(tasks))
+	files := tasks[:0:0]
 	for _, task := range tasks {
 		path := task.File.FilePath()
 		if _, dup := seen[path]; dup {
-			continue // a large file is planned as several splits
+			continue
 		}
 		seen[path] = struct{}{}
+		files = append(files, task)
+	}
+	w.filesMatched += len(files)
+	// The files are read side by side: a read is a round trip to the object
+	// store, and one after another they were the whole cost of a commit
+	// (#864). want is only read from here on.
+	found := make([][]int64, len(files))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(positionReaders)
+	for i, task := range files {
+		g.Go(func() error {
+			hits, err := w.matchingPositions(gctx, fs, task.File, want)
+			found[i] = hits
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return vectorDelta{}, err
+	}
 
-		w.filesMatched++
-		hits, err := w.matchingPositions(ctx, fs, task.File, want)
-		if err != nil {
-			return vectorDelta{}, err
-		}
+	var out vectorDelta
+	vectored := 0 // data files this commit writes a deletion vector for
+	for i, task := range files {
+		path, hits := task.File.FilePath(), found[i]
 		if len(hits) == 0 {
 			continue
 		}
@@ -152,6 +171,10 @@ func (w *TableWriter) deletionVectors(ctx context.Context, tbl *table.Table, key
 	return out, nil
 }
 
+// positionReaders is how many data files a commit reads at once to resolve
+// positions. Each reader holds one file's key columns, a batch at a time.
+const positionReaders = 8
+
 // unmarked returns the positions not yet set in marked.
 func unmarked(positions []int64, marked *dv.RoaringPositionBitmap) []int64 {
 	fresh := positions[:0]
@@ -164,9 +187,9 @@ func unmarked(positions []int64, marked *dv.RoaringPositionBitmap) []int64 {
 }
 
 // keySet encodes the batch's keys, typed as the table's key columns, for
-// lookup while a data file is read. It also returns the range of the first
-// key column as a filter, which the scan plan uses to skip data files that
-// cannot hold any of the keys.
+// lookup while a data file is read. It also returns a filter over the key
+// columns, which the scan plan uses to skip the partitions and the data files
+// that cannot hold any of the keys.
 func (w *TableWriter) keySet(keys [][]any) (map[string]struct{}, iceberg.BooleanExpression, error) {
 	rec, err := w.deleteRecord(keys)
 	if err != nil {
@@ -182,7 +205,63 @@ func (w *TableWriter) keySet(keys [][]any) (map[string]struct{}, iceberg.Boolean
 		}
 		set[string(buf)] = struct{}{}
 	}
-	return set, keyRange(w.delCols[0], rec.Column(0)), nil
+	// Every key column narrows the plan: a file is read only when each of
+	// them admits one of the batch's values.
+	within := iceberg.BooleanExpression(iceberg.AlwaysTrue{})
+	for i, name := range w.delCols {
+		within = iceberg.NewAnd(within, keyFilter(name, rec.Column(i)))
+	}
+	return set, within, nil
+}
+
+// keyInMax is the most distinct values of a key column a plan filter lists
+// one by one. Up to it the filter is "name in (values)", which rules out a
+// data file or a partition that holds none of them even when it lies between
+// two that do; past it the filter falls back to the values' range, as a list
+// that long costs more to evaluate against every file than it saves.
+const keyInMax = 200
+
+// keyFilter is the plan filter of one key column: its distinct values when
+// they are few, their range otherwise.
+func keyFilter(name string, col arrow.Array) iceberg.BooleanExpression {
+	if col.Len() == 0 || col.NullN() > 0 {
+		return iceberg.AlwaysTrue{}
+	}
+	ref := iceberg.Reference(name)
+	switch c := col.(type) {
+	case *array.Int64:
+		if vals, ok := distinctUpTo(c.Len(), c.Value, keyInMax); ok {
+			return iceberg.IsIn(ref, vals...)
+		}
+	case *array.Int32:
+		if vals, ok := distinctUpTo(c.Len(), c.Value, keyInMax); ok {
+			return iceberg.IsIn(ref, vals...)
+		}
+	case *array.String:
+		if vals, ok := distinctUpTo(c.Len(), c.Value, keyInMax); ok {
+			return iceberg.IsIn(ref, vals...)
+		}
+	}
+	return keyRange(name, col)
+}
+
+// distinctUpTo returns the distinct values of a column of n rows, or false
+// when there are more than limit.
+func distinctUpTo[T comparable](n int, value func(int) T, limit int) ([]T, bool) {
+	seen := make(map[T]struct{}, min(n, limit))
+	out := make([]T, 0, min(n, limit))
+	for i := range n {
+		v := value(i)
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		if len(out) == limit {
+			return nil, false
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out, true
 }
 
 // keyRange is "name between the column's smallest and largest value" for the
