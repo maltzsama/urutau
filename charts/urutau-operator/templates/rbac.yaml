@@ -60,10 +60,8 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
-  # Leader election: a coordination.k8s.io Lease in the operator's namespace.
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # The leader-election Lease is granted by leader-election.yaml, in the
+  # operator's own namespace only (issue #867).
   # Events: the operator records reconciliation and leader-election Events.
   # Without this rule the API server rejects every Event, so kubectl describe
   # shows none (issue #364).

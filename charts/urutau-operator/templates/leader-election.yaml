@@ -1,0 +1,36 @@
+# Leader election: controller-runtime coordinates the replicas through a
+# coordination.k8s.io Lease in the operator's own namespace. That namespace is
+# not a watched one, so the ClusterRole bindings in rbac.yaml do not reach it
+# when rbac.clusterWide=false; this Role is bound here in every mode. Without
+# it the manager retries the Lease forever and never reconciles (issue #867).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "urutau-operator.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # The Events leader election records on the Lease.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "urutau-operator.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "urutau-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "urutau-operator.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "urutau-operator.fullname" . }}
+    namespace: {{ .Release.Namespace }}

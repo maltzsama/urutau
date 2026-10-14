@@ -70,13 +70,8 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
-  # Leader election: controller-runtime coordinates the manager through a
-  # coordination.k8s.io Lease in the operator's own namespace. Without this
-  # rule the manager fails at startup the first time it tries to acquire the
-  # lease — it does not silently skip election.
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # The leader-election Lease is granted by the urutau-operator-leader-election
+  # Role below, in the operator's own namespace only (issue #867).
   # Events: the operator records reconciliation and leader-election Events.
   # Without this rule the API server rejects every Event
   # ("events is forbidden: cannot create resource events"), so kubectl
@@ -99,6 +94,40 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: urutau-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: urutau-operator
+    namespace: urutau-system
+---
+# Leader election: controller-runtime coordinates the replicas through a
+# coordination.k8s.io Lease in the operator's own namespace. The
+# multi-tenant overlay binds the ClusterRole only into the tenant namespaces,
+# which do not include this one, so the Lease is granted here, in every
+# install. Without it the manager retries the Lease forever and never
+# reconciles (issue #867).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: urutau-operator-leader-election
+  namespace: urutau-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # The Events leader election records on the Lease.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: urutau-operator-leader-election
+  namespace: urutau-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: urutau-operator-leader-election
 subjects:
   - kind: ServiceAccount
     name: urutau-operator
