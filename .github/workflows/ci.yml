@@ -107,6 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           C=charts/urutau-operator
+          source hack/leader-election-granted.sh
 
           helm template urutau $C --namespace urutau-system > /dev/null
           helm template urutau $C --namespace team-a > /dev/null
@@ -157,23 +158,50 @@ jobs:
           if grep -q 'kind: ClusterRoleBinding' /tmp/urutau-ns-rbac.yaml; then
             echo "namespace-scoped mode still renders a ClusterRoleBinding"; exit 1
           fi
-          [ "$(grep -c 'kind: RoleBinding' /tmp/urutau-ns-rbac.yaml)" = "2" ]
+          # Count the RoleBindings to the ClusterRole (roleRef kind, indented):
+          # the leader-election RoleBinding binds a Role (#867).
+          [ "$(grep -c '^  kind: ClusterRole$' /tmp/urutau-ns-rbac.yaml)" = "2" ]
           # A namespace repeated in watchNamespaces renders once (a duplicate
           # RoleBinding object would fail the install).
           helm template urutau $C -n urutau-system \
             --set rbac.clusterWide=false --set 'operator.watchNamespaces=team-a\,team-a\,team-b' \
             > /tmp/urutau-ns-dup.yaml
-          [ "$(grep -c 'kind: RoleBinding' /tmp/urutau-ns-dup.yaml)" = "2" ]
+          [ "$(grep -c '^  kind: ClusterRole$' /tmp/urutau-ns-dup.yaml)" = "2" ]
           # ...and it is unsatisfiable with no watched namespaces.
           if helm template urutau $C -n urutau-system --set rbac.clusterWide=false >/dev/null 2>&1; then
             echo "rbac.clusterWide=false with no watchNamespaces rendered instead of failing"; exit 1
           fi
+
+          # Leader election takes a Lease in the operator's own namespace, which
+          # is not a watched one: in every RBAC mode the release namespace must
+          # hold a Role granting leases, bound to the operator (#867).
+          for wide in true false; do
+            helm template urutau $C -n urutau-system \
+              --set rbac.clusterWide=$wide --set operator.watchNamespaces=team-a \
+              > /tmp/urutau-le.yaml
+            if ! leader_election_granted /tmp/urutau-le.yaml; then
+              echo "rbac.clusterWide=$wide: no leases Role bound in the release namespace"; exit 1
+            fi
+          done
 
           # A second release can share the CRD (#360).
           if helm template urutau $C -n urutau-system --set crds.install=false \
             | grep -q 'kind: CustomResourceDefinition'; then
             echo "crds.install=false still rendered the CRD"; exit 1
           fi
+
+      # The kustomize installs grant the leader-election Lease in the
+      # operator's namespace too, the multi-tenant one included (#867).
+      - name: Render the kustomize installs
+        run: |
+          set -euo pipefail
+          source hack/leader-election-granted.sh
+          for k in config/default config/multi-tenant; do
+            kubectl kustomize $k > /tmp/urutau-k.yaml
+            if ! leader_election_granted /tmp/urutau-k.yaml; then
+              echo "$k: no leases Role bound in urutau-system"; exit 1
+            fi
+          done
 
   test:
     runs-on: ubuntu-latest

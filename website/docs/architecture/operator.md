@@ -208,9 +208,13 @@ Two details are easy to get wrong when writing this RBAC by hand:
 The operator Deployment ships with `replicas: 2`. Only the elected leader runs
 the reconciler; the other replica is a hot standby that takes over if the
 leader dies. Election coordinates through a `coordination.k8s.io` `Lease`
-named `urutau-operator-lock` in the operator's namespace — which is why the
-ClusterRole carries a `leases` rule. Without it the manager fails at startup
-on lease acquisition rather than silently skipping election.
+named `urutau-operator-lock` in the operator's namespace — which is why every
+install binds a `urutau-operator-leader-election` Role there granting
+`leases`. It is a Role in that namespace, not a ClusterRole rule: a
+namespace-scoped install (the chart's `rbac.clusterWide=false`,
+`config/multi-tenant`) binds the ClusterRole only into the watched namespaces,
+and without the grant the manager retries the Lease forever and never
+reconciles, while its Pod stays `Ready` (issue #867).
 
 The standby is not load-balanced: the operator's work is small and
 order-sensitive (one reconciler per `CDCPipeline`), so extra replicas buy
