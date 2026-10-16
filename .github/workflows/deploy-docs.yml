@@ -25,7 +25,7 @@ jobs:
       # instead of a bare 404 at the deploy step.
       - uses: actions/configure-pages@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
