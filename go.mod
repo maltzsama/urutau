@@ -27,7 +27,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/trinodb/trino-go-client v1.0.0
 	github.com/twmb/franz-go v1.22.1
-	github.com/twmb/franz-go/pkg/kmsg v1.14.0
+	github.com/twmb/franz-go/pkg/kmsg v1.15.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/text v0.43.0
