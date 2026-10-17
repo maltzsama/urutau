@@ -140,7 +140,8 @@ func TestProcessKill(t *testing.T) {
 	go func() { done <- p.Wait() }()
 
 	select {
-	case <-done:
+	case err := <-done:
+		t.Logf("process exited after kill: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("process did not exit after kill")
 	}
@@ -166,7 +167,8 @@ func TestProcessStop(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- p.Stop() }()
 	select {
-	case <-done:
+	case err := <-done:
+		t.Logf("process exited after stop: %v", err)
 	case <-time.After(15 * time.Second):
 		t.Fatal("Stop() hung")
 	}

@@ -89,7 +89,9 @@ func TestDoGetRedeliversSentOnSendFailure(t *testing.T) {
 		t.Fatalf("second DoGet delivered %v, want [b1 b2]", bodies)
 	}
 	cancel()
-	<-done
+	if err := <-done; err != nil {
+		t.Logf("second DoGet ended: %v", err)
+	}
 
 	// Both stay on the sent list until an ack covers them (dropSent).
 	w.sentMu.Lock()
@@ -345,7 +347,9 @@ func TestDoGetRedeliversUnackedAfterSuccess(t *testing.T) {
 		t.Fatal("first DoGet did not deliver b1")
 	}
 	cancel1()
-	<-done1
+	if err := <-done1; err != nil {
+		t.Logf("first DoGet ended: %v", err)
+	}
 
 	// New session: b1 is redelivered even though its Send succeeded, because
 	// no ack covered it.
@@ -363,7 +367,9 @@ func TestDoGetRedeliversUnackedAfterSuccess(t *testing.T) {
 		t.Fatal("an unacked batch was not redelivered on reconnect")
 	}
 	cancel2()
-	<-done2
+	if err := <-done2; err != nil {
+		t.Logf("second DoGet ended: %v", err)
+	}
 }
 
 // #264: onDelete travels with the assignment, so an append-only table drops

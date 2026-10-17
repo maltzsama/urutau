@@ -97,7 +97,8 @@ func TestSupervisorRunEndsTheRunForAnAbsentWorker(t *testing.T) {
 	}, terminate)
 
 	select {
-	case <-terminate:
+	case err := <-terminate:
+		t.Logf("supervisor run ended: %v", err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("supervisor.run never ended the run for a worker gone past the absence timeout")
 	}

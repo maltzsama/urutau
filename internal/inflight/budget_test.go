@@ -155,8 +155,8 @@ func TestFlowBudgetSecondOversizedBatchBlocks(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- b.Acquire(context.Background(), "b", 200) }()
 	select {
-	case <-done:
-		t.Fatal("a second oversized batch must block while the first is in flight")
+	case err := <-done:
+		t.Fatalf("a second oversized batch must block while the first is in flight, Acquire returned: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 	b.Release("a", 200)

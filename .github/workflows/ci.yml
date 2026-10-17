@@ -33,9 +33,12 @@ jobs:
           path: |
             ~/.cache/golangci-lint
             ./bin/golangci-lint
-          key: ${{ runner.os }}-golangci-lint-v1-${{ hashFiles('Makefile') }}
+          # go.mod is part of the key: the lint binary is built with the Go
+          # version go.mod declares, and a stale one cannot typecheck newer
+          # Go (it panics on "file requires newer Go version").
+          key: ${{ runner.os }}-golangci-lint-v2-${{ hashFiles('Makefile', 'go.mod') }}
           restore-keys: |
-            ${{ runner.os }}-golangci-lint-v1-
+            ${{ runner.os }}-golangci-lint-v2-
 
       - name: Cache buf
         uses: actions/cache@v6

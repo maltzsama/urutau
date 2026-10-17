@@ -89,7 +89,8 @@ func TestRunAttachesAgainAfterLosingTheCoordinator(t *testing.T) {
 	// Its own shutdown still ends it.
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		t.Logf("worker stopped: %v", err)
 	case <-time.After(45 * time.Second):
 		t.Fatal("the worker did not stop when its context was cancelled")
 	}

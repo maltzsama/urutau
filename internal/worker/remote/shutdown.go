@@ -33,7 +33,7 @@ func workerShutdown(cause error, pipeCancel context.CancelFunc, pipeCtx context.
 		log.Error("worker: channel lost, aborting in-flight transactions", "cause", cause)
 		lost := fmt.Errorf("worker: channel lost: %w", cause)
 		select {
-		case <-runErr:
+		case <-runErr: //nolint:errcheck // the run's error is subsumed by the channel-lost cause
 		case <-time.After(5 * time.Second):
 			// Not stopped: nothing may attach again next to it.
 			return CoordinatorLost(pipelineRunning(lost))

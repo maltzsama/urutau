@@ -107,7 +107,8 @@ func TestStagedCycleFailurePoisonsLaterCommits(t *testing.T) {
 		t.Fatal("a failed commit must poison the table")
 	}
 	select {
-	case <-c.terminate:
+	case err := <-c.terminate:
+		t.Logf("run terminated: %v", err)
 	default:
 		t.Fatal("a failed commit must fail the run")
 	}

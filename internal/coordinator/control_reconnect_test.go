@@ -79,7 +79,9 @@ func TestControlReconnectSurvivesTheStaleDefer(t *testing.T) {
 	// The first stream's server-side close lands AFTER the reconnect: its
 	// defer must leave the new stream in place.
 	cancel1()
-	<-done1
+	if err := <-done1; err != nil {
+		t.Logf("stale control stream ended: %v", err)
+	}
 	c.mu.Lock()
 	got := w.control
 	c.mu.Unlock()
@@ -94,5 +96,7 @@ func TestControlReconnectSurvivesTheStaleDefer(t *testing.T) {
 	}
 
 	cancel2()
-	<-done2
+	if err := <-done2; err != nil {
+		t.Logf("reconnected control stream ended: %v", err)
+	}
 }
