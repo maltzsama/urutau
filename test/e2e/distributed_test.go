@@ -576,7 +576,9 @@ func TestCrashloopKillsJob(t *testing.T) {
 		t.Fatal("coordinator did not terminate on crashloop")
 	}
 	cStop()
-	<-wErr
+	if err := <-wErr; err != nil {
+		t.Logf("worker ended: %v", err)
+	}
 }
 
 // TestObservabilityEndpoints serves /metrics and /statusz and asserts both
@@ -788,6 +790,10 @@ func TestWorkerRecoveryAfterReset(t *testing.T) {
 
 	t.Log("recovery ok: new-epoch worker resumed without re-snapshot")
 	cStop()
-	<-secondErr
-	<-cErr
+	if err := <-secondErr; err != nil {
+		t.Logf("second worker ended: %v", err)
+	}
+	if err := <-cErr; err != nil {
+		t.Logf("coordinator ended: %v", err)
+	}
 }

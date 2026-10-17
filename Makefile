@@ -7,7 +7,7 @@ GO ?= go
 BIN := $(CURDIR)/bin
 
 BUF_VERSION ?= v1.72.0
-GOLANGCI_LINT_VERSION ?= v2.13.2
+GOLANGCI_LINT_VERSION ?= v2.15.0
 ENVTEST_VERSION ?= latest
 
 # release-please tags vX.Y.Z; strip the leading v so the string matches

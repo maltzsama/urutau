@@ -259,7 +259,8 @@ func TestDistributedPartitionedWorkerKilled(t *testing.T) {
 	// same address.
 	for _, ch := range wErrs {
 		select {
-		case <-ch:
+		case err := <-ch:
+			t.Logf("worker exited after the job failed: %v", err)
 		case <-time.After(30 * time.Second):
 			t.Fatal("a worker did not exit after the job failed")
 		}
