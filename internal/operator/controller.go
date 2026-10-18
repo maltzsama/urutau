@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -102,6 +103,7 @@ func (r *CoordinatorReconciler) fieldManager() string {
 // SetupWithManager wires the reconciler into the manager.
 func (r *CoordinatorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
+		//nolint:staticcheck // the GetEventRecorder replacement emits events.k8s.io/v1 Events, whose RBAC the chart doesn't grant yet; core/v1 events keep working.
 		r.Recorder = mgr.GetEventRecorderFor("urutau-operator")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
@@ -305,7 +307,14 @@ func (r *CoordinatorReconciler) ensure(ctx context.Context, desired client.Objec
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	desired.GetObjectKind().SetGroupVersionKind(gvk)
-	if err := r.Patch(ctx, desired, client.Apply, client.FieldOwner(r.fieldManager()), client.ForceOwnership); err != nil {
+	// The apply patch's data is json.Marshal(obj) (that's all client.Apply's
+	// Data does); RawPatch keeps server-side apply without the deprecated
+	// helper, which now requires a generated apply-configuration type.
+	data, err := json.Marshal(desired)
+	if err != nil {
+		return fmt.Errorf("apply %s: %w", what, err)
+	}
+	if err := r.Patch(ctx, desired, client.RawPatch(types.ApplyPatchType, data), client.FieldOwner(r.fieldManager()), client.ForceOwnership); err != nil {
 		return fmt.Errorf("apply %s: %w", what, err)
 	}
 	return nil
