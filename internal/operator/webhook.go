@@ -5,10 +5,8 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	"sigs.k8s.io/yaml"
 
@@ -19,7 +17,7 @@ import (
 
 // SetupWebhookWithManager registers the validating webhook.
 func (r *CoordinatorReconciler) SetupWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).For(&urutauv1alpha1.CDCPipeline{}).
+	return ctrl.NewWebhookManagedBy(mgr, &urutauv1alpha1.CDCPipeline{}).
 		WithValidator(&pipelineValidator{client: mgr.GetClient()}).Complete()
 }
 
@@ -28,29 +26,24 @@ func (r *CoordinatorReconciler) SetupWebhookWithManager(mgr ctrl.Manager) error 
 // (nil in unit tests) lets it check serverId uniqueness across CRs.
 type pipelineValidator struct{ client client.Client }
 
-var _ webhook.CustomValidator = (*pipelineValidator)(nil)
+var _ admission.Validator[*urutauv1alpha1.CDCPipeline] = (*pipelineValidator)(nil)
 
 // ValidateCreate rejects a spec that fails the resolved-spec validation.
-func (v *pipelineValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	return nil, v.validate(ctx, obj)
+func (v *pipelineValidator) ValidateCreate(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) (admission.Warnings, error) {
+	return nil, v.validate(ctx, cr)
 }
 
 // ValidateUpdate allows unchanged spec; otherwise validates like create.
-func (v *pipelineValidator) ValidateUpdate(ctx context.Context, old, new runtime.Object) (admission.Warnings, error) {
+func (v *pipelineValidator) ValidateUpdate(ctx context.Context, old, new *urutauv1alpha1.CDCPipeline) (admission.Warnings, error) {
 	return nil, v.validate(ctx, new)
 }
 
 // ValidateDelete is always allowed.
-func (v *pipelineValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+func (v *pipelineValidator) ValidateDelete(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) (admission.Warnings, error) {
 	return nil, nil
 }
 
-func (v *pipelineValidator) validate(ctx context.Context, obj runtime.Object) error {
-	cr, ok := obj.(*urutauv1alpha1.CDCPipeline)
-	if !ok {
-		return fmt.Errorf("expected CDCPipeline, got %T", obj)
-	}
-
+func (v *pipelineValidator) validate(ctx context.Context, cr *urutauv1alpha1.CDCPipeline) error {
 	// Exactly one definition source: image, s3, or inline. Anything else
 	// (zero or two) is a mistake the webhook must not guess about.
 	def := cr.Spec.Definition
