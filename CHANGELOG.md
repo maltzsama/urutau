@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.6.0](https://github.com/maltzsama/urutau/compare/v0.5.0...v0.6.0) (2026-10-18)
+
+
+### Features
+
+* **iceberg:** create tables as format-version 3 and upgrade existing ones ([e13bb9d](https://github.com/maltzsama/urutau/commit/e13bb9d525318865f37408b39df184802cec2eee))
+* **iceberg:** create tables as format-version 3 and upgrade existing ones ([#752](https://github.com/maltzsama/urutau/issues/752)) ([24f8a18](https://github.com/maltzsama/urutau/commit/24f8a1837e768c698e87415ab99f938175bd2fd6))
+* **iceberg:** log where a positional commit's time goes ([ae1cf1b](https://github.com/maltzsama/urutau/commit/ae1cf1b962670538aa367401806b2ac9a6e7a467))
+* **iceberg:** positional-delete mode with deletion vectors ([31e8cc6](https://github.com/maltzsama/urutau/commit/31e8cc66e3376e58a07cf1bff84122356fd146db))
+* **iceberg:** positional-delete mode with deletion vectors ([#753](https://github.com/maltzsama/urutau/issues/753)) ([0b3b110](https://github.com/maltzsama/urutau/commit/0b3b110a26a40b08dec2d1c2cfb186dccb6b0a9a))
+* **mysql:** decode the eucjpms character set in CDC ([024d537](https://github.com/maltzsama/urutau/commit/024d537858955e93a0cd93ab792b362226d7390d))
+* **mysql:** decode the eucjpms character set in CDC ([#116](https://github.com/maltzsama/urutau/issues/116)) ([24ce668](https://github.com/maltzsama/urutau/commit/24ce668ca7faa60684063e978a53e0a586a21080))
+
+
+### Bug Fixes
+
+* a batch that does not end its transaction is not covered by its own position ([8f67f50](https://github.com/maltzsama/urutau/commit/8f67f501f0c11c396d0ff591f9d55d7b1239facb)), closes [#823](https://github.com/maltzsama/urutau/issues/823)
+* a stale marker ack stalled a staged table's snapshot; the e2e S3 helper Pod timed out on a registry pull ([6f358a0](https://github.com/maltzsama/urutau/commit/6f358a0ab117e5f2ea1d80f6bc795ed3f606c24e))
+* **build:** run the release image as a numeric user so runAsNonRoot Pods start ([#797](https://github.com/maltzsama/urutau/issues/797)) ([fa91e1b](https://github.com/maltzsama/urutau/commit/fa91e1b56e33bf1938ee6130f6db65fc8da8e9b5))
+* **coordinator:** a held pump is wedged only when nothing has moved ([71bf3fa](https://github.com/maltzsama/urutau/commit/71bf3fab98fad0985736148f75ea9133ac509cf7)), closes [#826](https://github.com/maltzsama/urutau/issues/826)
+* **coordinator:** a pump held by backpressure is not wedged ([d4f34fd](https://github.com/maltzsama/urutau/commit/d4f34fd0b09e673a6322149bd836b6e6d35ec0d0)), closes [#819](https://github.com/maltzsama/urutau/issues/819)
+* **coordinator:** a stale Control handler no longer reports the reconnected worker lost ([#792](https://github.com/maltzsama/urutau/issues/792)) ([0303685](https://github.com/maltzsama/urutau/commit/03036858f2585cb571045929fba5ae735070f675))
+* **coordinator:** correctness fixes from the coordinator, recovery and maintenance audit ([3f515ff](https://github.com/maltzsama/urutau/commit/3f515ff908e538f5781bd7bbdb38ec43c4e4074b))
+* **coordinator:** diagnostics name the worker's own failure ([#787](https://github.com/maltzsama/urutau/issues/787), [#784](https://github.com/maltzsama/urutau/issues/784)) ([8679064](https://github.com/maltzsama/urutau/commit/8679064174786d3a624f0e07635920fc9ca69adf))
+* **coordinator:** do not count the time a worker waited for work as a stall ([#817](https://github.com/maltzsama/urutau/issues/817)) ([4b0fd75](https://github.com/maltzsama/urutau/commit/4b0fd751adbbaf12f2ab4a2de88faba7bd0d6010))
+* **coordinator:** drop a stale-generation ack on a staged table ([#805](https://github.com/maltzsama/urutau/issues/805)) ([4610f4b](https://github.com/maltzsama/urutau/commit/4610f4b2929ae3a3d7503ded638d9cbb4fcb61fa))
+* **coordinator:** drop a superseded generation's marker ack on a staged table ([2f668a7](https://github.com/maltzsama/urutau/commit/2f668a7f3cac5855db5e06bb93b43eff1bebf859))
+* **coordinator:** end the session of an owner a failed scale forgets ([4d81756](https://github.com/maltzsama/urutau/commit/4d81756cc758099c9277e8aa6e4accc62aea31ad)), closes [#842](https://github.com/maltzsama/urutau/issues/842)
+* **coordinator:** free the oversized slot when an oversized batch is not delivered ([#793](https://github.com/maltzsama/urutau/issues/793)) ([8255102](https://github.com/maltzsama/urutau/commit/8255102f86df85f2c0a1e27d678ffe5ca69fa3bd))
+* **coordinator:** keep a fan-out chunk's window ready through its catch-up ([c65d2fb](https://github.com/maltzsama/urutau/commit/c65d2fb46b8c64a1ed87a9eaba896ccaed31865e)), closes [#820](https://github.com/maltzsama/urutau/issues/820)
+* **coordinator:** keep snapshot window rows off the worker's sent list ([#790](https://github.com/maltzsama/urutau/issues/790)) ([2fcae7f](https://github.com/maltzsama/urutau/commit/2fcae7f55dc92f3c297306d3dd2416c848312f9c))
+* **coordinator:** key a chunk's resume cursor by its table ([#791](https://github.com/maltzsama/urutau/issues/791)) ([f421979](https://github.com/maltzsama/urutau/commit/f4219794f8a79868353d72d2fc0a74c0a6f48185))
+* **coordinator:** mark a range window ready before its catch-up ([c420786](https://github.com/maltzsama/urutau/commit/c42078652ab1c844e5880e3f2b4d9043707df592)), closes [#821](https://github.com/maltzsama/urutau/issues/821)
+* **coordinator:** no frontier when the dispatched positions cannot be ordered ([#761](https://github.com/maltzsama/urutau/issues/761)) ([ded5c95](https://github.com/maltzsama/urutau/commit/ded5c951cc5b380e923478486d7e10868c25a712))
+* **coordinator:** re-read fan-out snapshot chunks a restarted worker lost ([d2b47bf](https://github.com/maltzsama/urutau/commit/d2b47bfb4c090f78df7af036d0bb7a7ef09ebf57))
+* **coordinator:** re-read fan-out snapshot chunks a restarted worker lost ([1cf6e3f](https://github.com/maltzsama/urutau/commit/1cf6e3fad30a539d06d6e4c5e3471c7f1b8a83b7)), closes [#829](https://github.com/maltzsama/urutau/issues/829)
+* **coordinator:** report a worker StatefulSet the reconcile cannot read ([#758](https://github.com/maltzsama/urutau/issues/758)) ([df6e9d2](https://github.com/maltzsama/urutau/commit/df6e9d248a920eb7d85a15eab3f7a4466d5c07eb))
+* **coordinator:** run one table's maintenance pass at a time ([aead480](https://github.com/maltzsama/urutau/commit/aead480c6c7ac8e8e2e67cce636260605795f047)), closes [#831](https://github.com/maltzsama/urutau/issues/831)
+* **coordinator:** send the batches a re-slice pause held coalesced ([8b7d294](https://github.com/maltzsama/urutau/commit/8b7d2948ecc7a80b6e8b5d3eb673e2eb82023da2)), closes [#828](https://github.com/maltzsama/urutau/issues/828)
+* **coordinator:** six small correctness fixes ([#794](https://github.com/maltzsama/urutau/issues/794)) ([32ed2fc](https://github.com/maltzsama/urutau/commit/32ed2fc81a30f13fb83a5466671edff4dbe30285))
+* **coordinator:** wait for workers longer than their restart backoff ([#808](https://github.com/maltzsama/urutau/issues/808)) ([1c592f0](https://github.com/maltzsama/urutau/commit/1c592f0c15efdad80889a197c1f5cd99b634afca))
+* **e2e:** make the Couchbase Service headless so node-init can bind ([59a3c00](https://github.com/maltzsama/urutau/commit/59a3c009ee43c6e7d51c1586d49dac183c95d042))
+* **e2e:** raise the node inotify limit so pod logs are not lost ([#796](https://github.com/maltzsama/urutau/issues/796)) ([e9eb94c](https://github.com/maltzsama/urutau/commit/e9eb94ceb759d73558f55b84bdfcef5a60050038))
+* **e2e:** start the S3 helper Pod from the node's image, with three minutes to run ([61656b3](https://github.com/maltzsama/urutau/commit/61656b302c88e31e4491216a5f730994722d9c8b))
+* four faults of the full chaos run: maintenance overlap, empty-window marker ack, workers of removed tables, worker exit on a lost coordinator ([704f78c](https://github.com/maltzsama/urutau/commit/704f78c871af36a672ef3a203c1df95167537d61))
+* **gate:** seal a window only once its backlog is delivered ([5775e2a](https://github.com/maltzsama/urutau/commit/5775e2acdf8d6aac44c2d7128142901dadcb9919)), closes [#818](https://github.com/maltzsama/urutau/issues/818)
+* **iceberg:** retry a commit whose outcome is unknown instead of failing the batch ([#751](https://github.com/maltzsama/urutau/issues/751)) ([44d8b7f](https://github.com/maltzsama/urutau/commit/44d8b7f8769ba192ffafaab33fc45c47eb567b31))
+* **maintenance:** bound every Kubernetes call of the scheduler ([#779](https://github.com/maltzsama/urutau/issues/779)) ([a14ebe9](https://github.com/maltzsama/urutau/commit/a14ebe9f6d6d63f43148a5c52852a6aad91f86df))
+* **maintenance:** count a failed operation the same in /metrics and the dashboard ([#780](https://github.com/maltzsama/urutau/issues/780)) ([8198e4a](https://github.com/maltzsama/urutau/commit/8198e4ad0ff0e2c35022143d46af32df50a5d4a2))
+* **memlimit:** give a race build's heap a third of the cgroup's budget ([e3d6bb0](https://github.com/maltzsama/urutau/commit/e3d6bb03a45d52f17f1de869efe5674653fde827))
+* **memlimit:** give a race build's heap a third of the cgroup's budget ([f5f33c7](https://github.com/maltzsama/urutau/commit/f5f33c78120cc32d64a38f98579fac91a9b1450b))
+* **memlimit:** leave the race detector its memory in the runtime limit ([6fbf72e](https://github.com/maltzsama/urutau/commit/6fbf72e3524081331c92115eb5be30c96b68affb)), closes [#822](https://github.com/maltzsama/urutau/issues/822)
+* **mysql:** bound the binlog event read-ahead ([#804](https://github.com/maltzsama/urutau/issues/804)) ([9f8e51a](https://github.com/maltzsama/urutau/commit/9f8e51ac52bd19dda63f2923e1e0085e3f188e55))
+* **operator:** grant the leader-election Lease in the operator's namespace ([bf185ef](https://github.com/maltzsama/urutau/commit/bf185ef0aeb8c13f93930728f232d6e4765fa9c6))
+* **operator:** grant the leader-election Lease in the operator's namespace ([43843e5](https://github.com/maltzsama/urutau/commit/43843e58e2f62d543a9b750229645325665e513f))
+* **operator:** migrate to controller-runtime v0.25 webhook and client APIs ([d2ca23a](https://github.com/maltzsama/urutau/commit/d2ca23a8b609a3b4519b738ac4744037dda6bb86))
+* **recovery:** record a worker's loss once, before waking its waiters ([#788](https://github.com/maltzsama/urutau/issues/788)) ([0f27cd5](https://github.com/maltzsama/urutau/commit/0f27cd51b15ea0aadf0bf19c1fc7b710d05841e5))
+* **worker:** a live change seen during a chunk read touches its later windows ([2a68653](https://github.com/maltzsama/urutau/commit/2a68653ef74d7fe13c2ceb06c02b8954cbb489f5)), closes [#827](https://github.com/maltzsama/urutau/issues/827)
+* **worker:** ack an empty window's marker only after its delivery ships ([0769b55](https://github.com/maltzsama/urutau/commit/0769b55a7db80d479924e357d7739a1b0c1aea3e)), closes [#833](https://github.com/maltzsama/urutau/issues/833)
+* **worker:** attach again after losing the coordinator instead of exiting ([2ffe946](https://github.com/maltzsama/urutau/commit/2ffe9468bff633c2a1cf8be21f54bbc561d3674a)), closes [#841](https://github.com/maltzsama/urutau/issues/841)
+* **worker:** carry the replication slot name to the worker's snapshot source ([#799](https://github.com/maltzsama/urutau/issues/799)) ([f44257e](https://github.com/maltzsama/urutau/commit/f44257eaaf553f56727684b3102bdbf09cd3c227))
+* **worker:** keep connection-string credentials out of logs and errors ([#800](https://github.com/maltzsama/urutau/issues/800)) ([e6aa34b](https://github.com/maltzsama/urutau/commit/e6aa34bc8d686b48940fa9cf8add988ac1bdd2c6))
+* **worker:** open the sink the pipeline spec names, not always Iceberg ([#762](https://github.com/maltzsama/urutau/issues/762)) ([6cb9c80](https://github.com/maltzsama/urutau/commit/6cb9c8016418e8b34db252fae6e1c9766eb699d9))
+* **worker:** snapshot window rows are never covered ([c516d06](https://github.com/maltzsama/urutau/commit/c516d067e5d9db28cffacc7bb7a9f8f48cea2033)), closes [#824](https://github.com/maltzsama/urutau/issues/824)
+
+
+### Performance Improvements
+
+* **coordinator:** hot-path optimizations ([#795](https://github.com/maltzsama/urutau/issues/795)) ([a5503e5](https://github.com/maltzsama/urutau/commit/a5503e5777a853149e7f17b6bb81e7df18470f6a))
+* **iceberg:** make a positional commit's scan as cheap as a scan gets ([aa98eb0](https://github.com/maltzsama/urutau/commit/aa98eb08d181fa1ee743c85290080a2e0c0e3af1))
+* **iceberg:** narrow a positional commit's plan on every key column and read its files concurrently ([982a7a5](https://github.com/maltzsama/urutau/commit/982a7a564e85e5237f220a2194b54744cf12dc49))
+* **iceberg:** read a commit's existing deletion vectors one Puffin file at a time ([367870a](https://github.com/maltzsama/urutau/commit/367870a44b781f76d3d925cc60a8b4b0fc6e05a4))
+* **iceberg:** read a positional commit's existing deletion vectors concurrently ([1c914d7](https://github.com/maltzsama/urutau/commit/1c914d7a7dd6ed01a331801fdf18581a83fc78b9))
+* **iceberg:** sixteen readers for a positional commit's files ([ddd3cc4](https://github.com/maltzsama/urutau/commit/ddd3cc4ca1ddf847c3032791844fa3dc51825072))
+
 ## [0.5.0](https://github.com/maltzsama/urutau/compare/v0.4.0...v0.5.0) (2026-10-10)
 
 
