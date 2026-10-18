@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/maltzsama/urutau/compare/v0.6.0...v0.6.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **build:** pin the release image Go toolchain to 1.27.2 ([434e90d](https://github.com/maltzsama/urutau/commit/434e90d624c6a2e41e71d169f1cdc37224fdd172))
+* **build:** pin the release image Go toolchain to 1.27.2 ([71f9da1](https://github.com/maltzsama/urutau/commit/71f9da1f52df92d894c6bfda1d412ba231111337))
+
 ## [0.6.0](https://github.com/maltzsama/urutau/compare/v0.5.0...v0.6.0) (2026-10-18)
 
 
