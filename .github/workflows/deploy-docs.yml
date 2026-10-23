@@ -23,7 +23,7 @@ jobs:
       # Sets the Pages base URL and fails early with a clear message if
       # Pages is not enabled or not set to the GitHub Actions source,
       # instead of a bare 404 at the deploy step.
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
 
       - uses: actions/setup-node@v7
         with:
