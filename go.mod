@@ -23,7 +23,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
-	github.com/shopspring/decimal v1.5.0
+	github.com/shopspring/decimal v1.6.0
 	github.com/spf13/cobra v1.10.2
 	github.com/trinodb/trino-go-client v1.3.0
 	github.com/twmb/franz-go v1.22.2
