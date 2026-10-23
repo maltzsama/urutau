@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Sets the Pages base URL and fails early with a clear message if
       # Pages is not enabled or not set to the GitHub Actions source,
