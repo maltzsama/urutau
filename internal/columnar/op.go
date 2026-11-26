@@ -25,10 +25,10 @@ func colIndex(schema *arrow.Schema, name string) int {
 }
 
 // validateOpColumn checks that every value in the __op column is a known
-// operation (Insert=0, Update=1, Delete=2). An unknown or null value is an
-// immediate error: both would silently vanish from the split otherwise.
-// Value reads a null as 0 (OpInsert), and the op masks then yield null for
-// that row, filtering it out of both outputs.
+// operation (Insert=0, Update=1, Delete=2) and that it is not null. Both are
+// rejected before the split: an unknown non-null value would be routed as an
+// upsert by the delete mask, and a null value — read by Value as 0 — makes
+// both masks null, so the row would vanish from both outputs.
 func validateOpColumn(opCol *array.Uint8) error {
 	for i := range opCol.Len() {
 		if opCol.IsNull(i) {
