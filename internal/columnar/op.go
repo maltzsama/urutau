@@ -25,10 +25,15 @@ func colIndex(schema *arrow.Schema, name string) int {
 }
 
 // validateOpColumn checks that every value in the __op column is a known
-// operation (Insert=0, Update=1, Delete=2). An unknown value is an immediate
-// error: it would silently vanish from the split otherwise.
+// operation (Insert=0, Update=1, Delete=2). An unknown or null value is an
+// immediate error: both would silently vanish from the split otherwise.
+// Value reads a null as 0 (OpInsert), and the op masks then yield null for
+// that row, filtering it out of both outputs.
 func validateOpColumn(opCol *array.Uint8) error {
 	for i := range opCol.Len() {
+		if opCol.IsNull(i) {
+			return fmt.Errorf("dataplane: null __op at row %d", i)
+		}
 		switch opCol.Value(i) {
 		case OpInsert, OpUpdate, OpDelete:
 		default:
