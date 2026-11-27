@@ -124,6 +124,15 @@ func (b *batcher) commitPending() error {
 		b.freePending()
 	}()
 
+	// Validate __op once, before the mode switch: every branch below consumes
+	// it. Append classifies rows by it (appendRowsToKeep; AppendMode never
+	// calls Collapse), the snapshot partition splits on it, and Collapse
+	// splits on it. A null op is a wire-contract violation on all three, and
+	// validating here keeps the rejection identical regardless of mode.
+	if err := columnar.ValidateOpNulls(merged.Record); err != nil {
+		return fmt.Errorf("worker: table %s: %w", b.p.target, err)
+	}
+
 	// Snapshot partition: untouched snapshot PKs are pure-appended (no
 	// equality delete); everything else collapses columnar.
 	//

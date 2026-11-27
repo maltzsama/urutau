@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/maltzsama/urutau/dataplane"
+	"github.com/maltzsama/urutau/internal/columnar"
 )
 
 // enrichWindowRows runs a snapshot window's batch through the enricher before
@@ -32,6 +33,14 @@ func (p *tablePipeline) enrichWindowRows(ctx context.Context, cb *dataplane.Batc
 // pending/flush path, so the empty delivery keeps its place in the cycle's send
 // order rather than jumping ahead of buffered data.
 func (p *tablePipeline) applyEnrich(ctx context.Context, batch *dataplane.Batch, origRows int, bufferEmpty func(*dataplane.Batch) error) (enriched *dataplane.Batch, dropped bool, err error) {
+	// Enrichment initialises its keep mask with is_not_null(__op), so a null
+	// op row would be filtered out here — before Collapse ever validates it.
+	// Reject the wire-contract violation before the join sees the batch, so
+	// it cannot turn into a silent drop (or a phantom join miss).
+	if verr := columnar.ValidateOpNulls(batch.Record); verr != nil {
+		batch.Release()
+		return nil, false, fmt.Errorf("worker: table %s: %w", p.target, verr)
+	}
 	enriched, err = p.enricher.EnrichBatch(ctx, batch, p.knownSchema.PrimaryKey)
 	if err != nil {
 		batch.Release()
